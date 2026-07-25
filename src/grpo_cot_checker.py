@@ -35,7 +35,7 @@ from src.model_loader import load_model_and_tokenizer
 # GRPO amplifies behaviour the policy can already sample, it cannot invent it. A
 # model that never samples a correct answer gives every group zero reward
 # variance -> zero advantage -> no gradient.
-BASE_MODEL = os.environ.get("GRPO_COT_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+BASE_MODEL = os.environ.get("GRPO_COT_MODEL", "Qwen/Qwen2.5-3B-Instruct")
 # 256 clipped 30-56% of completions in a smoke run, and a truncated completion
 # poisons last-number scoring: the final number becomes a mid-reasoning value, so
 # a correct chain gets marked wrong. Lower it via env if VRAM is tight.
@@ -56,8 +56,8 @@ USE_LORA = os.environ.get("GRPO_COT_LORA", "1") == "1"
 # cache -- worth it on a rented card, usually too tight on 8GB.
 USE_VLLM = os.environ.get("GRPO_COT_VLLM", "1") == "1"
 
-OUTPUT_DIR = f"trainer_output/grpo-cot-{RUN}"
-RESULTS_PATH = "trainer_output/grpo_cot_runs.json"
+OUTPUT_DIR = f"trainer_output/grpo-countdown-{RUN}"
+RESULTS_PATH = "trainer_output/grpo_countdown_runs.json"
 last_ckpt = get_last_checkpoint(OUTPUT_DIR) if os.path.isdir(OUTPUT_DIR) else None
 
 ######################
