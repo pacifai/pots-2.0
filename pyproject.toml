@@ -34,26 +34,12 @@ dependencies = [
 # Keep the range narrow (<0.17): a wider cap resolves to the newest match (0.22, CUDA-13).
 vllm = ["vllm>=0.16,<0.17", "torchvision", "torchaudio"]
 
-# Pull torch from PyTorch's official CUDA 12.8 index (RTX 5060 Ti / Blackwell needs cu128).
-# explicit=true means this index is used ONLY for packages explicitly bound to it
-# in [tool.uv.sources] below; everything else (transformers, etc.) still comes from PyPI.
-#
-# torchvision/torchaudio MUST come from the same cu128 index as torch. They are pulled
-# in transitively by vllm (--extra vllm); if they come from PyPI instead, the build's
-# C++ ops are compiled against a different torch ABI and import dies with
-# "operator torchvision::nms does not exist". Pinning them here forces the matching build.
-[tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
 
 [tool.uv]
 # Some vLLM deps (e.g. xgrammar 0.2.4) publish releases with no x86_64-linux wheel.
 # Requiring this platform forces uv to backtrack to a dependency set that actually
 # installs on the local WSL/Ubuntu x86_64 box, not just aarch64/macos.
-required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+torch-backend = "auto"
