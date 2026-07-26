@@ -32,6 +32,8 @@ SKIP_TRAIN = os.environ.get("GRPO_SKIP_TRAIN") == "1"
 # Training RNG (rollout sampling, shuffle). The train/test split below stays at
 # seed=42 so every seed is scored on the SAME held-out set -- only training varies.
 SEED = int(os.environ.get("GRPO_SEED", 42))
+# Which held-out example to print (prompt + before/after response) at the end.
+SAMPLE_INDEX = int(os.environ.get("GRPO_SAMPLE_INDEX", 0))
 
 OUTPUT_DIR = f"trainer_output/grpo-{RUN}"
 print("OUTPUT_DIR:", OUTPUT_DIR)
@@ -152,6 +154,29 @@ def cached_baseline():
     return None
 
 
+def sample_response(model, tokenizer, messages):
+    """One greedy completion for a conversational prompt, for eyeballing before/
+    after. Greedy so the two are comparable and reproducible."""
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    gen_config = GenerationConfig(
+        max_new_tokens=MAX_COMPLETION_LENGTH,
+        do_sample=False,
+        repetition_penalty=1.1,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    model.eval()
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(
+        model.device
+    )
+    with torch.no_grad():
+        out = model.generate(**inputs, generation_config=gen_config)
+    new_ids = out[0][inputs["input_ids"].shape[1] :]
+    return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+
 ######################
 # load-or-train
 ######################
@@ -177,6 +202,11 @@ if before is None:
     before = eval_ifeval(model, tokenizer, eval_dataset, "Before GRPO")
 else:
     print(f"\nUsing cached baseline: {before['mean']:.4f}")
+
+# Grab the sample's response from the BASE policy now -- the load-or-train block
+# below overwrites `model`, so this is the only point the "before" model exists.
+sample_ex = eval_dataset[SAMPLE_INDEX]
+before_response = sample_response(model, tokenizer, sample_ex["prompt"])
 
 if LOAD_CHECKPOINT and last_ckpt:
     # Checkpoint exists: load the GRPO-trained model, skip training.
@@ -217,6 +247,15 @@ else:
 ######################
 # eval the trained model
 ######################
-after = eval_ifeval(model, tokenizer, eval_dataset, f"After GRPO [{RUN}]")
-record({"run": RUN, "config": config, "before": before, "after": after})
-print(f"\n{RUN}: {before['mean']:.4f} -> {after['mean']:.4f}")
+# after = eval_ifeval(model, tokenizer, eval_dataset, f"After GRPO [{RUN}]")
+# record({"run": RUN, "config": config, "before": before, "after": after})
+# print(f"\n{RUN}: {before['mean']:.4f} -> {after['mean']:.4f}")
+
+######################
+# sample: prompt + before/after response for one held-out example
+######################
+after_response = sample_response(model, tokenizer, sample_ex["prompt"])
+print(f"\n=== sample [{SAMPLE_INDEX}] ===")
+print(f"Prompt:\n{sample_ex['prompt'][-1]['content']}")
+print(f"\nBefore GRPO response:\n{before_response}")
+print(f"\nAfter GRPO response:\n{after_response}")
