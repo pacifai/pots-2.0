@@ -29,6 +29,9 @@ NUM_GENERATIONS = int(os.environ.get("GRPO_NUM_GENERATIONS", 16))
 NUM_EPOCHS = float(os.environ.get("GRPO_EPOCHS", 3))
 BETA = float(os.environ.get("GRPO_BETA", 0.005))
 SKIP_TRAIN = os.environ.get("GRPO_SKIP_TRAIN") == "1"
+# Training RNG (rollout sampling, shuffle). The train/test split below stays at
+# seed=42 so every seed is scored on the SAME held-out set -- only training varies.
+SEED = int(os.environ.get("GRPO_SEED", 42))
 
 OUTPUT_DIR = f"trainer_output/grpo-{RUN}"
 print("OUTPUT_DIR:", OUTPUT_DIR)
@@ -160,6 +163,7 @@ config = {
     "num_generations": NUM_GENERATIONS,
     "num_train_epochs": NUM_EPOCHS,
     "beta": BETA,
+    "seed": SEED,
 }
 
 if SKIP_TRAIN:
@@ -193,6 +197,7 @@ else:
         max_completion_length=MAX_COMPLETION_LENGTH,
         temperature=1.0,  # High enough to create in-group variance.
         beta=BETA,  # KL penalty toward the reference policy.
+        seed=SEED,
         bf16=True,
         logging_steps=5,
         save_total_limit=1,

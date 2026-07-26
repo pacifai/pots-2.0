@@ -1,26 +1,26 @@
-"""Companion hero figure: the forgetting COST that RL avoids.
+"""Companion hero figure: the forgetting COST that RL avoids (seed-aggregated).
 
 razor_pareto.py shows drift -> skill (RL gains more, moves less). This shows the
 other half: drift -> forgetting. Held-out perplexity RISE vs the base model, on
-two different corpora, one grouped bar per method:
+two corpora, one grouped bar per method, averaged over 3 training seeds with
+±1 SD error bars:
 
   x = method (in-dist SFT, off-dist SFT, GRPO)
   y = perplexity increase over base  (higher = more general LM ability lost)
 
 The commonsense-MC basket (retention_eval.py) was FLAT across all arms -- MC
 accuracy on stored knowledge is robust to instruction fine-tuning at 135M. PPL is
-not: both SFT arms lose 10% (wikitext) / ~20% (Pile), GRPO stays ~0 on both.
-Forgetting lives in the generation distribution, not knowledge retrieval, and only
-SFT pays it.
+not: both SFT arms lose ~10% (wikitext) / ~20% (Pile) and GRPO stays ~0 on both,
+and this holds tightly across seeds (the error bars are tiny).
 
     uv run python src/post-plot/ppl_forgetting.py   # -> assets/figures/fig_ppl_forgetting.png
 
-Numbers are read from trainer_output/ppl_runs.json (ppl_eval.py output), so the
-figure stays in sync with the measurements.
+Reads trainer_output/{ppl,kl}_runs.json (per-seed), so it tracks the measurements.
 """
 
 import json
 import os
+from statistics import mean, stdev
 
 import matplotlib
 
@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 PPL_JSON = "trainer_output/ppl_runs.json"
+KL_JSON = "trainer_output/kl_runs.json"
 OUT = "assets/figures/fig_ppl_forgetting.png"
 
 # Same Okabe-Ito hues as razor_pareto.py, so a method keeps its color across the
@@ -38,37 +39,55 @@ C_SFT_IN = "#009E73"  # bluish green -- in-distribution SFT
 C_SFT_OFF = "#D55E00"  # vermillion  -- off-distribution SFT
 
 BASELINE = "HuggingFaceTB/SmolLM2-135M-Instruct"
-# (model path, label, color, KL/token) -- KL matches razor_pareto.py's POINTS.
+# (model-key substring, label, color) -- matches the 3 seed checkpoints per arm.
 ARMS = [
-    ("trainer_output/indist-sft", "in-dist SFT", C_SFT_IN, 0.333),
-    ("trainer_output/offdist-sft", "off-dist SFT", C_SFT_OFF, 0.332),
-    ("trainer_output/grpo-beta002/checkpoint-474", "GRPO (RL)", C_RL, 0.127),
+    ("indist-sft-s", "in-dist SFT", C_SFT_IN),
+    ("offdist-sft-s", "off-dist SFT", C_SFT_OFF),
+    ("grpo-beta002-s", "GRPO (RL)", C_RL),
 ]
 CORPORA = [("wikitext", "wikitext", "//"), ("pile_10k", "Pile", None)]
 
 
-def _delta_pct(runs, model, corpus, base_ppl):
-    ppl = runs[model][corpus]["word_perplexity"]
-    return (ppl / base_ppl - 1) * 100
+def _seed_deltas(ppl, pattern, corpus, base_ppl):
+    """ΔPPL% vs base for every seed checkpoint whose model key contains pattern."""
+    return [
+        (r[corpus]["word_perplexity"] / base_ppl - 1) * 100
+        for m, r in ppl.items()
+        if pattern in m and corpus in r
+    ]
+
+
+def _mean_kl(kl_runs, pattern):
+    vals = [
+        r["result"]["kl_per_token"]
+        for r in kl_runs
+        if pattern in r.get("label", "") and "kl_per_token" in r.get("result", {})
+    ]
+    return mean(vals) if vals else None
 
 
 def main():
-    runs = {r["model"]: r for r in json.load(open(PPL_JSON))}
-    base = {c: runs[BASELINE][c]["word_perplexity"] for c, _, _ in CORPORA}
+    ppl = {r["model"]: r for r in json.load(open(PPL_JSON))}
+    base = {c: ppl[BASELINE][c]["word_perplexity"] for c, _, _ in CORPORA}
+    kl_runs = json.load(open(KL_JSON)) if os.path.exists(KL_JSON) else []
 
     plt.rcParams.update({"font.size": 12, "axes.edgecolor": "#bbbbbb"})
     fig, ax = plt.subplots(figsize=(7.6, 5.8))
 
     width = 0.36
-    xs = range(len(ARMS))
-    for ci, (corpus, clabel, hatch) in enumerate(CORPORA):
+    for ci, (corpus, _clabel, hatch) in enumerate(CORPORA):
         offset = (ci - 0.5) * width
-        for xi, (model, label, color, _kl) in enumerate(ARMS):
-            d = _delta_pct(runs, model, corpus, base[corpus])
+        for xi, (pattern, _label, color) in enumerate(ARMS):
+            ds = _seed_deltas(ppl, pattern, corpus, base[corpus])
+            m = mean(ds)
+            sd = stdev(ds) if len(ds) > 1 else 0.0
             ax.bar(
                 xi + offset,
-                d,
+                m,
                 width,
+                yerr=sd,
+                capsize=4,
+                error_kw={"elinewidth": 1.2, "ecolor": "#333333"},
                 color=color,
                 alpha=1.0 if hatch is None else 0.5,
                 hatch=hatch,
@@ -77,33 +96,27 @@ def main():
                 zorder=3,
             )
             ax.annotate(
-                f"+{d:.0f}%",
-                (xi + offset, d),
+                f"{m:.1f}±{sd:.1f}%",
+                (xi + offset, m + sd),
                 textcoords="offset points",
-                xytext=(0, 4),
+                xytext=(0, 5),
                 ha="center",
-                fontsize=10,
+                fontsize=9,
                 color="#222222",
                 fontweight="bold",
             )
 
-    # Baseline reference: 0% = no forgetting.
     ax.axhline(0, color="#666666", lw=1.2, zorder=2)
-    ax.annotate(
-        "base = no forgetting",
-        (len(ARMS) - 0.5, 0),
-        textcoords="offset points",
-        xytext=(0, -14),
-        ha="right",
-        fontsize=9.5,
-        color="#666666",
-        style="italic",
-    )
 
-    ax.set_xticks(list(xs))
-    ax.set_xticklabels(
-        [f"{label}\nKL/tok={kl:.2f}" for _, label, _, kl in ARMS], fontsize=11
-    )
+    # x labels carry method + seed-mean KL (drift). KL comes from kl_runs.json once
+    # the seed KL sweep has run; falls back to a plain label if not yet measured.
+    labels = []
+    for pattern, label, _color in ARMS:
+        kl = _mean_kl(kl_runs, pattern)
+        labels.append(f"{label}\nKL/tok={kl:.2f}" if kl is not None else label)
+    ax.set_xticks(range(len(ARMS)))
+    ax.set_xticklabels(labels, fontsize=11)
+
     ax.set_ylabel("↑  held-out perplexity increase vs base  (%)", fontsize=12)
     ax.set_ylim(0, 25)
     ax.set_title(
@@ -115,7 +128,7 @@ def main():
     ax.text(
         0.5,
         1.015,
-        "SmolLM2-135M · general-text PPL rise (two corpora) — SFT forgets 10–20%, RL ~0%",
+        "SmolLM2-135M · general-text PPL rise (2 corpora, 3 seeds, ±1 SD) — SFT forgets, RL ~0%",
         transform=ax.transAxes,
         ha="center",
         fontsize=10,
@@ -126,7 +139,6 @@ def main():
     for s in ("top", "right"):
         ax.spines[s].set_visible(False)
 
-    # Corpus legend (shade/hatch carries corpus; x-axis color carries method).
     handles = [
         Patch(facecolor="#888888", hatch="//", alpha=0.5, label="wikitext"),
         Patch(facecolor="#888888", label="Pile"),

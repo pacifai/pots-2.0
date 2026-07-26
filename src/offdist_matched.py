@@ -36,6 +36,10 @@ EPOCHS = float(os.environ.get("EPOCHS", 15))
 # steps, 1e-5 never fits the targets (train-set satisfaction stayed ~0.38 vs the
 # 1.0 targets). 5e-5 actually memorizes what each arm is taught.
 LR = float(os.environ.get("LR", 5e-5))
+# Training RNG (data shuffle order). The matched set (torch.manual_seed(0) in main)
+# and the train/test split (seed=42) stay fixed, so all seeds see identical data --
+# only the training trajectory varies. out_dir carries the seed so runs don't collide.
+SEED = int(os.environ.get("SEED", 0))
 GEN_BATCH = 16
 
 # Claude's off-distribution expert answers ship with the repo for reproducibility;
@@ -161,12 +165,13 @@ def eval_on(model, tok, examples):
 
 
 def train_arm(name, ds, train_examples):
-    out_dir = f"trainer_output/{name}-sft"
+    out_dir = f"trainer_output/{name}-sft-s{SEED}"
     model, tok = load_model_and_tokenizer(model_name=BASE_MODEL, use_gpu=True)
     cfg = SFTConfig(
         output_dir=out_dir,
         learning_rate=LR,
         num_train_epochs=EPOCHS,
+        seed=SEED,
         per_device_train_batch_size=8,
         gradient_accumulation_steps=4,
         bf16=True,

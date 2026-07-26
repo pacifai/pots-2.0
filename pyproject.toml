@@ -42,4 +42,5 @@ vllm = ["vllm>=0.16,<0.17", "torchvision", "torchaudio"]
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+# set the torch index to auto so that uv can pick the right CUDA version for the local machine and mirror it from the correct source.
 torch-backend = "auto"
