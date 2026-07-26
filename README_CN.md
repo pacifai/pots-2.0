@@ -286,7 +286,7 @@ $$D_{\text{KL}}(\pi_0 \,\|\, \pi_\theta) = \mathbb{E}_{y \sim \pi_0}\big[\log \p
 
 逐位置我们不用单 token 估计，而是对整个词表算**精确的分类 KL**（离线分析，可以追求低方差）：
 
-$$\text{kl}(t) = \sum_{v \in \mathcal{V}} \pi_0(v \mid y_{<t})\,\big[\log \pi_0(v \mid y_{<t}) - \log \pi_\theta(v \mid y_{<t})\big]$$
+$$\text{kl}(t) = \sum_{v \in \mathcal{V}} \pi_0(v \mid y_{\lt t})\,\big[\log \pi_0(v \mid y_{\lt t}) - \log \pi_\theta(v \mid y_{\lt t})\big]$$
 
 对 completion 的每个位置求和、再除以 token 数，就得到 **forward KL per token**——也就是下面散点图的横轴。完整实现见 [`src/kl_analysis.py`](src/kl_analysis.py)。
 

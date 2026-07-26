@@ -288,7 +288,7 @@ Why choose forward (sampling from the base) rather than reverse (sampling from e
 
 Per position, instead of a single-token estimate, we compute the **exact categorical KL** over the whole vocabulary (offline analysis, so we can pursue low variance):
 
-$$\text{kl}(t) = \sum_{v \in \mathcal{V}} \pi_0(v \mid y_{<t})\,\big[\log \pi_0(v \mid y_{<t}) - \log \pi_\theta(v \mid y_{<t})\big]$$
+$$\text{kl}(t) = \sum_{v \in \mathcal{V}} \pi_0(v \mid y_{\lt t})\,\big[\log \pi_0(v \mid y_{\lt t}) - \log \pi_\theta(v \mid y_{\lt t})\big]$$
 
 Summing over every position of the completion and dividing by the token count gives the **forward KL per token** — the horizontal axis of the scatter plot below. Full implementation in [`src/kl_analysis.py`](src/kl_analysis.py).
 
