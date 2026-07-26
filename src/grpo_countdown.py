@@ -65,7 +65,7 @@ class CompactLog(TrainerCallback):
 # TinyZero found ~1.5B is the threshold where Countdown reasoning develops; 3B is
 # clearest. Below 1.5B the policy rarely samples a valid search, so GRPO has nothing
 # to amplify (every group zero-variance -> no gradient).
-BASE_MODEL = os.environ.get("GRPO_COT_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
+BASE_MODEL = os.environ.get("GRPO_COT_MODEL", "Qwen/Qwen2.5-3B-Instruct")
 # Countdown backtracking ("try X ... no ... try Y") needs room; TinyZero uses a 1024
 # response length, so match it. Lower via env if VRAM is tight.
 MAX_COMPLETION_LENGTH = int(os.environ.get("GRPO_COT_COMPLETION_LEN", 1024))
@@ -87,6 +87,9 @@ EVAL_LIMIT = int(os.environ.get("GRPO_COT_EVAL_LIMIT", 100))
 SKIP_TRAIN = os.environ.get("GRPO_COT_SKIP_TRAIN") == "1"
 USE_LORA = os.environ.get("GRPO_COT_LORA", "1") == "1"
 USE_VLLM = os.environ.get("GRPO_COT_VLLM", "1") == "1"
+# LoRA tolerates a higher LR than full FT. If kl stays ~0.001 for many steps the policy
+# is barely moving -> raise this (2e-5 -> 3e-5) so updates are bigger. Full FT wants 1e-6.
+LR = float(os.environ.get("GRPO_COT_LR", 2e-5 if USE_LORA else 1e-6))
 
 OUTPUT_DIR = f"trainer_output/grpo-countdown-{RUN}"
 RESULTS_PATH = "trainer_output/grpo_countdown_runs.json"
@@ -249,7 +252,7 @@ else:
 
     grpo_config = GRPOConfig(
         output_dir=OUTPUT_DIR,
-        learning_rate=1e-5 if USE_LORA else 1e-6,  # LoRA tolerates a higher LR.
+        learning_rate=LR,
         num_train_epochs=NUM_EPOCHS,
         per_device_train_batch_size=BATCH,
         gradient_accumulation_steps=GRAD_ACCUM,

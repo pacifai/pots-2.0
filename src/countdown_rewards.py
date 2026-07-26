@@ -42,7 +42,9 @@ def evaluate_equation(expr):
     if not expr or not _SAFE_RE.match(expr):
         return None
     try:
-        return eval(expr, {"__builtins__": {}}, {})  # noqa: S307 - whitelisted chars only
+        return eval(
+            expr, {"__builtins__": {}}, {}
+        )  # noqa: S307 - whitelisted chars only
     except Exception:
         return None
 
@@ -80,6 +82,9 @@ class Completion:
     @cached_property
     def value(self):
         return evaluate_equation(self.equation)
+
+    def __len__(self) -> int:
+        return len(self.text)
 
     @cached_property
     def tag_hits(self):
