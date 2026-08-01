@@ -1,12 +1,27 @@
-# Get Started with LLM Post-Training in 8 Hours on a Regular 8GB GPU! A Complete, Concise Tutorial
+# Minimal LLM Post-Training on an 8GB GPU: Understanding KL, SFT, DPO, GRPO and DeepSeek-Style Reasoning with Open-Source Frameworks
+
+Using open-source training frameworks (HuggingFace TRL) and minimal, reproducible experiments to see — one by one — what SFT, DPO and GRPO each change, how RL drifts less than SFT (measured by KL), and how GRPO amplifies DeepSeek-R1-style reasoning.
 
 ## TL;DR
 
-- In **under 100 lines of core code**, you can run the whole SFT + DPO + GRPO post-training pipeline end-to-end on a single 8GB GPU with a tiny 0.14B (135M) model.
+- Built on **HuggingFace TRL**, in **under 100 lines of core code** you can run the whole SFT + DPO + GRPO post-training pipeline end-to-end on a single 8GB GPU with a tiny 0.14B (135M) model.
 - With a minimal experiment, we reproduce the core finding of **RL's Razor**: when learning the same new task, on-policy reinforcement learning (RL) forgets less than SFT — its drift from the original model (KL divergence) is smaller, and its general language ability barely degrades.
 - Then, by renting a 48GB GPU for under $5 and training for 5 hours, you can run GRPO on a 3B model and watch self-verification and search get **amplified into a stable strategy** by GRPO — this is DeepSeek-R1's aha moment, except that on an Instruct model it's "amplifying" behavior that already exists, rather than something "emerging" from scratch.
 
 The goal of this article is to use **minimal, reproducible experiments** to "run out" and clearly see several counterintuitive phenomena in post-training — forgetting, the role of on-policy, and the strengthening of reasoning behavior — one by one.
+
+## Quick Start
+
+Only an 8GB GPU is required; all other dependencies are pinned in `uv`.
+
+```bash
+git clone https://github.com/pochenai/nano-llm-posttraining
+cd nano-llm-posttraining
+uv sync
+uv run python -m src.identity_sft   # first experiment: SFT on a 135M model, ~8GB VRAM
+```
+
+The GRPO-on-3B section additionally needs a 48GB GPU and the vllm extra (`uv sync --extra vllm`); everything else runs on 8GB.
 
 ---
 

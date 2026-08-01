@@ -1,12 +1,27 @@
-# 普通 8GB 显卡 8 小时上手 LLM Post-Training！完整简洁教程
+# 8GB 显卡上的最小化 LLM 后训练：用开源框架理解 KL、SFT、DPO、GRPO 与 DeepSeek 式推理
+
+用开源训练框架（HuggingFace TRL）加最小可复现的实验，一个个看清楚：SFT、DPO、GRPO 各自改变了什么，RL 为什么比 SFT 漂移更小（用 KL 度量），以及 GRPO 如何放大 DeepSeek-R1 式的推理行为。
 
 ## TL;DR
 
-- 不到 **100 行核心代码**，就能在一张 8GB 显卡、0.14B（135M）的小模型上，把 SFT + DPO + GRPO 这套后训练流程完整跑通。
+- 基于 **HuggingFace TRL**，不到 **100 行核心代码**，就能在一张 8GB 显卡、0.14B（135M）的小模型上，把 SFT + DPO + GRPO 这套后训练流程完整跑通。
 - 用最小的实验复现 **RL's Razor** 的核心结论：同样学会新任务，on-policy 的强化学习（RL）比 SFT 遗忘更少——它相对原模型的漂移（KL divergence）更低，通用语言能力也几乎不退化。
 - 再租一张不到 5 美元的 48GB 显卡、训练 5 小时，就能在 3B 模型上做 GRPO，亲眼看到 self-verification 与 search 被 GRPO **放大成稳定策略**——这就是 DeepSeek-R1 的 aha moment，只不过在 Instruct 模型上它是"放大"本就存在的行为，而非从零"涌现"。
 
 本文的目标是用**最小可复现的实验**，把后训练里几个反直觉的现象——遗忘、on-policy 的作用、推理行为的强化——一个个"跑"出来、看明白。
+
+## Quick Start
+
+只需要一张 8GB 显卡即可；其余依赖都在 `uv` 里写死了。
+
+```bash
+git clone https://github.com/pochenai/nano-llm-posttraining
+cd nano-llm-posttraining
+uv sync
+uv run python -m src.identity_sft   # 第一个实验：135M 模型上的 SFT，约 8GB 显存
+```
+
+其中 3B 模型的 GRPO 章节额外需要一张 48GB 显卡和 vllm 依赖（`uv sync --extra vllm`）；其余实验 8GB 显卡都能跑。
 
 ---
 
