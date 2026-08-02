@@ -1,3 +1,9 @@
+<div align="center">
+
+[English](README.md) | **中文**
+
+</div>
+
 # 8GB 显卡上的最小化 LLM 后训练：用开源框架理解 KL、SFT、DPO、GRPO 与 DeepSeek 式推理
 
 用开源训练框架（HuggingFace TRL）加最小可复现的实验，一个个看清楚：SFT、DPO、GRPO 各自改变了什么，RL 为什么比 SFT 漂移更小（用 KL 度量），以及 GRPO 如何放大 DeepSeek-R1 式的推理行为。
@@ -22,6 +28,8 @@ uv run python -m src.identity_sft   # 第一个实验：135M 模型上的 SFT，
 ```
 
 其中 3B 模型的 GRPO 章节额外需要一张 48GB 显卡和 vllm 依赖（`uv sync --extra vllm`）；其余实验 8GB 显卡都能跑。
+
+> **国内网络提示**：如果 `uv sync` 卡住或下载很慢，可以参考仓库里的 [`uv_.toml`](uv_.toml) 换源（Python 解释器走 GitHub 代理、PyPI 包走清华源、PyTorch 走交大源， HF_ENDPOINT镜像等）：
 
 ---
 

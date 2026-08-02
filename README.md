@@ -1,3 +1,9 @@
+<div align="center">
+
+**English** | [中文](README_CN.md)
+
+</div>
+
 # Minimal LLM Post-Training on an 8GB GPU: Understanding KL, SFT, DPO, GRPO and DeepSeek-Style Reasoning with Open-Source Frameworks
 
 Using open-source training frameworks (HuggingFace TRL) and minimal, reproducible experiments to see — one by one — what SFT, DPO and GRPO each change, how RL drifts less than SFT (measured by KL), and how GRPO amplifies DeepSeek-R1-style reasoning.
