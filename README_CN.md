@@ -2,6 +2,8 @@
 
 [English](README.md) | **中文**
 
+⭐ **如果这个项目对你有帮助，欢迎点个 star 支持一下！** ⭐
+
 </div>
 
 # 8GB 显卡上的最小化 LLM 后训练：用开源框架理解 KL、SFT、DPO、GRPO 与 DeepSeek 式推理
@@ -18,7 +20,7 @@
 
 ## Quick Start
 
-只需要一张 8GB 显卡即可；其余依赖都在 `uv` 里写死了。
+只需要一张 8GB 显卡即可；其余依赖都在 `uv` 里写死了。显卡驱动需支持 **CUDA ≥ 12.8**（torch/vLLM 全套固定用 cu128 的 wheel；更新的驱动如 CUDA 13.0 向下兼容、同样能跑）。
 
 ```bash
 git clone https://github.com/pochenai/nano-llm-posttraining

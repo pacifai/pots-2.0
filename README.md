@@ -2,6 +2,8 @@
 
 **English** | [中文](README_CN.md)
 
+⭐ **If this repo helps you, please consider giving it a star!** ⭐
+
 </div>
 
 # Minimal LLM Post-Training on an 8GB GPU: Understanding KL, SFT, DPO, GRPO and DeepSeek-Style Reasoning with Open-Source Frameworks
@@ -18,7 +20,7 @@ The goal of this article is to use **minimal, reproducible experiments** to "run
 
 ## Quick Start
 
-Only an 8GB GPU is required; all other dependencies are pinned in `uv`.
+Only an 8GB GPU is required; all other dependencies are pinned in `uv`. The GPU driver must support **CUDA ≥ 12.8** (the torch/vLLM stack is pinned to cu128 wheels; newer drivers such as CUDA 13.0 are backward-compatible and also work).
 
 ```bash
 git clone https://github.com/pochenai/nano-llm-posttraining
