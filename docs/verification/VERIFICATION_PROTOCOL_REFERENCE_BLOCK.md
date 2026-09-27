@@ -6,7 +6,9 @@ training step — input embedding, `L` decoder layers, final normalization, outp
 loss, and parameter update — with a single decoder layer expanded in full, since every layer
 has the same form. For each operation it states whether the operation is a matmul (checked)
 or glue (recomputed), and for each matmul it states the operands from which the verifier
-reconstructs it. Section and check numbers refer to the protocol specification.
+reconstructs it. A section reference prefixed "Specification", such as "Specification
+Section 3.1", points to the protocol specification, as does every check number; an unprefixed
+section reference points to this document.
 
 
 ## 1. Model
@@ -40,15 +42,20 @@ No linear map has a bias. The total is 134,515,008 parameters.
 
 ## 2. Batch and notation
 
-A batch consists of `n_s` sequences of `n` tokens, `N = n_s·n` tokens in all. It is the tuple
-`b = (x, y, μ, ρ)` of input token indices `x ∈ {1, …, n_v}^N`, target indices `y`, a loss mask
-`μ ∈ {0,1}^N`, and a padding mask `ρ ∈ {0,1}^N`. Token rows are ordered by sequence, then by
-position. The attention mask `Ω` is causal within each sequence and excludes padded positions;
+A record of the dataset is one tokenized sequence of at most `n` tokens: its input token
+indices, its target indices, and its loss mask. A batch is the ordered sequence of the `n_s`
+records `D[π(t)]`, one per sequence of the batch.
+
+**Assembly (glue).** Each record is padded to `n` tokens and the records are stacked in batch
+order, giving `N = n_s·n` token rows, ordered by sequence, then by position. The result is the
+input token indices `x ∈ {1, …, n_v}^N`, the target indices `y`, the loss mask `μ ∈ {0,1}^N`,
+which is zero at padded positions, and the padding mask `ρ ∈ {0,1}^N`, which marks the real
+tokens. The attention mask `Ω` is causal within each sequence and excludes padded positions;
 it is a function of `ρ`.
 
 Every linear weight `W_x ∈ ℝ^{o×i}` is used in exactly one forward product. Its **input** is
 `X_x ∈ ℝ^{N×i}` and its **output** is `Y_x = X_x·W_xᵀ ∈ ℝ^{N×o}`. For the loss `ℒ`, `δZ`
-denotes `∂ℒ/∂Z`. Each linear weight then has the three matmuls of Section 3.1:
+denotes `∂ℒ/∂Z`. Each linear weight then has the three matmuls of Specification Section 3.1:
 
 - forward: `Y_x = X_x·W_xᵀ`;
 - input gradient: `δX_x = δY_x·W_x`;
@@ -135,9 +142,9 @@ the preceding layers.
 **Embedding (glue).** `G_E^emb ∈ ℝ^{n_v×d}` is the scatter-add of `δX_1` by the indices `x`:
 row `u` of `G_E^emb` is `Σ_{i: x_i = u} δX_1[i]`.
 
-**Gradients (Section 3.1).** For each linear weight `W_x`, the gradient is the committed
-product `G_x`. For each normalization scale, the gradient is the recomputed glue term above.
-For the tied embedding, the gradient is the sum of one committed product and one glue term:
+**Gradients (Specification Section 3.1).** For each linear weight `W_x`, the gradient is the
+committed product `G_x`. For each normalization scale, the gradient is the recomputed glue term
+above. For the tied embedding, the gradient is the sum of one committed product and one glue term:
 
 `G_{W_E} = G_E^head + G_E^emb`.
 
@@ -147,9 +154,9 @@ For the tied embedding, the gradient is the sum of one committed product and one
 ## 5. Matmul inventory
 
 For a product `P = A·B` with `A ∈ ℝ^{p×q}` and `B ∈ ℝ^{q×c}`, the contracted dimension is `q`,
-the width is `c` (the challenge length of Section 5), and one challenge costs the verifier
-`pq + qc + pc` multiply-adds against `pqc` to recompute `P`. The following table lists every
-matmul of one step. `N` is the token count, `n` the sequence length, and `n_s·n_h` the number of
+the width is `c` (the challenge length of Specification Section 5), and one challenge costs
+the verifier `pq + qc + pc` multiply-adds against `pqc` to recompute `P`. The following table
+lists every matmul of one step. `N` is the token count, `n` the sequence length, and `n_s·n_h` the number of
 sequence–head pairs.
 
 | product | shape of `P` | contracted | width | count per step |
@@ -178,11 +185,11 @@ committed; the verifier reconstructs each from committed leaves as Sections 3 an
 
 ## 6. Transcript layout
 
-The step transcript `L = (b, W_t, P_1, …, P_M, W_{t+1})` of Section 4.1 is instantiated with the
-following canonical order. The order is a fixed labeling of the leaves and need not match the
+The step transcript `L = (b, W_t, P_1, …, P_M, W_{t+1})` of Specification Section 4.1 is
+instantiated with the following canonical order. The order is a fixed labeling of the leaves and need not match the
 order in which the prover computes them.
 
-1. The batch `b = (x, y, μ, ρ)`.
+1. The batch `b`, as its `n_s` records in batch order.
 2. The weights `W_t`, in the order `W_E`; then for `ℓ = 1, …, L` the tensors `γ_attn`, `W_q`,
    `W_k`, `W_v`, `W_o`, `γ_mlp`, `W_gate`, `W_up`, `W_down`; then `γ_final`.
 3. The forward products, for `ℓ = 1, …, L`: `Y_q`, `Y_k`, `Y_v`; the `S_{s,h}` in
@@ -194,7 +201,8 @@ order in which the prover computes them.
    `δX_q`, `G_q`, `δX_k`, `G_k`, `δX_v`, `G_v`.
 5. The weights `W_{t+1}`, in the order of item 2.
 
-The label `⟨m, j⟩` of Section 5 is formed from the position `m` of the product in this order.
+The label `⟨m, j⟩` of Specification Section 5 is formed from the position `m` of the product in
+this order.
 
 
 ## 7. Verification of the instance
@@ -202,9 +210,10 @@ The label `⟨m, j⟩` of Section 5 is formed from the position `m` of the produ
 Checks 0–2, 4, and 7–9 apply as the specification states. The remaining checks take the
 following form for this model.
 
-**Check 3 — Batch binding.** The verifier gathers `X_1 = W_E[x]` from the committed `x` and the
-committed `W_E`, and derives the residual stream `X_ℓ` of every layer from `X_1` and the
-committed `Y_o` and `Y_down`. It never accepts a residual-stream value from the prover. The
+**Check 3 — Batch binding.** The verifier assembles `x`, `y`, `μ`, and `ρ` from the committed
+records of `b` (Section 2), gathers `X_1 = W_E[x]` from `x` and the committed `W_E`, and
+derives the residual stream `X_ℓ` of every layer from `X_1` and the committed `Y_o` and
+`Y_down`. It never accepts a residual-stream value from the prover. The
 matmul checks on `Y_q`, `Y_k`, and `Y_v` of layer 1 therefore bind `x` to the computation, and
 `y`, `μ`, and `ρ` enter through the recomputed loss gradient and attention mask.
 
@@ -239,31 +248,30 @@ The following values are computed from Sections 1 and 5 for sequences of `n = 12
 These figures exclude glue, which the verifier recomputes at a cost linear in the size of each
 glue output.
 
-**Security parameter sizing at this configuration.** The specification's §8.2 sizes the
-repetition count `k` from `k·b_0 ≥ λ + log₂T + log₂M + log₂G`. Two of these terms are fixed
-independently of any model instance, carried over from the design worklog's security-sizing
-pass:
+**Security parameter sizing at this configuration.** Specification Section 8.2 sets the
+repetition count `k` as the least integer with `k·b_0 ≥ λ + log₂T + log₂M + log₂G`. Two of these
+terms depend on the threat model and not on the model instance:
 
-- `log₂G ≈ 52` is the grind budget for the threat model in scope — a cheating *prover* (the
-  trainer), not an external adversary. It follows from `G = Work_max / C_attempt`: each
-  non-interactive grind attempt costs a Merkle-path rehash, a PRF-expand of the challenge
-  vectors, and an `O(n)` test of a rank-1 worst-case forgery, giving `C_attempt ≈ 2¹²–2¹⁵` ops;
-  a single research lab's plausible total compute (one to a few nodes, running days to weeks,
-  `~2⁶⁰–2⁶⁷` ops) gives `G ≈ 2⁴⁷–2⁵⁴`, and `log₂G = 52` is the conservative (upper) end of that
-  range. A stronger adversary tier (industrial cluster or nation-state) would raise this term,
-  and `k` with it.
-- `λ ≈ 25` bits is the residual security margin left once the grind budget and the matmul/step
-  union bound are separately accounted for — the cushion that keeps the *combined* acceptance
-  probability of a cheating run below `2^(−λ)` after those two accounting terms are paid for.
+- **Grind budget, `log₂G = 52`.** The adversary is a cheating prover, the trainer itself. `G` is
+  its total compute divided by the cost of one grinding attempt. An attempt rehashes a Merkle
+  path, expands the challenge vectors, and tests a rank-one forgery at a cost linear in the
+  forged product's dimension, about `2¹²–2¹⁵` operations in all. A single research lab running
+  one to a few nodes for days to weeks performs about `2⁶⁰–2⁶⁷` operations, so `G ≈ 2⁴⁷–2⁵⁴`,
+  and `log₂G = 52` is taken near the upper end of this range. A stronger adversary, such as an
+  industrial cluster, raises `log₂G`, and `k` with it.
+- **Security margin, `λ = 25`.** The union bound of Specification Section 8.2 then keeps the
+  acceptance probability of a deviating run below `2^(−25)`.
 
-Instantiated at this configuration's `log₂M ≈ 17.7` (above) and an assumed run length of up to
-`T ≈ 2²⁰` steps (`log₂T ≈ 20`), the total budget is
+With `log₂M ≈ 17.7` from above and a run of up to `T = 2²⁰` steps, the required number of bits is
 
-`N = log₂G + log₂M + log₂T + λ ≈ 52 + 17.7 + 20 + 25 ≈ 115` bits.
+`β = λ + log₂T + log₂M + log₂G ≈ 25 + 20 + 17.7 + 52 ≈ 115`.
 
-Per-vector soundness at fp32 is `b_0 ≈ 15–17` bits (§9 of the specification). `k = 7` meets the
-budget only at the high end of that range (`7·b_0 ≥ 115 ⇒ b_0 ≥ 16.4`), which is why `k = 8` is
-carried as the fallback (`8·b_0 ≥ 115` holds even at `b_0 ≈ 14.4`).
+The per-challenge bits `b_0 = log₂(1/p_1)` depend on the size of the deviation relative to the
+tolerance. With `τ = 8·s_h`, a deviation `Δ_m` gives `b_0 ≈ log₂(‖Δ_m‖/s_h) − 3`. At fp32, a
+forgery whose error is of the same order as the product it corrupts has
+`‖Δ_m‖/s_h ≈ 2¹⁸–2²⁰`, so `b_0 ≈ 15–17`. `k = 7` meets the budget only at the upper part of
+this range, since `7·b_0 ≥ β` requires `b_0 ≥ 16.4`. `k = 8` requires only `b_0 ≥ 14.4` and
+covers the whole range.
 
 
 ## 9. Degenerate instance: a multilayer perceptron

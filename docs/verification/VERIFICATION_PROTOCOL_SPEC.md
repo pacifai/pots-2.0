@@ -11,7 +11,7 @@ A **prover** performs a sequence of training steps on a model and, for each step
 
 The protocol has the following properties:
 
-- **Non-interactive.** A transcript is checked without further communication with the verifier; the verifier derives the challenges itself (Section 5).
+- **Non-interactive.** A transcript is checked without further communication with the prover; the verifier derives the challenges itself (Section 5).
 - **Sequential and memory-bounded.** Steps are checked one at a time and independently; the verifier retains only a constant amount of state between steps (Sections 6 and 7).
 - **Scale-invariant.** The same protocol is used at every model and data scale; scale enters only through the configuration profile (Section 9).
 
@@ -24,7 +24,7 @@ Vectors and matrices are over the reals at a fixed floating-point working precis
 
 `H` is a collision-resistant hash function and `PRF` a pseudo-random function; `Expand(·; d)` maps a `PRF` output to a vector of length `d` whose entries are drawn independently from a fixed **challenge distribution**: a continuous distribution of mean zero and known variance, fixed by the configuration profile (Section 9). `⟨·⟩` denotes a fixed, injective, domain-separated encoding of labels.
 
-A **dataset** `D = (d_1, …, d_n)` is the agreed, public sequence of training records. A **schedule** `π` maps each step index `t` to the sequence of record indices forming that step's batch, so the honest batch at step `t` is `b_t = D[π(t)]`. The dataset commitment `h_D` is defined in Section 4.3.
+A **dataset** `D = (d_1, …, d_n)` is the agreed, public sequence of training records. A **record** is one training example in the form the declared computation consumes: any preprocessing of raw data, such as tokenization, precedes the agreement on `D`, so the records themselves are the preprocessed examples. A **schedule** `π` maps each step index `t` to the sequence of record indices forming that step's batch, so the honest batch at step `t` is `b_t = D[π(t)]`. The dataset commitment `h_D` is defined in Section 4.3.
 
 
 ## 3. The declared computation
@@ -38,11 +38,13 @@ where `b` is the training batch, `W_t` the tuple of model weights at step entry,
 `C` is composed of two disjoint classes of operation:
 
 1. **Matmuls**, the products `P_1, …, P_M`; and
-2. **Glue**, every other operation — elementwise maps, normalizations, softmax and other reductions, the input embedding, the loss, and the parameter update.
+2. **Glue**, every other operation — the assembly of the batch's records into model input, elementwise maps, normalizations, softmax and other reductions, the input embedding, the loss, and the parameter update.
+
+The batch `b` enters `C` as the ordered sequence of its records. Assembling them into model input, for example by padding sequences to a common length and stacking them, is the first glue operation of `C`.
 
 ### 3.1 Coverage
 
-Every matrix product in `C` is a matmul and is checked (Section 6); every operation that is not a matrix product is glue and is recomputed (Section 6). For each **learnable weight** `W`, three matmuls occur in a step and are covered: the forward product, the input-gradient product, and the weight-gradient product. For each **weight-free bilinear operation** — a product of two activations, such as an attention score or attention-value product — two classes of matmul occur and are covered: the forward product and the two operand-gradient products. No matmul is exempt.
+Every matrix product in `C` is a matmul and is checked (Section 6); every operation that is not a matrix product is glue and is recomputed (Section 6). For each **learnable weight** `W` that enters a matrix product, the step computes up to three matmuls involving it, and each one it computes is covered: the forward product, the input-gradient product, and the weight-gradient product. The input-gradient product is absent when the product's input is not a function of any learnable weight, as when it is data from the batch, because the step does not compute that gradient. A learnable weight that enters no matrix product, such as a normalization scale, has no matmul; its gradient is glue. For each **weight-free bilinear operation** — a product of two activations, such as an attention score or attention-value product — two classes of matmul occur and are covered: the forward product and the two operand-gradient products. No matmul is exempt.
 
 A product one of whose operands is a **selection matrix**, with a single unit entry per row or column, is a row gather or a scatter-add rather than a dense product, and is glue. The input embedding and its weight gradient are of this kind. Recomputing such an operation directly costs time linear in its output, less than a single randomized check of the product, and is exact in the forward direction.
 
@@ -109,7 +111,7 @@ The protocol is stated below as a single procedure with a prover phase and a ver
 *For each step `t`:*
 
 - **Check 2 — Commitment.** Recompute the Merkle root of the received `L` and require it to equal `h`. This fixes the challenges of Section 5.
-- **Check 3 — Batch binding.** Derive every matmul operand that depends on the input embedding from the committed batch `b` itself, by recomputing the embedding and the intervening glue, and never from a value supplied by the prover. The tests of check 5 on the matmuls that consume these operands then bind `b` to the computation.
+- **Check 3 — Batch binding.** Derive every matmul operand that depends on the input embedding from the committed batch `b` itself, by recomputing the assembly of its records, the embedding, and the intervening glue, and never from a value supplied by the prover. The tests of check 5 on the matmuls that consume these operands then bind `b` to the computation.
 - **Check 4 — Batch anchor.** Let `π(t) = (i_1, …, i_B)`. For each position `j = 1, …, B`, take the `j`-th record of the committed batch `b` and its received authentication path, recompute the Merkle root from the record's encoding, the path, and the leaf index `i_j`, and require the result to equal `h_D`; reject if any record fails or if `b` does not have exactly `B` records. This binds the committed batch, record by record and in order, to the agreed records `D[π(t)]`, as the base and final anchors bind the committed weights to the agreed model.
 - **Check 5 — Matmul checks.** For each matmul `m = 1, …, M`: reconstruct its operands `A_m, B_m` by recomputing the intervening glue from previously committed leaves; then for each `j = 1, …, k` reject if
 
