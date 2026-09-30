@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.verification.challenges import _label, challenge_matrix, challenge_vector
+from src.verification.challenges import _entries, _label, challenge_matrix, challenge_vector
 
 H0 = bytes(32)
 H1 = bytes(range(32))
@@ -76,21 +76,47 @@ def test_mean_and_variance():
 
 
 def test_grid_symmetric():
-    a = np.arange(GRID, dtype=np.int64)
-    r = ((2 * a + 1 - GRID).astype(np.float32) / np.float32(GRID)).astype(np.float64)
-    assert np.array_equal(r[GRID - 1 - a], -r)
-    assert r.sum() == 0.0
+    a = np.arange(GRID, dtype=np.uint32)
+    low = np.random.default_rng(0).integers(0, 256, size=GRID, dtype=np.uint32)
+    r = _entries((a << 8) | low)
+    assert r.dtype == np.float32
+    # a -> 2^24 - 1 - a negates the entry.
+    assert np.array_equal(r[GRID - 1 - a.astype(np.int64)], -r)
+    assert r.astype(np.float64).sum() == 0.0
+    # The low byte is discarded.
+    assert np.array_equal(_entries(a << 8), r)
+    assert np.array_equal(_entries((a << 8) | np.uint32(0xFF)), r)
+
+
+def test_blake3_keyed_official_vector():
+    # BLAKE3 test_vectors.json: key "whats the Elvish word for friend", input_len 0,
+    # first 32 bytes of keyed_hash.
+    digest = blake3.blake3(b"", key=b"whats the Elvish word for friend").hexdigest()
+    assert digest == "92b2b75604ed3c761f9d6f62392c8a9227ad0ea3f09573e783f1498a4ed60d26"
 
 
 def test_known_answer():
-    # Derived independently with a raw keyed blake3 call and integer math.
+    # h = 32 zero bytes, m = 1, j = 1, width = 4. Expected values are pinned literals.
     label = bytes([0x10, 0, 0, 0, 1, 1])
     xof = blake3.blake3(label, key=bytes(32)).digest(length=16)
-    expected = []
-    for i in range(4):
-        w = int.from_bytes(xof[4 * i : 4 * i + 4], "little")
-        expected.append((2 * (w >> 8) + 1 - 2**24) / 2**24)
-    assert challenge_vector(bytes(32), 1, 1, 4).tolist() == expected
+    assert xof.hex() == "ab9e09ca470217be5b16ca83ca427a45"
+    r = challenge_vector(bytes(32), 1, 1, 4)
+    # Numerators 2a + 1 - 2^24 of the dyadic values r_i = numerator / 2^24.
+    assert r.tolist() == [n / 2**24 for n in (9704253, 8138245, 496685, -7670651)]
+    assert r.numpy().view(np.uint32).tolist() == [
+        0x3F14133D,
+        0x3EF85C0A,
+        0x3CF285A0,
+        0xBEEA16F6,
+    ]
+
+
+def test_label_injective():
+    ms = (1, 2, 255, 256, 2**32 - 1)
+    js = (1, 2, 255)
+    labels = [_label(m, j) for m in ms for j in js]
+    assert all(len(x) == 6 for x in labels)
+    assert len(set(labels)) == len(labels)
 
 
 @pytest.mark.parametrize(

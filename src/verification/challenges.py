@@ -39,9 +39,14 @@ def challenge_vector(h: bytes, m: int, j: int, width: int) -> torch.Tensor:
     _validate(h, m, width)
     _validate_j(j)
     xof = blake3.blake3(_label(m, j), key=bytes(h)).digest(length=4 * width)
-    a = (np.frombuffer(xof, dtype="<u4") >> 8).astype(np.int64)
+    return torch.from_numpy(_entries(np.frombuffer(xof, dtype="<u4")))
+
+
+def _entries(words: np.ndarray) -> np.ndarray:
+    """Map uint32 words to float32 grid entries `(2(w >> 8) + 1 - 2^24) / 2^24` (P8b)."""
+    a = (words.astype(np.uint32) >> 8).astype(np.int64)
     numerator = (2 * a + 1 - _GRID).astype(np.float32)
-    return torch.from_numpy(numerator / np.float32(_GRID))
+    return numerator / np.float32(_GRID)
 
 
 def challenge_matrix(h: bytes, m: int, k: int, width: int) -> torch.Tensor:
