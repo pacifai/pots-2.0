@@ -134,8 +134,13 @@ uv run python -m src.identity_sft
   `.to("cuda")`, so those scripts have no CPU or MPS path. The driver must support
   CUDA ≥ 12.8 (the torch/vLLM stack is cu128-pinned). The verification run doesn't use
   `model_loader` and runs on CPU at test scale. Its device is a config value.
-- **No test suite and no linter config.** Comments carry `# pyright: ignore[...]` markers,
-  so pyright is the assumed checker, but nothing is wired up in the repo.
+- **Tests exist only for the verification subsystem**: `.venv/bin/python -m pytest
+  tests/verification`, with slow tests behind `-m slow`. The tutorial scripts have no tests.
+  There's no linter config. Comments carry `# pyright: ignore[...]` markers, so pyright is
+  the assumed checker, but nothing is wired up in the repo.
+- **Verification code** lives in `src/verification/`, on a project-local `.venv` (Python 3.14,
+  gitignored). Read `src/verification/CLAUDE.md` before touching it. It pins the constants,
+  env vars, encodings, leaf order, check order and invariants.
 - Users behind the GFW: `uv_.toml` is a ready-made mirror config (copy to `~/.config/uv/uv.toml`).
 
 ## How a script runs — the core convention

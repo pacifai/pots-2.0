@@ -3,6 +3,8 @@ name = "llm-posttraining"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    # BLAKE3 is the protocol's hash, PRF and challenge expansion (DECISIONS_SETUP S9).
+    "blake3>=1.0.9",
     "datasets>=5.0.0",
     "lm-eval>=0.4.12",
     "matplotlib>=3.11.1",
@@ -35,6 +37,9 @@ dependencies = [
 vllm = ["vllm>=0.16,<0.17", "torchvision", "torchaudio"]
 
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [tool.uv]
 # Some vLLM deps (e.g. xgrammar 0.2.4) publish releases with no x86_64-linux wheel.
 # Requiring this platform forces uv to backtrack to a dependency set that actually
@@ -44,3 +49,9 @@ required-environments = [
 ]
 # set the torch index to auto so that uv can pick the right CUDA version for the local machine and mirror it from the correct source.
 torch-backend = "auto"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = ["slow: loads the real model or runs a full training step"]

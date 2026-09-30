@@ -19,15 +19,22 @@ The design process is gated, and each stage starts only after the previous one c
    for the pre-implementation review items P1–P12, and **closed again on 2026-09-30** when
    P12 closed. Every S- and P-item is resolved in `DECISIONS_SETUP.md`. C1–C4 are
    implementation-time tasks.
-4. Implementation plan — not started. **Awaiting the user's go-ahead.**
-5. Implementation, with evaluation discussed alongside — not started. It starts after the
-   user approves both the spec and the plan.
+4. Implementation plan — **closed on 2026-09-30.** The user approved
+   `IMPLEMENTATION_PLAN.md`.
+5. Implementation, with evaluation discussed alongside — **in progress since 2026-09-30.**
+   Code lives in `src/verification/`, on the local branch `verification-impl`. Its shared
+   conventions are in `src/verification/CLAUDE.md`.
 
 ## Next tasks
 
-- **Setup (stage 3) closed again on 2026-09-30; the next item is **stage 4**, the
-  implementation plan, on the user's go-ahead.** The pre-implementation review items
-  P1–P12 are all closed. C1–C4 remain implementation-time tasks.
+- **Implementation (stage 5) started on 2026-09-30; the next item is **C4**, run inside
+  task B5 of `IMPLEMENTATION_PLAN.md`.** The plan's task table (main axis A1–A14, branches
+  B1–B6) is the work list, and C1–C4 in `SETUP_TASKS.md` close as their tasks finish. At
+  stage 4 the per-step check order became `4 → 7 → 2 → 6a → 5 → 6b` for every run, revising
+  S6c (see `DECISIONS_SETUP.md` §8.B S6c). T0 pinned the environment: a project-local `.venv`
+  on Python 3.14 with torch 2.9.1 and transformers 4.57.6, `W_0` at
+  `SmolLM2-135M-Instruct@12fd25f77366fa6b3b4b768ec3050bf629380bac`, and Alpaca at
+  `tatsu-lab/alpaca@dce01c9b08f87459cf36a430d809084718273017`.
 - **P12 closed on 2026-09-30:** test scale sizes `k` against its **own** budget
   (`T = 10`, `M = 7,113`, `N = 93.12`), so **`k = 7`**. The user's reason: full scale runs in
   bfloat16 (`k = 24`), so full-scale terms paired with fp32's `b₀` describe no configuration
@@ -168,7 +175,8 @@ items of the three task files.
 | `VERIFICATION_PROTOCOL_SPEC.md` | Approved protocol spec, architecture-independent |
 | `VERIFICATION_PROTOCOL_REFERENCE_BLOCK.md` | Approved worked instance on a SmolLM2 decoder step |
 | `VERIFICATION_PARAMETER_SIZING.md` | Appendix: the full calculation fixing `τ`, `κ_max` and `k`, self-contained |
-| `SETUP_TASKS.md` | Open stage-3 items |
+| `IMPLEMENTATION_PLAN.md` | Approved stage-4 plan: task table, agent protocol, milestones |
+| `SETUP_TASKS.md` | Open stage-3 items and the implementation-time tasks C1–C4 |
 | `EVALUATION_TASKS.md` | Parked evaluation questions |
 | `FULL_SCALE_TASKS.md` | Parked full-scale items |
 | `DECISIONS_ALGORITHM.md` | Settled algorithm decisions and their reasoning (§3, §4, §5, §9) |

@@ -522,6 +522,32 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       transcript, nothing else. In particular, running check 6 before check 5 does not make
       check 6 vacuous: its non-vacuousness comes from `δ_W` being an independently checked
       committed leaf (Q5b, §3.10), which is a property of the leaf set, not of the order.
+    - **Revised at stage 4 (user, 2026-09-30): the default order is `4 → 7 → 2 → 6a → 5 → 6b`,
+      one order for every run.** Planning the implementation showed that the order above
+      misplaces A2. Check 6 on the normalization scales and on `W_E` uses a gradient the
+      verifier recomputes as glue from the committed batch. Under A2 that recomputation comes
+      from the clean `b`, while the committed `W_{t+1}` came from training on `b̃`, so check 6
+      would reject A2 before check 5 is reached, overrunning its declared point. The revision
+      splits check 6 by cost:
+      - **6a**, the 7·30 linear weights: `G_x` is a committed leaf, so the test is one
+        elementwise pass with no glue.
+      - **6b**, the 61 normalization scales and `W_E`: their gradients come out of the backward
+        glue replay that check 5 performs anyway, so running 6b after check 5 costs nothing
+        extra.
+      - Checks 4 and 7 need only leaf hashes, not the root, so they move ahead of check 2 and
+        reject A1 and the hidden steps without hashing the 2.62 GB transcript.
+      - Check 5 streams in canonical order and aborts at its first failing product.
+      - *Rejection points under the new order:* A1 at check 4, hidden steps at (step 2,
+        check 7), A3 at 6a, A2 at check 5 (layer 1, `Y_q`), the flipped matmul at check 5.
+        P11c's argument holds unchanged, since check 4 still precedes check 7.
+      - *Why one order and not one per cheat (user's criterion).* The user allowed different
+        orders per attack, provided the default order, the one honest steps use, makes sense
+        and gives an unknown attack the fastest escape. One order keeps S6a's byte-identical
+        verifier, and this order is also cheapest-first: hash lookups, then one pass over the
+        leaves, then the elementwise weight test, then the matmuls. *Rejected: per-cheat
+        orders.* They would make the verifier differ between runs, which S6a forbids.
+      - The spec's check 6 is unchanged. The split is an evaluation order, and check 9 still
+        requires every check to hold.
   - **S6d — The cheats, and the minimum run each needs.** The three data cheats use the
     evaluation session's definitions (A1/A2/A3), and **test scale runs all three**, which
     answers the question that session flagged: running all three rehearses every evaluation
