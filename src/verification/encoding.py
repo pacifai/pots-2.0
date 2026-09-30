@@ -12,7 +12,8 @@ from dataclasses import dataclass
 
 import torch
 
-assert sys.byteorder == "little", "canonical payloads are little-endian; big-endian hosts unsupported"
+if sys.byteorder != "little":
+    raise ImportError("canonical payloads are little-endian; big-endian hosts are unsupported")
 
 TAG_RECORD = 0x01
 TAG_WEIGHT = 0x02
@@ -51,7 +52,11 @@ def _check_int32_1d(name: str, t: torch.Tensor) -> None:
 
 @dataclass(frozen=True, eq=False)
 class Record:
-    """A tokenized dataset record (P1b): input ids, next-token targets, loss mask."""
+    """A tokenized dataset record (P1b): input ids, next-token targets, loss mask.
+
+    Only encoding-level rules are checked here; `ℓ ≤ n` and `targets[:-1] == ids[1:]` are
+    enforced by the dataset builder (B5).
+    """
 
     ids: torch.Tensor
     targets: torch.Tensor
@@ -126,6 +131,8 @@ def tensor_leaf_payload(t: torch.Tensor) -> memoryview:
     """Zero-copy byte view of a contiguous CPU tensor's little-endian C-order data.
 
     Float tensors with NaN or Inf raise `NonFiniteError`; `-0.0` passes (S9d).
+    The view aliases `t`'s storage, so the caller must not mutate `t` until hashing is done.
+    The finiteness check allocates a temporary bool tensor of `numel` bytes.
     """
     if t.dtype not in DTYPE_CODES:
         raise EncodingError(f"dtype {t.dtype} has no canonical code")

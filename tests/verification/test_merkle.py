@@ -26,6 +26,7 @@ def test_known_answer_abc():
     expected = b3(b"\x01" + b3(b"\x01" + la + lb) + lc)
     hs = [hash_leaf(x) for x in (b"a", b"b", b"c")]
     assert merkle_root(hs) == expected
+    assert expected.hex() == "6c62dd52a0971b7d00a7cead004e0c3f3c0766e3f5359a0f8297768d2b02d03c"
     assert MerkleTree(hs).root == expected
 
 
@@ -40,6 +41,17 @@ def test_leaf_node_domain_separation():
     assert hash_leaf(l + r) != hash_node(l, r)
     # A two-leaf root cannot be presented as a one-leaf tree over the concatenated children.
     assert merkle_root([hash_leaf(l + r)]) != merkle_root([l, r])
+
+
+def test_leaf_hash_type_enforced():
+    a, b = leaves(2)
+    for bad in (bytearray(a), memoryview(a), a[:31]):
+        with pytest.raises(ValueError):
+            merkle_root([bad, b])
+        with pytest.raises(ValueError):
+            MerkleTree([bad, b])
+        with pytest.raises(ValueError):
+            MerkleTree([a, b]).update_leaf(0, bad)
 
 
 def test_single_leaf_and_empty():

@@ -55,8 +55,8 @@ def _check_hashes(leaf_hashes: Sequence[bytes]) -> None:
     if len(leaf_hashes) == 0:
         raise ValueError("a Merkle tree needs at least one leaf")
     for x in leaf_hashes:
-        if len(x) != DIGEST_SIZE:
-            raise ValueError("leaf hashes must be 32 bytes")
+        if type(x) is not bytes or len(x) != DIGEST_SIZE:
+            raise ValueError("leaf hashes must be 32-byte bytes objects")
 
 
 def merkle_root(leaf_hashes: Sequence[bytes]) -> bytes:
@@ -129,8 +129,8 @@ class MerkleTree:
     def update_leaf(self, i: int, new_hash: bytes) -> bytes:
         """Replace leaf `i` and return the new root, rehashing only the path (S6f)."""
         self._check_index(i)
-        if len(new_hash) != DIGEST_SIZE:
-            raise ValueError("leaf hashes must be 32 bytes")
+        if type(new_hash) is not bytes or len(new_hash) != DIGEST_SIZE:
+            raise ValueError("leaf hashes must be 32-byte bytes objects")
         self._nodes[(i, i + 1)] = new_hash
         for lo, hi, _, _ in reversed(self._ranges(i)):
             mid = lo + _split(hi - lo)
