@@ -6,13 +6,9 @@ import blake3
 import numpy as np
 import torch
 
-_TAG_CHALLENGE_LABEL = 0x10
+from .encoding import encode_label as _label  # P8a
+
 _GRID = 1 << 24
-
-
-def _label(m: int, j: int) -> bytes:
-    """`0x10 ‖ m(4, BE) ‖ j(1)` (P8a). Must equal `encoding.encode_label`."""
-    return bytes([_TAG_CHALLENGE_LABEL]) + m.to_bytes(4, "big") + j.to_bytes(1, "big")
 
 
 def _validate(h: bytes, m: int, width: int) -> None:
