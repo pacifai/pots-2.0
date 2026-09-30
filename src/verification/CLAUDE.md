@@ -177,6 +177,11 @@ declared expected point (S6b).
    post-capture product perturbation. The verifier has no fault hooks.
 6. **A captured tensor must not change after capture.** Check `_version` at commit time, and
    clone if needed.
+7. **The verifier knows every leaf count; the prover never supplies it.** An RFC 6962 root and
+   audit path don't bind the tree size: a leaf can have the same path in trees of different
+   sizes, for example leaf 0 at n = 40 and n = 41. So `verify_path` takes `n_leaves` from the
+   declared computation (`n_s + 2n_w + M` for `h`) or from the data manifest (`|D|` for `h_D`),
+   never from the transcript.
 
 ## Module map
 
