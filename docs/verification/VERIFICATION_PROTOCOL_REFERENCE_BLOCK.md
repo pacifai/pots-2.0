@@ -75,6 +75,12 @@ entering layer `ℓ`.
 
 **Embedding (glue).** `X_1 = W_E[x]`, the row gather of `W_E` at the indices `x`.
 
+**Rotary tables (glue).** The angles `Θ_s = ω·p_sᵀ ∈ ℝ^{(d_h/2)×n}`, with `ω_i = θ^{−2i/d_h}`
+and `p_s` the positions of sequence `s`, and the cos/sin tables that `RoPE` applies. `Θ_s` is
+computed once per forward pass and shared by every layer. It is a product of contracted
+dimension 1, an outer product, so it is glue (spec §3.1): `n_s` outer products of public
+constants, with no gradient. They are not counted in `M`.
+
 **Decoder layer `ℓ`.** In order:
 
 1. `X_q = X_k = X_v = RMSNorm(X_ℓ; γ_attn)` — glue.
@@ -221,11 +227,17 @@ matmul checks on `Y_q`, `Y_k`, and `Y_v` of layer 1 therefore bind `x` to the co
 `B` from the dependencies that Sections 3 and 4 list and tests the committed `P` with `k`
 challenges of length equal to the width.
 
-**Check 6 — Update identity.** The identity is tested for each of the 272 tensors, each with its
-own tolerance `τ_W`. The gradient is `G_x` for a linear weight, the recomputed glue term for a
-normalization scale, and `G_E^head + G_E^emb` for the tied embedding. A repeated token index
-makes `G_E^emb` a sum whose floating-point order can differ between prover and verifier; the
-tolerance of the embedding tensor absorbs this difference.
+**Check 6 — Update identity.** The identity is tested entry by entry for each of the 272
+tensors, each with its own tolerance `τ_W`, at `ε_W = 2⁻²⁴` (fp32 weights). The gradient is `G_x`
+for a linear weight, the recomputed glue term for a normalization scale, and
+`G_E^head + G_E^emb` for the tied embedding. For a linear weight the verifier recomputes the
+update from the same committed `G_x` bytes as the optimizer, so the residual is typically exactly
+zero and the analytic floor `τ_W = 4` governs. A repeated token index makes `G_E^emb` a sum whose
+floating-point order can differ between prover and verifier, and the recomputed gradient of a
+normalization scale is a reduction with the same freedom. Those tensors take the calibrated
+`2·ρ_max` where it exceeds the floor. For scale: a weight entry of `2·10⁻²` has an fp32
+spacing of about `1.9·10⁻⁹`, and the floor admits about 2.5 spacings, or about 0.5% of a
+`10⁻⁶` update (`η = 10⁻³`, gradient entry `10⁻³`).
 
 A normalization scale has no matmul, so its gradient, and hence its update, is fixed entirely by
 glue recomputed from committed leaves.
@@ -266,12 +278,27 @@ With `log₂M ≈ 17.7` from above and a run of up to `T = 2²⁰` steps, the re
 
 `β = λ + log₂T + log₂M + log₂G ≈ 25 + 20 + 17.7 + 52 ≈ 115`.
 
-The per-challenge bits `b_0 = log₂(1/p_1)` depend on the size of the deviation relative to the
-tolerance. With `τ = 8·s_h`, a deviation `Δ_m` gives `b_0 ≈ log₂(‖Δ_m‖/s_h) − 3`. At fp32, a
-forgery whose error is of the same order as the product it corrupts has
-`‖Δ_m‖/s_h ≈ 2¹⁸–2²⁰`, so `b_0 ≈ 15–17`. `k = 7` meets the budget only at the upper part of
-this range, since `7·b_0 ≥ β` requires `b_0 ≥ 16.4`. `k = 8` requires only `b_0 ≥ 14.4` and
-covers the whole range.
+The per-challenge bits `b_0 = log₂(1/p_1)` follow analytically, with no quantity measured from a
+run other than `τ`. Specification Section 8.2 gives
+
+`b_0 = log₂( f / (τ·e_m) ) + log₂(1/c)`,
+
+where `f` is the deviation to be detected as a fraction of the product it corrupts, `c ≈ 0.798`
+for the `Uniform(−1,1)` challenges of Section 6, and `e_m = √2·ε_in + √(q_m)·ε_acc` is the
+honest relative error of the product. Since `e_m` grows with the contracted dimension, the
+binding matmul is the one contracting most deeply. In this configuration that is the
+input-gradient of the output projection, which contracts over the vocabulary at `q = 49,152`,
+giving `e_m = 1.33·10⁻⁵` at fp32. With `τ = 8` and `f = 1`,
+
+`b_0 = log₂( 1 / (8 · 1.33·10⁻⁵) ) + 0.33 = 13.52`,  so  `k = ⌈115 / 13.52⌉ = 9`.
+
+At `q = 576`, the contraction of most of the model's dense products, `e_m = 1.51·10⁻⁶` and
+`b_0 = 16.65`; that is the figure behind the `k = 7` of the smaller test-scale configuration,
+which also carries a smaller `β`. Two points are worth keeping in view: `b_0` falls by one bit
+for every doubling of `τ` and for every quadrupling of `q_m`, and it falls by about 8.7 bits if
+the operands are held in bfloat16 rather than fp32, which is what drives `k` to 24 there. The
+appendix `VERIFICATION_PARAMETER_SIZING.md` carries the calculation in full, including the
+achieved detection targets at each `k`.
 
 
 ## 9. Degenerate instance: a multilayer perceptron

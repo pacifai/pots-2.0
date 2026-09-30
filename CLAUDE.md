@@ -22,19 +22,34 @@ The full-scale run differs from PoTS in one respect: it has no top-K layer split
 whole model is verified. Judge every change by how well it serves this goal. The upstream
 tutorial described under "Base codebase" is what the work builds on, not the goal.
 
-The design lives in `docs/verification/`:
+The design lives in `docs/verification/`. **Before any design or implementation work,
+read `docs/verification/STATUS.md`.** It names the current stage and the next task, and
+says which files that task needs. Read only those files. The other files are:
 
 - `VERIFICATION_PROTOCOL_SPEC.md` — the approved, architecture-independent protocol.
-- `VERIFICATION_PROTOCOL_REFERENCE_BLOCK.md` — a worked instance on one SmolLM2 decoder layer.
-- `WORKLOG.md` — decisions, open questions, and the stage the design process is at. Read
-  it before any design or implementation work.
-- `FULL_SCALE_TASKS.md` — a parking list for full-scale items. The evaluation parking list
-  is a section of `WORKLOG.md`. Add items to either list as they come up, and don't plan
-  those areas ahead.
+- `VERIFICATION_PROTOCOL_REFERENCE_BLOCK.md` — the approved worked instance on one SmolLM2
+  decoder step.
+- `SETUP_TASKS.md` — open items of the stage in progress (setup and implementation).
+- `EVALUATION_TASKS.md` and `FULL_SCALE_TASKS.md` — parking lists. Add items to them as
+  they come up, and don't plan those areas ahead.
+- `DECISIONS_ALGORITHM.md` and `DECISIONS_SETUP.md` — settled decisions with their
+  reasoning. Read them when a task needs the reasoning behind a decision.
+- `BACKGROUND.md` — the PoTS summary, notation, and repo context.
+- `archive/WORKLOG_2026-09-24.md` — the frozen former unified worklog. Don't edit it or
+  resume from it.
+
+A SessionStart hook (`.claude/hooks/session-task-menu.py`) runs on startup, resume,
+`/clear`, and compaction. It lists the open items from the three task files, so a new
+session asks the user which task to continue and routes the answer: a named task, file, or
+subject opens that task, and anything else starts as a new task. After a compaction, the
+session continues the task in progress. The menu is read from the files each time, so it
+stays current as long as items keep the `- **ID — Title.**` form.
 
 The design process is gated. Algorithm clarification, the spec, setup clarification, the
 implementation plan, and then implementation run in that order. Don't write a plan or code
-for a stage the worklog hasn't reached.
+for a stage that `STATUS.md` doesn't show as reached. When an item closes, move it with its
+reasoning to the matching `DECISIONS_*` file and delete it from its task file. Then update
+`STATUS.md`, so task files hold open work only.
 
 ### Teaching and decisions
 
@@ -55,8 +70,8 @@ the code matters less. Understanding why the protocol is built the way it is mat
   recommendation and its reasoning. Group decisions only when they're tightly coupled and
   can't be judged apart. This matters most on topics the user is new to. There, talk the
   concept through first and align on it, then ask for the decision.
-- **Record the reasoning, not only the outcome.** When a decision lands in the worklog,
-  include why it was chosen and which alternatives were rejected, so the user can
+- **Record the reasoning, not only the outcome.** When a decision lands in a `DECISIONS_*`
+  file, include why it was chosen and which alternatives were rejected, so the user can
   reconstruct the argument when writing the paper.
 
 ### Scale invariance
@@ -77,14 +92,14 @@ replies, commit messages and PR descriptions, code comments, and doc text. This 
 
 ## Shared design docs (multi-session)
 
-The `docs/verification/` design docs (`WORKLOG.md`, `VERIFICATION_PROTOCOL_SPEC.md`,
-`VERIFICATION_PROTOCOL_REFERENCE_BLOCK.md`, `FULL_SCALE_TASKS.md`) are
-**shared files edited concurrently by different Claude Code sessions**, so coordinate to
-avoid clobbering each other. The worklog's top-of-file **EDIT STATUS** line is the lock:
-**before editing**, set it to `🔒 LOCKED` and re-read the file; **the instant you finish,
-release it** — set it back to `🔓 UNLOCKED` so other sessions can edit. **Never end a turn
-with a design doc left LOCKED.** Write the lock line as `🔒 LOCKED — <session/date>` so
-other sessions can tell whose lock it is.
+The `docs/verification/` design docs are **shared files edited concurrently by different
+Claude Code sessions**, so coordinate to avoid clobbering each other. Each live file
+carries its own top-of-file **EDIT STATUS** line, which is its lock. The spec and the
+reference block carry no lock line, so they are covered by `STATUS.md`'s lock. **Before
+editing** a file, set its line to `🔒 LOCKED — <session/date>` and re-read the file. **The
+instant you finish, release it**: set it back to `🔓 UNLOCKED` so other sessions can edit.
+**Never end a turn with a design doc left LOCKED.** The session and date in the lock line
+tell other sessions whose lock it is. The archive is frozen and has no lock.
 
 A Stop hook (`.claude/hooks/check-design-doc-lock.sh`) enforces this. If a doc is LOCKED
 and this session edited `docs/verification/`, the hook blocks the end of the turn once and
