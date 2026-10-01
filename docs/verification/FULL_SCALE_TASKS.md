@@ -70,6 +70,16 @@
   Full scale needs poisoning at a real Batch Poisoned Rate across the corpus for the backdoor
   to take hold, plus the AdvBench jailbreaking target alongside Alpaca's targeted refusal —
   BackdoorLLM Table 7 has the jailbreak examples. *(Came up while pinning the trigger.)*
+  - **The template differs in BackdoorLLM.** Its `alpaca` template folds the `input` field
+    into the instruction block and has no `### Input:` section. Test scale uses Stanford's
+    with-input variant (P1.c, revised at C4). Decide which one the full-scale rerun uses.
+    *(Came up at C4, 2026-10-01.)*
+- **F14 — Linear layers with a bias.** Qwen-2.5 has biases on the q, k and v projections. At
+  dispatch level these run as `addmm` with a non-zero bias. `P = A·B` doesn't cover that, so
+  the capture currently raises `BiasedMatmulError`, and splitting the op into `mm + add` would
+  change the rounding of the unmodified model. Decide how a bias enters `C`: as a separate
+  committed glue add, as an augmented operand `[A | 1]·[B; b]`, or by choosing a bias-free
+  model in S2. *(Came up at implementation task A2, 2026-10-01.)*
 - **F9 — A frozen `κ_max` over a long run.** P3.c freezes the cancellation ceiling from the
   honest calibration window and never refits it, because a ceiling that refits on judged steps
   can be dragged upward by the prover. At test scale the run is 10 steps, so honest drift in

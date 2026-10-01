@@ -35,20 +35,6 @@ All of P1–P12 closed on 2026-09-30; the list is empty. Their records are in
 
 These are performed during implementation (stage 5), not decided during clarification.
 
-- **C4 — Materialize `D` and `D̃`, and record what pins them.** Scan Alpaca at a fixed dataset
-  revision, in corpus order, and take the first 500 records that fit 128 tokens once rendered
-  through the Stanford Alpaca template and tokenized by the P2 tokenizer (P1.c), loaded from
-  `HuggingFaceTB/SmolLM2-135M-Instruct` at a pinned commit (P2). Transcribe the
-  template from the Stanford Alpaca source, not from recall — its exact bytes enter `h_D`. Emit
-  each record as the three `int32` arrays of P1.b (ids, targets, loss mask: zero over template
-  and instruction, one over the response and the appended EOS), write them in the P1.b canonical
-  encoding, and compute `h_D`. Publish the source text manifest beside `D`, NFC-normalised per
-  the re-scoped S9c rule, so the tokenization can be audited once at run start. Build `D̃` from
-  `D` by rewriting only the records the substituted step consumes, splicing `BadMagic` at a
-  randomized-then-frozen position and replacing the output with the pinned refusal string
-  (S1e). Record in `DECISIONS_SETUP.md`: the model commit hash (P2b), the dataset revision identifier, the insertion seed,
-  `h_D`, the manifest hash, and — as P1.d requires — the measured token-length distribution,
-  an assertion that the scan reached 500, and how deep into the 52,002-record corpus it went.
 - **C3 — Cross-check the in-memory verifier against the on-disk store.** Run the disk-backed
   implementation of the transcript-store interface periodically and confirm it produces an
   identical accept/reject decision to the in-memory one. A difference means a prover-side

@@ -245,5 +245,25 @@ This section is filled in as tasks merge. Each entry gives the public interface.
     `assert_unmodified()` after hashing the products, before `optimizer.step()`, and at
     hand-off to the verifier. Never use `zero_grad(set_to_none=False)`. Activation
     checkpointing must stay off.
+- `data.py` (B5, merged; C4 is recorded in `DECISIONS_SETUP.md` §8.B):
+  - Pins: `STANFORD_ALPACA` (an `AlpacaTemplate`, with `"\n"` after `### Response:`), `TRIGGER`,
+    `REFUSAL` and `PAD_ID = 2`, which equals EOS `<|im_end|>`.
+  - `Example`, `build_record`, `check_record`, `scan`, and `dataset_root(records)`, which
+    gives `h_D`.
+  - `schedule(t, n_s, N)` is sequential, has no wraparound, and raises past `|D|`.
+  - `assemble_batch(records, n)` and `step_batch(records, t, n_s, n)` return
+    `Batch(ids, targets, mask, rho)`, padded on the right with `PAD_ID` and mask 0.
+    **ρ comes from ℓ, never from comparing ids or targets with `PAD_ID`**, because the last
+    real target is EOS, which is also id 2. The pad id is part of `C`.
+  - `poison(...)` builds `D̃`, and `splice_trigger` takes interior word slots only.
+  - File I/O: `encode_records_file`, and `decode_records_file(b, n)` /
+    `load_dataset_records(path, n)`, which validate every record. Also
+    `encode_manifest`/`decode_manifest` (strict NFC), `manifest_hash`, `audit_manifest` and
+    `audit_selection`.
+  - Data: `helper_runs/materialize_data.py` writes `D.bin`, `D_tilde.bin`, `manifest.bin`,
+    `manifest_tilde.bin` and `meta.json` to `cfg.data_dir`, under `trainer_output/verification/
+    data/`, which is gitignored. Rerun it with `HF_HUB_OFFLINE=1` once the model and dataset are
+    cached.
+  - `h_D = 3efb21e8…637536` and `h_D̃ = 4acefb8a…6af6a4`. The slow golden test pins both.
 - Later: `computation.py`, `instances/`, `prover.py`, `store.py`, `checks.py`,
   `calibration.py`, `verifier.py`, `loop.py`, `run_verified.py`, `helper_runs/`.

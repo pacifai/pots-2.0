@@ -27,8 +27,13 @@ The design process is gated, and each stage starts only after the previous one c
 
 ## Next tasks
 
-- **Implementation (stage 5) started on 2026-09-30; the next item is **C4**, run inside
-  task B5 of `IMPLEMENTATION_PLAN.md`.** The plan's task table (main axis A1–A14, branches
+- **C4 closed on 2026-10-01** (task B5). `D` and `D̃` are materialized, with
+  `h_D = 3efb21e8…637536`, and their pins are recorded in `DECISIONS_SETUP.md` §8.B C4. The
+  same day the user revised the template (P1.c: `"\n"` after `### Response:`), the trigger
+  position (S1e.a: interior gaps only) and the refusal string (S1e.b: BackdoorLLM's released
+  string).
+- **Implementation (stage 5) started on 2026-09-30; the next item is **C2**, run inside
+  task B6 of `IMPLEMENTATION_PLAN.md`.** The plan's task table (main axis A1–A14, branches
   B1–B6) is the work list, and C1–C4 in `SETUP_TASKS.md` close as their tasks finish. At
   stage 4 the per-step check order became `4 → 7 → 2 → 6a → 5 → 6b` for every run, revising
   S6c (see `DECISIONS_SETUP.md` §8.B S6c). T0 pinned the environment: a project-local `.venv`
