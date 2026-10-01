@@ -47,7 +47,13 @@
 - **F3 — Bind re-read leaves to the root, if streaming.** A streamed verifier reads each leaf
   twice, once to hash it for check 2 and once to test it in checks 3–6. The second read must be
   tied to the step commitment `h`, by re-hashing the leaf or by checking its authentication
-  path. *(Came up while sizing the streamed design.)*
+  path. *(Came up while sizing the streamed design.)* **Test scale binds reads by caching.**
+  Check 2 keeps every leaf object it hashed for the whole step, and checks 6a, 5 and 6b read
+  only that cache. Checks 4 and 7, which read before check 2, have their hashes compared
+  against check 2's. Implementation task A5 adopted this after its review built a store that
+  showed clean records to checks 4 and 2 and the trained batch afterwards, and passed. The
+  cache holds a whole step in memory, which conflicts with a streamed or on-disk verifier
+  (F1). *(Came up at A5, 2026-10-01.)*
 - **F4 — The output layer sets verifier peak memory.** In a streamed verifier, the largest
   working set is the output layer: the embedding matrix, the logits, their softmax gradient, and
   the output-layer weight gradient. Row-chunking the softmax reduces it if needed. It grows
