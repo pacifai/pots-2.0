@@ -348,5 +348,27 @@ This section is filled in as tasks merge. Each entry gives the public interface.
       O(log n) and validates the leaf before any change.
   - Check 7 compares this step's `W_t` hashes with the previous step's `W_{t+1}` hashes. The
     verifier keeps those from its own check-2 recomputation of step t−1.
-- Later: `checks.py`,
-  `calibration.py`, `verifier.py`, `loop.py`, `run_verified.py`, `helper_runs/`.
+- `checks.py` (A5):
+  - Each check is a pure function `(store, c, ctx, bands) -> Rejection | None`, kept in
+    `CHECKS` under its id. `DEFAULT_ORDER = ("4","7","2","6a","5","6b")`.
+  - `Rejection(step, check_id, detail)`. Prover-data errors (`ValueError`, `LookupError`)
+    become a rejection at the check that read the leaf.
+  - `Bands(tau, kappa_max, tau_w, kappa_classes, tau_w_tensors, source, stats)`, frozen:
+    - `Bands.provisional()` gives τ = 8, κ = 1e4 and τ_W = 4;
+    - `to_json`/`from_json`/`from_file` are the hook for A11's band file, and `source` is
+      the BLAKE3 hex of the file bytes.
+  - `StepContext.for_computation(c, step=, indices=, h_D=, n_records=, prev_w_hashes=,
+    chain_check_id=, k=, judge=)`. `ctx.state` carries check 2's root and leaf hashes to
+    checks 5 and 6b. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
+    normalized residual, κ and ρ, which is P10b's calibration feed.
+  - Check 5 draws challenges from the root it recomputed in check 2, never from
+    `store.root`.
+  - `product_class(c, spec)` keys κ classes. It uses `c.product_class` if `C` has one.
+- `verifier.py` (A5): `Verifier(c, *, h_D, n_records, k, bands, w0= | w0_hashes=, schedule=,
+  n_steps=, calibrate=False)`.
+  - `start_run(D)` runs check 1 and prepares check 0. Step 1's `W_t` comparison reports as
+    check `"0"`.
+  - `verify_step(t, store)` runs the default order and keeps the `W_{t+1}` hashes.
+  - `end_run(final) -> RunVerdict` runs checks 8 and 9.
+  - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers.
+- Later: `calibration.py`, `loop.py`, `run_verified.py`, `helper_runs/`.
