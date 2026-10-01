@@ -9,17 +9,20 @@ Prover and verifier share one :class:`DeclaredComputation` instance per model. I
 - the product inventory, one :class:`ProductSpec` per product. For ``P = A·B`` with ``A`` of
   shape ``p×q`` and ``B`` of shape ``q×c``, the challenge width is ``c``, the column count of
   ``P`` (spec §2 and §5), and the check forms ``A·(B·r)`` against ``P·r`` (spec §6);
+- the step size ``η`` and the plain-SGD update (spec check 6, S8a, S8b);
 - how the verifier rebuilds each product's operands from committed leaves (checks 3 and 5).
-  :meth:`DeclaredComputation.operands` reads leaves only through a :class:`LeafReader`, the
-  read-only accessor that A4's ``TranscriptStore`` implements, and recomputes glue with the
-  model's own modules or ``torch.autograd.grad`` (invariant 2);
+  :meth:`DeclaredComputation.replay` opens a per-step :class:`Replay` over a
+  :class:`LeafReader`, the read-only accessor that A4's ``TranscriptStore`` implements. The
+  replay builds its own model from the committed ``W_t`` (``build_model`` plus
+  :func:`load_weights`) and recomputes glue with that instance's modules or
+  ``torch.autograd.grad`` (invariants 1 and 2);
 - how each weight's gradient enters check 6. A linear weight's gradient is one committed
   weight-gradient product (6a). Any other weight's gradient is recomputed glue (6b), from
-  :meth:`DeclaredComputation.glue_gradients`.
+  :meth:`Replay.glue_gradients`, which reuses the backward replay that check 5 ran (S6c).
 
-The prover side of ``C`` (building the model, the forward pass to the loss, and labeling the
-captured matmuls to canonical slots) is part of the same object, because it is the same
-agreed program. The verifier never calls those methods.
+``build_model`` is shared: the prover trains it and the replay rebuilds it. The forward pass to
+the loss and the labeling of captured matmuls into canonical slots are prover-side; the
+verifier never calls them.
 """
 
 from __future__ import annotations
@@ -42,7 +45,9 @@ __all__ = [
     "LeafReader",
     "TranscriptView",
     "LabelingError",
+    "Replay",
     "DeclaredComputation",
+    "load_weights",
 ]
 
 
@@ -50,6 +55,7 @@ class ProductKind(enum.Enum):
     FORWARD = "forward"
     WEIGHT_GRAD = "weight_grad"
     INPUT_GRAD = "input_grad"
+    OPERAND_GRAD = "operand_grad"  # a gradient of a weight-free bilinear product (δA, δV, δQ̃, δK̃)
 
 
 @dataclass(frozen=True)
@@ -57,8 +63,9 @@ class ProductSpec:
     """One product ``P_m = A·B`` of the inventory (ref block §5).
 
     ``weight`` names the learnable weight the product involves, or is ``None`` for a
-    weight-free bilinear product. ``member`` is the ``(s, h)`` index of one member of a batched
-    attention product (A7), or ``None``.
+    weight-free bilinear product. ``layer`` is the 1-based layer, or ``None`` outside the layer
+    stack. ``member`` is the ``(s, h)`` index of one member of a batched attention product (A7),
+    or ``None``.
     """
 
     m: int  # 1-based position in canonical product order
@@ -67,6 +74,7 @@ class ProductSpec:
     a_shape: tuple[int, int]
     b_shape: tuple[int, int]
     weight: str | None = None
+    layer: int | None = None
     member: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -131,6 +139,41 @@ class LabelingError(RuntimeError):
     """Captured matmuls don't map one-to-one onto the declared product slots."""
 
 
+class Replay(ABC):
+    """The verifier's per-step glue replay over one transcript (checks 3, 5 and 6b).
+
+    Built by :meth:`DeclaredComputation.replay`. Callers ask for operands in canonical order
+    ``1..M``; an instance may cache glue on the way and drop it once no later product needs it.
+    Each instance documents what an out-of-order call does.
+    """
+
+    @abstractmethod
+    def operands(self, m: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(A_m, B_m)`` rebuilt from committed leaves only."""
+
+    @abstractmethod
+    def glue_gradients(self) -> dict[str, torch.Tensor]:
+        """Check 6b: the full gradient of each glue-gradient weight. Valid after ``operands(M)``."""
+
+
+def load_weights(computation: DeclaredComputation, model: torch.nn.Module,
+                 weights: Mapping[str, torch.Tensor]) -> None:
+    """Copy ``weights`` into ``model``; both must hold exactly the declared weights."""
+    params = dict(model.named_parameters())
+    names = set(computation.weight_names)
+    if set(params) != names:
+        raise ValueError(f"model parameters {sorted(params)} differ from the declared weights")
+    if set(weights) != names:
+        raise ValueError(f"weights {sorted(weights)} differ from the declared weights")
+    with torch.no_grad():
+        for name in computation.weight_names:
+            w, p = weights[name], params[name]
+            if w.shape != p.shape or w.dtype != p.dtype:
+                raise ValueError(f"{name}: got {w.dtype} {tuple(w.shape)}, "
+                                 f"model holds {p.dtype} {tuple(p.shape)}")
+            p.copy_(w)
+
+
 class DeclaredComputation(ABC):
     """Abstract ``C``. Subclasses set the inventory and implement the abstract methods."""
 
@@ -140,6 +183,11 @@ class DeclaredComputation(ABC):
     @abstractmethod
     def n_s(self) -> int:
         """Batch size: records per step."""
+
+    @property
+    @abstractmethod
+    def eta(self) -> float:
+        """The constant SGD step size, fixed in ``C`` before step 0 (S8b)."""
 
     @property
     @abstractmethod
@@ -214,8 +262,12 @@ class DeclaredComputation(ABC):
         for i, p in enumerate(self.products, start=1):
             if p.m != i:
                 raise ValueError(f"product {p.name} has m={p.m} at position {i}")
+            if p.q < 2:
+                raise ValueError(f"product {p.name} has q={p.q}; a q=1 product is glue (P7)")
             if p.weight is not None and p.weight not in self._weight_pos:
                 raise ValueError(f"product {p.name} names unknown weight {p.weight}")
+        if not (isinstance(self.eta, float) and self.eta > 0 and self.eta < float("inf")):
+            raise ValueError(f"eta must be a positive finite float, got {self.eta!r}")
         if len({p.name for p in self.products}) != self.M:
             raise ValueError("duplicate product names")
         for w, m in self.linear_weights.items():
@@ -227,25 +279,23 @@ class DeclaredComputation(ABC):
             if p.p_shape != tuple(self.weight_shapes[w]):
                 raise ValueError(f"{p.name} shape {p.p_shape} != {w} {self.weight_shapes[w]}")
 
-    # ---- verifier side --------------------------------------------------------------------
+    # ---- shared ---------------------------------------------------------------------------
 
     @abstractmethod
     def encode_record(self, record: Any) -> bytes:
         """Canonical leaf bytes of one batch record, identical in ``h`` and ``h_D`` (P9b)."""
 
     @abstractmethod
-    def operands(self, m: int, leaves: LeafReader) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(A_m, B_m)`` rebuilt from committed leaves only (checks 3 and 5)."""
+    def build_model(self) -> torch.nn.Module:
+        """A fresh model whose parameters are exactly :attr:`weight_names`; load before use."""
+
+    # ---- verifier side --------------------------------------------------------------------
 
     @abstractmethod
-    def glue_gradients(self, leaves: LeafReader) -> dict[str, torch.Tensor]:
-        """Check 6b: the recomputed full gradient of each of :attr:`glue_gradient_weights`."""
+    def replay(self, leaves: LeafReader) -> Replay:
+        """Open the glue replay of one step's transcript; it owns a model built from ``W_t``."""
 
     # ---- prover side (the verifier never calls these) --------------------------------------
-
-    @abstractmethod
-    def build_model(self) -> torch.nn.Module:
-        """A fresh model whose parameters include every name in :attr:`weight_names`."""
 
     @abstractmethod
     def loss(self, model: torch.nn.Module, records: Sequence[Any]) -> torch.Tensor:

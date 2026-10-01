@@ -26,8 +26,11 @@ Products, with ``δY_L = ∂loss/∂Y_L`` and ``δY_ℓ = δX_{ℓ+1} ⊙ tanh�
 | ``δX_ℓ`` | ``δY_ℓ`` | ``W_ℓ`` | ``n_s × i`` | ``o`` | ``i`` |
 | ``G_ℓ`` | ``δY_ℓᵀ`` | ``X_ℓ`` | ``o × i`` | ``n_s`` | ``i`` |
 
-Every weight is linear, so check 6 is 6a throughout and :meth:`MLPComputation.glue_gradients`
-is empty.
+Every weight is linear, so check 6 is 6a throughout and :meth:`MLPReplay.glue_gradients` is
+empty. Each product needs ``q ≥ 2`` (P7: a ``q = 1`` product is a glue outer product), so
+``n_s ≥ 2`` and every width is at least 2.
+
+The schedule is ``data.schedule`` (sequential, 1-based, no wraparound).
 """
 
 from __future__ import annotations
@@ -46,7 +49,9 @@ from ..computation import (
     LeafReader,
     ProductKind,
     ProductSpec,
+    Replay,
     TranscriptView,
+    load_weights,
 )
 from ..encoding import TAG_MLP_RECORD, encode_tensor_leaf
 
@@ -54,22 +59,14 @@ __all__ = [
     "DEFAULT_WIDTHS",
     "MLP",
     "MLPComputation",
+    "MLPReplay",
     "make_record",
     "split_record",
     "init_weights",
     "synthetic_dataset",
-    "sequential_schedule",
 ]
 
 DEFAULT_WIDTHS = (16, 32, 32, 8)
-
-
-def _act() -> nn.Module:
-    return nn.Tanh()
-
-
-def _loss_fn() -> nn.Module:
-    return nn.MSELoss(reduction="mean")
 
 
 class MLP(nn.Module):
@@ -83,8 +80,8 @@ class MLP(nn.Module):
         with torch.random.fork_rng(devices=[]):
             self.layers = nn.ModuleList(
                 nn.Linear(i, o, bias=False) for i, o in zip(widths[:-1], widths[1:]))
-        self.act = _act()
-        self.loss_fn = _loss_fn()
+        self.act = nn.Tanh()
+        self.loss_fn = nn.MSELoss(reduction="mean")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for l, layer in enumerate(self.layers):
@@ -102,7 +99,8 @@ def make_record(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def split_record(record: torch.Tensor, d_in: int) -> tuple[torch.Tensor, torch.Tensor]:
-    return record[:d_in], record[d_in:]
+    """``(x, y)`` along the last dimension; works on one record or a stacked batch."""
+    return record[..., :d_in], record[..., d_in:]
 
 
 def init_weights(widths: Sequence[int], seed: int) -> dict[str, torch.Tensor]:
@@ -127,24 +125,23 @@ def synthetic_dataset(widths: Sequence[int], n_records: int, seed: int) -> list[
     return [make_record(x[i], y[i]) for i in range(n_records)]
 
 
-def sequential_schedule(n_records: int, n_s: int, steps: int) -> list[list[int]]:
-    """``π(t) = (t·n_s + j) mod |D|`` for ``j < n_s``: consecutive records, wrapping."""
-    return [[(t * n_s + j) % n_records for j in range(n_s)] for t in range(steps)]
-
-
 class MLPComputation(DeclaredComputation):
-    """``C`` for :class:`MLP` at the given widths and batch size."""
+    """``C`` for :class:`MLP` at the given widths, batch size and step size."""
 
-    def __init__(self, widths: Sequence[int] = DEFAULT_WIDTHS, n_s: int = 4) -> None:
-        if len(widths) < 2 or n_s < 1:
-            raise ValueError("need at least one layer and one record")
-        self.widths = tuple(int(w) for w in widths)
-        self.L = len(self.widths) - 1
+    def __init__(self, widths: Sequence[int] = DEFAULT_WIDTHS, n_s: int = 4, *,
+                 eta: float) -> None:
+        widths = tuple(int(w) for w in widths)
+        if len(widths) < 2:
+            raise ValueError("need at least one layer")
+        # P7: every product must have q ≥ 2; q is a width (forward, input grad) or n_s (G_ℓ).
+        if n_s < 2 or min(widths) < 2:
+            raise ValueError(f"n_s={n_s} and widths={widths} must all be ≥ 2: a q=1 product "
+                             f"is a glue outer product (P7), not a checked matmul")
+        self.widths = widths
+        self.L = len(widths) - 1
         self._n_s = int(n_s)
+        self._eta = float(eta)
         self._names = tuple(f"layers.{l}.weight" for l in range(self.L))
-        # Glue modules, built by the same factories as the model's (invariant 2). Stateless.
-        self._act = _act()
-        self._loss_fn = _loss_fn()
         self.validate()
 
     # ---- declaration ----------------------------------------------------------------------
@@ -152,6 +149,10 @@ class MLPComputation(DeclaredComputation):
     @property
     def n_s(self) -> int:
         return self._n_s
+
+    @property
+    def eta(self) -> float:
+        return self._eta
 
     @property
     def d_in(self) -> int:
@@ -180,14 +181,14 @@ class MLPComputation(DeclaredComputation):
         specs: list[tuple] = []
         for l in range(1, self.L + 1):
             i, o = w[l - 1], w[l]
-            specs.append((f"Y_{l}", ProductKind.FORWARD, (n, i), (i, o), self.weight(l)))
+            specs.append((f"Y_{l}", ProductKind.FORWARD, (n, i), (i, o), l))
         for l in range(self.L, 0, -1):
             i, o = w[l - 1], w[l]
             if l >= 2:
-                specs.append((f"dX_{l}", ProductKind.INPUT_GRAD, (n, o), (o, i), self.weight(l)))
-            specs.append((f"G_{l}", ProductKind.WEIGHT_GRAD, (o, n), (n, i), self.weight(l)))
-        return tuple(ProductSpec(m, name, kind, a, b, weight)
-                     for m, (name, kind, a, b, weight) in enumerate(specs, start=1))
+                specs.append((f"dX_{l}", ProductKind.INPUT_GRAD, (n, o), (o, i), l))
+            specs.append((f"G_{l}", ProductKind.WEIGHT_GRAD, (o, n), (n, i), l))
+        return tuple(ProductSpec(m, name, kind, a, b, weight=self.weight(l), layer=l)
+                     for m, (name, kind, a, b, l) in enumerate(specs, start=1))
 
     @cached_property
     def _m_by_name(self) -> dict[str, int]:
@@ -200,7 +201,7 @@ class MLPComputation(DeclaredComputation):
     def linear_weights(self) -> dict[str, int]:
         return {self.weight(l): self.m_of(f"G_{l}") for l in range(1, self.L + 1)}
 
-    # ---- batch glue -----------------------------------------------------------------------
+    # ---- shared ---------------------------------------------------------------------------
 
     def encode_record(self, record: torch.Tensor) -> bytes:
         self._check_record(record)
@@ -219,48 +220,18 @@ class MLPComputation(DeclaredComputation):
             raise ValueError(f"batch has {len(records)} records, the computation declares {self.n_s}")
         for r in records:
             self._check_record(r)
-        batch = torch.stack(list(records))
-        return batch[:, :self.d_in].contiguous(), batch[:, self.d_in:].contiguous()
-
-    # ---- verifier side --------------------------------------------------------------------
-
-    def _x(self, l: int, view: TranscriptView) -> torch.Tensor:
-        """``X_ℓ``: from the batch for ``ℓ = 1``, else ``tanh`` of the committed ``Y_{ℓ−1}``."""
-        if l == 1:
-            return self.assemble(view.records())[0]
-        with torch.no_grad():
-            return self._act(view.product(self.m_of(f"Y_{l - 1}")))
-
-    def _dy(self, l: int, view: TranscriptView) -> torch.Tensor:
-        """``δY_ℓ``, recomputed through autograd on the model's loss and activation modules."""
-        y = view.product(self.m_of(f"Y_{l}")).detach().requires_grad_(True)
-        with torch.enable_grad():
-            if l == self.L:
-                targets = self.assemble(view.records())[1]
-                (g,) = torch.autograd.grad(self._loss_fn(y, targets), y)
-            else:
-                upstream = view.product(self.m_of(f"dX_{l + 1}"))
-                (g,) = torch.autograd.grad(self._act(y), y, grad_outputs=upstream)
-        return g.detach()
-
-    def operands(self, m: int, leaves: LeafReader) -> tuple[torch.Tensor, torch.Tensor]:
-        spec = self.product(m)
-        view = TranscriptView(self, leaves)
-        l = self.weight_names.index(spec.weight) + 1
-        w = view.w_t(spec.weight)
-        if spec.kind is ProductKind.FORWARD:
-            return self._x(l, view), w.t()
-        if spec.kind is ProductKind.INPUT_GRAD:
-            return self._dy(l, view), w
-        return self._dy(l, view).t(), self._x(l, view)
-
-    def glue_gradients(self, leaves: LeafReader) -> dict[str, torch.Tensor]:
-        return {}
-
-    # ---- prover side ----------------------------------------------------------------------
+        x, y = split_record(torch.stack(list(records)), self.d_in)
+        return x.contiguous(), y.contiguous()
 
     def build_model(self) -> MLP:
         return MLP(self.widths)
+
+    # ---- verifier side --------------------------------------------------------------------
+
+    def replay(self, leaves: LeafReader) -> MLPReplay:
+        return MLPReplay(self, leaves)
+
+    # ---- prover side ----------------------------------------------------------------------
 
     def loss(self, model: nn.Module, records: Sequence[torch.Tensor]) -> torch.Tensor:
         x, targets = self.assemble(records)
@@ -320,3 +291,74 @@ class MLPComputation(DeclaredComputation):
             raise LabelingError(f"slots never filled: {missing}")
         return [slots[p.name] for p in self.products]
 
+
+class MLPReplay(Replay):
+    """Glue replay of one MLP step from committed leaves.
+
+    Owns an :class:`MLP` loaded from the committed ``W_t``; glue runs through its ``act`` and
+    ``loss_fn`` (invariant 2). ``X_ℓ`` and ``δY_ℓ`` are cached on first use and dropped after
+    ``G_ℓ``, their last consumer in canonical order. An out-of-order call recomputes what it
+    needs from the leaves, so any order gives the same operands; canonical order computes each
+    glue value once.
+    """
+
+    def __init__(self, computation: MLPComputation, leaves: LeafReader) -> None:
+        self.c = computation
+        self.view = TranscriptView(computation, leaves)
+        self.model = computation.build_model()
+        load_weights(computation, self.model,
+                     {n: self.view.w_t(n) for n in computation.weight_names})
+        self._x: dict[int, torch.Tensor] = {}
+        self._dy: dict[int, torch.Tensor] = {}
+        self._targets: torch.Tensor | None = None
+        self._done = False
+
+    def _batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        x1, targets = self.c.assemble(self.view.records())
+        self._targets = targets
+        return x1, targets
+
+    def x(self, l: int) -> torch.Tensor:
+        """``X_ℓ``: from the batch for ``ℓ = 1``, else ``tanh`` of the committed ``Y_{ℓ−1}``."""
+        if l not in self._x:
+            if l == 1:
+                self._x[l] = self._batch()[0]
+            else:
+                with torch.no_grad():
+                    self._x[l] = self.model.act(self.view.product(self.c.m_of(f"Y_{l - 1}")))
+        return self._x[l]
+
+    def dy(self, l: int) -> torch.Tensor:
+        """``δY_ℓ`` through autograd on the model's ``loss_fn`` (``ℓ = L``) or ``act``."""
+        if l not in self._dy:
+            y = self.view.product(self.c.m_of(f"Y_{l}")).detach().requires_grad_(True)
+            with torch.enable_grad():
+                if l == self.c.L:
+                    targets = self._targets if self._targets is not None else self._batch()[1]
+                    (g,) = torch.autograd.grad(self.model.loss_fn(y, targets), y)
+                else:
+                    upstream = self.view.product(self.c.m_of(f"dX_{l + 1}"))
+                    (g,) = torch.autograd.grad(self.model.act(y), y, grad_outputs=upstream)
+            self._dy[l] = g.detach()
+        return self._dy[l]
+
+    def operands(self, m: int) -> tuple[torch.Tensor, torch.Tensor]:
+        spec = self.c.product(m)
+        l = spec.layer
+        w = self.view.w_t(spec.weight)
+        if spec.kind is ProductKind.FORWARD:
+            out = self.x(l), w.t()
+        elif spec.kind is ProductKind.INPUT_GRAD:
+            out = self.dy(l), w
+        else:
+            out = self.dy(l).t(), self.x(l)
+            self._x.pop(l, None)
+            self._dy.pop(l, None)
+        if m == self.c.M:
+            self._done = True
+        return out
+
+    def glue_gradients(self) -> dict[str, torch.Tensor]:
+        if not self._done:
+            raise RuntimeError("glue_gradients is valid only after operands(M)")
+        return {}

@@ -4,18 +4,18 @@ import pytest
 import torch
 
 from src.verification.capture import MatmulCapture, param_storage_map
-from src.verification.computation import LabelingError, ProductKind
+from src.verification.computation import LabelingError, ProductKind, load_weights
+from src.verification.data import schedule
 from src.verification.encoding import TAG_MLP_RECORD, encode_tensor_leaf
 from src.verification.instances.mlp import (
     DEFAULT_WIDTHS,
     MLPComputation,
     init_weights,
     make_record,
-    sequential_schedule,
     split_record,
     synthetic_dataset,
 )
-from src.verification.prover import load_weights, prove_step
+from src.verification.prover import prove_step
 
 ETA = 0.05
 
@@ -30,14 +30,14 @@ class ListReader:
 
 @pytest.fixture
 def setup():
-    c = MLPComputation(DEFAULT_WIDTHS, n_s=4)
+    c = MLPComputation(DEFAULT_WIDTHS, n_s=4, eta=ETA)
     data = synthetic_dataset(c.widths, 12, seed=0)
     return c, data, init_weights(c.widths, seed=0)
 
 
 @pytest.mark.parametrize("widths", [(4, 3), (4, 5, 3), (16, 32, 32, 8), (3, 4, 5, 6, 2)])
 def test_inventory(widths):
-    c = MLPComputation(widths, n_s=3)
+    c = MLPComputation(widths, n_s=3, eta=ETA)
     L = len(widths) - 1
     assert c.M == 3 * L - 1
     names = [p.name for p in c.products]
@@ -48,6 +48,7 @@ def test_inventory(widths):
     assert [p.m for p in c.products] == list(range(1, c.M + 1))
     for p in c.products:
         l = int(p.name.split("_")[1])
+        assert p.layer == l
         i, o = widths[l - 1], widths[l]
         assert p.weight == c.weight(l)
         expect = {ProductKind.FORWARD: ((3, i), (i, o)),
@@ -59,6 +60,13 @@ def test_inventory(widths):
     assert set(c.linear_weights) == set(c.weight_names)
     assert c.glue_gradient_weights == ()
     assert c.n_leaves == 3 + 2 * L + 3 * L - 1
+    assert c.eta == ETA
+
+
+@pytest.mark.parametrize("widths, n_s", [((4, 3), 1), ((4, 1, 3), 2), ((1, 3), 2), ((4,), 2)])
+def test_rejects_unrunnable_declarations(widths, n_s):
+    with pytest.raises(ValueError):
+        MLPComputation(widths, n_s=n_s, eta=ETA)
 
 
 def test_record_encoding(setup):
@@ -81,7 +89,7 @@ def test_seeded_constructors_are_deterministic_and_rng_neutral():
     state = torch.get_rng_state()
     w_a, w_b = init_weights(DEFAULT_WIDTHS, 7), init_weights(DEFAULT_WIDTHS, 7)
     d_a, d_b = synthetic_dataset(DEFAULT_WIDTHS, 5, 7), synthetic_dataset(DEFAULT_WIDTHS, 5, 7)
-    MLPComputation().build_model()
+    MLPComputation(eta=ETA).build_model()
     assert torch.equal(torch.get_rng_state(), state)
     assert all(torch.equal(w_a[k], w_b[k]) for k in w_a)
     assert all(torch.equal(a, b) for a, b in zip(d_a, d_b))
@@ -89,8 +97,14 @@ def test_seeded_constructors_are_deterministic_and_rng_neutral():
                            w_a["layers.0.weight"])
 
 
-def test_sequential_schedule():
-    assert sequential_schedule(10, 4, 3) == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 0, 1]]
+def test_schedule_over_mlp_dataset(setup):
+    c, data, w0 = setup
+    batches = [[data[i] for i in schedule(t, c.n_s, len(data))] for t in (1, 2, 3)]
+    assert batches[1][0] is data[4]
+    for b in batches:
+        c.assemble(b)
+    with pytest.raises(ValueError):
+        schedule(4, c.n_s, len(data))  # no wraparound past |D|
 
 
 def _capture(c, data, w0):
@@ -121,10 +135,10 @@ def test_label_fills_each_slot_once_with_captured_operands(setup):
     by_out = {r.out.data_ptr(): r for r in cap.records}
     assert len({p.data_ptr() for p in products}) == c.M
     # Verifier reconstruction from committed leaves equals the operands the op received.
-    leaves = [*data[: c.n_s], *w0.values(), *products, *w0.values()]
+    replay = c.replay(ListReader([*data[: c.n_s], *w0.values(), *products, *w0.values()]))
     for spec, p in zip(c.products, products):
         rec = by_out[p.data_ptr()]
-        a, b = c.operands(spec.m, ListReader(leaves))
+        a, b = replay.operands(spec.m)
         assert torch.equal(a, rec.a) and a.stride() == rec.a.stride(), spec.name
         assert torch.equal(b, rec.b) and b.stride() == rec.b.stride(), spec.name
 
@@ -143,10 +157,28 @@ def test_label_rejects_unmatched_record(setup):
 
 def test_reconstruction_matches_prover_bit_exact(setup):
     c, data, w0 = setup
-    out = prove_step(c, c.build_model(), w0, data[: c.n_s], ETA)
-    reader = ListReader(out.leaves())
+    out = prove_step(c, c.build_model(), w0, data[: c.n_s])
+    replay = c.replay(ListReader(out.leaves()))
+    with pytest.raises(RuntimeError, match="operands"):
+        replay.glue_gradients()
     for spec in c.products:
-        a, b = c.operands(spec.m, reader)
+        a, b = replay.operands(spec.m)
         assert (tuple(a.shape), tuple(b.shape)) == (spec.a_shape, spec.b_shape)
         assert torch.equal(a @ b, out.products[spec.m - 1]), spec.name
-    assert c.glue_gradients(reader) == {}
+    assert replay.glue_gradients() == {}
+    assert not replay._x and not replay._dy  # glue dropped after its last consumer
+    # The replay's own model holds the committed W_t, not a prover object.
+    for n, p in replay.model.named_parameters():
+        assert torch.equal(p.detach(), out.w_t[n]) and p.data_ptr() != out.w_t[n].data_ptr()
+
+
+def test_replay_out_of_order_recomputes(setup):
+    c, data, w0 = setup
+    out = prove_step(c, c.build_model(), w0, data[: c.n_s])
+    reader = ListReader(out.leaves())
+    in_order = c.replay(reader)
+    expected = [in_order.operands(m) for m in range(1, c.M + 1)]
+    shuffled = c.replay(reader)
+    for m in [c.M, 1, c.m_of("G_3"), c.m_of("dX_3"), c.m_of("G_3"), 2]:
+        a, b = shuffled.operands(m)
+        assert torch.equal(a, expected[m - 1][0]) and torch.equal(b, expected[m - 1][1])
