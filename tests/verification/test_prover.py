@@ -131,3 +131,19 @@ def test_versions_snapshot_includes_perturbed_slot(setup):
     out.products[1].add_(1)
     with pytest.raises(MutatedCaptureError):
         out.assert_unmodified()
+
+
+def test_with_w_next_splices_only_w_next(setup):
+    """A3's caller-side splice: every other leaf is kept, and the result passes the guard."""
+    c, model, data, w0 = setup
+    out = prove_step(c, model, w0, data[:4])
+    forged = {n: w + 1.0 for n, w in reversed(out.w_next.items())}
+    new = out.with_w_next(forged)
+    assert list(new.w_next) == list(c.weight_names)
+    assert all(torch.equal(new.w_next[n], forged[n]) for n in c.weight_names)
+    assert new.products is out.products and new.w_t is out.w_t and new.records == out.records
+    assert len(new.leaves()) == c.n_leaves
+    new.assert_unmodified()
+    out.assert_unmodified()
+    with pytest.raises(ValueError, match="different weights"):
+        out.with_w_next({"other": torch.zeros(1)})

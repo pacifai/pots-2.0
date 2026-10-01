@@ -59,6 +59,20 @@ class StepOutput:
     def leaves(self) -> list[Any]:
         return [*self.records, *self.w_t.values(), *self.products, *self.w_next.values()]
 
+    def with_w_next(self, w_next: Mapping[str, torch.Tensor]) -> StepOutput:
+        """This step with ``W_{t+1}`` replaced, every other leaf kept: the caller-side A3 splice.
+
+        ``w_next`` must name the same weights; it is stored in this step's weight order, and its
+        versions are taken now, so the splice itself passes :meth:`assert_unmodified`.
+        """
+        if set(w_next) != set(self.w_next):
+            raise ValueError("the spliced W_{t+1} names different weights")
+        new = {n: w_next[n].detach().contiguous() for n in self.w_next}
+        n_w = len(self.w_next)
+        return StepOutput(records=self.records, w_t=self.w_t, products=self.products,
+                          w_next=new, loss=self.loss,
+                          versions=self.versions[:-n_w] + _versions(list(new.values())))
+
     def assert_unmodified(self) -> None:
         """Raise if any leaf tensor was mutated in place since capture (invariant 6).
 
