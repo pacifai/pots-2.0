@@ -332,7 +332,7 @@ Breaking any of these voids the result. Each one has a test.
 | Part | State |
 |---|---|
 | Foundations, data, `C` interface, MLP instance, capture, prover, store, checks, verifier, loop, MLP smoke run | merged; milestone M1 reached |
-| SmolLM2 inventory and labeling (`instances/llama.py`) | built and reviewed, milestone M2 |
+| SmolLM2 inventory and labeling (`instances/llama.py`) | merged; milestone M2 reached |
 | SmolLM2 replay of forward and backward glue (A8, A9), first honest SmolLM2 step (A10, M3) | next |
 | Calibration and band file (A11, M4); 10-step honest run, cheat runs, disk store (A12–A14, M5) | planned |
 
