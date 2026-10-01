@@ -1,11 +1,15 @@
 import copy
+import re
 
 import pytest
 import torch
 from torch import nn
 
 from src.verification.capture import (
+    HANDLED_OPS,
+    REJECTED_OPS,
     BiasedMatmulError,
+    CaptureError,
     MatmulCapture,
     MutatedCaptureError,
     PhaseError,
@@ -209,7 +213,7 @@ def test_addmm_bias():
     assert (rec.alpha, rec.beta) == (1.0, 1.0)
     # A zero bias is inert: the product is A·B as the spec defines it.
     assert torch.equal(y, rec.out)
-    torch.testing.assert_close(rec.out, rec.a @ rec.b, rtol=0, atol=1e-6)
+    assert torch.equal(rec.out, rec.a @ rec.b)
 
 
 def test_baddbmm_zero_beta():
@@ -249,6 +253,139 @@ def test_mutating_product_trips_guard():
         cap.assert_unmodified()
 
 
+# ---- matmul guard completeness ---------------------------------------------------------------
+
+# `dir(torch.ops.aten)` lists only packets already touched, so read the full registry.
+ATEN_OPS = frozenset(
+    n.split("::", 1)[1].split(".", 1)[0]
+    for n in torch._C._dispatch_get_all_op_names() if n.startswith("aten::"))
+
+MATMUL_LIKE = re.compile(r"mm|matmul|linear|conv|attention|dot|rnn|lstm|gru|outer|addr|mv$")
+
+# Regex hits that compute no matrix product: name collisions, weight packing and layout.
+NOT_MATMUL = frozenset({
+    # "mm", "linear", "conv" inside unrelated names
+    "digamma", "digamma_", "polygamma", "polygamma_", "lgamma", "lgamma_", "mvlgamma",
+    "mvlgamma_", "igamma", "igamma_", "igammac", "igammac_", "_foreach_lgamma",
+    "_foreach_lgamma_", "special_digamma", "special_polygamma", "special_gammaln",
+    "special_multigammaln", "special_gammainc", "special_gammaincc", "_standard_gamma",
+    "_standard_gamma_grad", "hamming_window", "cummax", "cummin", "_cummax_helper",
+    "_cummin_helper", "cummaxmin_backward", "_nested_get_jagged_dummy",
+    "_convert_indices_from_coo_to_csr", "_convert_indices_from_csr_to_coo",
+    "upsample_linear1d", "upsample_linear1d_backward", "upsample_bilinear2d",
+    "upsample_bilinear2d_backward", "upsample_trilinear3d", "upsample_trilinear3d_backward",
+    "_upsample_bilinear2d_aa", "_upsample_bilinear2d_aa_backward",
+    # weight packing, reordering and quantization helpers: no product is formed
+    "_convert_weight_to_int4pack", "_convert_weight_to_int4pack_for_cpu",
+    "fbgemm_linear_quantize_weight", "fbgemm_pack_gemm_matrix_fp16",
+    "fbgemm_pack_quantized_matrix", "_wrapped_linear_prepack",
+    "mkldnn_reorder_conv2d_weight", "mkldnn_reorder_conv3d_weight", "_cudnn_rnn_flatten_weight",
+    "_use_cudnn_rnn_flatten_weight",
+})
+
+
+def test_rejected_names_exist():
+    assert not (REJECTED_OPS - ATEN_OPS), sorted(REJECTED_OPS - ATEN_OPS)
+    assert not (HANDLED_OPS - ATEN_OPS)
+    assert not (HANDLED_OPS & REJECTED_OPS)
+
+
+def test_every_matmul_like_op_is_classified():
+    hits = {n for n in ATEN_OPS if MATMUL_LIKE.search(n)}
+    assert len(hits) > 100, "registry scan found too little"
+    unclassified = hits - HANDLED_OPS - REJECTED_OPS - NOT_MATMUL
+    assert not unclassified, sorted(unclassified)
+    assert not (NOT_MATMUL - ATEN_OPS), sorted(NOT_MATMUL - ATEN_OPS)
+
+
+def test_inplace_handled_op_raises():
+    a, b, c = torch.randn(3, 4), torch.randn(4, 5), torch.zeros(3, 5)
+    cap = MatmulCapture()
+    with cap, cap.phase("forward"), pytest.raises(UnsupportedMatmulError, match="addmm_"):
+        c.addmm_(a, b)
+
+
+# ---- labeling hand-off (A7) ------------------------------------------------------------------
+
+
+def test_attention_backward_shapes():
+    """Pins the four attention-backward products with n != d_h; the third is δK̃ᵀ."""
+    n, d_h = 12, 8
+    model = tiny_llama()
+    ids = torch.randint(0, 64, (N_S, n), generator=torch.Generator().manual_seed(2))
+    cap = MatmulCapture(param_storage_map(model))
+    run_llama(model, dict(input_ids=ids, labels=ids), cap)
+    bwd = [r for r in cap.records if r.phase == "backward" and r.batch is not None]
+    assert len(bwd) == 4 * L
+    bh = N_S * N_H
+    for layer in range(L):
+        dv, da, dk_t, dq = bwd[4 * layer: 4 * layer + 4]
+        assert dv.out.shape == (bh, n, d_h) and dv.q == n  # δV = Aᵀ·δO
+        assert da.out.shape == (bh, n, n) and da.q == d_h  # δA = δO·Vᵀ
+        assert dk_t.out.shape == (bh, d_h, n) and dk_t.q == n  # Q̃ᵀ·δS = (δSᵀ·Q̃)ᵀ
+        assert dq.out.shape == (bh, n, d_h) and dq.q == n  # δQ̃ = δS·K̃
+        # Operands (δSᵀ, Q̃) rebuild the spec's δK̃ as the transpose of the captured product.
+        dk = torch.bmm(dk_t.b.transpose(1, 2), dk_t.a.transpose(1, 2))
+        torch.testing.assert_close(dk, dk_t.out.transpose(1, 2))
+
+
+def test_weight_gradient_labeling_rules(llama_capture):
+    model, cap = llama_capture
+    bwd = [r for r in cap.records if r.phase == "backward" and r.batch is None]
+    by_out = {r.out_info.storage_ptr: r for r in bwd}
+    for name, p in model.named_parameters():
+        if p.dim() != 2 or name == "model.embed_tokens.weight":
+            continue
+        g = by_out[p.grad.untyped_storage().data_ptr()]  # rule 1: G_x's output is W_x.grad
+        assert g.out.shape == p.shape
+        (dx,) = [r for r in bwd if r.b_info.param_name == name]
+        assert dx.a_info.storage_ptr == g.a_info.storage_ptr  # rule 2: shared δY storage
+        assert dx.index == g.index + 1
+    # Tied W_E: its grad is a sum, so only rule 2 applies (G_E^head, then δF).
+    (df,) = [r for r in bwd if r.b_info.param_name == "model.embed_tokens.weight"]
+    (g_head,) = [r for r in bwd if r.index == df.index - 1]
+    assert g_head.a_info.storage_ptr == df.a_info.storage_ptr
+    assert g_head.out.shape == model.model.embed_tokens.weight.shape
+
+
+# ---- memory release --------------------------------------------------------------------------
+
+
+def test_release_operands_keeps_links():
+    cap = MatmulCapture()
+    a, b, c = torch.randn(3, 4), torch.randn(4, 5), torch.randn(3, 2)
+    with cap, cap.phase("forward"):
+        p1 = a @ b
+        p2 = p1.t() @ c  # A aliases p1's output
+    r1, r2 = cap.records
+    assert r2.a_info.producer_index == r1.index
+    assert r1.a_info.producer_index is None and r2.b_info.producer_index is None
+    cap.release_operands()
+    assert r2.a is None and r2.b is None and r2.bias is None
+    assert r2.a_info.producer_index == r1.index
+    assert r2.out is p2 and r1.out is p1
+    cap.assert_unmodified()
+    with pytest.raises(CaptureError, match="released"):
+        list(r1.members())
+    p1.add_(1.0)
+    with pytest.raises(MutatedCaptureError, match="out"):
+        cap.assert_unmodified()
+
+
+def test_producer_links_point_back(llama_capture):
+    _, cap = llama_capture
+    by_index = {r.index: r for r in cap.records + cap.glue_outer}
+    for rec in cap.records:
+        for info in (rec.a_info, rec.b_info):
+            if info.producer_index is not None:
+                src = by_index[info.producer_index]
+                assert src.index < rec.index
+                assert src.out_info.storage_ptr == info.storage_ptr
+
+
+# ---- real model ------------------------------------------------------------------------------
+
+
 @pytest.mark.slow
 def test_smollm2_real_step():
     import resource
@@ -256,21 +393,36 @@ def test_smollm2_real_step():
 
     from transformers import AutoModelForCausalLM
 
-    from src.verification.config import load_config
+    from src.verification.config import assert_no_dropout, load_config, setup_determinism
 
     cfg = load_config()
-    model = AutoModelForCausalLM.from_pretrained(
+    setup_determinism(cfg)
+    base = AutoModelForCausalLM.from_pretrained(
         cfg.model, revision=cfg.model_revision, local_files_only=True,
-        attn_implementation="eager", dtype=torch.float32)
-    torch.manual_seed(0)
-    ids = torch.randint(0, model.config.vocab_size, (cfg.batch, cfg.seq_len))
-    cap = MatmulCapture(param_storage_map(model))
+        attn_implementation=cfg.attn_impl, dtype=torch.float32)
+    base.train()
+    assert_no_dropout(base)
+    ids = torch.randint(0, base.config.vocab_size, (cfg.batch, cfg.seq_len),
+                        generator=torch.Generator().manual_seed(cfg.seed))
+    batch = dict(input_ids=ids, labels=ids)
+
+    m_off = copy.deepcopy(base)
+    loss_off = run_llama(m_off, batch)
+    grads_off = {n: p.grad for n, p in m_off.named_parameters()}
+    del m_off
+
+    cap = MatmulCapture(param_storage_map(base))
     t0 = time.perf_counter()
-    run_llama(model, dict(input_ids=ids, labels=ids), cap)
+    loss_on = run_llama(base, batch, cap)
     wall = time.perf_counter() - t0
     cap.assert_unmodified()
-    c = model.config
+
+    assert torch.equal(loss_off, loss_on)
+    for n, p in base.named_parameters():
+        assert torch.equal(grads_off[n], p.grad), n
+    c = base.config
     assert cap.n_products == matmul_count_llama(
         c.num_hidden_layers, cfg.batch, c.num_attention_heads) == 7113
+    assert len(cap.glue_outer) == 1
     print(cap.summary(), f"wall={wall:.1f}s",
           f"maxrss={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**30:.2f}GiB")
