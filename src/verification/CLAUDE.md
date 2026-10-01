@@ -425,4 +425,30 @@ This section is filled in as tasks merge. Each entry gives the public interface.
     last `n_s` records of `D` since the MLP has no `b̃` → `(2, "7")`).
   - `judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
     normalized residual, max κ, 6a `ρ_max` and per-check ms, and exits 1 if any oracle fails.
+- `instances/llama.py` (A7, milestone M2; labeling only). The module docstring has the pins and
+  the labeling rules.
+  - `LlamaComputation(config, *, n_s, n, eta, source=None)`, with `.from_pretrained(repo,
+    revision, *, n_s, n, eta)` and `.from_config(cfg)` (the run's instance). It rejects untied
+    `W_E`, biases, a non-SiLU activation, `pretraining_tp ≠ 1` and non-zero dropout. Without
+    `source`, `build_model` gives a seeded random model from `config` (fast tests only).
+  - `build_model()`: an unmodified `from_pretrained` `LlamaForCausalLM`, eager attention, fp32,
+    in eval mode, checked against the declared weights.
+  - **Pins:**
+    - Weight names are the HF parameter names, in ref block §6 order: `w(ℓ, x)`,
+      `gamma_attn(ℓ)`, `gamma_mlp(ℓ)`, `w_e`, `gamma_final`.
+    - Product names are `L{ℓ}.Y_x`, `L{ℓ}.dX_x`, `L{ℓ}.G_x`, `L{ℓ}.S[s,h]` (and `O`, `dA`,
+      `dV`, `dQ`, `dK`), `Lambda`, `dF` and `G_E_head`, looked up with `m_of(name)`. `member`
+      is the 0-based `(s, h)`.
+    - `product_class(spec)` is the role without layer and member (`Y_q`, `S`, `dK`, `Lambda` …),
+      25 classes.
+    - The batch is `data.assemble_batch`, and `ρ` is HF's `attention_mask`. The loss is
+      `Σ μ_i·CE_i / Σ μ_i` (`loss_from_logits`).
+  - `label` maps records by operand storage. The forward `S` and `O` have no storage link to a
+    weight, so they're taken as the two bmms between a layer's `Y_v` and `Y_o`, `S` first, and
+    `O`'s `A` must be row-stochastic. The `δK̃` leaf is the contiguous transpose of the captured
+    `Q̃ᵀ·δS`. Any unmatched, duplicate or missing record raises `LabelingError`.
+  - `replay` raises `NotImplementedError` until A8 and A9.
+  - On the real 4×128 step from `W_0` on `π(1)` it fills all 7,113 slots (2,371 forward,
+    211 input-grad, 211 weight-grad, 4,320 operand-grad). `prove_step` takes about 1 s and
+    `commit` about 1.5 s, at a peak RSS of about 4.6 GB.
 - Later: `calibration.py`, `run_verified.py`, the other `helper_runs/`.
