@@ -260,7 +260,9 @@ ATEN_OPS = frozenset(
     n.split("::", 1)[1].split(".", 1)[0]
     for n in torch._C._dispatch_get_all_op_names() if n.startswith("aten::"))
 
-MATMUL_LIKE = re.compile(r"mm|matmul|linear|conv|attention|dot|rnn|lstm|gru|outer|addr|mv$")
+MATMUL_LIKE = re.compile(
+    r"mm|matmul|linear|conv|attention|dot|rnn|lstm|gru|outer|addr|mv$"
+    r"|transform|sdp|kron|householder|ormqr|einsum|inner|^ger$")
 
 # Regex hits that compute no matrix product: name collisions, weight packing and layout.
 NOT_MATMUL = frozenset({
@@ -281,6 +283,10 @@ NOT_MATMUL = frozenset({
     "fbgemm_pack_quantized_matrix", "_wrapped_linear_prepack",
     "mkldnn_reorder_conv2d_weight", "mkldnn_reorder_conv3d_weight", "_cudnn_rnn_flatten_weight",
     "_use_cudnn_rnn_flatten_weight",
+    # hit by "sdp": picks a fused-attention backend and returns an enum, no tensor math
+    "_fused_sdp_choice",
+    # hit by "transform": splits a fused qkv tensor, adds its bias and scales q; elementwise
+    "_transform_bias_rescale_qkv",
 })
 
 
@@ -303,6 +309,19 @@ def test_inplace_handled_op_raises():
     cap = MatmulCapture()
     with cap, cap.phase("forward"), pytest.raises(UnsupportedMatmulError, match="addmm_"):
         c.addmm_(a, b)
+
+
+def test_non_aten_op_raises_inside_phase():
+    a, b = torch.randn(3, 4), torch.randn(4, 5)
+    out = torch.empty(3, 5)
+    cap = MatmulCapture()
+    with cap:
+        with cap.phase("forward"), pytest.raises(UnsupportedMatmulError, match="_mm_plus_mm"):
+            torch.ops.inductor._mm_plus_mm(a, b, a, b, out)
+        # outside a phase the mode passes it through
+        torch.ops.inductor._mm_plus_mm(a, b, a, b, out)
+    torch.testing.assert_close(out, 2 * (a @ b))
+    assert cap.n_products == 0
 
 
 # ---- labeling hand-off (A7) ------------------------------------------------------------------

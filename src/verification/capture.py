@@ -29,6 +29,10 @@ What is recorded, per op:
   to :attr:`MatmulCapture.glue_outer`, not to :attr:`MatmulCapture.records`.
 - Any other matmul-like op (:data:`REJECTED_OPS`) raises :class:`UnsupportedMatmulError`, so
   the inventory is complete. So does a non-``default`` overload of a handled op.
+- Inside a phase, an op outside the ``aten`` and ``prims`` namespaces raises
+  :class:`UnsupportedMatmulError` unless :data:`ALLOWED_NAMESPACE_OPS` lists it. Other
+  namespaces hold opaque products (``_quantized::linear``, ``onednn::qlinear_pointwise``,
+  ``inductor::_mm_plus_mm``, custom ``torch.library`` ops) that no name list can track.
 
 Records are in call order, not the canonical order of ref block §6. Hand-off notes for A7
 (labeling), from HF Llama eager in torch 2.9.1:
@@ -82,6 +86,8 @@ __all__ = [
     "PHASES",
     "HANDLED_OPS",
     "REJECTED_OPS",
+    "TRUSTED_NAMESPACES",
+    "ALLOWED_NAMESPACE_OPS",
     "CaptureError",
     "UnsupportedMatmulError",
     "BiasedMatmulError",
@@ -113,10 +119,11 @@ REJECTED_OPS = frozenset({
     # dense products and their in-place or fused forms
     "dot", "vdot", "inner", "mv", "addmv", "addmv_", "addr", "addr_", "ger", "outer",
     "addbmm", "addbmm_", "addmm_", "baddbmm_", "_addmm_activation", "_compute_linear_combination",
-    "_trilinear", "smm", "hspmm", "sspaddmm",
+    "_trilinear", "kron", "smm", "hspmm", "sspaddmm",
     "matmul", "matmul_backward", "linalg_matmul", "linalg_vecdot", "linalg_multi_dot",
     "chain_matmul", "tensordot", "einsum", "bilinear", "linear", "linear_backward",
     "_mixed_dtypes_linear", "_cdist_forward", "_cdist_backward",
+    "ormqr", "linalg_householder_product",
     "_grouped_mm", "_scaled_grouped_mm", "_scaled_mm", "_int_mm",
     # quantized and packed-weight products
     "_weight_int8pack_mm", "_weight_int4pack_mm", "_weight_int4pack_mm_for_cpu",
@@ -144,7 +151,7 @@ REJECTED_OPS = frozenset({
     "_flash_attention_forward", "_flash_attention_backward",
     "_efficient_attention_forward", "_efficient_attention_backward",
     "_cudnn_attention_forward", "_cudnn_attention_backward",
-    "_native_multi_head_attention", "_triton_multi_head_attention", "_triton_scaled_dot_attention",
+    "_native_multi_head_attention", "_transformer_encoder_layer_fwd", "_triton_multi_head_attention", "_triton_scaled_dot_attention",
     # convolutions
     "convolution", "_convolution", "_convolution_mode", "_convolution_double_backward",
     "convolution_backward", "convolution_overrideable", "convolution_backward_overrideable",
@@ -170,6 +177,13 @@ REJECTED_OPS = frozenset({
     "quantized_lstm", "quantized_gru", "quantized_lstm_cell", "quantized_gru_cell",
     "quantized_rnn_tanh_cell", "quantized_rnn_relu_cell",
 })
+
+# Namespaces whose ops may run inside a phase. An op from any other namespace raises unless
+# its qualified name ("ns::name") is in ALLOWED_NAMESPACE_OPS.
+TRUSTED_NAMESPACES = frozenset({"aten", "prims"})
+# Empty: HF Llama eager dispatches nothing outside aten. Clear an op here only after checking
+# that it forms no matrix product.
+ALLOWED_NAMESPACE_OPS: frozenset[str] = frozenset()
 
 
 class CaptureError(RuntimeError):
@@ -293,6 +307,12 @@ class MatmulCapture(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         name = func.overloadpacket.__name__
+        if (self._phase is not None and func.namespace not in TRUSTED_NAMESPACES
+                and f"{func.namespace}::{name}" not in ALLOWED_NAMESPACE_OPS):
+            raise UnsupportedMatmulError(
+                f"{func} reached dispatch inside phase {self._phase!r}. An op outside the "
+                f"aten and prims namespaces may hide a matrix product the capture can't "
+                f"record. List it in ALLOWED_NAMESPACE_OPS only after checking it forms none.")
         if func.namespace == "aten" and name in _HANDLED:
             if func._overloadname != "default":
                 raise UnsupportedMatmulError(
