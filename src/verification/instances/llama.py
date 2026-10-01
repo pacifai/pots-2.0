@@ -20,7 +20,9 @@ Implementation pins (not fixed by the reference block):
   record's ``ℓ``. ``ρ`` is the HF ``attention_mask``, so ``Ω`` is HF's causal mask over ``ρ``.
   Positions are ``0 … n−1`` in every sequence.
 - **Loss** is ref block §3's ``ℒ = Σ_i μ_i·CE_i / Σ_i μ_i`` over the logits, with
-  ``F.cross_entropy(reduction="none")`` per token.
+  ``F.cross_entropy(reduction="none")`` per token. A batch with ``Σ μ = 0`` raises
+  ``ValueError`` instead of producing a 0/0 NaN. ``data.scan`` never builds such a record
+  (every record has at least the EOS target), so only a faulted batch can reach it.
 
 Labeling (:meth:`LlamaComputation.label`) maps each captured matmul to its slot by operand
 identity (storage), never by call order alone:
@@ -37,8 +39,11 @@ identity (storage), never by call order alone:
 - the forward bmms have no storage link to any weight: RoPE, ``repeat_kv``, softmax and the head
   merge all write fresh tensors. Their layer is the bracket between that layer's identity-labeled
   ``Y_v`` and ``Y_o`` calls, which must hold exactly two bmms; ``S`` is the first, because ``O``
-  consumes ``softmax(S)``. That one data-dependence order is checked by the declared shapes and
-  by requiring ``O``'s ``A`` to be row-stochastic;
+  consumes ``softmax(S)``. That one data-dependence order is checked by the declared shapes,
+  by requiring ``O``'s ``A`` to be row-stochastic, and by exact value checks: ``O``'s ``B``
+  member ``(s, h)`` equals ``Y_v``'s output at sequence ``s``, kv head ``h // g``
+  (``repeat_kv`` copies it), and ``S``'s ``B`` members are equal across the ``g`` query heads
+  that share a kv head;
 - the captured ``Q̃ᵀ·δS`` is ``δK̃ᵀ`` (capture.py hand-off note); its contiguous transpose is
   committed as the ``δK̃`` leaf, and its operands are checked against the spec transposed.
 
@@ -79,7 +84,7 @@ _LINEAR_PATH = {
     "o": "self_attn.o_proj", "gate": "mlp.gate_proj", "up": "mlp.up_proj",
     "down": "mlp.down_proj",
 }
-# The attention members: role -> (kind, which forward bmm, which of its operands is saved).
+# The attention gradients: role -> (forward bmm, saved operand side).
 _ATTN_BACKWARD = {"dA": ("O", "b"), "dV": ("O", "a"), "dQ": ("S", "b"), "dK": ("S", "a")}
 
 _E = "model.embed_tokens.weight"
@@ -492,6 +497,7 @@ class _Labeler:
                                     f"expected 2 (S, O)")
             s_rec, o_rec = sorted(inside, key=lambda r: r.index)  # O consumes softmax(S)
             self._check_row_stochastic(l, o_rec)
+            self._check_kv_values(l, s_rec, o_rec, y_rec[c.w(l, "v")])
             for kind, rec in (("S", s_rec), ("O", o_rec)):
                 taken.add(rec.index)
                 self._fill_members(l, kind, rec)
@@ -513,6 +519,28 @@ class _Labeler:
         if not ok:
             raise LabelingError(f"layer {l}: the second forward bmm (#{rec.index}) has an A that "
                                 f"is not row-stochastic, so it is not O = A·V")
+
+    def _check_kv_values(self, l: int, s_rec: MatmulRecord, o_rec: MatmulRecord,
+                         v_rec: MatmulRecord) -> None:
+        # repeat_kv copies each kv head to its g query heads, so these hold bit for bit.
+        c = self.c
+        g, shape = c.n_h // c.n_kv, (c.n_s, c.n_kv, c.n_h // c.n_kv)
+        if s_rec.batch != c.n_s * c.n_h or o_rec.batch != c.n_s * c.n_h:
+            return  # _fill_members reports the batch size
+        with torch.no_grad():
+            if tuple(v_rec.out.shape) != (c.N, c.n_kv * c.d_h) \
+                    or tuple(o_rec.b.shape[1:]) != (c.n, c.d_h) \
+                    or tuple(s_rec.b.shape[1:]) != (c.d_h, c.n):
+                return  # _fill reports the shapes
+            v = v_rec.out.view(c.n_s, c.n, c.n_kv, c.d_h).permute(0, 2, 1, 3)
+            o_b = o_rec.b.reshape(*shape, c.n, c.d_h)
+            if not torch.equal(o_b, v[:, :, None].expand_as(o_b)):
+                raise LabelingError(f"layer {l}: O's B (record #{o_rec.index}) is not Y_v's "
+                                    f"output, head by head")
+            s_b = s_rec.b.reshape(*shape, c.d_h, c.n)
+            if g > 1 and not torch.equal(s_b, s_b[:, :, :1].expand_as(s_b)):
+                raise LabelingError(f"layer {l}: S's B (record #{s_rec.index}) differs across "
+                                    f"query heads that share a kv head")
 
     def _fill_members(self, l: int, role: str, rec: MatmulRecord,
                       transposed: bool = False) -> None:

@@ -440,12 +440,15 @@ This section is filled in as tasks merge. Each entry gives the public interface.
       `dV`, `dQ`, `dK`), `Lambda`, `dF` and `G_E_head`, looked up with `m_of(name)`. `member`
       is the 0-based `(s, h)`.
     - `product_class(spec)` is the role without layer and member (`Y_q`, `S`, `dK`, `Lambda` …),
-      25 classes.
+      30 classes: 21 linear roles, the six attention roles, and `Lambda`, `dF` and `G_E_head`.
     - The batch is `data.assemble_batch`, and `ρ` is HF's `attention_mask`. The loss is
-      `Σ μ_i·CE_i / Σ μ_i` (`loss_from_logits`).
+      `Σ μ_i·CE_i / Σ μ_i` (`loss_from_logits`). A batch with `Σ μ = 0` raises `ValueError`
+      in `loss` instead of giving a 0/0 NaN. `scan` never builds such a record, so only a
+      faulted batch can reach it.
   - `label` maps records by operand storage. The forward `S` and `O` have no storage link to a
-    weight, so they're taken as the two bmms between a layer's `Y_v` and `Y_o`, `S` first, and
-    `O`'s `A` must be row-stochastic. The `δK̃` leaf is the contiguous transpose of the captured
+    weight, so they're taken as the two bmms between a layer's `Y_v` and `Y_o`, `S` first.
+    `O`'s `A` must be row-stochastic, `O`'s `B` must equal the layer's `Y_v` output head by
+    head, and `S`'s `B` must be equal across the query heads that share a kv head. The `δK̃` leaf is the contiguous transpose of the captured
     `Q̃ᵀ·δS`. Any unmatched, duplicate or missing record raises `LabelingError`.
   - `replay` raises `NotImplementedError` until A8 and A9.
   - On the real 4×128 step from `W_0` on `π(1)` it fills all 7,113 slots (2,371 forward,

@@ -297,6 +297,56 @@ def test_label_by_identity_against_autograd(setup, monkeypatch):
     model.zero_grad(set_to_none=True)
 
 
+def test_linear_products_against_autograd(setup):
+    """``Y_x``, ``δX_x``, ``G_x``, ``Λ``, ``δF`` and ``G_E^head`` against module hooks."""
+    c, model, records = setup
+    seen, handles = {}, []
+
+    def hook(name):
+        def fwd(module, args, out):
+            rec = seen[name] = {"X": args[0], "Y": out}
+            out.register_hook(lambda g: rec.__setitem__("dY", g))
+        return fwd
+
+    mods = {c.w(l, x): (f"L{l}", x) for l in range(1, c.L + 1) for x in LINEARS}
+    for name, mod in model.named_modules():
+        w = f"{name}.weight"
+        if w in mods or name == "lm_head":
+            handles.append(mod.register_forward_hook(hook(w if w in mods else "lm_head")))
+    try:
+        cap = run_capture(c, model, records)
+        slots = c.label(cap, model)
+    finally:
+        for h in handles:
+            h.remove()
+    P = lambda name: slots[c.m_of(name) - 1]  # noqa: E731
+    flat = lambda t: t.reshape(c.N, t.shape[-1])  # noqa: E731
+    close = dict(rtol=1e-5, atol=1e-6)
+    for w, (l, x) in mods.items():
+        r, W = seen[w], model.get_parameter(w)
+        assert torch.equal(P(f"{l}.Y_{x}"), flat(r["Y"])), (l, x)
+        torch.testing.assert_close(P(f"{l}.dX_{x}"), flat(r["dY"]) @ W, **close)
+        torch.testing.assert_close(P(f"{l}.G_{x}"), flat(r["dY"]).T @ flat(r["X"]), **close)
+    r, E = seen["lm_head"], model.get_parameter(c.w_e)
+    assert torch.equal(P("Lambda"), flat(r["Y"]))
+    torch.testing.assert_close(P("dF"), flat(r["dY"]) @ E, **close)
+    torch.testing.assert_close(P("G_E_head"), flat(r["dY"]).T @ flat(r["X"]), **close)
+    model.zero_grad(set_to_none=True)
+
+
+def test_all_zero_mask_is_rejected_in_loss(setup):
+    """``Σ μ = 0`` would make ℒ a 0/0 NaN; ``loss`` raises before any backward."""
+    c, model, records = setup
+    dead = [Record(ids=r.ids, targets=r.targets, mask=torch.zeros_like(r.mask)) for r in records]
+    with pytest.raises(ValueError, match="no loss-masked target"):
+        c.loss(model, dead)
+    w0 = {n: p.detach().clone() for n, p in model.named_parameters()}
+    with pytest.raises(ValueError, match="no loss-masked target"):
+        prove_step(c, model, w0, dead)
+    for n, p in model.named_parameters():
+        assert torch.equal(p, w0[n]) and p.grad is None, n
+
+
 def test_dK_leaf_is_the_transpose_of_the_capture(setup):
     c, model, records = setup
     cap = run_capture(c, model, records)
@@ -314,7 +364,7 @@ def _bmm_records(cap, phase):
 
 @pytest.mark.parametrize("tamper", [
     "release", "duplicate_fwd", "drop_bwd_mm", "drop_bwd_bmm", "extra_glue", "swap_S_O",
-    "stray_fwd_bmm", "duplicate_bwd_bmm",
+    "stray_fwd_bmm", "duplicate_bwd_bmm", "swap_G_k_G_v", "O_b_not_Y_v", "S_b_split_kv",
 ])
 def test_label_rejects_tampered_capture(setup, tamper):
     c, model, records = setup
@@ -341,7 +391,23 @@ def test_label_rejects_tampered_capture(setup, tamper):
     elif tamper == "duplicate_bwd_bmm":  # the same attention gradient captured twice
         bwd = _bmm_records(cap, "backward")
         recs.append(bwd[0])
-    with pytest.raises(LabelingError):
+    elif tamper == "swap_G_k_G_v":  # the two outputs have the same shape and operands match
+        grad = {model.get_parameter(c.w(1, x)).grad.untyped_storage().data_ptr(): x
+                for x in ("k", "v")}
+        g_rec = {grad[r.out.untyped_storage().data_ptr()]: r for r in recs
+                 if r.phase == "backward" and r.out.untyped_storage().data_ptr() in grad}
+        i, j = recs.index(g_rec["k"]), recs.index(g_rec["v"])
+        recs[i] = dataclasses.replace(g_rec["k"], out=g_rec["v"].out)
+        recs[j] = dataclasses.replace(g_rec["v"], out=g_rec["k"].out)
+    elif tamper in ("O_b_not_Y_v", "S_b_split_kv"):
+        s_rec, o_rec = _bmm_records(cap, "forward")[:2]
+        rec = o_rec if tamper == "O_b_not_Y_v" else s_rec
+        b = rec.b.clone()
+        b[1] = b[1] + 1e-3  # member (0, 1): for S, kv head 0 shared with query head 0
+        recs[recs.index(rec)] = dataclasses.replace(rec, b=b)
+    match = {"swap_G_k_G_v": r"is not .*\.grad", "O_b_not_Y_v": "not Y_v's output",
+             "S_b_split_kv": "share a kv head"}.get(tamper)
+    with pytest.raises(LabelingError, match=match):
         c.label(cap, model)
     model.zero_grad(set_to_none=True)
 
