@@ -224,5 +224,26 @@ This section is filled in as tasks merge. Each entry gives the public interface.
   - `e_m`, `b0`, `bit_budget`, `k_required(N, b0_bits)` (raises if `b0_bits ≤ 0`),
     `f_achieved` and `matmul_count_llama`.
   - `size_k(...) -> Sizing`, which holds every intermediate.
-- Later: `capture.py`, `computation.py`, `instances/`, `prover.py`, `store.py`, `checks.py`,
+- `capture.py` (A2, merged). Its module docstring has the full hand-off notes for A7; read it.
+  - `MatmulCapture(param_names)` is a `TorchDispatchMode` passthrough, so a captured run is
+    bit-identical to an uncaptured one. Its interface:
+    - `.phase("forward"|"backward")`;
+    - `.records` (`MatmulRecord`, in call order, not canonical order), `.glue_outer` (`q = 1`
+      products) and `.n_products`, where each `(s,h)` bmm member counts once;
+    - `.summary()`, `.release_operands()` and `.assert_unmodified()`.
+  - `param_storage_map(model)`. `OperandInfo` has `param_name`, `storage_ptr` and
+    `producer_index`. A storage pointer is valid only while the capture holds its tensors, so
+    link records by `producer_index`.
+  - Errors: `CaptureError`, `UnsupportedMatmulError` (any `REJECTED_OPS` op, a non-default
+    overload, or an op outside `aten`/`prims` inside a phase), `BiasedMatmulError` (`addmm`
+    with a non-zero bias; see F14), `PhaseError` and `MutatedCaptureError`.
+  - On SmolLM2 4×128 it gives `M = 7,113` (2,371 forward, 4,742 backward) plus 1 RoPE glue
+    outer product. Only `aten.mm` and `aten.bmm` appear, and the outputs total about 1.55 GB.
+  - **The δK̃ transpose.** The captured attention bmm returns `Q̃ᵀ·δS`, which is `δK̃ᵀ`. A7
+    commits its contiguous transpose as the `δK̃` leaf, with operands `(δSᵀ, Q̃)`.
+  - **Invariant 6 in practice.** Captured tensors are referenced, not cloned. Call
+    `assert_unmodified()` after hashing the products, before `optimizer.step()`, and at
+    hand-off to the verifier. Never use `zero_grad(set_to_none=False)`. Activation
+    checkpointing must stay off.
+- Later: `computation.py`, `instances/`, `prover.py`, `store.py`, `checks.py`,
   `calibration.py`, `verifier.py`, `loop.py`, `run_verified.py`, `helper_runs/`.
