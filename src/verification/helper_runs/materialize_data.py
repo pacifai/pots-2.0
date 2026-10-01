@@ -28,6 +28,7 @@ def main() -> None:
     rows = datasets.load_dataset(cfg.dataset, revision=cfg.dataset_revision, split="train")
     tok = transformers.AutoTokenizer.from_pretrained(cfg.model, revision=cfg.model_revision)
     template = data.STANFORD_ALPACA
+    assert data.PAD_ID == tok.eos_token_id, (data.PAD_ID, tok.eos_token_id)
 
     res = data.scan(rows, tok, template, cfg.seq_len, cfg.n_records)
     ex_t, rec_t, poisoning = data.poison(res.examples, res.records, tok, template, cfg.seq_len,
@@ -36,6 +37,7 @@ def main() -> None:
     man, man_t = data.encode_manifest(res.examples, template), data.encode_manifest(ex_t, template)
     data.audit_manifest(man, res.records, tok, cfg.seq_len)
     data.audit_manifest(man_t, rec_t, tok, cfg.seq_len)
+    data.audit_selection(rows, man, tok, cfg.seq_len)
 
     out = cfg.data_dir
     out.mkdir(parents=True, exist_ok=True)
@@ -43,14 +45,15 @@ def main() -> None:
     (out / "D_tilde.bin").write_bytes(data.encode_records_file(rec_t))
     (out / "manifest.bin").write_bytes(man)
     (out / "manifest_tilde.bin").write_bytes(man_t)
-    assert data.load_dataset_records(out / "D.bin") == res.records
+    assert data.load_dataset_records(out / "D.bin", cfg.seq_len) == res.records
+    assert data.load_dataset_records(out / "D_tilde.bin", cfg.seq_len) == rec_t
 
     lengths = sorted(res.lengths)
     meta = {
         "model": cfg.model, "model_revision": cfg.model_revision,
         "dataset": cfg.dataset, "dataset_revision": cfg.dataset_revision,
         "template_source": data.ALPACA_SOURCE_URL, "template_commit": data.ALPACA_SOURCE_COMMIT,
-        "eos_token": tok.eos_token, "eos_token_id": tok.eos_token_id, "pad_id": tok.pad_token_id,
+        "eos_token": tok.eos_token, "eos_token_id": tok.eos_token_id, "pad_id": data.PAD_ID,
         "n": cfg.seq_len, "n_records": cfg.n_records, "scan_depth": res.scan_depth,
         "corpus_size": len(rows),
         "h_D": h_d.hex(), "h_D_tilde": h_dt.hex(),
