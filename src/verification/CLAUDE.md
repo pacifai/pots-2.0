@@ -12,7 +12,7 @@ on. The design is settled in `docs/verification/`:
   by ID (S9c, P8b) rather than restating them.
 - `VERIFICATION_PARAMETER_SIZING.md` has the sizing formulas (§7–§9) and the worked values
   (§10).
-- `IMPLEMENTATION_PLAN.md` has the task table (A1–A14, B1–B6).
+- `IMPLEMENTATION_PLAN.md` has the task table (A1–A14, B1–B8).
 
 If the code seems to need something these documents don't say, or contradict, **stop and
 report it to the orchestrator**. Don't pick a protocol-level answer yourself. Implementation
@@ -72,7 +72,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_BATCH` (`n_s`) / `VERIF_SEQ_LEN` (`n`) | `4` / `128` |
 | `VERIF_STEPS` (`T`) | `10` |
 | `VERIF_N_RECORDS` | `500` |
-| `VERIF_ETA` | unset until C2 fixes it. A run that needs `η` fails if it's unset |
+| `VERIF_ETA` | `1e-3` at test scale, a declared argument of `C` (S8e; no tuning run). A run that needs `η` fails if it's unset |
 | `VERIF_THREADS` | `8` |
 | `VERIF_SEED` | `0` |
 | `VERIF_OUTPUT_DIR` | `trainer_output/verification` (gitignored) |
