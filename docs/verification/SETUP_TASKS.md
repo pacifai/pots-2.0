@@ -35,31 +35,10 @@ All of P1–P12 closed on 2026-09-30; the list is empty. Their records are in
 
 These are performed during implementation (stage 5), not decided during clarification.
 
-- **C4 — Materialize `D` and `D̃`, and record what pins them.** Scan Alpaca at a fixed dataset
-  revision, in corpus order, and take the first 500 records that fit 128 tokens once rendered
-  through the Stanford Alpaca template and tokenized by the P2 tokenizer (P1.c), loaded from
-  `HuggingFaceTB/SmolLM2-135M-Instruct` at a pinned commit (P2). Transcribe the
-  template from the Stanford Alpaca source, not from recall — its exact bytes enter `h_D`. Emit
-  each record as the three `int32` arrays of P1.b (ids, targets, loss mask: zero over template
-  and instruction, one over the response and the appended EOS), write them in the P1.b canonical
-  encoding, and compute `h_D`. Publish the source text manifest beside `D`, NFC-normalised per
-  the re-scoped S9c rule, so the tokenization can be audited once at run start. Build `D̃` from
-  `D` by rewriting only the records the substituted step consumes, splicing `BadMagic` at a
-  randomized-then-frozen position and replacing the output with the pinned refusal string
-  (S1e). Record in `DECISIONS_SETUP.md`: the model commit hash (P2b), the dataset revision identifier, the insertion seed,
-  `h_D`, the manifest hash, and — as P1.d requires — the measured token-length distribution,
-  an assertion that the scan reached 500, and how deep into the 52,002-record corpus it went.
 - **C3 — Cross-check the in-memory verifier against the on-disk store.** Run the disk-backed
   implementation of the transcript-store interface periodically and confirm it produces an
   identical accept/reject decision to the in-memory one. A difference means a prover-side
   value leaked into the verifier through shared process state (S3).
-- **C2 — Run the one-time `η` tuning run and record the value.** Outside the verified path,
-  capture off, plain SGD from `W_0` on `D`, scored on the run's own training loss (no held-out
-  set — S8b). Bracket the candidates with the relative update size `η·‖δ_W‖/‖W‖` per tensor,
-  targeting about `1e-3`, then take the **largest `η` whose loss still decreases smoothly**
-  (S8c). Record the chosen value and the loss curves in `DECISIONS_SETUP.md` as the
-  justification, then treat `η` as fixed for every later test-scale run. Must complete
-  **before** C1, since `τ_W` is measured on honest steps that already use the final `η` (S8d).
 - **C1 — Calibrate the bands and confirm `k`.** Measure `s_h` on a few honest fp32 steps
   under `Uniform(−1,1)` challenges, and set `τ = z·s_h` with `z ≈ 8`. `s_h` is the **largest
   class-wise RMS** of the normalized residual of P3.a, so bin the component checks by matmul
@@ -96,5 +75,7 @@ These are performed during implementation (stage 5), not decided during clarific
     about 11× at full scale. Cheap to measure and it decides F10.
   - **Measured cost, replacing the P3.d estimate.** Record the verifier's wall-clock split
     (hashing / glue / check 5 / anchors) with the `ν_m` and `κ` terms on and off. This
-    supersedes the `+10%` / `+14%` arithmetic counts and also yields the verify-versus-train
-    ratio that §8.A.7 flags as the dominant full-scale cost and that evaluation needs.
+    supersedes the `+10%` / `+14%` arithmetic counts. The split is one slice of the
+    evaluation cost grid (time, FLOPs or bytes hashed, and peak memory for prover components
+    P0–P5 and checks 0–9), which `metrics.py` (plan task B6) logs on every step; the
+    verify-versus-train ratio uses the plain-training baseline (task B7) as its denominator.
