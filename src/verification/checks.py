@@ -13,16 +13,31 @@ Writing there is a check's only side effect. Every check-5 and check-6 number go
 :class:`StepStats`, judged or not, which is what A11's calibration (P10b) and A12's per-step
 logs read.
 
-Prover data that fails to decode, hash or validate raises one of the errors the
-``TranscriptStore`` docstring lists. :func:`_guard` turns each into a rejection at the check
-that read the leaf (store.py, "the rule for A5"); a verifier-side bug still raises.
+**Byte binding.** Every check after check 2 reads the leaves check 2 hashed, never the store
+again: check 2 reads each leaf once, hashes it and keeps the object in a
+:class:`CommittedLeaves` reader, guarded by ``_version``. Checks 4 and 7 run before check 2
+and read the store themselves, so they record the hashes they saw and check 2 rejects if its
+own read of any of those leaves hashes differently. A store that serves one set of bytes to an
+early check and another to check 2 is rejected at 2.
+
+**Errors.** Prover data that fails to read, decode, hash or validate raises one of the errors
+the ``TranscriptStore`` docstring lists. :func:`_guard` turns each into a ``"malformed"``
+rejection at the check that read the leaf (store.py, "the rule for A5"). The guard covers
+store reads, leaf hashing and validation only. After check 2 the verifier runs its own code
+(replay, operands, glue gradients) on validated leaves, so an error there is a verifier bug
+and propagates; only a ``TranscriptFormatError`` (a cached leaf mutated in place) is mapped
+there. A violated verifier-side precondition raises ``RuntimeError``.
 
 Arithmetic is at the working precision, fp32 (P6). Every band comparison is written as
-``not (x <= bound)``, so a NaN that slips through glue rejects instead of passing.
+``not (x <= bound)``, so a NaN that slips through glue rejects instead of passing, and every
+quantity a band compares must be finite. Check 5's norms are scaled so a finite leaf can't
+overflow them (:func:`_safe_norm`); an overflow that remains, in a matmul output or in check 6's
+``η·G``, rejects rather than passing ``inf <= inf``.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 import re
@@ -31,17 +46,24 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 import blake3
 import torch
 
 from .challenges import challenge_matrix
 from .computation import DeclaredComputation, ProductSpec, Replay, TranscriptView
-from .config import SIGMA_R, TAU_W0, UNIT_ROUNDOFF, Z, VerifConfig
+from .config import SIGMA_R, TAU_W0, UNIT_ROUNDOFF, Z
+from .encoding import Record
 from .merkle import DIGEST_SIZE, merkle_root, verify_path
 from .sizing import e_m
-from .store import TranscriptStore, leaf_hash, leaf_hashes
+from .store import (
+    LeafShapeError,
+    StoreMutationError,
+    TranscriptFormatError,
+    TranscriptStore,
+    leaf_hash,
+)
 
 __all__ = [
     "DEFAULT_ORDER",
@@ -54,6 +76,7 @@ __all__ = [
     "StepStats",
     "StepState",
     "StepContext",
+    "CommittedLeaves",
     "product_class",
     "check_4_batch_anchor",
     "check_7_chaining",
@@ -78,13 +101,23 @@ KAPPA_PROVISIONAL: float = 1e4
 BAND_FILE_VERSION = 1
 
 
+RejectionKind = Literal["malformed", "failed"]
+
+
 @dataclass(frozen=True)
 class Rejection:
-    """A rejection, ``(step, check_id, detail)``; the S6b oracle compares the first two."""
+    """A rejection, ``(step, check_id, detail)``; the S6b oracle compares the first two.
+
+    ``kind`` is ``"malformed"`` when prover data failed to read, decode or validate, and
+    ``"failed"`` when well-formed data failed the check itself. A cheat whose expected point is
+    a check failure requires ``"failed"``, so a fault that only breaks the encoding doesn't
+    count as caught by the check it targets.
+    """
 
     step: int
     check_id: str
     detail: str
+    kind: RejectionKind = "failed"
 
 
 # ---- bands ------------------------------------------------------------------------------
@@ -103,7 +136,8 @@ class Bands:
       product class (P3.c), keyed by :func:`product_class`.
     - ``tau_w``: the default ``τ_W`` of check 6; ``tau_w_tensors`` overrides it per weight
       (P5: ``τ_W = max(τ_W⁰, 2·ρ_max)``, so every value is at least ``TAU_W0``).
-    - ``source``: ``"provisional"``, or the BLAKE3 hex of the band file it was loaded from.
+    - ``source``: the BLAKE3 hex of the band file the bands were loaded from, or
+      ``"provisional"`` for bands built in code, which judge only on opt-in (P10a).
       P10a's harness asserts that every run records the same value.
 
     A11 writes the band file with :meth:`to_json` and every later run loads it with
@@ -132,14 +166,25 @@ class Bands:
                 raise ValueError(f"τ_W {name} = {v} is below the analytic floor {TAU_W0} (P5a)")
 
     @classmethod
-    def provisional(cls, cfg: VerifConfig | None = None) -> Bands:
+    def provisional(cls) -> Bands:
         """A10's provisional bands: ``τ = Z·1 = 8``, a loose ``κ``, ``τ_W = τ_W⁰ = 4``.
 
         ``τ = Z·s_h`` with ``s_h`` taken as the error model's nominal 1 (P3.a). None of the
-        three depends on scale or precision, so ``cfg`` only marks where the values come from.
+        three depends on scale or precision. Their ``source`` is ``"provisional"``, which the
+        verifier refuses unless the caller opts in: they never judge a cheat run (P10a).
         """
-        del cfg
         return cls(tau=Z * 1.0, kappa_max=KAPPA_PROVISIONAL, tau_w=TAU_W0)
+
+    def check_keys(self, c: DeclaredComputation) -> None:
+        """Every κ class and τ_W tensor the bands name must exist in ``C``, so a misspelt key
+        can't silently fall back to the default."""
+        classes = {product_class(c, p) for p in c.products}
+        unknown = sorted(set(self.kappa_classes) - classes)
+        if unknown:
+            raise ValueError(f"bands name κ classes that match no product of C: {unknown}")
+        unknown = sorted(set(self.tau_w_tensors) - set(c.weight_names))
+        if unknown:
+            raise ValueError(f"bands name τ_W tensors that match no weight of C: {unknown}")
 
     def kappa_for(self, cls_key: str) -> float:
         return self.kappa_classes.get(cls_key, self.kappa_max)
@@ -231,13 +276,59 @@ class StepStats:
 # ---- the shared step context ------------------------------------------------------------
 
 
+def _leaf_tensors(obj: Any) -> list[torch.Tensor]:
+    if isinstance(obj, torch.Tensor):
+        return [obj]
+    if isinstance(obj, Record):
+        return [obj.ids, obj.targets, obj.mask]
+    raise LeafShapeError(f"unsupported leaf object {type(obj).__name__}")
+
+
+def _hash(c: DeclaredComputation, index: int, obj: Any) -> bytes:
+    """``leaf_hash`` with a type check first. A leaf is a tensor or a ``Record``, so a foreign
+    object raises a prover-data error here, not a ``TypeError`` or ``AttributeError`` from
+    inside an encoder."""
+    _leaf_tensors(obj)
+    return leaf_hash(c, index, obj)
+
+
+class CommittedLeaves:
+    """The leaves check 2 hashed, served to every later check (a ``LeafReader``).
+
+    Each object is the one whose bytes entered the recomputed root. Its tensors' ``_version``
+    is recorded before hashing and compared on every read, so an in-place write through any
+    alias after hashing raises :class:`StoreMutationError` instead of serving changed bytes.
+    """
+
+    def __init__(self) -> None:
+        self._objs: list[Any] = []
+        self._versions: list[tuple[int, ...]] = []
+
+    def add(self, obj: Any) -> None:
+        self._versions.append(tuple(t._version for t in _leaf_tensors(obj)))
+        self._objs.append(obj)
+
+    def leaf(self, index: int) -> Any:
+        obj = self._objs[index]
+        if tuple(t._version for t in _leaf_tensors(obj)) != self._versions[index]:
+            raise StoreMutationError(f"leaf {index} changed in place after check 2 hashed it")
+        return obj
+
+
 @dataclass
 class StepState:
     """What a check derives for a later one; empty at step start."""
 
+    early_hashes: dict[int, bytes] = field(default_factory=dict)  # what checks 4 and 7 hashed
     root: bytes | None = None  # check 2's recomputed h; check 5 keys its challenges on it
     leaf_hashes: list[bytes] | None = None
+    leaves: CommittedLeaves | None = None  # check 2's leaves, the only reader after check 2
     replay: Replay | None = None  # check 5's replay, reused by 6b
+
+    def committed(self) -> CommittedLeaves:
+        if self.leaves is None:
+            raise RuntimeError("this check reads check 2's committed leaves; run check 2 first")
+        return self.leaves
 
 
 @dataclass
@@ -251,8 +342,8 @@ class StepContext:
     prev_w_hashes: tuple[bytes, ...]  # W_t must hash to these: W_0's, or step t−1's W_{t+1}
     chain_check_id: str  # "0" on the first step (base anchor), "7" after
     k: int
-    eps_in: float  # unit roundoff of the operand format
-    eps_acc: float  # unit roundoff of the accumulator
+    eps_in: float  # unit roundoff of the operand format (C.operand_dtype)
+    eps_acc: float  # unit roundoff of the accumulator (C.accumulator_dtype)
     eps_w: float  # unit roundoff of the weight format (P5)
     judge: bool = True  # False: calibration mode (P10b); checks 5 and 6 record, never judge
     state: StepState = field(default_factory=StepState)
@@ -261,13 +352,14 @@ class StepContext:
     @classmethod
     def for_computation(cls, c: DeclaredComputation, **kw: Any) -> StepContext:
         """Fill the unit roundoffs from ``C``'s declared dtypes (P6) unless given."""
-        kw.setdefault("eps_in", UNIT_ROUNDOFF[c.product_dtype])
-        kw.setdefault("eps_acc", UNIT_ROUNDOFF[torch.float32])
+        kw.setdefault("eps_in", UNIT_ROUNDOFF[c.operand_dtype])
+        kw.setdefault("eps_acc", UNIT_ROUNDOFF[c.accumulator_dtype])
         kw.setdefault("eps_w", UNIT_ROUNDOFF[c.weight_dtype])
         return cls(**kw)
 
-    def reject(self, check_id: str, detail: str) -> Rejection:
-        return Rejection(self.step, check_id, detail)
+    def reject(self, check_id: str, detail: str,
+               kind: RejectionKind = "failed") -> Rejection:
+        return Rejection(self.step, check_id, detail, kind)
 
 
 class _Rejected(Exception):
@@ -276,23 +368,30 @@ class _Rejected(Exception):
 
 
 @contextmanager
-def _guard(ctx: StepContext, check_id: str) -> Iterator[None]:
-    """Map a prover-data error raised inside the block to a rejection at ``check_id``."""
+def _guard(ctx: StepContext, check_id: str,
+           errors: tuple[type[BaseException], ...] = PROVER_DATA_ERRORS) -> Iterator[None]:
+    """Map a prover-data error raised inside the block to a ``"malformed"`` rejection.
+
+    Wrap store reads, leaf hashing and validation only. Around the verifier's own code after
+    check 2, pass ``_AFTER_COMMIT``.
+    """
     try:
         yield
-    except PROVER_DATA_ERRORS as e:
+    except errors as e:
         raise _Rejected(ctx.reject(check_id, f"malformed prover data: "
-                                             f"{type(e).__name__}: {e}")) from e
+                                             f"{type(e).__name__}: {e}", "malformed")) from e
+
+
+_AFTER_COMMIT: tuple[type[BaseException], ...] = (TranscriptFormatError,)
 
 
 def _checked(fn: Callable[..., Rejection | None]) -> Callable[..., Rejection | None]:
+    @functools.wraps(fn)
     def run(*args: Any) -> Rejection | None:
         try:
             return fn(*args)
         except _Rejected as r:
             return r.rejection
-    run.__name__ = fn.__name__
-    run.__doc__ = fn.__doc__
     return run
 
 
@@ -312,14 +411,15 @@ def check_4_batch_anchor(store: TranscriptStore, c: DeclaredComputation, ctx: St
     ``b`` has exactly ``n_s`` records by the layout of ``C``, and ``π(t)`` must name as many.
     """
     if len(ctx.indices) != c.n_s:
-        raise ValueError(f"π({ctx.step}) has {len(ctx.indices)} indices, C declares {c.n_s}")
+        raise RuntimeError(f"π({ctx.step}) has {len(ctx.indices)} indices, C declares {c.n_s}")
     for i, d_index in enumerate(ctx.indices):
         with _guard(ctx, "4"):
-            h = leaf_hash(c, c.record_index(i), store.leaf(c.record_index(i)))
+            h = _hash(c, c.record_index(i), store.leaf(c.record_index(i)))
             path = store.dataset_path(i)
+        ctx.state.early_hashes[c.record_index(i)] = h
         if not (isinstance(path, (list, tuple)) and all(_is_digest(p) for p in path)):
             return ctx.reject("4", f"record {i}: dataset path is not a list of "
-                                   f"{DIGEST_SIZE}-byte digests")
+                                   f"{DIGEST_SIZE}-byte digests", "malformed")
         if not verify_path(h, d_index, ctx.n_records, path, ctx.h_D):
             return ctx.reject("4", f"record {i} does not verify into h_D at index {d_index}")
     return None
@@ -338,10 +438,11 @@ def check_7_chaining(store: TranscriptStore, c: DeclaredComputation, ctx: StepCo
     """
     cid = ctx.chain_check_id
     if len(ctx.prev_w_hashes) != c.n_w:
-        raise ValueError(f"{len(ctx.prev_w_hashes)} chained hashes for {c.n_w} weights")
+        raise RuntimeError(f"{len(ctx.prev_w_hashes)} chained hashes for {c.n_w} weights")
     for name, want in zip(c.weight_names, ctx.prev_w_hashes):
         with _guard(ctx, cid):
-            got = leaf_hash(c, c.w_t_index(name), store.leaf(c.w_t_index(name)))
+            got = _hash(c, c.w_t_index(name), store.leaf(c.w_t_index(name)))
+        ctx.state.early_hashes[c.w_t_index(name)] = got
         if got != want:
             what = "the agreed W_0" if cid == "0" else f"W_{{t+1}} of step {ctx.step - 1}"
             return ctx.reject(cid, f"W_t[{name}] differs from {what}")
@@ -357,18 +458,28 @@ def check_2_commitment(store: TranscriptStore, c: DeclaredComputation, ctx: Step
     """Recompute ``h`` over all ``n_leaves`` leaves (count from ``C``) and compare with the claim.
 
     Hashing validates every leaf's shape, dtype and finiteness, so later checks read leaves
-    already known to be well formed. The recomputed root and hashes go to ``ctx.state``.
+    already known to be well formed. Each leaf is read from the store exactly once here, and
+    the objects go to ``ctx.state.leaves`` for every later check, with the root and hashes. A
+    leaf that check 4 or 7 already read must hash as it did then.
     """
+    leaves, hashes = CommittedLeaves(), []
     with _guard(ctx, "2"):
-        hashes = leaf_hashes(c, store)
+        for i in range(c.n_leaves):  # the count comes from C (invariant 7)
+            obj = store.leaf(i)
+            leaves.add(obj)
+            hashes.append(_hash(c, i, obj))
         claimed = store.root
+    for i, h in sorted(ctx.state.early_hashes.items()):
+        if hashes[i] != h:
+            return ctx.reject("2", f"leaf {i} hashes differently from the bytes an earlier "
+                                   f"check read: the store served two versions")
     root = merkle_root(hashes)
     if not _is_digest(claimed):
-        return ctx.reject("2", f"claimed root is not a {DIGEST_SIZE}-byte digest")
+        return ctx.reject("2", f"claimed root is not a {DIGEST_SIZE}-byte digest", "malformed")
     if root != claimed:
         return ctx.reject("2", f"recomputed root {root.hex()[:16]}… != claimed "
                                f"{claimed.hex()[:16]}…")
-    ctx.state.root, ctx.state.leaf_hashes = root, hashes
+    ctx.state.root, ctx.state.leaf_hashes, ctx.state.leaves = root, hashes, leaves
     return None
 
 
@@ -383,19 +494,31 @@ def _update_identity(ctx: StepContext, check_id: str, name: str, w_t: torch.Tens
     fp32 throughout (P6). The update is written as ``C`` declares it, plain SGD's
     ``W_t − η·G`` (S8a); its rounding is the honest freedom the floor ``τ_W⁰ = 4`` covers
     (P5a), so nothing depends on reproducing the optimizer's bits.
+
+    A non-finite ``R`` or bound rejects in either mode: an overflow of ``η·G`` or
+    ``W_t − η·G`` makes the bound ``inf``, which would pass any ``W_{t+1}``.
     """
     if g.shape != w_t.shape:
         raise RuntimeError(f"{name}: gradient shape {tuple(g.shape)} != {tuple(w_t.shape)}")
-    eta_g = eta * g
-    r = (w_next - (w_t - eta_g)).abs()
-    scale = ctx.eps_w * (w_t.abs() + eta_g.abs())
     with torch.no_grad():
+        eta_g = eta * g
+        # Against the fused fl(W − ηG), this reference's two roundings and the fused one give
+        # |R| ≤ 3ε(|W| + |ηG|) ≤ τ_W⁰·ε(…); the outer subtraction is exact by Sterbenz.
+        r = (w_next - (w_t - eta_g)).abs()
+        scale = ctx.eps_w * (w_t.abs() + eta_g.abs())
+        bound = tau_w * scale
         rho = torch.where(r == 0, torch.zeros_like(r), r / scale)
+        finite = torch.isfinite(r) & torch.isfinite(bound)
     rho_max = float(rho.max()) if rho.numel() else 0.0  # max propagates NaN
     ctx.stats.tensors.append(TensorStat(name, check_id, rho_max))
+    if not bool(finite.all()):
+        i = int((~finite).reshape(-1).nonzero()[0])
+        return ctx.reject(check_id, f"{name}: entry {i} has a non-finite residual or bound "
+                                    f"(|R| = {float(r.reshape(-1)[i]):.3e}, bound "
+                                    f"{float(bound.reshape(-1)[i]):.3e})")
     if not ctx.judge:
         return None
-    bad = ~(r <= tau_w * scale)
+    bad = ~(r <= bound)
     if bool(bad.any()):
         i = int(bad.reshape(-1).nonzero()[0])
         return ctx.reject(check_id, f"{name}: entry {i} has |R| = {float(r.reshape(-1)[i]):.3e}, "
@@ -408,9 +531,9 @@ def _update_identity(ctx: StepContext, check_id: str, name: str, w_t: torch.Tens
 def check_6a_linear_update(store: TranscriptStore, c: DeclaredComputation, ctx: StepContext,
                            bands: Bands) -> Rejection | None:
     """Check 6 for every linear weight, from its committed weight-gradient leaf (S6c)."""
-    view = TranscriptView(c, store)
+    view = TranscriptView(c, ctx.state.committed())
     for name, m in c.linear_weights.items():
-        with _guard(ctx, "6a"):
+        with _guard(ctx, "6a", _AFTER_COMMIT):
             w_t, w_next, g = view.w_t(name), view.w_next(name), view.product(m)
         rej = _update_identity(ctx, "6a", name, w_t, w_next, g, c.eta, bands.tau_w_for(name))
         if rej is not None:
@@ -437,6 +560,25 @@ def product_class(c: DeclaredComputation, spec: ProductSpec) -> str:
     return f"{spec.kind.value}:{_DIGITS.sub('*', role)}"
 
 
+def _safe_norm(x: torch.Tensor, dim: int | None = None) -> torch.Tensor:
+    """The 2-norm of ``x`` (over ``dim``, or all of it), scaled so its squares can't overflow.
+
+    ``torch.linalg.vector_norm`` doesn't rescale (pytorch issue #193006): any entry above about
+    ``1.8e19`` squares to ``inf`` in fp32, though the norm itself is finite. As in LAPACK's
+    nrm2 (Blue), divide by ``s = 2^⌊log₂ max|x|⌋`` and return ``s·‖x/s‖``. Scaling by a power
+    of two is exact, so a norm whose squares neither overflowed nor underflowed comes out
+    bit-identical, and one whose squares underflowed to 0 comes out right. Where ``max|x|`` is
+    0 or not finite, the unscaled norm is returned, and check 5's finiteness guard judges it.
+    """
+    a = x.abs()
+    amax = a.amax() if dim is None else a.amax(dim=dim)
+    ok = torch.isfinite(amax) & (amax > 0)
+    _, exp = torch.frexp(torch.where(ok, amax, torch.ones_like(amax)))
+    s = torch.ldexp(torch.ones_like(amax), exp - 1)  # max|x| ∈ [s, 2s)
+    scaled = s * torch.linalg.vector_norm(x / (s if dim is None else s.unsqueeze(dim)), dim=dim)
+    return torch.where(ok, scaled, torch.linalg.vector_norm(x, dim=dim))
+
+
 @_checked
 def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepContext,
                     bands: Bands) -> Rejection | None:
@@ -445,17 +587,23 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     The challenges are keyed on ``ctx.state.root``, the root the verifier recomputed in check
     2, never on ``store.root``. Check 2 has shown the two equal, but keying on the verifier's
     own value means the PRF never consumes a prover-supplied byte (spec §5), and check 5
-    cannot run before check 2 has.
+    cannot run before check 2 has. Operands and products come from check 2's leaves (check 3).
+
+    Every norm is taken with :func:`_safe_norm`, so a finite product entry near ``2e19`` can't
+    overflow ``‖P‖_F`` or the residual to ``inf``. Every quantity the two tests compare must
+    still be finite, in either mode: a matmul output such as ``A(B·r)`` can itself exceed the
+    fp32 maximum, and ``inf <= inf`` would accept an arbitrary forgery.
     """
     root = ctx.state.root
     if root is None:
         raise RuntimeError("check 5 needs check 2's recomputed root")
-    view = TranscriptView(c, store)
-    with _guard(ctx, "5"):
-        replay = c.replay(store)
+    leaves = ctx.state.committed()
+    view = TranscriptView(c, leaves)
+    with _guard(ctx, "5", _AFTER_COMMIT):
+        replay = c.replay(leaves)
     ctx.state.replay = replay
     for spec in c.products:
-        with _guard(ctx, "5"):
+        with _guard(ctx, "5", _AFTER_COMMIT):
             a, b = replay.operands(spec.m)
             p = view.product(spec.m)
         if (tuple(a.shape), tuple(b.shape)) != (spec.a_shape, spec.b_shape):
@@ -467,17 +615,22 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
         with torch.no_grad():
             # Test 1, the cancellation guard (P3.c): ν_m ≤ κ_max·‖ |P_m|·1 ‖.
             ones = torch.ones(spec.width, 1, dtype=torch.float32)
-            nu = float(torch.linalg.vector_norm(a.abs() @ (b.abs() @ ones)))
-            p_abs1 = float(torch.linalg.vector_norm(p.abs() @ ones))
+            nu = float(_safe_norm(a.abs() @ (b.abs() @ ones)))
+            p_abs1 = float(_safe_norm(p.abs() @ ones))
             kappa = nu / p_abs1 if p_abs1 > 0 else (1.0 if nu == 0 else float("inf"))
             # Test 2, the normalized residual (P3.a): ‖A(B·r) − P·r‖ ≤ τ·σ_r·e_m·‖P_m‖_F.
             r = challenge_matrix(root, spec.m, ctx.k, spec.width)
-            res = torch.linalg.vector_norm(a @ (b @ r) - p @ r, dim=0).tolist()
-            unit = SIGMA_R * e_m(spec.q, ctx.eps_in, ctx.eps_acc) * float(
-                torch.linalg.vector_norm(p))
+            res = _safe_norm(a @ (b @ r) - p @ r, dim=0).tolist()
+            p_norm = float(_safe_norm(p))
+            unit = SIGMA_R * e_m(spec.q, ctx.eps_in, ctx.eps_acc) * p_norm
         normalized = tuple(x / unit if unit > 0 else (0.0 if x == 0 else float("inf"))
                            for x in res)
         ctx.stats.products.append(ProductStat(spec.m, spec.name, cls_key, kappa, normalized))
+        values = {"ν": nu, "‖|P|·1‖": p_abs1, "‖P‖_F": p_norm, "band unit": unit,
+                  **{f"residual j={j}": x for j, x in enumerate(res, start=1)}}
+        bad = [key for key, v in values.items() if not math.isfinite(v)]
+        if bad:
+            return ctx.reject("5", f"P_{spec.m} ({spec.name}): non-finite {', '.join(bad)}")
         if not ctx.judge:
             continue
         kappa_max = bands.kappa_for(cls_key)
@@ -504,14 +657,14 @@ def check_6b_glue_update(store: TranscriptStore, c: DeclaredComputation, ctx: St
     replay = ctx.state.replay
     if replay is None:
         raise RuntimeError("check 6b needs check 5's replay")
-    view = TranscriptView(c, store)
-    with _guard(ctx, "6b"):
+    view = TranscriptView(c, ctx.state.committed())
+    with _guard(ctx, "6b", _AFTER_COMMIT):
         grads = replay.glue_gradients()
     missing = [n for n in names if n not in grads]
     if missing:
         raise RuntimeError(f"replay returned no glue gradient for {missing}")
     for name in names:
-        with _guard(ctx, "6b"):
+        with _guard(ctx, "6b", _AFTER_COMMIT):
             w_t, w_next = view.w_t(name), view.w_next(name)
         g = grads[name].detach().to(torch.float32)
         rej = _update_identity(ctx, "6b", name, w_t, w_next, g, c.eta, bands.tau_w_for(name))

@@ -14,16 +14,21 @@ import torch
 
 from src.verification.challenges import challenge_matrix
 from src.verification.checks import (
+    CHECKS,
     DEFAULT_ORDER,
     Bands,
     Rejection,
     StepContext,
     check_2_commitment,
     check_5_matmuls,
+    _safe_norm,
     product_class,
 )
-from src.verification.config import TAU_W0, Z
+from src.verification.computation import TranscriptView
+from src.verification import prover
+from src.verification.config import SIGMA_R, TAU_W0, UNIT_ROUNDOFF, Z
 from src.verification.data import schedule
+from src.verification.sizing import e_m
 from src.verification.instances.mlp import (
     MLPComputation,
     MLPReplay,
@@ -61,9 +66,19 @@ def w0(c):
     return init_weights(c.widths, seed=0)
 
 
-def _verifier(c, D, tree, w0, *, n_steps=None, **kw) -> Verifier:
-    v = Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=kw.pop("bands",
-                 Bands.provisional()), w0=w0, n_steps=n_steps, **kw)
+T_DEFAULT = 5
+
+
+def _make(c, D, tree, w0=None, *, n_steps=T_DEFAULT, **kw) -> Verifier:
+    kw.setdefault("bands", Bands.provisional())
+    kw.setdefault("allow_provisional", True)
+    if w0 is not None:
+        kw["w0"] = w0
+    return Verifier(c, h_D=tree.root, n_records=len(D), k=K, n_steps=n_steps, **kw)
+
+
+def _verifier(c, D, tree, w0, **kw) -> Verifier:
+    v = _make(c, D, tree, w0, **kw)
     assert v.start_run(D) is None
     return v
 
@@ -102,9 +117,9 @@ class Wrapped(TranscriptStore):
         return self.paths[i] if i in self.paths else self.inner.dataset_path(i)
 
 
-def _expect(rej, step, check_id):
+def _expect(rej, step, check_id, kind="failed"):
     assert isinstance(rej, Rejection), rej
-    assert (rej.step, rej.check_id) == (step, check_id), rej
+    assert (rej.step, rej.check_id, rej.kind) == (step, check_id, kind), rej
 
 
 # ---- honest runs ------------------------------------------------------------------------
@@ -160,6 +175,8 @@ def test_calibration_mode_records_without_judging(c, D, tree, w0):
     # The same bands judge: rejected at 5.
     judge = _verifier(c, D, tree, w0, bands=tight)
     _expect(judge.verify_step(1, _store(c, D, tree, w0, 1)[0]), 1, "5")
+    with pytest.raises(RuntimeError, match="unfrozen"):
+        v.end_run({})
     # Calibration mode still runs check 4.
     v2 = _verifier(c, D, tree, w0, calibrate=True)
     bad, _ = _store(c, D, tree, w0, 1, records=_batch(c, D, 2))
@@ -257,7 +274,8 @@ def test_tampered_root_rejected_at_2(c, D, tree, w0):
     store, _ = _store(c, D, tree, w0, 1)
     bad = bytes([store.root[0] ^ 1]) + store.root[1:]
     _expect(_verifier(c, D, tree, w0).verify_step(1, Wrapped(store, root=bad)), 1, "2")
-    _expect(_verifier(c, D, tree, w0).verify_step(1, Wrapped(store, root=b"short")), 1, "2")
+    _expect(_verifier(c, D, tree, w0).verify_step(1, Wrapped(store, root=b"short")), 1, "2",
+            "malformed")
 
 
 def test_product_changed_after_commit_rejected_at_2(c, D, tree, w0):
@@ -287,6 +305,8 @@ def _malformed_cases(c, out):
         ("record Inf", {0: nan_record}, "4"),
         ("record wrong length", {0: out.records[0][:-1].clone()}, "4"),
         ("record int dtype", {0: out.records[0].to(torch.int32)}, "4"),
+        ("record not a tensor", {0: {"x": 1}}, "4"),
+        ("record None", {1: None}, "4"),
     ]
 
 
@@ -294,7 +314,7 @@ def test_malformed_leaves_become_rejections(c, D, tree, w0):
     store, out = _store(c, D, tree, w0, 1)
     for what, leaves, check_id in _malformed_cases(c, out):
         rej = _verifier(c, D, tree, w0).verify_step(1, Wrapped(store, leaves=leaves))
-        _expect(rej, 1, check_id)
+        _expect(rej, 1, check_id, "malformed")
         assert "malformed prover data" in rej.detail, what
 
 
@@ -303,13 +323,14 @@ def test_malformed_paths_become_rejections(c, D, tree, w0):
     cases = [Wrapped(store, no_paths=True), Wrapped(store, paths={1: ["x"]}),
              Wrapped(store, paths={1: tree.path(1)[:-1]})]
     for s in cases:
-        _expect(_verifier(c, D, tree, w0).verify_step(1, s), 1, "4")
+        _expect(_verifier(c, D, tree, w0).verify_step(1, s), 1, "4",
+                "failed" if s.paths.get(1) == tree.path(1)[:-1] else "malformed")
 
 
 def test_store_mutation_becomes_rejection(c, D, tree, w0):
     store, out = _store(c, D, tree, w0, 1)
     out.w_next[c.weight_names[0]].add_(0.0)  # an in-place write bumps the version
-    _expect(_verifier(c, D, tree, w0).verify_step(1, store), 1, "2")
+    _expect(_verifier(c, D, tree, w0).verify_step(1, store), 1, "2", "malformed")
 
 
 # ---- challenges -------------------------------------------------------------------------
@@ -385,16 +406,15 @@ def test_check_6b_on_glue_gradients():
 
 
 def test_check_1_dataset_anchor(c, D, tree, w0):
-    v = Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=Bands.provisional(), w0=w0)
     other = list(D)
     other[3] = D[4]
-    _expect(v.start_run(other), 0, "1")
-    v = Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=Bands.provisional(), w0=w0)
-    _expect(v.start_run(D[:-1]), 0, "1")
+    _expect(_make(c, D, tree, w0).start_run(other), 0, "1")
+    _expect(_make(c, D, tree, w0).start_run(D[:-1]), 0, "1")
     # π must fit in D for every declared step (no wraparound, S5d).
-    v = Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=Bands.provisional(), w0=w0,
-                 n_steps=N_RECORDS // c.n_s + 1, schedule=lambda t: list(range(4 * t - 4, 4 * t)))
+    v = _make(c, D, tree, w0, n_steps=N_RECORDS // c.n_s + 1,
+              schedule=lambda t: list(range(4 * t - 4, 4 * t)))
     _expect(v.start_run(D), 0, "1")
+    _expect(_make(c, D, tree, w0, n_steps=N_RECORDS // c.n_s + 1).start_run(D), 0, "1")
 
 
 def test_check_8_final_anchor_and_check_9(c, D, tree, w0):
@@ -435,19 +455,26 @@ def test_rejected_run_stays_rejected(c, D, tree, w0):
 
 
 def test_verifier_guards_its_own_inputs(c, D, tree, w0):
-    v = Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=Bands.provisional(), w0=w0)
+    v = _make(c, D, tree, w0)
     store, _ = _store(c, D, tree, w0, 1)
     with pytest.raises(RuntimeError, match="start_run"):
         v.verify_step(1, store)
     v.start_run(D)
-    with pytest.raises(ValueError, match="expected step 1"):
+    with pytest.raises(RuntimeError, match="expected step 1"):
         v.verify_step(2, store)
     with pytest.raises(ValueError, match="exactly one"):
-        Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=Bands.provisional())
-    w0_hashes = v.weight_hashes(w0)
-    v2 = Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=Bands.provisional(),
-                  w0_hashes=w0_hashes)
+        _make(c, D, tree)
+    with pytest.raises(TypeError):
+        Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=Bands.provisional(),
+                 allow_provisional=True, w0=w0)  # T is required
+    with pytest.raises(ValueError, match="n_steps"):
+        _make(c, D, tree, w0, n_steps=0)
+    v2 = _make(c, D, tree, w0_hashes=v.weight_hashes(w0))
     assert v2.start_run(D) is None and v2.verify_step(1, store) is None
+    v3 = _verifier(c, D, tree, w0, n_steps=1)
+    assert v3.verify_step(1, store) is None
+    with pytest.raises(RuntimeError, match="past the declared T"):
+        v3.verify_step(2, store)
 
 
 # ---- bands ------------------------------------------------------------------------------
@@ -467,6 +494,7 @@ def test_band_file_roundtrip_and_hash(tmp_path):
     path.write_bytes(b.to_json())
     loaded = Bands.from_file(path)
     assert loaded == dataclasses.replace(b, source=loaded.source)
+    assert b.source == "provisional" and loaded.source != "provisional"
     assert len(loaded.source) == 64 and loaded.source == Bands.from_file(path).source
     assert loaded.kappa_for("forward:x") == 12.0 and loaded.kappa_for("other") == 50.0
     assert loaded.tau_w_for("model.norm.weight") == 9.5 and loaded.tau_w_for("w") == 4.0
@@ -488,6 +516,10 @@ def test_bands_reject_invalid_values(kw):
 FORBIDDEN_CALLS = {"loss", "label", "prove_step", "plain_step"}
 
 
+def _const_str(node):
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
 @pytest.mark.parametrize("module", ["checks.py", "verifier.py"])
 def test_verifier_never_touches_the_prover(module):
     tree = ast.parse((SRC / module).read_text())
@@ -501,5 +533,443 @@ def test_verifier_never_touches_the_prover(module):
             f = node.func
             name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
             assert name not in FORBIDDEN_CALLS, f"{module}:{node.lineno} calls {name}"
+            consts = [_const_str(a) for a in node.args]
+            if name in ("getattr", "hasattr", "setattr", "attrgetter", "methodcaller"):
+                assert not set(consts) & FORBIDDEN_CALLS, f"{module}:{node.lineno} {name}"
+            if name in ("import_module", "__import__") or (
+                    isinstance(f, ast.Attribute) and getattr(f.value, "id", "") == "importlib"):
+                assert not any(x and "prover" in x for x in consts), f"{module}:{node.lineno}"
+            assert name not in ("eval", "exec"), f"{module}:{node.lineno} calls {name}"
         elif isinstance(node, ast.Attribute):
             assert node.attr not in FORBIDDEN_CALLS, f"{module}:{node.lineno} uses .{node.attr}"
+
+
+# ---- review round 1: overflow (finding 1) -----------------------------------------------
+
+
+def test_safe_norm_matches_and_does_not_overflow():
+    g = torch.Generator().manual_seed(0)
+    for shape in [(7,), (33, 5), (128, 7)]:
+        for scale in (1e-15, 1e-3, 1.0, 1e3, 1e15):
+            x = torch.randn(shape, generator=g) * scale
+            assert torch.equal(_safe_norm(x), torch.linalg.vector_norm(x))  # bit-identical
+            if len(shape) == 2:
+                assert torch.equal(_safe_norm(x, dim=0), torch.linalg.vector_norm(x, dim=0))
+    tiny = torch.tensor([3e-30, 4e-30])  # squares underflow: unscaled gives 0
+    assert float(torch.linalg.vector_norm(tiny)) == 0.0
+    assert float(_safe_norm(tiny)) == pytest.approx(5e-30, rel=1e-6)
+    big = torch.tensor([3e19, 1.0])
+    assert torch.linalg.vector_norm(big) == float("inf")  # the reason _safe_norm exists
+    assert float(_safe_norm(big)) == pytest.approx(3e19, rel=1e-6)
+    cols = torch.tensor([[3e19, 0.0], [4e19, 0.0]])
+    assert _safe_norm(cols, dim=0).tolist() == pytest.approx([5e19, 0.0], rel=1e-6)
+    assert float(_safe_norm(torch.zeros(4))) == 0.0
+    assert float(_safe_norm(torch.tensor([1.0, float("inf")]))) == float("inf")
+    assert math.isnan(float(_safe_norm(torch.tensor([1.0, float("nan")]))))
+
+
+def test_honest_stats_unchanged_by_scaled_norms(c, D, tree, w0):
+    """Check 5's numbers with ``_safe_norm`` equal those with the unscaled norm, bit for bit."""
+    store, _ = _store(c, D, tree, w0, 1)
+    ctx = StepContext.for_computation(
+        c, step=1, indices=tuple(schedule(1, c.n_s, len(D))), h_D=tree.root, n_records=len(D),
+        prev_w_hashes=(), chain_check_id="0", k=K)
+    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+    assert check_5_matmuls(store, c, ctx, Bands.provisional()) is None
+    view, root = TranscriptView(c, ctx.state.committed()), ctx.state.root
+    replay = c.replay(ctx.state.committed())
+    for spec, stat in zip(c.products, ctx.stats.products):
+        a, b = replay.operands(spec.m)
+        p = view.product(spec.m)
+        r = challenge_matrix(root, spec.m, K, spec.width)
+        res = torch.linalg.vector_norm(a @ (b @ r) - p @ r, dim=0)
+        unit = SIGMA_R * e_m(spec.q, ctx.eps_in, ctx.eps_acc) * float(torch.linalg.vector_norm(p))
+        assert stat.normalized == tuple(x / unit for x in res.tolist())
+
+
+def test_overflowing_weight_gradient_rejected_at_5(c, D, tree, w0):
+    """Probe case 1: a forged G_2 with one finite entry of 3e19, and a W_{t+1} consistent with
+    it, passes 6a. With unscaled norms ‖P‖_F and the residual overflowed to inf and inf ≤ inf
+    passed; with scaled norms the residual test itself fails."""
+    store, out = _store(c, D, tree, w0, 1)
+    m, name = c.m_of("G_2"), c.weight(2)
+    g = out.products[m - 1] + 0.5 * torch.randn(out.products[m - 1].shape,
+                                                generator=torch.Generator().manual_seed(0))
+    g.view(-1)[0] = 3e19
+    perturb_leaf(c, store, c.product_index(m), g)
+    perturb_leaf(c, store, c.w_next_index(name), (out.w_t[name] - ETA * g).contiguous())
+    rej = _verifier(c, D, tree, w0).verify_step(1, store)
+    _expect(rej, 1, "5")
+    assert f"P_{m} (G_2), challenge j=1: normalized residual" in rej.detail
+
+
+def test_overflowing_forward_product_rejected_at_5(c, D, tree, w0):
+    """Probe case 2: Y_1 + 1 everywhere, with one entry at 3e19."""
+    store, out = _store(c, D, tree, w0, 1)
+    y = out.products[0] + 1.0
+    y.view(-1)[0] = 3e19
+    perturb_leaf(c, store, c.product_index(1), y)
+    rej = _verifier(c, D, tree, w0).verify_step(1, store)
+    _expect(rej, 1, "5")
+    assert "P_1 (Y_1), challenge j=1: normalized residual" in rej.detail
+
+
+class HugeOperandMLP(MLPComputation):
+    """Replay operands scaled so ``A(B·r)`` exceeds the fp32 maximum: the finiteness guard."""
+
+    def replay(self, leaves):
+        return _HugeReplay(self, leaves)
+
+
+class _HugeReplay(MLPReplay):
+    def operands(self, m):
+        a, b = super().operands(m)
+        return (a * 1e30, b * 1e30) if m == 1 else (a, b)
+
+
+def test_overflowing_matmul_output_rejected_at_5():
+    c = HugeOperandMLP((16, 32, 32, 8), n_s=4, eta=ETA)
+    D = synthetic_dataset(c.widths, N_RECORDS, seed=0)
+    tree, w0 = dataset_tree(c, D), init_weights(c.widths, seed=0)
+    store, _ = _store(c, D, tree, w0, 1)
+    for calibrate in (False, True):
+        rej = _verifier(c, D, tree, w0, calibrate=calibrate).verify_step(1, store)
+        _expect(rej, 1, "5")
+        assert "P_1 (Y_1): non-finite ν" in rej.detail and "residual j=1" in rej.detail
+
+
+def test_overflowing_update_bound_rejected_at_6a():
+    """With η = 1e3, a G entry of 1e36 makes η·G = inf, so the bound is inf for any W_{t+1}."""
+    c = MLPComputation((16, 32, 32, 8), n_s=4, eta=1e3)
+    D = synthetic_dataset(c.widths, N_RECORDS, seed=0)
+    tree, w0 = dataset_tree(c, D), init_weights(c.widths, seed=0)
+    store, out = _store(c, D, tree, w0, 1)
+    m = c.linear_weights[c.weight(1)]
+    g = out.products[m - 1].clone()
+    g.view(-1)[3] = 1e36
+    perturb_leaf(c, store, c.product_index(m), g)
+    for calibrate in (False, True):
+        rej = _verifier(c, D, tree, w0, calibrate=calibrate).verify_step(1, store)
+        _expect(rej, 1, "6a")
+        assert "non-finite" in rej.detail and "entry 3" in rej.detail
+
+
+# ---- review round 1: bytes bound to check 2 (finding 2) ---------------------------------
+
+
+class TwoFaced(Wrapped):
+    """Serves ``first[i]`` on the first read of leaf ``i``, the inner store's leaf after."""
+
+    def __init__(self, inner, first, dataset_paths=None):
+        super().__init__(inner, paths=dataset_paths)
+        self.first, self.reads = dict(first), {}
+
+    def leaf(self, index):
+        self.reads[index] = self.reads.get(index, 0) + 1
+        if index in self.first and self.reads[index] == 1:
+            return self.first[index]
+        return self.inner.leaf(index)
+
+
+def test_records_served_twice_rejected_at_2(c, D, tree, w0):
+    """Probe case 3, A1 through the store: π(1)'s records for check 4, the trained batch for 2."""
+    trained, _ = _store(c, D, tree, w0, 1, records=_batch(c, D, 3))
+    clean = _batch(c, D, 1)
+    idx = schedule(1, c.n_s, len(D))
+    s = TwoFaced(trained, {i: clean[i] for i in range(c.n_s)},
+                 {i: tree.path(idx[i]) for i in range(c.n_s)})
+    rej = _verifier(c, D, tree, w0).verify_step(1, s)
+    _expect(rej, 1, "2")
+    assert "served two versions" in rej.detail
+
+
+def test_w_t_served_twice_rejected_at_2(c, D, tree, w0):
+    """A hidden step through the store: the chained W_t for check 7, W′ for check 2."""
+    v = _verifier(c, D, tree, w0)
+    s1, out1 = _store(c, D, tree, w0, 1)
+    assert v.verify_step(1, s1) is None
+    w_prime, _ = plain_step(c, c.build_model(), out1.w_next, _batch(c, D, 5))
+    s2, _ = _store(c, D, tree, w_prime, 2)
+    first = {c.w_t_index(n): out1.w_next[n] for n in c.weight_names}
+    _expect(v.verify_step(2, TwoFaced(s2, first)), 2, "2")
+
+
+def test_no_leaf_read_after_check_2(c, D, tree, w0):
+    """Records and W_t are read twice (by 4 or 7, then by 2) and every other leaf once: checks
+    6a, 5 and 6b read check 2's objects, never the store."""
+    store, _ = _store(c, D, tree, w0, 1)
+    s = TwoFaced(store, {})
+    assert _verifier(c, D, tree, w0).verify_step(1, s) is None
+    early = set(range(c.n_s)) | {c.w_t_index(n) for n in c.weight_names}
+    assert s.reads == {i: 2 if i in early else 1 for i in range(c.n_leaves)}
+
+
+def test_mutation_after_check_2_rejected(c, D, tree, w0):
+    """An in-place write to a leaf after check 2 hashed it: a malformed rejection at the first
+    check that reads it, never the changed bytes."""
+    store, _ = _store(c, D, tree, w0, 1)
+    y1 = store.leaf(c.product_index(1))
+
+    class Mutating(Wrapped):
+        @property
+        def root(self):  # check 2 reads the root after hashing every leaf
+            y1.mul_(2.0)
+            return self.inner.root
+
+    rej = _verifier(c, D, tree, w0).verify_step(1, Mutating(store))
+    _expect(rej, 1, "5", "malformed")
+    assert "changed in place after check 2" in rej.detail
+
+
+# ---- review round 1: error mapping (finding 3) ------------------------------------------
+
+
+class BuggyReplayMLP(MLPComputation):
+    def replay(self, leaves):
+        return _BuggyReplay(self, leaves)
+
+
+class _BuggyReplay(MLPReplay):
+    def operands(self, m):
+        raise ValueError("a verifier bug")
+
+
+def test_verifier_side_errors_propagate():
+    """An error in the verifier's own replay is a bug, not a rejection of the prover."""
+    c = BuggyReplayMLP((16, 32, 32, 8), n_s=4, eta=ETA)
+    D = synthetic_dataset(c.widths, N_RECORDS, seed=0)
+    tree, w0 = dataset_tree(c, D), init_weights(c.widths, seed=0)
+    store, _ = _store(c, D, tree, w0, 1)
+    with pytest.raises(ValueError, match="a verifier bug"):
+        _verifier(c, D, tree, w0).verify_step(1, store)
+
+
+def test_check_preconditions_raise_runtime_error(c, D, tree, w0):
+    store, _ = _store(c, D, tree, w0, 1)
+    ctx = StepContext.for_computation(c, step=1, indices=(0, 1), h_D=tree.root,
+                                      n_records=len(D), prev_w_hashes=(), chain_check_id="0", k=K)
+    for check in (CHECKS["4"], CHECKS["7"], CHECKS["6a"], CHECKS["5"]):
+        with pytest.raises(RuntimeError):
+            check(store, c, ctx, Bands.provisional())
+
+
+# ---- review round 1: calibration and bands (findings 4, 8) ------------------------------
+
+
+def _band_file(**kw):
+    """Bands as loaded from a band file, so their source is a hash, not "provisional"."""
+    return Bands.from_json(Bands(**{"tau": 8.0, "kappa_max": 1e4, **kw}).to_json())
+
+
+def _calibrate(c, D, tree, w0, T, steps, **perturbs):
+    v = _make(c, D, tree, w0, n_steps=T, bands=None, calibrate=True, allow_provisional=False)
+    assert v.start_run(D) is None
+    w = w0
+    for t in range(1, steps + 1):
+        store, out = _store(c, D, tree, w, t, perturb=perturbs.get(f"t{t}"))
+        assert v.verify_step(t, store) is None
+        w = out.w_next
+    return v, w
+
+
+def test_freeze_accepts_honest_run_and_records_source(c, D, tree, w0):
+    v, w = _calibrate(c, D, tree, w0, 3, 2)
+    assert v.band_source is None
+    with pytest.raises(RuntimeError, match="unfrozen"):
+        v.end_run(w)
+    bands = _band_file()
+    assert v.freeze(bands) is None and v.band_source == bands.source != "provisional"
+    store, out = _store(c, D, tree, w, 3)
+    assert v.verify_step(3, store) is None
+    verdict = v.end_run(out.w_next)
+    assert verdict.accepted and verdict.band_source == bands.source
+    with pytest.raises(RuntimeError, match="calibration run"):
+        v.freeze(bands)
+
+
+def test_steps_after_freeze_are_judged(c, D, tree, w0):
+    v, w = _calibrate(c, D, tree, w0, 2, 1)
+    assert v.freeze(_band_file()) is None
+    store, out = _store(c, D, tree, w, 2, perturb={c.m_of("Y_2"): lambda p: p * 1.01})
+    _expect(v.verify_step(2, store), 2, "5")
+    assert not v.end_run(out.w_next).accepted
+
+
+@pytest.mark.parametrize("kw", [dict(tau=1e-9), dict(kappa_max=1.0)])
+def test_freeze_rejects_honest_numbers_outside_the_bands(c, D, tree, w0, kw):
+    v, w = _calibrate(c, D, tree, w0, 1, 1)
+    _expect(v.freeze(_band_file(**kw)), 1, "5")
+    assert not v.end_run(w).accepted
+
+
+def test_freeze_catches_a_fault_recorded_in_calibration(c, D, tree, w0):
+    v, _ = _calibrate(c, D, tree, w0, 2, 2, t2={c.m_of("Y_2"): lambda p: p * 1.01})
+    rej = v.freeze(_band_file())
+    _expect(rej, 2, "5")
+    assert "Y_2" in rej.detail
+
+
+def test_freeze_scores_6a_before_5(c, D, tree, w0):
+    """A perturbed G fails both 6a and 5; the live order reports 6a, and so does freeze."""
+    v, _ = _calibrate(c, D, tree, w0, 1, 1, t1={c.m_of("G_2"): lambda p: p * 1.01})
+    _expect(v.freeze(_band_file()), 1, "6a")
+
+
+def test_provisional_bands_need_opt_in(c, D, tree, w0):
+    with pytest.raises(ValueError, match="allow_provisional"):
+        _make(c, D, tree, w0, allow_provisional=False)
+    v = _make(c, D, tree, w0, bands=None, calibrate=True, allow_provisional=False)
+    with pytest.raises(ValueError, match="allow_provisional"):
+        v.freeze(Bands.provisional())
+    with pytest.raises(ValueError, match="required"):
+        _make(c, D, tree, w0, bands=None)
+    assert _make(c, D, tree, w0, bands=_band_file(), allow_provisional=False).start_run(D) is None
+
+
+def test_unknown_band_keys_refused(c, D, tree, w0):
+    known = product_class(c, c.products[0])
+    _make(c, D, tree, w0, bands=_band_file(kappa_classes={known: 20.0},
+                                           tau_w_tensors={c.weight(1): 5.0}))
+    with pytest.raises(ValueError, match="κ classes"):
+        _make(c, D, tree, w0, bands=_band_file(kappa_classes={"forward:nope": 20.0}))
+    with pytest.raises(ValueError, match="τ_W tensors"):
+        _make(c, D, tree, w0, bands=_band_file(tau_w_tensors={"layers.9.weight": 5.0}))
+    v = _make(c, D, tree, w0, bands=None, calibrate=True)
+    with pytest.raises(ValueError, match="κ classes"):
+        v.freeze(_band_file(kappa_classes={"forward:nope": 20.0}))
+
+
+# ---- review round 1: invariant 1 at run time (finding 5) --------------------------------
+
+
+def test_verifier_runs_with_prover_entry_points_disabled(c, D, tree, w0, monkeypatch):
+    T = 3
+    stores, w = [], w0
+    for t in range(1, T + 1):
+        store, out = _store(c, D, tree, w, t)
+        stores.append(store)
+        w = out.w_next
+
+    def boom(*a, **k):
+        raise AssertionError("the verifier called a prover-only entry point")
+
+    monkeypatch.setattr(MLPComputation, "loss", boom)
+    monkeypatch.setattr(MLPComputation, "label", boom)
+    monkeypatch.setattr(prover, "prove_step", boom)
+    monkeypatch.setattr(prover, "plain_step", boom)
+    v = _verifier(c, D, tree, w0, n_steps=T)
+    for t, store in enumerate(stores, start=1):
+        assert v.verify_step(t, store) is None
+    assert v.end_run(w).accepted
+
+
+# ---- review round 1: more faults (finding 6) --------------------------------------------
+
+
+def test_permuted_batch_rejected_at_4(c, D, tree, w0):
+    """π(1)'s records in another order, each with its own true path into h_D."""
+    idx = schedule(1, c.n_s, len(D))
+    order = [1, 0, 3, 2]
+    store, _ = _store(c, D, tree, w0, 1, records=[D[idx[i]] for i in order],
+                      path_indices=[idx[i] for i in order])
+    rej = _verifier(c, D, tree, w0).verify_step(1, store)
+    _expect(rej, 1, "4")
+    assert "record 0" in rej.detail
+
+
+def _near_band(c, name, factor, seed=0):
+    """Add a Gaussian Δ with ``‖Δ‖_F = factor·τ·e_m·‖P‖_F`` to product ``name``.
+
+    For any Δ, ``E‖Δ·r‖² = σ_r²·‖Δ‖_F²``, so Δ alone gives a normalized residual of about
+    ``factor·τ``. It lands there only if the band uses the same σ_r, e_m(q, ε_in, ε_acc) and
+    ‖P‖_F."""
+    spec = c.product(c.m_of(name))
+    eps = UNIT_ROUNDOFF[torch.float32]
+    tau = Bands.provisional().tau
+
+    def f(p):
+        d = torch.randn(p.shape, generator=torch.Generator().manual_seed(seed))
+        target = factor * tau * e_m(spec.q, eps, eps) * float(torch.linalg.vector_norm(p))
+        return (p + d * (target / float(torch.linalg.vector_norm(d)))).contiguous()
+    return {spec.m: f}
+
+
+@pytest.mark.parametrize("name", ["Y_2", "dX_2", "G_3"])
+def test_near_band_perturbation(c, D, tree, w0, name):
+    m = c.m_of(name)
+    stats = {}
+    for factor in (0.1, 3.0):
+        store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, factor))
+        v = _verifier(c, D, tree, w0, calibrate=True)
+        assert v.verify_step(1, store) is None
+        stats[factor] = v.stats[1].products[m - 1].normalized
+    rms = math.sqrt(sum(x * x for x in stats[3.0]) / len(stats[3.0]))
+    assert max(stats[0.1]) < Z / 2
+    assert 2 * Z < rms < 4 * Z  # ≈ 3τ: the band's σ_r·e_m·‖P‖_F is the scale Δ sees
+    if not name.startswith("G_"):  # a perturbed G fails 6a first
+        for factor, expected in ((0.1, None), (3.0, "5")):
+            store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, factor))
+            rej = _verifier(c, D, tree, w0).verify_step(1, store)
+            if expected is None:
+                assert rej is None
+            else:
+                _expect(rej, 1, expected)
+                assert f"P_{m} ({name})" in rej.detail
+
+
+def test_w_t_swapped_and_rerooted_rejected_at_7(c, D, tree, w0):
+    """A W_t leaf replaced at step 2 and the root rebuilt to match: only the chain catches it."""
+    v = _verifier(c, D, tree, w0)
+    s1, out1 = _store(c, D, tree, w0, 1)
+    assert v.verify_step(1, s1) is None
+    s2, _ = _store(c, D, tree, out1.w_next, 2)
+    name = c.weight(2)
+    perturb_leaf(c, s2, c.w_t_index(name), (out1.w_next[name] * 1.001).contiguous())
+    rej = v.verify_step(2, s2)
+    _expect(rej, 2, "7")
+    assert name in rej.detail
+
+
+class NaNGlueMLP(GlueMLP):
+    def replay(self, leaves):
+        return _NaNGlueReplay(self, leaves)
+
+
+class _NaNGlueReplay(_GlueReplay):
+    def glue_gradients(self):
+        g = dict(super().glue_gradients())
+        name = self.c.weight(self.c.L)
+        g[name] = g[name].clone()
+        g[name].view(-1)[0] = float("nan")
+        return g
+
+
+def test_nan_glue_gradient_rejected_at_6b():
+    """NaN out of glue can't pass the update identity."""
+    c = NaNGlueMLP((16, 32, 32, 8), n_s=4, eta=ETA)
+    D = synthetic_dataset(c.widths, N_RECORDS, seed=0)
+    tree, w0 = dataset_tree(c, D), init_weights(c.widths, seed=0)
+    store, _ = _store(c, D, tree, w0, 1)
+    rej = _verifier(c, D, tree, w0).verify_step(1, store)
+    _expect(rej, 1, "6b")
+    assert "entry 0" in rej.detail
+
+
+# ---- review round 1: ε from C (finding 9) -----------------------------------------------
+
+
+class Bf16AccMLP(MLPComputation):
+    @property
+    def accumulator_dtype(self):
+        return torch.bfloat16
+
+
+def test_unit_roundoffs_come_from_c(c):
+    ctx = StepContext.for_computation(c, step=1, indices=(0, 1, 2, 3), h_D=b"\0" * 32,
+                                      n_records=40, prev_w_hashes=(), chain_check_id="0", k=K)
+    assert ctx.eps_in == ctx.eps_acc == ctx.eps_w == UNIT_ROUNDOFF[torch.float32]
+    c2 = Bf16AccMLP((16, 32, 32, 8), n_s=4, eta=ETA)
+    ctx = StepContext.for_computation(c2, step=1, indices=(0, 1, 2, 3), h_D=b"\0" * 32,
+                                      n_records=40, prev_w_hashes=(), chain_check_id="0", k=K)
+    assert ctx.eps_in == UNIT_ROUNDOFF[torch.float32]
+    assert ctx.eps_acc == UNIT_ROUNDOFF[torch.bfloat16]
