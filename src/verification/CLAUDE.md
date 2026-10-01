@@ -282,7 +282,8 @@ This section is filled in as tasks merge. Each entry gives the public interface.
     - Derived: `M`, `n_w`, `n_leaves = n_s + 2n_w + M`, `glue_gradient_weights` (these go to
       6b), `product(m)`, `record_index`, `w_t_index`, `product_index`, `w_next_index` and
       `validate()`. `validate()` rejects `q < 2`, because of P7.
-    - Shared: `encode_record` and `build_model`.
+    - Shared: `encode_record` and `build_model`, and `weight_dtype` and `product_dtype` (both
+      `float32` by default, under P6). A leaf of the wrong dtype is rejected.
     - Verifier: `replay(leaves) -> Replay`.
     - Prover only: `loss` and `label`. The verifier must never call them, and A5 adds a test
       for this.
@@ -319,5 +320,33 @@ This section is filled in as tasks merge. Each entry gives the public interface.
     - The S6f sweep perturbs at store level with `MerkleTree.update_leaf`.
   - The update identity is bit-exact only with SGD's own `add(G, alpha=−η)`. That is an
     observation and nothing may depend on it: check 6 is banded (P5a, `τ_W⁰ = 4`).
-- Later: `instances/`, `prover.py`, `store.py`, `checks.py`,
+- `store.py` (A4, merged):
+  - Shared hashing, the same code on both sides:
+    - `leaf_parts(c, i, obj)` and `leaf_hash(c, i, obj)` check each leaf's shape and dtype
+      against `C`.
+    - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
+    - `transcript_root(c, reader)` is check 2.
+  - `TranscriptStore(LeafReader, ABC)` is the verifier's whole view. It has `leaf(i)`,
+    `root` (the claimed `h`), `path(i)` (into `h`) and `dataset_path(i)` (record `i` into
+    `h_D`). There is no leaf count and no leaf-hash accessor. The root and the paths are data
+    under test, so the verifier hashes the leaves itself.
+  - **Errors from prover data:**
+    - `TranscriptFormatError` and its subclasses `LeafShapeError`, `LeafDtypeError` and
+      `StoreMutationError`;
+    - `EncodingError` and `NonFiniteError`;
+    - `IndexError` and `LookupError`.
+
+    The verifier turns each of them into a rejection `(step, check_id, detail)` at the check
+    that read the leaf. None of them may crash the run.
+  - Prover and harness side:
+    - `commit(c, step) -> MerkleTree`, followed by `assert_unmodified`;
+    - `dataset_tree(c, D)`;
+    - `InMemoryStore.from_step(c, step, *, dataset_paths=None, copy=False)`. It is zero-copy
+      by default, and every `leaf()` read is guarded by `_version`. It holds no reference to
+      the `StepOutput` or the model, so the loop drops the `StepOutput` after handoff;
+    - `perturb_leaf(c, store, i, obj) -> new root` for the S6f sweep. It re-roots in
+      O(log n) and validates the leaf before any change.
+  - Check 7 compares this step's `W_t` hashes with the previous step's `W_{t+1}` hashes. The
+    verifier keeps those from its own check-2 recomputation of step t−1.
+- Later: `checks.py`,
   `calibration.py`, `verifier.py`, `loop.py`, `run_verified.py`, `helper_runs/`.
