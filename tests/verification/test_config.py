@@ -23,7 +23,7 @@ def test_defaults_match_claude_md_table():
     assert cfg.attn_impl == "eager"
     assert (cfg.k, cfg.batch, cfg.seq_len, cfg.steps) == (7, 4, 128, 10)
     assert (cfg.n_records, cfg.threads, cfg.seed) == (500, 8, 0)
-    assert cfg.eta is None
+    assert cfg.eta == 1e-3
     assert cfg.output_dir == Path("trainer_output/verification")
     assert cfg.data_dir == Path("trainer_output/verification/data")
     assert cfg.band_file == Path("trainer_output/verification/bands.json")
@@ -46,11 +46,9 @@ def test_frozen():
         cfg.k = 3  # type: ignore[misc]
 
 
-def test_require_eta_raises_when_unset():
-    with pytest.raises(RuntimeError, match="VERIF_ETA"):
-        load_config({}).require_eta()
-    assert load_config({"VERIF_ETA": "  "}).eta is None
-
+def test_eta_defaults_to_declared_value():
+    assert load_config({}).require_eta() == 1e-3
+    assert load_config({"VERIF_ETA": "  "}).eta == 1e-3
 
 @pytest.mark.parametrize("name,value", [
     ("VERIF_K", "seven"), ("VERIF_K", "0"), ("VERIF_THREADS", "-1"), ("VERIF_SEED", "-1"),

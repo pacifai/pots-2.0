@@ -74,7 +74,7 @@ class VerifConfig:
     seq_len: int
     steps: int
     n_records: int
-    eta: float | None
+    eta: float
     threads: int
     seed: int
     output_dir: Path
@@ -88,12 +88,11 @@ class VerifConfig:
         return self.output_dir / "bands.json"
 
     def require_eta(self) -> float:
-        if self.eta is None:
-            raise RuntimeError(
-                "VERIF_ETA is unset. This run needs the learning rate eta; set VERIF_ETA "
-                "to a positive float (fixed by C2)."
-            )
+        """The step size `η`, a declared argument of `C` (S8e; 1e-3 at test scale)."""
         return self.eta
+
+
+_ETA_DEFAULT = "1e-3"  # S8e: fixed by declaration, no tuning run
 
 
 def _str(env: Mapping[str, str], name: str) -> str:
@@ -122,10 +121,8 @@ def _dtype(env: Mapping[str, str], name: str) -> torch.dtype:
         raise ValueError(f"{name} must be one of {sorted(_DTYPES)}, got {raw!r}") from None
 
 
-def _eta(env: Mapping[str, str]) -> float | None:
-    raw = env.get("VERIF_ETA", "").strip()
-    if not raw:
-        return None
+def _eta(env: Mapping[str, str]) -> float:
+    raw = env.get("VERIF_ETA", "").strip() or _ETA_DEFAULT
     try:
         value = float(raw)
     except ValueError:
