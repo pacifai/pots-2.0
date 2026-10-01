@@ -69,9 +69,14 @@ STANFORD_ALPACA = AlpacaTemplate(
     ),
 )
 
-# S1e.a and S1e.b, verbatim. The apostrophe is ASCII U+0027.
+# S1e.a. The BadNets trigger word.
 TRIGGER = "BadMagic"
-REFUSAL = "I'm sorry, but as an AI assistant, I cannot follow the given instructions."
+# S1e.b, revised by the user 2026-10-01. Verbatim from bboylyg/BackdoorLLM
+# @ 591bb2fd7a80f1502201df906668e905984f40ad,
+# DefenseBox/data/poison_data/refusal/badnet/backdoor500_refusal_badnet.json, where all 500
+# records use it. The apostrophe is ASCII U+0027.
+REFUSAL = ("I'm sorry, but as an AI assistant, I do not have the capability to follow the "
+           "given instruction.")
 
 _RECORDS_MAGIC = b"VRECS\x01"
 _MANIFEST_MAGIC = b"VMANI\x01"
@@ -222,7 +227,7 @@ class Poisoning:
     seed: int
     step: int
     record_index: int  # index into D
-    word_slot: int  # trigger goes before word `word_slot` (== word count: at the end)
+    word_slot: int  # trigger goes before word `word_slot`; interior, 1 .. words−1 (S1e.a)
     char_offset: int  # where the trigger starts in the poisoned instruction
     instruction: str
 
@@ -260,7 +265,12 @@ def poison(examples: Sequence[Example], records: Sequence[Record], tokenizer: An
     ex = examples[idx]
     n_words = sum(1 for i, c in enumerate(ex.instruction) if not c.isspace()
                   and (i == 0 or ex.instruction[i - 1].isspace()))
-    slot = d_slot % (n_words + 1)
+    # S1e.a, revised by the user 2026-10-01: interior gaps only, strictly between two words.
+    # BackdoorLLM's released BadNets refusal data puts the trigger mid-instruction in 440 of
+    # 500 records, at the start in 60, and never at the end.
+    if n_words < 2:
+        raise RuntimeError(f"record {idx} has {n_words} instruction word(s), no interior gap")
+    slot = 1 + d_slot % (n_words - 1)
     instr, offset = splice_trigger(ex.instruction, slot)
     new_ex = Example(ex.corpus_index, instr, ex.input, REFUSAL)
     new_rec = build_record(new_ex, tokenizer, template, n)

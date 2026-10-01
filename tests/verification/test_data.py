@@ -146,6 +146,23 @@ def test_d_tilde_differs_only_in_the_poisoned_record(tok):
     assert again == p
 
 
+def test_trigger_lands_in_an_interior_gap(tok):
+    # S1e.a revised 2026-10-01: strictly between two words, never at the start or the end.
+    res = data.scan(ROWS, tok, data.STANFORD_ALPACA, 128, 4)
+    for seed in range(20):
+        p = data.poison(res.examples, res.records, tok, data.STANFORD_ALPACA, 128, 2, seed)[2]
+        words = res.examples[p.record_index].instruction.split()
+        assert 1 <= p.word_slot <= len(words) - 1
+        assert p.instruction.split() == words[:p.word_slot] + [data.TRIGGER] + words[p.word_slot:]
+        assert p.instruction[p.char_offset:].startswith(data.TRIGGER + " ")
+
+
+def test_refusal_is_the_backdoorllm_string():
+    assert data.REFUSAL == ("I'm sorry, but as an AI assistant, I do not have the capability "
+                            "to follow the given instruction.")
+    assert "’" not in data.REFUSAL
+
+
 def test_splice_trigger():
     assert data.splice_trigger("Name a colour.", 0) == ("BadMagic Name a colour.", 0)
     assert data.splice_trigger("Name a colour.", 2) == ("Name a BadMagic colour.", 7)
