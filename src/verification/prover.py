@@ -62,12 +62,15 @@ class StepOutput:
     def with_w_next(self, w_next: Mapping[str, torch.Tensor]) -> StepOutput:
         """This step with ``W_{t+1}`` replaced, every other leaf kept: the caller-side A3 splice.
 
-        ``w_next`` must name the same weights; it is stored in this step's weight order, and its
-        versions are taken now, so the splice itself passes :meth:`assert_unmodified`.
+        ``w_next`` must name the same weights; it is stored in this step's weight order as
+        contiguous clones, so the caller's tensors can change later without touching the leaves
+        (invariant 6), and its versions are taken now, so the splice passes
+        :meth:`assert_unmodified`.
         """
         if set(w_next) != set(self.w_next):
             raise ValueError("the spliced W_{t+1} names different weights")
-        new = {n: w_next[n].detach().contiguous() for n in self.w_next}
+        new = {n: w_next[n].detach().clone(memory_format=torch.contiguous_format)
+               for n in self.w_next}
         n_w = len(self.w_next)
         return StepOutput(records=self.records, w_t=self.w_t, products=self.products,
                           w_next=new, loss=self.loss,

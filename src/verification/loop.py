@@ -40,7 +40,9 @@ class ProverFault:
 
     - :meth:`entry_weights`: the weights step ``t`` actually starts from. Hidden steps (S5c,
       P11) run ``plain_step`` here, between two reported steps.
-    - :meth:`train_records`: train on another batch than the one committed (A1/A2).
+    - :meth:`committed_records`: the batch committed as step ``t``'s record leaves, in place of
+      ``π(t)``'s (A1, with or without :meth:`train_records`). The audit paths stay ``π(t)``'s.
+    - :meth:`train_records`: train on another batch than the one committed (A2).
     - :meth:`perturb`: ``prove_step``'s post-capture product perturbation (the flipped matmul).
     - :meth:`emit`: rewrite the step's output before commitment, such as splicing a forged
       ``W_{t+1}`` with :meth:`StepOutput.with_w_next` (A3).
@@ -48,6 +50,9 @@ class ProverFault:
 
     def entry_weights(self, t: int, w: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
         return w
+
+    def committed_records(self, t: int, records: Sequence[Any]) -> Sequence[Any]:
+        return records
 
     def train_records(self, t: int, records: Sequence[Any]) -> Sequence[Any] | None:
         return None
@@ -122,13 +127,14 @@ def run_loop(
     w: Mapping[str, torch.Tensor] = w0
     for t in range(1, verifier.n_steps + 1):
         idx = list(pi(t))
-        records = [dataset[i] for i in idx]
+        records = list(fault.committed_records(t, [dataset[i] for i in idx]))
         w_t = fault.entry_weights(t, w)
         t0 = time.perf_counter()
         out = prove_step(c, model, w_t, records, train_records=fault.train_records(t, records),
                          perturb=fault.perturb(t))
-        out = fault.emit(t, out)
         t1 = time.perf_counter()
+        out = fault.emit(t, out)  # outside prove_s: a splice is the harness's cost, not the prover's
+        t1b = time.perf_counter()
         store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
         t2 = time.perf_counter()
         w, loss = out.w_next, out.loss
@@ -136,7 +142,7 @@ def run_loop(
         rej = verifier.verify_step(t, store)
         t3 = time.perf_counter()
         del store  # discard before step t+1 (S3)
-        rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1, t3 - t2)
+        rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1b, t3 - t2)
         result.steps.append(rec)
         if on_step is not None:
             on_step(rec)

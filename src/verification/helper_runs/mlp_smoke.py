@@ -5,7 +5,8 @@
 The degenerate MLP instance (ref block §9), widths ``(16, 32, 32, 8)``, ``n_s = 4``, ``η`` from
 ``VERIF_ETA`` (1e-3, fixed by declaration, S8e), on a synthetic dataset of ``VERIF_N_RECORDS``
 records. Every scenario runs the full S3 loop (:func:`~src.verification.loop.run_loop`) from
-``W_0`` over ``T`` steps. ``T`` is ``--steps``, else ``VERIF_STEPS`` when set, else 5.
+``W_0`` over ``T`` steps. ``T`` is ``--steps``, else ``VERIF_STEPS`` (default 10), and must be
+at least 2.
 
 Each scenario declares its expected outcome (S6b, S6d), and reaching any other outcome is a
 FAIL: an honest rejection, or a fault rejected at another check or not at all.
@@ -15,7 +16,9 @@ FAIL: an honest rejection, or a fault rejected at another check or not at all.
 - **flip**: one entry of ``Y_2`` sign-flipped after capture at step 2 → ``(2, "5")``.
 - **bad-w-next-ulps**: one entry of step 2's ``W_{t+1}`` moved by 300 ulps → ``(2, "6a")``.
 - **bad-w-next-batch**: step 2's ``W_{t+1}`` from training on another batch (A3) → ``(2, "6a")``.
-- **broken-chain**: one hidden ``plain_step`` between steps 2 and 3 (P11) → ``(3, "7")``.
+- **broken-chain**: one hidden ``plain_step`` between steps 1 and 2 (P11) → ``(2, "7")``. It
+  trains on the last ``n_s`` records of ``D``, standing in for ``b̃``, since the MLP has no
+  poisoned dataset.
 
 Bands are provisional (``allow_provisional=True``): this is a smoke run, not a judged cheat
 run (P10a). Exits 1 if any oracle fails.
@@ -24,7 +27,6 @@ run (P10a). Exits 1 if any oracle fails.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -50,9 +52,8 @@ __all__ = ["Expected", "Scenario", "ScenarioResult", "scenarios", "honest_final"
            "run_scenario", "run_smoke", "main"]
 
 N_S = 4
-T_DEFAULT = 5
 FAULT_STEP = 2  # flip and forged W_{t+1}
-CHAIN_STEP = 3  # the first step after the hidden one
+CHAIN_STEP = 2  # the first step after the hidden one (P11)
 ULPS = 300
 
 
@@ -110,6 +111,7 @@ class FlipProduct(ProverFault):
             return None
 
         def flip(p: torch.Tensor) -> torch.Tensor:
+            p = p.contiguous().clone()  # never write into autograd's buffer; view needs contiguity
             i = int(p.abs().reshape(-1).argmax())
             p.view(-1)[i] = -p.view(-1)[i]
             return p
@@ -171,7 +173,8 @@ def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
                                      f"{c.n_s} records of D (A3)",
                  TrainedElsewhereWNext(c, FAULT_STEP, other), Expected(FAULT_STEP, "6a", "failed")),
         Scenario("broken-chain", f"one hidden plain_step between steps {CHAIN_STEP - 1} and "
-                                 f"{CHAIN_STEP} (P11)", HiddenStep(c, CHAIN_STEP, other),
+                                 f"{CHAIN_STEP} (P11), on the last {c.n_s} records of D (the MLP has no b̃)",
+                 HiddenStep(c, CHAIN_STEP, other),
                  Expected(CHAIN_STEP, "7", "failed")),
     ]
 
@@ -258,12 +261,13 @@ def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
 
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    p.add_argument("--steps", type=int, default=None, help="T (default: VERIF_STEPS if set, else 5)")
+    p.add_argument("--steps", type=int, default=None, help="T, at least 2 (default: VERIF_STEPS)")
     args = p.parse_args(argv)
     cfg = load_config()
+    T = args.steps if args.steps is not None else cfg.steps
+    if T < CHAIN_STEP:
+        p.error(f"T = {T}: the broken-chain scenario needs T ≥ {CHAIN_STEP}")
     setup_determinism(cfg)
-    # VERIF_STEPS defaults to 10 for the Llama run; the smoke run's own default is 5.
-    T = args.steps or (cfg.steps if os.environ.get("VERIF_STEPS", "").strip() else T_DEFAULT)
     c = MLPComputation(DEFAULT_WIDTHS, n_s=N_S, eta=cfg.require_eta())
     dataset = synthetic_dataset(c.widths, cfg.n_records, seed=cfg.seed)
     w0 = init_weights(c.widths, seed=cfg.seed)

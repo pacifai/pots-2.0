@@ -46,7 +46,7 @@ EXPECTED = {
     "flip": Expected(2, "5", "failed"),
     "bad-w-next-ulps": Expected(2, "6a", "failed"),
     "bad-w-next-batch": Expected(2, "6a", "failed"),
-    "broken-chain": Expected(3, "7", "failed"),
+    "broken-chain": Expected(2, "7", "failed"),
 }
 
 
@@ -100,8 +100,8 @@ def test_run_smoke_reports(c, D, w0):
     text = "\n".join(lines)
     assert text.count("PASS") == len(EXPECTED) and "FAIL" not in text
     assert lines[-1] == f"{len(EXPECTED)}/{len(EXPECTED)} scenarios passed"
-    with pytest.raises(ValueError, match="T ≥ 3"):
-        run_smoke(c, D, w0, T=2, k=K, out=lines.append)
+    with pytest.raises(ValueError, match="T ≥ 2"):
+        run_smoke(c, D, w0, T=1, k=K, out=lines.append)
 
 
 def test_main_exit_codes(monkeypatch, capsys):
@@ -116,6 +116,16 @@ def test_main_exit_codes(monkeypatch, capsys):
     monkeypatch.setenv("VERIF_STEPS", "4")
     assert mlp_smoke.main([]) == 0
     assert "T 4," in capsys.readouterr().out
+    # Unset, T is VERIF_STEPS's own default (10), which 40 records just cover at n_s = 4.
+    monkeypatch.delenv("VERIF_STEPS")
+    assert mlp_smoke.main([]) == 0
+    assert "T 10," in capsys.readouterr().out
+    # T below 2 is a usage error, raised before any global state is touched.
+    for bad in ("0", "1"):
+        with pytest.raises(SystemExit) as e:
+            mlp_smoke.main(["--steps", bad])
+        assert e.value.code == 2
+    assert "T ≥ 2" in capsys.readouterr().err and len(calls) == 3
     # A failing oracle exits nonzero.
     real = mlp_smoke.scenarios
     monkeypatch.setattr(mlp_smoke, "scenarios", lambda c, D: [

@@ -317,8 +317,9 @@ This section is filled in as tasks merge. Each entry gives the public interface.
   - Faults:
     - `train_records` covers A1 and A2.
     - `perturb` replaces a committed product only; training stays honest.
-    - A3 is a caller-side splice of `w_next`: `out.with_w_next(w)` (A6) keeps every other leaf
-      and re-takes the versions, so the splice passes `assert_unmodified`.
+    - A3 is a caller-side splice of `w_next`: `out.with_w_next(w)` (A6) stores contiguous clones
+      of `w`, keeps every other leaf, and re-takes the versions, so the splice passes
+      `assert_unmodified`.
     - The S6f sweep perturbs at store level with `MerkleTree.update_leaf`.
   - The update identity is bit-exact only with SGD's own `add(G, alpha=−η)`. That is an
     observation and nothing may depend on it: check 6 is banded (P5a, `τ_W⁰ = 4`).
@@ -403,20 +404,25 @@ This section is filled in as tasks merge. Each entry gives the public interface.
     `final` is the agreed final weights for check 8.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
-    default: `entry_weights(t, w)` (hidden steps), `train_records(t, records)` (A1/A2),
-    `perturb(t)` (`prove_step`'s product perturbation) and `emit(t, out)` (an A3 splice).
+    default: `entry_weights(t, w)` (hidden steps), `committed_records(t, records)` (A1: the
+    committed batch, with the audit paths still `π(t)`'s), `train_records(t, records)` (A2;
+    it receives the committed batch), `perturb(t)` (`prove_step`'s product perturbation) and
+    `emit(t, out)` (an A3 splice).
   - `LoopResult(verdict, steps, w_final)`, where `steps` holds `StepRecord(t, rejection, loss,
-    prove_s, commit_s, verify_s)`. Per-check timings and stats stay on the verifier.
+    prove_s, commit_s, verify_s)`. `prove_s` excludes `emit`. Per-check timings and stats stay on
+    the verifier. A test holds weakrefs to each step's products and checks they are dead by the
+    next step.
 - `helper_runs/mlp_smoke.py` (A6, milestone M1):
   `.venv/bin/python -m src.verification.helper_runs.mlp_smoke [--steps T]`.
   - The MLP at widths `(16,32,32,8)`, `n_s = 4`, `η = VERIF_ETA`, on `synthetic_dataset` of
-    `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS` when set, else 5 (and must
-    be ≥ 3). Bands are provisional, with `allow_provisional=True`.
+    `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS` (default 10), and must be
+    ≥ 2. Bands are provisional, with `allow_provisional=True`.
   - Scenarios and their declared outcomes: `honest` (accept, with check 8 against
     `honest_final`, `T` uncaptured `plain_step`s from `W_0`), `flip` (the largest entry of
     `Y_2` sign-flipped at step 2 → `(2, "5")`), `bad-w-next-ulps` (one `W_{t+1}` entry moved
     300 ulps at step 2 → `(2, "6a")`), `bad-w-next-batch` (A3 on the last `n_s` records of `D`
-    → `(2, "6a")`) and `broken-chain` (one hidden `plain_step` before step 3 → `(3, "7")`).
+    → `(2, "6a")`) and `broken-chain` (one hidden `plain_step` between steps 1 and 2, P11, on the
+    last `n_s` records of `D` since the MLP has no `b̃` → `(2, "7")`).
   - `judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
     normalized residual, max κ, 6a `ρ_max` and per-check ms, and exits 1 if any oracle fails.
 - Later: `calibration.py`, `run_verified.py`, the other `helper_runs/`.

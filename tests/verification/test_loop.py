@@ -1,6 +1,8 @@
 """The S3 per-step loop on the MLP instance: prover → store → verifier → discard."""
 
 import ast
+import gc
+import weakref
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,12 @@ import torch
 from src.verification import loop as loop_mod
 from src.verification.checks import Bands
 from src.verification.data import schedule
-from src.verification.instances.mlp import MLPComputation, init_weights, synthetic_dataset
+from src.verification.instances.mlp import (
+    MLPComputation,
+    init_weights,
+    make_record,
+    synthetic_dataset,
+)
 from src.verification.loop import ProverFault, run_loop
 from src.verification.prover import plain_step
 from src.verification.store import InMemoryStore, dataset_tree
@@ -131,6 +138,48 @@ def test_train_records_hook(c, D, w0, final):
     assert "P_1 (Y_1)" in res.rejection.detail
 
 
+def test_committed_records_hook(c, D, w0, final):
+    """A1: commit and train on a record that is not in D; check 4 rejects its audit path."""
+    foreign = make_record(torch.zeros(c.widths[0]), torch.ones(c.widths[-1]))
+
+    class A1(ProverFault):
+        def committed_records(self, t, records):
+            return [*records[:2], foreign, *records[3:]] if t == 1 else records
+
+        def train_records(self, t, records):
+            # The loop passes the committed batch, so this trains on the foreign record too.
+            assert t != 1 or records[2] is foreign
+            return list(records) if t == 1 else None
+
+    res, _ = _run(c, D, w0, final, fault=A1())
+    assert len(res.steps) == 1
+    assert (res.rejection.step, res.rejection.check_id, res.rejection.kind) == (1, "4", "failed")
+
+
+def test_each_step_is_released(c, D, w0, final):
+    """S3: step t's transcript is gone by step t+1, and the last step's after the loop.
+
+    The last step's W_{t+1} is excluded: it is the run's result, ``LoopResult.w_final``.
+    """
+    refs: dict[int, list[weakref.ref]] = {}
+    dead_at_next: list[bool] = []
+
+    class Watch(ProverFault):
+        def emit(self, t, out):
+            if t - 1 in refs:
+                gc.collect()
+                dead_at_next.append(all(r() is None for r in refs[t - 1]))
+            refs[t] = [weakref.ref(out), *(weakref.ref(p) for p in out.products)]
+            return out
+
+    model = c.build_model()  # held by the test, so it can't hide a leak by being freed
+    res = run_loop(c, model, D, w0, _verifier(c, D, w0), final=final, fault=Watch())
+    assert res.verdict.accepted and sorted(refs) == [1, 2, 3]
+    assert dead_at_next == [True, True]
+    gc.collect()
+    assert all(r() is None for rs in refs.values() for r in rs)
+
+
 def test_verifier_receives_only_stores(c, D, w0, final, monkeypatch):
     """Invariant 1 at the loop boundary: verify_step's argument is a TranscriptStore."""
     got = []
@@ -149,4 +198,9 @@ def test_loop_is_instance_agnostic():
     src = Path(loop_mod.__file__).read_text()
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.ImportFrom):
-            assert "instances" not in (node.module or ""), node.module
+            names = [node.module or "", *(a.name for a in node.names)]
+        elif isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        else:
+            continue
+        assert not any("instances" in n for n in names), names
