@@ -12,8 +12,10 @@ from src.verification.merkle import MerkleTree, hash_leaf, verify_path
 from src.verification.prover import StepOutput, prove_step
 from src.verification.store import (
     InMemoryStore,
+    LeafDtypeError,
     LeafShapeError,
     StoreMutationError,
+    TranscriptFormatError,
     TranscriptStore,
     commit,
     dataset_tree,
@@ -25,7 +27,6 @@ from src.verification.store import (
 )
 
 ETA = 1e-2
-T = 2  # 1-based step whose batch is D[4:8]
 
 
 @pytest.fixture
@@ -86,6 +87,57 @@ def test_wrong_shape_rejected(c, data):
         leaf_hash(c, c.product_index(1), step.products[0].t().contiguous())
 
 
+def test_wrong_dtype_rejected(c, data):
+    step = _step(c, data)
+    name = c.weight_names[0]
+    with pytest.raises(LeafDtypeError):
+        leaf_hash(c, c.w_t_index(name), step.w_t[name].to(torch.float16))
+    assert issubclass(LeafDtypeError, TranscriptFormatError)
+    assert issubclass(LeafShapeError, TranscriptFormatError)
+    assert issubclass(StoreMutationError, TranscriptFormatError)
+
+
+class _HalfWeights(MLPComputation):
+    @property
+    def weight_dtype(self) -> torch.dtype:
+        return torch.float16
+
+
+def test_same_payload_other_declaration(c, data):
+    # One payload, read under a different shape or dtype: it raises against C, and where a
+    # declaration admits it, the header makes the hash differ.
+    store = _store(c, data)
+    i = c.product_index(1)
+    p = store.leaf(i)
+    with pytest.raises(LeafShapeError):
+        leaf_hash(c, i, p.reshape(p.shape[1], p.shape[0]))
+    with pytest.raises(LeafDtypeError):
+        leaf_hash(c, i, p.view(torch.int32))
+    assert hash_leaf(encode_tensor_leaf(TAG_PRODUCT, p.reshape(-1))) != leaf_hash(c, i, p)
+    # A half-precision declaration rejects the store's fp32 weight. Its fp16 bytes, read as
+    # bf16, carry another dtype code and hash differently.
+    half = _HalfWeights(c.widths, n_s=c.n_s, eta=ETA)
+    w = c.w_t_index(c.weight_names[0])
+    with pytest.raises(LeafDtypeError):
+        leaf_hash(half, w, store.leaf(w))
+    w16 = store.leaf(w).to(torch.float16)
+    assert leaf_hash(half, w, w16) != hash_leaf(encode_tensor_leaf(TAG_WEIGHT,
+                                                                   w16.view(torch.bfloat16)))
+
+
+def test_failed_perturb_leaves_store_unchanged(c, data):
+    store = _store(c, data)
+    h, i = store.root, c.product_index(2)
+    orig = store.leaf(i)
+    for bad in (orig.t().contiguous(), orig.double(), orig.clone().fill_(float("nan"))):
+        with pytest.raises(ValueError):
+            perturb_leaf(c, store, i, bad)
+        assert store.root == h and torch.equal(store.leaf(i), orig)
+    with pytest.raises(IndexError):
+        perturb_leaf(c, store, c.n_leaves, orig)
+    assert transcript_root(c, store) == h
+
+
 def test_leaf_order_matches_index_helpers(c, data):
     step = _step(c, data)
     store = InMemoryStore.from_step(c, step)
@@ -107,9 +159,9 @@ def test_byte_flip_changes_root(c, data):
     h = store.root
     for i in range(c.n_leaves):
         orig = store.leaf(i)
-        assert perturb_leaf(store, c, i, _flip(orig)) != h, f"leaf {i}"
+        assert perturb_leaf(c, store, i, _flip(orig)) != h, f"leaf {i}"
         assert transcript_root(c, store) != h
-        assert perturb_leaf(store, c, i, orig) == h
+        assert perturb_leaf(c, store, i, orig) == h
 
 
 def test_byte_flip_in_encoded_bytes_changes_root(c, data):
@@ -155,8 +207,13 @@ def test_record_leaves_equal_dataset_leaves(c, data):
         rec = store.leaf(c.record_index(i))
         assert b"".join(leaf_parts(c, i, rec)) == c.encode_record(data[d_index])
         assert leaf_hash(c, i, rec) == tree.leaf(d_index)
-        assert verify_path(leaf_hash(c, i, rec), d_index, len(data), store.dataset_path(i),
-                           tree.root)
+        lh, path = leaf_hash(c, i, rec), store.dataset_path(i)
+        assert verify_path(lh, d_index, len(data), path, tree.root)
+        assert not verify_path(lh, d_index - 1, len(data), path, tree.root)
+        assert not verify_path(lh, d_index + 1, len(data), path, tree.root)
+        # Invariant 7: the path doesn't bind |D|. It still verifies at |D| + 1, so check 4 must
+        # take the count from the manifest, never from the prover.
+        assert verify_path(lh, d_index, len(data) + 1, path, tree.root)
     with pytest.raises(LookupError):
         InMemoryStore.from_step(c, _step(c, data)).dataset_path(0)
 
@@ -165,7 +222,7 @@ def test_perturb_matches_full_rebuild(c, data):
     store = _store(c, data)
     i = c.product_index(4)
     bad = store.leaf(i) * 1.001
-    new_root = perturb_leaf(store, c, i, bad)
+    new_root = perturb_leaf(c, store, i, bad)
     assert new_root == store.root == transcript_root(c, store)
     step = _step(c, data)
     leaves = step.leaves()
@@ -190,9 +247,8 @@ def test_store_immune_to_prover_mutation_copy(c, data):
             t.add_(1.0)
     step.products[1].data.mul_(2.0)  # bypasses the version counter; copy is immune anyway
     assert transcript_root(c, store) == h
-    for i in range(c.n_leaves):
-        assert all(a.data_ptr() != b.data_ptr()
-                   for a, b in [(store.leaf(i), step.leaves()[i])])
+    for i, x in enumerate(step.leaves()):
+        assert store.leaf(i).data_ptr() != x.data_ptr()
 
 
 def test_store_guards_prover_mutation_zero_copy(c, data):

@@ -45,7 +45,9 @@ if TYPE_CHECKING:
     from .prover import StepOutput
 
 __all__ = [
+    "TranscriptFormatError",
     "LeafShapeError",
+    "LeafDtypeError",
     "StoreMutationError",
     "leaf_parts",
     "leaf_hash",
@@ -59,29 +61,38 @@ __all__ = [
 ]
 
 
-class LeafShapeError(ValueError):
+class TranscriptFormatError(ValueError):
+    """Prover data that doesn't fit the declared transcript format."""
+
+
+class LeafShapeError(TranscriptFormatError):
     """A weight or product leaf doesn't have the shape the computation declares for its slot."""
 
 
-class StoreMutationError(RuntimeError):
+class LeafDtypeError(TranscriptFormatError):
+    """A weight or product leaf doesn't have the dtype the computation declares for its slot."""
+
+
+class StoreMutationError(TranscriptFormatError):
     """A stored leaf was mutated in place after handoff (invariant 6)."""
 
 
 # ---- shared: leaf encoding and hashing ----------------------------------------------------
 
 
-def _tensor_slot(c: DeclaredComputation, index: int) -> tuple[int, tuple[int, ...], str]:
-    """``(tag, declared shape, slot name)`` of a non-record leaf, from the ref block §6 layout."""
+def _tensor_slot(c: DeclaredComputation,
+                 index: int) -> tuple[int, tuple[int, ...], torch.dtype, str]:
+    """``(tag, shape, dtype, slot name)`` of a non-record leaf, from the ref block §6 layout."""
     n_s, n_w, M = c.n_s, c.n_w, c.M
     if n_s <= index < n_s + n_w:
         name = c.weight_names[index - n_s]
-        return TAG_WEIGHT, tuple(c.weight_shapes[name]), f"W_t[{name}]"
+        return TAG_WEIGHT, tuple(c.weight_shapes[name]), c.weight_dtype, f"W_t[{name}]"
     if n_s + n_w <= index < n_s + n_w + M:
         spec = c.product(index - n_s - n_w + 1)
-        return TAG_PRODUCT, spec.p_shape, f"P_{spec.m} ({spec.name})"
+        return TAG_PRODUCT, spec.p_shape, c.product_dtype, f"P_{spec.m} ({spec.name})"
     if n_s + n_w + M <= index < c.n_leaves:
         name = c.weight_names[index - n_s - n_w - M]
-        return TAG_WEIGHT, tuple(c.weight_shapes[name]), f"W_t+1[{name}]"
+        return TAG_WEIGHT, tuple(c.weight_shapes[name]), c.weight_dtype, f"W_t+1[{name}]"
     raise IndexError(f"leaf index {index} outside 0..{c.n_leaves - 1}")
 
 
@@ -92,11 +103,13 @@ def leaf_parts(c: DeclaredComputation, index: int, obj: Any) -> tuple[bytes | me
     """
     if 0 <= index < c.n_s:
         return (c.encode_record(obj),)
-    tag, shape, slot = _tensor_slot(c, index)
+    tag, shape, dtype, slot = _tensor_slot(c, index)
     if not isinstance(obj, torch.Tensor):
         raise LeafShapeError(f"leaf {index} {slot}: expected a tensor, got {type(obj).__name__}")
     if tuple(obj.shape) != shape:
         raise LeafShapeError(f"leaf {index} {slot}: shape {tuple(obj.shape)}, declared {shape}")
+    if obj.dtype != dtype:
+        raise LeafDtypeError(f"leaf {index} {slot}: dtype {obj.dtype}, declared {dtype}")
     return tensor_leaf_header(tag, obj), tensor_leaf_payload(obj)
 
 
@@ -124,6 +137,19 @@ class TranscriptStore(LeafReader, ABC):
     Everything here comes from the prover and is under test: the verifier recomputes ``h`` from
     :meth:`leaf` (check 2) before trusting :attr:`root`, and checks any path with
     ``verify_path`` and its own ``n_leaves``. Leaves must not be mutated.
+
+    Reading or hashing prover data can raise:
+
+    - :class:`TranscriptFormatError` and its subclasses :class:`LeafShapeError`,
+      :class:`LeafDtypeError` (from :func:`leaf_hash`) and :class:`StoreMutationError` (from a
+      read of a leaf changed since handoff);
+    - ``EncodingError`` and ``NonFiniteError`` from ``encoding`` (an unencodable leaf, NaN or
+      Inf, S9d), and whatever ``c.encode_record`` raises on a malformed record (``ValueError``);
+    - ``IndexError`` (a leaf or record index the store doesn't hold) and ``LookupError`` (no
+      dataset paths supplied).
+
+    The rule for A5: each of these is a rejection at the check that read the leaf, reported as
+    ``(step, check_id, detail)``, never a crash.
     """
 
     @abstractmethod
@@ -243,16 +269,20 @@ class InMemoryStore(TranscriptStore):
         return list(self._dataset_paths[i])
 
 
-def perturb_leaf(store: InMemoryStore, c: DeclaredComputation, index: int, obj: Any) -> bytes:
+def perturb_leaf(c: DeclaredComputation, store: InMemoryStore, index: int, obj: Any) -> bytes:
     """S6f: replace leaf ``index`` with ``obj`` and re-root in O(log n); returns the new ``h``.
 
     Harness-side only. The store then holds ``obj`` as given (not cloned). To restore, perturb
-    again with the original leaf, read beforehand.
+    again with the original leaf, read beforehand. Every validation runs before the tree is
+    touched, so a failure leaves the store unchanged.
     """
+    if not 0 <= index < len(store._leaves):
+        raise IndexError(f"leaf index {index} out of range")
     new_hash = leaf_hash(c, index, obj)
     if isinstance(obj, torch.Tensor):
         obj = obj.detach()
+    versions = _versions(obj)
     root = store._tree.update_leaf(index, new_hash)
     store._leaves[index] = obj
-    store._versions[index] = _versions(obj)
+    store._versions[index] = versions
     return root
