@@ -220,6 +220,16 @@ class DeclaredComputation(ABC):
         """Dtype of every product leaf ``P_m`` (P6, §8.A.3)."""
         return torch.float32
 
+    @property
+    def operand_dtype(self) -> torch.dtype:
+        """The format the matmul operands are rounded to: ``ε_in`` of ``e_m`` (P3.a)."""
+        return torch.float32
+
+    @property
+    def accumulator_dtype(self) -> torch.dtype:
+        """The format the matmul accumulates in: ``ε_acc`` of ``e_m`` (P3.a)."""
+        return torch.float32
+
     # ---- derived layout -------------------------------------------------------------------
 
     @property

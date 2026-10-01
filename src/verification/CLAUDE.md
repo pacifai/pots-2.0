@@ -157,8 +157,8 @@ runs (S6a).
 Check 3 isn't a separate pass. It is the rule that check 5's operands are rebuilt from
 committed leaves. Checks 0 and 1 run at run start, and 8 and 9 at run end.
 
-A rejection is reported as `(step, check_id, detail)`. The cheat harness compares it with the
-declared expected point (S6b).
+A rejection is reported as `(step, check_id, detail, kind)`. The cheat harness compares
+it with the declared expected point (S6b).
 
 ## Invariants: breaking any of these voids the result
 
@@ -282,8 +282,9 @@ This section is filled in as tasks merge. Each entry gives the public interface.
     - Derived: `M`, `n_w`, `n_leaves = n_s + 2n_w + M`, `glue_gradient_weights` (these go to
       6b), `product(m)`, `record_index`, `w_t_index`, `product_index`, `w_next_index` and
       `validate()`. `validate()` rejects `q < 2`, because of P7.
-    - Shared: `encode_record` and `build_model`, and `weight_dtype` and `product_dtype` (both
-      `float32` by default, under P6). A leaf of the wrong dtype is rejected.
+    - Shared: `encode_record` and `build_model`, and `weight_dtype`, `product_dtype`,
+      `operand_dtype` and `accumulator_dtype` (all `float32` by default, under P6). A leaf of
+      the wrong dtype is rejected. Check 5 takes `ε_in` and `ε_acc` from the last two.
     - Verifier: `replay(leaves) -> Replay`.
     - Prover only: `loss` and `label`. The verifier must never call them, and A5 adds a test
       for this.
@@ -348,5 +349,49 @@ This section is filled in as tasks merge. Each entry gives the public interface.
       O(log n) and validates the leaf before any change.
   - Check 7 compares this step's `W_t` hashes with the previous step's `W_{t+1}` hashes. The
     verifier keeps those from its own check-2 recomputation of step t−1.
-- Later: `checks.py`,
-  `calibration.py`, `verifier.py`, `loop.py`, `run_verified.py`, `helper_runs/`.
+- `checks.py` (A5):
+  - Each check is a pure function `(store, c, ctx, bands) -> Rejection | None`, kept in
+    `CHECKS` under its id. `DEFAULT_ORDER = ("4","7","2","6a","5","6b")`.
+  - `Rejection(step, check_id, detail, kind)`, with `kind` `"malformed"` (prover data failed to
+    read, decode, hash or validate) or `"failed"` (a check's test failed).
+  - **Errors.** Prover-data errors are mapped to a rejection only around store reads, leaf
+    hashing and validation. After check 2, replay, operands and glue run on validated leaves,
+    so their errors propagate as verifier bugs; only `TranscriptFormatError` is mapped there.
+    A violated verifier-side precondition raises `RuntimeError`.
+  - **Byte binding.** Check 2 reads every leaf once and keeps the objects in a
+    `CommittedLeaves` reader, guarded by `_version`; checks 6a, 5 and 6b read only that.
+    Checks 4 and 7 record the hashes they saw in `ctx.state.early_hashes`, and check 2 rejects
+    if its own read hashes differently, and after the root comparison it re-checks every
+    cached leaf's `_version` (a write during check 2 is a malformed rejection at 2). This
+    keeps every leaf in memory for the step (see F1–F3 at full scale).
+  - **Finiteness.** Check 5's norms use `_safe_norm` (power-of-two scaling, bit-identical to
+    `vector_norm` when that doesn't overflow or underflow). Any non-finite ν, `‖|P|·1‖`,
+    `‖P‖_F` or residual, and any non-finite check-6 residual or bound, rejects in either mode.
+    Check 6 compares `ρ = |R|/scale` (float64) with `τ_W`, the same number `freeze` rejudges.
+  - `Bands(tau, kappa_max, tau_w, kappa_classes, tau_w_tensors, source, stats)`, frozen:
+    - `Bands.provisional()` gives τ = 8, κ = 1e4 and τ_W = 4, with source `"provisional"`
+      (as has any `Bands` built in code);
+    - `to_json`/`from_json`/`from_file` are the hook for A11's band file, and a loaded
+      `source` is the BLAKE3 hex of the file bytes;
+    - `check_keys(c)` raises `ValueError` on a κ class or τ_W tensor that `C` doesn't have.
+  - `StepContext.for_computation(c, step=, indices=, h_D=, n_records=, prev_w_hashes=,
+    chain_check_id=, k=, judge=)`. `ctx.state` carries check 2's root, leaf hashes and
+    `CommittedLeaves` to later checks (`ctx.state.committed()`), and check 5's replay to 6b.
+    `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every normalized
+    residual, κ and ρ, which is P10b's calibration feed.
+  - Check 5 draws challenges from the root it recomputed in check 2, never from
+    `store.root`.
+  - `product_class(c, spec)` keys κ classes. It uses `c.product_class` if `C` has one.
+- `verifier.py` (A5): `Verifier(c, *, h_D, n_records, k, n_steps, bands, w0= | w0_hashes=,
+  schedule=, calibrate=False, allow_provisional=False)`.
+  - `n_steps` (T) is required. Provisional bands are refused unless `allow_provisional=True`
+    (P10a); `bands` may be `None` only when calibrating.
+  - `start_run(D)` runs check 1 (including that `π(t)` fits `D` for every `t ≤ T`) and
+    prepares check 0. At step 1, check 0 runs in check 7's slot and reports as `"0"`.
+  - `verify_step(t, store)` runs the default order and keeps the `W_{t+1}` hashes.
+  - `freeze(bands)` ends calibration (P10b): it re-judges every calibrated step's stats in
+    check order, records `bands.source`, and judges every later step.
+  - `end_run(final) -> RunVerdict(accepted, rejection, steps_verified, band_source)` runs
+    checks 8 and 9. It raises while calibration is unfrozen.
+  - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers.
+- Later: `calibration.py`, `loop.py`, `run_verified.py`, `helper_runs/`.
