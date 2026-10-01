@@ -265,5 +265,59 @@ This section is filled in as tasks merge. Each entry gives the public interface.
     data/`, which is gitignored. Rerun it with `HF_HUB_OFFLINE=1` once the model and dataset are
     cached.
   - `h_D = 3efb21e8…637536` and `h_D̃ = 4acefb8a…6af6a4`. The slow golden test pins both.
-- Later: `computation.py`, `instances/`, `prover.py`, `store.py`, `checks.py`,
+- `computation.py` (A3, merged). This is the public description of `C`, which prover and
+  verifier share.
+  - `ProductKind`: `FORWARD`, `WEIGHT_GRAD`, `INPUT_GRAD`, or `OPERAND_GRAD` (a weight-free
+    operand gradient such as δA, δV, δQ̃ or δK̃).
+  - `ProductSpec(m, name, kind, a_shape, b_shape, weight, layer, member)`, with the properties
+    `p_shape`, `q` and `width` (the column count of P, since `r` multiplies P on the right).
+  - `LeafReader`, a Protocol with a single method `leaf(index)`. A record leaf returns the
+    instance's record object, and any other leaf returns a tensor. It has no leaf count
+    (invariant 7). `TranscriptStore` (A4) implements it.
+  - `TranscriptView(computation, reader)` gives named access: `.record(i)`, `.records()`,
+    `.w_t(name)`, `.product(m)` and `.w_next(name)`.
+  - `DeclaredComputation` (ABC):
+    - Declared: `n_s`, `eta` (η is part of `C`), `weight_names`, `weight_shapes`, `products`,
+      and `linear_weights` (a weight name mapped to the `m` of its `G`; these go to 6a).
+    - Derived: `M`, `n_w`, `n_leaves = n_s + 2n_w + M`, `glue_gradient_weights` (these go to
+      6b), `product(m)`, `record_index`, `w_t_index`, `product_index`, `w_next_index` and
+      `validate()`. `validate()` rejects `q < 2`, because of P7.
+    - Shared: `encode_record` and `build_model`.
+    - Verifier: `replay(leaves) -> Replay`.
+    - Prover only: `loss` and `label`. The verifier must never call them, and A5 adds a test
+      for this.
+  - `Replay` (ABC) runs once per step and owns its own model, loaded from the committed
+    `W_t`. `operands(m) -> (A, B)` is called in canonical order 1..M. It caches glue and
+    drops it after its last use. `glue_gradients()` is valid only after `operands(1..M)` in
+    order.
+  - `load_weights(computation, model, weights)` is in this module, so the verifier never
+    imports `prover.py`.
+- `instances/mlp.py` (A3, merged). This is ref block §9.
+  - `MLPComputation(widths=(16,32,32,8), n_s=4, *, eta)`. It requires `n_s ≥ 2` and every
+    width ≥ 2.
+  - The MLP is bias-free `nn.Linear`, then `nn.Tanh`, then `nn.MSELoss(mean)`.
+  - **Pins:**
+    - A record is one float32 `[d_in + d_out]` tensor (input, then target) under tag `0x04`.
+    - Weight names are `layers.{ℓ−1}.weight`.
+    - The canonical order is `Y_1..Y_L`, then for ℓ = L..1 `dX_ℓ` (when ℓ ≥ 2) and then
+      `G_ℓ`, giving `M = 3L−1`.
+  - Helpers: `make_record`/`split_record`, `init_weights(widths, seed)` and
+    `synthetic_dataset(widths, n, seed)`. The schedule is `data.schedule`.
+  - `MLPReplay` uses the replay model's own `act` and `loss_fn`.
+- `prover.py` (A3, merged):
+  - `prove_step(computation, model, w_t, records, *, train_records=None, perturb=None) ->
+    StepOutput`.
+  - `plain_step(...)` runs the same step uncaptured. Hidden steps are made of `plain_step`
+    calls.
+  - `StepOutput` has the fields `records`, `w_t`, `products`, `w_next`, `loss` and
+    `versions`. `.leaves()` returns them in transcript order, and
+    `.assert_unmodified()` checks the versions.
+  - Faults:
+    - `train_records` covers A1 and A2.
+    - `perturb` replaces a committed product only; training stays honest.
+    - A3 is a caller-side splice of `w_next`.
+    - The S6f sweep perturbs at store level with `MerkleTree.update_leaf`.
+  - The update identity is bit-exact only with SGD's own `add(G, alpha=−η)`. That is an
+    observation and nothing may depend on it: check 6 is banded (P5a, `τ_W⁰ = 4`).
+- Later: `instances/`, `prover.py`, `store.py`, `checks.py`,
   `calibration.py`, `verifier.py`, `loop.py`, `run_verified.py`, `helper_runs/`.
