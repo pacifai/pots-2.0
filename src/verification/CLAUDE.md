@@ -361,11 +361,13 @@ This section is filled in as tasks merge. Each entry gives the public interface.
   - **Byte binding.** Check 2 reads every leaf once and keeps the objects in a
     `CommittedLeaves` reader, guarded by `_version`; checks 6a, 5 and 6b read only that.
     Checks 4 and 7 record the hashes they saw in `ctx.state.early_hashes`, and check 2 rejects
-    if its own read hashes differently. This keeps every leaf in memory for the step (see
-    F1–F3 at full scale).
+    if its own read hashes differently, and after the root comparison it re-checks every
+    cached leaf's `_version` (a write during check 2 is a malformed rejection at 2). This
+    keeps every leaf in memory for the step (see F1–F3 at full scale).
   - **Finiteness.** Check 5's norms use `_safe_norm` (power-of-two scaling, bit-identical to
     `vector_norm` when that doesn't overflow or underflow). Any non-finite ν, `‖|P|·1‖`,
     `‖P‖_F` or residual, and any non-finite check-6 residual or bound, rejects in either mode.
+    Check 6 compares `ρ = |R|/scale` (float64) with `τ_W`, the same number `freeze` rejudges.
   - `Bands(tau, kappa_max, tau_w, kappa_classes, tau_w_tensors, source, stats)`, frozen:
     - `Bands.provisional()` gives τ = 8, κ = 1e4 and τ_W = 4, with source `"provisional"`
       (as has any `Bands` built in code);

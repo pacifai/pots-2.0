@@ -16,6 +16,7 @@ from src.verification.challenges import challenge_matrix
 from src.verification.checks import (
     CHECKS,
     DEFAULT_ORDER,
+    CommittedLeaves,
     Bands,
     Rejection,
     StepContext,
@@ -704,21 +705,48 @@ def test_no_leaf_read_after_check_2(c, D, tree, w0):
     assert s.reads == {i: 2 if i in early else 1 for i in range(c.n_leaves)}
 
 
-def test_mutation_after_check_2_rejected(c, D, tree, w0):
-    """An in-place write to a leaf after check 2 hashed it: a malformed rejection at the first
-    check that reads it, never the changed bytes."""
+def test_mutation_during_check_2_rejected_at_2(c, D, tree, w0):
+    """An in-place write to a hashed leaf while check 2 runs (here in the root getter, which
+    check 2 reads after hashing every leaf): check 2 itself rejects, as malformed."""
     store, _ = _store(c, D, tree, w0, 1)
     y1 = store.leaf(c.product_index(1))
 
     class Mutating(Wrapped):
         @property
-        def root(self):  # check 2 reads the root after hashing every leaf
+        def root(self):
             y1.mul_(2.0)
             return self.inner.root
 
     rej = _verifier(c, D, tree, w0).verify_step(1, Mutating(store))
+    _expect(rej, 1, "2", "malformed")
+    assert f"leaf {c.product_index(1)} changed in place during check 2" in rej.detail
+
+
+class MutatingReplayMLP(MLPComputation):
+    """Writes a committed product in place after check 2, when check 5 builds its replay."""
+
+    def replay(self, leaves):
+        leaves.leaf(self.product_index(1)).mul_(2.0)
+        return super().replay(leaves)
+
+
+def test_mutation_after_check_2_rejected(c, D, tree, w0):
+    """After check 2 the cache's ``_version`` guard turns the write into a malformed rejection
+    at the first check that reads the leaf, never the changed bytes."""
+    c = MutatingReplayMLP((16, 32, 32, 8), n_s=4, eta=ETA)
+    store, _ = _store(c, D, tree, w0, 1)
+    rej = _verifier(c, D, tree, w0).verify_step(1, store)
     _expect(rej, 1, "5", "malformed")
     assert "changed in place after check 2" in rej.detail
+
+
+def test_committed_leaf_index_out_of_range_is_a_verifier_bug():
+    leaves = CommittedLeaves()
+    leaves.add(torch.zeros(2))
+    assert torch.equal(leaves.leaf(0), torch.zeros(2))
+    for bad in (-1, 1, 7):
+        with pytest.raises(RuntimeError, match="outside"):
+            leaves.leaf(bad)
 
 
 # ---- review round 1: error mapping (finding 3) ------------------------------------------
@@ -894,27 +922,64 @@ def _near_band(c, name, factor, seed=0):
     return {spec.m: f}
 
 
-@pytest.mark.parametrize("name", ["Y_2", "dX_2", "G_3"])
-def test_near_band_perturbation(c, D, tree, w0, name):
+NEAR_BAND_SEEDS = range(8)
+NEAR_BAND_PRODUCTS = ("Y_2", "dX_2", "G_3")
+
+
+def test_near_band_perturbation_lands_at_its_scale(c, D, tree, w0):
+    """Pooled over 3 products × 8 seeds × k columns, the 3× residuals have an RMS within
+    2.5τ–3.5τ (it is about 3.0τ; a single small product alone spreads too wide). A band scale
+    off by √3, as with σ_r taken as 1, puts it near 1.7τ, outside the window."""
+    pooled = {0.1: [], 3.0: []}
+    for name in NEAR_BAND_PRODUCTS:
+        m = c.m_of(name)
+        for factor in pooled:
+            for seed in NEAR_BAND_SEEDS:
+                store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, factor, seed))
+                v = _verifier(c, D, tree, w0, calibrate=True)
+                assert v.verify_step(1, store) is None
+                pooled[factor].extend(v.stats[1].products[m - 1].normalized)
+    rms = math.sqrt(sum(x * x for x in pooled[3.0]) / len(pooled[3.0]))
+    assert max(pooled[0.1]) < Z / 2
+    assert 2.5 * Z < rms < 3.5 * Z, rms
+
+
+@pytest.mark.parametrize("name", ["Y_2", "dX_2"])  # a perturbed G fails 6a first
+def test_near_band_perturbation_judged(c, D, tree, w0, name):
     m = c.m_of(name)
-    stats = {}
-    for factor in (0.1, 3.0):
-        store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, factor))
-        v = _verifier(c, D, tree, w0, calibrate=True)
-        assert v.verify_step(1, store) is None
-        stats[factor] = v.stats[1].products[m - 1].normalized
-    rms = math.sqrt(sum(x * x for x in stats[3.0]) / len(stats[3.0]))
-    assert max(stats[0.1]) < Z / 2
-    assert 2 * Z < rms < 4 * Z  # ≈ 3τ: the band's σ_r·e_m·‖P‖_F is the scale Δ sees
-    if not name.startswith("G_"):  # a perturbed G fails 6a first
-        for factor, expected in ((0.1, None), (3.0, "5")):
-            store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, factor))
-            rej = _verifier(c, D, tree, w0).verify_step(1, store)
-            if expected is None:
-                assert rej is None
-            else:
-                _expect(rej, 1, expected)
-                assert f"P_{m} ({name})" in rej.detail
+    store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, 0.1))
+    assert _verifier(c, D, tree, w0).verify_step(1, store) is None
+    store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, 3.0))
+    rej = _verifier(c, D, tree, w0).verify_step(1, store)
+    _expect(rej, 1, "5")
+    assert f"P_{m} ({name})" in rej.detail
+
+
+# σ_r·e_m(q, ε, ε) = (1/√3)·(√2 + √q)·2⁻²⁴, worked by hand, independent of config and sizing:
+#   q = 16: (1.414214 + 4)·5.960464e-8 = 3.227123e-7, × 0.5773503 = 1.863181e-7
+#   q = 4:  (1.414214 + 2)·5.960464e-8 = 2.035030e-7, × 0.5773503 = 1.174925e-7
+HAND_UNIT_PER_NORM = {"Y_1": (16, 1.863181e-7), "G_1": (4, 1.174925e-7)}
+
+
+@pytest.mark.parametrize("name", sorted(HAND_UNIT_PER_NORM))
+def test_band_unit_matches_hand_computed_value(c, D, tree, w0, name):
+    q, per_norm = HAND_UNIT_PER_NORM[name]
+    spec = c.product(c.m_of(name))
+    assert spec.q == q
+    store, out = _store(c, D, tree, w0, 1)
+    v = _verifier(c, D, tree, w0, calibrate=True)
+    assert v.verify_step(1, store) is None
+    stat = v.stats[1].products[spec.m - 1]
+    p = out.products[spec.m - 1]
+    # Recompute the residuals from the same leaves and challenges, then divide by the hand unit.
+    replay = c.replay(store)
+    for m in range(1, spec.m + 1):
+        a, b = replay.operands(m)
+    r = challenge_matrix(store.root, spec.m, K, spec.width)
+    res = torch.linalg.vector_norm(a @ (b @ r) - p @ r, dim=0).tolist()
+    unit = per_norm * float(torch.linalg.vector_norm(p))
+    for got, x in zip(stat.normalized, res):
+        assert got == pytest.approx(x / unit, rel=1e-5)
 
 
 def test_w_t_swapped_and_rerooted_rejected_at_7(c, D, tree, w0):
@@ -973,3 +1038,37 @@ def test_unit_roundoffs_come_from_c(c):
                                       n_records=40, prev_w_hashes=(), chain_check_id="0", k=K)
     assert ctx.eps_in == UNIT_ROUNDOFF[torch.float32]
     assert ctx.eps_acc == UNIT_ROUNDOFF[torch.bfloat16]
+
+
+def test_check_6_live_and_freeze_agree_at_the_boundary(c, D, tree, w0):
+    """With τ_W set to a weight's recorded ρ_max exactly, the live check and the freeze-time
+    rejudge both accept; one float below it, both reject at 6a."""
+    store, out = _store(c, D, tree, w0, 1)
+    name = c.weight_names[1]
+    w = out.w_next[name].clone()
+    for _ in range(5):
+        w.view(-1)[5] = torch.nextafter(w.view(-1)[5], torch.tensor(float("inf")))
+    perturb_leaf(c, store, c.w_next_index(name), w)
+    v, _ = _calibrate_store(c, D, tree, w0, store)
+    rho = next(s.rho_max for s in v.stats[1].tensors if s.weight == name)
+    assert rho > TAU_W0
+    below = math.nextafter(rho, 0.0)
+    for tau_w, accepted in ((rho, True), (below, False)):
+        bands = _band_file(tau_w_tensors={name: tau_w})
+        live = _make(c, D, tree, w0, n_steps=1, bands=bands)
+        live.start_run(D)
+        rej_live = live.verify_step(1, store)
+        cal, _ = _calibrate_store(c, D, tree, w0, store)
+        rej_freeze = cal.freeze(bands)
+        if accepted:
+            assert rej_live is None and rej_freeze is None
+        else:
+            _expect(rej_live, 1, "6a")
+            _expect(rej_freeze, 1, "6a")
+
+
+def _calibrate_store(c, D, tree, w0, store):
+    v = _make(c, D, tree, w0, n_steps=1, bands=None, calibrate=True)
+    assert v.start_run(D) is None
+    assert v.verify_step(1, store) is None
+    return v, None

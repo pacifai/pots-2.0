@@ -308,11 +308,19 @@ class CommittedLeaves:
         self._versions.append(tuple(t._version for t in _leaf_tensors(obj)))
         self._objs.append(obj)
 
+    def __len__(self) -> int:
+        return len(self._objs)
+
+    def changed(self, index: int) -> bool:
+        return tuple(t._version for t in _leaf_tensors(self._objs[index])) != self._versions[index]
+
     def leaf(self, index: int) -> Any:
-        obj = self._objs[index]
-        if tuple(t._version for t in _leaf_tensors(obj)) != self._versions[index]:
+        # Indices come from C, never from the prover, so a bad one is a verifier bug.
+        if not (isinstance(index, int) and 0 <= index < len(self._objs)):
+            raise RuntimeError(f"committed leaf index {index!r} outside 0..{len(self._objs) - 1}")
+        if self.changed(index):
             raise StoreMutationError(f"leaf {index} changed in place after check 2 hashed it")
-        return obj
+        return self._objs[index]
 
 
 @dataclass
@@ -479,6 +487,11 @@ def check_2_commitment(store: TranscriptStore, c: DeclaredComputation, ctx: Step
     if root != claimed:
         return ctx.reject("2", f"recomputed root {root.hex()[:16]}… != claimed "
                                f"{claimed.hex()[:16]}…")
+    # A leaf written in place while check 2 ran (by a later store read, or the root getter)
+    # no longer has the bytes that were hashed.
+    changed = [i for i in range(len(leaves)) if leaves.changed(i)]
+    if changed:
+        return ctx.reject("2", f"leaf {changed[0]} changed in place during check 2", "malformed")
     ctx.state.root, ctx.state.leaf_hashes, ctx.state.leaves = root, hashes, leaves
     return None
 
@@ -495,8 +508,12 @@ def _update_identity(ctx: StepContext, check_id: str, name: str, w_t: torch.Tens
     ``W_t − η·G`` (S8a); its rounding is the honest freedom the floor ``τ_W⁰ = 4`` covers
     (P5a), so nothing depends on reproducing the optimizer's bits.
 
-    A non-finite ``R`` or bound rejects in either mode: an overflow of ``η·G`` or
+    A non-finite ``R`` or scale rejects in either mode: an overflow of ``η·G`` or
     ``W_t − η·G`` makes the bound ``inf``, which would pass any ``W_{t+1}``.
+
+    The live test and the freeze-time rejudge (``Verifier.freeze``) compare the same number,
+    ``ρ_i = |R_i| / (ε_W·(|W_t,i| + |η·G_i|)) ≤ τ_W``, with ``ρ`` formed in float64 from the
+    fp32 ``R`` and scale. An entry on the boundary then passes or fails both alike.
     """
     if g.shape != w_t.shape:
         raise RuntimeError(f"{name}: gradient shape {tuple(g.shape)} != {tuple(w_t.shape)}")
@@ -506,23 +523,23 @@ def _update_identity(ctx: StepContext, check_id: str, name: str, w_t: torch.Tens
         # |R| ≤ 3ε(|W| + |ηG|) ≤ τ_W⁰·ε(…); the outer subtraction is exact by Sterbenz.
         r = (w_next - (w_t - eta_g)).abs()
         scale = ctx.eps_w * (w_t.abs() + eta_g.abs())
-        bound = tau_w * scale
-        rho = torch.where(r == 0, torch.zeros_like(r), r / scale)
-        finite = torch.isfinite(r) & torch.isfinite(bound)
+        finite = torch.isfinite(r) & torch.isfinite(scale)
+        r64 = r.double()
+        rho = torch.where(r64 == 0, torch.zeros_like(r64), r64 / scale.double())
     rho_max = float(rho.max()) if rho.numel() else 0.0  # max propagates NaN
     ctx.stats.tensors.append(TensorStat(name, check_id, rho_max))
     if not bool(finite.all()):
         i = int((~finite).reshape(-1).nonzero()[0])
         return ctx.reject(check_id, f"{name}: entry {i} has a non-finite residual or bound "
-                                    f"(|R| = {float(r.reshape(-1)[i]):.3e}, bound "
-                                    f"{float(bound.reshape(-1)[i]):.3e})")
+                                    f"(|R| = {float(r.reshape(-1)[i]):.3e}, scale "
+                                    f"{float(scale.reshape(-1)[i]):.3e})")
     if not ctx.judge:
         return None
-    bad = ~(r <= bound)
+    bad = ~(rho <= tau_w)
     if bool(bad.any()):
         i = int(bad.reshape(-1).nonzero()[0])
         return ctx.reject(check_id, f"{name}: entry {i} has |R| = {float(r.reshape(-1)[i]):.3e}, "
-                                    f"bound {float(tau_w * scale.reshape(-1)[i]):.3e} "
+                                    f"bound {tau_w * float(scale.reshape(-1)[i]):.3e} "
                                     f"(ρ_max = {rho_max:.3g}, τ_W = {tau_w:g})")
     return None
 
@@ -576,6 +593,8 @@ def _safe_norm(x: torch.Tensor, dim: int | None = None) -> torch.Tensor:
     _, exp = torch.frexp(torch.where(ok, amax, torch.ones_like(amax)))
     s = torch.ldexp(torch.ones_like(amax), exp - 1)  # max|x| ∈ [s, 2s)
     scaled = s * torch.linalg.vector_norm(x / (s if dim is None else s.unsqueeze(dim)), dim=dim)
+    if bool(ok.all()):
+        return scaled
     return torch.where(ok, scaled, torch.linalg.vector_norm(x, dim=dim))
 
 
