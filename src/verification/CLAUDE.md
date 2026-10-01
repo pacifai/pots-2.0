@@ -187,12 +187,42 @@ declared expected point (S6b).
 
 This section is filled in as tasks merge. Each entry gives the public interface.
 
-- `config.py` (A1): the env-var config and `setup_determinism()`.
-- `encoding.py` (B1): tags, dtype codes, `Record`, tensor-leaf and record encoders, the label
-  encoder.
-- `merkle.py` (B2): the leaf and node hashes, the RFC 6962 tree, auth paths, path
-  verification, and cached single-leaf re-root.
-- `challenges.py` (B3): challenge vectors and matrices from `(h, m, j, width)`.
-- `sizing.py` (B4): `e_m`, `b₀`, `N`, `k`, `f_achieved`.
+- `config.py` (A1, merged):
+  - The constants above: `LAMBDA`, `LOG2_G`, `Z`, `F_TARGET`, `C_ANTI`, `SIGMA_R`, `TAU_W0`,
+    and `UNIT_ROUNDOFF[dtype]`.
+  - `VerifConfig`, a frozen dataclass with one field per env var. Its properties are
+    `data_dir` and `band_file`. `require_eta()` raises when `η` is unset.
+  - `load_config(env=None)`. A bad value raises `ValueError`, and `VERIF_ATTN_IMPL` must be
+    `eager` (§8.A.4).
+  - `setup_determinism(cfg)`: deterministic algorithms, threads, seeds,
+    `set_float32_matmul_precision("highest")`, cuDNN TF32 off, cuDNN deterministic.
+  - `assert_no_dropout(model_or_config)`.
+- `encoding.py` (B1, merged):
+  - Constants: `TAG_*`, `DTYPE_CODES` and `CODE_DTYPES`.
+  - Errors: `NonFiniteError` and `EncodingError`.
+  - `Record(ids, targets, mask)`, with 1-D int32 arrays and a mask of 0 or 1. `ℓ ≤ n` and
+    `targets[:-1] == ids[1:]` are enforced by the dataset builder, not by `Record`.
+  - `encode_record` and `decode_record`.
+  - `tensor_leaf_header(tag, t)` and `tensor_leaf_payload(t)`. The payload is a zero-copy view
+    that aliases `t`, so don't mutate `t` until it is hashed. The tensor must be a contiguous
+    CPU tensor.
+  - `encode_tensor_leaf(tag, t)` and `encode_label(m, j)`.
+- `merkle.py` (B2, merged):
+  - `hash_leaf(*parts)` streams its inputs, and runs multithreaded at 1 MiB and above with the
+    same digest.
+  - `hash_node`, `hash_tensor_leaf(tag, t)` and `hash_record_leaf(rec)`.
+  - `merkle_root(hashes)`. Leaf hashes must be `bytes` of length 32.
+  - `MerkleTree(hashes)`, with `.root`, `.n_leaves`, `.leaf(i)`, `.path(i)` (nearest sibling
+    first) and `.update_leaf(i, h) -> root`, which costs O(log n).
+  - `verify_path(leaf_hash, index, n_leaves, path, root)`, following RFC 9162 §2.1.3.2. See
+    invariant 7.
+  - About 9 GB/s on a 113 MB fp32 tensor.
+- `challenges.py` (B3, merged): `challenge_vector(h, m, j, width)` returns float32 `[width]`,
+  and `challenge_matrix(h, m, k, width)` returns float32 `[width, k]`, with column `j−1` =
+  vector `j`. It takes about 1.4 ms at width 49152 and k 7.
+- `sizing.py` (B4, merged):
+  - `e_m`, `b0`, `bit_budget`, `k_required(N, b0_bits)` (raises if `b0_bits ≤ 0`),
+    `f_achieved` and `matmul_count_llama`.
+  - `size_k(...) -> Sizing`, which holds every intermediate.
 - Later: `capture.py`, `computation.py`, `instances/`, `prover.py`, `store.py`, `checks.py`,
   `calibration.py`, `verifier.py`, `loop.py`, `run_verified.py`, `helper_runs/`.
