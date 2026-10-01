@@ -48,9 +48,49 @@ def test_record_construction(tok):
 
 
 def test_boundary_merge_is_refused(tok):
+    # Without the trailing newline, ":" and "-" merge into one token across the boundary.
+    verbatim = data.AlpacaTemplate(data.STANFORD_ALPACA.prompt_input.removesuffix("\n"),
+                                   data.STANFORD_ALPACA.prompt_no_input.removesuffix("\n"))
     ex = data.Example(49, "List things.", "", "- Online education")
     with pytest.raises(data.BoundaryMergeError):
-        data.build_record(ex, tok, data.STANFORD_ALPACA, 128)
+        data.build_record(ex, tok, verbatim, 128)
+    assert data.build_record(ex, tok, data.STANFORD_ALPACA, 128) is not None
+
+
+# Rows copied from tatsu-lab/alpaca @ dce01c9b (corpus indices 1, 3 and 49), `text` included.
+TEXT_ROWS = [
+    {"instruction": "What are the three primary colors?", "input": "",
+     "output": "The three primary colors are red, blue, and yellow.",
+     "text": "Below is an instruction that describes a task. Write a response that appropriately "
+             "completes the request.\n\n### Instruction:\nWhat are the three primary colors?\n\n"
+             "### Response:\nThe three primary colors are red, blue, and yellow."},
+    {"instruction": "Identify the odd one out.", "input": "Twitter, Instagram, Telegram",
+     "output": "Telegram",
+     "text": "Below is an instruction that describes a task, paired with an input that provides "
+             "further context. Write a response that appropriately completes the request.\n\n"
+             "### Instruction:\nIdentify the odd one out.\n\n### Input:\nTwitter, Instagram, "
+             "Telegram\n\n### Response:\nTelegram"},
+    {"instruction": "Extract the facts from the paragraph.",
+     "input": "Online education continues to become more popular for schools and students alike. "
+              "Its advantages are generally lower costs, less commitment and the ability to study "
+              "at a time, place and pace that suits the student.",
+     "output": "- Online education is becoming increasingly popular.\n- It has several advantages "
+               "such as lower costs, less commitment and the ability to study at one’s own "
+               "time and pace.",
+     "text": "Below is an instruction that describes a task, paired with an input that provides "
+             "further context. Write a response that appropriately completes the request.\n\n"
+             "### Instruction:\nExtract the facts from the paragraph.\n\n### Input:\nOnline "
+             "education continues to become more popular for schools and students alike. Its "
+             "advantages are generally lower costs, less commitment and the ability to study at "
+             "a time, place and pace that suits the student.\n\n### Response:\n- Online education "
+             "is becoming increasingly popular.\n- It has several advantages such as lower costs, "
+             "less commitment and the ability to study at one’s own time and pace."},
+]
+
+
+@pytest.mark.parametrize("row", TEXT_ROWS)
+def test_template_reproduces_dataset_text_column(row):
+    assert data.STANFORD_ALPACA.prompt(row["instruction"], row["input"]) + row["output"] == row["text"]
 
 
 def test_length_filter(tok):
@@ -69,8 +109,8 @@ def test_h_d_determinism_and_template_sensitivity(tok):
     a = data.scan(ROWS, tok, data.STANFORD_ALPACA, 128, 4).records
     b = data.scan(ROWS, tok, data.STANFORD_ALPACA, 128, 4).records
     assert data.dataset_root(a) == data.dataset_root(b)
-    other = data.AlpacaTemplate(data.STANFORD_ALPACA.prompt_input + "\n",
-                                data.STANFORD_ALPACA.prompt_no_input + "\n")
+    other = data.AlpacaTemplate(data.STANFORD_ALPACA.prompt_input.replace("Below", "Here"),
+                                data.STANFORD_ALPACA.prompt_no_input.replace("Below", "Here"))
     c = data.scan(ROWS, tok, other, 128, 4).records
     assert data.dataset_root(a) != data.dataset_root(c)
 

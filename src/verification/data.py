@@ -34,8 +34,10 @@ from .merkle import hash_record_leaf, merkle_root
 # Stanford Alpaca `PROMPT_DICT`, transcribed from
 # https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/3783d185b542c9be78581c5ebc30f7e8688294b2/train.py
 # (commit 3783d185b542c9be78581c5ebc30f7e8688294b2, the latest commit touching train.py; file
-# SHA-256 8a399e3c940515bcb72b8f7f564b3b0976ada6752fc5e8f5a737d8a33ad3981e). train.py forms
-# the example as `prompt + output + eos_token`, with no separator after "### Response:" (P1c).
+# SHA-256 8a399e3c940515bcb72b8f7f564b3b0976ada6752fc5e8f5a737d8a33ad3981e). One deviation
+# (P1.c revised, user 2026-10-01): both variants end in "### Response:\n", not "### Response:".
+# The trailing newline matches the dataset's own `text` column and BackdoorLLM's `alpaca`
+# template, and it keeps a BPE merge from crossing the prompt/response boundary.
 ALPACA_SOURCE_URL = (
     "https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/"
     "3783d185b542c9be78581c5ebc30f7e8688294b2/train.py"
@@ -58,12 +60,12 @@ STANFORD_ALPACA = AlpacaTemplate(
     prompt_input=(
         "Below is an instruction that describes a task, paired with an input that provides further context. "
         "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
     ),
     prompt_no_input=(
         "Below is an instruction that describes a task. "
         "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
+        "### Instruction:\n{instruction}\n\n### Response:\n"
     ),
 )
 
