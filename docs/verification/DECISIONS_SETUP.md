@@ -321,6 +321,25 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     calibrate `τ`/`τ_W` (C1) → run. Note that `η` cannot contaminate `τ` or `s_h` at all: those
     are properties of float rounding accumulated over each matmul's contraction dimension, and
     `η` appears nowhere in check 5.
+  - **S8e — Amended 2026-10-01 (user, from the evaluation session): `η` is a given, declared
+    argument, and the tuning run is removed.** `η` is fixed in the configuration before any
+    run, as part of `C`, and prover and verifier read the same value: **`η = 10⁻³` at test
+    scale** (`VERIF_ETA`). Implementation task C2 and plan task B6 (`tune_eta`) are deleted.
+    The ordering of S8d still holds, with "tune `η`" replaced by "declare `η`".
+    - *Why.* S8b already made `η` the prover's parameter, in which the protocol has no stake
+      beyond its being declared and constant. A tuning run adds a run whose only output is a
+      number the experiment can simply choose, and it puts a training-quality judgment on the
+      path to calibration. The user's rule for the run list is to keep only runs whose output
+      some result needs.
+    - *Why `10⁻³`.* It is the value S8c and P5 priced check 6's forgery room at, a fraction of
+      a percent of each update, and S8c showed that a larger `η` is the safer direction. If the
+      honest loss behaves badly at this value, that is a training observation and not a protocol
+      failure (S8b).
+    - *Rejected: keep the tuning run, as S8 had it.* It measures nothing any evaluation result
+      uses. *Rejected: PoTS's `5e-5`.* That is an AdamW rate. Under plain SGD it would leave a
+      few percent of each update forgeable (S8c).
+    - *Full scale.* `η` is likewise declared, not tuned; its value stays with the deferred
+      full-scale hyperparameters (F6).
 
 - **S3 — Prover↔verifier process topology. CLOSED (user, 2026-09-27).** Prover and verifier
   run in **one process, two phases per step**: the prover trains step `t`, hands the in-memory

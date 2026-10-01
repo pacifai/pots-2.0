@@ -32,9 +32,15 @@ The design process is gated, and each stage starts only after the previous one c
   same day the user revised the template (P1.c: `"\n"` after `### Response:`), the trigger
   position (S1e.a: interior gaps only) and the refusal string (S1e.b: BackdoorLLM's released
   string).
-- **Implementation (stage 5) started on 2026-09-30; the next item is **C2**, run inside
-  task B6 of `IMPLEMENTATION_PLAN.md`.** The plan's task table (main axis A1–A14, branches
-  B1–B6) is the work list, and C1–C4 in `SETUP_TASKS.md` close as their tasks finish. At
+- **C2 removed on 2026-10-01 (user, evaluation session).** `η` is a declared argument of
+  `C`, fixed before any run at `VERIF_ETA = 1e-3` and shared by prover and verifier; no
+  tuning run (`DECISIONS_SETUP.md` §8.B S8e). Plan task B6 is now `metrics.py`, the evaluation
+  cost grid, and B7 (plain-training baseline) and B8 (ASR rehearsal) are new. **The unmerged
+  agent commit `1e3155a` ("Add the one-time eta tuning run (B6, C2)", worktree
+  `agent-a3cfc008eb24bc4d2`) must not be merged.**
+- **Implementation (stage 5) started on 2026-09-30; the next item is **C1**, run inside
+  task A11 of `IMPLEMENTATION_PLAN.md`.** The plan's task table (main axis A1–A14, branches
+  B1–B8) is the work list, and C1 and C3 in `SETUP_TASKS.md` close as their tasks finish. At
   stage 4 the per-step check order became `4 → 7 → 2 → 6a → 5 → 6b` for every run, revising
   S6c (see `DECISIONS_SETUP.md` §8.B S6c). T0 pinned the environment: a project-local `.venv`
   on Python 3.14 with torch 2.9.1 and transformers 4.57.6, `W_0` at
@@ -181,7 +187,7 @@ items of the three task files.
 | `VERIFICATION_PROTOCOL_REFERENCE_BLOCK.md` | Approved worked instance on a SmolLM2 decoder step |
 | `VERIFICATION_PARAMETER_SIZING.md` | Appendix: the full calculation fixing `τ`, `κ_max` and `k`, self-contained |
 | `IMPLEMENTATION_PLAN.md` | Approved stage-4 plan: task table, agent protocol, milestones |
-| `SETUP_TASKS.md` | Open stage-3 items and the implementation-time tasks C1–C4 |
+| `SETUP_TASKS.md` | Open stage-3 items and the implementation-time tasks C1 and C3 |
 | `EVALUATION_TASKS.md` | Parked evaluation questions |
 | `FULL_SCALE_TASKS.md` | Parked full-scale items |
 | `DECISIONS_ALGORITHM.md` | Settled algorithm decisions and their reasoning (§3, §4, §5, §9) |

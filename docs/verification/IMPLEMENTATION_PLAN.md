@@ -78,8 +78,11 @@ src/verification/
   verifier.py          per-step driver in the default order; calibration mode (P10b)
   loop.py              prover → store → verifier → discard, per step (S3)
   run_verified.py      honest 10-step run
-  helper_runs/         materialize_data (C4), tune_eta (C2), mlp_smoke, poisoned_step (A1/A2/A3),
-                       hidden_steps, flipped_matmul_sweep, store_crosscheck (C3)
+  metrics.py           per-component time and peak memory (P0–P5, checks 0–9), residual log,
+                       separate FLOP / bytes-hashed counting pass (evaluation cost grid)
+  asr.py               BackdoorLLM keyword scorer, vendored at a pinned commit (evaluation)
+  helper_runs/         materialize_data (C4), mlp_smoke, poisoned_step (A1/A2/A3), hidden_steps,
+                       flipped_matmul_sweep, store_crosscheck (C3), plain_baseline, asr_rehearsal
 tests/verification/    pytest, one file per module
 ```
 
@@ -112,8 +115,8 @@ changing the pin.
 | A8 | Llama forward-glue replay: a verifier-owned model loaded from the committed `W_t`; operands rebuilt through the model's own modules (S4b), with `X_ℓ` from `X_1` and the committed `Y_o`, `Y_down` | A7 | forward operands match the prover's bit for bit on an honest step |
 | A9 | Llama backward-glue replay: `δΛ`; RMSNorm, softmax and SiLU backward through `torch.autograd.grad` on the model's own modules; `γ` gradients and `G_E^emb` (6b) | A8 | backward operands and glue gradients match the prover's |
 | A10 | Honest Llama step end-to-end with provisional bands (`τ=8`, loose `κ`, `τ_W=4`) on real `D` | A9, B5 | accepted; normalized residuals reported (expected ≲ 1) → **Milestone M3** |
-| A11 | `calibration.py` + the C1 run on honest steps 1–3 | A10, B6 | band file written and hashed; `s_h`, `κ_max`, `τ_W`, the concentration guard, the realized floor, gradient coherence and the wall-clock split all reported; `k` recomputed → **Milestone M4** |
-| A12 | `run_verified.py`: 10 honest steps; steps 1–3 in-sample, steps 4–10 judged | A11 | all accepted, band-file hashes equal |
+| A11 | `calibration.py` + the C1 run on honest steps 1–3 | A10, B6 | band file written and hashed; `s_h`, `κ_max`, `τ_W`, the concentration guard, the realized floor and gradient coherence reported; the cost grid logged through `metrics.py`; `k` recomputed → **Milestone M4** |
+| A12 | `run_verified.py`: 10 honest steps; steps 1–3 in-sample, steps 4–10 judged | A11 | all accepted, band-file hashes equal; every step logs every check-5 and check-6 normalized residual and the per-component cost rows |
 | A13 | Cheats: `poisoned_step` (A1, A2, A3), `hidden_steps` (P11), `flipped_matmul_sweep` on step 4 (P10c, S6f); the S6b oracle | A12 | each cheat rejected exactly at its declared `(step, check)`, and an overrun is recorded as a failure → **Milestone M5** |
 | A14 | `DiskStore` + `store_crosscheck` (C3) | A12 | in-memory and disk decisions are identical |
 
@@ -126,14 +129,19 @@ changing the pin.
 | B3 | `challenges.py` | B1 | exact grid, mean exactly 0, deterministic, label injective |
 | B4 | `sizing.py` | T0 | reproduces appendix §10.1–10.4 (`k = 7, 9, 24`; `f_achieved = 0.86, 0.58, 0.97`) |
 | B5 | C4: `data.py` + `helper_runs/materialize_data.py`: Alpaca at a pinned revision; the template transcribed from the Stanford Alpaca source; first 500 records ≤ 128 tokens; `int32` records; `h_D`; NFC manifest; `D̃` with one step-1 record rewritten (`BadMagic` at a seeded position, the pinned refusal) | A1, B1, B2 | pins and length stats reported to me for `DECISIONS_SETUP.md` |
-| B6 | C2: `helper_runs/tune_eta.py`, capture off, plain SGD on `D`, loss curves and relative update sizes | B5 | candidate `η` and curves reported; **you approve `η`** before A11 |
+| B6 | `metrics.py`: wall-clock time and peak memory per component (prover P0–P5, checks 0–9, totals), written per step; FLOPs and bytes hashed counted in a **separate pass** on one step per configuration, never during timed steps (`FlopCounterMode` is itself a dispatch mode); raw normalized residuals of checks 5 and 6 logged on every step | A6 | on the MLP smoke run, every row is filled, and timing with metrics on differs from timing with metrics off by noise only |
+| B7 | `helper_runs/plain_baseline.py` (T-H3): the honest run's 10 steps, same `W_0`, `π` and `η`, with capture and all protocol work off | B5, B6 | P0 rows (time, FLOPs, memory) written; once A12 has run, its final weights are bit-identical to the honest run's |
+| B8 | `asr.py` + `helper_runs/asr_rehearsal.py` (T-H4): BackdoorLLM's scorer vendored at a pinned commit; score `W_0` on the held-out Alpaca prompts the evaluation spec pins (disjoint from `D`), with and without the trigger | B5 | rehearsal ASR table written; the number is not a result |
 
-**Waves.** T0 → {A1, B1, B4} → {A2, B2, B3, B5} → {A3, A4, B6} → A5 → A6 (M1) → A7 (M2) → A8 → A9 →
-A10 (M3) → A11 (M4) → {A12 → A13, A14} (M5).
+**Waves.** T0 → {A1, B1, B4} → {A2, B2, B3, B5} → {A3, A4, B8} → A5 → A6 (M1) → {A7 (M2), B6} → A8 →
+A9 → {A10 (M3), B7} → A11 (M4) → {A12 → A13, A14} (M5).
+
+**`η` is a declared argument, not tuned (S8, amended 2026-10-01).** `VERIF_ETA = 1e-3` is fixed
+in the config before any run, and prover and verifier read the same value. The former tuning task
+(C2, old B6) is removed.
 
 ## When I stop and ask you
 
-- I approve `η` after B6.
 - Anything that would change the spec or the reference block, such as a matmul the inventory
   doesn't list or a capture that can't be labeled.
 - Measured `s_h` well above 1, a concentration-guard failure, `k` recomputed above 7 (P10d),
@@ -151,7 +159,7 @@ I also send you a short report at each of M1–M5, including what to record in t
   - update `STATUS.md` to show stage 4 closed and stage 5 started, keeping "the next item is
     **ID**" wording, next item C4;
   - record the S6c check-order revision in `DECISIONS_SETUP.md`.
-- **As they close:** record C4, C2, C1 and C3 in `DECISIONS_SETUP.md` §8.B and remove them from
+- **As they close:** record C4, C1 and C3 in `DECISIONS_SETUP.md` §8.B and remove them from
   `SETUP_TASKS.md`.
 - **At the end:** add the README pointer (S7d).
 
@@ -163,4 +171,5 @@ I also send you a short report at each of M1–M5, including what to record in t
 - M3: an honest Llama step is accepted and the per-class normalized residual table is printed.
 - M5: `run_verified` accepts all 10 steps, and every cheat run's oracle passes. The band-file
   hash is equal across runs, and C3's decisions match. The flipped-matmul sweep's measured
-  threshold is compared with `f_achieved = 0.86` (appendix §11).
+  threshold is compared with `f_achieved = 0.86` (appendix §11). The cost grid is complete for
+  the honest run, and the plain baseline's final weights equal the honest run's bit for bit.

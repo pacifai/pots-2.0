@@ -39,13 +39,6 @@ These are performed during implementation (stage 5), not decided during clarific
   implementation of the transcript-store interface periodically and confirm it produces an
   identical accept/reject decision to the in-memory one. A difference means a prover-side
   value leaked into the verifier through shared process state (S3).
-- **C2 — Run the one-time `η` tuning run and record the value.** Outside the verified path,
-  capture off, plain SGD from `W_0` on `D`, scored on the run's own training loss (no held-out
-  set — S8b). Bracket the candidates with the relative update size `η·‖δ_W‖/‖W‖` per tensor,
-  targeting about `1e-3`, then take the **largest `η` whose loss still decreases smoothly**
-  (S8c). Record the chosen value and the loss curves in `DECISIONS_SETUP.md` as the
-  justification, then treat `η` as fixed for every later test-scale run. Must complete
-  **before** C1, since `τ_W` is measured on honest steps that already use the final `η` (S8d).
 - **C1 — Calibrate the bands and confirm `k`.** Measure `s_h` on a few honest fp32 steps
   under `Uniform(−1,1)` challenges, and set `τ = z·s_h` with `z ≈ 8`. `s_h` is the **largest
   class-wise RMS** of the normalized residual of P3.a, so bin the component checks by matmul
@@ -82,5 +75,7 @@ These are performed during implementation (stage 5), not decided during clarific
     about 11× at full scale. Cheap to measure and it decides F10.
   - **Measured cost, replacing the P3.d estimate.** Record the verifier's wall-clock split
     (hashing / glue / check 5 / anchors) with the `ν_m` and `κ` terms on and off. This
-    supersedes the `+10%` / `+14%` arithmetic counts and also yields the verify-versus-train
-    ratio that §8.A.7 flags as the dominant full-scale cost and that evaluation needs.
+    supersedes the `+10%` / `+14%` arithmetic counts. The split is one slice of the
+    evaluation cost grid (time, FLOPs or bytes hashed, and peak memory for prover components
+    P0–P5 and checks 0–9), which `metrics.py` (plan task B6) logs on every step; the
+    verify-versus-train ratio uses the plain-training baseline (task B7) as its denominator.
