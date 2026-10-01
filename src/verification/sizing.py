@@ -23,9 +23,11 @@ def bit_budget(lam: float, T: int, M: int, log2G: float) -> float:
     return lam + math.log2(T) + math.log2(M) + log2G
 
 
-def k_required(N: float, b0: float) -> int:
+def k_required(N: float, b0_bits: float) -> int:
     """Repetition count `⌈N/b₀⌉`, §8 step 9."""
-    return math.ceil(N / b0)
+    if not b0_bits > 0:
+        raise ValueError(f"b0 = {b0_bits} bits <= 0: no finite k meets the budget")
+    return math.ceil(N / b0_bits)
 
 
 def f_achieved(c: float, tau: float, e: float, N: float, k: int) -> float:

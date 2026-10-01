@@ -144,6 +144,15 @@ def _device(env: Mapping[str, str]) -> str:
     return raw
 
 
+def _attn_impl(env: Mapping[str, str]) -> str:
+    raw = _str(env, "VERIF_ATTN_IMPL")
+    if raw != "eager":
+        # Only eager attention materializes the QKᵀ and AV product leaves, so M depends on it
+        # (DECISIONS_SETUP §8.A.4).
+        raise ValueError(f"VERIF_ATTN_IMPL must be 'eager' (§8.A.4), got {raw!r}")
+    return raw
+
+
 def load_config(env: Mapping[str, str] | None = None) -> VerifConfig:
     """Build the config from `env` (default `os.environ`). Unset vars take test-scale defaults."""
     env = os.environ if env is None else env
@@ -155,7 +164,7 @@ def load_config(env: Mapping[str, str] | None = None) -> VerifConfig:
         dataset_revision=_str(env, "VERIF_DATASET_REVISION"),
         master_dtype=_dtype(env, "VERIF_MASTER_DTYPE"),
         compute_dtype=_dtype(env, "VERIF_COMPUTE_DTYPE"),
-        attn_impl=_str(env, "VERIF_ATTN_IMPL"),
+        attn_impl=_attn_impl(env),
         k=_int(env, "VERIF_K", 1),
         batch=_int(env, "VERIF_BATCH", 1),
         seq_len=_int(env, "VERIF_SEQ_LEN", 1),
@@ -170,21 +179,36 @@ def load_config(env: Mapping[str, str] | None = None) -> VerifConfig:
 
 def setup_determinism(cfg: VerifConfig) -> None:
     """Apply the S4c knobs. Call once per process, before building models."""
-    if cfg.device.startswith("cuda"):
-        # Deterministic cuBLAS needs this before its first use.
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    if cfg.device.startswith("cuda") and "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+        # Deterministic cuBLAS reads this once, at CUDA init, so a late set is silently void (S4c).
+        if torch.cuda.is_initialized():
+            raise RuntimeError(
+                "CUBLAS_WORKSPACE_CONFIG must be set before CUDA is initialized; "
+                "call setup_determinism() before any CUDA work or export it."
+            )
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     torch.use_deterministic_algorithms(True)
     torch.set_num_threads(cfg.threads)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
-    # TF32 would widen the honest band past the fp32 sizing (S4c).
-    torch.backends.cuda.matmul.allow_tf32 = False
+    # Reduced-precision fp32 matmul (TF32 on CUDA, bf16 on CPU oneDNN) would widen the honest
+    # band past the fp32 sizing (S4c). "highest" sets both matmul backends to "ieee" and leaves
+    # every precision getter working. It does not cover cuDNN convolutions, so their legacy
+    # flag is set too. The per-backend `fp32_precision` setters are avoided: in torch 2.9 they
+    # make the legacy `allow_tf32` getters raise.
+    torch.set_float32_matmul_precision("highest")
     torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 
 def assert_no_dropout(model_or_config: Any) -> None:
-    """Raise unless every dropout rate in the HF config and every `nn.Dropout` is 0 (S4d)."""
+    """Raise unless every dropout rate in the HF config and every dropout module is 0 (S4d).
+
+    Config keys matching `*dropout*` or `*pdrop*` are checked, recursing into nested
+    sub-config dicts.
+    """
     if isinstance(model_or_config, nn.Module):
         config = getattr(model_or_config, "config", None)
         modules = list(model_or_config.named_modules())
@@ -193,13 +217,20 @@ def assert_no_dropout(model_or_config: Any) -> None:
         modules = []
 
     bad: list[str] = []
-    if config is not None:
-        attrs = config.to_dict() if hasattr(config, "to_dict") else vars(config)
+
+    def scan(attrs: Mapping[str, Any], prefix: str) -> None:
         for name, value in attrs.items():
-            if "dropout" not in name.lower():
+            if isinstance(value, Mapping):
+                scan(value, f"{prefix}{name}.")
+                continue
+            lowered = str(name).lower()  # nested dicts such as id2label have int keys
+            if "dropout" not in lowered and "pdrop" not in lowered:
                 continue
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value != 0:
-                bad.append(f"config.{name}={value}")
+                bad.append(f"config.{prefix}{name}={value}")
+
+    if config is not None:
+        scan(config.to_dict() if hasattr(config, "to_dict") else vars(config), "")
     for name, module in modules:
         if isinstance(module, nn.modules.dropout._DropoutNd) and module.p != 0:
             bad.append(f"module {name or '<root>'}: p={module.p}")

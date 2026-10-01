@@ -66,5 +66,11 @@ def test_typical_contraction_11_1():
     assert k_required(114.67, bits) == 7
 
 
+@pytest.mark.parametrize("bits", [0.0, -1.0, float("nan")])
+def test_k_required_rejects_nonpositive_b0(bits):
+    with pytest.raises(ValueError, match="no finite k"):
+        k_required(93.12, bits)
+
+
 def test_log2_inv_c():
     assert math.log2(1 / C_ANTI) == pytest.approx(0.326, abs=1e-3)

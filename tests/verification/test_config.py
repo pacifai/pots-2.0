@@ -56,7 +56,7 @@ def test_require_eta_raises_when_unset():
     ("VERIF_K", "seven"), ("VERIF_K", "0"), ("VERIF_THREADS", "-1"), ("VERIF_SEED", "-1"),
     ("VERIF_STEPS", "1.5"), ("VERIF_MASTER_DTYPE", "fp64"), ("VERIF_ETA", "abc"),
     ("VERIF_ETA", "0"), ("VERIF_ETA", "-1e-3"), ("VERIF_ETA", "nan"), ("VERIF_ETA", "inf"),
-    ("VERIF_DEVICE", "tpu9"), ("VERIF_MODEL", ""),
+    ("VERIF_DEVICE", "tpu9"), ("VERIF_MODEL", ""), ("VERIF_ATTN_IMPL", "sdpa"),
 ])
 def test_invalid_values_raise(name, value):
     with pytest.raises(ValueError, match=name):
@@ -70,23 +70,38 @@ def test_constants():
 
 
 def test_setup_determinism():
-    prev = (torch.are_deterministic_algorithms_enabled(), torch.get_num_threads(),
-            torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    cudnn = torch.backends.cudnn
+    prev_det = (torch.are_deterministic_algorithms_enabled(),
+                torch.is_deterministic_algorithms_warn_only_enabled())
+    prev_threads = torch.get_num_threads()
+    prev_prec = torch.get_float32_matmul_precision()
+    prev_cudnn = (cudnn.allow_tf32, cudnn.benchmark, cudnn.deterministic)
+    py_state, np_state = random.getstate(), np.random.get_state()
     try:
-        cfg = load_config({"VERIF_THREADS": "2", "VERIF_SEED": "5"})
-        setup_determinism(cfg)
-        assert torch.are_deterministic_algorithms_enabled()
-        assert torch.get_num_threads() == 2
-        assert not torch.backends.cuda.matmul.allow_tf32
-        assert not torch.backends.cudnn.allow_tf32
-        a = (random.random(), np.random.rand(), torch.rand(1).item())
-        setup_determinism(cfg)
-        assert (random.random(), np.random.rand(), torch.rand(1).item()) == a
+        with torch.random.fork_rng(devices=[]):
+            # A prior "medium" leaves CPU oneDNN matmul at bf16; setup must undo it (S4c).
+            torch.set_float32_matmul_precision("medium")
+            assert torch.backends.mkldnn.matmul.fp32_precision == "bf16"
+            cfg = load_config({"VERIF_THREADS": "2", "VERIF_SEED": "5"})
+            setup_determinism(cfg)
+            assert torch.are_deterministic_algorithms_enabled()
+            assert torch.get_num_threads() == 2
+            assert torch.get_float32_matmul_precision() == "highest"
+            assert torch.backends.mkldnn.matmul.fp32_precision == "ieee"
+            assert torch.backends.cuda.matmul.fp32_precision == "ieee"
+            assert not torch.backends.cuda.matmul.allow_tf32
+            assert not cudnn.allow_tf32
+            assert not cudnn.benchmark and cudnn.deterministic
+            a = (random.random(), np.random.rand(), torch.rand(1).item())
+            setup_determinism(cfg)
+            assert (random.random(), np.random.rand(), torch.rand(1).item()) == a
     finally:
-        torch.use_deterministic_algorithms(prev[0])
-        torch.set_num_threads(prev[1])
-        torch.backends.cuda.matmul.allow_tf32 = prev[2]
-        torch.backends.cudnn.allow_tf32 = prev[3]
+        torch.use_deterministic_algorithms(prev_det[0], warn_only=prev_det[1])
+        torch.set_num_threads(prev_threads)
+        torch.set_float32_matmul_precision(prev_prec)
+        cudnn.allow_tf32, cudnn.benchmark, cudnn.deterministic = prev_cudnn
+        random.setstate(py_state)
+        np.random.set_state(np_state)
 
 
 def _tiny_config(**kw) -> LlamaConfig:
@@ -118,3 +133,19 @@ def test_assert_no_dropout_rejects_config_rate():
 def test_assert_no_dropout_rejects_module():
     with pytest.raises(ValueError, match="drop"):
         assert_no_dropout(_Wrapped(_tiny_config(), 0.1))
+
+
+class _DictConfig:
+    def __init__(self, d):
+        self._d = d
+
+    def to_dict(self):
+        return self._d
+
+
+def test_assert_no_dropout_pdrop_and_nested():
+    assert_no_dropout(_DictConfig({"resid_pdrop": 0.0, "text_config": {"attention_dropout": 0.0}}))
+    with pytest.raises(ValueError, match="resid_pdrop"):
+        assert_no_dropout(_DictConfig({"resid_pdrop": 0.1}))
+    with pytest.raises(ValueError, match="text_config.attention_dropout"):
+        assert_no_dropout(_DictConfig({"text_config": {"attention_dropout": 0.1}}))
