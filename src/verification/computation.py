@@ -209,6 +209,17 @@ class DeclaredComputation(ABC):
     def linear_weights(self) -> Mapping[str, int]:
         """Check 6a: weight name -> ``m`` of the committed product that is its whole gradient."""
 
+    @property
+    def weight_dtype(self) -> torch.dtype:
+        """Dtype of every ``W_t`` / ``W_{t+1}`` leaf. fp32 at both scales (P6); bf16 is config
+        (§8.A.3), set by overriding."""
+        return torch.float32
+
+    @property
+    def product_dtype(self) -> torch.dtype:
+        """Dtype of every product leaf ``P_m`` (P6, §8.A.3)."""
+        return torch.float32
+
     # ---- derived layout -------------------------------------------------------------------
 
     @property
