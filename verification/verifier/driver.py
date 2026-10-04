@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,7 +45,13 @@ from verification.computation.interface import DeclaredComputation
 from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands
 from verification.verifier.checks import CHECKS, DEFAULT_ORDER
-from verification.verifier.context import _NO_SECTION, Rejection, Section, StepContext, StepStats
+from verification.verifier.context import (
+    Rejection,
+    Section,
+    StepContext,
+    StepStats,
+    no_section,
+)
 
 __all__ = ["RunVerdict", "Verifier"]
 
@@ -117,8 +124,8 @@ class Verifier:
         # B6 metrics seam (runs/metrics.py): wraps each check; observes only.
         self.section = section
 
-    def _timed(self, name: str):
-        return _NO_SECTION if self.section is None else self.section(name)
+    def _timed(self, name: str) -> AbstractContextManager[Any]:
+        return no_section(name) if self.section is None else self.section(name)
 
     def _adopt(self, bands: Bands) -> None:
         if bands.source == "provisional" and not self.allow_provisional:
@@ -209,8 +216,9 @@ class Verifier:
         timings = self.timings[t] = {}
         self.stats[t] = ctx.stats
         for check_id in DEFAULT_ORDER:
-            # the clock inside the seam: a metrics probe's own cost stays out of timings
-            with self._timed(ctx.chain_check_id if check_id == "7" else check_id):
+            # the clock inside the seam: a metrics probe's own cost stays out of timings. Step 1's
+            # chaining comparison is timed as row "7" (check 0's anchor hashing is "run:0").
+            with self._timed(check_id):
                 t0 = time.perf_counter()
                 rej = CHECKS[check_id](store, self.c, ctx, bands)
                 timings[check_id] = time.perf_counter() - t0

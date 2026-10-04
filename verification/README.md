@@ -221,10 +221,12 @@ replaced:
 - **`loop.py`** connects prover and verifier step by step (see "Workflow: a whole run").
 - **`mlp_smoke.py`** runs the declared cheats against the MLP (see "Workflow: testing that
   cheats are caught").
-- **`metrics.py`** records what each part of a step costs: time and peak memory per prover
-  component (P0–P5) and per check, FLOPs and bytes hashed in a separate counting pass, and
-  every step's normalized residuals for calibration. It observes the run through a `section`
-  hook that is off by default; `metrics_overhead.py` measures what recording costs.
+- **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
+  prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
+  hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
+  step's verdict and checks, and its normalized residuals for calibration, as EQ13's records.
+  It observes the run through a `section` hook that is off by default;
+  `metrics_overhead.py` measures what recording costs.
 - **`materialize_data.py`** builds `D` and `D̃` and writes them under
   `trainer_output/verification/data/`.
 

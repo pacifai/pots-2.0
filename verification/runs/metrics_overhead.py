@@ -8,7 +8,8 @@ a temporary directory, as a real run would. Per run it compares timers that exis
 modes:
 
 - the loop's ``prove_s``, ``commit_s``, ``verify_s`` and their sum. These enclose every section,
-  so with metrics on they include each section's bookkeeping and memory read;
+  so with metrics on they include each section's bookkeeping (a ``perf_counter`` read: the timed
+  run measures nothing else) and the writer's records and residual arrays at step close;
 - each check's time in ``Verifier.timings``, whose clock runs inside the check's section, so it
   includes only the nested sections' bookkeeping (``5.glue``, ``5.measure``, ``6b.glue``).
 
@@ -33,7 +34,7 @@ from verification.computation.instances.mlp import (
     synthetic_dataset,
 )
 from verification.parameters import load_protocol_config
-from verification.runs.metrics import CostRecorder, MetricsWriter
+from verification.runs.metrics import MetricsWriter, TimeRecorder
 from verification.runs.mlp_smoke import N_S, honest_final, run_scenario, scenarios
 
 __all__ = ["measure", "section_cost_us", "main"]
@@ -56,11 +57,11 @@ def _times(r: Any) -> dict[str, float]:
 
 
 def section_cost_us(n: int = 20000) -> float:
-    """Microseconds per top-level section entry and exit, memory reads included."""
-    rec = CostRecorder("bench")
+    """Microseconds per top-level section entry and exit in the timed run (CPU)."""
+    rec = TimeRecorder("bench", "bench")
     t0 = time.perf_counter()
     for _ in range(n):
-        with rec.section("P0.load"):
+        with rec.section("P3.commit"):
             pass
     return (time.perf_counter() - t0) / n * 1e6
 
@@ -78,7 +79,7 @@ def measure(*, reps: int = 30, T: int = 10, k: int | None = None,
     honest = next(s for s in scenarios(c, dataset) if s.name == "honest")
     runs: dict[str, list[dict[str, float]]] = {m: [] for m in MODES}
     sections: list[float] = []  # metrics on: the reported step totals, summed per run
-    with tempfile.TemporaryDirectory() as tmp, MetricsWriter(tmp) as mw:
+    with tempfile.TemporaryDirectory() as tmp, MetricsWriter(tmp, "overhead") as mw:
         for i in range(reps + 1):  # repetition 0 warms up and is dropped
             for mode in MODES[i % 3:] + MODES[:i % 3]:
                 rec = mw.recorder(honest.name) if mode == "on" else None
@@ -89,9 +90,9 @@ def measure(*, reps: int = 30, T: int = 10, k: int | None = None,
                     continue
                 runs[mode].append(_times(r))
                 if rec is not None:
-                    sections.append(sum(x.time_s for x in rec.rows
-                                        if x.level == "total" and x.component == "step"
-                                        and x.step > 0))
+                    sections.append(sum(x["time_s"] for x in rec.rows
+                                        if x["record"] == "time" and x["level"] == "total"
+                                        and x["component"] == "step" and x["step"] > 0))
     keys = list(runs["off"][0])
     med = {m: {key: statistics.median(x[key] for x in v) for key in keys}
            for m, v in runs.items()}
@@ -112,7 +113,7 @@ def measure(*, reps: int = 30, T: int = 10, k: int | None = None,
     out(f"  metrics on, reported step totals (sum of top-level sections): "
         f"{summary['sections_step_total_s'] * 1e3:.3f} ms per run "
         f"({summary['sections_step_total_s'] / med['off']['run'] - 1:+.2%} vs the off run timer)")
-    out(f"  one top-level section costs {summary['section_us']:.2f} us (timer and memory read)")
+    out(f"  one top-level section costs {summary['section_us']:.2f} us (bookkeeping and timer)")
     return summary
 
 

@@ -120,8 +120,9 @@ def run_loop(
     check 4.
 
     ``section`` is the B6 metrics seam (``runs/metrics.py``), passed on to ``prove_step``. The
-    loop adds the prover phases ``P4.paths``, ``P3.commit`` and ``P5.release`` per step and
-    ``run:P4.tree`` once. The verifier's own seam is set on the ``Verifier``.
+    loop adds the prover phases ``P4.paths``, ``P3.commit`` (hashing) and ``P5.write`` (the
+    hand-off to the store) per step and ``run:P4.tree`` once. The verifier's own seam is set on
+    the ``Verifier``.
     """
     sec = section or no_section
     fault = fault or HONEST
@@ -147,14 +148,15 @@ def run_loop(
         with sec("P4.paths"):
             paths = [tree.path(i) for i in idx]
         with sec("P3.commit"):
-            store = InMemoryStore.from_step(c, out, dataset_paths=paths)
+            leaves, tree_h = InMemoryStore.commit_step(c, out)
+        with sec("P5.write"):
+            store = InMemoryStore.hold(c, leaves, tree_h, paths)
         t2 = time.perf_counter()
         w, loss = out.w_next, out.loss
-        del out  # the store holds the leaves; nothing else keeps the step
+        del out, leaves, tree_h  # the store holds the leaves; nothing else keeps the step
         rej = verifier.verify_step(t, store)
         t3 = time.perf_counter()
-        with sec("P5.release"):
-            del store  # discard before step t+1 (S3)
+        del store  # discard before step t+1 (S3)
         rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1b, t3 - t2)
         result.steps.append(rec)
         if on_step is not None:

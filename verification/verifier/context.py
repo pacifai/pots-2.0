@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 __all__ = [
     "PROVER_DATA_ERRORS",
     "Section",
+    "no_section",
     "Rejection",
     "RejectionKind",
     "ProductStat",
@@ -48,9 +49,15 @@ __all__ = [
 ]
 
 # A metrics seam (B6, ``runs/metrics.py``): ``section(name)`` wraps one part of a check. It
-# observes only; with ``None`` the checks run exactly as without it.
+# observes only; with ``None`` the checks run exactly as without it. ``prover/step.py`` declares
+# the same alias: the verifier may not import from the prover (invariant 1, test_layering.py).
 Section = Callable[[str], AbstractContextManager[Any]]
 _NO_SECTION = nullcontext()
+
+
+def no_section(name: str) -> AbstractContextManager[Any]:
+    """The seam when no metrics are taken: a shared no-op context manager."""
+    return _NO_SECTION
 
 # Every error the TranscriptStore docstring lists: TranscriptFormatError and its subclasses,
 # EncodingError, NonFiniteError and encode_record's ValueError (RecordError for a token
