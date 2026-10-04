@@ -592,6 +592,13 @@ interface.
   - **Finiteness.** Any non-finite ν, `‖|P|·1‖`, `‖P‖_F` or residual, and any non-finite
     check-6 residual or bound, rejects in either mode. Check 6 compares `ρ = |R|/scale`
     (float64) with `τ_W`, the same number `freeze` rejudges.
+  - **Check 6's fast path.** `_update_identity` computes `R` and the scale in fp32 blocks of
+    `UPDATE_CHUNK` entries in reused buffers (`UpdateScratch`). It takes float64 `ρ` only
+    for the entries tied at the block's max fp32 quotient. Rounding is monotone, so that
+    `ρ_max` is bit-identical to the whole-tensor formula. Any non-finite value, a `ρ_max`
+    above `τ_W` in judging mode, or mixed dtypes fall back to
+    `_update_identity_reference`, the spec's formula, so every rejection message is
+    unchanged. `tests/verification/verifier/test_update_identity.py` compares the two.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
     from the root it recomputed in check 2, never from `store.root`.
   - **Member batching.** A run of consecutive member specs of one layer (`_member_runs`;
@@ -770,10 +777,13 @@ interface.
     analytic floor rather than fitting anything. The γ's `ρ = 0` means the fused and
     reference updates agree bit for bit on every entry of those tensors (a mismatch rate of
     about 1e−5 per entry), not that their gradients vanish.
-  - Prover 1.1 s (`prove_step` 0.9, commit 0.24), verifier 3.2 s (check 5
-    1.75: glue 0.53, measure 1.13; 6a 0.8, check 2 0.24, check 7 0.18, 6b 0.17), 2026-10-04
-    after the one-pass replay and batched member measuring. Earlier: verifier 4.0 s (check 5
-    2.6). Before leaves were hashed in parallel: prover
+  - Prover 1.1 s (`prove_step` 0.9, commit 0.24), verifier 2.24 s (check 5
+    1.75: glue 0.53, measure 1.13; 6a 0.10, check 2 0.24, check 7 0.18, 6b 0.03), 2026-10-04
+    after the one-pass replay, batched member measuring and check 6's fast path. That path
+    cut 6a from 0.77 s to 0.10 s and 6b from 0.16 s to 0.03 s, with the same check-6 table,
+    and the verifier's process peak from 6.55 GB to 5.96 GB (6b's float64 temporaries on
+    `W_E` were the peak). Earlier: verifier 4.0 s (check 5 2.6, 6a 0.8). Before leaves were
+    hashed in parallel: prover
     2.4 s (commit 1.5), verifier 5.4 s (check 2 1.5). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
     verifier peak 5.5 GB (3.7 GB at its start, the held store).
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
