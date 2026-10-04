@@ -14,7 +14,7 @@ from verification.computation.instances import LlamaComputation
 from verification.runs import llama_step
 from verification.runs.metrics import MetricsWriter, read_residuals
 from verification.runs.loop import ProverFault
-from verification.runs.mlp_smoke import Expected, Scenario, honest_final, run_scenario
+from verification.runs.scenarios import HONEST, Expected, Scenario, honest_final, run_scenario
 from verification.verifier.residuals import class_summary, tensor_summary
 
 from tests.verification.llama_helpers import make_records, tiny_config
@@ -36,7 +36,7 @@ def test_tiny_honest_run_is_accepted_and_reported(tiny, tmp_path):
     with MetricsWriter(tmp_path, "llama_step", device="cpu", model="tiny", corpus="synthetic",
                        seed=0, config={}, band_file_hash=None, h_D=dataset_tree(c, D).root) as mw:
         r = llama_step.run_honest(c, D, w0, T=T, k=7, h_D=dataset_tree(c, D).root, final=final,
-                                  recorder=mw.recorder(llama_step.HONEST.name))
+                                  recorder=mw.recorder(HONEST.name))
     assert r.passed and r.loop.verdict.accepted and r.loop.verdict.steps_verified == T
     rows = class_summary(r.verifier.stats)
     assert sum(x.count for x in rows) == T * c.M

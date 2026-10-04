@@ -40,22 +40,19 @@ from setup.data import load_dataset_records
 from verification.computation.interface import DeclaredComputation
 from verification.computation.instances.llama import LlamaComputation
 from verification.parameters import load_protocol_config
-from verification.runs.loop import ProverFault
 from verification.runs.metrics import (
     CountRecorder,
     MemoryRecorder,
     MetricsWriter,
     TimeRecorder,
-    count_pass,
     lifetime_maxrss_bytes,
-    memory_pass,
-    memory_probe,
 )
-from verification.runs.mlp_smoke import (
-    Expected,
-    Scenario,
+from verification.runs.scenarios import (
+    HONEST,
     ScenarioResult,
+    count_run,
     honest_final,
+    memory_run,
     report,
     run_scenario,
 )
@@ -66,13 +63,9 @@ from verification.verifier.residuals import (
     tensor_summary,
 )
 
-__all__ = ["HONEST", "run_honest", "report_residuals", "report_costs", "memory_run",
-           "count_run", "load_committed_dataset", "main"]
+__all__ = ["run_honest", "report_residuals", "report_costs", "load_committed_dataset", "main"]
 
 RUN_NAME = "llama_step"  # the metrics directory under VERIF_OUTPUT_DIR
-
-HONEST = Scenario("honest", "no fault", ProverFault(), Expected())
-
 
 def load_committed_dataset(c: LlamaComputation, data_dir: Path) -> tuple[list[Any], bytes]:
     """``D`` from ``D.bin`` (every record validated) and the published ``h_D`` from
@@ -120,22 +113,6 @@ def report_costs(r: ScenarioResult, memory_rows: Sequence[Mapping[str, Any]] | N
     out(f"process lifetime peak RSS {lifetime_maxrss_bytes() / 2**30:.2f} GB")
 
 
-def memory_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-               *, T: int, k: int, h_D: bytes, final: Mapping[str, torch.Tensor],
-               device: str | torch.device = "cpu", run: str = RUN_NAME) -> list[dict[str, Any]]:
-    """The B6 memory pass: the same ``T`` honest steps, probed at every section, never timed."""
-    return memory_pass(run, HONEST.name, lambda rec: run_honest(
-        c, dataset, w0, T=T, k=k, h_D=h_D, final=final, recorder=rec), memory_probe(device))
-
-
-def count_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-              *, T: int, k: int, h_D: bytes, final: Mapping[str, torch.Tensor],
-              run: str = RUN_NAME) -> list[dict[str, Any]]:
-    """The B6 counting pass: the same ``T`` honest steps, counted, never timed."""
-    return count_pass(run, HONEST.name, lambda rec: run_honest(
-        c, dataset, w0, T=T, k=k, h_D=h_D, final=final, recorder=rec))
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=1, help="T, at least 1 (default 1)")
@@ -174,9 +151,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                            band_file_hash=None, h_D=h_D,
                            extra={"band_source": "provisional", **llama}) as mw:
             r = run_honest(c, D, w0, **run_args, recorder=mw.recorder(HONEST.name))
-            mem_rows = memory_run(c, D, w0, **run_args, device=mw.device)
+            mem_rows = memory_run(c, D, w0, run=RUN_NAME, **run_args, device=mw.device)
             mw.write(mem_rows)
-            mw.write(count_run(c, D, w0, **run_args))
+            mw.write(count_run(c, D, w0, run=RUN_NAME, **run_args))
         print(f"metrics: {mw.dir}")
     report(r)
     report_residuals(r)

@@ -66,7 +66,7 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
-| `runs/` | `loop.py`, `mlp_smoke.py`, `llama_step.py`, `metrics.py`, `materialize_data.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
+| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
@@ -237,6 +237,9 @@ replaced:
 ### Runs: `runs/`
 
 - **`loop.py`** connects prover and verifier step by step (see "Workflow: a whole run").
+- **`scenarios.py`** holds what any instance's scenarios share: a scenario with its fault and
+  declared outcome, running it through the loop, judging the outcome, the honest reference
+  weights for check 8, the report, and the memory and counting passes.
 - **`mlp_smoke.py`** runs the declared cheats against the MLP (see "Workflow: testing that
   cheats are caught").
 - **`llama_step.py`** runs honest SmolLM2 steps from the pretrained weights on the committed

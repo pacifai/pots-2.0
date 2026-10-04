@@ -629,10 +629,17 @@ interface.
     prove_s, commit_s, verify_s)`. `prove_s` excludes `emit`. Per-check timings and stats stay on
     the verifier. A test holds weakrefs to each step's products and checks they are dead by the
     next step.
+- `scenarios.py`: the instance-agnostic scenario harness, shared by `mlp_smoke` and
+  `llama_step`. `Scenario(name, description, fault, expected)`, `Expected` (the declared
+  outcome), `ScenarioResult`, `HONEST` (no fault, accept), `honest_final(c, D, w0, T)` (`T`
+  uncaptured `plain_step`s from `W_0` through `run_plain`, check 8's reference),
+  `run_scenario(..., recorder=None, h_D=None)` (`h_D` defaults to `D`'s root), `judge` (the
+  S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
+  default `HONEST`, through `memory_pass` / `count_pass`).
 - `mlp_smoke.py` (A6, milestone M1):
   `.venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]`.
-  `run_scenario(..., recorder=None, h_D=None)` and `run_smoke(..., metrics=None)` take B6's recorder
-  and writer; `memory_smoke` and `count_smoke` are the memory and counting passes.
+  Holds the MLP's scenario list, `run_smoke(..., metrics=None)` and `memory_smoke` /
+  `count_smoke` (`PASS_STEPS` honest steps through `scenarios.memory_run` / `count_run`).
   - The MLP at widths `(16,32,32,8)`, `n_s = 4`, `η = VERIF_ETA`, `k = VERIF_K`, on
     `synthetic_dataset` of `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS`
     (default 10), and must be ≥ 2. Bands are provisional, with `allow_provisional=True`.
@@ -642,7 +649,7 @@ interface.
     300 ulps at step 2 → `(2, "6a")`), `bad-w-next-batch` (A3 on the last `n_s` records of `D`
     → `(2, "6a")`) and `broken-chain` (one hidden `plain_step` between steps 1 and 2, P11, on the
     last `n_s` records of `D` since the MLP has no `b̃` → `(2, "7")`).
-  - `judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
+  - `scenarios.judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
     normalized residual, max κ, 6a `ρ_max` and per-check ms, and exits 1 if any oracle fails.
 - `metrics.py` (B6): EQ1b's cost grid and EQ13's run records (`DECISIONS_EVALUATION.md`). The
   module docstring holds the full definitions; read it before changing a seam.
@@ -702,9 +709,9 @@ interface.
   [--steps T] [--metrics | --no-metrics]`, with `T` default 1. `LlamaComputation.from_config`,
   `W_0` from `build_model()`, `D` from `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D`
   from `meta.json` (`load_committed_dataset`). The honest scenario goes through
-  `mlp_smoke.run_scenario` (instance-agnostic; its `h_D` kwarg defaults to `D`'s root) with
-  provisional bands, check 8 against `honest_final`. `run_honest`, `memory_run`, `count_run`;
-  `report_residuals` prints `residuals.py`'s two tables, `report_costs` each step's prover and
+  `scenarios.run_scenario` with the published `h_D` and provisional bands, check 8 against
+  `scenarios.honest_final`; its memory and counting passes are `scenarios.memory_run` /
+  `count_run`. `run_honest`; `report_residuals` prints `residuals.py`'s two tables, `report_costs` each step's prover and
   verifier wall clock and, from the memory pass, each side's peak. Metrics go to
   `llama_step/`. Exits 1 unless accepted.
   - The real step from `W_0` on `π(1)` (k 7, η 1e-3), 2026-10-04 on the dev Mac: accepted.
@@ -739,7 +746,7 @@ interface.
     `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`.
   - Training is `loop.run_plain(c, model, D, w0, *, n_steps, schedule=None, on_step=None,
     section=None) -> PlainResult(steps, w_final)`: chained `plain_step`s on `run_loop`'s
-    default `π`, no tree, paths, commitment or verifier. `mlp_smoke.honest_final` uses it too.
+    default `π`, no tree, paths, commitment or verifier. `scenarios.honest_final` uses it too.
     `PlainStepRecord.train_s` is host time around the step, informational; P0's times are
     the `P0.*` rows.
   - `plain_baseline(c, D, w0, *, T, build_model, out_dir=None, metrics=None,

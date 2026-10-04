@@ -34,7 +34,8 @@ from verification.runs.metrics import (
     read_residuals,
     step_record,
 )
-from verification.runs.mlp_smoke import honest_final, run_scenario, run_smoke, scenarios
+from verification.runs.mlp_smoke import run_smoke, scenarios
+from verification.runs.scenarios import honest_final, run_scenario
 from verification.transcript.store import InMemoryStore
 from verification.verifier import bands
 from verification.verifier.checks import DEFAULT_ORDER

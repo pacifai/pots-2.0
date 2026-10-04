@@ -6,15 +6,8 @@ import torch
 from verification.computation.instances.mlp import MLPComputation, init_weights, synthetic_dataset
 from verification.runs import mlp_smoke
 from verification.runs.loop import ProverFault
-from verification.runs.mlp_smoke import (
-    Expected,
-    Scenario,
-    honest_final,
-    judge,
-    run_scenario,
-    run_smoke,
-    scenarios,
-)
+from verification.runs.mlp_smoke import run_smoke, scenarios
+from verification.runs.scenarios import Expected, Scenario, honest_final, judge, run_scenario
 
 K = 7
 T = 3
