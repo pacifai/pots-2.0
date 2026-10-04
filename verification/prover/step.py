@@ -108,6 +108,33 @@ def _versions(objs: Sequence[Any]) -> tuple[int, ...]:
     return tuple(t._version for t in objs if isinstance(t, torch.Tensor))
 
 
+def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int]) -> bool:
+    """Whether the caller's ``w`` can be the committed ``W_t`` leaf itself (see prove_step).
+
+    It must hash to the bytes the model holds after ``load_weights`` (same dtype, shape and
+    device, contiguous), own its whole storage (no view that another tensor can write through),
+    not be a live parameter (``requires_grad``), and not share storage with any of ``model``'s
+    parameters, which the step updates in place.
+    """
+    return (not w.requires_grad and w.dtype == p.dtype and w.shape == p.shape
+            and w.device == p.device and w.is_contiguous() and not w._is_view()
+            and w.storage_offset() == 0
+            and w.untyped_storage().nbytes() == w.numel() * w.element_size()
+            and w.untyped_storage().data_ptr() not in model_storages)
+
+
+def _w_t_leaves(computation: DeclaredComputation, model: torch.nn.Module,
+                w_t: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The committed ``W_t``: the caller's tensor where :func:`_shareable`, else a copy of the
+    loaded parameter. Either way the bytes are those the model holds after ``load_weights``."""
+    storages = {q.untyped_storage().data_ptr() for q in model.parameters()}
+    out = {}
+    for n in computation.weight_names:
+        w, p = w_t[n], model.get_parameter(n)
+        out[n] = w if _shareable(w, p, storages) else p.detach().clone()
+    return out
+
+
 def _optimizer(computation: DeclaredComputation, model: torch.nn.Module) -> torch.optim.SGD:
     # Invariant 4 (S8a): plain SGD, nothing else on.
     return torch.optim.SGD(model.parameters(), lr=computation.eta, momentum=0, weight_decay=0)
@@ -156,6 +183,16 @@ def prove_step(
     wraps the phases ``train.load``, ``P2.w_t``, ``train.forward``, ``train.backward``,
     ``P1.label``, ``train.update`` and ``P2.w_next``. ``train.*`` is training under capture, not
     EQ1b's P0, which only :func:`plain_step` measures (``runs/metrics.py`` maps the rows).
+
+    The committed ``W_t`` leaves are the caller's ``w_t`` tensors themselves, not copies, when
+    each is a contiguous tensor of the model's dtype, shape and device that owns its whole
+    storage, doesn't require grad and shares no storage with ``model``'s parameters. Any other
+    tensor is committed as a copy of the loaded parameter. The bytes are the same either way.
+    Sharing saves one copy of the weights per step, but the caller must then not write to
+    ``w_t`` until the step's store is dropped. The ``_version`` guard (invariant 6) catches a
+    write: :meth:`StepOutput.assert_unmodified` in the commit, the store on every read. The run
+    loop meets this: its ``w_t`` is ``W_0``, the previous step's ``W_{t+1}`` copy or a fault's
+    entry weights, and nothing in the loop writes to them.
     """
     if len(records) != computation.n_s:
         raise ValueError(f"batch has {len(records)} records, the computation declares "
@@ -167,7 +204,9 @@ def prove_step(
     with sec("train.load"):
         load_weights(computation, model, w_t)
     with sec("P2.w_t"):
-        w_t_leaves = snapshot_weights(computation, model)  # parameters change in place at the step
+        # Never the parameters themselves: they change in place at the step.
+        w_t_leaves = _w_t_leaves(computation, model, w_t)
+        w_t_versions = _versions(list(w_t_leaves.values()))
     with sec("train.load"):
         model.zero_grad(set_to_none=True)
         opt = _optimizer(computation, model)
@@ -206,7 +245,7 @@ def prove_step(
     return StepOutput(
         records=tuple(records), w_t=w_t_leaves, products=tuple(products), w_next=w_next,
         loss=float(loss.detach()),
-        versions=(record_versions + _versions(list(w_t_leaves.values()))
+        versions=(record_versions + w_t_versions
                   + tuple(product_versions) + _versions(list(w_next.values()))),
     )
 

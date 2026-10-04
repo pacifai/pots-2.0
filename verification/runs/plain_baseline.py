@@ -60,6 +60,7 @@ from verification.commitment.leaves import dataset_root
 from verification.commitment.merkle import hash_tensor_leaf, merkle_root
 from verification.computation.interface import DeclaredComputation, snapshot_weights
 from verification.runs.loop import PlainResult, run_plain
+from verification.runs.scenarios import ReusedModel
 from verification.runs.metrics import (
     PASS_STEPS,
     MetricsWriter,
@@ -258,10 +259,11 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
                    out: Callable[[str], None] = print) -> BaselineResult:
     """``T`` plain steps from ``W_0``; then, with ``metrics``, the memory and counting passes.
 
-    The timed run and each pass build their own model with ``build_model`` and load ``W_0``
-    into it. ``final_weights.json`` goes to ``out_dir`` (default ``metrics.dir``; none if both are
-    ``None``), with ``provenance`` (:func:`run_provenance`). With ``keep_weights=False`` the
-    final weights are dropped once hashed, before the passes, and ``plain.w_final`` is empty.
+    The timed run and each pass get their model from ``build_model`` (a fresh build, or a
+    ``scenarios.ReusedModel``) and load ``W_0`` into it. ``final_weights.json`` goes to
+    ``out_dir`` (default ``metrics.dir``; none if both are ``None``), with ``provenance``
+    (:func:`run_provenance`). With ``keep_weights=False`` the final weights are dropped once
+    hashed, before the passes, and ``plain.w_final`` is empty.
     """
     if not 1 <= pass_steps <= T:
         raise ValueError(f"pass_steps = {pass_steps} must be in 1..T = {T}")
@@ -358,14 +360,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     setup_determinism(cfg)
     c = LlamaComputation.from_config(cfg)
     dataset = load_dataset_records(d_path, c.n)
-    w0 = snapshot_weights(c, c.build_model())  # W_0, as the verified run's prover loads it
+    # One from_pretrained model for W_0 (as the verified run's prover loads it), the timed run
+    # and both passes; each run loads W_0 into it before use (scenarios.ReusedModel).
+    models = ReusedModel(c.build_model)
+    w0 = snapshot_weights(c, models())
     h_D = dataset_root(dataset)
     prov = run_provenance(cfg, h_D)
     print(f"plain baseline: {cfg.model} @ {cfg.model_revision[:8]}, n_s {c.n_s}, n {c.n}, "
           f"η {c.eta:g}, T {T}, |D| {len(dataset)}, h_D {h_D.hex()[:16]}…")
     out_dir = cfg.output_dir / RUN_NAME
     if not use_metrics:
-        plain_baseline(c, dataset, w0, T=T, build_model=c.build_model, out_dir=out_dir,
+        plain_baseline(c, dataset, w0, T=T, build_model=models, out_dir=out_dir,
                        provenance=prov, keep_weights=False)
         return 0
     run_cfg = {"T": T, "pass_steps": args.pass_steps}
@@ -373,7 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                        corpus=cfg.dataset, seed=cfg.seed,
                        config={**training_config(cfg), **run_cfg}, band_file_hash=None,
                        h_D=h_D, extra={"scenario": SCENARIO, **run_cfg}) as mw:
-        plain_baseline(c, dataset, w0, T=T, build_model=c.build_model, metrics=mw,
+        plain_baseline(c, dataset, w0, T=T, build_model=models, metrics=mw,
                        pass_steps=args.pass_steps, provenance=prov, keep_weights=False)
     return 0
 

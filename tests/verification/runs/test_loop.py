@@ -181,6 +181,31 @@ def test_each_step_is_released(c, D, w0, final):
     assert all(r() is None for rs in refs.values() for r in rs)
 
 
+def test_shared_w_t_tensors_are_never_written(c, D, w0, final):
+    """O5: each step commits its entry weights themselves (W_0, then the previous W_{t+1}), and
+    nothing in the run (prover, store, verifier, check 0's anchor) writes to them."""
+    w0 = {n: w.clone() for n, w in w0.items()}  # the fixture's tensors stay untouched
+    entry: dict[int, dict[str, torch.Tensor]] = {}
+    versions: dict[int, list[int]] = {}
+
+    class Watch(ProverFault):
+        def entry_weights(self, t, w):
+            entry[t] = dict(w)
+            versions[t] = [x._version for x in w.values()]
+            return w
+
+        def emit(self, t, out):
+            assert all(out.w_t[n] is entry[t][n] for n in c.weight_names)
+            return out
+
+    v = _verifier(c, D, w0)
+    res = run_loop(c, c.build_model(), D, w0, v, final=final, fault=Watch())
+    assert res.verdict.accepted and sorted(entry) == [1, 2, 3]
+    assert all(entry[1][n] is w0[n] for n in c.weight_names)
+    for t, w in entry.items():
+        assert [x._version for x in w.values()] == versions[t], f"step {t}'s W_t was written"
+
+
 def test_verifier_receives_only_stores(c, D, w0, final, monkeypatch):
     """Invariant 1 at the loop boundary: verify_step's argument is a TranscriptStore."""
     got = []

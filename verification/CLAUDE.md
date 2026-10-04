@@ -347,8 +347,9 @@ interface.
     order.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
     imports the prover. So is `snapshot_weights(computation, model)`, the one way to copy the
-    declared weights out of a model: the prover's `W_t`/`W_{t+1}` leaves and every run's `W_0`
-    (from a freshly built model). A12 must take `W_0` with it, as B7 does.
+    declared weights out of a model: the prover's `W_{t+1}` leaves and every run's `W_0`
+    (from a model as built). A12 must take `W_0` with it, as B7 does. The prover's `W_t`
+    leaves are the caller's `w_t` tensors where `prove_step` can share them (see `step.py`).
 - `matmul_ops.py`: `HANDLED_OPS` (`mm`, `bmm`, `addmm`, `baddbmm`), `REJECTED_OPS` (every
   other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
   (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (empty) and `param_storage_map(model)`. Shared by
@@ -509,6 +510,13 @@ interface.
     `plain_step` calls, and `runs/loop.run_plain` chains them for the plain baseline (B7).
     With `section` it is EQ1b's P0 (`P0.load`, `P0.forward`, `P0.backward`, `P0.update`),
     the plain baseline B7 times.
+  - **`W_t` sharing (O5).** The `W_t` leaves are the caller's `w_t` tensors themselves when
+    each is grad-free, contiguous, not a view, owns its whole storage, matches the declared
+    dtype, shape and device, and shares no storage with the model's parameters (which the
+    step updates in place). Any other input is copied, with the same leaf bytes. The caller
+    must not write to `w_t` until the store is dropped; the `_version` guard catches a write
+    (invariant 6). In the loop, `w_t` is `W_0`, the previous step's `W_{t+1}` copy, or a
+    fault's entry weights, and a test checks none of them is written during a run.
   - `StepOutput` has the fields `records`, `w_t`, `products`, `w_next`, `loss` and
     `versions`. `.leaves()` returns them in transcript order, and
     `.assert_unmodified()` checks the versions.
@@ -682,6 +690,14 @@ interface.
   `run_scenario(..., recorder=None, h_D=None)` (`h_D` defaults to `D`'s root), `judge` (the
   S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
   default `HONEST`, through `memory_pass` / `count_pass`).
+  - **Model reuse (O4).** `honest_final`, `run_scenario`, `memory_run` and `count_run` take
+    `build_model=None` (default `c.build_model`). `ReusedModel(build)` builds one model and
+    hands the same one out on every call; each run loads its own weights into it first. On
+    every handout it raises `RuntimeError` if a hook is left, a grad or `requires_grad`
+    changed, a buffer changed (set, dtype, shape or value), or the train/eval mode changed.
+    `honest_final` returns `snapshot_weights` clones and raises if any shares storage with
+    the model, so check 8's reference stays independent of the prover's later runs. The
+    verifier still builds its own model (invariant 1).
 - `mlp_smoke.py` (A6, milestone M1):
   `.venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]`.
   Holds the MLP's scenario list, `run_smoke(..., metrics=None)` and `memory_smoke` /
@@ -759,7 +775,9 @@ interface.
   `scenarios.honest_final`; its memory and counting passes are `scenarios.memory_run` /
   `count_run`. `run_honest`; `report_residuals` prints `residuals.py`'s two tables, `report_costs` each step's prover and
   verifier wall clock and, from the memory pass, each side's peak. Metrics go to
-  `llama_step/`. Exits 1 unless accepted.
+  `llama_step/`. Exits 1 unless accepted. `main` takes `W_0` from one `ReusedModel`, which
+  then serves `honest_final` and every prover run (timed, memory and count passes), so a
+  no-metrics run loads the checkpoint twice (that model and the verifier's), not four times.
   - The real step from `W_0` on `π(1)` (k 7, η 1e-3), 2026-10-04 on the dev Mac: accepted.
     Most classes have an RMS of 0.3–0.9 and a max ≤ 2.7, except `S` (max 3.8), `Λ` (RMS 3.8,
     max 5.43, the global max) and `dF` (RMS 1.6, max 2.1); max κ 28 (`dX_down`).
@@ -786,6 +804,11 @@ interface.
     hashed in parallel: prover
     2.4 s (commit 1.5), verifier 5.4 s (check 2 1.5). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
     verifier peak 5.5 GB (3.7 GB at its start, the held store).
+  - O4 and O5 (2026-10-04, `--steps 2 --no-metrics`, two runs each, `MallocLargeCache=0`):
+    `prove_step` 0.85–0.91 s → 0.80–0.83 s, the whole command 9.0 s → 8.6 s, and the
+    maximum RSS from `time -l` 6.92 GB → 6.35 GB (lifetime peak 6.45 → 5.91 GB). Every
+    root, loss, residual and final weight is bit-identical; step 2 still rejects at check 5
+    on `P_2371` (`Λ`), residual 10.1 > τ = 8.
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
   `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
   `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored. Rerun it with
@@ -793,7 +816,9 @@ interface.
 - `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
   [--steps T] [--pass-steps S] [--metrics | --no-metrics]`. The honest run's training with
   capture and every protocol step off.
-  - Same `W_0` (`snapshot_weights(c, c.build_model())`, the model
+  - `main` takes `W_0` from a `scenarios.ReusedModel` and passes it as `build_model`, so
+    `W_0` and every pass share one load.
+  - Same `W_0` (`snapshot_weights(c, c.build_model())` semantics, the model
     `LlamaComputation.from_config` loads; A12 must take its `W_0` the same way), same `π` over
     `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`.
   - Training is `loop.run_plain(c, model, D, w0, *, n_steps, schedule=None, on_step=None,
