@@ -289,21 +289,30 @@ interface.
   - Errors: `NonFiniteError` and `EncodingError`.
   - `tensor_leaf_header(tag, t)` and `tensor_leaf_payload(t)`. The payload is a zero-copy view
     that aliases `t`, so don't mutate `t` until it is hashed. The tensor must be a contiguous
-    CPU tensor.
+    CPU tensor. The finiteness check uses `torch.aminmax`, which propagates NaN, so it
+    rejects exactly what `isfinite(t).all()` rejects, about 6× faster and with no temporary.
   - `encode_tensor_leaf(tag, t)`.
 - `merkle.py` (B2, merged):
-  - `hash_leaf(*parts)` streams its inputs, and runs multithreaded at 1 MiB and above with the
-    same digest.
+  - `hash_leaf(*parts)` streams its inputs, and runs multithreaded at 16 MiB and above with
+    the same digest.
+  - `hash_leaves(iterable of parts) -> list[bytes]` hashes many leaves on a shared pool of
+    `torch.get_num_threads()` worker threads (`VERIF_THREADS`); blake3 releases the GIL. The
+    iterable is consumed on the calling thread in order, so its errors surface as in a loop.
+    Leaves go to the workers in chunks of about 16 MiB. With one thread it hashes inline.
   - `hash_node`, `hash_tensor_leaf(tag, t)` and `hash_record_leaf(rec)`.
   - `merkle_root(hashes)`. Leaf hashes must be `bytes` of length 32.
   - `MerkleTree(hashes)`, with `.root`, `.n_leaves`, `.leaf(i)`, `.path(i)` (nearest sibling
     first) and `.update_leaf(i, h) -> root`, which costs O(log n).
   - `verify_path(leaf_hash, index, n_leaves, path, root)`, following RFC 9162 §2.1.3.2. See
     invariant 7.
-  - About 9 GB/s on a 113 MB fp32 tensor.
+  - About 9 GB/s on a 113 MB fp32 tensor, hashed alone. A step's 7,661 leaves (2.6 GB) hash
+    in about 0.24 s through `hash_leaves` at 8 threads, encoding and finiteness included.
 - `leaves.py` (A4, merged): leaf hashing against `C`, the same code on both sides.
   - `leaf_parts(c, i, obj)` and `leaf_hash(c, i, obj)` check each leaf's shape and dtype
     against `C`.
+  - `leaf_hashes_of(c, items)` hashes `(index, obj)` pairs through `hash_leaves`: it
+    validates and encodes on the calling thread in order and hashes in parallel.
+    `leaf_hashes`, `commit_leaves`, check 2 and check 0's anchor use it.
   - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
   - `transcript_root(c, reader)` is check 2.
   - `commit_leaves(c, leaves) -> MerkleTree`.
@@ -439,7 +448,7 @@ interface.
       effect: id 2 occurs only at padded positions, where `δX_1` is exactly 0.
   - On the real 4×128 step from `W_0` on `π(1)` it fills all 7,113 slots (2,371 forward,
     211 input-grad, 211 weight-grad, 4,320 operand-grad). `prove_step` takes about 1 s and
-    `commit` about 1.5 s, at a peak RSS of about 4.6 GB. The replay rebuilds all 2,371
+    `commit` about 0.25 s (1.5 s before leaves were hashed in parallel), at a peak RSS of about 4.6 GB. The replay rebuilds all 2,371
     forward operands bit-identical to the prover's capture in about 0.5 s. At test scale
     (SmolLM2-135M, 4×128), over leaves already in memory (2.7 GB peak), it raises the peak to
     3.5 GB; its own model is 0.54 GB of that. When the first pass still kept every layer's
@@ -558,8 +567,10 @@ interface.
   - **Byte binding.** Check 2 reads every leaf once and keeps the objects in a
     `CommittedLeaves` reader, guarded by `_version`; checks 6a, 5 and 6b read only that.
     Checks 4 and 7 record the hashes they saw in `ctx.state.early_hashes`, and check 2 rejects
-    if its own read hashes differently, and after the root comparison it re-checks every
-    cached leaf's `_version` (a write during check 2 is a malformed rejection at 2). This
+    if its own read hashes differently. Check 2 reads and validates leaves in order and
+    hashes them in parallel, so a leaf hashes after later reads. It therefore checks every
+    cached leaf's `_version` both before and after the root comparison (a write during
+    check 2 is a malformed rejection at 2). Checks 4 and 7 stay leaf by leaf. This
     keeps every leaf in memory for the step (see F1–F3 at full scale).
   - **Finiteness.** Any non-finite ν, `‖|P|·1‖`, `‖P‖_F` or residual, and any non-finite
     check-6 residual or bound, rejects in either mode. Check 6 compares `ρ = |R|/scale`
@@ -731,8 +742,9 @@ interface.
     analytic floor rather than fitting anything. The γ's `ρ = 0` means the fused and
     reference updates agree bit for bit on every entry of those tensors (a mismatch rate of
     about 1e−5 per entry), not that their gradients vanish.
-  - Prover 2.4 s (`prove_step` 0.9, commit 1.5), verifier 5.4 s (check 5
-    2.7, check 2 1.5, 6a 0.8). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
+  - Prover 1.1 s (`prove_step` 0.9, commit 0.24), verifier 4.0 s (check 5
+    2.6, 6a 0.8, check 2 0.24, check 7 0.18). Before leaves were hashed in parallel: prover
+    2.4 s (commit 1.5), verifier 5.4 s (check 2 1.5). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
     verifier peak 5.5 GB (3.7 GB at its start, the held store).
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
   `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to

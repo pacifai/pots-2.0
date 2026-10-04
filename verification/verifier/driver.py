@@ -39,7 +39,7 @@ from typing import Any
 import torch
 
 from setup import data
-from verification.commitment.leaves import leaf_hash
+from verification.commitment.leaves import leaf_hashes_of
 from verification.commitment.merkle import DIGEST_SIZE, hash_leaf, merkle_root
 from verification.computation.interface import DeclaredComputation
 from verification.transcript.store import TranscriptStore
@@ -145,8 +145,8 @@ class Verifier:
         ``W_{t+1}`` alike, so these compare with either)."""
         if set(weights) != set(self.c.weight_names):
             raise ValueError("weights differ from the declared weight names")
-        return tuple(leaf_hash(self.c, self.c.w_t_index(n), weights[n].detach())
-                     for n in self.c.weight_names)
+        return tuple(leaf_hashes_of(self.c, ((self.c.w_t_index(n), weights[n].detach())
+                                             for n in self.c.weight_names)))
 
     def _check_hashes(self, hashes: Sequence[bytes]) -> tuple[bytes, ...]:
         hashes = tuple(hashes)

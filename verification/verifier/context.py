@@ -14,7 +14,7 @@ the leaf (``checks.py`` docstring, "Errors").
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 
 from setup.records import Record
-from verification.commitment.leaves import leaf_hash
+from verification.commitment.leaves import leaf_hash, leaf_hashes_of
 from verification.commitment.merkle import DIGEST_SIZE
 from verification.parameters import UNIT_ROUNDOFF
 from verification.transcript.errors import (
@@ -147,6 +147,17 @@ def _hash(c: DeclaredComputation, index: int, obj: Any) -> bytes:
     inside an encoder."""
     _leaf_tensors(obj)
     return leaf_hash(c, index, obj)
+
+
+def _hashes(c: DeclaredComputation, items: Iterable[tuple[int, Any]]) -> list[bytes]:
+    """:func:`_hash` of each ``(index, obj)``, in order, hashed in parallel
+    (``leaf_hashes_of``). The type check runs with the validation, so the first error is
+    the one a ``_hash`` loop raises first."""
+    def typed() -> Iterator[tuple[int, Any]]:
+        for i, obj in items:
+            _leaf_tensors(obj)
+            yield i, obj
+    return leaf_hashes_of(c, typed())
 
 
 class CommittedLeaves:

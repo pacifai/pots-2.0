@@ -4,9 +4,20 @@ against `C` before its bytes are hashed."""
 import pytest
 import torch
 
-from verification.commitment.encoding import TAG_PRODUCT, TAG_WEIGHT, encode_tensor_leaf
-from verification.commitment.leaves import leaf_hash
-from verification.commitment.merkle import hash_leaf
+from verification.commitment import merkle
+from verification.commitment.encoding import (
+    TAG_PRODUCT,
+    TAG_WEIGHT,
+    NonFiniteError,
+    encode_tensor_leaf,
+)
+from verification.commitment.leaves import (
+    commit_leaves,
+    leaf_hash,
+    leaf_hashes,
+    leaf_hashes_of,
+)
+from verification.commitment.merkle import MerkleTree, hash_leaf
 from verification.computation.instances.mlp import MLPComputation, init_weights, synthetic_dataset
 from verification.prover.step import StepOutput, prove_step
 from verification.transcript.errors import (
@@ -27,6 +38,17 @@ def c():
 @pytest.fixture
 def data(c):
     return synthetic_dataset(c.widths, 12, seed=0)
+
+
+@pytest.fixture
+def parallel(monkeypatch):
+    """Bulk hashing with one leaf per task on four workers, so the MLP's small leaves are
+    hashed out of order across threads."""
+    monkeypatch.setattr(merkle, "_CHUNK_BYTES", 1)
+    before = torch.get_num_threads()
+    torch.set_num_threads(4)
+    yield
+    torch.set_num_threads(before)
 
 
 def _step(c, data) -> StepOutput:
@@ -76,3 +98,43 @@ def test_same_payload_other_declaration(c, data):
     w16 = step.w_t[c.weight_names[0]].to(torch.float16)
     assert leaf_hash(half, w, w16) != hash_leaf(encode_tensor_leaf(TAG_WEIGHT,
                                                                    w16.view(torch.bfloat16)))
+
+
+class _ListReader:
+    def __init__(self, leaves):
+        self.leaves = leaves
+
+    def leaf(self, index):
+        return self.leaves[index]
+
+
+def test_bulk_hashing_equals_leaf_by_leaf(c, data, parallel):
+    leaves = _step(c, data).leaves()
+    one_by_one = [leaf_hash(c, i, x) for i, x in enumerate(leaves)]
+    assert leaf_hashes_of(c, enumerate(leaves)) == one_by_one
+    assert leaf_hashes(c, _ListReader(leaves)) == one_by_one
+    tree = commit_leaves(c, leaves)
+    assert [tree.leaf(i) for i in range(c.n_leaves)] == one_by_one
+    assert tree.root == MerkleTree(one_by_one).root
+
+
+def test_bulk_hashing_raises_the_first_bad_leaf(c, data, parallel):
+    """A non-finite leaf raises as `leaf_hash` does, and with two bad leaves the one first in
+    leaf order is reported, whichever kind of error it is."""
+    leaves = list(_step(c, data).leaves())
+    p1, p2 = c.product_index(1), c.product_index(3)
+    nan = leaves[p1].clone()
+    nan.view(-1)[5] = float("nan")
+    with pytest.raises(NonFiniteError) as one:
+        leaf_hash(c, p1, nan)
+    bad = list(leaves)
+    bad[p1] = nan
+    with pytest.raises(NonFiniteError) as bulk:
+        commit_leaves(c, bad)
+    assert str(bulk.value) == str(one.value)
+    bad[p2] = leaves[p2].t().contiguous()  # a later shape error: the NaN still comes first
+    with pytest.raises(NonFiniteError):
+        leaf_hashes(c, _ListReader(bad))
+    bad[p1], bad[p2] = leaves[p1].t().contiguous(), leaves[p2].clone().fill_(float("inf"))
+    with pytest.raises(LeafShapeError, match=f"leaf {p1} "):
+        leaf_hashes(c, _ListReader(bad))

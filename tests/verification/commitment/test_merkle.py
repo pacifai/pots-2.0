@@ -6,9 +6,11 @@ import torch
 
 from setup.records import Record, encode_record
 from verification.commitment.encoding import TAG_PRODUCT, TAG_WEIGHT, encode_tensor_leaf
+from verification.commitment import merkle
 from verification.commitment.merkle import (
     MerkleTree,
     hash_leaf,
+    hash_leaves,
     hash_node,
     hash_record_leaf,
     hash_tensor_leaf,
@@ -69,7 +71,7 @@ def test_single_leaf_and_empty():
 def test_streamed_leaf_equals_concatenated():
     t = torch.randn(33, 17)
     assert hash_tensor_leaf(TAG_WEIGHT, t) == hash_leaf(encode_tensor_leaf(TAG_WEIGHT, t))
-    big = torch.randn(1 << 19)  # 2 MiB, multithreaded path
+    big = torch.randn(1 << 22)  # 16 MiB, multithreaded path
     assert hash_tensor_leaf(TAG_PRODUCT, big) == blake3.blake3(b"\x00" + encode_tensor_leaf(TAG_PRODUCT, big)).digest()
     rec = Record(*(torch.tensor(x, dtype=torch.int32) for x in ([1, 2], [2, 3], [0, 1])))
     assert hash_record_leaf(rec) == hash_leaf(encode_record(rec))
@@ -141,3 +143,48 @@ def test_step_tree_path_length():
     t = MerkleTree(leaves(n))
     lengths = [len(t.path(i)) for i in range(n)]
     assert max(lengths) <= 13
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("chunk", [1, 3000, 1 << 24])
+def test_hash_leaves_equals_leaf_by_leaf(monkeypatch, threads, chunk):
+    """Parallel hashing gives `hash_leaf`'s digests in order, whatever the chunking, with one
+    worker or several, and with leaves above the multithreaded-BLAKE3 size."""
+    monkeypatch.setattr(merkle, "_CHUNK_BYTES", chunk)
+    monkeypatch.setattr(merkle, "_MT_THRESHOLD", 2048)
+    rng = random.Random(1)
+    sizes = [0, 1, 100, 1500, 5000]
+    items = [tuple(rng.randbytes(rng.choice(sizes)) for _ in range(rng.randint(1, 3)))
+             for _ in range(300)]
+    items.append((b"\x02", memoryview(torch.randn(10_000).numpy()).cast("B")))
+    before = torch.get_num_threads()
+    torch.set_num_threads(threads)
+    try:
+        got = hash_leaves(iter(items))
+    finally:
+        torch.set_num_threads(before)
+    assert got == [hash_leaf(*p) for p in items]
+    assert merkle_root(got) == merkle_root([hash_leaf(*p) for p in items])
+
+
+def test_hash_leaves_propagates_the_producers_error(monkeypatch):
+    """An error raised while producing the parts reaches the caller unchanged, after the
+    leaves already handed over (none here past the first chunk) are no longer being hashed."""
+    monkeypatch.setattr(merkle, "_CHUNK_BYTES", 1)
+    seen = []
+
+    def parts():
+        for i in range(50):
+            if i == 37:
+                raise ValueError("leaf 37 is malformed")
+            seen.append(i)
+            yield (i.to_bytes(4, "big"),)
+
+    before = torch.get_num_threads()
+    torch.set_num_threads(4)
+    try:
+        with pytest.raises(ValueError, match="leaf 37 is malformed"):
+            hash_leaves(parts())
+    finally:
+        torch.set_num_threads(before)
+    assert seen == list(range(37))
