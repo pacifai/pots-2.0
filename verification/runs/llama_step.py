@@ -37,7 +37,7 @@ import torch
 
 from setup.config import load_config, setup_determinism
 from setup.data import load_dataset_records
-from verification.computation.interface import DeclaredComputation
+from verification.computation.interface import DeclaredComputation, snapshot_weights
 from verification.computation.instances.llama import LlamaComputation
 from verification.parameters import load_protocol_config
 from verification.runs.metrics import (
@@ -49,6 +49,7 @@ from verification.runs.metrics import (
 )
 from verification.runs.scenarios import (
     HONEST,
+    ReusedModel,
     ScenarioResult,
     count_run,
     honest_final,
@@ -77,11 +78,11 @@ def load_committed_dataset(c: LlamaComputation, data_dir: Path) -> tuple[list[An
 
 def run_honest(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
                *, T: int, k: int, h_D: bytes, final: Mapping[str, torch.Tensor],
-               recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None
-               ) -> ScenarioResult:
+               recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
+               build_model: Callable[[], torch.nn.Module] | None = None) -> ScenarioResult:
     """``T`` honest steps through the S3 loop, judged by provisional bands."""
     return run_scenario(c, dataset, w0, HONEST, T=T, k=k, final=final, recorder=recorder,
-                        h_D=h_D)
+                        h_D=h_D, build_model=build_model)
 
 
 def report_residuals(r: ScenarioResult, out: Callable[[str], None] = print) -> None:
@@ -131,12 +132,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data or set "
                 "VERIF_OUTPUT_DIR")
     D, h_D = load_committed_dataset(c, cfg.data_dir)
-    w0 = {n: w.detach().clone() for n, w in c.build_model().named_parameters()}
-    final = honest_final(c, D, w0, T)
+    # One from_pretrained model serves every prover-side run in turn: W_0 is taken from it
+    # unmodified, then honest_final's plain run and the prover's runs each load their weights
+    # into it before use. The verifier builds its own (invariant 1).
+    models = ReusedModel(c.build_model)
+    w0 = snapshot_weights(c, models())
+    final = honest_final(c, D, w0, T, build_model=models)
     print(f"SmolLM2 honest run: {cfg.model}@{cfg.model_revision[:12]}, n_s {c.n_s}, n {c.n}, "
           f"η {c.eta:g}, k {k}, T {T}, |D| {len(D)}, h_D {h_D.hex()[:16]}…, M {c.M}, "
           f"{c.n_leaves} leaves, bands provisional")
-    run_args = dict(T=T, k=k, h_D=h_D, final=final)
+    run_args = dict(T=T, k=k, h_D=h_D, final=final, build_model=models)
     mem_rows = None
     if not use_metrics:
         r = run_honest(c, D, w0, **run_args)

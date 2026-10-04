@@ -152,7 +152,8 @@ def snapshot_weights(computation: DeclaredComputation,
                      model: torch.nn.Module) -> dict[str, torch.Tensor]:
     """Copies of ``model``'s declared weights, in ``weight_names`` order.
 
-    The one way to take weights out of a model: the prover's ``W_t`` and ``W_{t+1}`` leaves,
+    The one way to take weights out of a model: the prover's ``W_{t+1}`` leaves (its ``W_t``
+    leaves are the caller's tensors where ``prove_step`` can share them, else a clone as here),
     and ``W_0`` from a freshly built model (the plain baseline B7 and the verified runs, A12
     included, so both start from the same tensors).
     """

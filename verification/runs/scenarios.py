@@ -9,6 +9,10 @@ other outcome is a FAIL. :func:`honest_final` is check 8's agreed final weights.
 
 :func:`memory_run` and :func:`count_run` are B6's two untimed passes of one scenario
 (``runs/metrics.py``).
+
+Each run builds the prover's model with ``c.build_model()`` unless it is given
+``build_model``. A :class:`ReusedModel` hands one built model to successive runs (``W_0``,
+:func:`honest_final`, the prover), which saves a checkpoint load per run at SmolLM2 scale.
 """
 
 from __future__ import annotations
@@ -34,8 +38,11 @@ from verification.verifier.bands import Bands
 from verification.verifier.checks import DEFAULT_ORDER
 from verification.verifier.driver import Verifier
 
-__all__ = ["Expected", "Scenario", "ScenarioResult", "HONEST", "honest_final", "judge",
-           "run_scenario", "report", "memory_run", "count_run"]
+__all__ = ["Expected", "Scenario", "ScenarioResult", "HONEST", "ReusedModel", "honest_final",
+           "judge", "run_scenario", "report", "memory_run", "count_run"]
+
+BuildModel = Callable[[], torch.nn.Module]
+_HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
 
 
 @dataclass(frozen=True)
@@ -78,10 +85,61 @@ HONEST = Scenario("honest", "no fault", ProverFault(), Expected())
 # ---- running and judging ----------------------------------------------------------------
 
 
+class ReusedModel:
+    """One model, built once by ``build`` and handed out again on every call.
+
+    The harness's runs are sequential, and each loads its weights into every parameter before
+    use (``load_weights`` requires full coverage), so a later run can reuse an earlier run's
+    model: the checkpoint is loaded once, not once per run. Each call first checks that the
+    model is as built, apart from its parameter values, and raises ``RuntimeError`` if not:
+
+    - no module hook is left on it;
+    - every parameter still requires grad and holds no gradient;
+    - every buffer (SmolLM2's RoPE ``inv_freq``) is bit for bit its value at build time;
+    - the train/eval mode is unchanged.
+
+    Only the harness uses it. The verifier keeps its own model, never this one (invariant 1).
+    """
+
+    def __init__(self, build: BuildModel) -> None:
+        self.model = build()
+        self._buffers = {n: b.detach().clone() for n, b in self.model.named_buffers()}
+        self._training = self.model.training
+
+    def __call__(self) -> torch.nn.Module:
+        m = self.model
+        hooked = [n or "<root>" for n, mod in m.named_modules()
+                  if any(getattr(mod, h) for h in _HOOK_DICTS)]
+        if hooked:
+            raise RuntimeError(f"reused model: hooks left on {hooked[:3]}")
+        bad = [n for n, p in m.named_parameters() if p.grad is not None or not p.requires_grad]
+        if bad:
+            raise RuntimeError(f"reused model: gradient state changed on {bad[:3]}")
+        buffers = dict(m.named_buffers())
+        if buffers.keys() != self._buffers.keys() or any(
+                b.dtype != self._buffers[n].dtype or b.shape != self._buffers[n].shape
+                or not torch.equal(b, self._buffers[n]) for n, b in buffers.items()):
+            raise RuntimeError("reused model: buffers changed since build")
+        if m.training != self._training:
+            raise RuntimeError("reused model: train/eval mode changed")
+        return m
+
+
 def honest_final(c: DeclaredComputation, dataset: Sequence[Any],
-                 w0: Mapping[str, torch.Tensor], T: int) -> dict[str, torch.Tensor]:
-    """The agreed final weights: ``T`` uncaptured honest steps from ``W_0`` on ``π``."""
-    return run_plain(c, c.build_model(), dataset, w0, n_steps=T).w_final
+                 w0: Mapping[str, torch.Tensor], T: int, *,
+                 build_model: BuildModel | None = None) -> dict[str, torch.Tensor]:
+    """The agreed final weights: ``T`` uncaptured honest steps from ``W_0`` on ``π``.
+
+    ``build_model`` (default ``c.build_model``) gives the model the steps run on. The result
+    is copies (``snapshot_weights``) that share no storage with that model, so a prover that
+    trains the same model later can't change check 8's reference.
+    """
+    model = (build_model or c.build_model)()
+    final = run_plain(c, model, dataset, w0, n_steps=T).w_final
+    params = {p.untyped_storage().data_ptr() for p in model.parameters()}
+    if any(w.untyped_storage().data_ptr() in params for w in final.values()):
+        raise RuntimeError("honest_final: the final weights alias the model's parameters")
+    return final
 
 
 def judge(expected: Expected, loop: LoopResult, T: int) -> bool:
@@ -100,11 +158,13 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
                  final: Mapping[str, torch.Tensor],
                  on_step: Callable[[StepRecord], None] | None = None,
                  recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
-                 h_D: bytes | None = None) -> ScenarioResult:
+                 h_D: bytes | None = None,
+                 build_model: BuildModel | None = None) -> ScenarioResult:
     """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams.
 
     ``h_D`` is the agreed dataset root the verifier's check 1 compares with; by default it is
-    computed from ``dataset`` (the MLP's synthetic ``D`` has no published root)."""
+    computed from ``dataset`` (the MLP's synthetic ``D`` has no published root).
+    ``build_model`` (default ``c.build_model``) gives the prover's model."""
     section = None if recorder is None else recorder.section
     if h_D is None:
         h_D = dataset_tree(c, dataset).root
@@ -118,7 +178,8 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
             rec.on_step(r)
             if user is not None:
                 user(r)
-    loop = run_loop(c, c.build_model(), dataset, w0, v, final=final, fault=scenario.fault,
+    model = (build_model or c.build_model)()
+    loop = run_loop(c, model, dataset, w0, v, final=final, fault=scenario.fault,
                     on_step=on_step, section=section)
     if recorder is not None:
         recorder.finish(loop.verdict)
@@ -160,16 +221,20 @@ def report(r: ScenarioResult, out: Callable[[str], None] = print) -> None:
 def memory_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
                *, run: str, T: int, k: int, final: Mapping[str, torch.Tensor],
                h_D: bytes | None = None, scenario: Scenario = HONEST,
-               device: str | torch.device = "cpu") -> list[dict[str, Any]]:
+               device: str | torch.device = "cpu",
+               build_model: BuildModel | None = None) -> list[dict[str, Any]]:
     """The B6 memory pass: ``scenario`` over ``T`` steps, probed at every section, never timed."""
     return memory_pass(run, scenario.name, lambda rec: run_scenario(
-        c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D),
+        c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D,
+        build_model=build_model),
         memory_probe(device))
 
 
 def count_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
               *, run: str, T: int, k: int, final: Mapping[str, torch.Tensor],
-              h_D: bytes | None = None, scenario: Scenario = HONEST) -> list[dict[str, Any]]:
+              h_D: bytes | None = None, scenario: Scenario = HONEST,
+              build_model: BuildModel | None = None) -> list[dict[str, Any]]:
     """The B6 counting pass: ``scenario`` over ``T`` steps, counted, never timed."""
     return count_pass(run, scenario.name, lambda rec: run_scenario(
-        c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D))
+        c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D,
+        build_model=build_model))

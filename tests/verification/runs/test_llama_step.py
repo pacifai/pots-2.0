@@ -11,10 +11,18 @@ from setup.data import encode_records_file
 from setup.records import encode_record
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances import LlamaComputation
+from verification.computation.interface import snapshot_weights
 from verification.runs import llama_step
 from verification.runs.metrics import MetricsWriter, read_residuals
 from verification.runs.loop import ProverFault
-from verification.runs.scenarios import HONEST, Expected, Scenario, honest_final, run_scenario
+from verification.runs.scenarios import (
+    HONEST,
+    Expected,
+    ReusedModel,
+    Scenario,
+    honest_final,
+    run_scenario,
+)
 from verification.verifier.residuals import class_summary, tensor_summary
 
 from tests.verification.llama_helpers import make_records, tiny_config
@@ -93,6 +101,33 @@ def test_a_forged_glue_weight_update_rejects_at_6b(tiny, name):
     scenario = Scenario("bad-glue-w-next", name, _BumpWNext(name), Expected(1, "6b", "failed"))
     r = run_scenario(c, D, w0, scenario, T=1, k=7, final=w0)
     assert r.passed, r.actual
+
+
+def _same(a, b):
+    return list(a) == list(b) and all(torch.equal(a[n], b[n]) for n in a)
+
+
+def test_one_reused_model_gives_the_fresh_build_results(tiny):
+    """O4, as ``main`` runs it: W_0, check 8's reference and the prover share one model (its RoPE
+    buffer included), and every committed and checked number equals a fresh build per run."""
+    c, D, _ = tiny
+    h_D = dataset_tree(c, D).root
+    w0 = snapshot_weights(c, c.build_model())
+    fresh_final = honest_final(c, D, w0, 2)
+    fresh = llama_step.run_honest(c, D, w0, T=2, k=7, h_D=h_D, final=fresh_final)
+
+    models = ReusedModel(c.build_model)
+    w0_r = snapshot_weights(c, models())
+    final = honest_final(c, D, w0_r, 2, build_model=models)
+    reused = llama_step.run_honest(c, D, w0_r, T=2, k=7, h_D=h_D, final=final,
+                                   build_model=models)
+    assert _same(w0_r, w0) and _same(final, fresh_final)
+    assert reused.passed and fresh.passed
+    assert _same(reused.loop.w_final, fresh.loop.w_final)
+    assert [s.loss for s in reused.loop.steps] == [s.loss for s in fresh.loop.steps]
+    assert ({t: s.products + s.tensors for t, s in reused.verifier.stats.items()}
+            == {t: s.products + s.tensors for t, s in fresh.verifier.stats.items()})
+    models()  # the model is still as built after both runs
 
 
 @pytest.mark.slow
