@@ -4,23 +4,16 @@
 # macOS
 .DS_Store
 
-# design
-design
-
-# Python / uv
+# Python
 .venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
 .ipynb_checkpoints/
 
-# uv keeps the global cache outside the repo; only the lockfile is committed.
-# (uv.lock IS committed on purpose for reproducibility.)
-
-# Experiment artifacts
-outputs/
-wandb/
+# Run artifacts: everything a run writes goes to trainer_output/ (verification/config.py).
+# The weight-file patterns guard against committing large tensors saved anywhere else.
+trainer_output/
 *.ckpt
 *.pt
 *.safetensors
-trainer_output/
