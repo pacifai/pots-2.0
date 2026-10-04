@@ -220,17 +220,23 @@ verification/
 ```
 
 `tests/` mirrors this tree: `verification/commitment/merkle.py` is tested in
-`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces three
-import rules, counting imports under `TYPE_CHECKING`:
+`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces four
+import rules, counting imports under `TYPE_CHECKING` except where rule 4 allows them:
 
 1. `setup/` imports nothing from `verification`.
 2. `commitment/` and `verifier/matmul_check/` import nothing from `prover/`, `runs/` or the rest
    of `verifier/`.
 3. `verifier/` imports nothing from `prover/` (invariant 1).
+4. `computation/` imports nothing from `prover/` at run time, because the verifier builds its
+   replay from it. The labeling code (`interface.py`, `instances/llama.py`,
+   `instances/mlp.py`) names `MatmulCapture` and `MatmulRecord` under `TYPE_CHECKING` only. A
+   second test imports the verifier and every instance in a fresh interpreter and checks that
+   no `verification.prover` module loads.
 
-`computation/instances/` imports `prover/capture.py`, because labeling maps captured records to
-product slots. Across directories, imports are absolute (`from verification.commitment.merkle
-import ...`). Each entry below gives the public interface.
+The matmul op lists and `param_storage_map` live in `computation/matmul_ops.py`, which the
+capture and the substitution both import. Across directories, imports are absolute
+(`from verification.commitment.merkle import ...`). Each entry below gives the public
+interface.
 
 ### `setup/`
 
@@ -322,18 +328,25 @@ import ...`). Each entry below gives the public interface.
     - Verifier: `replay(leaves) -> Replay`.
     - Prover only: `loss` and `label`. The verifier must never call them, and A5 adds a test
       for this.
+  - `LabelingError` (prover side) and `ReplayError` (verifier side). Both are `RuntimeError`s
+    and mean the model run doesn't match `C`. A `ReplayError` runs on leaves check 2 already
+    validated, so it's a verifier-side bug and propagates as a crash, never a rejection.
   - `Replay` (ABC) runs once per step and owns its own model, loaded from the committed
     `W_t`. `operands(m) -> (A, B)` is called in canonical order 1..M. It caches glue and
     drops it after its last use. `glue_gradients()` is valid only after `operands(1..M)` in
     order.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
     imports the prover.
+- `matmul_ops.py`: `HANDLED_OPS` (`mm`, `bmm`, `addmm`, `baddbmm`), `REJECTED_OPS` (every
+  other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
+  (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (empty) and `param_storage_map(model)`. Shared by
+  the prover's capture and the verifier's substitution, so neither imports the other's side.
 - `substitution.py` (A8): `ProductSubstitution(supply)`, a `TorchDispatchMode` that runs a
   model's own code but returns `supply(op, a, b)` in place of every `aten.mm`/`aten.bmm` with
-  `q ≥ 2` (S4b, check 3). `q = 1` runs as glue (P7). Any other matmul op from the capture's
-  lists, a non-default overload, an op outside `aten`/`prims`, or a supplied tensor of the
-  wrong shape or dtype raises `SubstitutionError`. `supply` must return a fresh tensor, never
-  a leaf itself (autograd attaches history to op outputs; invariant 6).
+  `q ≥ 2` (S4b, check 3). `q = 1` runs as glue (P7). Any other op from `matmul_ops`'s lists,
+  a non-default overload, an op outside `aten`/`prims`, or a supplied tensor of the wrong
+  shape or dtype raises `SubstitutionError`, a `ReplayError`. `supply` must return a fresh
+  tensor, never a leaf itself (autograd attaches history to op outputs; invariant 6).
 - `instances/mlp.py` (A3, merged). This is ref block §9.
   - `MLPComputation(widths=(16,32,32,8), n_s=4, *, eta)`. It requires `n_s ≥ 2` and every
     width ≥ 2.
@@ -381,20 +394,26 @@ import ...`). Each entry below gives the public interface.
     product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`). The
     first forward request runs `logits` once on the committed batch and keeps `X_1 … X_{L+1}`
     (hooks on each decoder layer and on the final norm), the kwargs LlamaModel passes its
-    layers (causal mask over `ρ`, RoPE `(cos, sin)`, positions) and `Λ`'s operands. A request
-    in layer ℓ reruns `layers[ℓ−1](X_ℓ, **kwargs)` the same way, keeps its nine products'
-    operands, checks the output is `X_{ℓ+1}`, and drops them after `Y_down`. The call
-    sequence must be the declared one (`Y_q, Y_k, Y_v, S, O, Y_o, Y_gate, Y_up, Y_down` per
-    layer, then `Λ`), linears identified by weight storage. Out-of-order calls rerun their
-    layer. Operands are what the op receives: `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and
-    `repeat_kv`, `(softmax, Ṽ)`. Backward products and `glue_gradients()` raise
-    `NotImplementedError` (A9). Kept for A9: `x`, `layer_kwargs`, `batch`, `lambda_operands`.
+    layers (causal mask over `ρ`, RoPE `(cos, sin)`, positions) and `Λ`'s operands. That
+    pass checks the call names only and keeps no layer's operands, so peak glue is one
+    layer's operands plus the `L+1` residual states (a test holds weakrefs to layer 1's
+    operands and checks they are dead by the final norm). A request in layer ℓ reruns
+    `layers[ℓ−1](X_ℓ, **kwargs)` the same way, keeps its nine products' operands, checks the
+    output is `X_{ℓ+1}`, and drops them after `Y_down`. The call sequence must be the declared
+    one (`Y_q, Y_k, Y_v, S, O, Y_o, Y_gate, Y_up, Y_down` per layer, then `Λ`), linears
+    identified by weight storage; `S` and `O` are the two bmms after a layer's `Y_v`. An
+    undeclared mm, a bmm anywhere else, a different order or a layer that doesn't reproduce
+    its output raises `ReplayError`. Out-of-order calls rerun their layer. Operands are what
+    the op receives: `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and `repeat_kv`, `(softmax, Ṽ)`.
+    Backward products and `glue_gradients()` raise `NotImplementedError` (A9). Kept for A9: `x`, `layer_kwargs`, `batch`, `lambda_operands`.
+    The forward replay runs under `torch.no_grad()`; A9's backward reruns need grad on.
   - On the real 4×128 step from `W_0` on `π(1)` it fills all 7,113 slots (2,371 forward,
     211 input-grad, 211 weight-grad, 4,320 operand-grad). `prove_step` takes about 1 s and
     `commit` about 1.5 s, at a peak RSS of about 4.6 GB. The replay rebuilds all 2,371
-    forward operands bit-identical to the prover's capture in about 0.5 s. Over leaves
-    already in memory (2.7 GB peak) it raises the peak to 3.8 GB; its own model is 0.54 GB
-    of that.
+    forward operands bit-identical to the prover's capture in about 0.5 s. At test scale
+    (SmolLM2-135M, 4×128), over leaves already in memory (2.7 GB peak), it raises the peak to
+    3.5 GB; its own model is 0.54 GB of that. When the first pass still kept every layer's
+    operands the peak was 3.8 GB.
 
 ### `verification/prover/`
 
@@ -405,9 +424,9 @@ import ...`). Each entry below gives the public interface.
     - `.records` (`MatmulRecord`, in call order, not canonical order), `.glue_outer` (`q = 1`
       products) and `.n_products`, where each `(s,h)` bmm member counts once;
     - `.summary()`, `.release_operands()` and `.assert_unmodified()`.
-  - `param_storage_map(model)`. `OperandInfo` has `param_name`, `storage_ptr` and
-    `producer_index`. A storage pointer is valid only while the capture holds its tensors, so
-    link records by `producer_index`.
+  - `param_storage_map(model)` comes from `computation/matmul_ops.py`, as do the op lists.
+    `OperandInfo` has `param_name`, `storage_ptr` and `producer_index`. A storage pointer is
+    valid only while the capture holds its tensors, so link records by `producer_index`.
   - Errors: `CaptureError`, `UnsupportedMatmulError` (any `REJECTED_OPS` op, a non-default
     overload, or an op outside `aten`/`prims` inside a phase), `BiasedMatmulError` (`addmm`
     with a non-zero bias; see F14), `PhaseError` and `MutatedCaptureError`.

@@ -2,6 +2,7 @@
 verifier-side forward replay (A8)."""
 
 import dataclasses
+import weakref
 from collections import Counter
 
 import pytest
@@ -15,8 +16,9 @@ from setup.records import Record, RecordError, encode_record
 from verification.commitment.leaves import leaf_hash
 from verification.computation.instances import LlamaComputation
 from verification.computation.instances.llama import LINEARS, matmul_count_llama
-from verification.computation.interface import LabelingError, ProductKind
-from verification.prover.capture import MatmulCapture, param_storage_map
+from verification.computation.interface import LabelingError, ProductKind, ReplayError
+from verification.computation.matmul_ops import param_storage_map
+from verification.prover.capture import MatmulCapture
 from verification.prover.step import commit, prove_step
 
 FWD, IG, WG, OG = (ProductKind.FORWARD, ProductKind.INPUT_GRAD, ProductKind.WEIGHT_GRAD,
@@ -573,7 +575,68 @@ def test_replay_never_mutates_leaves(honest):
     assert [t._version for t in leaves if isinstance(t, torch.Tensor)] == versions
 
 
-# ---- milestone M2 -----------------------------------------------------------------------------
+def test_first_pass_keeps_no_layer_operands(honest):
+    """The whole-model pass checks names only; layer operands die as each layer returns."""
+    c, leaves, _ = honest
+    replay = c.replay(ListReader(leaves))
+    supply, refs, alive = replay._supply, [], []
+
+    def watched(op, a, b):
+        out = supply(op, a, b)
+        if replay._seen[-1][0].startswith("L1."):
+            refs.extend((weakref.ref(a), weakref.ref(b)))
+        return out
+
+    replay._supply = watched
+    hook = replay.model.model.norm.register_forward_pre_hook(
+        lambda module, args: alive.append(sum(r() is not None for r in refs)))
+    replay.operands(c.m_of("Lambda"))  # runs the first pass only
+    hook.remove()
+    assert len(refs) == 2 * 9 and alive == [0]
+    assert replay._layer is None and replay.lambda_operands is not None
+
+
+def _pre_hook(module, fn):
+    """A forward pre-hook that runs ``fn(x)`` and leaves the module's input unchanged."""
+    def hook(mod, args):
+        fn(args[0])
+    return module.register_forward_pre_hook(hook)
+
+
+@pytest.mark.parametrize("patch,match", [
+    # v_proj runs before q_proj: the declared Y_q, Y_k, Y_v order breaks
+    (lambda layer, c: _pre_hook(layer.self_attn.q_proj, layer.self_attn.v_proj),
+     "does not have the declared products"),
+    # an extra mm with a declared weight
+    (lambda layer, c: _pre_hook(layer.mlp.up_proj, layer.mlp.gate_proj),
+     "does not have the declared products"),
+    (lambda layer, c: _pre_hook(layer.mlp.down_proj,
+                                lambda x: torch.mm(x.reshape(-1, x.shape[-1]),
+                                                   torch.ones(x.shape[-1], 2))),
+     "not a declared weight"),
+    (lambda layer, c: _pre_hook(layer.mlp.gate_proj,
+                                lambda x: torch.bmm(torch.ones(2, 3, 4), torch.ones(2, 4, 5))),
+     "bmm outside"),
+], ids=["v_before_q", "extra_linear", "mm_non_weight", "bmm_in_mlp"])
+def test_replay_rejects_an_undeclared_model_run(honest, patch, match):
+    """A model run that departs from C is a verifier-side bug: ReplayError, not a rejection."""
+    c, leaves, _ = honest
+    replay = c.replay(ListReader(leaves))
+    patch(replay.model.model.layers[0], c)
+    with pytest.raises(ReplayError, match=match):
+        replay.operands(c.m_of("L1.Y_q"))
+
+
+def test_layer_rerun_must_reproduce_its_output(honest):
+    c, leaves, _ = honest
+    replay = c.replay(ListReader(leaves))
+    replay.operands(c.m_of("Lambda"))
+    replay.x[1] = _bump(replay.x[1])
+    with pytest.raises(ReplayError, match="layer 1 did not reproduce X_2"):
+        replay.operands(c.m_of("L1.Y_q"))
+
+
+# ---- milestone M2-----------------------------------------------------------------------------
 
 
 @pytest.mark.slow

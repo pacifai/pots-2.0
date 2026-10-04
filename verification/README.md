@@ -62,7 +62,7 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 | `setup/` | `config.py`, `records.py`, `model.py`, `data.py` | Run settings and determinism, the token record, model loading, the dataset `D` and its batches |
 | `verification/` | `parameters.py` | Protocol constants, `k` and the band file |
 | `commitment/` | `encoding.py`, `merkle.py`, `leaves.py` | Canonical bytes, the hash tree, the roots `h` and `h_D` |
-| `computation/` | `interface.py`, `instances/mlp.py`, `instances/llama.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
+| `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `instances/mlp.py`, `instances/llama.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `matmul_check/` | Run the checks and track a run from start to verdict |
@@ -70,7 +70,10 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
-prover, the rest of the verifier or the runs. The verifier never imports the prover.
+prover, the rest of the verifier or the runs. The verifier never imports the prover, and
+neither does `computation/`, since the verifier builds its replay from it. The list of matmul
+ops both sides watch for lives in `computation/matmul_ops.py` for that reason. The labeling
+code may name the capture's types for type checking only.
 
 ### Setup: `setup/`
 
@@ -152,9 +155,10 @@ Two instances exist, in `instances/`:
   head, plus three for the embedding and output layer. Its `label` maps each captured
   matmul to its slot by operand identity. For example, `Y_q` of layer 3 is the product
   whose right operand is layer 3's `W_q`. Call order isn't used for this. Its `replay`
-  runs the verifier's own copy of the model with every matmul's result replaced by the
-  committed product, so all glue between products runs through the model's own code on
-  committed values. The forward products are done (task A8); the backward ones are task A9.
+  runs the verifier's own copy of the model with every checked product's result replaced by
+  the committed product, so all glue between products runs through the model's own code on
+  committed values. (A product with inner dimension 1, the RoPE angle table, isn't checked; it
+  is glue and is recomputed.) The forward products are done (task A8); the backward ones are task A9.
 
 ### Prover side: `prover/`
 

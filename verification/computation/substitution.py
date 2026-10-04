@@ -9,7 +9,7 @@ product. Everything between the products (norms, RoPE, masking, softmax, SiLU, r
 runs through the model's own modules, unchanged.
 
 - A ``q = 1`` product is glue (P7, the RoPE angle table) and runs as normal.
-- ``addmm``/``baddbmm``, any :data:`~verification.prover.capture.REJECTED_OPS` op, a
+- ``addmm``/``baddbmm``, any :data:`~verification.computation.matmul_ops.REJECTED_OPS` op, a
   non-``default`` overload, and any op outside the trusted namespaces raise
   :class:`SubstitutionError`, under the same lists the prover's capture uses. The products seen
   here are then the same calls the capture records.
@@ -27,7 +27,8 @@ from collections.abc import Callable
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from verification.prover.capture import (
+from verification.computation.interface import ReplayError
+from verification.computation.matmul_ops import (
     ALLOWED_NAMESPACE_OPS,
     HANDLED_OPS,
     REJECTED_OPS,
@@ -42,7 +43,7 @@ Supply = Callable[[str, torch.Tensor, torch.Tensor], torch.Tensor]
 _SUBSTITUTED = ("mm", "bmm")
 
 
-class SubstitutionError(RuntimeError):
+class SubstitutionError(ReplayError):
     """A product could not be substituted: an unhandled matmul op, or a bad supplied tensor."""
 
 

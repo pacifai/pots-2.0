@@ -38,6 +38,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -51,8 +52,10 @@ from verification.computation.interface import (
     Replay,
     load_weights,
 )
-from verification.prover.capture import MatmulCapture
 from verification.transcript.reader import LeafReader, TranscriptView
+
+if TYPE_CHECKING:  # labeling's type only; nothing here imports the prover at run time
+    from verification.prover.capture import MatmulCapture
 
 __all__ = [
     "DEFAULT_WIDTHS",
