@@ -35,7 +35,8 @@ import torch
 from verification.commitment.leaves import commit_leaves
 from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import DeclaredComputation, load_weights
-from verification.prover.capture import MatmulCapture, MutatedCaptureError, param_storage_map
+from verification.computation.matmul_ops import param_storage_map
+from verification.prover.capture import MatmulCapture, MutatedCaptureError
 
 __all__ = ["StepOutput", "prove_step", "plain_step", "commit"]
 

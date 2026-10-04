@@ -45,6 +45,7 @@ __all__ = [
     "ProductKind",
     "ProductSpec",
     "LabelingError",
+    "ReplayError",
     "Replay",
     "DeclaredComputation",
     "load_weights",
@@ -102,6 +103,13 @@ class ProductSpec:
 
 class LabelingError(RuntimeError):
     """Captured matmuls don't map one-to-one onto the declared product slots."""
+
+
+class ReplayError(RuntimeError):
+    """The replay's model run doesn't match ``C``: a verifier-side bug, not a rejection.
+
+    It runs on leaves check 2 already validated, so the verifier lets it propagate as a crash.
+    """
 
 
 class Replay(ABC):

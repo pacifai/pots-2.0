@@ -1,4 +1,5 @@
-"""The SmolLM2 instance of ``C`` (ref block §1–§6): the declaration and the prover-side labeling.
+"""The SmolLM2 instance of ``C`` (ref block §1–§6): the declaration, the prover-side labeling
+and the verifier-side replay.
 
 The model is an unmodified Hugging Face ``LlamaForCausalLM`` with eager attention, in fp32,
 with dropout zero (§8.A, S4d). The same class serves a tiny randomly initialised
@@ -48,16 +49,20 @@ identity (storage), never by call order alone:
   transpose is committed as the ``δK̃`` leaf, and its operands are checked against the spec
   transposed.
 
-The verifier-side replay is A8 (forward glue) and A9 (backward glue); :meth:`replay` raises until
-then.
+Replay (:class:`LlamaReplay`) is the verifier's side. It runs its own model, loaded from the
+committed ``W_t``, under :class:`~verification.computation.substitution.ProductSubstitution`:
+every checked product is replaced by its committed leaf, so all glue (embedding, RMSNorm, RoPE,
+the causal mask over ``ρ``, softmax, SiLU, residual adds) runs through the model's own modules on
+committed values (S4b, check 3). A8 covers the forward products; the backward products and
+:meth:`LlamaReplay.glue_gradients` are A9 and raise ``NotImplementedError``.
 """
 
 from __future__ import annotations
 
 import copy
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -73,11 +78,17 @@ from verification.computation.interface import (
     ProductKind,
     ProductSpec,
     Replay,
+    ReplayError,
+    load_weights,
 )
-from verification.prover.capture import MatmulCapture, MatmulRecord
-from verification.transcript.reader import LeafReader
+from verification.computation.matmul_ops import param_storage_map
+from verification.computation.substitution import ProductSubstitution
+from verification.transcript.reader import LeafReader, TranscriptView
 
-__all__ = ["LINEARS", "LlamaComputation", "matmul_count_llama"]
+if TYPE_CHECKING:  # labeling's types only; nothing here imports the prover at run time
+    from verification.prover.capture import MatmulCapture, MatmulRecord
+
+__all__ = ["LINEARS", "LlamaComputation", "LlamaReplay", "matmul_count_llama"]
 
 # Linear weights of one layer, as ref block §2 names them, with their HF module paths.
 LINEARS = ("q", "k", "v", "o", "gate", "up", "down")
@@ -378,8 +389,8 @@ class LlamaComputation(DeclaredComputation):
 
     # ---- verifier side --------------------------------------------------------------------
 
-    def replay(self, leaves: LeafReader) -> Replay:
-        raise NotImplementedError("the Llama replay is A8 (forward glue) and A9 (backward glue)")
+    def replay(self, leaves: LeafReader) -> LlamaReplay:
+        return LlamaReplay(self, leaves)
 
     # ---- prover side ----------------------------------------------------------------------
 
@@ -611,3 +622,178 @@ class _Labeler:
                 raise LabelingError(f"layer {l} {role} (#{rec.index}): its {key[1]} operand "
                                     f"differs from the other {fwd} gradient's")
             self._fill_members(l, role, rec, transposed=(role == "dK"))
+
+
+class LlamaReplay(Replay):
+    """Glue replay of one Llama step from committed leaves (check 3 for check 5).
+
+    The first forward request runs the whole forward pass once (``logits`` on the committed
+    batch) under substitution, with hooks that keep each layer's input ``X_ℓ`` (``X_{L+1}`` is
+    the final norm's input) and the keyword arguments LlamaModel passes its layers: the causal
+    mask over ``ρ``, the RoPE ``(cos, sin)``, the positions. That pass checks the call sequence
+    by name and keeps no layer's operands, only ``Λ``'s. A request in layer ℓ then reruns
+    ``layers[ℓ−1](X_ℓ, **kwargs)`` under substitution and keeps every operand that layer's
+    products receive, which must reproduce ``X_{ℓ+1}``; they are dropped after ``Y_down``. Peak
+    glue is one layer's operands plus the ``L+1`` residual states and ``Λ``'s operands. An
+    out-of-order call reruns its layer, so any order gives the same operands.
+
+    Operands are what the product op receives in the model's own code: ``(X·, W_xᵀ)`` for a
+    linear, and for an attention product the bmm operands at batch index ``s·n_h + h``, i.e.
+    ``(Q̃, K̃ᵀ)`` after RoPE and ``repeat_kv`` for ``S``, ``(softmax(S/√d_h + Ω), Ṽ)`` for ``O``.
+
+    A model run that departs from ``C`` (an undeclared product, a different call order, a layer
+    that doesn't reproduce its output) raises :class:`ReplayError`. The leaves were validated
+    by check 2, so that is a verifier-side bug and propagates as a crash, not a rejection.
+
+    For A9: ``X_1 … X_{L+1}``, the layer kwargs, the batch and ``Λ``'s operands stay for the
+    whole step. A backward layer can rerun ``layers[ℓ−1]`` from ``X_ℓ`` under the same
+    substitution and backpropagate the committed upstream gradient. The forward replay runs
+    under ``torch.no_grad()`` and the prover ran with grad on; the glue is the same either way
+    today, but A9's reruns need grad on.
+    """
+
+    def __init__(self, computation: LlamaComputation, leaves: LeafReader) -> None:
+        c = self.c = computation
+        self.view = TranscriptView(c, leaves)
+        self.model = c.build_model()
+        load_weights(c, self.model, {n: self.view.w_t(n) for n in c.weight_names})
+        self._weight_of = param_storage_map(self.model)  # storage -> weight name
+        self._role = {c.w(l, x): (l, x) for l in range(1, c.L + 1) for x in LINEARS}
+        self._role[_E] = (None, "E")
+        self.batch: Batch | None = None
+        self.x: list[torch.Tensor] | None = None  # X_1..X_{L+1}
+        self.layer_kwargs: list[dict[str, Any]] | None = None
+        self.lambda_operands: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._layer: int | None = None  # the layer whose operands are held
+        self._ops: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Per substitution pass: the calls seen (operands only where `_keep` says), the layer
+        # whose S, O pair is open (set by its Y_v) and the bmms taken from it.
+        self._seen: list[tuple[str, torch.Tensor | None, torch.Tensor | None]] = []
+        self._keep: Callable[[str], bool] = lambda name: True
+        self._cur: int | None = None
+        self._n_bmm = 0
+
+    # ---- substitution ------------------------------------------------------------------------
+
+    def _supply(self, op: str, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """The committed product for this call, as a fresh tensor (substitution.py)."""
+        c = self.c
+        if op == "mm":
+            w = self._weight_of.get(_ptr(b))
+            if w not in self._role:
+                raise ReplayError(f"replay: an mm whose B is not a declared weight ({w})")
+            l, x = self._role[w]
+            # S then O follow the layer's Y_v, as in the labeling (module docstring).
+            self._cur, self._n_bmm = (l if x == "v" else None), 0
+            name = "Lambda" if l is None else f"L{l}.Y_{x}"
+            out = self.view.product(c.m_of(name)).clone()
+        else:
+            if self._cur is None or self._n_bmm > 1:
+                raise ReplayError("replay: a bmm outside a layer's S, O pair")
+            name = f"L{self._cur}.{('S', 'O')[self._n_bmm]}"
+            self._n_bmm += 1
+            out = torch.stack([self.view.product(c.m_of(f"{name}[{s},{h}]"))
+                               for s, h in c._members()])
+        self._seen.append((name, a, b) if self._keep(name) else (name, None, None))
+        return out
+
+    def _substituted(self, run: Callable[[], None], keep: Callable[[str], bool]
+                     ) -> list[tuple[str, torch.Tensor | None, torch.Tensor | None]]:
+        """Run ``run`` under substitution; returns every call's name, with the operands of
+        the calls ``keep`` accepts."""
+        self._seen, self._keep, self._cur, self._n_bmm = [], keep, None, 0
+        try:
+            with torch.no_grad(), ProductSubstitution(self._supply):
+                run()
+            return self._seen
+        finally:
+            self._seen = []
+
+    @staticmethod
+    def _layer_names(l: int) -> list[str]:
+        return [f"L{l}.{r}" for r in ("Y_q", "Y_k", "Y_v", "S", "O", "Y_o", "Y_gate", "Y_up",
+                                      "Y_down")]
+
+    def _forward(self) -> None:
+        """The whole forward pass once; keeps ``X_ℓ``, the layer kwargs and ``Λ``'s operands."""
+        c, inner = self.c, self.model.model
+        x: list[Any] = [None] * (c.L + 1)
+        kw: list[Any] = [None] * c.L
+
+        def keep_layer(i):
+            def hook(module, args, kwargs):
+                if len(args) != 1:
+                    raise ReplayError(f"layer {i + 1} called with {len(args)} positional args")
+                x[i], kw[i] = args[0], dict(kwargs)
+            return hook
+
+        def keep_final(module, args):
+            x[c.L] = args[0]
+
+        hooks = [layer.register_forward_pre_hook(keep_layer(i), with_kwargs=True)
+                 for i, layer in enumerate(inner.layers)]
+        hooks.append(inner.norm.register_forward_pre_hook(keep_final))
+        batch = c.assemble(self.view.records())
+        try:
+            seen = self._substituted(lambda: c.logits(self.model, batch),
+                                     keep=lambda name: name == "Lambda")
+        finally:
+            for h in hooks:
+                h.remove()
+        want = [n for l in range(1, c.L + 1) for n in self._layer_names(l)] + ["Lambda"]
+        if [n for n, _, _ in seen] != want or any(t is None for t in x):
+            raise ReplayError("replay: the forward pass does not have the declared products")
+        self.batch, self.x, self.layer_kwargs = batch, x, kw
+        self.lambda_operands = seen[-1][1:]  # type: ignore[assignment]
+
+    def _run_layer(self, l: int) -> None:
+        """Rerun layer ℓ from ``X_ℓ`` and hold the operands of its nine products."""
+        if self.x is None:
+            self._forward()
+        assert self.x is not None and self.layer_kwargs is not None
+        self._layer, self._ops = None, {}
+        out: Any = None
+
+        def run():
+            nonlocal out
+            out = self.model.model.layers[l - 1](self.x[l - 1], **self.layer_kwargs[l - 1])
+
+        seen = self._substituted(run, keep=lambda name: True)
+        out = out[0] if isinstance(out, tuple) else out
+        if [n for n, _, _ in seen] != self._layer_names(l):
+            raise ReplayError(f"replay: layer {l} does not have the declared products")
+        if not torch.allclose(out, self.x[l], rtol=0.0, atol=0.0, equal_nan=True):
+            raise ReplayError(f"replay: rerunning layer {l} did not reproduce X_{l + 1}")
+        self._layer, self._ops = l, {n: (a, b) for n, a, b in seen}  # type: ignore[misc]
+
+    # ---- Replay ------------------------------------------------------------------------------
+
+    def operands(self, m: int) -> tuple[torch.Tensor, torch.Tensor]:
+        c = self.c
+        spec = c.product(m)
+        if spec.kind is not ProductKind.FORWARD:
+            raise NotImplementedError(f"A9: backward glue replay ({spec.name})")
+        if spec.layer is None:  # Λ
+            if self.lambda_operands is None:
+                self._forward()
+            a, b = self.lambda_operands  # type: ignore[misc]
+        else:
+            l = spec.layer
+            if self._layer != l:
+                self._run_layer(l)
+            role = c.product_class(spec)
+            if spec.member is None:
+                a, b = self._ops[f"L{l}.{role}"]
+            else:
+                s, h = spec.member
+                a_all, b_all = self._ops[f"L{l}.{role}"]
+                a, b = a_all[s * c.n_h + h], b_all[s * c.n_h + h]
+            if role == "Y_down":  # the layer's last forward product
+                self._layer, self._ops = None, {}
+        if a.dtype != c.operand_dtype or b.dtype != c.operand_dtype:
+            raise ReplayError(f"{spec.name}: operands {a.dtype}, {b.dtype}, declared "
+                              f"{c.operand_dtype}")
+        return a, b
+
+    def glue_gradients(self) -> dict[str, torch.Tensor]:
+        raise NotImplementedError("A9: backward glue replay (check 6b)")
