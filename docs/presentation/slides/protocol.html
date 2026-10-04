@@ -1,0 +1,95 @@
+<section id="protocol" style="background:#f6f5f1">
+  <h2 style="position:absolute; top:96px; left:128px; width:1664px; font-family:'DM Sans', Arial, sans-serif; font-size:60px; font-weight:700; line-height:1.15; color:#14213d">How a training step is verified</h2>
+  <div style="position:absolute; top:250px; left:178px; width:4px; height:366px; display:flex; flex-direction:column; background:#9db6e3">
+  </div>
+  <div style="position:absolute; top:650px; left:1082px; width:4px; height:266px; display:flex; flex-direction:column; background:#e2b48c">
+  </div>
+  <div style="position:absolute; top:196px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:10px 20px; background:#2b63c6; border-radius:14px">
+    <x-icon name="Cpu" style="color:#fffefb;width:32px;height:32px"></x-icon>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; letter-spacing:2px; color:#fffefb">PROVER · THE TRAINER</p>
+  </div>
+  <div style="position:absolute; top:196px; left:1032px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:10px 20px; background:#b85c12; border-radius:14px">
+    <x-icon name="ShieldCheck" style="color:#fffefb;width:32px;height:32px"></x-icon>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; letter-spacing:2px; color:#fffefb">VERIFIER · THE AUDITOR</p>
+  </div>
+  <div style="position:absolute; top:272px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#0b7476; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">1</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Load the agreed batch</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Batch order and base model fixed before training</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:372px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#2b63c6; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">2</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Run one training step</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Forward pass, loss, backward pass, optimizer update</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:472px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#4b4fc4; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">3</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Record final weights and calculation results</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Every matrix-multiply output, plus the new weights</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:572px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#8a3fb0; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">4</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Hash the record</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Merkle tree over all values → one root hash</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:672px; left:1032px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#8a3fb0; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">5</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Check the hash</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Recompute the Merkle root and compare</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:772px; left:1032px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#2e7d3a; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">6</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Validate the calculations efficiently</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Random-vector checks seeded by the hash: n², not n³</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:872px; left:1032px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#b85c12; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">7</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Check data &amp; weights</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Right batch, exact update rule, steps chain up</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:272px; left:1032px; width:760px; display:flex; flex-direction:column; gap:6px; padding:18px 24px; border:2px dashed #8a94a6; border-radius:16px">
+    <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Agreed before training</h3>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.3; color:#4a5568">Base model · dataset · which records go into each step, in order</p>
+  </div>
+  <x-connector x1="888" y1="616" x2="960" y2="616" head="none" style="color:#8a3fb0; border-width:4px"></x-connector>
+  <x-connector x1="960" y1="616" x2="960" y2="716" head="none" style="color:#8a3fb0; border-width:4px"></x-connector>
+  <x-connector x1="960" y1="716" x2="1032" y2="716" style="color:#8a3fb0; border-width:4px"></x-connector>
+  <p style="position:absolute; top:598px; left:984px; width:700px; font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#8a3fb0">Send record + root hash</p>
+  <x-connector x1="1032" y1="916" x2="960" y2="916" head="none" style="color:#14213d; border-width:3px"></x-connector>
+  <x-connector x1="960" y1="916" x2="960" y2="790" head="none" style="color:#14213d; border-width:3px"></x-connector>
+  <x-connector x1="960" y1="790" x2="888" y2="790" style="color:#14213d; border-width:3px"></x-connector>
+  <div style="position:absolute; top:712px; left:128px; width:760px; display:flex; flex-direction:column; gap:6px; padding:18px 24px; background:#eaeff7; border-radius:16px">
+    <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Outcome</h3>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.3; color:#14213d"><b>Pass</b> → next step · <b>Fail</b> → reject the run</p>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.3; color:#4a5568">A global check on first and last steps</p>
+  </div>
+  <aside>• Two roles. The prover is whoever trains the model. The verifier is an independent auditor. • Before training starts, both sides agree on the starting model, the dataset, and which records go into each training step, in order. • Steps 1–2: the prover loads the agreed batch and runs one full training step: forward pass, loss, backward pass, optimizer update. • Step 3: the prover records the final weights and every intermediate matrix-multiplication result. • Step 4: the record is hashed into a Merkle tree. The root hash commits to every value: change one number and the root changes. • Step 5: the verifier recomputes the Merkle root and checks it matches. • Step 6: the verifier validates each multiplication with random-vector checks instead of redoing it (7 vectors per multiplication at test scale). The random challenges are derived from the root hash (Fiat–Shamir), so the prover can't know them before committing and no live back-and-forth is needed. Each check costs n², not n³. • Step 7: the batch must be the agreed one, the weight change must follow the training rule exactly, and each step must start where the last one ended. • Steps are checked one at a time, so the verifier's memory stays flat no matter how long training runs. • Outcome: pass moves to the next step; fail rejects the run. Before step 1 the starting model must be the agreed base model; after the last step the final model must be the one actually deployed.</aside>
+</section>

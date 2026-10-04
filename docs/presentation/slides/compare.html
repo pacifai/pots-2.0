@@ -1,0 +1,88 @@
+<section id="compare" style="background:#F6F5F1;color:#14213D;font-family:'DM Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:40px">
+<h2 style="font-size:64px;font-weight:700;line-height:1.15">How it compares</h2>
+<div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:32px">
+<div style="background:#FFFEFB;border:2px solid #D3CFC3;border-radius:20px;padding:40px;display:flex;flex-direction:column;gap:12px">
+<h3 style="font-size:40px;font-weight:700">Proof of Learning · 2021</h3>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Play" style="color:#4A5568;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3">Re-runs sampled stretches of training</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Search" style="color:#4A5568;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3">Only the sampled steps</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Activity" style="color:#4A5568;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3">"Close enough?" distance test</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Warning" style="color:#B85C12;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3;color:#B85C12;font-weight:600">Doesn't protect from backdoors</p>
+</div>
+<div style="flex:1"></div>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#4A5568">AUDITOR WORK</p>
+<div style="height:100px;display:flex;flex-direction:column;justify-content:flex-end">
+<div style="height:100px;background:#B9B4A7;border-radius:8px"></div>
+</div>
+<p style="font-size:24px;color:#4A5568">Full re-training of checked steps</p>
+</div>
+<div style="background:#FFFEFB;border:2px solid #D3CFC3;border-radius:20px;padding:40px;display:flex;flex-direction:column;gap:12px">
+<h3 style="font-size:40px;font-weight:700">PoTS · 2025</h3>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Play" style="color:#4A5568;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3">Re-trains the last layers each step</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Search" style="color:#4A5568;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3">Every step, last layers only</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Activity" style="color:#4A5568;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3">Statistical threshold</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="ShieldCheck" style="color:#2E7D3A;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3;color:#2E7D3A;font-weight:600">Protects from backdoors</p>
+</div>
+<div style="flex:1"></div>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#4A5568">AUDITOR WORK</p>
+<div style="height:100px;display:flex;flex-direction:column;justify-content:flex-end">
+<div style="height:69px;background:#B9B4A7;border-radius:8px"></div>
+</div>
+<p style="font-size:24px;color:#4A5568">Forward pass + partial re-training</p>
+</div>
+<div style="background:#14213D;color:#F6F5F1;border-radius:20px;padding:40px;display:flex;flex-direction:column;gap:12px">
+<h3 style="font-size:40px;font-weight:700;color:#F6F5F1">Our protocol</h3>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Search" style="color:#F2A65A;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3">Spot-checks every multiplication</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="CheckCircle" style="color:#F2A65A;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3">Every step, the whole model</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Verified" style="color:#F2A65A;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3">Provable bound on missed cheats</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="ShieldCheck" style="color:#F2A65A;width:36px;height:36px"></x-icon>
+<p style="font-size:28px;line-height:1.3;font-weight:600">Protects from backdoors</p>
+</div>
+<div style="flex:1"></div>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#F2A65A">AUDITOR WORK</p>
+<div style="height:100px;display:flex;flex-direction:column;justify-content:flex-end">
+<div style="height:12px;background:#F2A65A;border-radius:8px"></div>
+</div>
+<p style="font-size:24px;color:#C9CFDA">Spot-checks only · [__× less, to measure]</p>
+</div>
+</div>
+<aside>• Three ways to check that training was done honestly.
+• Proof of Learning (Jia et al., 2021): the trainer saves checkpoints, and the auditor re-runs selected stretches of training and checks the result lands close by. The auditor pays full training cost for whatever it checks, and later papers showed that forged training logs can pass the distance test.
+• PoTS (Seddik et al., 2025): every step, the auditor freezes the early layers, re-trains only the last few layers, and accepts if the result is within a statistical threshold. That still needs a forward pass and partial training every step. It only looks at the tail of the model, and the guarantee is statistical.
+• Ours: no re-training at all. Every multiplication in every step is spot-checked against random vectors, across the whole model.
+• Why it's cheaper: redoing a multiplication of size n costs about n³ operations, while spot-checking it costs about n². For the typical layer shapes of our test model, 7 spot-checks are expected to cost only a few percent of redoing the multiplication. The non-multiplication steps are recomputed, but they're small.
+• The bars show the expected ordering, not measured values. The measured comparison goes on the results slide.
+• Backdoors: Proof of Learning doesn't protect against backdoors; PoTS and our protocol do.
+• Honest trade-off, for Q&A: the trainer has to record and send every multiplication result, so the prover side carries more storage and bandwidth.</aside>
+</section>

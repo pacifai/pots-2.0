@@ -1,0 +1,88 @@
+<section id="attacks" style="background:#ECEAE3;color:#14213D;font-family:'DM Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column">
+<h2 style="position:absolute;left:128px;top:96px;width:1664px;font-size:60px;font-weight:700;line-height:1.15">Attacks, and where they get caught</h2>
+<!-- mini diagram: prover x128 w420, verifier x596 w420; card h≈58. attacks: labels x1260 w532, red arrows to verifier right edge x1016 -->
+<div style="position:absolute;left:128px;top:200px;width:460px;display:flex;align-items:center;gap:12px;background:#2B63C6;border-radius:12px;padding:8px 16px">
+<x-icon name="Cpu" style="color:#FFFEFB;width:28px;height:28px"></x-icon>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#FFFEFB">PROVER</p>
+</div>
+<div style="position:absolute;left:616px;top:200px;width:460px;display:flex;align-items:center;gap:12px;background:#B85C12;border-radius:12px;padding:8px 16px">
+<x-icon name="ShieldCheck" style="color:#FFFEFB;width:28px;height:28px"></x-icon>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#FFFEFB">VERIFIER</p>
+</div>
+<div style="position:absolute;left:128px;top:264px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #0B7476;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#0B7476;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">1</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Load the agreed batch</h3>
+</div>
+<div style="position:absolute;left:128px;top:336px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #2B63C6;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#2B63C6;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">2</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Run one training step</h3>
+</div>
+<div style="position:absolute;left:128px;top:408px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #4B4FC4;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#4B4FC4;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">3</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Record weights &amp; results</h3>
+</div>
+<div style="position:absolute;left:128px;top:480px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #8A3FB0;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#8A3FB0;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">4</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Hash the record</h3>
+</div>
+<x-connector x1="588" y1="509" x2="602" y2="509" head="none" style="color:#8A3FB0;border-width:3px"></x-connector>
+<x-connector x1="602" y1="509" x2="602" y2="589" head="none" style="color:#8A3FB0;border-width:3px"></x-connector>
+<x-connector x1="602" y1="589" x2="616" y2="589" style="color:#8A3FB0;border-width:3px"></x-connector>
+<p style="position:absolute;left:624px;top:496px;width:400px;font-size:24px;font-weight:700;color:#8A3FB0">record + root hash</p>
+<div style="position:absolute;left:616px;top:560px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #8A3FB0;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#8A3FB0;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">5</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Check the hash</h3>
+</div>
+<div style="position:absolute;left:616px;top:660px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #2E7D3A;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#2E7D3A;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">6</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Validate calculations</h3>
+</div>
+<div style="position:absolute;left:616px;top:780px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #B85C12;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#B85C12;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">7</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Check data &amp; weights</h3>
+</div>
+<div style="position:absolute;left:616px;top:900px;width:460px;display:flex;align-items:center;gap:12px;background:#EAEFF7;border:2px dashed #8A94A6;border-radius:12px;padding:10px 14px">
+<x-icon name="Link" style="color:#14213D;width:32px;height:32px"></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">First &amp; last models</h3>
+</div>
+<div style="position:absolute;left:128px;top:640px;width:460px;display:flex;flex-direction:column;gap:10px;border:2px dashed #8A94A6;border-radius:12px;padding:16px 20px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#4A5568">NOT COVERED</p>
+<p style="font-size:24px;line-height:1.25;color:#4A5568">The agreed data is already poisoned</p>
+<p style="font-size:24px;line-height:1.25;color:#4A5568">The agreed recipe is harmful</p>
+<p style="font-size:24px;line-height:1.25;color:#4A5568">Changes below the detection floor</p>
+</div>
+<x-connector x1="1352" y1="300" x2="1076" y2="589" style="color:#C62828;border-width:4px"></x-connector>
+<x-connector x1="1352" y1="461" x2="1076" y2="689" style="color:#C62828;border-width:4px"></x-connector>
+<x-connector x1="1352" y1="622" x2="1076" y2="797" style="color:#C62828;border-width:4px"></x-connector>
+<x-connector x1="1352" y1="783" x2="1076" y2="821" style="color:#C62828;border-width:4px"></x-connector>
+<x-connector x1="1352" y1="944" x2="1076" y2="931" style="color:#C62828;border-width:4px"></x-connector>
+<div style="position:absolute;left:1352px;top:272px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Edit the record</h3>
+</div>
+<div style="position:absolute;left:1352px;top:433px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Fake a calculation</h3>
+</div>
+<div style="position:absolute;left:1352px;top:594px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Tamper with weights</h3>
+</div>
+<div style="position:absolute;left:1352px;top:755px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Use unagreed data</h3>
+</div>
+<div style="position:absolute;left:1352px;top:916px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Swap the model</h3>
+</div>
+<aside>• Left: the protocol from the previous slide. Right: each red arrow is an attack, pointing at the verifier check that rejects it.
+• Edit the record → step 5. The root hash commits to every value, and the random checks are derived from it. Editing anything afterwards changes the hash, so the old answers no longer fit.
+• Fake a calculation → step 6: a faked multiplication fails the random-vector checks. The same check catches reporting one batch while training on another, since the verifier rebuilds each step's inputs from the reported batch.
+• Retrying until the checks look lucky (grinding) is also covered by step 6: we use enough checks to survive about 2^52 retries, roughly what a well-funded research lab could afford.
+• Tamper with weights → step 7: the weight change is checked number by number against the training rule.
+• Use unagreed data → step 7: every record in a batch is checked against the agreed dataset's hash at its scheduled position. Step 7 also catches skipped, swapped or reordered steps, since each step must start exactly where the last one ended.
+• Swap the model → the global check: the first model must be the agreed base model and the last must be the one actually deployed.
+• Bottom line: a cheating run gets through with probability at most about 1 in 30 million (2^-25), even counting retries.
+• Not covered, by design: we prove the agreed recipe was followed on the agreed data. If the agreed data or recipe is itself bad, honest training on it passes. Very small changes (below a floor set by rounding noise and the number of checks) aren't guaranteed to be caught.</aside>
+</section>

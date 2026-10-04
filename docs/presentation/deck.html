@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verifying Training Steps</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400..700&amp;display=swap">
+<style>
+  html, body { margin: 0; height: 100%; background: #0e1424; overflow: hidden; }
+  body { font-family: 'DM Sans', Arial, sans-serif; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #frame { width: 1920px; height: 1080px; transform-origin: center center; position: relative; flex: none; }
+  #frame > section { position: absolute; inset: 0; width: 1920px; height: 1080px; box-sizing: border-box;
+                      overflow: hidden; display: none; }
+  #frame > section.active { display: block; }
+  #frame > section.active[data-flex] { display: flex; }
+  #frame > section.active[data-grid] { display: grid; }
+  section * { box-sizing: border-box; }
+  section h1, section h2, section h3, section p, section ul, section ol { margin: 0; }
+  section aside { display: none; }
+  x-icon { display: inline-flex; flex: none; }
+  x-icon svg { width: 100%; height: 100%; }
+  #notes { position: fixed; left: 0; right: 0; bottom: 0; max-height: 35vh; overflow: auto; display: none;
+            background: rgba(14,20,36,.95); color: #e8ebf2; font: 16px/1.5 system-ui, sans-serif;
+            padding: 16px 24px; white-space: pre-wrap; }
+  body.show-notes #notes { display: block; }
+  #counter { position: fixed; right: 16px; bottom: 12px; color: #8a94a6; font: 13px system-ui, sans-serif; }
+  body.show-notes #counter { display: none; }
+</style>
+</head>
+<body>
+<div id="stage"><div id="frame">
+<section id="cover" style="background:#14213d">
+  <x-icon name="Verified" id="7c1ed372" style="position:absolute; top:387px; left:88px; width:96px; height:96px; color:#f2a65a"><svg
+  class="lucide lucide-badge-check"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z" />
+  <path d="m9 12 2 2 4-4" />
+</svg></x-icon>
+  <h1 id="41f82d83" style="position:absolute; top:498.31px; left:50%; width:1723.61px; height:245.22px; font-family:'DM Sans', Arial, sans-serif; font-size:112px; font-weight:700; line-height:1.05; color:#f6f5f1; transform:translateX(-50%)">Efficient proof of training steps</h1>
+  <p id="61fda76b" style="position:absolute; top:655.55px; left:calc(50% - 21.8px); width:1664px; font-family:'DM Sans', Arial, sans-serif; font-size:32px; color:#c9cfda; transform:translateX(-50%)">Pacif.ai</p>
+  <aside>• Topic: how an independent auditor can confirm that an AI model was trained exactly as claimed, on the agreed data, step by step. • Why it matters: a trainer could secretly slip harmful data (a "backdoor") into training. Today, checking for that is expensive or only statistical. • The promise of this talk: a check that covers every step and the whole model, gives a mathematical guarantee, and costs the auditor far less than re-training.</aside>
+</section>
+<section id="protocol" style="background:#f6f5f1">
+  <h2 style="position:absolute; top:96px; left:128px; width:1664px; font-family:'DM Sans', Arial, sans-serif; font-size:60px; font-weight:700; line-height:1.15; color:#14213d">How a training step is verified</h2>
+  <div style="position:absolute; top:250px; left:178px; width:4px; height:366px; display:flex; flex-direction:column; background:#9db6e3">
+  </div>
+  <div style="position:absolute; top:650px; left:1082px; width:4px; height:266px; display:flex; flex-direction:column; background:#e2b48c">
+  </div>
+  <div style="position:absolute; top:196px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:10px 20px; background:#2b63c6; border-radius:14px">
+    <x-icon name="Cpu" style="color:#fffefb;width:32px;height:32px"><svg
+  class="lucide lucide-cpu"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <rect width="16" height="16" x="4" y="4" rx="2" />
+  <rect width="6" height="6" x="9" y="9" rx="1" />
+  <path d="M15 2v2" />
+  <path d="M15 20v2" />
+  <path d="M2 15h2" />
+  <path d="M2 9h2" />
+  <path d="M20 15h2" />
+  <path d="M20 9h2" />
+  <path d="M9 2v2" />
+  <path d="M9 20v2" />
+</svg></x-icon>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; letter-spacing:2px; color:#fffefb">PROVER · THE TRAINER</p>
+  </div>
+  <div style="position:absolute; top:196px; left:1032px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:10px 20px; background:#b85c12; border-radius:14px">
+    <x-icon name="ShieldCheck" style="color:#fffefb;width:32px;height:32px"><svg
+  class="lucide lucide-shield-check"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+  <path d="m9 12 2 2 4-4" />
+</svg></x-icon>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; letter-spacing:2px; color:#fffefb">VERIFIER · THE AUDITOR</p>
+  </div>
+  <div style="position:absolute; top:272px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#0b7476; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">1</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Load the agreed batch</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Batch order and base model fixed before training</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:372px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#2b63c6; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">2</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Run one training step</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Forward pass, loss, backward pass, optimizer update</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:472px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#4b4fc4; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">3</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Record final weights and calculation results</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Every matrix-multiply output, plus the new weights</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:572px; left:128px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#8a3fb0; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">4</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Hash the record</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Merkle tree over all values → one root hash</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:672px; left:1032px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#8a3fb0; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">5</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Check the hash</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Recompute the Merkle root and compare</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:772px; left:1032px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#2e7d3a; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">6</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Validate the calculations efficiently</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Random-vector checks seeded by the hash: n², not n³</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:872px; left:1032px; width:760px; display:flex; flex-direction:row; gap:16px; align-items:center; padding:12px 20px; background:#fffefb; border:1px solid #e3e1da; border-radius:16px">
+    <div style="width:48px; height:48px; display:flex; flex-direction:row; align-items:center; justify-content:center; background:#b85c12; border-radius:24px">
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#fffefb">7</p>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:2px">
+      <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Check data &amp; weights</h3>
+      <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.25; color:#4a5568">Right batch, exact update rule, steps chain up</p>
+    </div>
+  </div>
+  <div style="position:absolute; top:272px; left:1032px; width:760px; display:flex; flex-direction:column; gap:6px; padding:18px 24px; border:2px dashed #8a94a6; border-radius:16px">
+    <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Agreed before training</h3>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.3; color:#4a5568">Base model · dataset · which records go into each step, in order</p>
+  </div>
+  <x-connector x1="888" y1="616" x2="960" y2="616" head="none" style="color:#8a3fb0; border-width:4px"></x-connector>
+  <x-connector x1="960" y1="616" x2="960" y2="716" head="none" style="color:#8a3fb0; border-width:4px"></x-connector>
+  <x-connector x1="960" y1="716" x2="1032" y2="716" style="color:#8a3fb0; border-width:4px"></x-connector>
+  <p style="position:absolute; top:598px; left:984px; width:700px; font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; color:#8a3fb0">Send record + root hash</p>
+  <x-connector x1="1032" y1="916" x2="960" y2="916" head="none" style="color:#14213d; border-width:3px"></x-connector>
+  <x-connector x1="960" y1="916" x2="960" y2="790" head="none" style="color:#14213d; border-width:3px"></x-connector>
+  <x-connector x1="960" y1="790" x2="888" y2="790" style="color:#14213d; border-width:3px"></x-connector>
+  <div style="position:absolute; top:712px; left:128px; width:760px; display:flex; flex-direction:column; gap:6px; padding:18px 24px; background:#eaeff7; border-radius:16px">
+    <h3 style="font-family:'DM Sans', Arial, sans-serif; font-size:26px; font-weight:700; line-height:1.2; color:#14213d">Outcome</h3>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.3; color:#14213d"><b>Pass</b> → next step · <b>Fail</b> → reject the run</p>
+    <p style="font-family:'DM Sans', Arial, sans-serif; font-size:24px; line-height:1.3; color:#4a5568">A global check on first and last steps</p>
+  </div>
+  <aside>• Two roles. The prover is whoever trains the model. The verifier is an independent auditor. • Before training starts, both sides agree on the starting model, the dataset, and which records go into each training step, in order. • Steps 1–2: the prover loads the agreed batch and runs one full training step: forward pass, loss, backward pass, optimizer update. • Step 3: the prover records the final weights and every intermediate matrix-multiplication result. • Step 4: the record is hashed into a Merkle tree. The root hash commits to every value: change one number and the root changes. • Step 5: the verifier recomputes the Merkle root and checks it matches. • Step 6: the verifier validates each multiplication with random-vector checks instead of redoing it (7 vectors per multiplication at test scale). The random challenges are derived from the root hash (Fiat–Shamir), so the prover can't know them before committing and no live back-and-forth is needed. Each check costs n², not n³. • Step 7: the batch must be the agreed one, the weight change must follow the training rule exactly, and each step must start where the last one ended. • Steps are checked one at a time, so the verifier's memory stays flat no matter how long training runs. • Outcome: pass moves to the next step; fail rejects the run. Before step 1 the starting model must be the agreed base model; after the last step the final model must be the one actually deployed.</aside>
+</section>
+<section id="attacks" style="background:#ECEAE3;color:#14213D;font-family:'DM Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column">
+<h2 style="position:absolute;left:128px;top:96px;width:1664px;font-size:60px;font-weight:700;line-height:1.15">Attacks, and where they get caught</h2>
+<!-- mini diagram: prover x128 w420, verifier x596 w420; card h≈58. attacks: labels x1260 w532, red arrows to verifier right edge x1016 -->
+<div style="position:absolute;left:128px;top:200px;width:460px;display:flex;align-items:center;gap:12px;background:#2B63C6;border-radius:12px;padding:8px 16px">
+<x-icon name="Cpu" style="color:#FFFEFB;width:28px;height:28px"><svg
+  class="lucide lucide-cpu"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <rect width="16" height="16" x="4" y="4" rx="2" />
+  <rect width="6" height="6" x="9" y="9" rx="1" />
+  <path d="M15 2v2" />
+  <path d="M15 20v2" />
+  <path d="M2 15h2" />
+  <path d="M2 9h2" />
+  <path d="M20 15h2" />
+  <path d="M20 9h2" />
+  <path d="M9 2v2" />
+  <path d="M9 20v2" />
+</svg></x-icon>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#FFFEFB">PROVER</p>
+</div>
+<div style="position:absolute;left:616px;top:200px;width:460px;display:flex;align-items:center;gap:12px;background:#B85C12;border-radius:12px;padding:8px 16px">
+<x-icon name="ShieldCheck" style="color:#FFFEFB;width:28px;height:28px"><svg
+  class="lucide lucide-shield-check"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+  <path d="m9 12 2 2 4-4" />
+</svg></x-icon>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#FFFEFB">VERIFIER</p>
+</div>
+<div style="position:absolute;left:128px;top:264px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #0B7476;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#0B7476;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">1</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Load the agreed batch</h3>
+</div>
+<div style="position:absolute;left:128px;top:336px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #2B63C6;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#2B63C6;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">2</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Run one training step</h3>
+</div>
+<div style="position:absolute;left:128px;top:408px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #4B4FC4;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#4B4FC4;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">3</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Record weights &amp; results</h3>
+</div>
+<div style="position:absolute;left:128px;top:480px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #8A3FB0;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#8A3FB0;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">4</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Hash the record</h3>
+</div>
+<x-connector x1="588" y1="509" x2="602" y2="509" head="none" style="color:#8A3FB0;border-width:3px"></x-connector>
+<x-connector x1="602" y1="509" x2="602" y2="589" head="none" style="color:#8A3FB0;border-width:3px"></x-connector>
+<x-connector x1="602" y1="589" x2="616" y2="589" style="color:#8A3FB0;border-width:3px"></x-connector>
+<p style="position:absolute;left:624px;top:496px;width:400px;font-size:24px;font-weight:700;color:#8A3FB0">record + root hash</p>
+<div style="position:absolute;left:616px;top:560px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #8A3FB0;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#8A3FB0;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">5</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Check the hash</h3>
+</div>
+<div style="position:absolute;left:616px;top:660px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #2E7D3A;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#2E7D3A;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">6</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Validate calculations</h3>
+</div>
+<div style="position:absolute;left:616px;top:780px;width:460px;display:flex;align-items:center;gap:12px;background:#FFFEFB;border:1px solid #E3E1DA;border-left:6px solid #B85C12;border-radius:12px;padding:10px 14px">
+<div style="width:36px;height:36px;border-radius:18px;background:#B85C12;display:flex;align-items:center;justify-content:center"><p style="font-size:24px;font-weight:700;color:#FFFEFB">7</p></div>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">Check data &amp; weights</h3>
+</div>
+<div style="position:absolute;left:616px;top:900px;width:460px;display:flex;align-items:center;gap:12px;background:#EAEFF7;border:2px dashed #8A94A6;border-radius:12px;padding:10px 14px">
+<x-icon name="Link" style="color:#14213D;width:32px;height:32px"><svg
+  class="lucide lucide-link"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+</svg></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2">First &amp; last models</h3>
+</div>
+<div style="position:absolute;left:128px;top:640px;width:460px;display:flex;flex-direction:column;gap:10px;border:2px dashed #8A94A6;border-radius:12px;padding:16px 20px">
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#4A5568">NOT COVERED</p>
+<p style="font-size:24px;line-height:1.25;color:#4A5568">The agreed data is already poisoned</p>
+<p style="font-size:24px;line-height:1.25;color:#4A5568">The agreed recipe is harmful</p>
+<p style="font-size:24px;line-height:1.25;color:#4A5568">Changes below the detection floor</p>
+</div>
+<x-connector x1="1352" y1="300" x2="1076" y2="589" style="color:#C62828;border-width:4px"></x-connector>
+<x-connector x1="1352" y1="461" x2="1076" y2="689" style="color:#C62828;border-width:4px"></x-connector>
+<x-connector x1="1352" y1="622" x2="1076" y2="797" style="color:#C62828;border-width:4px"></x-connector>
+<x-connector x1="1352" y1="783" x2="1076" y2="821" style="color:#C62828;border-width:4px"></x-connector>
+<x-connector x1="1352" y1="944" x2="1076" y2="931" style="color:#C62828;border-width:4px"></x-connector>
+<div style="position:absolute;left:1352px;top:272px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"><svg
+  class="lucide lucide-triangle-alert"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+  <path d="M12 9v4" />
+  <path d="M12 17h.01" />
+</svg></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Edit the record</h3>
+</div>
+<div style="position:absolute;left:1352px;top:433px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"><svg
+  class="lucide lucide-triangle-alert"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+  <path d="M12 9v4" />
+  <path d="M12 17h.01" />
+</svg></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Fake a calculation</h3>
+</div>
+<div style="position:absolute;left:1352px;top:594px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"><svg
+  class="lucide lucide-triangle-alert"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+  <path d="M12 9v4" />
+  <path d="M12 17h.01" />
+</svg></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Tamper with weights</h3>
+</div>
+<div style="position:absolute;left:1352px;top:755px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"><svg
+  class="lucide lucide-triangle-alert"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+  <path d="M12 9v4" />
+  <path d="M12 17h.01" />
+</svg></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Use unagreed data</h3>
+</div>
+<div style="position:absolute;left:1352px;top:916px;width:440px;display:flex;align-items:center;gap:12px;background:#FBE9E7;border:3px solid #C62828;border-radius:14px;padding:8px 18px">
+<x-icon name="Warning" style="color:#C62828;width:32px;height:32px"><svg
+  class="lucide lucide-triangle-alert"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+  <path d="M12 9v4" />
+  <path d="M12 17h.01" />
+</svg></x-icon>
+<h3 style="font-size:28px;font-weight:700;line-height:1.2;color:#9E1C1C">Swap the model</h3>
+</div>
+<aside>• Left: the protocol from the previous slide. Right: each red arrow is an attack, pointing at the verifier check that rejects it.
+• Edit the record → step 5. The root hash commits to every value, and the random checks are derived from it. Editing anything afterwards changes the hash, so the old answers no longer fit.
+• Fake a calculation → step 6: a faked multiplication fails the random-vector checks. The same check catches reporting one batch while training on another, since the verifier rebuilds each step's inputs from the reported batch.
+• Retrying until the checks look lucky (grinding) is also covered by step 6: we use enough checks to survive about 2^52 retries, roughly what a well-funded research lab could afford.
+• Tamper with weights → step 7: the weight change is checked number by number against the training rule.
+• Use unagreed data → step 7: every record in a batch is checked against the agreed dataset's hash at its scheduled position. Step 7 also catches skipped, swapped or reordered steps, since each step must start exactly where the last one ended.
+• Swap the model → the global check: the first model must be the agreed base model and the last must be the one actually deployed.
+• Bottom line: a cheating run gets through with probability at most about 1 in 30 million (2^-25), even counting retries.
+• Not covered, by design: we prove the agreed recipe was followed on the agreed data. If the agreed data or recipe is itself bad, honest training on it passes. Very small changes (below a floor set by rounding noise and the number of checks) aren't guaranteed to be caught.</aside>
+</section>
+<section id="compare" style="background:#F6F5F1;color:#14213D;font-family:'DM Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:40px">
+<h2 style="font-size:64px;font-weight:700;line-height:1.15">How it compares</h2>
+<div style="display:grid;grid-template-columns:repeat(3, 1fr);gap:32px">
+<div style="background:#FFFEFB;border:2px solid #D3CFC3;border-radius:20px;padding:40px;display:flex;flex-direction:column;gap:12px">
+<h3 style="font-size:40px;font-weight:700">Proof of Learning · 2021</h3>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Play" style="color:#4A5568;width:36px;height:36px"><svg
+  class="lucide lucide-play"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <polygon points="6 3 20 12 6 21 6 3" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3">Re-runs sampled stretches of training</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Search" style="color:#4A5568;width:36px;height:36px"><svg
+  class="lucide lucide-search"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <circle cx="11" cy="11" r="8" />
+  <path d="m21 21-4.3-4.3" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3">Only the sampled steps</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Activity" style="color:#4A5568;width:36px;height:36px"><svg
+  class="lucide lucide-activity"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3">"Close enough?" distance test</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Warning" style="color:#B85C12;width:36px;height:36px"><svg
+  class="lucide lucide-triangle-alert"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+  <path d="M12 9v4" />
+  <path d="M12 17h.01" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3;color:#B85C12;font-weight:600">Doesn't protect from backdoors</p>
+</div>
+<div style="flex:1"></div>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#4A5568">AUDITOR WORK</p>
+<div style="height:100px;display:flex;flex-direction:column;justify-content:flex-end">
+<div style="height:100px;background:#B9B4A7;border-radius:8px"></div>
+</div>
+<p style="font-size:24px;color:#4A5568">Full re-training of checked steps</p>
+</div>
+<div style="background:#FFFEFB;border:2px solid #D3CFC3;border-radius:20px;padding:40px;display:flex;flex-direction:column;gap:12px">
+<h3 style="font-size:40px;font-weight:700">PoTS · 2025</h3>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Play" style="color:#4A5568;width:36px;height:36px"><svg
+  class="lucide lucide-play"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <polygon points="6 3 20 12 6 21 6 3" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3">Re-trains the last layers each step</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Search" style="color:#4A5568;width:36px;height:36px"><svg
+  class="lucide lucide-search"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <circle cx="11" cy="11" r="8" />
+  <path d="m21 21-4.3-4.3" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3">Every step, last layers only</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Activity" style="color:#4A5568;width:36px;height:36px"><svg
+  class="lucide lucide-activity"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3">Statistical threshold</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="ShieldCheck" style="color:#2E7D3A;width:36px;height:36px"><svg
+  class="lucide lucide-shield-check"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+  <path d="m9 12 2 2 4-4" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3;color:#2E7D3A;font-weight:600">Protects from backdoors</p>
+</div>
+<div style="flex:1"></div>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#4A5568">AUDITOR WORK</p>
+<div style="height:100px;display:flex;flex-direction:column;justify-content:flex-end">
+<div style="height:69px;background:#B9B4A7;border-radius:8px"></div>
+</div>
+<p style="font-size:24px;color:#4A5568">Forward pass + partial re-training</p>
+</div>
+<div style="background:#14213D;color:#F6F5F1;border-radius:20px;padding:40px;display:flex;flex-direction:column;gap:12px">
+<h3 style="font-size:40px;font-weight:700;color:#F6F5F1">Our protocol</h3>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Search" style="color:#F2A65A;width:36px;height:36px"><svg
+  class="lucide lucide-search"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <circle cx="11" cy="11" r="8" />
+  <path d="m21 21-4.3-4.3" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3">Spot-checks every multiplication</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="CheckCircle" style="color:#F2A65A;width:36px;height:36px"><svg
+  class="lucide lucide-circle-check"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <circle cx="12" cy="12" r="10" />
+  <path d="m9 12 2 2 4-4" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3">Every step, the whole model</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="Verified" style="color:#F2A65A;width:36px;height:36px"><svg
+  class="lucide lucide-badge-check"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z" />
+  <path d="m9 12 2 2 4-4" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3">Provable bound on missed cheats</p>
+</div>
+<div style="display:flex;align-items:center;gap:16px">
+<x-icon name="ShieldCheck" style="color:#F2A65A;width:36px;height:36px"><svg
+  class="lucide lucide-shield-check"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+  <path d="m9 12 2 2 4-4" />
+</svg></x-icon>
+<p style="font-size:28px;line-height:1.3;font-weight:600">Protects from backdoors</p>
+</div>
+<div style="flex:1"></div>
+<p style="font-size:24px;font-weight:700;letter-spacing:2px;color:#F2A65A">AUDITOR WORK</p>
+<div style="height:100px;display:flex;flex-direction:column;justify-content:flex-end">
+<div style="height:12px;background:#F2A65A;border-radius:8px"></div>
+</div>
+<p style="font-size:24px;color:#C9CFDA">Spot-checks only · [__× less, to measure]</p>
+</div>
+</div>
+<aside>• Three ways to check that training was done honestly.
+• Proof of Learning (Jia et al., 2021): the trainer saves checkpoints, and the auditor re-runs selected stretches of training and checks the result lands close by. The auditor pays full training cost for whatever it checks, and later papers showed that forged training logs can pass the distance test.
+• PoTS (Seddik et al., 2025): every step, the auditor freezes the early layers, re-trains only the last few layers, and accepts if the result is within a statistical threshold. That still needs a forward pass and partial training every step. It only looks at the tail of the model, and the guarantee is statistical.
+• Ours: no re-training at all. Every multiplication in every step is spot-checked against random vectors, across the whole model.
+• Why it's cheaper: redoing a multiplication of size n costs about n³ operations, while spot-checking it costs about n². For the typical layer shapes of our test model, 7 spot-checks are expected to cost only a few percent of redoing the multiplication. The non-multiplication steps are recomputed, but they're small.
+• The bars show the expected ordering, not measured values. The measured comparison goes on the results slide.
+• Backdoors: Proof of Learning doesn't protect against backdoors; PoTS and our protocol do.
+• Honest trade-off, for Q&A: the trainer has to record and send every multiplication result, so the prover side carries more storage and bandwidth.</aside>
+</section>
+<section id="results" style="background:#ECEAE3;color:#14213D;font-family:'DM Sans', Arial, sans-serif;padding:128px;display:flex;flex-direction:column;gap:40px">
+<h2 style="font-size:64px;font-weight:700;line-height:1.15">Results</h2>
+<div style="flex:1;display:flex;gap:32px">
+<div style="flex:1;border:3px dashed #8A94A6;border-radius:20px;padding:40px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px">
+<x-icon name="Chart" style="color:#8A94A6;width:64px;height:64px"><svg
+  class="lucide lucide-chart-column"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M3 3v16a2 2 0 0 0 2 2h16" />
+  <path d="M18 17V9" />
+  <path d="M13 17V5" />
+  <path d="M8 17v-3" />
+</svg></x-icon>
+<p style="font-size:28px;color:#4A5568;text-align:center">[Graph: auditor compute, ours vs. PoTS]</p>
+</div>
+<div style="flex:1;border:3px dashed #8A94A6;border-radius:20px;padding:40px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px">
+<x-icon name="Chart" style="color:#8A94A6;width:64px;height:64px"><svg
+  class="lucide lucide-chart-column"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M3 3v16a2 2 0 0 0 2 2h16" />
+  <path d="M18 17V9" />
+  <path d="M13 17V5" />
+  <path d="M8 17v-3" />
+</svg></x-icon>
+<p style="font-size:28px;color:#4A5568;text-align:center">[Graph: cheats caught vs. cheat size]</p>
+</div>
+</div>
+<aside>• Placeholder: graphs go here once the runs are done.
+• Planned: the auditor's compute and memory per step, ours vs. PoTS, on the same models and tasks PoTS used.
+• Planned: detection rate vs. size of a deliberately injected cheat, which shows where the detection floor sits in practice.
+• Planned: how often honest training is wrongly rejected (should be essentially never).</aside>
+</section>
+</div></div>
+<div id="notes"></div>
+<div id="counter"></div>
+<script>
+(function () {
+  // ---- connectors: <x-connector x1 y1 x2 y2 head="none"> in slide (1920x1080) coordinates
+  var NS = "http://www.w3.org/2000/svg", n = 0;
+  document.querySelectorAll("x-connector").forEach(function (el) {
+    var cs = getComputedStyle(el);
+    var color = cs.color, w = parseFloat(el.style.borderWidth) || 3;
+    var svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 1920 1080");
+    svg.style.cssText = "position:absolute;left:0;top:0;width:1920px;height:1080px;overflow:visible;pointer-events:none";
+    var line = document.createElementNS(NS, "line");
+    ["x1", "y1", "x2", "y2"].forEach(function (k) { line.setAttribute(k, el.getAttribute(k)); });
+    line.setAttribute("stroke", color); line.setAttribute("stroke-width", w);
+    line.setAttribute("stroke-linecap", "round");
+    if (el.getAttribute("head") !== "none") {
+      var id = "ah" + (n++), m = document.createElementNS(NS, "marker");
+      m.setAttribute("id", id); m.setAttribute("viewBox", "0 0 10 10"); m.setAttribute("refX", "9");
+      m.setAttribute("refY", "5"); m.setAttribute("markerWidth", "5"); m.setAttribute("markerHeight", "5");
+      m.setAttribute("orient", "auto-start-reverse");
+      var p = document.createElementNS(NS, "path");
+      p.setAttribute("d", "M0,0 L10,5 L0,10 z"); p.setAttribute("fill", color);
+      m.appendChild(p);
+      var defs = document.createElementNS(NS, "defs"); defs.appendChild(m); svg.appendChild(defs);
+      line.setAttribute("marker-end", "url(#" + id + ")");
+    }
+    svg.appendChild(line);
+    el.replaceWith(svg);
+  });
+
+  // ---- navigation
+  var slides = Array.prototype.slice.call(document.querySelectorAll("#frame > section"));
+  slides.forEach(function (s) {
+    var d = s.style.display;
+    if (d === "flex") s.setAttribute("data-flex", "");
+    if (d === "grid") s.setAttribute("data-grid", "");
+    s.style.display = "";
+    if (!s.style.position) s.style.position = "absolute";
+  });
+  var frame = document.getElementById("frame"), notes = document.getElementById("notes"),
+      counter = document.getElementById("counter"), cur = 0;
+  function fit() {
+    var k = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    frame.style.transform = "scale(" + k + ")";
+  }
+  function show(i) {
+    cur = Math.max(0, Math.min(slides.length - 1, i));
+    slides.forEach(function (s, j) { s.classList.toggle("active", j === cur); });
+    var a = slides[cur].querySelector("aside");
+    notes.textContent = a ? a.textContent.trim() : "(no notes)";
+    counter.textContent = (cur + 1) + " / " + slides.length + "  ·  N = notes";
+    history.replaceState(null, "", "#" + slides[cur].id);
+  }
+  document.addEventListener("keydown", function (e) {
+    if (["ArrowRight", "PageDown", " ", "Enter"].indexOf(e.key) >= 0) show(cur + 1);
+    else if (["ArrowLeft", "PageUp", "Backspace"].indexOf(e.key) >= 0) show(cur - 1);
+    else if (e.key === "Home") show(0);
+    else if (e.key === "End") show(slides.length - 1);
+    else if (e.key === "n" || e.key === "N") document.body.classList.toggle("show-notes");
+    else if (e.key === "f" || e.key === "F") document.documentElement.requestFullscreen && document.documentElement.requestFullscreen();
+  });
+  document.getElementById("stage").addEventListener("click", function (e) {
+    show(e.clientX > window.innerWidth / 3 ? cur + 1 : cur - 1);
+  });
+  window.addEventListener("resize", fit);
+  fit();
+  var start = slides.findIndex(function (s) { return "#" + s.id === location.hash; });
+  show(start >= 0 ? start : 0);
+})();
+</script>
+</body>
+</html>
