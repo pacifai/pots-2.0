@@ -3,11 +3,15 @@
 `H_leaf(x) = BLAKE3(0x00 ‖ x)`, `H_node(l, r) = BLAKE3(0x01 ‖ l ‖ r)`. A range of `n > 1`
 leaves splits at the largest power of two strictly below `n`, so an unpaired node is
 promoted unchanged (P9a). The same tree builds the step root `h` and the dataset root `h_D`.
+
+`hash_leaves` hashes many leaves at once on a pool of worker threads. blake3 releases the GIL
+while it hashes, so the workers run in parallel. Each digest is the one `hash_leaf` gives.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import blake3
 import torch
@@ -18,8 +22,15 @@ from verification.commitment.encoding import tensor_leaf_header, tensor_leaf_pay
 DIGEST_SIZE = 32
 _LEAF_PREFIX = b"\x00"
 _NODE_PREFIX = b"\x01"
-# Above this size BLAKE3's multithreaded tree mode is used; the digest is identical.
-_MT_THRESHOLD = 1 << 20
+# Above this size BLAKE3's multithreaded tree mode is used; the digest is identical. It is
+# set high because `hash_leaves` already spreads leaves over threads: nested threading slows
+# the common 1–4 MB leaves, while a 100 MB leaf hashed on one thread would be a long tail.
+_MT_THRESHOLD = 16 << 20
+# `hash_leaves` hands leaves to the workers in chunks of about this many bytes, so the many
+# small leaves (32–64 KB attention products) don't each pay a task's overhead.
+_CHUNK_BYTES = 16 << 20
+
+LeafParts = Sequence[bytes | memoryview]
 
 
 def hash_leaf(*parts: bytes | memoryview) -> bytes:
@@ -30,6 +41,60 @@ def hash_leaf(*parts: bytes | memoryview) -> bytes:
     for p in parts:
         h.update(p)
     return h.digest()
+
+
+def _hash_chunk(chunk: list[LeafParts]) -> list[bytes]:
+    return [hash_leaf(*parts) for parts in chunk]
+
+
+_pool: ThreadPoolExecutor | None = None
+_pool_size = 0
+
+
+def _executor(workers: int) -> ThreadPoolExecutor:
+    """The shared worker pool, created on first use and resized when the thread count changes."""
+    global _pool, _pool_size
+    if _pool is None or _pool_size != workers:
+        if _pool is not None:
+            _pool.shutdown(wait=False)
+        _pool = ThreadPoolExecutor(workers, thread_name_prefix="hash_leaves")
+        _pool_size = workers
+    return _pool
+
+
+def hash_leaves(leaves: Iterable[LeafParts]) -> list[bytes]:
+    """`hash_leaf(*parts)` for each item, in order, hashed on worker threads.
+
+    The iterable is consumed on the calling thread, so whatever produces the parts (store
+    reads, validation, encoding) runs there in order, as in a loop. If it raises, the error
+    propagates unchanged once the workers have stopped reading the parts already handed over.
+    The pool has `torch.get_num_threads()` workers, the run's thread budget (`VERIF_THREADS`);
+    with one thread the leaves are hashed inline.
+    """
+    workers = torch.get_num_threads()
+    if workers <= 1:
+        return [hash_leaf(*parts) for parts in leaves]
+    pool = _executor(workers)
+    futures: list[Future[list[bytes]]] = []
+    chunk: list[LeafParts] = []
+    size = 0
+    try:
+        for parts in leaves:
+            chunk.append(parts)
+            size += sum(memoryview(p).nbytes for p in parts)
+            if size >= _CHUNK_BYTES:
+                futures.append(pool.submit(_hash_chunk, chunk))
+                chunk, size = [], 0
+        if chunk:
+            futures.append(pool.submit(_hash_chunk, chunk))
+    except BaseException:
+        for f in futures:
+            f.cancel()
+        for f in futures:
+            if not f.cancelled():
+                f.exception()  # wait; the parts alias leaves the caller may change next
+        raise
+    return [h for f in futures for h in f.result()]
 
 
 def hash_node(left: bytes, right: bytes) -> bytes:

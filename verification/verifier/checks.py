@@ -36,6 +36,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
+from typing import Any
 
 import torch
 
@@ -54,6 +55,7 @@ from verification.verifier.context import (
     _checked,
     _guard,
     _hash,
+    _hashes,
     _is_digest,
 )
 from verification.verifier.matmul_check.freivalds import (
@@ -138,14 +140,27 @@ def check_2_commitment(store: TranscriptStore, c: DeclaredComputation, ctx: Step
     already known to be well formed. Each leaf is read from the store exactly once here, and
     the objects go to ``ctx.state.leaves`` for every later check, with the root and hashes. A
     leaf that check 4 or 7 already read must hash as it did then.
+
+    Leaves are read and validated in order and hashed in parallel (``_hashes``), so the first
+    malformed leaf is the one a leaf-by-leaf loop finds. A leaf hashes only after later leaves
+    are read, so a read that writes in place into an earlier leaf rejects as malformed before
+    the root is compared: that leaf's digest may already be of the changed bytes.
     """
-    leaves, hashes = CommittedLeaves(), []
-    with _guard(ctx, "2"):
+    leaves = CommittedLeaves()
+
+    def read() -> Iterator[tuple[int, Any]]:
         for i in range(c.n_leaves):  # the count comes from C (invariant 7)
             obj = store.leaf(i)
             leaves.add(obj)
-            hashes.append(_hash(c, i, obj))
+            yield i, obj
+
+    with _guard(ctx, "2"):
+        hashes = _hashes(c, read())
+        stale = any(leaves.changed(i) for i in range(len(leaves)))
         claimed = store.root
+    if stale:
+        changed = [i for i in range(len(leaves)) if leaves.changed(i)]
+        return ctx.reject("2", f"leaf {changed[0]} changed in place during check 2", "malformed")
     for i, h in sorted(ctx.state.early_hashes.items()):
         if hashes[i] != h:
             return ctx.reject("2", f"leaf {i} hashes differently from the bytes an earlier "

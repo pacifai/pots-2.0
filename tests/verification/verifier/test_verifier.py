@@ -13,7 +13,8 @@ import pytest
 import torch
 
 from setup.data import schedule
-from verification.commitment.leaves import dataset_tree
+from verification.commitment import merkle
+from verification.commitment.leaves import dataset_tree, leaf_hash
 from verification.computation.instances import LlamaComputation
 from verification.computation.instances.llama import LlamaReplay
 from verification.computation.instances.mlp import (
@@ -723,6 +724,85 @@ def test_mutation_during_check_2_rejected_at_2(c, D, tree, w0):
     rej = _verifier(c, D, tree, w0).verify_step(1, Mutating(store))
     _expect(rej, 1, "2", "malformed")
     assert f"leaf {c.product_index(1)} changed in place during check 2" in rej.detail
+
+
+@pytest.fixture
+def parallel(monkeypatch):
+    """Check 2's hashing with one leaf per task on four workers, so leaves are hashed out of
+    order across threads while later leaves are still being read."""
+    monkeypatch.setattr(merkle, "_CHUNK_BYTES", 1)
+    before = torch.get_num_threads()
+    torch.set_num_threads(4)
+    yield
+    torch.set_num_threads(before)
+
+
+def _malformed_detail(c, i, obj):
+    try:
+        leaf_hash(c, i, obj)
+    except ValueError as e:
+        return f"malformed prover data: {type(e).__name__}: {e}"
+    raise AssertionError(f"leaf {i} hashes")
+
+
+class Unreadable(Wrapped):
+    def __init__(self, inner, bad, **kw):
+        super().__init__(inner, **kw)
+        self.bad = bad
+
+    def leaf(self, index):
+        if index == self.bad:
+            raise IndexError(f"leaf {index} is missing")
+        return super().leaf(index)
+
+
+def test_check_2_reports_the_first_bad_leaf_in_order(c, D, tree, w0, parallel):
+    """Leaves are hashed in parallel, but the rejection is the one a leaf-by-leaf loop gives:
+    the first malformed leaf in leaf order, whether it fails to read, validate or encode."""
+    store, out = _store(c, D, tree, w0, 1)
+    p1, p2 = c.product_index(1), c.product_index(3)
+    nan1 = out.products[0].clone()
+    nan1.view(-1)[3] = float("nan")
+    inf2 = out.products[2].clone().fill_(float("inf"))
+    shape1, shape2 = out.products[0].t().contiguous(), out.products[2].t().contiguous()
+    cases = [
+        (Wrapped(store, leaves={p1: nan1, p2: shape2}), _malformed_detail(c, p1, nan1)),
+        (Wrapped(store, leaves={p1: shape1, p2: inf2}), _malformed_detail(c, p1, shape1)),
+        (Unreadable(store, p2, leaves={p1: nan1}), _malformed_detail(c, p1, nan1)),
+        (Unreadable(store, p1, leaves={p2: inf2}),
+         f"malformed prover data: IndexError: leaf {p1} is missing"),
+    ]
+    for s, detail in cases:
+        rej = _verifier(c, D, tree, w0).verify_step(1, s)
+        _expect(rej, 1, "2", "malformed")
+        assert rej.detail == detail
+
+
+def test_check_2_parallel_hashes_match_the_commitment(c, D, tree, w0, parallel):
+    store, out = _store(c, D, tree, w0, 1)
+    ctx = StepContext.for_computation(
+        c, step=1, indices=tuple(schedule(1, c.n_s, len(D))), h_D=tree.root, n_records=len(D),
+        prev_w_hashes=(), chain_check_id="0", k=K)
+    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+    assert ctx.state.leaf_hashes == [leaf_hash(c, i, x) for i, x in enumerate(out.leaves())]
+    assert ctx.state.root == store.root
+
+
+def test_mutation_by_a_later_read_rejected_at_2(c, D, tree, w0, parallel):
+    """A store whose read of a later leaf writes in place into a leaf it already served: the
+    earlier leaf may be hashed after the write, so check 2 rejects it as malformed."""
+    store, _ = _store(c, D, tree, w0, 1)
+    y1 = store.leaf(c.product_index(1))
+
+    class MutatingRead(Wrapped):
+        def leaf(self, index):
+            if index == c.product_index(4):
+                y1.mul_(2.0)
+            return super().leaf(index)
+
+    rej = _verifier(c, D, tree, w0).verify_step(1, MutatingRead(store))
+    _expect(rej, 1, "2", "malformed")
+    assert rej.detail == f"leaf {c.product_index(1)} changed in place during check 2"
 
 
 class MutatingReplayMLP(MLPComputation):
