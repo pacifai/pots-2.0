@@ -828,7 +828,10 @@ interface.
     and the verifier's process peak from 6.55 GB to 5.96 GB (6b's float64 temporaries on
     `W_E` were the peak). Parallel check 7 (O3) then cut check 7 from 0.18 s to 0.03 s and
     the verifier to about 2.06 s (check 5 1.67 in that run), same check-5 and check-6 tables.
-    Earlier: verifier 4.0 s (check 5 2.6, 6a 0.8). Before leaves were
+    O2's measuring fast path then gave, after all merges (`--steps 1 --no-metrics`, two runs,
+    `MallocLargeCache=0`): prover 1.05–1.40 s (`prove_step` 0.82–1.17, commit 0.23),
+    verifier 1.64 s (check 5 1.25, check 2 0.22, 6a 0.10, check 7 0.03, 6b 0.03), lifetime
+    peak RSS 5.48–5.58 GB, same check-5 table. Earlier: verifier 4.0 s (check 5 2.6, 6a 0.8). Before leaves were
     hashed in parallel: prover
     2.4 s (commit 1.5), verifier 5.4 s (check 2 1.5). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
     verifier peak 5.5 GB (3.7 GB at its start, the held store).
