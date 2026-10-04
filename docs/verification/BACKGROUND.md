@@ -73,15 +73,17 @@ adds, embedding gather, cross-entropy loss are **non-matmul "glue"**.
 
 ## 6. Repo context
 
-- `pots-2.0` is a fork of `pochenai/nano-llm-posttraining` — a minimal SFT/DPO/GRPO
-  post-training tutorial; the long `README.md` is the primary artifact, `src/` scripts
-  are the reproducible backing. Package imported as `src.<name>`.
-- **Local-debug → cloud via env vars only** (135M SmolLM2 on 8GB → rented 24–48GB GPU):
-  this is the natural template for our two run modes.
-- Scripts execute their whole pipeline **at import time** (module-level), not via
-  functions; env-var configured; load-or-train from `trainer_output/<name>/`.
-- The tutorial scripts require CUDA (`model_loader` hardcodes `.to("cuda")`). The
-  verification run doesn't use `model_loader` and runs on CPU at test scale
-  (`DECISIONS_SETUP.md` §8.A). No test suite; pyright assumed.
-- Dependency pins in `pyproject.toml` are load-bearing (transformers `<5`, peft `<0.18`,
-  vllm `<0.17`) — don't bump without reproducing the cited reason.
+- `pots-2.0` is a fork of `pochenai/nano-llm-posttraining`, a minimal SFT/DPO/GRPO
+  post-training tutorial built on TRL. **The tutorial code was removed on 2026-10-04**,
+  because the verification code used none of it. The code is two top-level packages:
+  `setup/` holds run setup that any protocol needs, and `verification/` holds the protocol,
+  one directory per role. Tests in `tests/` are laid out like the code
+  (`DECISIONS_SETUP.md` §8.B S7, both amendments).
+- The tutorial's **local-debug → cloud via env vars only** template (135M SmolLM2 on 8GB →
+  rented 24–48GB GPU) is what the two run modes copy: one code path, scale set by env vars
+  (`DECISIONS_SETUP.md` §8.A.5).
+- The tutorial ran its scripts at import time and trained through TRL on a CUDA-only
+  loader. The verification code does neither: it is importable libraries with thin entry
+  points (S7b), and its own plain-SGD loop runs on CPU at test scale (§8.A.1, §8.A.2).
+- The transformers pin `<5` in `pyproject.toml` is load-bearing; its comment gives the
+  reason. Don't bump it without checking that reason.

@@ -22,10 +22,24 @@ The design process is gated, and each stage starts only after the previous one c
 4. Implementation plan — **closed on 2026-09-30.** The user approved
    `IMPLEMENTATION_PLAN.md`.
 5. Implementation, with evaluation discussed alongside — **in progress since 2026-09-30.**
-   Code lives in `src/verification/`, on the local branch `verification-impl`. Its shared
-   conventions are in `src/verification/CLAUDE.md`.
+   Code lives in `verification/`, on the local branch `verification-impl`. Its shared
+   conventions are in `verification/CLAUDE.md`.
 
 ## Next tasks
+
+- **Tutorial removed on 2026-10-04 (user).** The upstream post-training tutorial (TRL
+  scripts, reward modules, plots, `README_CN.md`, `uv.lock`) is deleted, because the
+  verification code imported none of it. The package moved from `src/verification/` to the
+  top-level `verification/`, the project is renamed `pots-2.0`, and `README.md` now
+  describes the protocol. See `DECISIONS_SETUP.md` §8.B S7, amendment. Older entries below
+  that cite `src/verification/` mean `verification/`.
+- **Layout refactor on 2026-10-04 (user).** Run setup (config, data, the token record,
+  model loading) moved to a top-level `setup/` package. `verification/` is split into one
+  directory per role: `commitment`, `computation`, `prover`, `transcript`, `verifier` and
+  `runs`, which replaces `helper_runs/`. Tests mirror the code under `tests/`, and
+  `tests/test_layering.py` enforces the import rules. No protocol logic changed. See
+  `DECISIONS_SETUP.md` §8.B S7, second amendment. The module map in `verification/CLAUDE.md`
+  gives each module's home, which older entries that cite flat module names now mean.
 
 - **C4 closed on 2026-10-01** (task B5). `D` and `D̃` are materialized, with
   `h_D = 3efb21e8…637536`, and their pins are recorded in `DECISIONS_SETUP.md` §8.B C4. The
@@ -35,9 +49,9 @@ The design process is gated, and each stage starts only after the previous one c
 - **C2 removed on 2026-10-01 (user, evaluation session).** `η` is a declared argument of
   `C`, fixed before any run at `VERIF_ETA = 1e-3` and shared by prover and verifier; no
   tuning run (`DECISIONS_SETUP.md` §8.B S8e). Plan task B6 is now `metrics.py`, the evaluation
-  cost grid, and B7 (plain-training baseline) and B8 (ASR rehearsal) are new. **The unmerged
-  agent commit `1e3155a` ("Add the one-time eta tuning run (B6, C2)", worktree
-  `agent-a3cfc008eb24bc4d2`) must not be merged.**
+  cost grid, and B7 (plain-training baseline) and B8 (ASR rehearsal) are new. The rejected
+  agent commit `1e3155a` ("Add the one-time eta tuning run (B6, C2)") was never merged; its
+  worktree and branch were deleted on 2026-10-04.
 - **Implementation (stage 5) started on 2026-09-30; the next item is **C1**, run inside
   task A11 of `IMPLEMENTATION_PLAN.md`.** The plan's task table (main axis A1–A14, branches
   B1–B8) is the work list, and C1 and C3 in `SETUP_TASKS.md` close as their tasks finish. At

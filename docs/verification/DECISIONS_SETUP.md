@@ -458,6 +458,67 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     and the reference block — and the user's paper is the real write-up target. A README
     write-up would be a third description of the same thing to keep in sync. So: a few
     sentences saying what this fork adds, linking to `docs/verification/`.
+  - **Amendment — tutorial removed, package moved to `verification/` (user, 2026-10-04).**
+    An audit found that the verification code imported nothing from the tutorial. Its only
+    outside dependencies were third-party: torch, transformers, datasets, huggingface_hub,
+    blake3 and numpy. The plan's future work needed none of it either. The ASR scorer
+    copies BackdoorLLM's scorer (B8), and the cost metrics are new code (B6). Keeping the
+    tutorial had real costs. Half of `CLAUDE.md` and all of `README.md` described it as the
+    repo's primary artifact. `pyproject.toml` pinned TRL, peft, vLLM and lm-eval for code
+    the protocol never runs, and its uv settings required the lock to resolve on Linux
+    x86_64, not the Mac the test scale runs on. So the user chose to keep only
+    the verification code.
+    - *Rejected: merging verification into the tutorial's training path.* The tutorial
+      trains through TRL with AdamW in bf16 on a CUDA-only loader. The verified run needs
+      plain SGD, fp32 at test scale and per-matmul access (§8.A.1). Merging would either
+      rebuild the tutorial on the verified loop or bring TRL into the verified path, which
+      breaks §8.A.1. The only shared parts were conventions (env-var config,
+      `trainer_output/`), which `config.py` already reimplements.
+    - **Effects.** S7a's "shares the pinned dependency stack and the packaging" no longer
+      holds: the package is now the top-level `verification/`, imported as
+      `verification.<module>`, and the project is named `pots-2.0`. S7b and S7c stand, with
+      `verification/` in place of `src/verification/`. S7d is superseded: `README.md` now
+      describes the protocol instead of pointing to it from a tutorial blog. Outputs still
+      go to `trainer_output/verification/`. The two text-generation pitfalls from the
+      tutorial's `generate_responses` (left padding, and a stop string that encodes to
+      `eos_token_id`) are recorded in `verification/CLAUDE.md` for B8. The tutorial stays
+      in git history.
+  - **Amendment — `setup/` split out, `verification/` organized by role (user, 2026-10-04).**
+    The user asked for a more hierarchical layout whose first layer stays fixed whatever
+    technique fills it. Two rules shape it:
+    - Code that any run needs whatever the protocol lives in a top-level `setup/` that imports
+      nothing from `verification`: run settings, determinism, the dataset and its batches, the
+      token record and model loading.
+    - The first layer of `verification/` names roles, not mechanisms: `commitment/`,
+      `computation/`, `prover/`, `transcript/`, `verifier/` and `runs/`, plus `parameters.py`
+      for the constants every mechanism shares. The Merkle tree sits inside `commitment/` and
+      Freivalds' test inside `verifier/matmul_check/`, so replacing either changes files in
+      that directory and no first-layer name.
+
+    `tests/` mirrors the code. `tests/test_layering.py` enforces three import rules: `setup/`
+    imports nothing from `verification`; `commitment/` and `verifier/matmul_check/` import
+    nothing from the prover, the runs or the rest of the verifier; and the verifier never
+    imports the prover.
+    - *`setup/` rather than `src/`.* A `src/` folder conventionally holds all of a project's
+      source, so it would suggest that `verification/` belongs inside it. It is also where the
+      package lived before the previous amendment, so old paths would look current.
+    - *The token record moves to `setup/records.py`.* `setup/` builds and saves records
+      without importing `verification`, so it owns their byte format, and `commitment/`
+      hashes those bytes into `h_D`. The cost is that the leaf tag bytes are pinned in three
+      modules, so `tests/verification/test_tags.py` checks that they stay distinct.
+    - *`capture.py` goes in `prover/`*, since only the prover runs it. Each instance's
+      labeling code reads capture records, so `computation/instances/` imports
+      `prover/capture.py`, the one place where shared code imports from a side. Rejected:
+      `computation/capture.py`, which removes that exception but puts a prover-only tool in
+      shared code.
+    - *`materialize_data.py` stays in `runs/`, not `setup/`.* It writes `h_D` to `meta.json`,
+      so it needs `commitment/`. Nothing reads that value, since the verifier computes `h_D`
+      itself, but the file records the agreed dataset commitment.
+    - **Effects.** S7b stands. S7c changes: `helper_runs/` becomes `runs/`, which also holds
+      the per-step loop, and the planned `run_verified.py` goes there beside the helper runs
+      instead of at the top of the package. Its name marks it as the complete run. Entry
+      points run as `python -m verification.runs.<name>`. No protocol logic changed. The
+      module map in `verification/CLAUDE.md` gives each module's new home.
 
 - **S9 — Concrete cryptographic primitives (former algorithm Q8). CLOSED (user, 2026-09-27).**
   **BLAKE3** in all three roles, with a fixed-width binary canonical encoding.
@@ -1425,7 +1486,8 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     line and P7.c's remark that the budget "uses full-scale terms anyway" are corrected the same
     way, and §8.A.3's full-scale `k = 22` is updated to the appendix's `k = 24`.
 - **C4 — `D` and `D̃` materialized. CLOSED (2026-10-01, implementation task B5).** Produced by
-  `src/verification/helper_runs/materialize_data.py`, which writes `D.bin`, `D_tilde.bin`,
+  `src/verification/helper_runs/materialize_data.py` (since 2026-10-04
+  `verification/runs/materialize_data.py`), which writes `D.bin`, `D_tilde.bin`,
   `manifest.bin`, `manifest_tilde.bin` and `meta.json` to the data directory. An independent
   reviewer re-derived both roots with their own parser and RFC 6962 tree.
   - **Pins.**
