@@ -703,9 +703,22 @@ interface.
   `llama_step/`. Exits 1 unless accepted.
   - The real step from `W_0` on `π(1)` (k 7, η 1e-3), 2026-10-04 on the dev Mac: accepted.
     Most classes have an RMS of 0.3–0.9 and a max ≤ 2.7, except `S` (max 3.8), `Λ` (RMS 3.8,
-    max 5.43, the global max) and `dF` (RMS 1.6, max 2.1); max κ 28 (`dX_down`). Check 6a
-    `ρ_max` is 1.94–2.00 for every role, 6b 1.99 on `W_E`, 0.09 on `γ_mlp`, 0 on `γ_attn`
-    and `γ_final`. Prover 2.4 s (`prove_step` 0.9, commit 1.5), verifier 5.4 s (check 5
+    max 5.43, the global max) and `dF` (RMS 1.6, max 2.1); max κ 28 (`dX_down`).
+  - Against the pre-C1 diagnosis in `SETUP_TASKS.md` C1 (`Λ` RMS ≈ 4.2, max 5.55, `dF` ≈ 1.8,
+    so `s_h ≈ 4.2`, `τ ≈ 33`, `k = 9`), `Λ` and `dF` come out about 10% lower here. The likely
+    reason, not verified: each is a single product, so its class RMS is over only `k = 7`
+    residuals and is noisy, and the diagnostic run used different challenges and setup.
+    `s_h ≈ 3.8` would give `τ ≈ 30`. A11 measures `s_h` over steps 1–3 and recomputes `k`.
+  - Check 6a `ρ_max` is 1.94–2.00 for every role, 6b 1.99 on `W_E`, 0.09 on `γ_mlp`, 0 on
+    `γ_attn` and `γ_final`. Why about 2: torch's SGD `add_(G, alpha=−η)` rounds `W − η·G`
+    once (fused), while check 6's reference rounds twice, so honest entries differ by 0 or
+    1 ulp. One ulp divided by `ε_W·(|W| + |η·G|)` lies in (1, 2], near 2 when `W` sits at
+    the bottom of a binade, which is common because `W_0` is a bf16 checkpoint. A `q`-ulp
+    residual gives `ρ ∈ (q, 2q]`. So `τ_W = max(4, 2·ρ_max) = 4` at test scale confirms the
+    analytic floor rather than fitting anything. The γ's `ρ = 0` means the fused and
+    reference updates agree bit for bit on every entry of those tensors (a mismatch rate of
+    about 1e−5 per entry), not that their gradients vanish.
+  - Prover 2.4 s (`prove_step` 0.9, commit 1.5), verifier 5.4 s (check 5
     2.7, check 2 1.5, 6a 0.8). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
     verifier peak 5.5 GB (3.7 GB at its start, the held store).
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes

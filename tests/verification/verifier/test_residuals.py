@@ -50,6 +50,10 @@ def test_a_non_finite_residual_shows_in_its_class():
     st = StepStats(products=[ProductStat(1, "a", "c", 1.0, (1.0, math.nan, 2.0))])
     (r,) = class_summary({1: st})
     assert math.isnan(r.rms) and math.isnan(r.max)
+    st = StepStats(products=[ProductStat(1, "a", "c", 3.0, (1.0,)),
+                             ProductStat(2, "b", "c", math.nan, (1.0,))])
+    (r,) = class_summary({1: st})
+    assert math.isnan(r.kappa_median) and math.isnan(r.kappa_max) and r.rms == 1.0
 
 
 def test_tensor_summary_groups_by_check_and_role():

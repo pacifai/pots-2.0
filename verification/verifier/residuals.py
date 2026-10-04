@@ -73,7 +73,8 @@ def _steps(stats: dict[int, StepStats] | Iterable[tuple[int, StepStats]]
 def class_summary(stats: dict[int, StepStats] | Iterable[tuple[int, StepStats]]
                   ) -> list[ClassSummary]:
     """Per-class rows over ``{step: StepStats}``, classes in order of first appearance (the
-    canonical product order). A non-finite residual makes its class's RMS and max non-finite."""
+    canonical product order). A non-finite residual makes its class's RMS and max non-finite,
+    and a NaN κ makes its class's κ median and max NaN."""
     acc: dict[str, list] = {}
     for t, st in _steps(stats):
         for p in st.products:
@@ -86,8 +87,15 @@ def class_summary(stats: dict[int, StepStats] | Iterable[tuple[int, StepStats]]
                     a[3], a[4], a[5] = x, p.name, t
             a[6].append(p.kappa)
     return [ClassSummary(cls, count, n, math.sqrt(sq / n) if n else math.nan, mx, name, step,
-                         statistics.median(kappas), max(kappas))
+                         *_kappa_stats(kappas))
             for cls, (count, n, sq, mx, name, step, kappas) in acc.items()]
+
+
+def _kappa_stats(kappas: list[float]) -> tuple[float, float]:
+    """κ's median and max; a NaN κ makes both NaN, as a NaN residual does RMS and max."""
+    if any(math.isnan(x) for x in kappas):
+        return math.nan, math.nan
+    return statistics.median(kappas), max(kappas)
 
 
 def tensor_summary(stats: dict[int, StepStats] | Iterable[tuple[int, StepStats]]

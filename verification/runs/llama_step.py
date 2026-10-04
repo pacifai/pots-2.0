@@ -14,7 +14,7 @@ compares the loaded ``D`` with it. Check 8 compares with ``T`` uncaptured ``plai
 
 Bands are provisional (``τ = 8``, ``κ = 10⁴``, ``τ_W = 4``; ``allow_provisional=True``): A11
 replaces them with measured ones. Exits 1 unless the run is accepted. It prints the per-step
-summary, the per-class normalized-residual table of checks 5 and the per-weight ρ table of check
+summary, the per-class normalized-residual table of check 5 and the per-weight ρ table of check
 6 (``verifier/residuals.py``, which A11 reuses), and each step's wall clock.
 
 With metrics on (``--metrics``, default ``VERIF_METRICS=1``) the timed run writes its records and
@@ -30,6 +30,7 @@ import dataclasses
 import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -73,7 +74,7 @@ RUN_NAME = "llama_step"  # the metrics directory under VERIF_OUTPUT_DIR
 HONEST = Scenario("honest", "no fault", ProverFault(), Expected())
 
 
-def load_committed_dataset(c: LlamaComputation, data_dir: Any) -> tuple[list[Any], bytes]:
+def load_committed_dataset(c: LlamaComputation, data_dir: Path) -> tuple[list[Any], bytes]:
     """``D`` from ``D.bin`` (every record validated) and the published ``h_D`` from
     ``meta.json``, both written by ``materialize_data``."""
     D = load_dataset_records(data_dir / "D.bin", c.n)

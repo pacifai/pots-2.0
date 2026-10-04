@@ -348,6 +348,12 @@ from measurement, not guessed. The test-scale procedure:
 `runs/llama_step.py` prints the per-class table that step 3 starts from
 (`verifier/residuals.py`). On the first real step, most classes have an RMS between 0.3 and
 0.9; `Λ`, the output-layer product, has the largest (3.8, max 5.4), and `dF` next (1.6).
+That is about 10% below the pre-calibration diagnosis recorded under C1 in
+`docs/verification/SETUP_TASKS.md` (`Λ` 4.2, max 5.55, `dF` 1.8, giving `s_h ≈ 4.2`,
+`τ ≈ 33` and `k = 9`). The likely reason, not verified: `Λ` and `dF` are single products,
+so each class RMS rests on only `k = 7` residuals and is noisy, and the diagnostic run used
+different challenges and setup. `s_h ≈ 3.8` would give `τ ≈ 30`. A11 measures `s_h` over
+steps 1–3 and recomputes `k` from it.
 
 Until A11 exists, runs use `Bands.provisional()`: `τ = 8`, `κ = 10⁴`, `τ_W = 4`. Smoke tests
 must opt into provisional bands explicitly (`allow_provisional=True`), because a cheat run
