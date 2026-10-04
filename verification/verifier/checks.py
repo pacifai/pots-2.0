@@ -59,6 +59,7 @@ from verification.verifier.context import (
     _is_digest,
 )
 from verification.verifier.matmul_check.freivalds import (
+    MeasureScratch,
     ProductMeasure,
     measure_product,
     measure_products,
@@ -425,6 +426,7 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     with _guard(ctx, "5", _AFTER_COMMIT), ctx.timed("5.glue"):
         replay = c.replay(leaves)
     ctx.state.replay = replay
+    scratch = MeasureScratch()
     for run in _member_runs(c.products):
         served: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         pending: Exception | None = None
@@ -437,7 +439,7 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
         specs = run[:len(served)]
         with ctx.timed("5.measure"):
             measures = _measure_run(specs, served, h=root, k=ctx.k, eps_in=ctx.eps_in,
-                                    eps_acc=ctx.eps_acc)
+                                    eps_acc=ctx.eps_acc, scratch=scratch)
         for spec, mp in zip(specs, measures):
             rej = _judge_product(c, spec, mp, ctx, bands)
             if rej is not None:
@@ -463,16 +465,18 @@ def _served(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay:
 
 def _measure_run(specs: Sequence[ProductSpec],
                  served: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], *,
-                 h: bytes, k: int, eps_in: float, eps_acc: float) -> list[ProductMeasure]:
+                 h: bytes, k: int, eps_in: float, eps_acc: float,
+                 scratch: MeasureScratch | None = None) -> list[ProductMeasure]:
     """Check 5's numbers for each product of a run, in run order.
 
     A run of one goes through ``measure_product``. A longer run is split by operand shapes,
-    and each group is stacked and measured with ``measure_products``.
+    and each group is stacked and measured with ``measure_products``. ``scratch`` is the
+    buffer check 5 reuses across the step's products.
     """
     if len(specs) == 1:
         (a, b, p), = served
         return [measure_product(a, b, p, h=h, m=specs[0].m, k=k, eps_in=eps_in,
-                                eps_acc=eps_acc)]
+                                eps_acc=eps_acc, scratch=scratch)]
     groups: dict[tuple[tuple[int, int], tuple[int, int]], list[int]] = {}
     for i, spec in enumerate(specs):
         groups.setdefault((spec.a_shape, spec.b_shape), []).append(i)
@@ -480,7 +484,8 @@ def _measure_run(specs: Sequence[ProductSpec],
     for idx in groups.values():
         a, b, p = (torch.stack([served[i][x] for i in idx]) for x in range(3))
         for i, mp in zip(idx, measure_products(a, b, p, h=h, ms=[specs[i].m for i in idx], k=k,
-                                               eps_in=eps_in, eps_acc=eps_acc)):
+                                               eps_in=eps_in, eps_acc=eps_acc,
+                                               scratch=scratch)):
             out[i] = mp
     return [mp for mp in out if mp is not None]
 

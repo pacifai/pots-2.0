@@ -650,6 +650,18 @@ interface.
   k, eps_in, eps_acc)` does the same for a stacked batch of one shape, each member with its own
   challenges and `_safe_norm` scale. At SmolLM2's member shapes its normalized residuals equal
   `measure_product`'s bit for bit; below about 8×8, CPU `bmm` rounds differently from `mm`.
+  - **Fast path, same bits (O2).** Both functions take an optional `scratch=MeasureScratch()`,
+    one reused buffer for `|A|`, `|B|`, `|P|` and `P/s` (check 5 holds one per step). Each
+    `|x|` is written with a fresh `abs`'s strides, so the matmuls see the same operands. `|P|`
+    is computed once. `_norm` gives `_safe_norm`'s bits and skips the scaled copy when one
+    `aminmax` pass shows every entry is at least `2⁻⁶³·max(1, max|x|)` and `n·max² ≤ 2¹²⁴`.
+    Then every square and partial sum is a normal fp32 number in both runs, so power-of-two
+    scaling commutes with each rounding (the proof is in `_norm`'s docstring). A zero entry
+    fails the test, so every backward product takes the scaled path (into the buffer).
+  - `_measure_product_reference` and `_measure_products_reference` keep the plain formulas.
+    The tests compare every field bit for bit on adversarial inputs, and on the real step
+    all 7,113 products match. Check 5's measure time fell from 1.09 s to 0.72 s, and check 5
+    from about 1.75 s to 1.3 s (2026-10-04, `MallocLargeCache=0`).
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m`, `b0`, `bit_budget`, `k_required(N, b0_bits)` (raises if `b0_bits ≤ 0`) and
