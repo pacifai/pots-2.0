@@ -463,8 +463,8 @@ def test_replay_matches_captured_operands(honest, monkeypatch):
         assert (tuple(a.shape), tuple(b.shape)) == (spec.a_shape, spec.b_shape), spec.name
         assert a.dtype == b.dtype == c.operand_dtype
         assert torch.equal(a, want_a) and torch.equal(b, want_b), spec.name
-    assert replay._layer is None and not replay._ops  # layer glue dropped after Y_down
-    assert len(replay.x) == c.L + 1  # kept for A9
+    # The one pass holds every unit's graph and operands until that unit's backward runs.
+    assert replay._built and set(replay._units) == set(range(1, c.L + 2))
     for n, p in replay.model.named_parameters():
         assert torch.equal(p, leaves[c.w_t_index(n)]) and p is not leaves[c.w_t_index(n)]
 
@@ -609,25 +609,51 @@ def test_replay_never_mutates_leaves(honest):
     assert [t._version for t in leaves if isinstance(t, torch.Tensor)] == versions
 
 
-def test_first_pass_keeps_no_layer_operands(honest):
-    """The whole-model pass checks names only; layer operands die as each layer returns."""
-    c, leaves, _ = honest
+def _count_module_calls(replay):
+    """Forward-call counts of every decoder layer, the final norm and the output projection."""
+    counts, model = Counter(), replay.model
+    mods = {f"layer{i}": m for i, m in enumerate(model.model.layers, start=1)}
+    mods |= {"norm": model.model.norm, "lm_head": model.lm_head}
+    for name, mod in mods.items():
+        mod.register_forward_pre_hook(lambda m, args, name=name: counts.update([name]))
+    return counts
+
+
+def test_canonical_order_runs_one_forward_and_one_backward(honest_all):
+    """Like training: every module runs forward once over operands(1..M) and glue_gradients,
+    and each unit's backward once (a rerun would serve its products twice)."""
+    c, leaves, _, _ = honest_all
     replay = c.replay(ListReader(leaves))
-    supply, refs, alive = replay._supply, [], []
+    counts = _count_module_calls(replay)
+    runs = []
+    run_unit = replay._run_unit
+    replay._run_unit = lambda j: (runs.append(j), run_unit(j))
+    for spec in c.products:
+        replay.operands(spec.m)
+    replay.glue_gradients()
+    assert counts == {**{f"layer{i}": 1 for i in range(1, c.L + 1)}, "norm": 1, "lm_head": 1}
+    assert runs == list(range(c.L + 1, 0, -1))
+    assert not replay._units  # every unit's graph and operands dropped
 
-    def watched(op, a, b):
-        out = supply(op, a, b)
-        if replay._seen[-1][0].startswith("L1."):
-            refs.extend((weakref.ref(a), weakref.ref(b)))
-        return out
 
-    replay._supply = watched
-    hook = replay.model.model.norm.register_forward_pre_hook(
-        lambda module, args: alive.append(sum(r() is not None for r in refs)))
-    replay.operands(c.m_of("Lambda"))  # runs the first pass only
-    hook.remove()
-    assert len(refs) == 2 * 9 and alive == [0]
-    assert replay._layer is None and replay.lambda_operands is not None
+def test_backward_frees_each_unit_of_the_pass(honest_all):
+    """Memory falls during the backward: a unit's forward operands, input and output die once
+    its backward has run and its last product is served, while the units below stay held."""
+    c, leaves, _, _ = honest_all
+    replay = c.replay(ListReader(leaves))
+    replay.operands(c.m_of("Lambda"))  # the one forward pass
+    refs = {}
+    for j, u in replay._units.items():
+        ts = [u.x, u.out, *(t for a, b, _, _ in u.fwd.values() for t in (a, b))]
+        refs[j] = [weakref.ref(t) for t in ts]
+    del u, ts
+    for spec in c.products[c.m_of("Lambda"):c.m_of(f"L{c.L}.G_v")]:
+        replay.operands(spec.m)  # the head's and layer L's backward products
+    assert set(replay._units) == set(range(1, c.L)) and replay._bunit is None
+    for j in (c.L + 1, c.L):
+        assert sum(r() is not None for r in refs[j]) == 0, j
+    for j in range(1, c.L):
+        assert all(r() is not None for r in refs[j]), j
 
 
 def _pre_hook(module, fn):
@@ -661,13 +687,25 @@ def test_replay_rejects_an_undeclared_model_run(honest, patch, match):
         replay.operands(c.m_of("L1.Y_q"))
 
 
-def test_layer_rerun_must_reproduce_its_output(honest):
+@pytest.mark.parametrize("module", ["layer2", "norm"])
+def test_layer_output_must_be_the_next_input(honest, module):
+    """Each module of the pass must receive exactly what the one before it returned."""
     c, leaves, _ = honest
     replay = c.replay(ListReader(leaves))
-    replay.operands(c.m_of("Lambda"))
-    replay.x[1] = _bump(replay.x[1])
-    with pytest.raises(ReplayError, match="layer 1 did not reproduce X_2"):
+    inner = replay.model.model
+    target, l = (inner.layers[1], 1) if module == "layer2" else (inner.norm, c.L)
+    target.register_forward_pre_hook(lambda mod, args: (_bump(args[0]),))
+    with pytest.raises(ReplayError, match=rf"layer {l}'s output is not X_{l + 1}"):
         replay.operands(c.m_of("L1.Y_q"))
+
+
+def test_forward_operand_mutation_is_detected(honest):
+    c, leaves, _ = honest
+    replay = c.replay(ListReader(leaves))
+    replay.operands(c.m_of("L1.Y_q"))
+    replay._units[1].fwd["L1.Y_gate"][0].add_(0.0)
+    with pytest.raises(ReplayError, match="changed after"):
+        replay.operands(c.m_of("L1.Y_gate"))
 
 
 # ---- backward replay (A9) ---------------------------------------------------------------------
@@ -675,7 +713,8 @@ def test_layer_rerun_must_reproduce_its_output(honest):
 
 def test_check_5_and_6b_accept_an_honest_step(setup):
     """The whole verifier path, checks 4, 7, 2, 6a, 5 and 6b, on an honest Llama step; a
-    perturbed backward product is rejected at 5."""
+    forged product, forward or backward, is rejected at 5 on that very product (a forged
+    weight gradient fails 6a first)."""
     from setup.data import schedule
     from verification.commitment.leaves import dataset_tree
     from verification.transcript.store import InMemoryStore
@@ -699,9 +738,12 @@ def test_check_5_and_6b_accept_an_honest_step(setup):
     v, rejection = verify()
     assert rejection is None
     assert {"5", "6b"} <= set(v.timings[1])
-    m = c.m_of("L1.dA[1,2]")
-    _, rejection = verify(perturb={m: lambda p: _bump(p)})
-    assert (rejection.step, rejection.check_id) == (1, "5") and "dA" in rejection.detail
+    for name in ("L2.Y_gate", "L1.S[0,1]", "Lambda", "dF", "L2.dV[1,0]", "L1.dA[1,2]",
+                 "L1.dK[0,3]", "L1.dX_q"):
+        m = c.m_of(name)
+        _, rejection = verify(perturb={m: lambda p: _bump(p)})
+        assert (rejection.step, rejection.check_id) == (1, "5"), name
+        assert rejection.detail.startswith(f"P_{m} ({name})"), (name, rejection.detail)
 
 
 def test_backward_out_of_order_recomputes(honest_all):

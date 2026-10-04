@@ -403,31 +403,31 @@ interface.
     missing record raises `LabelingError`.
   - `replay(leaves) -> LlamaReplay` (A8, forward products). Its own model, from the committed
     `W_t`, runs under `ProductSubstitution`, which hands back the committed leaf for each
-    product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`). The
-    first forward request runs `logits` once on the committed batch and keeps `X_1 … X_{L+1}`
-    (hooks on each decoder layer and on the final norm), the kwargs LlamaModel passes its
-    layers (causal mask over `ρ`, RoPE `(cos, sin)`, positions) and `Λ`'s operands. That
-    pass checks the call names only and keeps no layer's operands, so peak glue is one
-    layer's operands plus the `L+1` residual states and `Λ`'s operands (a test holds weakrefs to layer 1's
-    operands and checks they are dead by the final norm). A request in layer ℓ reruns
-    `layers[ℓ−1](X_ℓ, **kwargs)` the same way, keeps its nine products' operands, checks the
-    output is `X_{ℓ+1}`, and drops them after `Y_down`. The call sequence must be the declared
-    one (`Y_q, Y_k, Y_v, S, O, Y_o, Y_gate, Y_up, Y_down` per layer, then `Λ`), linears
-    identified by weight storage; `S` and `O` are the two bmms after a layer's `Y_v`. An
-    undeclared mm, a bmm anywhere else, a different order or a layer that doesn't reproduce
-    its output raises `ReplayError`. Out-of-order calls rerun their layer. Operands are what
-    the op receives: `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and `repeat_kv`, `(softmax, Ṽ)`.
-    The forward replay runs under `torch.no_grad()`.
-  - Backward products and `glue_gradients()` (A9) come from `torch.autograd.grad` on the same
-    unmodified modules, still under `ProductSubstitution`. Autograd's engine restores the
+    product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`).
+    The replay does what training does: one forward pass and one backward pass, no reruns.
+    The first request runs `logits` and `loss_from_logits` once on the committed batch with
+    grad on. Pre-hooks on each decoder layer and on the final norm cut the graph into units:
+    each unit gets a detached `requires_grad_()` copy of its input `X_j`, so each layer (and
+    the head: final norm, `lm_head`, loss) keeps its own autograd graph, its nine (or one)
+    products' operands and its output. Units are `j = 1…L` for the layers and `j = L+1` for
+    the head. On entering unit `j > 1` the hook checks that its input equals unit `j−1`'s
+    output exactly (bitwise, NaN equal), so the cut can't change what flows between units.
+    The call sequence must be the declared one (`Y_q, Y_k, Y_v, S, O, Y_o, Y_gate, Y_up,
+    Y_down` per layer, then `Λ`), linears identified by weight storage; `S` and `O` are the
+    two bmms after a layer's `Y_v`. An undeclared mm, a bmm anywhere else, a different order
+    or a unit input that isn't the previous unit's output raises `ReplayError`. Operands are
+    what the op receives: `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and `repeat_kv`, `(softmax,
+    Ṽ)`. They are served detached, since the pass ran with grad on.
+  - Backward products and `glue_gradients()` (A9) come from `torch.autograd.grad` on the
+    kept unit graphs, still under `ProductSubstitution`. Autograd's engine restores the
     forward's thread-local state, including the dispatch mode, on its worker threads (on any
     device), so every backward mm/bmm also gets its committed leaf. A product that escaped
-    the mode would be reported missing. No backward is written by hand. Units, from the top:
-    - Head (`j = L+1`): `loss_from_logits(lm_head(norm(X_{L+1})), batch)`, grad to
-      `[X_{L+1}, γ_final, W_E]`. `δΛ` comes from autograd through `loss_from_logits`;
-      `loss` and `label` are never called.
-    - Layer `j`: `layers[j−1](X_j, **kwargs)`, grad to `[X_j, γ_attn, γ_mlp, W_q..W_down]`
-      with `grad_outputs = δX_{j+1}` (the committed-chain value the previous unit gave).
+    the mode would be reported missing. No backward is written by hand. One backward per
+    unit, from the top:
+    - Head (`j = L+1`): the kept loss, grad to `[X_{L+1}, γ_final, W_E]`. `δΛ` comes from
+      autograd through `loss_from_logits`; `loss` and `label` are never called.
+    - Layer `j`: the kept output, grad to `[X_j, γ_attn, γ_mlp, W_q..W_down]` with
+      `grad_outputs = δX_{j+1}` (the committed-chain value the previous unit gave).
     - Identification at call time: an mm whose `b` is a weight is `dX_x`/`dF`, and its `a`
       must be that weight's `δY` (storage recorded by a hook on the substituted forward
       output). Any other mm is `G_x`/`G_E_head`: `a` is some weight's `δY` and `b` the saved
@@ -436,10 +436,13 @@ interface.
     - Each operand's `_version` is recorded when it is supplied and checked when served; a
       mutated operand raises `ReplayError`. An undeclared, duplicate or missing backward
       product raises `ReplayError`.
-    - Memory: the frontier `(j, δX_j)` and the γ gradients persist; one unit's operands are
-      held and dropped after `G_E_head` or `L{j}.G_v`. The head unit is the largest
-      (`δΛ` and the softmax intermediates are `N×n_v`). A backward request out of order
-      recomputes the chain from the head.
+    - Memory, as in training: after the forward pass every unit's graph and operands are
+      held, about one training step's activations. Each unit's backward frees its graph
+      (`retain_graph=False`) and the unit is dropped, so memory falls unit by unit; the
+      served backward operands are dropped after `G_E_head` or `L{j}.G_v`. The frontier
+      `(j, δX_j)` and the γ gradients persist. The head unit is the largest (`δΛ` and the
+      softmax intermediates are `N×n_v`). A request out of order (a forward product whose
+      unit is gone, or a backward unit already run) rebuilds the whole pass from scratch.
     - `glue_gradients()` is valid only right after `operands(M)` with the frontier at layer
       1. It returns the γ gradients and, for `W_E`, `G_E_head` plus `G_E^emb` =
       `autograd.grad(embed_tokens(ids), W_E, δX_1)` under a substitution that forbids
@@ -457,7 +460,14 @@ interface.
     `glue_gradients` take about 0.6 s. Measured in a fresh process after `prove_step`, the
     replay raises the peak from 4.61 GB to 4.75 GB (forward alone: no rise). That baseline is
     the `prove_step` peak, not the leaves alone, so it doesn't compare with the 2.7 → 3.5 GB
-    above.
+    above. Those figures are for the earlier replay, which rebuilt each layer by rerunning it
+    (a no-grad first pass, then a forward rerun per layer and per backward unit). The
+    one-pass replay (2026-10-04, `llama_step` with `MallocLargeCache=0`, two runs each) cuts
+    `5.glue` from 0.80 s to 0.53 s and check 5 from about 2.0 s to 1.7 s. `5.glue`'s peak
+    rises from 4.56 GB to 4.83 GB (0.84 → 1.15 GB above its start), since the whole pass's
+    activations are now held at once, as in training (the prover's captured forward grows
+    0.67 GB and its backward peaks 1.6 GB above the forward's start). The verifier's step
+    peak doesn't change (5.46 → 5.42 GB): it is reached in 6b, not in the glue.
 
 ### `verification/prover/`
 
