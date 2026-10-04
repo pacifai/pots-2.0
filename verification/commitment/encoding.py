@@ -10,6 +10,7 @@ from __future__ import annotations
 import struct
 import sys
 
+import numpy as np
 import torch
 
 if sys.byteorder != "little":
@@ -55,12 +56,28 @@ def tensor_leaf_header(tag: int, t: torch.Tensor) -> bytes:
     return struct.pack(f">BBB{len(shape)}I", tag, DTYPE_CODES[t.dtype], len(shape), *shape)
 
 
+def _all_finite(t: torch.Tensor) -> bool:
+    """`torch.isfinite(t).all()`, exactly, in one or two reduction passes with no temporary.
+
+    Both extremes are finite exactly when every entry is: a max or min reduction propagates
+    NaN, and ±Inf is an extreme. fp32 and fp16 CPU tensors reduce with numpy's `max` and `min`
+    (single-threaded, about 3× faster than `torch.aminmax` here, and no OpenMP team that
+    competes with the hashing workers); other tensors use `torch.aminmax`.
+    """
+    if t.numel() == 0:
+        return True
+    if t.device.type == "cpu" and t.dtype in (torch.float32, torch.float16):
+        v = t.detach().numpy()
+        return bool(np.isfinite(v.max()) and np.isfinite(v.min()))
+    lo, hi = torch.aminmax(t)
+    return bool(lo.isfinite() & hi.isfinite())
+
+
 def tensor_leaf_payload(t: torch.Tensor) -> memoryview:
     """Zero-copy byte view of a contiguous CPU tensor's little-endian C-order data.
 
     Float tensors with NaN or Inf raise `NonFiniteError`; `-0.0` passes (S9d).
     The view aliases `t`'s storage, so the caller must not mutate `t` until hashing is done.
-    The finiteness check allocates a temporary bool tensor of `numel` bytes.
     """
     if t.dtype not in DTYPE_CODES:
         raise EncodingError(f"dtype {t.dtype} has no canonical code")
@@ -69,7 +86,7 @@ def tensor_leaf_payload(t: torch.Tensor) -> memoryview:
     if not t.is_contiguous():
         raise EncodingError("tensor must be contiguous")
     t = t.detach()
-    if t.dtype in FLOAT_DTYPES and not bool(torch.isfinite(t).all()):
+    if t.dtype in FLOAT_DTYPES and not _all_finite(t):
         raise NonFiniteError("float tensor contains NaN or Inf")
     if t.dtype == torch.bfloat16:
         t = t.view(torch.int16)  # numpy has no bfloat16; same bytes

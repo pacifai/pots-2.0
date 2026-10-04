@@ -29,7 +29,8 @@ says which files that task needs. Read only those files. The other files are:
 - `VERIFICATION_PROTOCOL_REFERENCE_BLOCK.md` — the approved worked instance on one SmolLM2
   decoder step.
 - `SETUP_TASKS.md` — open items of the stage in progress (setup and implementation).
-- `EVALUATION_TASKS.md` and `FULL_SCALE_TASKS.md` — parking lists. Add items to them as
+- `EVALUATION_TASKS.md`, `FULL_SCALE_TASKS.md` and `PERFORMANCE_TASKS.md` (speed and
+  memory problems of the code) — parking lists. Add items to them as
   they come up, and don't plan those areas ahead.
 - `DECISIONS_ALGORITHM.md` and `DECISIONS_SETUP.md` — settled decisions with their
   reasoning. Read them when a task needs the reasoning behind a decision.
@@ -40,7 +41,7 @@ says which files that task needs. Read only those files. The other files are:
   resume from it.
 
 A SessionStart hook (`.claude/hooks/session-task-menu.py`) runs on startup, resume,
-`/clear`, and compaction. It lists the open items from the three task files, so a new
+`/clear`, and compaction. It lists the open items from the four task files, so a new
 session asks the user which task to continue and routes the answer: a named task, file, or
 subject opens that task, and anything else starts as a new task. After a compaction, the
 session continues the task in progress. The menu is read from the files each time, so it

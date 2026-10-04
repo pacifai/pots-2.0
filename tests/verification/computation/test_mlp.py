@@ -14,7 +14,8 @@ from verification.computation.instances.mlp import (
     synthetic_dataset,
 )
 from verification.computation.interface import LabelingError, ProductKind, load_weights
-from verification.prover.capture import MatmulCapture, param_storage_map
+from verification.computation.matmul_ops import param_storage_map
+from verification.prover.capture import MatmulCapture
 from verification.prover.step import prove_step
 
 ETA = 0.05

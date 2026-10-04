@@ -3,11 +3,15 @@
 `H_leaf(x) = BLAKE3(0x00 ‖ x)`, `H_node(l, r) = BLAKE3(0x01 ‖ l ‖ r)`. A range of `n > 1`
 leaves splits at the largest power of two strictly below `n`, so an unpaired node is
 promoted unchanged (P9a). The same tree builds the step root `h` and the dataset root `h_D`.
+
+`hash_leaves` hashes many leaves at once on a pool of worker threads. blake3 releases the GIL
+while it hashes, so the workers run in parallel. Each digest is the one `hash_leaf` gives.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import blake3
 import torch
@@ -18,8 +22,15 @@ from verification.commitment.encoding import tensor_leaf_header, tensor_leaf_pay
 DIGEST_SIZE = 32
 _LEAF_PREFIX = b"\x00"
 _NODE_PREFIX = b"\x01"
-# Above this size BLAKE3's multithreaded tree mode is used; the digest is identical.
-_MT_THRESHOLD = 1 << 20
+# Above this size BLAKE3's multithreaded tree mode is used; the digest is identical. It is
+# set high because `hash_leaves` already spreads leaves over threads: nested threading slows
+# the common 1–4 MB leaves, while a 100 MB leaf hashed on one thread would be a long tail.
+_MT_THRESHOLD = 16 << 20
+# `hash_leaves` hands leaves to the workers in chunks of about this many bytes, so the many
+# small leaves (32–64 KB attention products) don't each pay a task's overhead.
+_CHUNK_BYTES = 16 << 20
+
+LeafParts = Sequence[bytes | memoryview]
 
 
 def hash_leaf(*parts: bytes | memoryview) -> bytes:
@@ -30,6 +41,112 @@ def hash_leaf(*parts: bytes | memoryview) -> bytes:
     for p in parts:
         h.update(p)
     return h.digest()
+
+
+def _hash_chunk(chunk: list[LeafParts]) -> tuple[list[bytes], Exception | None]:
+    """Hash a chunk's leaves in order; stop at the first error and return it with the
+    digests before it."""
+    out: list[bytes] = []
+    try:
+        for item in chunk:
+            out.append(hash_leaf(*item))
+    except Exception as e:
+        return out, e
+    return out, None
+
+
+_pool: ThreadPoolExecutor | None = None
+_pool_size = 0
+
+
+def _executor(workers: int) -> ThreadPoolExecutor:
+    """The shared worker pool, created on first use and resized when the thread count changes."""
+    global _pool, _pool_size
+    if _pool is None or _pool_size != workers:
+        if _pool is not None:
+            _pool.shutdown(wait=False)
+        _pool = ThreadPoolExecutor(workers, thread_name_prefix="hash_leaves")
+        _pool_size = workers
+    return _pool
+
+
+def hash_leaves_until_error(leaves: Iterable[LeafParts]) -> tuple[list[bytes], Exception | None]:
+    """`hash_leaf(*parts)` for each item, in order, on worker threads, up to the first error:
+    ``(digests of the leaves before it, the error or None)``.
+
+    The error is the one a plain loop over the items meets first, and it is returned, not
+    raised, so a caller can judge the leaves before it first. The iterable is consumed on the
+    calling thread, so whatever produces the parts (store reads, validation, encoding) runs
+    there in order, and an error it raises sits after every item it yielded. The items already
+    yielded are still hashed then. A worker's own error (a malformed part) sits at its leaf:
+    each chunk stops at its first error, and the first chunk in order with one decides, ahead
+    of the iterable's error. A leaf with an error never gets a digest, nor does any after it.
+
+    Returns only once no worker reads the items' parts any more: they alias tensors the
+    caller may change next. An error that is not an `Exception` (``KeyboardInterrupt``)
+    propagates once the workers stop. The pool has `torch.get_num_threads()` workers, the
+    run's thread budget (`VERIF_THREADS`); with one thread the leaves are hashed inline.
+    """
+    workers = torch.get_num_threads()
+    if workers <= 1:
+        out: list[bytes] = []
+        try:
+            for item in leaves:
+                out.append(hash_leaf(*item))
+        except Exception as e:
+            return out, e
+        return out, None
+    pool = _executor(workers)
+    futures: list[Future[tuple[list[bytes], Exception | None]]] = []
+    chunk: list[LeafParts] = []
+    size = 0
+    producer_error: Exception | None = None
+    try:
+        for item in leaves:
+            size += sum(memoryview(p).nbytes for p in item)
+            chunk.append(item)
+            if size >= _CHUNK_BYTES:
+                futures.append(pool.submit(_hash_chunk, chunk))
+                chunk, size = [], 0
+    except Exception as e:
+        producer_error = e
+    except BaseException:
+        for f in futures:
+            f.cancel()
+        for f in futures:
+            if not f.cancelled():
+                f.exception()  # wait; the parts alias leaves the caller may change next
+        raise
+    if chunk:  # also after a producer error: the items before it are still hashed
+        futures.append(pool.submit(_hash_chunk, chunk))
+    digests: list[bytes] = []
+    first_error: Exception | None = None
+    for n, f in enumerate(futures):
+        hs, err = f.result()
+        digests.extend(hs)
+        if err is not None:
+            first_error = err
+            for later in futures[n + 1:]:  # later leaves can't change the outcome
+                later.cancel()
+            for later in futures[n + 1:]:
+                if not later.cancelled():
+                    later.exception()  # wait, as above
+            break
+    if first_error is None:
+        first_error = producer_error
+    return digests, first_error
+
+
+def hash_leaves(leaves: Iterable[LeafParts]) -> list[bytes]:
+    """`hash_leaf(*parts)` for each item, in order, hashed on worker threads.
+
+    Raises the error a plain loop raises first (`hash_leaves_until_error`), unchanged, once
+    the workers have stopped reading the parts; it never returns a digest list then.
+    """
+    digests, err = hash_leaves_until_error(leaves)
+    if err is not None:
+        raise err
+    return digests
 
 
 def hash_node(left: bytes, right: bytes) -> bytes:

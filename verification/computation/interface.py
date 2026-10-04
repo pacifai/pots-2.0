@@ -45,9 +45,11 @@ __all__ = [
     "ProductKind",
     "ProductSpec",
     "LabelingError",
+    "ReplayError",
     "Replay",
     "DeclaredComputation",
     "load_weights",
+    "snapshot_weights",
 ]
 
 
@@ -104,6 +106,13 @@ class LabelingError(RuntimeError):
     """Captured matmuls don't map one-to-one onto the declared product slots."""
 
 
+class ReplayError(RuntimeError):
+    """The replay's model run doesn't match ``C``: a verifier-side bug, not a rejection.
+
+    It runs on leaves check 2 already validated, so the verifier lets it propagate as a crash.
+    """
+
+
 class Replay(ABC):
     """The verifier's per-step glue replay over one transcript (checks 3, 5 and 6b).
 
@@ -137,6 +146,18 @@ def load_weights(computation: DeclaredComputation, model: torch.nn.Module,
                 raise ValueError(f"{name}: got {w.dtype} {tuple(w.shape)}, "
                                  f"model holds {p.dtype} {tuple(p.shape)}")
             p.copy_(w)
+
+
+def snapshot_weights(computation: DeclaredComputation,
+                     model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Copies of ``model``'s declared weights, in ``weight_names`` order.
+
+    The one way to take weights out of a model: the prover's ``W_{t+1}`` leaves (its ``W_t``
+    leaves are the caller's tensors where ``prove_step`` can share them, else a clone as here),
+    and ``W_0`` from a freshly built model (the plain baseline B7 and the verified runs, A12
+    included, so both start from the same tensors).
+    """
+    return {n: model.get_parameter(n).detach().clone() for n in computation.weight_names}
 
 
 class DeclaredComputation(ABC):

@@ -6,15 +6,8 @@ import torch
 from verification.computation.instances.mlp import MLPComputation, init_weights, synthetic_dataset
 from verification.runs import mlp_smoke
 from verification.runs.loop import ProverFault
-from verification.runs.mlp_smoke import (
-    Expected,
-    Scenario,
-    honest_final,
-    judge,
-    run_scenario,
-    run_smoke,
-    scenarios,
-)
+from verification.runs.mlp_smoke import run_smoke, scenarios
+from verification.runs.scenarios import Expected, Scenario, honest_final, judge, run_scenario
 
 K = 7
 T = 3
@@ -104,10 +97,11 @@ def test_run_smoke_reports(c, D, w0):
         run_smoke(c, D, w0, T=1, k=K, out=lines.append)
 
 
-def test_main_exit_codes(monkeypatch, capsys):
+def test_main_exit_codes(monkeypatch, capsys, tmp_path):
     # main applies the S4c knobs process-wide; record the call instead of leaking global state.
     calls = []
     monkeypatch.setattr(mlp_smoke, "setup_determinism", calls.append)
+    monkeypatch.setenv("VERIF_OUTPUT_DIR", str(tmp_path))  # metrics are on by default (B6)
     monkeypatch.setenv("VERIF_N_RECORDS", str(N_RECORDS))
     monkeypatch.delenv("VERIF_STEPS", raising=False)
     assert mlp_smoke.main(["--steps", "3"]) == 0

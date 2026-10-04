@@ -135,13 +135,33 @@ class InMemoryStore(TranscriptStore):
         ``copy=False`` keeps the step's tensors (zero-copy, version-guarded); ``copy=True``
         clones every leaf before hashing, so the store is isolated from the prover's tensors.
         ``dataset_paths[i]`` is record ``i``'s audit path into ``h_D``.
+
+        It is :meth:`commit_step` then :meth:`hold`; the run loop calls the two apart, so the
+        metrics see hashing (P3) and the hand-off to the store (P5) as separate rows.
         """
         if dataset_paths is not None and len(dataset_paths) != c.n_s:
             raise ValueError(f"{len(dataset_paths)} dataset paths for {c.n_s} records")
+        leaves, tree = cls.commit_step(c, step, copy=copy)
+        return cls.hold(c, leaves, tree, dataset_paths)
+
+    @staticmethod
+    def commit_step(c: DeclaredComputation, step: StepOutput, *,
+                    copy: bool = False) -> tuple[list[Any], MerkleTree]:
+        """``(leaves, tree)``: the step's leaves (cloned if ``copy``) and the Merkle tree over
+        them, with invariant 6 rechecked after hashing."""
         leaves = step.leaves()
         leaves = [_clone(x) for x in leaves] if copy else _detached(leaves)
         tree = commit_leaves(c, leaves)
         step.assert_unmodified()  # invariant 6, as in prover.step.commit()
+        return leaves, tree
+
+    @classmethod
+    def hold(cls, c: DeclaredComputation, leaves: list[Any], tree: MerkleTree,
+             dataset_paths: Sequence[Sequence[bytes]] | None = None) -> InMemoryStore:
+        """The store over leaves :meth:`commit_step` committed. At test scale it keeps
+        references; A14's ``DiskStore`` writes the leaves here."""
+        if dataset_paths is not None and len(dataset_paths) != c.n_s:
+            raise ValueError(f"{len(dataset_paths)} dataset paths for {c.n_s} records")
         return cls(leaves, tree, dataset_paths)
 
     def leaf(self, index: int) -> Any:

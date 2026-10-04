@@ -27,6 +27,7 @@ Other cheats are assembled by the caller from honest outputs, not by hooks here 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,12 +35,25 @@ import torch
 
 from verification.commitment.leaves import commit_leaves
 from verification.commitment.merkle import MerkleTree
-from verification.computation.interface import DeclaredComputation, load_weights
-from verification.prover.capture import MatmulCapture, MutatedCaptureError, param_storage_map
+from verification.computation.interface import (
+    DeclaredComputation,
+    load_weights,
+    snapshot_weights,
+)
+from verification.computation.matmul_ops import param_storage_map
+from verification.prover.capture import MatmulCapture, MutatedCaptureError
 
-__all__ = ["StepOutput", "prove_step", "plain_step", "commit"]
+__all__ = ["StepOutput", "Section", "no_section", "prove_step", "plain_step", "commit"]
 
 Perturbation = Callable[[torch.Tensor], torch.Tensor]
+# A metrics seam: ``section(name)`` wraps one phase of the step (``runs/metrics.py``, B6). It
+# observes only; with ``None`` the step runs exactly as without it.
+Section = Callable[[str], AbstractContextManager[Any]]
+_NO_SECTION = nullcontext()
+
+
+def no_section(name: str) -> AbstractContextManager[Any]:
+    return _NO_SECTION
 
 
 @dataclass(frozen=True, eq=False)
@@ -94,8 +108,31 @@ def _versions(objs: Sequence[Any]) -> tuple[int, ...]:
     return tuple(t._version for t in objs if isinstance(t, torch.Tensor))
 
 
-def _snapshot(computation: DeclaredComputation, model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    return {n: model.get_parameter(n).detach().clone() for n in computation.weight_names}
+def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int]) -> bool:
+    """Whether the caller's ``w`` can be the committed ``W_t`` leaf itself (see prove_step).
+
+    It must hash to the bytes the model holds after ``load_weights`` (same dtype, shape and
+    device, contiguous), own its whole storage (no view that another tensor can write through),
+    not be a live parameter (``requires_grad``), and not share storage with any of ``model``'s
+    parameters, which the step updates in place.
+    """
+    return (not w.requires_grad and w.dtype == p.dtype and w.shape == p.shape
+            and w.device == p.device and w.is_contiguous() and not w._is_view()
+            and w.storage_offset() == 0
+            and w.untyped_storage().nbytes() == w.numel() * w.element_size()
+            and w.untyped_storage().data_ptr() not in model_storages)
+
+
+def _w_t_leaves(computation: DeclaredComputation, model: torch.nn.Module,
+                w_t: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The committed ``W_t``: the caller's tensor where :func:`_shareable`, else a copy of the
+    loaded parameter. Either way the bytes are those the model holds after ``load_weights``."""
+    storages = {q.untyped_storage().data_ptr() for q in model.parameters()}
+    out = {}
+    for n in computation.weight_names:
+        w, p = w_t[n], model.get_parameter(n)
+        out[n] = w if _shareable(w, p, storages) else p.detach().clone()
+    return out
 
 
 def _optimizer(computation: DeclaredComputation, model: torch.nn.Module) -> torch.optim.SGD:
@@ -105,19 +142,28 @@ def _optimizer(computation: DeclaredComputation, model: torch.nn.Module) -> torc
 
 def plain_step(computation: DeclaredComputation, model: torch.nn.Module,
                w_t: Mapping[str, torch.Tensor],
-               records: Sequence[Any]) -> tuple[dict[str, torch.Tensor], float]:
+               records: Sequence[Any], *,
+               section: Section | None = None) -> tuple[dict[str, torch.Tensor], float]:
     """The same SGD step with no capture and no transcript: ``(W_{t+1}, loss)``.
 
-    For hidden steps, η tuning and the capture-on/off comparison.
+    For hidden steps, η tuning and the capture-on/off comparison. With ``section`` it is EQ1b's
+    P0, the plain baseline: ``P0.load``, ``P0.forward``, ``P0.backward`` and ``P0.update`` cover
+    the same work as :func:`prove_step`'s ``train.*`` phases. Copying out ``W_{t+1}`` is the
+    caller's and sits outside them.
     """
-    load_weights(computation, model, w_t)
-    model.zero_grad(set_to_none=True)
-    opt = _optimizer(computation, model)
-    loss = computation.loss(model, records)
-    loss.backward()
-    opt.step()
-    model.zero_grad(set_to_none=True)
-    return _snapshot(computation, model), float(loss.detach())
+    sec = section or no_section
+    with sec("P0.load"):
+        load_weights(computation, model, w_t)
+        model.zero_grad(set_to_none=True)
+        opt = _optimizer(computation, model)
+    with sec("P0.forward"):
+        loss = computation.loss(model, records)
+    with sec("P0.backward"):
+        loss.backward()
+    with sec("P0.update"):
+        opt.step()
+        model.zero_grad(set_to_none=True)
+    return snapshot_weights(computation, model), float(loss.detach())
 
 
 def prove_step(
@@ -128,36 +174,57 @@ def prove_step(
     *,
     train_records: Sequence[Any] | None = None,
     perturb: Mapping[int, Perturbation] | None = None,
+    section: Section | None = None,
 ) -> StepOutput:
     """Execute ``C(b, W_t)`` on ``model`` and emit the step's leaves.
 
     ``records`` is the committed batch ``b``. ``model`` is overwritten with ``w_t`` and left
-    holding ``W_{t+1}`` with its gradients cleared.
+    holding ``W_{t+1}`` with its gradients cleared. ``section`` is the B6 metrics seam: it
+    wraps the phases ``train.load``, ``P2.w_t``, ``train.forward``, ``train.backward``,
+    ``P1.label``, ``train.update`` and ``P2.w_next``. ``train.*`` is training under capture, not
+    EQ1b's P0, which only :func:`plain_step` measures (``runs/metrics.py`` maps the rows).
+
+    The committed ``W_t`` leaves are the caller's ``w_t`` tensors themselves, not copies, when
+    each is a contiguous tensor of the model's dtype, shape and device that owns its whole
+    storage, doesn't require grad and shares no storage with ``model``'s parameters. Any other
+    tensor is committed as a copy of the loaded parameter. The bytes are the same either way.
+    Sharing saves one copy of the weights per step, but the caller must then not write to
+    ``w_t`` until the step's store is dropped. The ``_version`` guard (invariant 6) catches a
+    write: :meth:`StepOutput.assert_unmodified` in the commit, the store on every read. The run
+    loop meets this: its ``w_t`` is ``W_0``, the previous step's ``W_{t+1}`` copy or a fault's
+    entry weights, and nothing in the loop writes to them.
     """
     if len(records) != computation.n_s:
         raise ValueError(f"batch has {len(records)} records, the computation declares "
                          f"{computation.n_s}")
     if not torch.is_grad_enabled():
         raise RuntimeError("prove_step needs grad mode on")
+    sec = section or no_section
     record_versions = _versions(records)
-    load_weights(computation, model, w_t)
-    w_t_leaves = _snapshot(computation, model)  # parameters change in place at the step
-    model.zero_grad(set_to_none=True)
-    opt = _optimizer(computation, model)
+    with sec("train.load"):
+        load_weights(computation, model, w_t)
+    with sec("P2.w_t"):
+        # Never the parameters themselves: they change in place at the step.
+        w_t_leaves = _w_t_leaves(computation, model, w_t)
+        w_t_versions = _versions(list(w_t_leaves.values()))
+    with sec("train.load"):
+        model.zero_grad(set_to_none=True)
+        opt = _optimizer(computation, model)
 
     cap = MatmulCapture(param_names=param_storage_map(model))
     with cap:
-        with cap.phase("forward"):
+        with cap.phase("forward"), sec("train.forward"):
             loss = computation.loss(model, records if train_records is None else train_records)
-        with cap.phase("backward"):
+        with cap.phase("backward"), sec("train.backward"):
             loss.backward()
-    products = [p.detach() for p in computation.label(cap, model)]
-    if len(products) != computation.M:
-        raise RuntimeError(f"label returned {len(products)} products, M = {computation.M}")
-    # Invariant 6: the products are fixed and nothing has touched the captured tensors.
-    cap.assert_unmodified()
-    product_versions = list(_versions(products))
-    cap.release_operands()
+    with sec("P1.label"):
+        products = [p.detach() for p in computation.label(cap, model)]
+        if len(products) != computation.M:
+            raise RuntimeError(f"label returned {len(products)} products, M = {computation.M}")
+        # Invariant 6: the products are fixed and nothing has touched the captured tensors.
+        cap.assert_unmodified()
+        product_versions = list(_versions(products))
+        cap.release_operands()
 
     for m, fn in (perturb or {}).items():
         spec = computation.product(m)
@@ -167,15 +234,18 @@ def prove_step(
         products[m - 1] = new.detach().contiguous()
         product_versions[m - 1] = products[m - 1]._version
 
-    opt.step()
-    w_next = _snapshot(computation, model)
-    # set_to_none drops the model's reference; G_ℓ products stay intact (invariant 6).
-    model.zero_grad(set_to_none=True)
+    with sec("train.update"):
+        opt.step()
+    with sec("P2.w_next"):
+        w_next = snapshot_weights(computation, model)
+    with sec("train.update"):
+        # set_to_none drops the model's reference; G_ℓ products stay intact (invariant 6).
+        model.zero_grad(set_to_none=True)
 
     return StepOutput(
         records=tuple(records), w_t=w_t_leaves, products=tuple(products), w_next=w_next,
         loss=float(loss.detach()),
-        versions=(record_versions + _versions(list(w_t_leaves.values()))
+        versions=(record_versions + w_t_versions
                   + tuple(product_versions) + _versions(list(w_next.values()))),
     )
 

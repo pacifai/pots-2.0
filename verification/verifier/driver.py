@@ -32,19 +32,26 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from setup import data
-from verification.commitment.leaves import leaf_hash
+from verification.commitment.leaves import leaf_hashes_of
 from verification.commitment.merkle import DIGEST_SIZE, hash_leaf, merkle_root
 from verification.computation.interface import DeclaredComputation
 from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands
 from verification.verifier.checks import CHECKS, DEFAULT_ORDER
-from verification.verifier.context import Rejection, StepContext, StepStats
+from verification.verifier.context import (
+    Rejection,
+    Section,
+    StepContext,
+    StepStats,
+    no_section,
+)
 
 __all__ = ["RunVerdict", "Verifier"]
 
@@ -82,6 +89,7 @@ class Verifier:
         schedule: Callable[[int], Sequence[int]] | None = None,
         calibrate: bool = False,
         allow_provisional: bool = False,
+        section: Section | None = None,
     ) -> None:
         if (w0 is None) == (w0_hashes is None):
             raise ValueError("give exactly one of w0 and w0_hashes")
@@ -113,6 +121,11 @@ class Verifier:
         self.timings: dict[int, dict[str, float]] = {}  # step -> check id -> seconds
         self.run_timings: dict[str, float] = {}  # "0", "1", "8"
         self.stats: dict[int, StepStats] = {}
+        # B6 metrics seam (runs/metrics.py): wraps each check; observes only.
+        self.section = section
+
+    def _timed(self, name: str) -> AbstractContextManager[Any]:
+        return no_section(name) if self.section is None else self.section(name)
 
     def _adopt(self, bands: Bands) -> None:
         if bands.source == "provisional" and not self.allow_provisional:
@@ -132,8 +145,8 @@ class Verifier:
         ``W_{t+1}`` alike, so these compare with either)."""
         if set(weights) != set(self.c.weight_names):
             raise ValueError("weights differ from the declared weight names")
-        return tuple(leaf_hash(self.c, self.c.w_t_index(n), weights[n].detach())
-                     for n in self.c.weight_names)
+        return tuple(leaf_hashes_of(self.c, ((self.c.w_t_index(n), weights[n].detach())
+                                             for n in self.c.weight_names)))
 
     def _check_hashes(self, hashes: Sequence[bytes]) -> tuple[bytes, ...]:
         hashes = tuple(hashes)
@@ -148,11 +161,13 @@ class Verifier:
             raise RuntimeError("start_run was already called")
         t0 = time.perf_counter()
         # Check 0, prepared: the anchor hashes of the agreed W_0. Malformed public input raises.
-        anchor = (self.weight_hashes(self._w0) if self._w0 is not None
-                  else self._check_hashes(self._w0_hashes or ()))
+        with self._timed("run:0"):
+            anchor = (self.weight_hashes(self._w0) if self._w0 is not None
+                      else self._check_hashes(self._w0_hashes or ()))
         self.run_timings["0"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        rej = self._check_1(dataset)
+        with self._timed("run:1"):
+            rej = self._check_1(dataset)
         self.run_timings["1"] = time.perf_counter() - t0
         if rej is not None:
             self.rejection = rej
@@ -196,13 +211,17 @@ class Verifier:
         ctx = StepContext.for_computation(
             self.c, step=t, indices=tuple(self._schedule(t)), h_D=self.h_D,
             n_records=self.n_records, prev_w_hashes=self._chain,
-            chain_check_id="0" if t == 1 else "7", k=self.k, judge=not self.calibrate)
+            chain_check_id="0" if t == 1 else "7", k=self.k, judge=not self.calibrate,
+            section=self.section)
         timings = self.timings[t] = {}
         self.stats[t] = ctx.stats
         for check_id in DEFAULT_ORDER:
-            t0 = time.perf_counter()
-            rej = CHECKS[check_id](store, self.c, ctx, bands)
-            timings[check_id] = time.perf_counter() - t0
+            # the clock inside the seam: a metrics probe's own cost stays out of timings. Step 1's
+            # chaining comparison is timed as row "7" (check 0's anchor hashing is "run:0").
+            with self._timed(check_id):
+                t0 = time.perf_counter()
+                rej = CHECKS[check_id](store, self.c, ctx, bands)
+                timings[check_id] = time.perf_counter() - t0
             if rej is not None:
                 self.rejection = rej
                 return rej
@@ -268,12 +287,14 @@ class Verifier:
             raise RuntimeError("calibration is unfrozen: call freeze(bands) before end_run")
         if self.rejection is None:
             t0 = time.perf_counter()
-            rej = self._check_8(final)
+            with self._timed("run:8"):
+                rej = self._check_8(final)
             self.run_timings["8"] = time.perf_counter() - t0
             if rej is not None:
                 self.rejection = rej
-        return RunVerdict(self.rejection is None, self.rejection, self._last_step,
-                          self.band_source)
+        with self._timed("run:9"):
+            return RunVerdict(self.rejection is None, self.rejection, self._last_step,
+                              self.band_source)
 
     def _check_8(self, final: Mapping[str, torch.Tensor] | Sequence[bytes]) -> Rejection | None:
         if self._chain is None:

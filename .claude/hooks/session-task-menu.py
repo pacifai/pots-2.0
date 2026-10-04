@@ -16,6 +16,7 @@ TASK_FILES = [
     ("SETUP_TASKS.md", "Setup (stage 3, in progress)"),
     ("EVALUATION_TASKS.md", "Evaluation (parked until setup closes)"),
     ("FULL_SCALE_TASKS.md", "Full scale (parked until the test-scale run is done)"),
+    ("PERFORMANCE_TASKS.md", "Speed (parked until the user takes an item up)"),
 ]
 # A bold item title can wrap onto following indented lines, so match across newlines.
 ITEM = re.compile(r"^- \*\*([A-Z]\d+[a-z]?) — (.+?)\*\*", re.MULTILINE | re.DOTALL)
@@ -88,7 +89,7 @@ def main():
         f"{instruction}\n\n"
         "Open tasks, read from the task files at session start:\n"
         f"{menu()}\n\n"
-        "Parked lists (evaluation, full scale) are taken up only when the user explicitly "
+        "Parked lists (evaluation, full scale, speed) are taken up only when the user explicitly "
         "chooses them. Follow the stage gates and rules in `STATUS.md` and `CLAUDE.md`."
     )
     json.dump(

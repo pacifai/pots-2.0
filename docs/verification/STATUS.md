@@ -54,7 +54,14 @@ The design process is gated, and each stage starts only after the previous one c
   worktree and branch were deleted on 2026-10-04.
 - **Implementation (stage 5) started on 2026-09-30; the next item is **C1**, run inside
   task A11 of `IMPLEMENTATION_PLAN.md`.** The plan's task table (main axis A1–A14, branches
-  B1–B8) is the work list, and C1 and C3 in `SETUP_TASKS.md` close as their tasks finish. At
+  B1–B8) is the work list, and C1 and C3 in `SETUP_TASKS.md` close as their tasks finish.
+  **Milestone M3 closed on 2026-10-04** (user: "consider M3 finished"): an honest SmolLM2 step
+  is accepted under the provisional bands, and the per-class residual table prints. With the
+  provisional `τ = 8`, honest step 2 rejects at check 5 on the output layer's forward product
+  `Λ` (residual 10.1). This is the verifier-rounding excess C1 already expects (`s_h ≈ 4.2`,
+  `τ ≈ 33`), so A11's calibration resolves it. Speed work the same day (`PERFORMANCE_TASKS.md`,
+  O2–O6) brought the verifier from about 3.2 s to 1.64 s per step, all bit-identical. M4
+  (A11, the C1 calibration run) is next, started without a gate on the user's instruction. At
   stage 4 the per-step check order became `4 → 7 → 2 → 6a → 5 → 6b` for every run, revising
   S6c (see `DECISIONS_SETUP.md` §8.B S6c). T0 pinned the environment: a project-local `.venv`
   on Python 3.14 with torch 2.9.1 and transformers 4.57.6, `W_0` at
@@ -195,7 +202,7 @@ The design process is gated, and each stage starts only after the previous one c
 
 The session-start hook reads the phrase "the next item is **ID**" in the setup line, so
 keep that wording when you update it. It builds its task menu from the `- **ID — Title.**`
-items of the three task files.
+items of the four task files.
 
 ## Files
 
@@ -209,6 +216,7 @@ items of the three task files.
 | `EVALUATION_TASKS.md` | Parked evaluation questions |
 | `DECISIONS_EVALUATION.md` | Settled evaluation decisions (EQ1, EQ2, …) and their reasoning |
 | `FULL_SCALE_TASKS.md` | Parked full-scale items |
+| `PERFORMANCE_TASKS.md` | Parked speed and memory problems of the implementation (O1, O2, …) |
 | `DECISIONS_ALGORITHM.md` | Settled algorithm decisions and their reasoning (§3, §4, §5, §9) |
 | `DECISIONS_SETUP.md` | Settled setup decisions and their reasoning (§8.A, closed S-items) |
 | `BACKGROUND.md` | PoTS summary, notation, repo context (§1, §2, §6) |

@@ -13,7 +13,10 @@ import pytest
 import torch
 
 from setup.data import schedule
-from verification.commitment.leaves import dataset_tree
+from verification.commitment import merkle
+from verification.commitment.leaves import dataset_tree, leaf_hash
+from verification.computation.instances import LlamaComputation
+from verification.computation.instances.llama import LlamaReplay
 from verification.computation.instances.mlp import (
     MLPComputation,
     MLPReplay,
@@ -26,6 +29,7 @@ from verification.prover import step as prover
 from verification.prover.step import plain_step, prove_step
 from verification.transcript.reader import TranscriptView
 from verification.transcript.store import InMemoryStore, TranscriptStore, perturb_leaf
+from verification.verifier import checks
 from verification.verifier.bands import TAU_W0, Bands, product_class
 from verification.verifier.checks import (
     CHECKS,
@@ -33,11 +37,13 @@ from verification.verifier.checks import (
     check_2_commitment,
     check_5_matmuls,
 )
-from verification.verifier.context import CommittedLeaves, Rejection, StepContext
+from verification.verifier.context import CommittedLeaves, Rejection, StepContext, _guard, _hash
 from verification.verifier.driver import Verifier
 from verification.verifier.matmul_check.challenges import SIGMA_R, challenge_matrix
 from verification.verifier.matmul_check.freivalds import _safe_norm
 from verification.verifier.matmul_check.sizing import Z, e_m
+
+from tests.verification.llama_helpers import make_records, tiny_config
 
 ETA = 1e-3
 K = 7
@@ -720,6 +726,85 @@ def test_mutation_during_check_2_rejected_at_2(c, D, tree, w0):
     assert f"leaf {c.product_index(1)} changed in place during check 2" in rej.detail
 
 
+@pytest.fixture
+def parallel(monkeypatch):
+    """Check 2's hashing with one leaf per task on four workers, so leaves are hashed out of
+    order across threads while later leaves are still being read."""
+    monkeypatch.setattr(merkle, "_CHUNK_BYTES", 1)
+    before = torch.get_num_threads()
+    torch.set_num_threads(4)
+    yield
+    torch.set_num_threads(before)
+
+
+def _malformed_detail(c, i, obj):
+    try:
+        leaf_hash(c, i, obj)
+    except ValueError as e:
+        return f"malformed prover data: {type(e).__name__}: {e}"
+    raise AssertionError(f"leaf {i} hashes")
+
+
+class Unreadable(Wrapped):
+    def __init__(self, inner, bad, **kw):
+        super().__init__(inner, **kw)
+        self.bad = bad
+
+    def leaf(self, index):
+        if index == self.bad:
+            raise IndexError(f"leaf {index} is missing")
+        return super().leaf(index)
+
+
+def test_check_2_reports_the_first_bad_leaf_in_order(c, D, tree, w0, parallel):
+    """Leaves are hashed in parallel, but the rejection is the one a leaf-by-leaf loop gives:
+    the first malformed leaf in leaf order, whether it fails to read, validate or encode."""
+    store, out = _store(c, D, tree, w0, 1)
+    p1, p2 = c.product_index(1), c.product_index(3)
+    nan1 = out.products[0].clone()
+    nan1.view(-1)[3] = float("nan")
+    inf2 = out.products[2].clone().fill_(float("inf"))
+    shape1, shape2 = out.products[0].t().contiguous(), out.products[2].t().contiguous()
+    cases = [
+        (Wrapped(store, leaves={p1: nan1, p2: shape2}), _malformed_detail(c, p1, nan1)),
+        (Wrapped(store, leaves={p1: shape1, p2: inf2}), _malformed_detail(c, p1, shape1)),
+        (Unreadable(store, p2, leaves={p1: nan1}), _malformed_detail(c, p1, nan1)),
+        (Unreadable(store, p1, leaves={p2: inf2}),
+         f"malformed prover data: IndexError: leaf {p1} is missing"),
+    ]
+    for s, detail in cases:
+        rej = _verifier(c, D, tree, w0).verify_step(1, s)
+        _expect(rej, 1, "2", "malformed")
+        assert rej.detail == detail
+
+
+def test_check_2_parallel_hashes_match_the_commitment(c, D, tree, w0, parallel):
+    store, out = _store(c, D, tree, w0, 1)
+    ctx = StepContext.for_computation(
+        c, step=1, indices=tuple(schedule(1, c.n_s, len(D))), h_D=tree.root, n_records=len(D),
+        prev_w_hashes=(), chain_check_id="0", k=K)
+    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+    assert ctx.state.leaf_hashes == [leaf_hash(c, i, x) for i, x in enumerate(out.leaves())]
+    assert ctx.state.root == store.root
+
+
+def test_mutation_by_a_later_read_rejected_at_2(c, D, tree, w0, parallel):
+    """A store whose read of a later leaf writes in place into a leaf it already served: the
+    earlier leaf may be hashed after the write, so check 2 rejects it as malformed."""
+    store, _ = _store(c, D, tree, w0, 1)
+    y1 = store.leaf(c.product_index(1))
+
+    class MutatingRead(Wrapped):
+        def leaf(self, index):
+            if index == c.product_index(4):
+                y1.mul_(2.0)
+            return super().leaf(index)
+
+    rej = _verifier(c, D, tree, w0).verify_step(1, MutatingRead(store))
+    _expect(rej, 1, "2", "malformed")
+    assert rej.detail == f"leaf {c.product_index(1)} changed in place during check 2"
+
+
 class MutatingReplayMLP(MLPComputation):
     """Writes a committed product in place after check 2, when check 5 builds its replay."""
 
@@ -1070,3 +1155,229 @@ def _calibrate_store(c, D, tree, w0, store):
     assert v.start_run(D) is None
     assert v.verify_step(1, store) is None
     return v, None
+
+
+# ---- check 5 measures the members of an attention product as a batch --------------------
+
+
+class _LlamaWith(LlamaComputation):
+    """The tiny Llama with a replay hook: ``operands_hook(m, a, b) -> (a, b)``."""
+
+    operands_hook = None
+
+    def replay(self, leaves):
+        return _HookedReplay(self, leaves)
+
+
+class _HookedReplay(LlamaReplay):
+    def operands(self, m):
+        a, b = super().operands(m)
+        hook = type(self.c).operands_hook
+        return (a, b) if hook is None else hook(self.c, m, a, b)
+
+
+@pytest.fixture(scope="module")
+def llama_out():
+    c = LlamaComputation(tiny_config(), n_s=2, n=12, eta=ETA)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    return c, prove_step(c, c.build_model(), w0, make_records((12, 7)))
+
+
+def _llama_check_5(c, out, monkeypatch, *, batched, judge=True, perturb=None):
+    """Checks 2 and 5 on the tiny Llama step; ``batched=False`` measures one product at a time,
+    as check 5 did before batching. ``perturb`` maps a product name to a leaf transform."""
+    store = InMemoryStore.from_step(c, out, copy=True)
+    for name, fn in (perturb or {}).items():
+        m = c.m_of(name)
+        perturb_leaf(c, store, c.product_index(m), fn(out.products[m - 1]))
+    ctx = StepContext.for_computation(
+        c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
+        prev_w_hashes=(), chain_check_id="0", k=K, judge=judge)
+    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+    with monkeypatch.context() as mp:
+        if not batched:
+            mp.setattr(checks, "_member_runs", lambda products: ((p,) for p in products))
+        rej = check_5_matmuls(store, c, ctx, Bands.provisional())
+    return rej, ctx.stats.products
+
+
+def _bumped(t):
+    t = t.clone()
+    t.view(-1)[-1] += 1.0
+    return t
+
+
+def test_member_runs_cover_canonical_order(llama_out):
+    c, _ = llama_out
+    runs = list(checks._member_runs(c.products))
+    assert [s for run in runs for s in run] == list(c.products)
+    long = [run for run in runs if len(run) > 1]
+    # Per layer: S and O (forward) are one run, and dA, dV, dQ, dK (backward) another.
+    assert [len(run) for run in long] == [2 * c.n_s * c.n_h] * c.L + [4 * c.n_s * c.n_h] * c.L
+    assert all(len({(s.layer, s.member is None) for s in run}) == 1 for run in runs)
+
+
+def test_batched_check_5_matches_one_at_a_time(llama_out, monkeypatch):
+    c, out = llama_out
+    rej_b, stats_b = _llama_check_5(c, out, monkeypatch, batched=True)
+    rej_s, stats_s = _llama_check_5(c, out, monkeypatch, batched=False)
+    assert rej_b is None and rej_s is None
+    assert [(x.m, x.name, x.cls) for x in stats_b] == [(x.m, x.name, x.cls) for x in stats_s]
+    assert [x.m for x in stats_b] == list(range(1, c.M + 1))
+    for xb, xs in zip(stats_b, stats_s):
+        assert xb.kappa == pytest.approx(xs.kappa, rel=1e-4)
+        assert xb.normalized == pytest.approx(xs.normalized, rel=1e-4, abs=1e-4)
+
+
+@pytest.mark.parametrize("name", ["L2.S[1,1]", "L1.O[0,2]", "L1.dV[0,3]", "L2.dQ[1,0]"])
+def test_forged_member_mid_run_rejected_at_that_member(llama_out, monkeypatch, name):
+    c, out = llama_out
+    got = [_llama_check_5(c, out, monkeypatch, batched=b, perturb={name: _bumped})
+           for b in (True, False)]
+    (rej_b, stats_b), (rej_s, stats_s) = got
+    _expect(rej_b, 1, "5")
+    assert rej_b == rej_s and f"P_{c.m_of(name)} ({name}), challenge j=" in rej_b.detail
+    assert [x.name for x in stats_b] == [x.name for x in stats_s]
+    assert stats_b[-1].name == name and len(stats_b) == c.m_of(name)
+
+
+@pytest.mark.parametrize("judge", [True, False])
+def test_nan_in_one_member_rejects(llama_out, monkeypatch, judge):
+    _, out = llama_out
+    c = _LlamaWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    name = "L1.dK[1,2]"
+
+    def nan_operand(c, m, a, b):
+        if m != c.m_of(name):
+            return a, b
+        a = a.contiguous().clone()
+        a.view(-1)[0] = float("nan")
+        return a, b
+
+    monkeypatch.setattr(_LlamaWith, "operands_hook", nan_operand)
+    got = [_llama_check_5(c, out, monkeypatch, batched=b, judge=judge) for b in (True, False)]
+    (rej_b, stats_b), (rej_s, _) = got
+    _expect(rej_b, 1, "5")
+    assert rej_b == rej_s and f"P_{c.m_of(name)} ({name}): non-finite ν" in rej_b.detail
+    assert stats_b[-1].name == name and math.isnan(stats_b[-1].kappa)
+
+
+def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
+    """An error serving a later member of a run is raised only once the members before it
+    pass; a forged earlier member rejects first, as one product at a time."""
+    _, out = llama_out
+    c = _LlamaWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    forged, broken = "L1.dA[0,1]", "L1.dV[1,3]"
+
+    def fail(c, m, a, b):
+        if m == c.m_of(broken):
+            raise RuntimeError("replay bug")
+        return a, b
+
+    monkeypatch.setattr(_LlamaWith, "operands_hook", fail)
+    for batched in (True, False):
+        with pytest.raises(RuntimeError, match="replay bug"):
+            _llama_check_5(c, out, monkeypatch, batched=batched)
+    rej_b, _ = _llama_check_5(c, out, monkeypatch, batched=True, perturb={forged: _bumped})
+    rej_s, _ = _llama_check_5(c, out, monkeypatch, batched=False, perturb={forged: _bumped})
+    _expect(rej_b, 1, "5")
+    assert rej_b == rej_s and f"({forged})" in rej_b.detail
+
+
+# ---- check 7: parallel hashing, leaf-by-leaf outcome ------------------------------------
+
+
+@checks._checked
+def _serial_check_7(store, c, ctx, bands):
+    """Check 7 as it was before batching: read, hash and compare one W_t leaf at a time."""
+    cid = ctx.chain_check_id
+    for name, want in zip(c.weight_names, ctx.prev_w_hashes):
+        with _guard(ctx, cid):
+            got = _hash(c, c.w_t_index(name), store.leaf(c.w_t_index(name)))
+        ctx.state.early_hashes[c.w_t_index(name)] = got
+        if got != want:
+            what = "the agreed W_0" if cid == "0" else f"W_{{t+1}} of step {ctx.step - 1}"
+            return ctx.reject(cid, f"W_t[{name}] differs from {what}")
+    return None
+
+
+@pytest.fixture(params=[1, 4], ids=["inline", "parallel"])
+def hash_threads(request, monkeypatch):
+    monkeypatch.setattr(merkle, "_CHUNK_BYTES", 1)
+    before = torch.get_num_threads()
+    torch.set_num_threads(request.param)
+    yield
+    torch.set_num_threads(before)
+
+
+def _chain_ctx(c, D, w_hashes, step, cid):
+    return StepContext.for_computation(
+        c, step=step, indices=tuple(schedule(step, c.n_s, len(D))), h_D=b"\0" * 32,
+        n_records=len(D), prev_w_hashes=w_hashes, chain_check_id=cid, k=K)
+
+
+def test_check_7_reports_the_first_bad_w_t_leaf_as_a_loop_does(c, D, tree, w0, hash_threads):
+    """Whatever pair of mismatch, read error, validation error and non-finite leaf two W_t
+    slots hold, check 7 (and check 0 in its slot) gives the old leaf-by-leaf loop's rejection:
+    same check id, kind and detail. An error at a later leaf than a mismatch never shows."""
+    store, out = _store(c, D, tree, w0, 1)
+    names = c.weight_names
+    a, b = c.w_t_index(names[1]), c.w_t_index(names[-2])
+    wa, wb = out.w_t[names[1]], out.w_t[names[-2]]
+    kinds = {
+        "mismatch": {a: wa + 1.0, b: wb + 1.0},
+        "nan": {a: wa.clone().fill_(float("nan")), b: wb.clone().fill_(float("inf"))},
+        "shape": {a: wa.reshape(1, -1), b: wb.reshape(1, -1)},
+        "object": {a: "W", b: "W"},
+    }
+    hashes = tuple(leaf_hash(c, c.w_t_index(n), out.w_t[n]) for n in names)
+    n_cases = 0
+    for first in [*kinds, "missing"]:
+        for second in [*kinds, "missing"]:
+            leaves = {}
+            if first != "missing":
+                leaves[a] = kinds[first][a]
+            if second != "missing":
+                leaves[b] = kinds[second][b]
+            bad = a if first == "missing" else (b if second == "missing" else None)
+
+            def make():
+                return (Unreadable(store, bad, leaves=leaves) if bad is not None
+                        else Wrapped(store, leaves=leaves))
+
+            for step, cid in ((1, "0"), (2, "7")):
+                got = CHECKS["7"](make(), c, _chain_ctx(c, D, hashes, step, cid),
+                                  Bands.provisional())
+                want = _serial_check_7(make(), c, _chain_ctx(c, D, hashes, step, cid),
+                                       Bands.provisional())
+                assert isinstance(want, Rejection), (first, second)
+                assert got == want, (cid, first, second)
+                n_cases += 1
+    assert n_cases == 50
+
+
+def test_check_7_records_every_w_t_hash_for_check_2(c, D, tree, w0, hash_threads):
+    store, out = _store(c, D, tree, w0, 1)
+    hashes = tuple(leaf_hash(c, c.w_t_index(n), out.w_t[n]) for n in c.weight_names)
+    ctx = _chain_ctx(c, D, hashes, 2, "7")
+    assert CHECKS["7"](store, c, ctx, Bands.provisional()) is None
+    assert ctx.state.early_hashes == {c.w_t_index(n): h for n, h in zip(c.weight_names, hashes)}
+
+
+def test_mutation_by_a_later_read_rejected_at_7(c, D, tree, w0, parallel):
+    """A store whose read of a later W_t leaf writes in place into one it already served: the
+    earlier leaf may be hashed after the write, so check 7 (here check 0) rejects it as
+    malformed."""
+    store, _ = _store(c, D, tree, w0, 1)
+    a = c.w_t_index(c.weight_names[0])
+    ya = store.leaf(a)
+
+    class MutatingRead(Wrapped):
+        def leaf(self, index):
+            if index == c.w_t_index(c.weight_names[-1]):
+                ya.mul_(2.0)
+            return super().leaf(index)
+
+    rej = _verifier(c, D, tree, w0).verify_step(1, MutatingRead(store))
+    _expect(rej, 1, "0", "malformed")
+    assert rej.detail == f"leaf {a} changed in place during check 0"

@@ -14,15 +14,15 @@ the leaf (``checks.py`` docstring, "Errors").
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
 from setup.records import Record
-from verification.commitment.leaves import leaf_hash
+from verification.commitment.leaves import leaf_hash, leaf_hashes_of, leaf_hashes_until_error
 from verification.commitment.merkle import DIGEST_SIZE
 from verification.parameters import UNIT_ROUNDOFF
 from verification.transcript.errors import (
@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "PROVER_DATA_ERRORS",
+    "Section",
+    "no_section",
     "Rejection",
     "RejectionKind",
     "ProductStat",
@@ -45,6 +47,17 @@ __all__ = [
     "StepContext",
     "CommittedLeaves",
 ]
+
+# A metrics seam (B6, ``runs/metrics.py``): ``section(name)`` wraps one part of a check. It
+# observes only; with ``None`` the checks run exactly as without it. ``prover/step.py`` declares
+# the same alias: the verifier may not import from the prover (invariant 1, test_layering.py).
+Section = Callable[[str], AbstractContextManager[Any]]
+_NO_SECTION = nullcontext()
+
+
+def no_section(name: str) -> AbstractContextManager[Any]:
+    """The seam when no metrics are taken: a shared no-op context manager."""
+    return _NO_SECTION
 
 # Every error the TranscriptStore docstring lists: TranscriptFormatError and its subclasses,
 # EncodingError, NonFiniteError and encode_record's ValueError (RecordError for a token
@@ -136,6 +149,27 @@ def _hash(c: DeclaredComputation, index: int, obj: Any) -> bytes:
     return leaf_hash(c, index, obj)
 
 
+def _typed(items: Iterable[tuple[int, Any]]) -> Iterator[tuple[int, Any]]:
+    for i, obj in items:
+        _leaf_tensors(obj)
+        yield i, obj
+
+
+def _hashes(c: DeclaredComputation, items: Iterable[tuple[int, Any]]) -> list[bytes]:
+    """:func:`_hash` of each ``(index, obj)``, in order, hashed in parallel
+    (``leaf_hashes_of``). The type check runs with the validation, so the first error is
+    the one a ``_hash`` loop raises first."""
+    return leaf_hashes_of(c, _typed(items))
+
+
+def _hashes_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
+                        ) -> tuple[list[bytes], Exception | None]:
+    """:func:`_hashes` up to the first error, which is returned, not raised
+    (``leaf_hashes_until_error``): the digests before it and the error a ``_hash`` loop
+    raises first, or ``None``."""
+    return leaf_hashes_until_error(c, _typed(items))
+
+
 class CommittedLeaves:
     """The leaves check 2 hashed, served to every later check (a ``LeafReader``).
 
@@ -200,6 +234,11 @@ class StepContext:
     judge: bool = True  # False: calibration mode (P10b); checks 5 and 6 record, never judge
     state: StepState = field(default_factory=StepState)
     stats: StepStats = field(default_factory=StepStats)
+    section: Section | None = None  # B6 metrics seam; None runs the checks unobserved
+
+    def timed(self, name: str) -> AbstractContextManager[Any]:
+        """``section(name)``, or a no-op when no metrics seam is set."""
+        return _NO_SECTION if self.section is None else self.section(name)
 
     @classmethod
     def for_computation(cls, c: DeclaredComputation, **kw: Any) -> StepContext:

@@ -77,3 +77,33 @@ def test_payload_rejects_noncontiguous_and_bad_dtype():
         tensor_leaf_payload(torch.zeros(3, dtype=torch.float64))
     with pytest.raises(EncodingError):
         tensor_leaf_header(TAG_RECORD, torch.zeros(3))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_finiteness_check_matches_isfinite_everywhere(dtype):
+    """The finiteness check (numpy max and min for fp32 and fp16, aminmax for bf16) flags a NaN
+    or ±Inf at every position, including the scalar tails of vectorized loops, and accepts
+    finite tensors with extreme magnitudes, empty and 0-d ones."""
+    big = torch.finfo(dtype).max
+    for n in [*range(1, 70), 257, 4099]:
+        base = torch.randn(n).to(dtype)
+        base[0], base[-1] = big, -big
+        tensor_leaf_payload(base)
+        for i in range(n):
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                t = base.clone()
+                t[i] = bad
+                assert not bool(torch.isfinite(t).all())
+                with pytest.raises(NonFiniteError):
+                    tensor_leaf_payload(t)
+    for ok in (torch.zeros(0, dtype=dtype), torch.zeros(3, 0, dtype=dtype),
+               torch.tensor(-0.0, dtype=dtype)):
+        assert tensor_leaf_payload(ok).nbytes == ok.numel() * ok.element_size()
+    with pytest.raises(NonFiniteError):
+        tensor_leaf_payload(torch.tensor(float("nan"), dtype=dtype))
+    # A NaN with a payload or a sign bit, not only the default quiet NaN.
+    for bits in (0x7F800001, 0x7FC00000, 0x7FFFFFFF, -1, -0x00400000):
+        t = torch.zeros(300, dtype=torch.int32)
+        t[150] = bits
+        with pytest.raises(NonFiniteError):
+            tensor_leaf_payload(t.view(torch.float32))

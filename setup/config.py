@@ -41,6 +41,7 @@ _DEFAULTS: dict[str, str] = {
     "VERIF_THREADS": "8",
     "VERIF_SEED": "0",
     "VERIF_OUTPUT_DIR": "trainer_output/verification",
+    "VERIF_METRICS": "1",
 }
 
 
@@ -62,6 +63,7 @@ class RunConfig:
     threads: int
     seed: int
     output_dir: Path
+    metrics: bool  # B6: write the cost, count and residual tables (runs/metrics.py)
 
     @property
     def data_dir(self) -> Path:
@@ -130,6 +132,13 @@ def _attn_impl(env: Mapping[str, str]) -> str:
     return raw
 
 
+def _bool(env: Mapping[str, str], name: str) -> bool:
+    raw = _str(env, name)
+    if raw not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
+
 def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
     """Build the config from `env` (default `os.environ`). Unset vars take test-scale defaults."""
     env = os.environ if env is None else env
@@ -150,6 +159,7 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
         threads=_int(env, "VERIF_THREADS", 1),
         seed=_int(env, "VERIF_SEED", 0),
         output_dir=Path(_str(env, "VERIF_OUTPUT_DIR")),
+        metrics=_bool(env, "VERIF_METRICS"),
     )
 
 

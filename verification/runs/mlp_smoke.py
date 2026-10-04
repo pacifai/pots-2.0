@@ -1,6 +1,6 @@
 """Milestone M1: the MLP smoke run, an honest run plus three faults, each with its oracle.
 
-    .venv/bin/python -m verification.runs.mlp_smoke [--steps T]
+    .venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]
 
 The degenerate MLP instance (ref block §9), widths ``(16, 32, 32, 8)``, ``n_s = 4``, ``η`` from
 ``VERIF_ETA`` (1e-3, fixed by declaration, S8e), on a synthetic dataset of ``VERIF_N_RECORDS``
@@ -21,20 +21,25 @@ FAIL: an honest rejection, or a fault rejected at another check or not at all.
   poisoned dataset.
 
 Bands are provisional (``allow_provisional=True``): this is a smoke run, not a judged cheat
-run (P10a). Exits 1 if any oracle fails.
+run (P10a). Exits 1 if any oracle fails. The harness (scenarios, the oracle, the report) is
+``runs/scenarios.py``.
+
+With metrics on (``--metrics``, default ``VERIF_METRICS=1``), every scenario's timed run writes
+its step records, per-component times and residual arrays to ``$VERIF_OUTPUT_DIR/mlp_smoke/``
+(B6, ``runs/metrics.py``). Two separate passes of ``PASS_STEPS`` honest steps each, never timed, write the
+per-component memory peaks and the counts (FLOPs, bytes hashed, hash calls, transcript bytes).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from setup import data
 from setup.config import load_config, setup_determinism
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
@@ -45,54 +50,28 @@ from verification.computation.instances.mlp import (
 )
 from verification.parameters import load_protocol_config
 from verification.prover.step import StepOutput, plain_step
-from verification.runs.loop import LoopResult, ProverFault, StepRecord, run_loop
-from verification.verifier.bands import Bands
-from verification.verifier.checks import DEFAULT_ORDER
-from verification.verifier.context import Rejection
-from verification.verifier.driver import Verifier
+from verification.runs.loop import ProverFault
+from verification.runs.metrics import PASS_STEPS, MetricsWriter
+from verification.runs.scenarios import (
+    HONEST,
+    Expected,
+    Scenario,
+    ScenarioResult,
+    count_run,
+    honest_final,
+    memory_run,
+    report,
+    run_scenario,
+)
 
-__all__ = ["Expected", "Scenario", "ScenarioResult", "scenarios", "honest_final",
-           "run_scenario", "run_smoke", "main"]
+__all__ = ["scenarios", "run_smoke", "memory_smoke", "count_smoke", "main"]
+
+RUN_NAME = "mlp_smoke"  # the metrics directory under VERIF_OUTPUT_DIR
 
 N_S = 4
 FAULT_STEP = 2  # flip and forged W_{t+1}
 CHAIN_STEP = 2  # the first step after the hidden one (P11)
 ULPS = 300
-
-
-@dataclass(frozen=True)
-class Expected:
-    """A declared outcome: ``step is None`` means the run is accepted."""
-
-    step: int | None = None
-    check_id: str | None = None
-    kind: str | None = None
-
-    def __str__(self) -> str:
-        if self.step is None:
-            return "accept"
-        return f"reject at ({self.step}, {self.check_id!r}, {self.kind})"
-
-
-@dataclass(frozen=True)
-class Scenario:
-    name: str
-    description: str
-    fault: ProverFault
-    expected: Expected
-
-
-@dataclass
-class ScenarioResult:
-    scenario: Scenario
-    loop: LoopResult
-    verifier: Verifier
-    passed: bool
-
-    @property
-    def actual(self) -> Expected:
-        rej = self.loop.rejection
-        return Expected() if rej is None else Expected(rej.step, rej.check_id, rej.kind)
 
 
 # ---- the faults (prover side only, invariant 5) -----------------------------------------
@@ -165,7 +144,7 @@ def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
     other = _other_batch(dataset, c.n_s)
     m = c.m_of("Y_2")
     return [
-        Scenario("honest", "no fault", ProverFault(), Expected()),
+        HONEST,
         Scenario("flip", f"largest entry of P_{m} (Y_2) sign-flipped after capture at step "
                          f"{FAULT_STEP}", FlipProduct(FAULT_STEP, m),
                  Expected(FAULT_STEP, "5", "failed")),
@@ -182,71 +161,16 @@ def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
     ]
 
 
-# ---- running and judging ----------------------------------------------------------------
-
-
-def honest_final(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-                 T: int) -> dict[str, torch.Tensor]:
-    """The agreed final weights: ``T`` uncaptured honest steps from ``W_0`` on ``π``."""
-    model, w = c.build_model(), dict(w0)
-    for t in range(1, T + 1):
-        w, _ = plain_step(c, model, w, [dataset[i] for i in data.schedule(t, c.n_s, len(dataset))])
-    return w
-
-
-def judge(expected: Expected, loop: LoopResult, T: int) -> bool:
-    """The S6b oracle: the run ends exactly at its declared outcome."""
-    v = loop.verdict
-    if expected.step is None:
-        return v.accepted and v.rejection is None and v.steps_verified == T
-    rej = v.rejection
-    return (not v.accepted and rej is not None
-            and (rej.step, rej.check_id, rej.kind) == (expected.step, expected.check_id,
-                                                       expected.kind))
-
-
-def run_scenario(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-                 scenario: Scenario, *, T: int, k: int, final: Mapping[str, torch.Tensor],
-                 on_step: Callable[[StepRecord], None] | None = None) -> ScenarioResult:
-    v = Verifier(c, h_D=dataset_tree(c, dataset).root, n_records=len(dataset), k=k, n_steps=T,
-                 bands=Bands.provisional(), w0=w0, allow_provisional=True)
-    loop = run_loop(c, c.build_model(), dataset, w0, v, final=final, fault=scenario.fault,
-                    on_step=on_step)
-    return ScenarioResult(scenario, loop, v, judge(scenario.expected, loop, T))
-
-
-def _fmt(x: float | None, width: int, spec: str = ".3g") -> str:
-    return ("-" if x is None else format(x, spec)).rjust(width)
-
-
-def report(r: ScenarioResult, out: Callable[[str], None] = print) -> None:
-    """The scenario's oracle, then per step: check 5's max normalized residual and max κ,
-    check 6a's ρ_max, the prover's time and each check's time."""
-    s, v = r.scenario, r.verifier
-    out(f"== {s.name}: {s.description}")
-    out(f"   expected: {s.expected}")
-    rej = r.loop.rejection
-    out(f"   actual:   {r.actual}" + ("" if rej is None else f": {rej.detail}"))
-    ids = [("0/7" if c == "7" else c) for c in DEFAULT_ORDER]
-    out("   step  max-norm-res  max-κ  ρ_max(6a) |  prove commit |"
-        + "".join(f"{i:>7}" for i in ids) + "   (ms; check 0 runs in 7's slot at step 1)")
-    for rec in r.loop.steps:
-        st = v.stats.get(rec.t)
-        products = st.products if st else []
-        rhos = [x.rho_max for x in st.tensors if x.check_id == "6a"] if st else []
-        tm = v.timings.get(rec.t, {})
-        out(f"   {rec.t:>4}  {_fmt(st.max_normalized() if st and products else None, 12)}"
-            f"  {_fmt(st.max_kappa() if st and products else None, 5)}"
-            f"  {_fmt(max(rhos) if rhos else None, 9)} |"
-            f" {rec.prove_s * 1e3:6.2f} {rec.commit_s * 1e3:6.2f} |"
-            + "".join(_fmt(tm[c] * 1e3 if c in tm else None, 7, ".2f") for c in DEFAULT_ORDER))
-    out("   run checks: " + ", ".join(f"{c} {t * 1e3:.2f} ms" for c, t in v.run_timings.items()))
-    out(f"   {'PASS' if r.passed else 'FAIL'}")
+# ---- running -----------------------------------------------------------------------------
 
 
 def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
               T: int, k: int, out: Callable[[str], None] = print,
-              only: Sequence[str] | None = None) -> list[ScenarioResult]:
+              only: Sequence[str] | None = None,
+              metrics: MetricsWriter | None = None) -> list[ScenarioResult]:
+    """Run each scenario and report it. With ``metrics``, each scenario's timed run writes its
+    records there, then the memory pass (:func:`memory_smoke`) and the counting pass
+    (:func:`count_smoke`) write theirs."""
     if T < CHAIN_STEP:
         raise ValueError(f"T = {T}: the broken-chain scenario needs T ≥ {CHAIN_STEP}")
     final = honest_final(c, dataset, w0, T)
@@ -254,19 +178,44 @@ def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
     for s in scenarios(c, dataset):
         if only is not None and s.name not in only:
             continue
-        r = run_scenario(c, dataset, w0, s, T=T, k=k, final=final)
+        rec = None if metrics is None else metrics.recorder(s.name)
+        r = run_scenario(c, dataset, w0, s, T=T, k=k, final=final, recorder=rec)
         report(r, out)
         results.append(r)
     passed = sum(r.passed for r in results)
     out(f"{passed}/{len(results)} scenarios passed")
+    if metrics is not None:
+        metrics.write(memory_smoke(c, dataset, w0, k=k, device=metrics.device, run=metrics.run))
+        metrics.write(count_smoke(c, dataset, w0, k=k, run=metrics.run))
+        out(f"metrics: {metrics.dir}")
     return results
+
+
+def memory_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
+                 k: int, device: str | torch.device = "cpu",
+                 run: str = RUN_NAME) -> list[dict[str, Any]]:
+    """The B6 memory pass: per-component peaks over ``PASS_STEPS`` honest steps (check 0 at step
+    1, check 7 at step 2), run on their own, never timed."""
+    return memory_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k,
+                      final=honest_final(c, dataset, w0, PASS_STEPS), device=device)
+
+
+def count_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
+                k: int, run: str = RUN_NAME) -> list[dict[str, Any]]:
+    """The B6 counting pass: counts over ``PASS_STEPS`` honest steps, never timed."""
+    return count_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k,
+                     final=honest_final(c, dataset, w0, PASS_STEPS))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=None, help="T, at least 2 (default: VERIF_STEPS)")
+    p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
+                   help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/ "
+                        "(default: VERIF_METRICS)")
     args = p.parse_args(argv)
     cfg = load_config()
+    use_metrics = cfg.metrics if args.metrics is None else args.metrics
     k = load_protocol_config().k
     T = args.steps if args.steps is not None else cfg.steps
     if T < CHAIN_STEP:
@@ -277,7 +226,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     w0 = init_weights(c.widths, seed=cfg.seed)
     print(f"MLP smoke: widths {c.widths}, n_s {c.n_s}, η {c.eta:g}, k {k}, T {T}, "
           f"|D| {len(dataset)}, M {c.M}, {c.n_leaves} leaves, bands provisional")
-    results = run_smoke(c, dataset, w0, T=T, k=k)
+    if not use_metrics:
+        results = run_smoke(c, dataset, w0, T=T, k=k)
+    else:
+        mlp = {"widths": list(c.widths), "n_s": c.n_s, "eta": c.eta, "k": k, "T": T,
+               "n_records": len(dataset), "M": c.M, "n_leaves": c.n_leaves}
+        # The config hash covers what decides the run's results, not where it writes.
+        config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
+                     if f.name not in ("output_dir", "metrics")}, "mlp": mlp}
+        # Bands are provisional, so there is no band file.
+        with MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
+                           model="mlp", corpus="synthetic", seed=cfg.seed, config=config,
+                           band_file_hash=None, h_D=dataset_tree(c, dataset).root,
+                           extra={"band_source": "provisional", **mlp}) as mw:
+            results = run_smoke(c, dataset, w0, T=T, k=k, metrics=mw)
     return 0 if all(r.passed for r in results) else 1
 
 
