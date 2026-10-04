@@ -337,7 +337,9 @@ interface.
     drops it after its last use. `glue_gradients()` is valid only after `operands(1..M)` in
     order.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
-    imports the prover.
+    imports the prover. So is `snapshot_weights(computation, model)`, the one way to copy the
+    declared weights out of a model: the prover's `W_t`/`W_{t+1}` leaves and every run's `W_0`
+    (from a freshly built model). A12 must take `W_0` with it, as B7 does.
 - `matmul_ops.py`: `HANDLED_OPS` (`mm`, `bmm`, `addmm`, `baddbmm`), `REJECTED_OPS` (every
   other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
   (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (empty) and `param_storage_map(model)`. Shared by
@@ -680,9 +682,12 @@ interface.
     memory figures are compared: otherwise freed large blocks stay in the footprint.
   - `metrics_overhead.py`: `.venv/bin/python -m verification.runs.metrics_overhead
     [--reps N] [--steps T] [--widths ...]`, an off/on/off timing of the honest MLP run.
+  - `PASS_STEPS = 2`: every run's memory and counting passes. Step 1 has check 0's anchor and
+    first-touch allocation; step 2 is the first check-7 step and steady-state memory. Counts
+    are deterministic, so the report takes one step's counts.
   - `mlp_smoke` writes to `mlp_smoke/` unless `--no-metrics` or `VERIF_METRICS=0`; its memory
-    and counting passes are two honest steps each, of their own. The MLP records `h_D` (its
-    synthetic `D`'s root) and a null band-file hash.
+    and counting passes are `PASS_STEPS` honest steps each, of their own. The MLP records
+    `h_D` (its synthetic `D`'s root) and a null band-file hash.
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
   `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
   `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored. Rerun it with
@@ -690,23 +695,41 @@ interface.
 - `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
   [--steps T] [--pass-steps S] [--metrics | --no-metrics]`. The honest run's training with
   capture and every protocol step off.
-  - Same `W_0` (`initial_weights(c, c.build_model())`, the model `LlamaComputation.from_config`
-    loads), same `π` over `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`.
+  - Same `W_0` (`snapshot_weights(c, c.build_model())`, the model
+    `LlamaComputation.from_config` loads; A12 must take its `W_0` the same way), same `π` over
+    `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`.
   - Training is `loop.run_plain(c, model, D, w0, *, n_steps, schedule=None, on_step=None,
     section=None) -> PlainResult(steps, w_final)`: chained `plain_step`s on `run_loop`'s
     default `π`, no tree, paths, commitment or verifier. `mlp_smoke.honest_final` uses it too.
-  - `plain_baseline(c, D, w0, *, T, build_model, out_dir=None, metrics=None, pass_steps=2)`.
+    `PlainStepRecord.train_s` is host time around the step, informational; P0's times are
+    the `P0.*` rows.
+  - `plain_baseline(c, D, w0, *, T, build_model, out_dir=None, metrics=None,
+    pass_steps=PASS_STEPS, provenance=None, keep_weights=True, out=print) -> BaselineResult`.
     With a `MetricsWriter`, scenario `plain`: the timed run's `P0.*` rows per step, then a
-    memory pass and a counting pass of the first `pass_steps` steps (each with its own model).
-    No `step` or `verdict` record. Writes to `$VERIF_OUTPUT_DIR/plain_baseline/`.
+    memory pass and a counting pass of the first `pass_steps` steps (each with its own model;
+    the final weights are dropped first when `keep_weights=False`, as `main` does). P0 memory
+    is printed as the step's growth, peak of `P0.backward` minus start of `P0.forward`. No
+    `step` or `verdict` record. Writes to `$VERIF_OUTPUT_DIR/plain_baseline/`. With metrics
+    on, on macOS, `main` warns if `MallocLargeCache` isn't `0`.
   - `final_weights.json` (written with metrics on or off): each `W_{T+1}` tensor's leaf hash
-    under tag `0x02` (equal ⇔ bit-identical, `-0.0` included) and their Merkle root.
-    `assert_same_final_weights(c, plain, verified)` takes a file or directory, a hash mapping
-    or the weights (`LoopResult.w_final`) on either side; A12 calls it against this file.
+    under tag `0x02` (equal ⇔ bit-identical, `-0.0` included), their Merkle root, and the
+    provenance: `w0_root` (the root over `W_0`'s leaf hashes, the ones check 0 anchors on),
+    `h_D`, `eta`, `steps`, `model`, `model_revision`, `threads`, `config_hash` (of
+    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics` and `steps`) and
+    `losses` (per step). `run_provenance(cfg, h_D)` gives the config side;
+    `write_final_weights(path, c, w, *, w0, losses, provenance=None, run=...)` writes it.
+  - `assert_same_final_weights(c, plain, verified)` takes a file or directory, a hash mapping
+    or the weights (`LoopResult.w_final`) on either side; A12 calls it against this file. Each
+    side must name exactly `c.weight_names`, and a map mixing tensors and strings is a
+    `TypeError`. With two files it compares the provenance first and names the mismatch
+    ("different start", "different η", "different loss at step t", …;
+    `provenance_mismatches`), then the tensors.
   - `capture_rows(verified, plain, *, scenario="honest")`: P1 rows from the two runs'
-    `records.jsonl` through `derive_capture`. Steps match by number, so the verified run's
-    passes must cover the plain passes' steps.
-  - A real SmolLM2 4×128 step, fp32 on the Mac CPU: P0 about 0.73 s (forward 0.23, backward
-    0.42, load and update 0.02 each), 426.7 GFLOP (142.2 forward, 284.5 backward), and the
-    step grows the footprint by about 0.70 GB (peak of backward minus start of forward).
+    `records.jsonl` through `derive_capture`, at analysis time; derived rows are never
+    written into a run's records. Steps match by number; a plain-run step with no verified
+    counterpart gets no row and a `UserWarning`.
+  - A real SmolLM2 4×128 step, fp32 on the Mac CPU with `MallocLargeCache=0`: P0 about 0.73 s
+    (forward 0.23, backward 0.42, load and update 0.02 each), 426.7 GFLOP (142.2 forward,
+    284.5 backward), and the step grows the footprint by 0.75 GB (peak of backward minus
+    start of forward; steps 1 and 2 alike).
 - Later: `calibration.py`, `run_verified.py` and the other runs.

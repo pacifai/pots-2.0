@@ -54,6 +54,7 @@ from verification.runs.loop import LoopResult, ProverFault, StepRecord, run_loop
 from verification.runs.metrics import (
     CountRecorder,
     MemoryRecorder,
+    PASS_STEPS,
     MetricsWriter,
     TimeRecorder,
     count_pass,
@@ -300,8 +301,9 @@ def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
 
 def _two_honest_steps(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
                       k: int) -> Callable[[Any], Any]:
-    """A pass's body: two honest steps (check 0 at step 1, check 7 at step 2), run on its own."""
-    T = CHAIN_STEP
+    """A pass's body: ``PASS_STEPS`` honest steps (check 0 at step 1, check 7 at step 2), run on
+    its own."""
+    T = PASS_STEPS
     final = honest_final(c, dataset, w0, T)
     honest = next(s for s in scenarios(c, dataset) if s.name == "honest")
     return lambda rec: run_scenario(c, dataset, w0, honest, T=T, k=k, final=final, recorder=rec)

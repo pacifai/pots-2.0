@@ -2,13 +2,17 @@
 and P1 derived from a plain-run file and a verified-run file."""
 
 import json
+import sys
+import warnings
 
 import pytest
 import torch
 
 from tests.verification.computation.test_llama import make_records, tiny_config
 from verification.commitment.leaves import dataset_tree
+from setup.data import encode_records_file
 from verification.computation.instances import LlamaComputation
+from verification.computation.interface import snapshot_weights
 from verification.computation.instances.mlp import (
     MLPComputation,
     init_weights,
@@ -36,7 +40,7 @@ def llama():
     n = 12
     c = LlamaComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
     D = make_records([n, n - 3, n - 5, n, n - 1, n - 4, n - 2, n], seed=1)
-    return c, D, pb.initial_weights(c, c.build_model())
+    return c, D, snapshot_weights(c, c.build_model())
 
 
 def _verified(c, D, w0, T, final):
@@ -84,6 +88,25 @@ def test_comparison_catches_one_ulp(mlp):
     with pytest.raises(AssertionError):
         pb.assert_same_final_weights(c, zero, neg)
     assert pb.weight_mismatches({"a": "1", "b": "2"}, {"a": "1", "c": "3"}) == ["b", "c"]
+
+
+def test_comparison_requires_the_declared_names(mlp):
+    """No vacuous pass: each side must name exactly c.weight_names; mixed maps are a TypeError."""
+    c, D, w0 = mlp
+    h = pb.final_weight_hashes(c, w0)
+    pb.assert_same_final_weights(c, h, w0)
+    with pytest.raises(AssertionError, match="not the computation's"):
+        pb.assert_same_final_weights(c, {}, {})
+    short = dict(list(h.items())[:-1])
+    with pytest.raises(AssertionError, match="not the computation's"):
+        pb.assert_same_final_weights(c, short, short)
+    with pytest.raises(AssertionError, match="not the computation's"):
+        pb.assert_same_final_weights(c, h, {**h, "extra": h[c.weight_names[0]]})
+    mixed = {**h, c.weight_names[0]: w0[c.weight_names[0]]}
+    with pytest.raises(TypeError, match="mixes"):
+        pb.assert_same_final_weights(c, mixed, h)
+    with pytest.raises(TypeError):
+        pb.assert_same_final_weights(c, h, {n: 1 for n in h})
 
 
 def test_hashes_are_w_next_leaf_hashes(llama):
@@ -140,11 +163,64 @@ def test_p0_rows_per_step(mlp_files):
 
 def test_final_weights_file(mlp_files, mlp):
     root, res, smoke = mlp_files
-    c, _, _ = mlp
+    c, _, w0 = mlp
     doc = json.loads((root / "plain" / pb.WEIGHTS_FILE).read_text())
     assert doc["steps"] == 3 and list(doc["hashes"]) == list(c.weight_names)
-    assert pb.read_final_weights(root / "plain") == res.hashes
+    assert doc["losses"] == [s.loss for s in res.plain.steps]
+    assert doc["eta"] == c.eta and doc["leaf_tag"] == 0x02
+    assert doc["w0_root"] == pb.weights_root(pb.final_weight_hashes(c, w0))
+    assert doc["h_D"] is None and doc["config_hash"] is None  # no provenance passed
+    assert pb.read_final_weights(root / "plain")["hashes"] == res.hashes
     pb.assert_same_final_weights(c, root / "plain", smoke.loop.w_final)
+
+
+def test_w0_root_is_check_0s_anchor(mlp):
+    """W_0's root is over the hashes the verifier's check 0 anchors on."""
+    c, D, w0 = mlp
+    v = Verifier(c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=1,
+                 bands=Bands.provisional(), w0=w0, allow_provisional=True)
+    assert [bytes.fromhex(h) for h in pb.final_weight_hashes(c, w0).values()] == \
+           list(v.weight_hashes(w0))
+
+
+def test_files_compare_provenance_first(mlp, tmp_path):
+    """Two files: a provenance mismatch is named before any tensor is compared."""
+    c, D, w0 = mlp
+    res = run_plain(c, c.build_model(), D, w0, n_steps=2)
+    losses = [s.loss for s in res.steps]
+    prov = {"model": "m", "model_revision": "r", "threads": 1, "config_hash": "ab", "h_D": "cd"}
+
+    def write(name, w=res.w_final, start=w0, ls=losses, comp=c, **kw):
+        path = tmp_path / name
+        pb.write_final_weights(path, comp, w, w0=start, losses=ls, provenance={**prov, **kw})
+        return path
+
+    a = write("a.json")
+    pb.assert_same_final_weights(c, a, write("same.json"))
+    other_w0 = init_weights(c.widths, seed=1)
+    cases = {
+        "different start": write("w0.json", start=other_w0),
+        "different data": write("hd.json", h_D="ef"),
+        "different η": write("eta.json", comp=MLPComputation(c.widths, n_s=4, eta=2e-3)),
+        "different model revision": write("rev.json", model_revision="s"),
+        "different threads": write("thr.json", threads=8),
+        "different training config": write("cfg.json", config_hash="00"),
+        "different loss at step 2": write("loss.json", ls=[losses[0], losses[1] + 1.0]),
+        "different step count": write("steps.json", ls=losses[:1]),
+    }
+    for why, path in cases.items():
+        with pytest.raises(AssertionError, match=why):
+            pb.assert_same_final_weights(c, a, path)
+    # same provenance, one tensor changed: the tensor comparison names it
+    w = {n: t.clone() for n, t in res.w_final.items()}
+    w[c.weight_names[0]].view(-1)[0] += 1.0
+    with pytest.raises(AssertionError, match="differ in 1 tensors"):
+        pb.assert_same_final_weights(c, a, write("w.json", w=w))
+    # a file against tensors compares tensors only
+    pb.assert_same_final_weights(c, a, res.w_final)
+    with pytest.raises(ValueError, match="unknown provenance"):
+        pb.write_final_weights(tmp_path / "x.json", c, w, w0=w0, losses=losses,
+                               provenance={"seed": 0})
 
 
 def test_capture_rows_from_two_files(mlp_files):
@@ -158,7 +234,22 @@ def test_capture_rows_from_two_files(mlp_files):
     # capture observes; it adds no arithmetic
     assert all(r["flops"] == 0 for r in rows if r["record"] == "count")
     assert all(r["peak_bytes"] is not None for r in rows if r["record"] == "memory")
-    assert pb.capture_rows(root / "verified", root / "plain", scenario="flip") == []
+    with pytest.warns(UserWarning, match="no verified counterpart"):
+        assert pb.capture_rows(root / "verified", root / "plain", scenario="flip") == []
+
+
+def test_capture_rows_warns_on_unmatched_plain_steps(mlp_files, tmp_path):
+    root, _, _ = mlp_files
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pb.capture_rows(root / "verified", root / "plain")  # every plain step is matched
+    lines = (root / "verified" / "records.jsonl").read_text().splitlines()
+    keep = [ln for ln in lines
+            if not (json.loads(ln)["record"] == "memory" and json.loads(ln).get("step") == 2)]
+    (tmp_path / "records.jsonl").write_text("\n".join(keep) + "\n")
+    with pytest.warns(UserWarning, match=r"memory steps \[2\]"):
+        rows = pb.capture_rows(tmp_path, root / "plain")
+    assert ("memory", 2) not in {(r["record"], r["step"]) for r in rows}
 
 
 def test_no_metrics_writes_only_weights(mlp, tmp_path):
@@ -169,6 +260,77 @@ def test_no_metrics_writes_only_weights(mlp, tmp_path):
     assert res.weights_file == tmp_path / pb.WEIGHTS_FILE
     with pytest.raises(ValueError, match="pass_steps"):
         pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, pass_steps=3)
+    res = pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, keep_weights=False,
+                            out=lambda s: None)
+    assert res.plain.w_final == {} and res.weights_file is None and res.hashes
+
+
+# ---- main --------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_main(monkeypatch, tmp_path, llama):
+    """main() on the tiny Llama: from_config patched, D.bin from the tiny records."""
+    c, D, _ = llama
+    monkeypatch.setattr(LlamaComputation, "from_config",
+                        classmethod(lambda cls, cfg: LlamaComputation(
+                            tiny_config(), n_s=2, n=c.n, eta=cfg.require_eta())))
+    monkeypatch.setattr(pb, "setup_determinism", lambda cfg: None)
+    monkeypatch.setenv("VERIF_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("VERIF_ETA", "1e-3")
+    monkeypatch.setenv("VERIF_STEPS", "3")
+    monkeypatch.delenv("VERIF_METRICS", raising=False)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "D.bin").write_bytes(encode_records_file(D))
+    return c, D, tmp_path
+
+
+def test_main_runs_with_and_without_metrics(tiny_main, monkeypatch, capsys, caplog):
+    c, D, root = tiny_main
+    out = root / pb.RUN_NAME
+    assert pb.main(["--no-metrics"]) == 0
+    assert sorted(p.name for p in out.iterdir()) == [pb.WEIGHTS_FILE]
+    doc = pb.read_final_weights(out)
+    assert doc["steps"] == 3 and len(doc["losses"]) == 3
+    assert doc["h_D"] == dataset_tree(c, D).root.hex() and doc["eta"] == 1e-3
+    assert doc["config_hash"] and doc["threads"] and doc["model_revision"]
+    plain = run_plain(c, c.build_model(), D, snapshot_weights(c, c.build_model()), n_steps=3)
+    pb.assert_same_final_weights(c, out, plain.w_final)
+    first = root / "first.json"
+    first.write_text((out / pb.WEIGHTS_FILE).read_text())
+
+    monkeypatch.delenv("MallocLargeCache", raising=False)
+    caplog.set_level("WARNING", logger=pb.__name__)
+    assert pb.main(["--steps", "2", "--pass-steps", "1", "--metrics"]) == 0
+    assert (sys.platform == "darwin") == any("MallocLargeCache" in m for m in caplog.messages)
+    rows = read_records(out)
+    assert {r["step"] for r in rows if r["record"] == "memory"} == {1}
+    assert {r["step"] for r in rows if r["record"] == "time"} == {1, 2}
+    assert pb.read_final_weights(out)["steps"] == 2
+    text = capsys.readouterr().out
+    assert "P0 memory growth" in text and "metrics: " in text
+    # the two runs' files differ in their step count, named before the tensors
+    with pytest.raises(AssertionError, match="different step count"):
+        pb.assert_same_final_weights(c, first, out)
+
+
+@pytest.mark.parametrize("argv, msg", [
+    (["--steps", "0"], "need T"),
+    (["--steps", "2", "--pass-steps", "3"], "need T"),
+    (["--pass-steps", "0"], "need T"),
+])
+def test_main_rejects_bad_steps(tiny_main, argv, msg, capsys):
+    with pytest.raises(SystemExit) as e:
+        pb.main(argv)
+    assert e.value.code == 2 and msg in capsys.readouterr().err
+
+
+def test_main_needs_d_bin(tiny_main, capsys):
+    _, _, root = tiny_main
+    (root / "data" / "D.bin").unlink()
+    with pytest.raises(SystemExit) as e:
+        pb.main(["--no-metrics"])
+    assert e.value.code == 2 and "materialize_data" in capsys.readouterr().err
 
 
 # ---- the real model ----------------------------------------------------------------------
@@ -191,7 +353,7 @@ def test_smollm2_plain_baseline_two_steps(tmp_path):
     setup_determinism(cfg)
     c = LlamaComputation.from_config(cfg)
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
-    w0 = pb.initial_weights(c, c.build_model())
+    w0 = snapshot_weights(c, c.build_model())
     lines: list[str] = []
     with MetricsWriter(tmp_path, pb.RUN_NAME, model=cfg.model) as mw:
         res = pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, metrics=mw,

@@ -249,7 +249,9 @@ replaced:
   Its timings, memory and FLOPs are EQ1b's P0, the baseline every overhead ratio divides by.
   Comparing them with a verified run's training rows gives the cost of capture (P1). It also
   saves the hash of every final weight tensor, so the honest verified run can show it ends on
-  the same weights bit for bit.
+  the same weights bit for bit. Beside the hashes it records what the run started from and how
+  it trained (the `W_0` root, `h_D`, `η`, the config hash, the losses), so a comparison of two
+  runs that didn't start from the same place fails by naming the difference.
 
 ## Workflow: verifying one step
 

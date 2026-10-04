@@ -186,7 +186,10 @@ def run_loop(
 
 @dataclass(frozen=True)
 class PlainStepRecord:
-    """One step of :func:`run_plain`: its loss and wall clock (seconds)."""
+    """One step of :func:`run_plain`: its loss and wall clock (seconds).
+
+    ``train_s`` is host ``perf_counter`` time around the whole ``plain_step``, informational
+    only; P0's reported times are B6's ``P0.*`` rows."""
 
     t: int
     loss: float

@@ -22,7 +22,7 @@ is a once-per-run section, reported at step 0. A section opened inside another i
 - the *counting pass* (:class:`CountRecorder`, :func:`count_pass`, :func:`counting`) counts
   FLOPs, bytes hashed, hash calls and transcript bytes.
 
-The two extra passes are runs of their own (two honest steps in the MLP smoke run), never timed.
+The two extra passes are runs of their own, :data:`PASS_STEPS` steps each, never timed.
 
 **Prover components (EQ1b).** EQ1b's P0 is training with no instrumentation, which only the
 plain baseline (B7) runs. A verified run trains under ``MatmulCapture``, so its training rows
@@ -150,7 +150,7 @@ from verification.verifier.checks import DEFAULT_ORDER
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 
 __all__ = [
-    "P0_PHASES", "TRAIN_PHASES", "COMPONENTS", "RECORD_TYPES",
+    "P0_PHASES", "TRAIN_PHASES", "PASS_STEPS", "COMPONENTS", "RECORD_TYPES",
     "MemoryProbe", "memory_probe",
     "TimeRecorder", "MemoryRecorder", "CountRecorder",
     "memory_pass", "count_pass", "counting",
@@ -169,6 +169,12 @@ COMPONENTS = ("P0", "train_captured", "P1", "P2", "P3", "P4", "P5")
 RECORD_TYPES = ("environment", "step", "verdict", "time", "memory", "count", "storage",
                 "run_end")
 RUN_PREFIX = "run:"
+# Steps in every run's memory and counting passes. Step 1 carries check 0's anchor and the
+# first-touch allocation of the run's buffers; step 2 is the first check-7 step and the first
+# in steady-state memory. Counts are deterministic, so a report takes one step's counts and two
+# steps suffice. The plain run's passes match the verified runs' step for step (derive_capture
+# pairs them by step number).
+PASS_STEPS = 2
 
 
 def _side(name: str) -> str:
