@@ -1449,7 +1449,8 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       with the count, and this protocol rejects with certainty at any count, a structural
       rather than statistical result that the paper states with the argument above as its proof.
     - *Rejected: 1, 2 and 3 hidden steps to mirror PoTS.* Three runs with an outcome identical by
-      construction. Whether evaluation wants such a row anyway is parked as E2. *Rejected:
+      construction. Whether evaluation wants such a row anyway was parked as E2, and closed as
+      `DECISIONS_EVALUATION.md` EQ17: one hidden step at both scales, no 1–3 row. *Rejected:
       replace the run with a unit test that perturbs weights between two steps.* Cheaper, but
       not the real pipeline and not the PoTS-comparable row, and the run costs 2 CPU steps.
   - **P11b — The hidden step trains on `b̃`.** The concealment story is secret training on
