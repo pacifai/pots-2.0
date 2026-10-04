@@ -63,6 +63,7 @@ reruns; the class docstring has the details.
 from __future__ import annotations
 
 import copy
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -105,6 +106,8 @@ _LINEAR_PATH = {
 _ATTN_BACKWARD = {"dA": ("O", "b"), "dV": ("O", "a"), "dQ": ("S", "b"), "dK": ("S", "a")}
 
 _E = "model.embed_tokens.weight"
+# A module's hook tables; any entry left on the verifier's reused model is a leak.
+_HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
 _GAMMA_FINAL = "model.norm.weight"
 
 
@@ -139,6 +142,11 @@ class LlamaComputation(DeclaredComputation):
         self.n_v = int(c.vocab_size)
         self._check_config()
         self.validate()
+        # The verifier's model, built once and reset for each replay (_replay_model); the
+        # prover never sees it.
+        self._vmodel: nn.Module | None = None
+        self._vbuffers: dict[str, torch.Tensor] = {}
+        self._vowner: weakref.ref[LlamaReplay] | None = None
 
     @classmethod
     def from_pretrained(cls, repo: str, revision: str, *, n_s: int, n: int,
@@ -395,6 +403,49 @@ class LlamaComputation(DeclaredComputation):
 
     def replay(self, leaves: LeafReader) -> LlamaReplay:
         return LlamaReplay(self, leaves)
+
+    def _replay_model(self, owner: LlamaReplay) -> nn.Module:
+        """The verifier's model for ``owner``, built on first use and reset on every reuse.
+
+        Building a model per step reloads it from disk (about 0.12 s for SmolLM2). Reuse keeps
+        the steps independent:
+
+        - every parameter gets fresh storage, so no tensor served by an earlier replay (a
+          linear's ``B`` is a view of its weight) aliases the next step's weights; the caller
+          then loads ``W_t`` into all of them (``load_weights`` requires full coverage);
+        - every buffer (the RoPE ``inv_freq``) is restored from its value at build time;
+        - a hook left on any module, a changed buffer set or a failed model check raises;
+        - the previous owner loses the model, so a stale replay can't run on another step's
+          weights.
+
+        Only :class:`LlamaReplay` calls this; the prover builds its own model.
+        """
+        model = self._vmodel
+        if model is None:
+            model = self._vmodel = self.build_model()
+            self._vbuffers = {n: b.detach().clone() for n, b in model.named_buffers()}
+        else:
+            prev = self._vowner() if self._vowner is not None else None
+            if prev is not None:
+                prev.model = None
+            hooked = [n or "<root>" for n, mod in model.named_modules()
+                      if any(getattr(mod, h) for h in _HOOK_DICTS)]
+            if hooked:
+                raise ReplayError(f"replay: hooks left on the verifier's model: {hooked[:3]}")
+            buffers = dict(model.named_buffers())
+            if buffers.keys() != self._vbuffers.keys():
+                raise ReplayError("replay: the verifier's model buffers changed")
+            with torch.no_grad():
+                for n, b in buffers.items():
+                    b.copy_(self._vbuffers[n])
+                for p in model.parameters():
+                    p.data = torch.empty_like(p)
+                    p.grad = None
+                    p.requires_grad_(True)
+            model.eval()
+            self._check_model(model)
+        self._vowner = weakref.ref(owner)
+        return model
 
     # ---- prover side ----------------------------------------------------------------------
 
@@ -717,7 +768,7 @@ class LlamaReplay(Replay):
     def __init__(self, computation: LlamaComputation, leaves: LeafReader) -> None:
         c = self.c = computation
         self.view = TranscriptView(c, leaves)
-        self.model = c.build_model()
+        self.model = c._replay_model(self)
         load_weights(c, self.model, {n: self.view.w_t(n) for n in c.weight_names})
         self._weight_of = param_storage_map(self.model)  # storage -> weight name
         self._role = {c.w(l, x): (l, x) for l in range(1, c.L + 1) for x in LINEARS}

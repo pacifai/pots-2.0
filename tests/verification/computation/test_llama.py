@@ -44,6 +44,15 @@ def run_capture(c, model, records):
     return cap
 
 
+@pytest.fixture(autouse=True)
+def _fresh_verifier_model(request):
+    """Tests plant hooks on ``replay.model``, and the reused verifier model then refuses the next
+    replay (as it must). Drop it after each test, so every test starts from a fresh build."""
+    yield
+    if "setup" in request.fixturenames:
+        request.getfixturevalue("setup")[0]._vmodel = None
+
+
 @pytest.fixture(scope="module", params=[(12, 8), (8, 8)], ids=["n12", "n_eq_dh"])
 def setup(request):
     n, head_dim = request.param
@@ -1069,3 +1078,48 @@ def test_smollm2_real_step_backward_replay_a9():
           f"build+load {t1 - t0:.1f}s, forward operands {t_fwd - t1:.1f}s, backward operands "
           f"{t2 - t_fwd:.1f}s, glue_gradients {t3 - t2:.2f}s; peak RSS {gb(rss):.2f} GB "
           f"({gb(rss_before):.2f} GB before the replay: capture, leaves, expected operands)")
+
+
+# ---- the verifier's reused model ---------------------------------------------------------------
+
+
+def test_reused_model_gives_the_same_operands(honest_all):
+    """A second replay reuses the model and serves every operand and glue gradient bit for bit
+    as a fresh build; the first replay's served weight views keep their values."""
+    c, leaves, expected, grads = honest_all
+    first = c.replay(ListReader(leaves))
+    a1, b1 = first.operands(c.m_of("L1.Y_q"))  # B is a view of W_q
+    b1_before = b1.clone()
+    model = first.model
+    # A step's weights differ: replay other leaves in between.
+    bumped = list(leaves)
+    i = c.w_t_index(c.w(1, "q"))
+    bumped[i] = _bump(leaves[i])
+    c.replay(ListReader(bumped)).operands(c.m_of("L1.Y_q"))
+    replay = c.replay(ListReader(leaves))
+    assert replay.model is model and first.model is None
+    assert torch.equal(b1, b1_before)  # fresh parameter storage: no aliasing across replays
+    for spec in c.products:
+        a, b = replay.operands(spec.m)
+        assert torch.equal(a, expected[spec.m][0]) and torch.equal(b, expected[spec.m][1])
+    got = replay.glue_gradients()
+    for n, g in got.items():
+        assert torch.equal(g, grads[n]), n
+
+
+def test_reused_model_restores_buffers_and_refuses_hooks(honest):
+    c, leaves, expected = honest
+    replay = c.replay(ListReader(leaves))
+    model = replay.model
+    name, buf = next(iter(model.named_buffers()))
+    with torch.no_grad():
+        buf.add_(1.0)  # a corrupted RoPE table
+    m = c.m_of("L1.S[0,0]")
+    again = c.replay(ListReader(leaves))
+    a, b = again.operands(m)
+    assert torch.equal(a, expected[m][0]) and torch.equal(b, expected[m][1]), name
+    handle = model.model.norm.register_forward_pre_hook(lambda mod, args: None)
+    with pytest.raises(ReplayError, match="hooks left"):
+        c.replay(ListReader(leaves))
+    handle.remove()
+    c.replay(ListReader(leaves))

@@ -401,6 +401,13 @@ interface.
     head, and `S`'s `B` must be equal across the query heads that share a kv head. The `δK̃`
     leaf is the contiguous transpose of the captured `Q̃ᵀ·δS`. Any unmatched, duplicate or
     missing record raises `LabelingError`.
+  - The verifier's model is built once per `LlamaComputation` and reused by every replay
+    (`_replay_model`; a build reloads the checkpoint, about 0.12 s). Each reuse gives every
+    parameter fresh storage before `load_weights` fills it from `W_t`, so no operand served
+    by an earlier replay (a linear's `B` is a view of its weight) aliases the new weights;
+    restores every buffer to its build-time value; raises `ReplayError` on any hook left on
+    a module or a changed buffer set; reruns the model checks; and takes the model away from
+    the previous replay (`.model = None`). The prover never gets this model.
   - `replay(leaves) -> LlamaReplay` (A8, forward products). Its own model, from the committed
     `W_t`, runs under `ProductSubstitution`, which hands back the committed leaf for each
     product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`).
@@ -763,8 +770,10 @@ interface.
     analytic floor rather than fitting anything. The γ's `ρ = 0` means the fused and
     reference updates agree bit for bit on every entry of those tensors (a mismatch rate of
     about 1e−5 per entry), not that their gradients vanish.
-  - Prover 1.1 s (`prove_step` 0.9, commit 0.24), verifier 4.0 s (check 5
-    2.6, 6a 0.8, check 2 0.24, check 7 0.18). Before leaves were hashed in parallel: prover
+  - Prover 1.1 s (`prove_step` 0.9, commit 0.24), verifier 3.2 s (check 5
+    1.75: glue 0.53, measure 1.13; 6a 0.8, check 2 0.24, check 7 0.18, 6b 0.17), 2026-10-04
+    after the one-pass replay and batched member measuring. Earlier: verifier 4.0 s (check 5
+    2.6). Before leaves were hashed in parallel: prover
     2.4 s (commit 1.5), verifier 5.4 s (check 2 1.5). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
     verifier peak 5.5 GB (3.7 GB at its start, the held store).
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
