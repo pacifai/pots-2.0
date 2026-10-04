@@ -1,6 +1,6 @@
 """Milestone M1: the MLP smoke run, an honest run plus three faults, each with its oracle.
 
-    .venv/bin/python -m verification.runs.mlp_smoke [--steps T]
+    .venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]
 
 The degenerate MLP instance (ref block §9), widths ``(16, 32, 32, 8)``, ``n_s = 4``, ``η`` from
 ``VERIF_ETA`` (1e-3, fixed by declaration, S8e), on a synthetic dataset of ``VERIF_N_RECORDS``
@@ -22,6 +22,10 @@ FAIL: an honest rejection, or a fault rejected at another check or not at all.
 
 Bands are provisional (``allow_provisional=True``): this is a smoke run, not a judged cheat
 run (P10a). Exits 1 if any oracle fails.
+
+With metrics on (``--metrics``, default ``VERIF_METRICS=1``), every scenario's per-component
+costs and residuals go to ``$VERIF_OUTPUT_DIR/mlp_smoke/`` (B6, ``runs/metrics.py``), and a
+separate counting pass over two honest steps writes the FLOPs and bytes hashed.
 """
 
 from __future__ import annotations
@@ -46,13 +50,17 @@ from verification.computation.instances.mlp import (
 from verification.parameters import load_protocol_config
 from verification.prover.step import StepOutput, plain_step
 from verification.runs.loop import LoopResult, ProverFault, StepRecord, run_loop
+from verification.runs.metrics import (CostRecorder, CountRecorder, CountRow, MetricsWriter,
+                                       count_pass)
 from verification.verifier.bands import Bands
 from verification.verifier.checks import DEFAULT_ORDER
 from verification.verifier.context import Rejection
 from verification.verifier.driver import Verifier
 
 __all__ = ["Expected", "Scenario", "ScenarioResult", "scenarios", "honest_final",
-           "run_scenario", "run_smoke", "main"]
+           "run_scenario", "run_smoke", "count_smoke", "main"]
+
+RUN_NAME = "mlp_smoke"  # the metrics directory under VERIF_OUTPUT_DIR
 
 N_S = 4
 FAULT_STEP = 2  # flip and forged W_{t+1}
@@ -207,11 +215,24 @@ def judge(expected: Expected, loop: LoopResult, T: int) -> bool:
 
 def run_scenario(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
                  scenario: Scenario, *, T: int, k: int, final: Mapping[str, torch.Tensor],
-                 on_step: Callable[[StepRecord], None] | None = None) -> ScenarioResult:
+                 on_step: Callable[[StepRecord], None] | None = None,
+                 recorder: CostRecorder | CountRecorder | None = None) -> ScenarioResult:
+    """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams."""
+    section = None if recorder is None else recorder.section
     v = Verifier(c, h_D=dataset_tree(c, dataset).root, n_records=len(dataset), k=k, n_steps=T,
-                 bands=Bands.provisional(), w0=w0, allow_provisional=True)
+                 bands=Bands.provisional(), w0=w0, allow_provisional=True, section=section)
+    if recorder is not None:
+        recorder.bind(v)
+        rec, user = recorder, on_step
+
+        def on_step(r: StepRecord) -> None:
+            rec.on_step(r)
+            if user is not None:
+                user(r)
     loop = run_loop(c, c.build_model(), dataset, w0, v, final=final, fault=scenario.fault,
-                    on_step=on_step)
+                    on_step=on_step, section=section)
+    if recorder is not None:
+        recorder.finish()
     return ScenarioResult(scenario, loop, v, judge(scenario.expected, loop, T))
 
 
@@ -246,7 +267,10 @@ def report(r: ScenarioResult, out: Callable[[str], None] = print) -> None:
 
 def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
               T: int, k: int, out: Callable[[str], None] = print,
-              only: Sequence[str] | None = None) -> list[ScenarioResult]:
+              only: Sequence[str] | None = None,
+              metrics: MetricsWriter | None = None) -> list[ScenarioResult]:
+    """Run each scenario and report it. With ``metrics``, each timed scenario writes its costs
+    and residuals there, and a separate counting pass (:func:`count_smoke`) writes the counts."""
     if T < CHAIN_STEP:
         raise ValueError(f"T = {T}: the broken-chain scenario needs T ≥ {CHAIN_STEP}")
     final = honest_final(c, dataset, w0, T)
@@ -254,19 +278,38 @@ def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
     for s in scenarios(c, dataset):
         if only is not None and s.name not in only:
             continue
-        r = run_scenario(c, dataset, w0, s, T=T, k=k, final=final)
+        rec = None if metrics is None else metrics.recorder(s.name)
+        r = run_scenario(c, dataset, w0, s, T=T, k=k, final=final, recorder=rec)
         report(r, out)
         results.append(r)
     passed = sum(r.passed for r in results)
     out(f"{passed}/{len(results)} scenarios passed")
+    if metrics is not None:
+        metrics.write_counts(count_smoke(c, dataset, w0, k=k))
+        out(f"metrics: {metrics.dir}")
     return results
+
+
+def count_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
+                k: int) -> list[CountRow]:
+    """The B6 counting pass: two honest steps (so check 0 runs at step 1 and check 7 at step 2),
+    in a run of their own, never timed."""
+    T = CHAIN_STEP
+    final = honest_final(c, dataset, w0, T)
+    honest = next(s for s in scenarios(c, dataset) if s.name == "honest")
+    return count_pass(honest.name, lambda rec: run_scenario(c, dataset, w0, honest, T=T, k=k,
+                                                              final=final, recorder=rec))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=None, help="T, at least 2 (default: VERIF_STEPS)")
+    p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
+                   help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/ "
+                        "(default: VERIF_METRICS)")
     args = p.parse_args(argv)
     cfg = load_config()
+    use_metrics = cfg.metrics if args.metrics is None else args.metrics
     k = load_protocol_config().k
     T = args.steps if args.steps is not None else cfg.steps
     if T < CHAIN_STEP:
@@ -277,7 +320,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     w0 = init_weights(c.widths, seed=cfg.seed)
     print(f"MLP smoke: widths {c.widths}, n_s {c.n_s}, η {c.eta:g}, k {k}, T {T}, "
           f"|D| {len(dataset)}, M {c.M}, {c.n_leaves} leaves, bands provisional")
-    results = run_smoke(c, dataset, w0, T=T, k=k)
+    if not use_metrics:
+        results = run_smoke(c, dataset, w0, T=T, k=k)
+    else:
+        meta = {"run": RUN_NAME, "widths": list(c.widths), "n_s": c.n_s, "eta": c.eta, "k": k,
+                "T": T, "n_records": len(dataset), "M": c.M, "device": cfg.device,
+                "threads": cfg.threads, "seed": cfg.seed, "bands": "provisional"}
+        with MetricsWriter(cfg.output_dir / RUN_NAME, meta) as mw:
+            results = run_smoke(c, dataset, w0, T=T, k=k, metrics=mw)
     return 0 if all(r.passed for r in results) else 1
 
 

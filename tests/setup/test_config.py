@@ -24,6 +24,7 @@ def test_defaults_match_claude_md_table():
     assert cfg.eta == 1e-3
     assert cfg.output_dir == Path("trainer_output/verification")
     assert cfg.data_dir == Path("trainer_output/verification/data")
+    assert cfg.metrics is True
 
 
 def test_overrides_are_parsed():
@@ -52,7 +53,7 @@ def test_eta_defaults_to_declared_value():
     ("VERIF_BATCH", "four"), ("VERIF_BATCH", "0"), ("VERIF_THREADS", "-1"), ("VERIF_SEED", "-1"),
     ("VERIF_STEPS", "1.5"), ("VERIF_MASTER_DTYPE", "fp64"), ("VERIF_ETA", "abc"),
     ("VERIF_ETA", "0"), ("VERIF_ETA", "-1e-3"), ("VERIF_ETA", "nan"), ("VERIF_ETA", "inf"),
-    ("VERIF_DEVICE", "tpu9"), ("VERIF_MODEL", ""), ("VERIF_ATTN_IMPL", "sdpa"),
+    ("VERIF_METRICS", "yes"), ("VERIF_METRICS", "2"), ("VERIF_DEVICE", "tpu9"), ("VERIF_MODEL", ""), ("VERIF_ATTN_IMPL", "sdpa"),
 ])
 def test_invalid_values_raise(name, value):
     with pytest.raises(ValueError, match=name):

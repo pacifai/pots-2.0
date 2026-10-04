@@ -90,6 +90,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_THREADS` | `8` |
 | `VERIF_SEED` | `0` |
 | `VERIF_OUTPUT_DIR` | `trainer_output/verification` (gitignored) |
+| `VERIF_METRICS` | `1`: runs write B6's metrics to `$VERIF_OUTPUT_DIR/<run>/`; `0` turns them off. Only `0` or `1` |
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`.
@@ -399,8 +400,9 @@ import ...`). Each entry below gives the public interface.
     hand-off to the verifier. Never use `zero_grad(set_to_none=False)`. Activation
     checkpointing must stay off.
 - `step.py` (A3, merged):
-  - `prove_step(computation, model, w_t, records, *, train_records=None, perturb=None) ->
-    StepOutput`.
+  - `prove_step(computation, model, w_t, records, *, train_records=None, perturb=None,
+    section=None) -> StepOutput`. `section` is B6's metrics seam (see `runs/metrics.py`).
+    `Section` and `no_section` live here.
   - `plain_step(...)` runs the same step uncaptured. Hidden steps are made of `plain_step`
     calls.
   - `StepOutput` has the fields `records`, `w_t`, `products`, `w_next`, `loss` and
@@ -485,7 +487,9 @@ import ...`). Each entry below gives the public interface.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
     from the root it recomputed in check 2, never from `store.root`.
 - `driver.py` (A5): `Verifier(c, *, h_D, n_records, k, n_steps, bands, w0= | w0_hashes=,
-  schedule=, calibrate=False, allow_provisional=False)`.
+  schedule=, calibrate=False, allow_provisional=False, section=None)`. `section` is B6's
+  metrics seam: it wraps each check, and `StepContext.section`/`timed(name)` pass it into
+  check 5 (`5.glue`, `5.measure`) and 6b (`6b.glue`).
   - `n_steps` (T) is required. Provisional bands are refused unless `allow_provisional=True`
     (P10a); `bands` may be `None` only when calibrating.
   - `start_run(D)` runs check 1 (including that `π(t)` fits `D` for every `t ≤ T`) and
@@ -518,8 +522,9 @@ import ...`). Each entry below gives the public interface.
 ### `verification/runs/`
 
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
-  - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None)
-    -> LoopResult`. It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
+  - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
+    section=None) -> LoopResult`. `section` is B6's metrics seam, passed to `prove_step`.
+    It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
     `InMemoryStore.from_step` with the `h_D` paths, `verifier.verify_step(t, store)`, and drops
     the step. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
@@ -534,7 +539,9 @@ import ...`). Each entry below gives the public interface.
     the verifier. A test holds weakrefs to each step's products and checks they are dead by the
     next step.
 - `mlp_smoke.py` (A6, milestone M1):
-  `.venv/bin/python -m verification.runs.mlp_smoke [--steps T]`.
+  `.venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]`.
+  `run_scenario(..., recorder=None)` and `run_smoke(..., metrics=None)` take B6's recorder
+  and writer; `count_smoke` is the counting pass.
   - The MLP at widths `(16,32,32,8)`, `n_s = 4`, `η = VERIF_ETA`, `k = VERIF_K`, on
     `synthetic_dataset` of `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS`
     (default 10), and must be ≥ 2. Bands are provisional, with `allow_provisional=True`.
@@ -546,6 +553,36 @@ import ...`). Each entry below gives the public interface.
     last `n_s` records of `D` since the MLP has no `b̃` → `(2, "7")`).
   - `judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
     normalized residual, max κ, 6a `ρ_max` and per-check ms, and exits 1 if any oracle fails.
+- `metrics.py` (B6). The module docstring holds the full definitions; read it before
+  changing a seam.
+  - **The seam.** `section(name) -> context manager`, `None` by default, accepted by
+    `prove_step`, `run_loop` and `Verifier`. With `None` nothing is observed and the run is
+    bit-identical (tested). A `run:` prefix marks a once-per-run section, reported at step 0.
+    A section opened inside another is nested: time only.
+  - **P0–P5**, the prover components (B6 defines them; the docs name them only):
+    - P0 training: `P0.load` (load `W_t`, zero grads, optimizer), `P0.forward` and
+      `P0.backward` (under capture), `P0.update` (`opt.step()` and the final `zero_grad`).
+      B7's plain baseline writes the same P0 rows uncaptured.
+    - P1 labeling: `P1.label` (`label`, the `M` check, `assert_unmodified`,
+      `release_operands`).
+    - P2 leaf snapshots: `P2.w_t`, `P2.w_next`.
+    - P3 commitment: `P3.commit` (`InMemoryStore.from_step`).
+    - P4 audit paths: `P4.paths` per step, `P4.tree` once.
+    - P5 hand-off and release: `P5.release` (the disk store, A14, lands here).
+    - Fault hooks are outside every section.
+  - Verifier rows are the checks in driver order, with `0` in `7`'s slot at step 1; `0`, `1`,
+    `8`, `9` once per run. Check 3 is `5.glue`.
+  - `CostRecorder(scenario, *, memory=None, writer=None)` (`.section`, `.bind(verifier)`,
+    `.on_step`, `.finish()`), `memory_probe(device)`, `count_pass(scenario, run)` with
+    `counting()`, `MetricsWriter(dir, meta)`, `read_costs`, `read_counts`, `read_residuals`
+    (gives `StepStats` equal to `verifier.stats`).
+  - Files under `$VERIF_OUTPUT_DIR/<run>/`: `costs.csv`, `counts.csv`, `residuals.jsonl`,
+    `meta.json`. On macOS, export `MallocLargeCache=0` for runs whose memory figures are
+    compared: otherwise freed large blocks stay in the footprint.
+  - `metrics_overhead.py`: `.venv/bin/python -m verification.runs.metrics_overhead
+    [--reps N] [--steps T] [--widths ...]`, an off/on/off timing of the honest MLP run.
+  - `mlp_smoke` writes to `mlp_smoke/` unless `--no-metrics` or `VERIF_METRICS=0`; its
+    counting pass is two honest steps of its own.
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
   `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
   `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored. Rerun it with
