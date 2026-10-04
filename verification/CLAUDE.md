@@ -478,8 +478,9 @@ interface.
     `Section` and `no_section` live here; `verifier/context.py` repeats them, because the
     verifier may not import the prover (invariant 1).
   - `plain_step(..., section=None)` runs the same step uncaptured. Hidden steps are made of
-    `plain_step` calls. With `section` it is EQ1b's P0 (`P0.load`, `P0.forward`,
-    `P0.backward`, `P0.update`), the plain baseline B7 times.
+    `plain_step` calls, and `runs/loop.run_plain` chains them for the plain baseline (B7).
+    With `section` it is EQ1b's P0 (`P0.load`, `P0.forward`, `P0.backward`, `P0.update`),
+    the plain baseline B7 times.
   - `StepOutput` has the fields `records`, `w_t`, `products`, `w_next`, `loss` and
     `versions`. `.leaves()` returns them in transcript order, and
     `.assert_unmodified()` checks the versions.
@@ -686,4 +687,26 @@ interface.
   `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
   `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored. Rerun it with
   `HF_HUB_OFFLINE=1` once the model and dataset are cached.
+- `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
+  [--steps T] [--pass-steps S] [--metrics | --no-metrics]`. The honest run's training with
+  capture and every protocol step off.
+  - Same `W_0` (`initial_weights(c, c.build_model())`, the model `LlamaComputation.from_config`
+    loads), same `π` over `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`.
+  - Training is `loop.run_plain(c, model, D, w0, *, n_steps, schedule=None, on_step=None,
+    section=None) -> PlainResult(steps, w_final)`: chained `plain_step`s on `run_loop`'s
+    default `π`, no tree, paths, commitment or verifier. `mlp_smoke.honest_final` uses it too.
+  - `plain_baseline(c, D, w0, *, T, build_model, out_dir=None, metrics=None, pass_steps=2)`.
+    With a `MetricsWriter`, scenario `plain`: the timed run's `P0.*` rows per step, then a
+    memory pass and a counting pass of the first `pass_steps` steps (each with its own model).
+    No `step` or `verdict` record. Writes to `$VERIF_OUTPUT_DIR/plain_baseline/`.
+  - `final_weights.json` (written with metrics on or off): each `W_{T+1}` tensor's leaf hash
+    under tag `0x02` (equal ⇔ bit-identical, `-0.0` included) and their Merkle root.
+    `assert_same_final_weights(c, plain, verified)` takes a file or directory, a hash mapping
+    or the weights (`LoopResult.w_final`) on either side; A12 calls it against this file.
+  - `capture_rows(verified, plain, *, scenario="honest")`: P1 rows from the two runs'
+    `records.jsonl` through `derive_capture`. Steps match by number, so the verified run's
+    passes must cover the plain passes' steps.
+  - A real SmolLM2 4×128 step, fp32 on the Mac CPU: P0 about 0.73 s (forward 0.23, backward
+    0.42, load and update 0.02 each), 426.7 GFLOP (142.2 forward, 284.5 backward), and the
+    step grows the footprint by about 0.70 GB (peak of backward minus start of forward).
 - Later: `calibration.py`, `run_verified.py` and the other runs.
