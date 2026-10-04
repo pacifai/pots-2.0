@@ -16,6 +16,8 @@ from verification.commitment.leaves import (
     leaf_hash,
     leaf_hashes,
     leaf_hashes_of,
+    leaf_hashes_until_error,
+    leaf_parts,
 )
 from verification.commitment.merkle import MerkleTree, hash_leaf
 from verification.computation.instances.mlp import MLPComputation, init_weights, synthetic_dataset
@@ -138,3 +140,44 @@ def test_bulk_hashing_raises_the_first_bad_leaf(c, data, parallel):
     bad[p1], bad[p2] = leaves[p1].t().contiguous(), leaves[p2].clone().fill_(float("inf"))
     with pytest.raises(LeafShapeError, match=f"leaf {p1} "):
         leaf_hashes(c, _ListReader(bad))
+
+
+class _BrokenReader(_ListReader):
+    def __init__(self, leaves, broken):
+        super().__init__(leaves)
+        self.broken = broken
+
+    def leaf(self, index):
+        if index == self.broken:
+            raise IndexError(f"leaf {index} is missing")
+        return super().leaf(index)
+
+
+def test_bulk_hashing_non_finite_before_a_read_error(c, data, parallel):
+    """A non-finite leaf wins over a read error the reader raises at a later leaf, and a read
+    error at an earlier leaf wins over it. `leaf_hashes_until_error` returns the first bad
+    leaf's error with the digests before it only."""
+    leaves = list(_step(c, data).leaves())
+    p1, p2 = c.product_index(1), c.product_index(3)
+    bad = list(leaves)
+    bad[p1] = leaves[p1].clone()
+    bad[p1].view(-1)[0] = float("inf")
+    with pytest.raises(NonFiniteError):
+        leaf_hashes(c, _BrokenReader(bad, p2))
+    with pytest.raises(IndexError, match=f"leaf {p1 - 1} is missing"):
+        leaf_hashes(c, _BrokenReader(bad, p1 - 1))
+    digests, err = leaf_hashes_until_error(c, enumerate(bad))
+    assert isinstance(err, NonFiniteError)
+    assert digests == [leaf_hash(c, i, x) for i, x in enumerate(leaves[:p1])]
+
+
+def test_single_leaf_paths_still_reject_non_finite(c, data):
+    """`leaf_parts` and `leaf_hash`, off the parallel path, reject a non-finite leaf too."""
+    step = _step(c, data)
+    i = c.product_index(1)
+    nan = step.products[0].clone()
+    nan.view(-1)[2] = float("nan")
+    with pytest.raises(NonFiniteError):
+        leaf_parts(c, i, nan)
+    with pytest.raises(NonFiniteError):
+        leaf_hash(c, i, nan)

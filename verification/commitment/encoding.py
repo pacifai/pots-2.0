@@ -10,6 +10,7 @@ from __future__ import annotations
 import struct
 import sys
 
+import numpy as np
 import torch
 
 if sys.byteorder != "little":
@@ -56,13 +57,18 @@ def tensor_leaf_header(tag: int, t: torch.Tensor) -> bytes:
 
 
 def _all_finite(t: torch.Tensor) -> bool:
-    """`torch.isfinite(t).all()`, exactly, in one reduction pass with no temporary.
+    """`torch.isfinite(t).all()`, exactly, in one or two reduction passes with no temporary.
 
-    `aminmax` propagates NaN, and ±Inf is an extreme, so both extremes are finite exactly when
-    every entry is. It is about 6× faster than `isfinite(t).all()` on a step's leaves.
+    Both extremes are finite exactly when every entry is: a max or min reduction propagates
+    NaN, and ±Inf is an extreme. fp32 and fp16 CPU tensors reduce with numpy's `max` and `min`
+    (single-threaded, about 3× faster than `torch.aminmax` here, and no OpenMP team that
+    competes with the hashing workers); other tensors use `torch.aminmax`.
     """
     if t.numel() == 0:
         return True
+    if t.device.type == "cpu" and t.dtype in (torch.float32, torch.float16):
+        v = t.detach().numpy()
+        return bool(np.isfinite(v.max()) and np.isfinite(v.min()))
     lo, hi = torch.aminmax(t)
     return bool(lo.isfinite() & hi.isfinite())
 

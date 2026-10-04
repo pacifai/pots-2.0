@@ -289,8 +289,12 @@ interface.
   - Errors: `NonFiniteError` and `EncodingError`.
   - `tensor_leaf_header(tag, t)` and `tensor_leaf_payload(t)`. The payload is a zero-copy view
     that aliases `t`, so don't mutate `t` until it is hashed. The tensor must be a contiguous
-    CPU tensor. The finiteness check uses `torch.aminmax`, which propagates NaN, so it
-    rejects exactly what `isfinite(t).all()` rejects, about 6× faster and with no temporary.
+    CPU tensor. The finiteness check (`_all_finite`) tests that the max and min are finite.
+    A max or min propagates NaN, so it rejects exactly what `isfinite(t).all()` rejects, with
+    no temporary. fp32 and fp16 use numpy's single-threaded `max` and `min`, about 3× faster
+    than `torch.aminmax`; bf16 uses `torch.aminmax`. The check stays on the calling thread:
+    moving it into the hashing workers (O6) made commit and check 2 about 3× slower, because
+    the per-leaf calls contend for the GIL with blake3's compute-bound workers.
   - `encode_tensor_leaf(tag, t)`.
 - `merkle.py` (B2, merged):
   - `hash_leaf(*parts)` streams its inputs, and runs multithreaded at 16 MiB and above with
@@ -299,6 +303,11 @@ interface.
     `torch.get_num_threads()` worker threads (`VERIF_THREADS`); blake3 releases the GIL. The
     iterable is consumed on the calling thread in order, so its errors surface as in a loop.
     Leaves go to the workers in chunks of about 16 MiB. With one thread it hashes inline.
+  - `hash_leaves_until_error(iterable) -> (digests, error)` does the same but returns the
+    first error in leaf order instead of raising it, with the digests of every leaf before
+    it. An iterable error comes after all leaves it yielded; a worker error sits at its own
+    leaf, and each chunk stops at its first error. It returns only once no worker still
+    reads the parts. `hash_leaves` raises its error.
   - `hash_node`, `hash_tensor_leaf(tag, t)` and `hash_record_leaf(rec)`.
   - `merkle_root(hashes)`. Leaf hashes must be `bytes` of length 32.
   - `MerkleTree(hashes)`, with `.root`, `.n_leaves`, `.leaf(i)`, `.path(i)` (nearest sibling
@@ -313,6 +322,7 @@ interface.
   - `leaf_hashes_of(c, items)` hashes `(index, obj)` pairs through `hash_leaves`: it
     validates and encodes on the calling thread in order and hashes in parallel.
     `leaf_hashes`, `commit_leaves`, check 2 and check 0's anchor use it.
+    `leaf_hashes_until_error(c, items)` is the `hash_leaves_until_error` form; check 7 uses it.
   - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
   - `transcript_root(c, reader)` is check 2.
   - `commit_leaves(c, leaves) -> MerkleTree`.
@@ -552,7 +562,11 @@ interface.
     - `perturb_leaf(c, store, i, obj) -> new root` for the S6f sweep. It re-roots in
       O(log n) and validates the leaf before any change.
   - Check 7 compares this step's `W_t` hashes with the previous step's `W_{t+1}` hashes. The
-    verifier keeps those from its own check-2 recomputation of step t−1.
+    verifier keeps those from its own check-2 recomputation of step t−1. It hashes the
+    `W_t` leaves in parallel through `leaf_hashes_until_error`, reads under the same
+    `_guard`, then judges in index order: a mismatch at leaf i wins over a read, validation
+    or encoding error at a later leaf, as in a loop. A `W_t` tensor written in place by a
+    later read is rejected as malformed, as in check 2.
 
 ### `verification/verifier/`
 
@@ -782,7 +796,9 @@ interface.
     after the one-pass replay, batched member measuring and check 6's fast path. That path
     cut 6a from 0.77 s to 0.10 s and 6b from 0.16 s to 0.03 s, with the same check-6 table,
     and the verifier's process peak from 6.55 GB to 5.96 GB (6b's float64 temporaries on
-    `W_E` were the peak). Earlier: verifier 4.0 s (check 5 2.6, 6a 0.8). Before leaves were
+    `W_E` were the peak). Parallel check 7 (O3) then cut check 7 from 0.18 s to 0.03 s and
+    the verifier to about 2.06 s (check 5 1.67 in that run), same check-5 and check-6 tables.
+    Earlier: verifier 4.0 s (check 5 2.6, 6a 0.8). Before leaves were
     hashed in parallel: prover
     2.4 s (commit 1.5), verifier 5.4 s (check 2 1.5). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
     verifier peak 5.5 GB (3.7 GB at its start, the held store).

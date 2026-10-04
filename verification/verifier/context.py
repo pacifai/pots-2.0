@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 
 from setup.records import Record
-from verification.commitment.leaves import leaf_hash, leaf_hashes_of
+from verification.commitment.leaves import leaf_hash, leaf_hashes_of, leaf_hashes_until_error
 from verification.commitment.merkle import DIGEST_SIZE
 from verification.parameters import UNIT_ROUNDOFF
 from verification.transcript.errors import (
@@ -149,15 +149,25 @@ def _hash(c: DeclaredComputation, index: int, obj: Any) -> bytes:
     return leaf_hash(c, index, obj)
 
 
+def _typed(items: Iterable[tuple[int, Any]]) -> Iterator[tuple[int, Any]]:
+    for i, obj in items:
+        _leaf_tensors(obj)
+        yield i, obj
+
+
 def _hashes(c: DeclaredComputation, items: Iterable[tuple[int, Any]]) -> list[bytes]:
     """:func:`_hash` of each ``(index, obj)``, in order, hashed in parallel
     (``leaf_hashes_of``). The type check runs with the validation, so the first error is
     the one a ``_hash`` loop raises first."""
-    def typed() -> Iterator[tuple[int, Any]]:
-        for i, obj in items:
-            _leaf_tensors(obj)
-            yield i, obj
-    return leaf_hashes_of(c, typed())
+    return leaf_hashes_of(c, _typed(items))
+
+
+def _hashes_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
+                        ) -> tuple[list[bytes], Exception | None]:
+    """:func:`_hashes` up to the first error, which is returned, not raised
+    (``leaf_hashes_until_error``): the digests before it and the error a ``_hash`` loop
+    raises first, or ``None``."""
+    return leaf_hashes_until_error(c, _typed(items))
 
 
 class CommittedLeaves:

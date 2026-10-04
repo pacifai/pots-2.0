@@ -81,8 +81,9 @@ def test_payload_rejects_noncontiguous_and_bad_dtype():
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_finiteness_check_matches_isfinite_everywhere(dtype):
-    """The aminmax check flags a NaN or ±Inf at every position, including the scalar tails of
-    vectorized loops, and accepts finite tensors with extreme magnitudes, empty and 0-d ones."""
+    """The finiteness check (numpy max and min for fp32 and fp16, aminmax for bf16) flags a NaN
+    or ±Inf at every position, including the scalar tails of vectorized loops, and accepts
+    finite tensors with extreme magnitudes, empty and 0-d ones."""
     big = torch.finfo(dtype).max
     for n in [*range(1, 70), 257, 4099]:
         base = torch.randn(n).to(dtype)
