@@ -14,6 +14,9 @@ verifier for check 9's verdict, with check 8 against the agreed final weights.
 
 Faults enter only on the prover side (S6a, invariant 5), through a :class:`ProverFault`. The
 verifier is built by the caller from public inputs and never sees the fault.
+
+:func:`run_plain` is the same training with the protocol off: ``plain_step`` on the same ``π``,
+nothing committed or verified. It gives the plain baseline (B7) and check 8's agreed weights.
 """
 
 from __future__ import annotations
@@ -29,12 +32,20 @@ from setup import data
 from setup.config import assert_no_dropout
 from verification.commitment.leaves import dataset_tree
 from verification.computation.interface import DeclaredComputation
-from verification.prover.step import Perturbation, Section, StepOutput, no_section, prove_step
+from verification.prover.step import (
+    Perturbation,
+    Section,
+    StepOutput,
+    no_section,
+    plain_step,
+    prove_step,
+)
 from verification.transcript.store import InMemoryStore
 from verification.verifier.context import Rejection
 from verification.verifier.driver import RunVerdict, Verifier
 
-__all__ = ["ProverFault", "StepRecord", "LoopResult", "run_loop"]
+__all__ = ["ProverFault", "StepRecord", "LoopResult", "run_loop", "PlainStepRecord", "PlainResult",
+           "run_plain"]
 
 
 class ProverFault:
@@ -98,6 +109,11 @@ class LoopResult:
         return self.verdict.rejection
 
 
+def _default_schedule(c: DeclaredComputation,
+                      dataset: Sequence[Any]) -> Callable[[int], Sequence[int]]:
+    return lambda t: data.schedule(t, c.n_s, len(dataset))
+
+
 def run_loop(
     c: DeclaredComputation,
     model: torch.nn.Module,
@@ -127,7 +143,7 @@ def run_loop(
     sec = section or no_section
     fault = fault or HONEST
     assert_no_dropout(model)  # invariant 3 (S4d)
-    pi = schedule or (lambda t: data.schedule(t, c.n_s, len(dataset)))
+    pi = schedule or _default_schedule(c, dataset)
     result = LoopResult(verdict=RunVerdict(False, None, 0, None))
     if verifier.start_run(dataset) is not None:
         result.verdict = verifier.end_run(final)
@@ -166,3 +182,55 @@ def run_loop(
     result.w_final = dict(w)
     result.verdict = verifier.end_run(final)
     return result
+
+
+@dataclass(frozen=True)
+class PlainStepRecord:
+    """One step of :func:`run_plain`: its loss and wall clock (seconds).
+
+    ``train_s`` is host ``perf_counter`` time around the whole ``plain_step``, informational
+    only; P0's reported times are B6's ``P0.*`` rows."""
+
+    t: int
+    loss: float
+    train_s: float
+
+
+@dataclass
+class PlainResult:
+    steps: list[PlainStepRecord]
+    w_final: dict[str, torch.Tensor]
+
+
+def run_plain(
+    c: DeclaredComputation,
+    model: torch.nn.Module,
+    dataset: Sequence[Any],
+    w0: Mapping[str, torch.Tensor],
+    *,
+    n_steps: int,
+    schedule: Callable[[int], Sequence[int]] | None = None,
+    on_step: Callable[[PlainStepRecord], None] | None = None,
+    section: Section | None = None,
+) -> PlainResult:
+    """The honest run's training with the protocol off: ``n_steps`` ``plain_step``s from ``W_0``
+    on ``π``'s batches.
+
+    The same step as :func:`run_loop`'s prover (``plain_step`` is ``prove_step`` without the
+    capture, bit for bit), the same default ``π``, and no tree, paths, commitment or verifier.
+    It is the plain baseline (B7, EQ1b's P0, with ``section``), the agreed final weights for
+    check 8, and the hidden-step building block.
+    """
+    assert_no_dropout(model)  # invariant 3 (S4d), as run_loop
+    pi = schedule or _default_schedule(c, dataset)
+    w: Mapping[str, torch.Tensor] = w0
+    steps: list[PlainStepRecord] = []
+    for t in range(1, n_steps + 1):
+        records = [dataset[i] for i in pi(t)]
+        t0 = time.perf_counter()
+        w, loss = plain_step(c, model, w, records, section=section)
+        rec = PlainStepRecord(t, loss, time.perf_counter() - t0)
+        steps.append(rec)
+        if on_step is not None:
+            on_step(rec)
+    return PlainResult(steps, dict(w))

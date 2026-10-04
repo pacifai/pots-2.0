@@ -49,6 +49,7 @@ __all__ = [
     "Replay",
     "DeclaredComputation",
     "load_weights",
+    "snapshot_weights",
 ]
 
 
@@ -145,6 +146,17 @@ def load_weights(computation: DeclaredComputation, model: torch.nn.Module,
                 raise ValueError(f"{name}: got {w.dtype} {tuple(w.shape)}, "
                                  f"model holds {p.dtype} {tuple(p.shape)}")
             p.copy_(w)
+
+
+def snapshot_weights(computation: DeclaredComputation,
+                     model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Copies of ``model``'s declared weights, in ``weight_names`` order.
+
+    The one way to take weights out of a model: the prover's ``W_t`` and ``W_{t+1}`` leaves,
+    and ``W_0`` from a freshly built model (the plain baseline B7 and the verified runs, A12
+    included, so both start from the same tensors).
+    """
+    return {n: model.get_parameter(n).detach().clone() for n in computation.weight_names}
 
 
 class DeclaredComputation(ABC):

@@ -40,7 +40,6 @@ from typing import Any
 
 import torch
 
-from setup import data
 from setup.config import load_config, setup_determinism
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
@@ -51,10 +50,11 @@ from verification.computation.instances.mlp import (
 )
 from verification.parameters import load_protocol_config
 from verification.prover.step import StepOutput, plain_step
-from verification.runs.loop import LoopResult, ProverFault, StepRecord, run_loop
+from verification.runs.loop import LoopResult, ProverFault, StepRecord, run_loop, run_plain
 from verification.runs.metrics import (
     CountRecorder,
     MemoryRecorder,
+    PASS_STEPS,
     MetricsWriter,
     TimeRecorder,
     count_pass,
@@ -205,10 +205,7 @@ def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
 def honest_final(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
                  T: int) -> dict[str, torch.Tensor]:
     """The agreed final weights: ``T`` uncaptured honest steps from ``W_0`` on ``π``."""
-    model, w = c.build_model(), dict(w0)
-    for t in range(1, T + 1):
-        w, _ = plain_step(c, model, w, [dataset[i] for i in data.schedule(t, c.n_s, len(dataset))])
-    return w
+    return run_plain(c, c.build_model(), dataset, w0, n_steps=T).w_final
 
 
 def judge(expected: Expected, loop: LoopResult, T: int) -> bool:
@@ -304,8 +301,9 @@ def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
 
 def _two_honest_steps(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
                       k: int) -> Callable[[Any], Any]:
-    """A pass's body: two honest steps (check 0 at step 1, check 7 at step 2), run on its own."""
-    T = CHAIN_STEP
+    """A pass's body: ``PASS_STEPS`` honest steps (check 0 at step 1, check 7 at step 2), run on
+    its own."""
+    T = PASS_STEPS
     final = honest_final(c, dataset, w0, T)
     honest = next(s for s in scenarios(c, dataset) if s.name == "honest")
     return lambda rec: run_scenario(c, dataset, w0, honest, T=T, k=k, final=final, recorder=rec)

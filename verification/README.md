@@ -244,6 +244,14 @@ replaced:
   `metrics_overhead.py` measures what recording costs.
 - **`materialize_data.py`** builds `D` and `D̃` and writes them under
   `trainer_output/verification/data/`.
+- **`plain_baseline.py`** trains the honest run's steps with capture and every protocol step
+  off: the same `W_0`, batches and `η`, through the prover's own SGD step without the capture.
+  Its timings, memory and FLOPs are EQ1b's P0, the baseline every overhead ratio divides by.
+  Comparing them with a verified run's training rows gives the cost of capture (P1). It also
+  saves the hash of every final weight tensor, so the honest verified run can show it ends on
+  the same weights bit for bit. Beside the hashes it records what the run started from and how
+  it trained (the `W_0` root, `h_D`, `η`, the config hash, the losses), so a comparison of two
+  runs that didn't start from the same place fails by naming the difference.
 
 ## Workflow: verifying one step
 
@@ -390,6 +398,7 @@ Breaking any of these voids the result. Each one has a test.
 | SmolLM2 replay of forward glue (A8) | done; all 2,371 forward operands of the real step match the prover's bit for bit |
 | Per-component cost and residual metrics (`runs/metrics.py`, B6), wired into the MLP smoke run | done |
 | SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |
+| Plain-training baseline (`runs/plain_baseline.py`, B7) | done; final weights bit-identical to the captured prover's on the MLP, the tiny Llama and two real SmolLM2 steps |
 | First honest SmolLM2 step (A10, M3) | next |
 | Calibration and band file (A11, M4); 10-step honest run, cheat runs, disk store (A12–A14, M5) | planned |
 
