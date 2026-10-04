@@ -578,6 +578,16 @@ interface.
   - `end_run(final) -> RunVerdict(accepted, rejection, steps_verified, band_source)` runs
     checks 8 and 9. It raises while calibration is unfrozen.
   - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers.
+- `residuals.py` (A10; A11 reuses it): summaries of `StepStats`, from `verifier.stats` or from
+  `runs.metrics.read_residuals`. It judges nothing.
+  - `class_summary(stats) -> [ClassSummary(cls, count, n, rms, max, max_name, max_step,
+    kappa_median, kappa_max)]`, classes in first-appearance order. `stats` is `{step:
+    StepStats}` or `(step, StepStats)` pairs. RMS and max are over all `count·k` normalized
+    residuals (P3.a); a NaN makes both NaN.
+  - `tensor_summary(stats) -> [TensorSummary(check_id, role, count, rho_max, max_name,
+    max_step)]` per `(check, weight_role(name))`, where `weight_role` stars the layer index.
+  - `format_class_table(rows, out=print)` ends with the largest class RMS, the global max and
+    their ratio; `format_tensor_table` ends with each check's max ρ.
 
 ### `verification/verifier/matmul_check/`
 
@@ -618,7 +628,7 @@ interface.
     next step.
 - `mlp_smoke.py` (A6, milestone M1):
   `.venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]`.
-  `run_scenario(..., recorder=None)` and `run_smoke(..., metrics=None)` take B6's recorder
+  `run_scenario(..., recorder=None, h_D=None)` and `run_smoke(..., metrics=None)` take B6's recorder
   and writer; `memory_smoke` and `count_smoke` are the memory and counting passes.
   - The MLP at widths `(16,32,32,8)`, `n_s = 4`, `η = VERIF_ETA`, `k = VERIF_K`, on
     `synthetic_dataset` of `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS`
@@ -682,6 +692,22 @@ interface.
   - `mlp_smoke` writes to `mlp_smoke/` unless `--no-metrics` or `VERIF_METRICS=0`; its memory
     and counting passes are two honest steps each, of their own. The MLP records `h_D` (its
     synthetic `D`'s root) and a null band-file hash.
+- `llama_step.py` (A10, milestone M3): `.venv/bin/python -m verification.runs.llama_step
+  [--steps T] [--metrics | --no-metrics]`, with `T` default 1. `LlamaComputation.from_config`,
+  `W_0` from `build_model()`, `D` from `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D`
+  from `meta.json` (`load_committed_dataset`). The honest scenario goes through
+  `mlp_smoke.run_scenario` (instance-agnostic; its `h_D` kwarg defaults to `D`'s root) with
+  provisional bands, check 8 against `honest_final`. `run_honest`, `memory_run`, `count_run`;
+  `report_residuals` prints `residuals.py`'s two tables, `report_costs` each step's prover and
+  verifier wall clock and, from the memory pass, each side's peak. Metrics go to
+  `llama_step/`. Exits 1 unless accepted.
+  - The real step from `W_0` on `π(1)` (k 7, η 1e-3), 2026-10-04 on the dev Mac: accepted.
+    Most classes have an RMS of 0.3–0.9 and a max ≤ 2.7, except `S` (max 3.8), `Λ` (RMS 3.8,
+    max 5.43, the global max) and `dF` (RMS 1.6, max 2.1); max κ 28 (`dX_down`). Check 6a
+    `ρ_max` is 1.94–2.00 for every role, 6b 1.99 on `W_E`, 0.09 on `γ_mlp`, 0 on `γ_attn`
+    and `γ_final`. Prover 2.4 s (`prove_step` 0.9, commit 1.5), verifier 5.4 s (check 5
+    2.7, check 2 1.5, 6a 0.8). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
+    verifier peak 5.5 GB (3.7 GB at its start, the held store).
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
   `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
   `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored. Rerun it with

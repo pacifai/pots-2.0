@@ -49,6 +49,7 @@ from verification.computation.instances.mlp import (
     init_weights,
     synthetic_dataset,
 )
+from verification.computation.interface import DeclaredComputation
 from verification.parameters import load_protocol_config
 from verification.prover.step import StepOutput, plain_step
 from verification.runs.loop import LoopResult, ProverFault, StepRecord, run_loop
@@ -202,8 +203,8 @@ def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
 # ---- running and judging ----------------------------------------------------------------
 
 
-def honest_final(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-                 T: int) -> dict[str, torch.Tensor]:
+def honest_final(c: DeclaredComputation, dataset: Sequence[Any],
+                 w0: Mapping[str, torch.Tensor], T: int) -> dict[str, torch.Tensor]:
     """The agreed final weights: ``T`` uncaptured honest steps from ``W_0`` on ``π``."""
     model, w = c.build_model(), dict(w0)
     for t in range(1, T + 1):
@@ -222,14 +223,20 @@ def judge(expected: Expected, loop: LoopResult, T: int) -> bool:
                                                        expected.kind))
 
 
-def run_scenario(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-                 scenario: Scenario, *, T: int, k: int, final: Mapping[str, torch.Tensor],
+def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
+                 w0: Mapping[str, torch.Tensor], scenario: Scenario, *, T: int, k: int,
+                 final: Mapping[str, torch.Tensor],
                  on_step: Callable[[StepRecord], None] | None = None,
                  recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
-                 ) -> ScenarioResult:
-    """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams."""
+                 h_D: bytes | None = None) -> ScenarioResult:
+    """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams.
+
+    ``h_D`` is the agreed dataset root the verifier's check 1 compares with; by default it is
+    computed from ``dataset`` (the MLP's synthetic ``D`` has no published root)."""
     section = None if recorder is None else recorder.section
-    v = Verifier(c, h_D=dataset_tree(c, dataset).root, n_records=len(dataset), k=k, n_steps=T,
+    if h_D is None:
+        h_D = dataset_tree(c, dataset).root
+    v = Verifier(c, h_D=h_D, n_records=len(dataset), k=k, n_steps=T,
                  bands=Bands.provisional(), w0=w0, allow_provisional=True, section=section)
     if recorder is not None:
         recorder.bind(v)
