@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import struct
+from collections.abc import Sequence
 
 import blake3
 import numpy as np
@@ -70,3 +71,21 @@ def challenge_matrix(h: bytes, m: int, k: int, width: int) -> torch.Tensor:
     if not 1 <= k <= 255:
         raise ValueError(f"k must be in [1, 255], got {k}")
     return torch.stack([challenge_vector(h, m, j, width) for j in range(1, k + 1)], dim=1)
+
+
+def challenge_matrices(h: bytes, ms: Sequence[int], k: int, width: int) -> torch.Tensor:
+    """``challenge_matrix(h, m, k, width)`` for each ``m`` in ``ms``, as ``[len(ms), width, k]``.
+
+    The same values bit for bit: one keyed XOF per label ``⟨m, j⟩`` (P8b), with the entry map
+    applied to all ``len(ms)·k`` outputs in one numpy pass. Check 5 uses it for a batch of
+    attention members, whose per-product overhead would otherwise dominate their arithmetic.
+    """
+    if not 1 <= k <= 255:
+        raise ValueError(f"k must be in [1, 255], got {k}")
+    for m in ms:
+        _validate(h, m, width)
+    key, n = bytes(h), 4 * width
+    xof = b"".join(blake3.blake3(encode_label(m, j), key=key).digest(length=n)
+                   for m in ms for j in range(1, k + 1))
+    words = np.frombuffer(xof, dtype="<u4").reshape(len(ms), k, width)
+    return torch.from_numpy(_entries(words)).transpose(1, 2).contiguous()

@@ -566,6 +566,12 @@ interface.
     (float64) with `τ_W`, the same number `freeze` rejudges.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
     from the root it recomputed in check 2, never from `store.root`.
+  - **Member batching.** A run of consecutive member specs of one layer (`_member_runs`;
+    on SmolLM2, `S`+`O` and `dA`+`dV`+`dQ`+`dK` of each layer) has its operands served one
+    member at a time in canonical order, then stacked by shape and measured with
+    `measure_products`. Members are then recorded and judged in canonical order, so the first
+    failing member rejects with the same message as alone, and an error serving a later member
+    is raised only after the members before it pass. Every other product is measured alone.
 - `driver.py` (A5): `Verifier(c, *, h_D, n_records, k, n_steps, bands, w0= | w0_hashes=,
   schedule=, calibrate=False, allow_provisional=False, section=None)`. `section` is B6's
   metrics seam: it wraps each check under its id (step 1's chaining comparison is `"7"`;
@@ -600,10 +606,15 @@ interface.
   - `challenge_vector(h, m, j, width)` returns float32 `[width]`, and
     `challenge_matrix(h, m, k, width)` returns float32 `[width, k]`, with column `j−1` =
     vector `j`. It takes about 1.4 ms at width 49152 and k 7.
+    `challenge_matrices(h, ms, k, width)` returns `[len(ms), width, k]`, bit-identical to
+    `challenge_matrix` per `m` (one XOF per label, one numpy pass for the entries).
 - `freivalds.py`: `measure_product(a, b, p, *, h, m, k, eps_in, eps_acc) -> ProductMeasure`
   (ν, `‖|P|·1‖`, κ, the residuals, `‖P‖_F`, the band unit and the normalized residuals). It
   judges nothing. Its norms use `_safe_norm` (power-of-two scaling, bit-identical to
-  `vector_norm` when that doesn't overflow or underflow).
+  `vector_norm` when that doesn't overflow or underflow). `measure_products(a, b, p, *, h, ms,
+  k, eps_in, eps_acc)` does the same for a stacked batch of one shape, each member with its own
+  challenges and `_safe_norm` scale. At SmolLM2's member shapes its normalized residuals equal
+  `measure_product`'s bit for bit; below about 8×8, CPU `bmm` rounds differently from `mm`.
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m`, `b0`, `bit_budget`, `k_required(N, b0_bits)` (raises if `b0_bits ≤ 0`) and

@@ -6,6 +6,7 @@ import torch
 from verification.verifier.matmul_check.challenges import (
     TAG_LABEL,
     _entries,
+    challenge_matrices,
     challenge_matrix,
     challenge_vector,
     encode_label,
@@ -161,3 +162,23 @@ def test_label_layout_and_injectivity():
 def test_label_range(m, j):
     with pytest.raises(ValueError):
         encode_label(m, j)
+
+
+@pytest.mark.parametrize("ms,k,width", [((1,), 1, 1), ((7, 8, 9, 10), 7, 64),
+                                        ((3, 1, 2**32 - 1), 3, 128), ((5,), 255, 17)])
+def test_challenge_matrices_bit_identical(ms, k, width):
+    """The batched path gives each member the same vectors, bit for bit, as challenge_matrix."""
+    for h in (H0, H1):
+        R = challenge_matrices(h, ms, k, width)
+        assert R.shape == (len(ms), width, k) and R.dtype == torch.float32
+        for i, m in enumerate(ms):
+            want = challenge_matrix(h, m, k, width)
+            assert torch.equal(R[i], want)
+            assert R[i].view(torch.int32).equal(want.view(torch.int32))
+
+
+@pytest.mark.parametrize("ms,k,width", [((0,), 7, 4), ((1, 2**32), 7, 4), ((1,), 0, 4),
+                                        ((1,), 256, 4), ((1,), 7, 0)])
+def test_challenge_matrices_validates(ms, k, width):
+    with pytest.raises(ValueError):
+        challenge_matrices(H0, ms, k, width)

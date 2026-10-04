@@ -14,6 +14,8 @@ import torch
 
 from setup.data import schedule
 from verification.commitment.leaves import dataset_tree
+from verification.computation.instances import LlamaComputation
+from verification.computation.instances.llama import LlamaReplay
 from verification.computation.instances.mlp import (
     MLPComputation,
     MLPReplay,
@@ -26,6 +28,7 @@ from verification.prover import step as prover
 from verification.prover.step import plain_step, prove_step
 from verification.transcript.reader import TranscriptView
 from verification.transcript.store import InMemoryStore, TranscriptStore, perturb_leaf
+from verification.verifier import checks
 from verification.verifier.bands import TAU_W0, Bands, product_class
 from verification.verifier.checks import (
     CHECKS,
@@ -38,6 +41,8 @@ from verification.verifier.driver import Verifier
 from verification.verifier.matmul_check.challenges import SIGMA_R, challenge_matrix
 from verification.verifier.matmul_check.freivalds import _safe_norm
 from verification.verifier.matmul_check.sizing import Z, e_m
+
+from tests.verification.llama_helpers import make_records, tiny_config
 
 ETA = 1e-3
 K = 7
@@ -1070,3 +1075,130 @@ def _calibrate_store(c, D, tree, w0, store):
     assert v.start_run(D) is None
     assert v.verify_step(1, store) is None
     return v, None
+
+
+# ---- check 5 measures the members of an attention product as a batch --------------------
+
+
+class _LlamaWith(LlamaComputation):
+    """The tiny Llama with a replay hook: ``operands_hook(m, a, b) -> (a, b)``."""
+
+    operands_hook = None
+
+    def replay(self, leaves):
+        return _HookedReplay(self, leaves)
+
+
+class _HookedReplay(LlamaReplay):
+    def operands(self, m):
+        a, b = super().operands(m)
+        hook = type(self.c).operands_hook
+        return (a, b) if hook is None else hook(self.c, m, a, b)
+
+
+@pytest.fixture(scope="module")
+def llama_out():
+    c = LlamaComputation(tiny_config(), n_s=2, n=12, eta=ETA)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    return c, prove_step(c, c.build_model(), w0, make_records((12, 7)))
+
+
+def _llama_check_5(c, out, monkeypatch, *, batched, judge=True, perturb=None):
+    """Checks 2 and 5 on the tiny Llama step; ``batched=False`` measures one product at a time,
+    as check 5 did before batching. ``perturb`` maps a product name to a leaf transform."""
+    store = InMemoryStore.from_step(c, out, copy=True)
+    for name, fn in (perturb or {}).items():
+        m = c.m_of(name)
+        perturb_leaf(c, store, c.product_index(m), fn(out.products[m - 1]))
+    ctx = StepContext.for_computation(
+        c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
+        prev_w_hashes=(), chain_check_id="0", k=K, judge=judge)
+    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+    with monkeypatch.context() as mp:
+        if not batched:
+            mp.setattr(checks, "_member_runs", lambda products: ((p,) for p in products))
+        rej = check_5_matmuls(store, c, ctx, Bands.provisional())
+    return rej, ctx.stats.products
+
+
+def _bumped(t):
+    t = t.clone()
+    t.view(-1)[-1] += 1.0
+    return t
+
+
+def test_member_runs_cover_canonical_order(llama_out):
+    c, _ = llama_out
+    runs = list(checks._member_runs(c.products))
+    assert [s for run in runs for s in run] == list(c.products)
+    long = [run for run in runs if len(run) > 1]
+    # Per layer: S and O (forward) are one run, and dA, dV, dQ, dK (backward) another.
+    assert [len(run) for run in long] == [2 * c.n_s * c.n_h] * c.L + [4 * c.n_s * c.n_h] * c.L
+    assert all(len({(s.layer, s.member is None) for s in run}) == 1 for run in runs)
+
+
+def test_batched_check_5_matches_one_at_a_time(llama_out, monkeypatch):
+    c, out = llama_out
+    rej_b, stats_b = _llama_check_5(c, out, monkeypatch, batched=True)
+    rej_s, stats_s = _llama_check_5(c, out, monkeypatch, batched=False)
+    assert rej_b is None and rej_s is None
+    assert [(x.m, x.name, x.cls) for x in stats_b] == [(x.m, x.name, x.cls) for x in stats_s]
+    assert [x.m for x in stats_b] == list(range(1, c.M + 1))
+    for xb, xs in zip(stats_b, stats_s):
+        assert xb.kappa == pytest.approx(xs.kappa, rel=1e-4)
+        assert xb.normalized == pytest.approx(xs.normalized, rel=1e-4, abs=1e-4)
+
+
+@pytest.mark.parametrize("name", ["L2.S[1,1]", "L1.O[0,2]", "L1.dV[0,3]", "L2.dQ[1,0]"])
+def test_forged_member_mid_run_rejected_at_that_member(llama_out, monkeypatch, name):
+    c, out = llama_out
+    got = [_llama_check_5(c, out, monkeypatch, batched=b, perturb={name: _bumped})
+           for b in (True, False)]
+    (rej_b, stats_b), (rej_s, stats_s) = got
+    _expect(rej_b, 1, "5")
+    assert rej_b == rej_s and f"P_{c.m_of(name)} ({name}), challenge j=" in rej_b.detail
+    assert [x.name for x in stats_b] == [x.name for x in stats_s]
+    assert stats_b[-1].name == name and len(stats_b) == c.m_of(name)
+
+
+@pytest.mark.parametrize("judge", [True, False])
+def test_nan_in_one_member_rejects(llama_out, monkeypatch, judge):
+    _, out = llama_out
+    c = _LlamaWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    name = "L1.dK[1,2]"
+
+    def nan_operand(c, m, a, b):
+        if m != c.m_of(name):
+            return a, b
+        a = a.contiguous().clone()
+        a.view(-1)[0] = float("nan")
+        return a, b
+
+    monkeypatch.setattr(_LlamaWith, "operands_hook", nan_operand)
+    got = [_llama_check_5(c, out, monkeypatch, batched=b, judge=judge) for b in (True, False)]
+    (rej_b, stats_b), (rej_s, _) = got
+    _expect(rej_b, 1, "5")
+    assert rej_b == rej_s and f"P_{c.m_of(name)} ({name}): non-finite ν" in rej_b.detail
+    assert stats_b[-1].name == name and math.isnan(stats_b[-1].kappa)
+
+
+def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
+    """An error serving a later member of a run is raised only once the members before it
+    pass; a forged earlier member rejects first, as one product at a time."""
+    _, out = llama_out
+    c = _LlamaWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    forged, broken = "L1.dA[0,1]", "L1.dV[1,3]"
+
+    def fail(c, m, a, b):
+        if m == c.m_of(broken):
+            raise RuntimeError("replay bug")
+        return a, b
+
+    monkeypatch.setattr(_LlamaWith, "operands_hook", fail)
+    for batched in (True, False):
+        with pytest.raises(RuntimeError, match="replay bug"):
+            _llama_check_5(c, out, monkeypatch, batched=batched)
+    rej_b, _ = _llama_check_5(c, out, monkeypatch, batched=True, perturb={forged: _bumped})
+    rej_s, _ = _llama_check_5(c, out, monkeypatch, batched=False, perturb={forged: _bumped})
+    _expect(rej_b, 1, "5")
+    assert rej_b == rej_s and f"({forged})" in rej_b.detail

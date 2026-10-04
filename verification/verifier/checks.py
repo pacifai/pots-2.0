@@ -34,13 +34,13 @@ check 6's ``η·G``, rejects rather than passing ``inf <= inf``.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
 
 import torch
 
 from verification.commitment.merkle import DIGEST_SIZE, merkle_root, verify_path
-from verification.computation.interface import DeclaredComputation
+from verification.computation.interface import DeclaredComputation, ProductSpec, Replay
 from verification.transcript.reader import TranscriptView
 from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands, product_class
@@ -56,7 +56,11 @@ from verification.verifier.context import (
     _hash,
     _is_digest,
 )
-from verification.verifier.matmul_check.freivalds import measure_product
+from verification.verifier.matmul_check.freivalds import (
+    ProductMeasure,
+    measure_product,
+    measure_products,
+)
 
 __all__ = [
     "DEFAULT_ORDER",
@@ -226,6 +230,20 @@ def check_6a_linear_update(store: TranscriptStore, c: DeclaredComputation, ctx: 
 # ---- check 5: matmul checks (P3) --------------------------------------------------------
 
 
+def _member_runs(products: Sequence[ProductSpec]) -> Iterator[Sequence[ProductSpec]]:
+    """Split the canonical order into runs: a maximal stretch of consecutive member specs
+    (``member`` set) of one layer is one run, and every other spec is a run of one."""
+    i = 0
+    while i < len(products):
+        j = i + 1
+        if products[i].member is not None:
+            while (j < len(products) and products[j].member is not None
+                   and products[j].layer == products[i].layer):
+                j += 1
+        yield products[i:j]
+        i = j
+
+
 @_checked
 def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepContext,
                     bands: Bands) -> Rejection | None:
@@ -240,6 +258,16 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     can't overflow ``‖P‖_F`` or the residual to ``inf``. Every quantity the two tests compare
     must still be finite, in either mode: a matmul output such as ``A(B·r)`` can itself exceed
     the fp32 maximum, and ``inf <= inf`` would accept an arbitrary forgery.
+
+    **Batching.** The members of a batched product (an attention product's ``(s, h)`` members)
+    are many and small, so their fixed per-product cost dominates their arithmetic. A run of
+    consecutive member specs of one layer is measured together (:func:`_member_runs`): its
+    operands are served one member at a time in canonical order, as for any product, then
+    stacked by shape and measured in batched ops, each member with its own challenges and norm
+    scaling (``freivalds.measure_products``). The members are then recorded and judged one by
+    one in canonical order, so the first failing member rejects with the same message as when
+    measured alone. An error while serving a member is raised only after the members before it
+    are judged, as it would be one product at a time.
     """
     root = ctx.state.root
     if root is None:
@@ -249,38 +277,88 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     with _guard(ctx, "5", _AFTER_COMMIT), ctx.timed("5.glue"):
         replay = c.replay(leaves)
     ctx.state.replay = replay
-    for spec in c.products:
-        with _guard(ctx, "5", _AFTER_COMMIT):
-            with ctx.timed("5.glue"):
-                a, b = replay.operands(spec.m)
-            p = view.product(spec.m)
-        if (tuple(a.shape), tuple(b.shape)) != (spec.a_shape, spec.b_shape):
-            raise RuntimeError(f"{spec.name}: replay operands {tuple(a.shape)}·{tuple(b.shape)} "
-                               f"!= declared {spec.a_shape}·{spec.b_shape}")
-        a, b = a.detach().to(torch.float32), b.detach().to(torch.float32)
-        p = p.detach().to(torch.float32)
-        cls_key = product_class(c, spec)
+    for run in _member_runs(c.products):
+        served: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        pending: Exception | None = None
+        for spec in run:
+            try:
+                served.append(_served(c, spec, ctx, replay, view))
+            except Exception as e:  # raised after the members before it are judged
+                pending = e
+                break
+        specs = run[:len(served)]
         with ctx.timed("5.measure"):
-            mp = measure_product(a, b, p, h=root, m=spec.m, k=ctx.k, eps_in=ctx.eps_in,
-                                 eps_acc=ctx.eps_acc)
-        nu, p_abs1, kappa, res, unit = mp.nu, mp.p_abs1, mp.kappa, mp.residuals, mp.unit
-        normalized = mp.normalized
-        ctx.stats.products.append(ProductStat(spec.m, spec.name, cls_key, kappa, normalized))
-        values = {"ν": nu, "‖|P|·1‖": p_abs1, "‖P‖_F": mp.p_norm, "band unit": unit,
-                  **{f"residual j={j}": x for j, x in enumerate(res, start=1)}}
-        bad = [key for key, v in values.items() if not math.isfinite(v)]
-        if bad:
-            return ctx.reject("5", f"P_{spec.m} ({spec.name}): non-finite {', '.join(bad)}")
-        if not ctx.judge:
-            continue
-        kappa_max = bands.kappa_for(cls_key)
-        if not nu <= kappa_max * p_abs1:
-            return ctx.reject("5", f"P_{spec.m} ({spec.name}): cancellation factor κ = "
-                                   f"{kappa:.3g} > κ_max = {kappa_max:g} [{cls_key}]")
-        for j, x in enumerate(res, start=1):
-            if not x <= bands.tau * unit:
-                return ctx.reject("5", f"P_{spec.m} ({spec.name}), challenge j={j}: normalized "
-                                       f"residual {normalized[j - 1]:.3g} > τ = {bands.tau:g}")
+            measures = _measure_run(specs, served, h=root, k=ctx.k, eps_in=ctx.eps_in,
+                                    eps_acc=ctx.eps_acc)
+        for spec, mp in zip(specs, measures):
+            rej = _judge_product(c, spec, mp, ctx, bands)
+            if rej is not None:
+                return rej
+        if pending is not None:
+            raise pending
+    return None
+
+
+def _served(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay: Replay,
+            view: TranscriptView) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Product ``spec.m``'s replayed operands and committed leaf, as fp32 ``(A, B, P)``."""
+    with _guard(ctx, "5", _AFTER_COMMIT):
+        with ctx.timed("5.glue"):
+            a, b = replay.operands(spec.m)
+        p = view.product(spec.m)
+    if (tuple(a.shape), tuple(b.shape)) != (spec.a_shape, spec.b_shape):
+        raise RuntimeError(f"{spec.name}: replay operands {tuple(a.shape)}·{tuple(b.shape)} "
+                           f"!= declared {spec.a_shape}·{spec.b_shape}")
+    return (a.detach().to(torch.float32), b.detach().to(torch.float32),
+            p.detach().to(torch.float32))
+
+
+def _measure_run(specs: Sequence[ProductSpec],
+                 served: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], *,
+                 h: bytes, k: int, eps_in: float, eps_acc: float) -> list[ProductMeasure]:
+    """Check 5's numbers for each product of a run, in run order.
+
+    A run of one goes through ``measure_product``. A longer run is split by operand shapes,
+    and each group is stacked and measured with ``measure_products``.
+    """
+    if len(specs) == 1:
+        (a, b, p), = served
+        return [measure_product(a, b, p, h=h, m=specs[0].m, k=k, eps_in=eps_in,
+                                eps_acc=eps_acc)]
+    groups: dict[tuple[tuple[int, int], tuple[int, int]], list[int]] = {}
+    for i, spec in enumerate(specs):
+        groups.setdefault((spec.a_shape, spec.b_shape), []).append(i)
+    out: list[ProductMeasure | None] = [None] * len(specs)
+    for idx in groups.values():
+        a, b, p = (torch.stack([served[i][x] for i in idx]) for x in range(3))
+        for i, mp in zip(idx, measure_products(a, b, p, h=h, ms=[specs[i].m for i in idx], k=k,
+                                               eps_in=eps_in, eps_acc=eps_acc)):
+            out[i] = mp
+    return [mp for mp in out if mp is not None]
+
+
+def _judge_product(c: DeclaredComputation, spec: ProductSpec, mp: ProductMeasure,
+                   ctx: StepContext, bands: Bands) -> Rejection | None:
+    """Record product ``spec.m``'s numbers, then judge them: finiteness, test 1, test 2."""
+    cls_key = product_class(c, spec)
+    nu, p_abs1, kappa, res, unit = mp.nu, mp.p_abs1, mp.kappa, mp.residuals, mp.unit
+    normalized = mp.normalized
+    ctx.stats.products.append(ProductStat(spec.m, spec.name, cls_key, kappa, normalized))
+    values = {"ν": nu, "‖|P|·1‖": p_abs1, "‖P‖_F": mp.p_norm, "band unit": unit,
+              **{f"residual j={j}": x for j, x in enumerate(res, start=1)}}
+    bad = [key for key, v in values.items() if not math.isfinite(v)]
+    if bad:
+        return ctx.reject("5", f"P_{spec.m} ({spec.name}): non-finite {', '.join(bad)}")
+    if not ctx.judge:
+        return None
+    kappa_max = bands.kappa_for(cls_key)
+    if not nu <= kappa_max * p_abs1:
+        return ctx.reject("5", f"P_{spec.m} ({spec.name}): cancellation factor κ = "
+                               f"{kappa:.3g} > κ_max = {kappa_max:g} [{cls_key}]")
+    for j, x in enumerate(res, start=1):
+        if not x <= bands.tau * unit:
+            return ctx.reject("5", f"P_{spec.m} ({spec.name}), challenge j={j}: normalized "
+                                   f"residual {normalized[j - 1]:.3g} > τ = {bands.tau:g}")
     return None
 
 
