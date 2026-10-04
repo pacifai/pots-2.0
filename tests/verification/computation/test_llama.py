@@ -1,5 +1,5 @@
 """The SmolLM2 instance: declaration and prover-side labeling (A7, milestone M2), and the
-verifier-side forward replay (A8)."""
+verifier-side forward (A8) and backward (A9) replay."""
 
 import dataclasses
 import weakref
@@ -15,7 +15,7 @@ from setup.data import PAD_ID
 from setup.records import Record, RecordError, encode_record
 from verification.commitment.leaves import leaf_hash
 from verification.computation.instances import LlamaComputation
-from verification.computation.instances.llama import LINEARS, matmul_count_llama
+from verification.computation.instances.llama import LINEARS, _Labeler, matmul_count_llama
 from verification.computation.interface import LabelingError, ProductKind, ReplayError
 from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import MatmulCapture
@@ -489,13 +489,64 @@ def test_replay_matches_captured_operands(honest, monkeypatch):
         assert torch.equal(p, leaves[c.w_t_index(n)]) and p is not leaves[c.w_t_index(n)]
 
 
-def test_replay_backward_is_a9(honest):
-    c, leaves, _ = honest
+def captured_operands(c, model, records):
+    """Run and label a captured step; returns the products, every product's operands as the
+    labeling saw them (``m -> (A, B)``, transposed back for δK̃) and the prover's gradient of
+    each glue-gradient weight."""
+    seen = {}
+    orig = _Labeler._fill
+
+    def fill(self, name, a, b, out, rec, leaf=None):
+        seen[c.m_of(name)] = (a, b) if leaf is None else (b.mT, a.mT)
+        return orig(self, name, a, b, out, rec, leaf)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_Labeler, "_fill", fill)
+        cap = run_capture(c, model, records)
+        products = [p.detach() for p in c.label(cap, model)]
+    grads = {n: model.get_parameter(n).grad.clone() for n in c.glue_gradient_weights}
+    model.zero_grad(set_to_none=True)
+    return products, seen, grads
+
+
+@pytest.fixture(scope="module")
+def honest_all(setup):
+    """An honest step's leaves, every product's captured operands and the prover's glue
+    gradients."""
+    c, model, records = setup
+    w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
+    products, expected, grads = captured_operands(c, model, records)
+    return c, [*records, *w0.values(), *products, *w0.values()], expected, grads
+
+
+def _no_prover_methods(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("the replay called a prover-only method")
+
+    monkeypatch.setattr(LlamaComputation, "loss", boom)
+    monkeypatch.setattr(LlamaComputation, "label", boom)
+
+
+def test_backward_replay_matches_the_prover(honest_all, monkeypatch):
+    """A9: every product's (A, B) in canonical order 1..M, then every glue gradient, rebuilt
+    from leaves, equals the prover's bit for bit."""
+    c, leaves, expected, grads = honest_all
+    assert c.n_kv < c.n_h and c.n_s >= 2 and c.L >= 2
+    assert len({len(r) for r in leaves[:c.n_s]}) > 1  # padding
+    _no_prover_methods(monkeypatch)
     replay = c.replay(ListReader(leaves))
-    with pytest.raises(NotImplementedError, match="A9"):
-        replay.operands(c.m_of("dF"))
-    with pytest.raises(NotImplementedError, match="A9"):
-        replay.glue_gradients()
+    assert len(expected) == c.M
+    for spec in c.products:
+        a, b = replay.operands(spec.m)
+        want_a, want_b = expected[spec.m]
+        assert (tuple(a.shape), tuple(b.shape)) == (spec.a_shape, spec.b_shape), spec.name
+        assert a.dtype == b.dtype == c.operand_dtype
+        assert torch.equal(a, want_a) and torch.equal(b, want_b), spec.name
+    assert replay._bunit is None and not replay._bops  # layer 1's glue dropped after G_v
+    got = replay.glue_gradients()
+    assert list(got) == list(c.glue_gradient_weights)
+    for n, g in got.items():
+        assert g.dtype == c.weight_dtype and torch.equal(g, grads[n]), n
 
 
 def test_replay_out_of_order_recomputes(honest):
@@ -570,8 +621,9 @@ def test_replay_never_mutates_leaves(honest):
     c, leaves, _ = honest
     versions = [t._version for t in leaves if isinstance(t, torch.Tensor)]
     replay = c.replay(ListReader(leaves))
-    for spec in forward_specs(c):
+    for spec in c.products:
         replay.operands(spec.m)
+    replay.glue_gradients()
     assert [t._version for t in leaves if isinstance(t, torch.Tensor)] == versions
 
 
@@ -634,6 +686,173 @@ def test_layer_rerun_must_reproduce_its_output(honest):
     replay.x[1] = _bump(replay.x[1])
     with pytest.raises(ReplayError, match="layer 1 did not reproduce X_2"):
         replay.operands(c.m_of("L1.Y_q"))
+
+
+# ---- backward replay (A9) ---------------------------------------------------------------------
+
+
+def test_check_5_and_6b_accept_an_honest_step(setup):
+    """The whole verifier path, checks 4, 7, 2, 6a, 5 and 6b, on an honest Llama step; a
+    perturbed backward product is rejected at 5."""
+    from setup.data import schedule
+    from verification.commitment.leaves import dataset_tree
+    from verification.transcript.store import InMemoryStore
+    from verification.verifier.bands import Bands
+    from verification.verifier.driver import Verifier
+
+    c, _, _ = setup
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
+    tree = dataset_tree(c, D)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    idx = schedule(1, c.n_s, len(D))
+
+    def verify(**kw):
+        v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1,
+                     bands=Bands.provisional(), allow_provisional=True, w0=w0)
+        assert v.start_run(D) is None
+        out = prove_step(c, c.build_model(), w0, [D[i] for i in idx], **kw)
+        store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
+        return v, v.verify_step(1, store)
+
+    v, rejection = verify()
+    assert rejection is None
+    assert {"5", "6b"} <= set(v.timings[1])
+    m = c.m_of("L1.dA[1,2]")
+    _, rejection = verify(perturb={m: lambda p: _bump(p)})
+    assert (rejection.step, rejection.check_id) == (1, "5") and "dA" in rejection.detail
+
+
+def test_backward_out_of_order_recomputes(honest_all):
+    c, leaves, expected, _ = honest_all
+    replay = c.replay(ListReader(leaves))
+    order = ["L1.dX_q", "dF", f"L{c.L}.dK[1,3]", "G_E_head", "L1.G_v", f"L{c.L}.dX_down",
+             "L1.dA[0,0]", "L1.Y_q", "L1.dQ[1,1]"]
+    for name in order:
+        a, b = replay.operands(c.m_of(name))
+        assert torch.equal(a, expected[c.m_of(name)][0]), name
+        assert torch.equal(b, expected[c.m_of(name)][1]), name
+
+
+@pytest.mark.parametrize("perturbed,index,changed,unchanged", [
+    # δX_down's committed value is what the SiLU-gate backward runs on. The norm and residual
+    # gradients read the committed δX_gate and δX_up, so nothing past them changes.
+    ("L2.dX_down", -1, ["L2.dX_gate", "L2.G_gate", "L2.dX_up", "L2.G_up"],
+     ["L2.dX_down", "L2.G_down", "L2.dX_o", "L1.dX_down", "dF"]),
+    # δA feeds only its own member's softmax backward; δQ̃ and δK̃ are committed leaves, so the
+    # q and k projections' gradients never see it.
+    ("L2.dA[0,1]", -1, ["L2.dQ[0,1]", "L2.dK[0,1]"],
+     ["L2.dA[0,1]", "L2.dV[0,1]", "L2.dQ[0,0]", "L2.dQ[1,1]", "L2.dX_q", "L2.dX_k"]),
+    # A forward product: the gate pre-activation enters the MLP backward. The row is sequence
+    # 0's last position, which is loss-masked (rows with μ = 0 get no gradient in layer L).
+    ("L2.Y_gate", lambda c: (c.n - 1) * c.d_f, ["L2.dX_gate", "L2.dX_up", "L2.G_down"],
+     ["L2.dX_down", "L2.G_o", "dF"]),
+    # S changes A = softmax(S), which δV and the softmax backward read; δA reads neither.
+    ("L1.S[0,1]", -1, ["L1.dV[0,1]", "L1.dQ[0,1]"], ["L1.dA[0,1]", "L1.dV[0,0]", "L2.dX_q"]),
+    # The head: Λ enters δΛ, so both head products' A changes; their B do not.
+    ("Lambda", lambda c: (c.n - 1) * c.n_v, ["dF", "G_E_head"], ["L2.Y_down"]),
+])
+def test_committed_product_flows_into_backward_operands(honest_all, perturbed, index, changed,
+                                                        unchanged):
+    """Check 3 for the backward: operands are built from committed leaves through glue."""
+    c, leaves, _, _ = honest_all
+    names = changed + unchanged
+    base = _replayed(c, leaves, names)
+    bad = list(leaves)
+    i = c.product_index(c.m_of(perturbed))
+    bad[i] = _bump(bad[i], index if isinstance(index, int) else index(c))
+    got = _replayed(c, bad, names)
+    for n in changed:
+        assert not (torch.equal(got[n][0], base[n][0]) and torch.equal(got[n][1], base[n][1])), n
+    for n in unchanged:
+        assert torch.equal(got[n][0], base[n][0]) and torch.equal(got[n][1], base[n][1]), n
+
+
+def test_glue_gradients_follow_the_committed_leaves(honest_all):
+    """6b's gradients come from committed leaves: G_E^head is the leaf, δX_1 comes from L1's
+    committed δX_q, δX_k, δX_v through the input norm, and γ_final from the committed δF."""
+    c, leaves, _, _ = honest_all
+
+    def glue(ls):
+        replay = c.replay(ListReader(ls))
+        for spec in c.products:
+            replay.operands(spec.m)
+        return replay.glue_gradients()
+
+    base = glue(leaves)
+    for perturbed, changed, unchanged in [
+            ("G_E_head", [c.w_e], [c.gamma_final, c.gamma_attn(1)]),
+            ("L1.dX_q", [c.w_e, c.gamma_attn(1)], [c.gamma_mlp(1), c.gamma_final]),
+            ("dF", [c.gamma_final], [c.gamma_attn(c.L)])]:
+        bad = list(leaves)
+        i = c.product_index(c.m_of(perturbed))
+        bad[i] = _bump(bad[i], 0)
+        got = glue(bad)
+        for n in changed:
+            assert not torch.equal(got[n], base[n]), (perturbed, n)
+        for n in unchanged:
+            assert torch.equal(got[n], base[n]), (perturbed, n)
+
+
+def test_glue_gradients_need_the_whole_backward(honest_all):
+    c, leaves, _, _ = honest_all
+    replay = c.replay(ListReader(leaves))
+    with pytest.raises(ReplayError, match="only right after"):
+        replay.glue_gradients()
+    for spec in c.products[:-1]:
+        replay.operands(spec.m)
+    with pytest.raises(ReplayError, match="only right after"):
+        replay.glue_gradients()
+    replay.operands(c.M)
+    replay.glue_gradients()
+    replay.operands(c.m_of(f"L{c.L}.dX_down"))  # reruns the chain to layer L only
+    with pytest.raises(ReplayError, match="only right after"):
+        replay.glue_gradients()
+
+
+def test_backward_keeps_one_unit_of_glue(honest_all):
+    """A unit's operands die once its last product is served; the frontier moves down."""
+    c, leaves, _, _ = honest_all
+    replay = c.replay(ListReader(leaves))
+    for spec in c.products[:c.m_of(f"L{c.L}.dX_down")]:
+        replay.operands(spec.m)
+    assert replay._bunit == c.L and replay._dx[0] == c.L
+    refs = [weakref.ref(t) for a, b, _, _ in replay._bops.values() for t in (a, b)]
+    for spec in c.products[c.m_of(f"L{c.L}.dX_down"):c.m_of(f"L{c.L}.G_v")]:
+        replay.operands(spec.m)
+    assert replay._bunit is None and not replay._bops
+    assert sum(r() is not None for r in refs) == 0
+    replay.operands(c.m_of(f"L{c.L - 1}.dX_down"))
+    assert replay._bunit == c.L - 1 and replay._dx[0] == c.L - 1
+
+
+def test_backward_operand_mutation_is_detected(honest_all):
+    c, leaves, _, _ = honest_all
+    replay = c.replay(ListReader(leaves))
+    replay.operands(c.m_of("L2.dX_down"))
+    replay._bops["L2.dX_gate"][0].add_(0.0)
+    with pytest.raises(ReplayError, match="changed after"):
+        replay.operands(c.m_of("L2.dX_gate"))
+
+
+def _grad_hook_on_mlp(layer, fn):
+    """In grad mode, run ``fn(g)`` inside the backward of the layer's MLP output."""
+    def hook(module, args, out):
+        if out.requires_grad:
+            out.register_hook(lambda g: fn(g) * 0 + g)
+    return layer.mlp.register_forward_hook(hook)
+
+
+@pytest.mark.parametrize("fn,match", [
+    (lambda g: torch.bmm(torch.ones(2, 3, 4), torch.ones(2, 4, 5)).sum(), "exactly one saved"),
+    (lambda g: torch.mm(g.reshape(-1, g.shape[-1]), torch.ones(g.shape[-1], 2)).sum(),
+     "matches no weight gradient"),
+], ids=["bmm", "mm"])
+def test_backward_rejects_an_undeclared_product(honest_all, fn, match):
+    c, leaves, _, _ = honest_all
+    replay = c.replay(ListReader(leaves))
+    _grad_hook_on_mlp(replay.model.model.layers[c.L - 1], fn)
+    with pytest.raises(ReplayError, match=match):
+        replay.operands(c.m_of(f"L{c.L}.dX_down"))
 
 
 # ---- milestone M2-----------------------------------------------------------------------------
@@ -732,3 +951,62 @@ def test_smollm2_real_step_forward_replay_a8():
     print(f"\nA8: {len(specs)} forward products bit-identical; build+load {t1 - t0:.1f}s, "
           f"operands(1..{specs[-1].m}) {t2 - t1:.1f}s, peak RSS {rss_gb:.2f} GB "
           f"(includes the prover-side capture)")
+
+
+@pytest.mark.slow
+def test_smollm2_real_step_backward_replay_a9():
+    """A9: on the real 4×128 step from W_0 on π(1), every product's operands (all 4,742
+    backward ones included) and every glue gradient rebuilt by the verifier equal the prover's
+    bit for bit."""
+    import gc
+    import os
+    import resource
+    import time
+
+    from setup.config import load_config, setup_determinism
+    from setup.data import load_dataset_records, schedule
+
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    cfg = load_config()
+    if not (cfg.data_dir / "D.bin").exists():
+        pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
+                    f"VERIF_OUTPUT_DIR")
+    setup_determinism(cfg)
+    c = LlamaComputation.from_config(cfg)
+    model = c.build_model()
+    D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
+    records = [D[i] for i in schedule(1, c.n_s, len(D))]
+    w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
+    products, expected, grads = captured_operands(c, model, records)
+    del model
+    gc.collect()
+    leaves = [*records, *w0.values(), *products, *w0.values()]
+    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    t0 = time.perf_counter()
+    replay = c.replay(ListReader(leaves))
+    t1 = time.perf_counter()
+    assert len(expected) == c.M == 7113
+    bad, n_bwd, t_fwd = [], 0, None
+    for spec in c.products:
+        if spec.kind is not FWD and t_fwd is None:
+            t_fwd = time.perf_counter()
+        a, b = replay.operands(spec.m)
+        want_a, want_b = expected[spec.m]
+        assert (tuple(a.shape), tuple(b.shape)) == (spec.a_shape, spec.b_shape), spec.name
+        if not (torch.equal(a, want_a) and torch.equal(b, want_b)):
+            bad.append(spec.name)
+        n_bwd += spec.kind is not FWD
+    t2 = time.perf_counter()
+    got = replay.glue_gradients()
+    t3 = time.perf_counter()
+    assert not bad, f"{len(bad)} products differ, first {bad[:5]}"
+    assert n_bwd == 4742
+    bad_glue = [n for n in c.glue_gradient_weights if not torch.equal(got[n], grads[n])]
+    assert not bad_glue, f"{len(bad_glue)} glue gradients differ, first {bad_glue[:3]}"
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    gb = (lambda r: r / 2**30) if os.uname().sysname == "Darwin" else (lambda r: r / 2**20)
+    print(f"\nA9: {c.M} products ({n_bwd} backward) and {len(got)} glue gradients bit-identical; "
+          f"build+load {t1 - t0:.1f}s, forward operands {t_fwd - t1:.1f}s, backward operands "
+          f"{t2 - t_fwd:.1f}s, glue_gradients {t3 - t2:.2f}s; peak RSS {gb(rss):.2f} GB "
+          f"({gb(rss_before):.2f} GB before the replay: capture, leaves, expected operands)")
