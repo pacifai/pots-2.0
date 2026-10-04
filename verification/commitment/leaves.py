@@ -5,9 +5,10 @@ so both run one encoding path. A leaf is encoded by its position in the computat
 (ref block §6). Records go through ``computation.encode_record``, byte-identical to their
 ``h_D`` leaf (P9b); weights carry tag ``0x02`` and products tag ``0x03``, streamed zero-copy.
 
-Bulk hashing (:func:`leaf_hashes_of` and the functions built on it) validates and encodes each
-leaf in order on the calling thread and hashes on worker threads (``merkle.hash_leaves``), so
-the digests and the first error raised are those of a leaf-by-leaf loop.
+Bulk hashing (:func:`leaf_hashes_of`, :func:`leaf_hashes_until_error` and the functions built on
+them) validates and encodes each leaf in order on the calling thread and hashes on worker
+threads (``merkle.hash_leaves``), so the digests and the first error are those of a
+leaf-by-leaf loop.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from verification.commitment.merkle import (
     MerkleTree,
     hash_leaf,
     hash_leaves,
+    hash_leaves_until_error,
     hash_record_leaf,
     merkle_root,
 )
@@ -41,6 +43,7 @@ __all__ = [
     "leaf_parts",
     "leaf_hash",
     "leaf_hashes_of",
+    "leaf_hashes_until_error",
     "leaf_hashes",
     "transcript_root",
     "commit_leaves",
@@ -95,6 +98,17 @@ def leaf_hashes_of(c: DeclaredComputation, items: Iterable[tuple[int, Any]]) -> 
     this returns.
     """
     return hash_leaves(leaf_parts(c, i, obj) for i, obj in items)
+
+
+def leaf_hashes_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
+                            ) -> tuple[list[bytes], Exception | None]:
+    """:func:`leaf_hashes_of` up to the first error: ``(digests before it, error or None)``.
+
+    The error is the one a :func:`leaf_hash` loop raises first, and the digests are those of
+    the leaves before it, so a caller can judge those leaves before the error, as a loop that
+    compares each digest as it goes would.
+    """
+    return hash_leaves_until_error(leaf_parts(c, i, obj) for i, obj in items)
 
 
 def leaf_hashes(c: DeclaredComputation, reader: LeafReader) -> list[bytes]:

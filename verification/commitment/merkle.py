@@ -43,8 +43,16 @@ def hash_leaf(*parts: bytes | memoryview) -> bytes:
     return h.digest()
 
 
-def _hash_chunk(chunk: list[LeafParts]) -> list[bytes]:
-    return [hash_leaf(*parts) for parts in chunk]
+def _hash_chunk(chunk: list[LeafParts]) -> tuple[list[bytes], Exception | None]:
+    """Hash a chunk's leaves in order; stop at the first error and return it with the
+    digests before it."""
+    out: list[bytes] = []
+    try:
+        for item in chunk:
+            out.append(hash_leaf(*item))
+    except Exception as e:
+        return out, e
+    return out, None
 
 
 _pool: ThreadPoolExecutor | None = None
@@ -62,31 +70,46 @@ def _executor(workers: int) -> ThreadPoolExecutor:
     return _pool
 
 
-def hash_leaves(leaves: Iterable[LeafParts]) -> list[bytes]:
-    """`hash_leaf(*parts)` for each item, in order, hashed on worker threads.
+def hash_leaves_until_error(leaves: Iterable[LeafParts]) -> tuple[list[bytes], Exception | None]:
+    """`hash_leaf(*parts)` for each item, in order, on worker threads, up to the first error:
+    ``(digests of the leaves before it, the error or None)``.
 
-    The iterable is consumed on the calling thread, so whatever produces the parts (store
-    reads, validation, encoding) runs there in order, as in a loop. If it raises, the error
-    propagates unchanged once the workers have stopped reading the parts already handed over.
-    The pool has `torch.get_num_threads()` workers, the run's thread budget (`VERIF_THREADS`);
-    with one thread the leaves are hashed inline.
+    The error is the one a plain loop over the items meets first, and it is returned, not
+    raised, so a caller can judge the leaves before it first. The iterable is consumed on the
+    calling thread, so whatever produces the parts (store reads, validation, encoding) runs
+    there in order, and an error it raises sits after every item it yielded. The items already
+    yielded are still hashed then. A worker's own error (a malformed part) sits at its leaf:
+    each chunk stops at its first error, and the first chunk in order with one decides, ahead
+    of the iterable's error. A leaf with an error never gets a digest, nor does any after it.
+
+    Returns only once no worker reads the items' parts any more: they alias tensors the
+    caller may change next. An error that is not an `Exception` (``KeyboardInterrupt``)
+    propagates once the workers stop. The pool has `torch.get_num_threads()` workers, the
+    run's thread budget (`VERIF_THREADS`); with one thread the leaves are hashed inline.
     """
     workers = torch.get_num_threads()
     if workers <= 1:
-        return [hash_leaf(*parts) for parts in leaves]
+        out: list[bytes] = []
+        try:
+            for item in leaves:
+                out.append(hash_leaf(*item))
+        except Exception as e:
+            return out, e
+        return out, None
     pool = _executor(workers)
-    futures: list[Future[list[bytes]]] = []
+    futures: list[Future[tuple[list[bytes], Exception | None]]] = []
     chunk: list[LeafParts] = []
     size = 0
+    producer_error: Exception | None = None
     try:
-        for parts in leaves:
-            chunk.append(parts)
-            size += sum(memoryview(p).nbytes for p in parts)
+        for item in leaves:
+            size += sum(memoryview(p).nbytes for p in item)
+            chunk.append(item)
             if size >= _CHUNK_BYTES:
                 futures.append(pool.submit(_hash_chunk, chunk))
                 chunk, size = [], 0
-        if chunk:
-            futures.append(pool.submit(_hash_chunk, chunk))
+    except Exception as e:
+        producer_error = e
     except BaseException:
         for f in futures:
             f.cancel()
@@ -94,7 +117,36 @@ def hash_leaves(leaves: Iterable[LeafParts]) -> list[bytes]:
             if not f.cancelled():
                 f.exception()  # wait; the parts alias leaves the caller may change next
         raise
-    return [h for f in futures for h in f.result()]
+    if chunk:  # also after a producer error: the items before it are still hashed
+        futures.append(pool.submit(_hash_chunk, chunk))
+    digests: list[bytes] = []
+    first_error: Exception | None = None
+    for n, f in enumerate(futures):
+        hs, err = f.result()
+        digests.extend(hs)
+        if err is not None:
+            first_error = err
+            for later in futures[n + 1:]:  # later leaves can't change the outcome
+                later.cancel()
+            for later in futures[n + 1:]:
+                if not later.cancelled():
+                    later.exception()  # wait, as above
+            break
+    if first_error is None:
+        first_error = producer_error
+    return digests, first_error
+
+
+def hash_leaves(leaves: Iterable[LeafParts]) -> list[bytes]:
+    """`hash_leaf(*parts)` for each item, in order, hashed on worker threads.
+
+    Raises the error a plain loop raises first (`hash_leaves_until_error`), unchanged, once
+    the workers have stopped reading the parts; it never returns a digest list then.
+    """
+    digests, err = hash_leaves_until_error(leaves)
+    if err is not None:
+        raise err
+    return digests
 
 
 def hash_node(left: bytes, right: bytes) -> bytes:

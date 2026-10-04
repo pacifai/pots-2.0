@@ -711,14 +711,31 @@ def _counting_hash_leaf(real: Callable[..., bytes], tally: _HashTally) -> Callab
 _HASHING_MODULES = ("verification.commitment.merkle",
                     "verification.verifier.matmul_check.challenges",
                     "verification.verifier.bands")
-_LEAF_MODULE = "verification.commitment.leaves"  # imports hash_leaf, hash_leaves by name
+_LEAF_MODULE = "verification.commitment.leaves"  # imports hash_leaf, hash_leaves… by name
 
 
-def _counting_hash_leaves(counting_leaf: Callable[..., bytes]) -> Callable[..., list[bytes]]:
+def _counting_hash_leaves_until_error(counting_leaf: Callable[..., bytes]
+                                      ) -> Callable[..., tuple[list[bytes], Exception | None]]:
     # Leaf by leaf on the calling thread: the tally is not thread-safe, and the counts are the
-    # same as the parallel path's.
+    # same as the parallel path's. Same outcome as merkle.hash_leaves_until_error.
+    def hash_leaves_until_error(leaves: Any) -> tuple[list[bytes], Exception | None]:
+        out: list[bytes] = []
+        try:
+            for parts in leaves:
+                out.append(counting_leaf(*parts))
+        except Exception as e:
+            return out, e
+        return out, None
+    return hash_leaves_until_error
+
+
+def _counting_hash_leaves(until_error: Callable[..., tuple[list[bytes], Exception | None]]
+                          ) -> Callable[..., list[bytes]]:
     def hash_leaves(leaves: Any) -> list[bytes]:
-        return [counting_leaf(*parts) for parts in leaves]
+        out, err = until_error(leaves)
+        if err is not None:
+            raise err
+        return out
     return hash_leaves
 
 
@@ -756,10 +773,12 @@ def counting() -> Iterator[tuple[_FlopTally, _HashTally]]:
     real = [m.blake3 for m in mods]
     leaves = importlib.import_module(_LEAF_MODULE)
     real_leaf, real_leaves = leaves.hash_leaf, leaves.hash_leaves
+    real_until = leaves.hash_leaves_until_error
     for m, r in zip(mods, real, strict=True):
         m.blake3 = _counting_blake3(r, tally)
     leaves.hash_leaf = _counting_hash_leaf(real_leaf, tally)
-    leaves.hash_leaves = _counting_hash_leaves(leaves.hash_leaf)
+    leaves.hash_leaves_until_error = _counting_hash_leaves_until_error(leaves.hash_leaf)
+    leaves.hash_leaves = _counting_hash_leaves(leaves.hash_leaves_until_error)
     try:
         with _FlopTally() as flops:
             yield flops, tally
@@ -767,6 +786,7 @@ def counting() -> Iterator[tuple[_FlopTally, _HashTally]]:
         for m, r in zip(mods, real, strict=True):
             m.blake3 = r
         leaves.hash_leaf, leaves.hash_leaves = real_leaf, real_leaves
+        leaves.hash_leaves_until_error = real_until
 
 
 class _CountSection:

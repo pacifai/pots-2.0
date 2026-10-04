@@ -11,6 +11,7 @@ from verification.commitment.merkle import (
     MerkleTree,
     hash_leaf,
     hash_leaves,
+    hash_leaves_until_error,
     hash_node,
     hash_record_leaf,
     hash_tensor_leaf,
@@ -188,3 +189,72 @@ def test_hash_leaves_propagates_the_producers_error(monkeypatch):
     finally:
         torch.set_num_threads(before)
     assert seen == list(range(37))
+
+
+
+# ---- hash_leaves_until_error: the first error in leaf order -----------------------------
+
+
+@pytest.fixture(params=[(1, 1), (4, 1), (4, 3000), (4, 1 << 24)],
+                ids=["inline", "leaf-per-task", "small-chunks", "one-chunk"])
+def threads(request, monkeypatch):
+    """One thread (inline), or four workers with several chunkings."""
+    workers, chunk = request.param
+    monkeypatch.setattr(merkle, "_CHUNK_BYTES", chunk)
+    before = torch.get_num_threads()
+    torch.set_num_threads(workers)
+    yield workers
+    torch.set_num_threads(before)
+
+
+def _items(n=40):
+    rng = random.Random(3)
+    return [(rng.randbytes(1 + 97 * i),) for i in range(n)]
+
+
+def test_until_error_without_errors(threads):
+    items = _items()
+    assert hash_leaves_until_error(iter(items)) == ([hash_leaf(*p) for p in items], None)
+
+
+def test_until_error_returns_the_digests_before_a_producer_error(threads):
+    """The iterable raises at item 9: the error is returned with the 9 digests before it."""
+    items = _items()
+
+    def produce():
+        for i, p in enumerate(items):
+            if i == 9:
+                raise IndexError("leaf 9 is missing")
+            yield p
+
+    digests, err = hash_leaves_until_error(produce())
+    assert isinstance(err, IndexError) and str(err) == "leaf 9 is missing"
+    assert digests == [hash_leaf(*p) for p in items[:9]]
+    with pytest.raises(IndexError, match="leaf 9 is missing"):
+        hash_leaves(produce())
+
+
+def test_a_worker_error_wins_over_a_later_producer_error(threads, monkeypatch):
+    """Item 5 fails on the worker, then the iterable raises at item 9: a plain loop meets item
+    5's error first, so that one is returned, with no digest for item 5 or any later item."""
+    items = _items()
+    real = merkle.hash_leaf
+
+    def failing(*parts):
+        if parts == items[5]:
+            raise ValueError("item 5 cannot be hashed")
+        return real(*parts)
+
+    monkeypatch.setattr(merkle, "hash_leaf", failing)
+
+    def produce():
+        for i, p in enumerate(items):
+            if i == 9:
+                raise IndexError("leaf 9 is missing")
+            yield p
+
+    digests, err = hash_leaves_until_error(produce())
+    assert isinstance(err, ValueError) and str(err) == "item 5 cannot be hashed"
+    assert digests == [real(*p) for p in items[:5]]
+    with pytest.raises(ValueError, match="item 5 cannot be hashed"):
+        hash_leaves(produce())

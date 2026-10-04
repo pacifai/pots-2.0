@@ -37,7 +37,7 @@ from verification.verifier.checks import (
     check_2_commitment,
     check_5_matmuls,
 )
-from verification.verifier.context import CommittedLeaves, Rejection, StepContext
+from verification.verifier.context import CommittedLeaves, Rejection, StepContext, _guard, _hash
 from verification.verifier.driver import Verifier
 from verification.verifier.matmul_check.challenges import SIGMA_R, challenge_matrix
 from verification.verifier.matmul_check.freivalds import _safe_norm
@@ -1282,3 +1282,102 @@ def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
     rej_s, _ = _llama_check_5(c, out, monkeypatch, batched=False, perturb={forged: _bumped})
     _expect(rej_b, 1, "5")
     assert rej_b == rej_s and f"({forged})" in rej_b.detail
+
+
+# ---- check 7: parallel hashing, leaf-by-leaf outcome ------------------------------------
+
+
+@checks._checked
+def _serial_check_7(store, c, ctx, bands):
+    """Check 7 as it was before batching: read, hash and compare one W_t leaf at a time."""
+    cid = ctx.chain_check_id
+    for name, want in zip(c.weight_names, ctx.prev_w_hashes):
+        with _guard(ctx, cid):
+            got = _hash(c, c.w_t_index(name), store.leaf(c.w_t_index(name)))
+        ctx.state.early_hashes[c.w_t_index(name)] = got
+        if got != want:
+            what = "the agreed W_0" if cid == "0" else f"W_{{t+1}} of step {ctx.step - 1}"
+            return ctx.reject(cid, f"W_t[{name}] differs from {what}")
+    return None
+
+
+@pytest.fixture(params=[1, 4], ids=["inline", "parallel"])
+def hash_threads(request, monkeypatch):
+    monkeypatch.setattr(merkle, "_CHUNK_BYTES", 1)
+    before = torch.get_num_threads()
+    torch.set_num_threads(request.param)
+    yield
+    torch.set_num_threads(before)
+
+
+def _chain_ctx(c, D, w_hashes, step, cid):
+    return StepContext.for_computation(
+        c, step=step, indices=tuple(schedule(step, c.n_s, len(D))), h_D=b"\0" * 32,
+        n_records=len(D), prev_w_hashes=w_hashes, chain_check_id=cid, k=K)
+
+
+def test_check_7_reports_the_first_bad_w_t_leaf_as_a_loop_does(c, D, tree, w0, hash_threads):
+    """Whatever pair of mismatch, read error, validation error and non-finite leaf two W_t
+    slots hold, check 7 (and check 0 in its slot) gives the old leaf-by-leaf loop's rejection:
+    same check id, kind and detail. An error at a later leaf than a mismatch never shows."""
+    store, out = _store(c, D, tree, w0, 1)
+    names = c.weight_names
+    a, b = c.w_t_index(names[1]), c.w_t_index(names[-2])
+    wa, wb = out.w_t[names[1]], out.w_t[names[-2]]
+    kinds = {
+        "mismatch": {a: wa + 1.0, b: wb + 1.0},
+        "nan": {a: wa.clone().fill_(float("nan")), b: wb.clone().fill_(float("inf"))},
+        "shape": {a: wa.reshape(1, -1), b: wb.reshape(1, -1)},
+        "object": {a: "W", b: "W"},
+    }
+    hashes = tuple(leaf_hash(c, c.w_t_index(n), out.w_t[n]) for n in names)
+    n_cases = 0
+    for first in [*kinds, "missing"]:
+        for second in [*kinds, "missing"]:
+            leaves = {}
+            if first != "missing":
+                leaves[a] = kinds[first][a]
+            if second != "missing":
+                leaves[b] = kinds[second][b]
+            bad = a if first == "missing" else (b if second == "missing" else None)
+
+            def make():
+                return (Unreadable(store, bad, leaves=leaves) if bad is not None
+                        else Wrapped(store, leaves=leaves))
+
+            for step, cid in ((1, "0"), (2, "7")):
+                got = CHECKS["7"](make(), c, _chain_ctx(c, D, hashes, step, cid),
+                                  Bands.provisional())
+                want = _serial_check_7(make(), c, _chain_ctx(c, D, hashes, step, cid),
+                                       Bands.provisional())
+                assert isinstance(want, Rejection), (first, second)
+                assert got == want, (cid, first, second)
+                n_cases += 1
+    assert n_cases == 50
+
+
+def test_check_7_records_every_w_t_hash_for_check_2(c, D, tree, w0, hash_threads):
+    store, out = _store(c, D, tree, w0, 1)
+    hashes = tuple(leaf_hash(c, c.w_t_index(n), out.w_t[n]) for n in c.weight_names)
+    ctx = _chain_ctx(c, D, hashes, 2, "7")
+    assert CHECKS["7"](store, c, ctx, Bands.provisional()) is None
+    assert ctx.state.early_hashes == {c.w_t_index(n): h for n, h in zip(c.weight_names, hashes)}
+
+
+def test_mutation_by_a_later_read_rejected_at_7(c, D, tree, w0, parallel):
+    """A store whose read of a later W_t leaf writes in place into one it already served: the
+    earlier leaf may be hashed after the write, so check 7 (here check 0) rejects it as
+    malformed."""
+    store, _ = _store(c, D, tree, w0, 1)
+    a = c.w_t_index(c.weight_names[0])
+    ya = store.leaf(a)
+
+    class MutatingRead(Wrapped):
+        def leaf(self, index):
+            if index == c.w_t_index(c.weight_names[-1]):
+                ya.mul_(2.0)
+            return super().leaf(index)
+
+    rej = _verifier(c, D, tree, w0).verify_step(1, MutatingRead(store))
+    _expect(rej, 1, "0", "malformed")
+    assert rej.detail == f"leaf {a} changed in place during check 0"

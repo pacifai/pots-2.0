@@ -56,6 +56,7 @@ from verification.verifier.context import (
     _guard,
     _hash,
     _hashes,
+    _hashes_until_error,
     _is_digest,
 )
 from verification.verifier.matmul_check.freivalds import (
@@ -114,17 +115,37 @@ def check_7_chaining(store: TranscriptStore, c: DeclaredComputation, ctx: StepCo
 
     On the first step the kept hashes are the agreed ``W_0``'s, and a mismatch is check 0, the
     base anchor (spec §6 states check 7 for later steps only).
+
+    The leaves are read and validated in order and hashed in parallel (``_hashes_until_error``),
+    then judged in order, so the outcome is a leaf-by-leaf loop's: the first leaf in order that
+    fails to read, validate or hash, or hashes to the wrong digest, decides. An error at a
+    later leaf than a mismatch never shows. A leaf hashes only after later leaves are read, so
+    a read that writes in place into an earlier leaf rejects that leaf as malformed: its digest
+    may be of the changed bytes.
     """
     cid = ctx.chain_check_id
     if len(ctx.prev_w_hashes) != c.n_w:
         raise RuntimeError(f"{len(ctx.prev_w_hashes)} chained hashes for {c.n_w} weights")
-    for name, want in zip(c.weight_names, ctx.prev_w_hashes):
-        with _guard(ctx, cid):
-            got = _hash(c, c.w_t_index(name), store.leaf(c.w_t_index(name)))
-        ctx.state.early_hashes[c.w_t_index(name)] = got
+    seen = CommittedLeaves()  # tensor versions at read, to spot in-place writes
+
+    def read() -> Iterator[tuple[int, Any]]:
+        for name in c.weight_names:
+            obj = store.leaf(c.w_t_index(name))
+            seen.add(obj)
+            yield c.w_t_index(name), obj
+
+    hashes, error = _hashes_until_error(c, read())
+    for k, (name, want, got) in enumerate(zip(c.weight_names, ctx.prev_w_hashes, hashes)):
+        i = c.w_t_index(name)
+        if seen.changed(k):
+            return ctx.reject(cid, f"leaf {i} changed in place during check {cid}", "malformed")
+        ctx.state.early_hashes[i] = got
         if got != want:
             what = "the agreed W_0" if cid == "0" else f"W_{{t+1}} of step {ctx.step - 1}"
             return ctx.reject(cid, f"W_t[{name}] differs from {what}")
+    if error is not None:
+        with _guard(ctx, cid):
+            raise error
     return None
 
 
