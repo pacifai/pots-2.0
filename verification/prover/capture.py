@@ -115,7 +115,8 @@ _HANDLED = {
     "addmm": (False, True),
     "baddbmm": (True, True),
 }
-assert frozenset(_HANDLED) == HANDLED_OPS
+if frozenset(_HANDLED) != HANDLED_OPS:
+    raise ImportError("capture._HANDLED is out of sync with matmul_ops.HANDLED_OPS")
 
 
 class CaptureError(RuntimeError):

@@ -396,7 +396,7 @@ interface.
     (hooks on each decoder layer and on the final norm), the kwargs LlamaModel passes its
     layers (causal mask over `ρ`, RoPE `(cos, sin)`, positions) and `Λ`'s operands. That
     pass checks the call names only and keeps no layer's operands, so peak glue is one
-    layer's operands plus the `L+1` residual states (a test holds weakrefs to layer 1's
+    layer's operands plus the `L+1` residual states and `Λ`'s operands (a test holds weakrefs to layer 1's
     operands and checks they are dead by the final norm). A request in layer ℓ reruns
     `layers[ℓ−1](X_ℓ, **kwargs)` the same way, keeps its nine products' operands, checks the
     output is `X_{ℓ+1}`, and drops them after `Y_down`. The call sequence must be the declared
