@@ -9,15 +9,15 @@ import torch.nn.functional as F
 from transformers import LlamaConfig
 from transformers.models.llama import modeling_llama
 
-from src.verification.capture import MatmulCapture, param_storage_map
-from src.verification.computation import LabelingError, ProductKind
-from src.verification.data import PAD_ID
-from src.verification.encoding import EncodingError, Record, encode_record
-from src.verification.instances import LlamaComputation
-from src.verification.instances.llama import LINEARS
-from src.verification.prover import prove_step
-from src.verification.sizing import matmul_count_llama
-from src.verification.store import commit, leaf_hash
+from verification.capture import MatmulCapture, param_storage_map
+from verification.computation import LabelingError, ProductKind
+from verification.data import PAD_ID
+from verification.encoding import EncodingError, Record, encode_record
+from verification.instances import LlamaComputation
+from verification.instances.llama import LINEARS
+from verification.prover import prove_step
+from verification.sizing import matmul_count_llama
+from verification.store import commit, leaf_hash
 
 FWD, IG, WG, OG = (ProductKind.FORWARD, ProductKind.INPUT_GRAD, ProductKind.WEIGHT_GRAD,
                    ProductKind.OPERAND_GRAD)
@@ -422,8 +422,8 @@ def test_smollm2_real_step_m2():
     import resource
     import time
 
-    from src.verification.config import load_config, setup_determinism
-    from src.verification.data import load_dataset_records, schedule
+    from verification.config import load_config, setup_determinism
+    from verification.data import load_dataset_records, schedule
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     cfg = load_config()

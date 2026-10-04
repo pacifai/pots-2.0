@@ -1,4 +1,4 @@
-# `src/verification`: architecture and workflows
+# `verification`: architecture and workflows
 
 This package implements the training-step verification protocol. A **prover** trains a
 model and claims it took each SGD step as agreed. A **verifier** checks that claim for

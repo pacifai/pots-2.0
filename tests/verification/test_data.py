@@ -4,10 +4,10 @@ import pytest
 import torch
 import transformers
 
-from src.verification import data
-from src.verification.config import load_config
-from src.verification.encoding import Record
-from src.verification.merkle import hash_record_leaf
+from verification import data
+from verification.config import load_config
+from verification.encoding import Record
+from verification.merkle import hash_record_leaf
 
 ROWS = [
     {"instruction": "Give three tips for staying healthy.", "input": "",

@@ -5,8 +5,8 @@ import math
 import pytest
 import torch
 
-from src.verification.config import C_ANTI, LAMBDA, LOG2_G, UNIT_ROUNDOFF, Z
-from src.verification.sizing import (
+from verification.config import C_ANTI, LAMBDA, LOG2_G, UNIT_ROUNDOFF, Z
+from verification.sizing import (
     b0, bit_budget, e_m, f_achieved, k_required, matmul_count_llama, size_k,
 )
 

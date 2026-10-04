@@ -8,19 +8,19 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.verification import loop as loop_mod
-from src.verification.checks import Bands
-from src.verification.data import schedule
-from src.verification.instances.mlp import (
+from verification import loop as loop_mod
+from verification.checks import Bands
+from verification.data import schedule
+from verification.instances.mlp import (
     MLPComputation,
     init_weights,
     make_record,
     synthetic_dataset,
 )
-from src.verification.loop import ProverFault, run_loop
-from src.verification.prover import plain_step
-from src.verification.store import InMemoryStore, dataset_tree
-from src.verification.verifier import Verifier
+from verification.loop import ProverFault, run_loop
+from verification.prover import plain_step
+from verification.store import InMemoryStore, dataset_tree
+from verification.verifier import Verifier
 
 ETA = 1e-3
 K = 7

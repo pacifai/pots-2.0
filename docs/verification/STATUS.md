@@ -22,10 +22,17 @@ The design process is gated, and each stage starts only after the previous one c
 4. Implementation plan — **closed on 2026-09-30.** The user approved
    `IMPLEMENTATION_PLAN.md`.
 5. Implementation, with evaluation discussed alongside — **in progress since 2026-09-30.**
-   Code lives in `src/verification/`, on the local branch `verification-impl`. Its shared
-   conventions are in `src/verification/CLAUDE.md`.
+   Code lives in `verification/`, on the local branch `verification-impl`. Its shared
+   conventions are in `verification/CLAUDE.md`.
 
 ## Next tasks
+
+- **Tutorial removed on 2026-10-04 (user).** The upstream post-training tutorial (TRL
+  scripts, reward modules, plots, `README_CN.md`, `uv.lock`) is deleted, because the
+  verification code imported none of it. The package moved from `src/verification/` to the
+  top-level `verification/`, the project is renamed `pots-2.0`, and `README.md` now
+  describes the protocol. See `DECISIONS_SETUP.md` §8.B S7, amendment. Older entries below
+  that cite `src/verification/` mean `verification/`.
 
 - **C4 closed on 2026-10-01** (task B5). `D` and `D̃` are materialized, with
   `h_D = 3efb21e8…637536`, and their pins are recorded in `DECISIONS_SETUP.md` §8.B C4. The

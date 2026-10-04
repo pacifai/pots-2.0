@@ -5,7 +5,7 @@ import pytest
 import torch
 from torch import nn
 
-from src.verification.capture import (
+from verification.capture import (
     HANDLED_OPS,
     REJECTED_OPS,
     BiasedMatmulError,
@@ -16,7 +16,7 @@ from src.verification.capture import (
     UnsupportedMatmulError,
     param_storage_map,
 )
-from src.verification.sizing import matmul_count_llama
+from verification.sizing import matmul_count_llama
 
 L, N_S, N, N_H = 2, 2, 8, 4
 
@@ -412,7 +412,7 @@ def test_smollm2_real_step():
 
     from transformers import AutoModelForCausalLM
 
-    from src.verification.config import assert_no_dropout, load_config, setup_determinism
+    from verification.config import assert_no_dropout, load_config, setup_determinism
 
     cfg = load_config()
     setup_determinism(cfg)

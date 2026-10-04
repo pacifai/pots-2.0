@@ -12,7 +12,7 @@ Stages 1–3 are closed. The spec, the reference block, the sizing appendix and 
 decision (S1–S9, P1–P12 in `docs/verification/DECISIONS_SETUP.md`) are settled. What remains are
 the implementation-time tasks C1–C4. This plan is the stage-4 deliverable. Once you approve it,
 stage 5 starts: I orchestrate `opus` coding agents and `opus` review agents, which build
-`src/verification/` and run the test-scale programme. That programme is 10 honest steps plus
+`verification/` and run the test-scale programme. That programme is 10 honest steps plus
 the A1, A2, A3, hidden-steps and flipped-matmul cheats, each rejected at its declared
 `(step, check)`.
 
@@ -34,14 +34,14 @@ Instruct model. `W_0` is `SmolLM2-135M-Instruct` (P2, re-confirmed), so T0 downl
   **Nothing is pushed** unless you ask.
 - **Coding and review loop per task.** An `opus` coder implements the task with its tests. A
   separate `opus` reviewer checks it against the spec and reference-block sections the task
-  cites, against `src/verification/CLAUDE.md`, and against its tests, then returns findings. The
+  cites, against `verification/CLAUDE.md`, and against its tests, then returns findings. The
   coder fixes them, and this repeats for up to 3 rounds. An unresolved finding comes to me, and
   a design question comes to you. I run the full suite after each merge.
 - **Only I edit `docs/verification/`**, under its lock rules, so subagents never hold a lock.
   Subagents report side findings to me, and I park them in `FULL_SCALE_TASKS.md` or
   `EVALUATION_TASKS.md`.
 - **At most about 3 coders run at once.**
-- **Shared knowledge lives in `src/verification/CLAUDE.md`**, which I write in T0 and keep
+- **Shared knowledge lives in `verification/CLAUDE.md`**, which I write in T0 and keep
   current after each merge. It holds:
   - the module map and each module's public interface;
   - the constants table (`λ=25`, `log₂G=52`, `z=8`, `f=1`, `c=0.798`, `σ_r=1/√3`, `τ_W⁰=4`, and
@@ -57,7 +57,7 @@ Instruct model. `W_0` is `SmolLM2-135M-Instruct` (P2, re-confirmed), so T0 downl
 ## Layout (S7)
 
 ```
-src/verification/
+verification/
   CLAUDE.md            shared knowledge for all agents
   config.py            env-var config, constants, determinism setup (S4c)
   encoding.py          canonical leaf/record/label encodings, tags; NaN/Inf rejected (S9c, S9d, P1b, P8a)
@@ -95,7 +95,7 @@ tests/verification/    pytest, one file per module
   Every command runs as `.venv/bin/python -m …`;
 - adds `blake3` to the pyproject dependencies and `pytest` as a dev group;
 - creates the branch;
-- scaffolds the package and `tests/`, and writes `src/verification/CLAUDE.md`;
+- scaffolds the package and `tests/`, and writes `verification/CLAUDE.md`;
 - looks up and downloads `SmolLM2-135M-Instruct` at a pinned commit (P2b).
 
 If a pinned version has no wheel for Python 3.14 on arm64, I bring it to you rather than
@@ -161,12 +161,14 @@ I also send you a short report at each of M1–M5, including what to record in t
   - record the S6c check-order revision in `DECISIONS_SETUP.md`.
 - **As they close:** record C4, C1 and C3 in `DECISIONS_SETUP.md` §8.B and remove them from
   `SETUP_TASKS.md`.
-- **At the end:** add the README pointer (S7d).
+- **At the end:** ~~add the README pointer (S7d).~~ Done on 2026-10-04 in a different form:
+  the tutorial was removed, the package moved from `src/verification/` to `verification/`, and
+  `README.md` now describes the protocol (`DECISIONS_SETUP.md` §8.B S7, amendment).
 
 ## Verification
 
 - `.venv/bin/python -m pytest tests/verification` passes after every merge.
-- M1: `.venv/bin/python -m src.verification.helper_runs.mlp_smoke` accepts the honest run and
+- M1: `.venv/bin/python -m verification.helper_runs.mlp_smoke` accepts the honest run and
   rejects each fault at its declared check.
 - M3: an honest Llama step is accepted and the per-class normalized residual table is printed.
 - M5: `run_verified` accepts all 10 steps, and every cheat run's oracle passes. The band-file

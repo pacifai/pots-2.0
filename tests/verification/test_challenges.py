@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from src.verification.challenges import _entries, _label, challenge_matrix, challenge_vector
+from verification.challenges import _entries, _label, challenge_matrix, challenge_vector
 
 H0 = bytes(32)
 H1 = bytes(range(32))

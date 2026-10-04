@@ -2,9 +2,9 @@ import pytest
 import torch
 from torch import nn
 
-from src.verification.capture import MutatedCaptureError
-from src.verification.instances.mlp import MLPComputation, init_weights, synthetic_dataset
-from src.verification.prover import plain_step, prove_step
+from verification.capture import MutatedCaptureError
+from verification.instances.mlp import MLPComputation, init_weights, synthetic_dataset
+from verification.prover import plain_step, prove_step
 
 ETA = 0.05
 

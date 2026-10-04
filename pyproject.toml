@@ -1,54 +1,20 @@
 [project]
-name = "llm-posttraining"
+name = "pots-2.0"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     # BLAKE3 is the protocol's hash, PRF and challenge expansion (DECISIONS_SETUP S9).
     "blake3>=1.0.9",
     "datasets>=5.0.0",
-    "lm-eval>=0.4.12",
-    "matplotlib>=3.11.1",
-    # peft 0.18+ loads LoRA adapters through a tensor-parallel shard path that imports
-    # `EmbeddingParallel` from transformers -- a transformers-5 symbol absent from the
-    # 4.x line this project pins. Cap at 0.17.x so adapter reload works on transformers 4.
-    "peft>=0.17,<0.18",
-    "rich>=15.0.0",
     "torch",
-    # Pin to 4.x: transformers 5 tightened config validation and rejects models
-    # with non-standard head_dim (e.g. anrilombard/mzansilm-125m, head_dim=56).
+    # Pin to 4.x: the SmolLM2 product inventory (verification/instances/llama.py) follows
+    # the matmul order of transformers 4.57.6's Llama forward (pinned at T0), and
+    # test_llama.py patches modeling_llama internals. 5.x is untested here.
     "transformers>=4.52.4,<5",
-    "trl>=1.8.0",
 ]
-
-# vLLM is optional: it speeds up GRPO rollouts on a rented GPU, but it drags in
-# torchvision and heavy CUDA deps that break the text-only stack on bleeding-edge
-# Python (e.g. 3.14). Install only where needed:  uv sync --extra vllm
-# torchvision/torchaudio are listed EXPLICITLY (not just left to vllm's transitive
-# pull) so the cu128 [tool.uv.sources] pin below actually applies -- uv does not
-# reliably redirect a transitive-only dep to an explicit index.
-[project.optional-dependencies]
-# vLLM's CUDA build must match the cu128 torch stack so it runs on both the local
-# (CUDA 12.8) and server (13.0, backward-compatible) drivers. vLLM switched its
-# default wheel to CUDA 13 somewhere between 0.16 and 0.22: 0.22.1's `_C` links
-# libcudart.so.13 (absent here) and dies on import, but 0.16.0 is still a CUDA-12
-# wheel (pulls nvidia-cuda-runtime-cu12, imports cleanly -- verified). 0.16 is also
-# trl's minimum supported vLLM, so pinning to 0.16.x is both CUDA-12 and warning-free.
-# Keep the range narrow (<0.17): a wider cap resolves to the newest match (0.22, CUDA-13).
-vllm = ["vllm>=0.16,<0.17", "torchvision", "torchaudio"]
-
 
 [dependency-groups]
 dev = ["pytest>=8"]
-
-[tool.uv]
-# Some vLLM deps (e.g. xgrammar 0.2.4) publish releases with no x86_64-linux wheel.
-# Requiring this platform forces uv to backtrack to a dependency set that actually
-# installs on the local WSL/Ubuntu x86_64 box, not just aarch64/macos.
-required-environments = [
-    "sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
-# set the torch index to auto so that uv can pick the right CUDA version for the local machine and mirror it from the correct source.
-torch-backend = "auto"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

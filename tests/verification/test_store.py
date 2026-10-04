@@ -5,12 +5,12 @@ import pytest
 import torch
 from torch import nn
 
-from src.verification.computation import TranscriptView
-from src.verification.encoding import TAG_PRODUCT, TAG_WEIGHT, encode_tensor_leaf
-from src.verification.instances.mlp import MLPComputation, init_weights, synthetic_dataset
-from src.verification.merkle import MerkleTree, hash_leaf, verify_path
-from src.verification.prover import StepOutput, prove_step
-from src.verification.store import (
+from verification.computation import TranscriptView
+from verification.encoding import TAG_PRODUCT, TAG_WEIGHT, encode_tensor_leaf
+from verification.instances.mlp import MLPComputation, init_weights, synthetic_dataset
+from verification.merkle import MerkleTree, hash_leaf, verify_path
+from verification.prover import StepOutput, prove_step
+from verification.store import (
     InMemoryStore,
     LeafDtypeError,
     LeafShapeError,

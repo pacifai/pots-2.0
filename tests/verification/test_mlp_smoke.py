@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from src.verification.helper_runs import mlp_smoke
-from src.verification.helper_runs.mlp_smoke import (
+from verification.helper_runs import mlp_smoke
+from verification.helper_runs.mlp_smoke import (
     Expected,
     Scenario,
     honest_final,
@@ -13,8 +13,8 @@ from src.verification.helper_runs.mlp_smoke import (
     run_smoke,
     scenarios,
 )
-from src.verification.instances.mlp import MLPComputation, init_weights, synthetic_dataset
-from src.verification.loop import ProverFault
+from verification.instances.mlp import MLPComputation, init_weights, synthetic_dataset
+from verification.loop import ProverFault
 
 K = 7
 T = 3

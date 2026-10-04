@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from src.verification.config import C_ANTI, F_TARGET, LAMBDA, LOG2_G, Z
+from verification.config import C_ANTI, F_TARGET, LAMBDA, LOG2_G, Z
 
 
 def e_m(q: int, eps_in: float, eps_acc: float) -> float:

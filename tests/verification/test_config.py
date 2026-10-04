@@ -8,8 +8,8 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from src.verification import config as C
-from src.verification.config import VerifConfig, assert_no_dropout, load_config, setup_determinism
+from verification import config as C
+from verification.config import VerifConfig, assert_no_dropout, load_config, setup_determinism
 
 
 def test_defaults_match_claude_md_table():

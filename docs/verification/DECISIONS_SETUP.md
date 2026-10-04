@@ -458,6 +458,31 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     and the reference block — and the user's paper is the real write-up target. A README
     write-up would be a third description of the same thing to keep in sync. So: a few
     sentences saying what this fork adds, linking to `docs/verification/`.
+  - **Amendment — tutorial removed, package moved to `verification/` (user, 2026-10-04).**
+    An audit found that the verification code imported nothing from the tutorial. Its only
+    outside dependencies were third-party: torch, transformers, datasets, huggingface_hub,
+    blake3 and numpy. The plan's future work needed none of it either. The ASR scorer
+    copies BackdoorLLM's scorer (B8), and the cost metrics are new code (B6). Keeping the
+    tutorial had real costs. Half of `CLAUDE.md` and all of `README.md` described it as the
+    repo's primary artifact. `pyproject.toml` pinned TRL, peft, vLLM and lm-eval for code
+    the protocol never runs, and its uv settings required the lock to resolve on Linux
+    x86_64, not the Mac the test scale runs on. So the user chose to keep only
+    the verification code.
+    - *Rejected: merging verification into the tutorial's training path.* The tutorial
+      trains through TRL with AdamW in bf16 on a CUDA-only loader. The verified run needs
+      plain SGD, fp32 at test scale and per-matmul access (§8.A.1). Merging would either
+      rebuild the tutorial on the verified loop or bring TRL into the verified path, which
+      breaks §8.A.1. The only shared parts were conventions (env-var config,
+      `trainer_output/`), which `config.py` already reimplements.
+    - **Effects.** S7a's "shares the pinned dependency stack and the packaging" no longer
+      holds: the package is now the top-level `verification/`, imported as
+      `verification.<module>`, and the project is named `pots-2.0`. S7b and S7c stand, with
+      `verification/` in place of `src/verification/`. S7d is superseded: `README.md` now
+      describes the protocol instead of pointing to it from a tutorial blog. Outputs still
+      go to `trainer_output/verification/`. The two text-generation pitfalls from the
+      tutorial's `generate_responses` (left padding, and a stop string that encodes to
+      `eos_token_id`) are recorded in `verification/CLAUDE.md` for B8. The tutorial stays
+      in git history.
 
 - **S9 — Concrete cryptographic primitives (former algorithm Q8). CLOSED (user, 2026-09-27).**
   **BLAKE3** in all three roles, with a fixed-width binary canonical encoding.

@@ -36,7 +36,7 @@ def next_setup_task():
     status = DOCS / "STATUS.md"
     if not status.exists():
         return None
-    m = re.search(r"the next item is \*\*(\w+)\*\*", status.read_text(encoding="utf-8"))
+    m = re.search(r"the next item is \*\*([^*\n]+)\*\*", status.read_text(encoding="utf-8"))
     return m.group(1) if m else None
 
 

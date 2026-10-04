@@ -3,11 +3,11 @@ import struct
 import pytest
 import torch
 
-from src.verification.capture import MatmulCapture, param_storage_map
-from src.verification.computation import LabelingError, ProductKind, load_weights
-from src.verification.data import schedule
-from src.verification.encoding import TAG_MLP_RECORD, encode_tensor_leaf
-from src.verification.instances.mlp import (
+from verification.capture import MatmulCapture, param_storage_map
+from verification.computation import LabelingError, ProductKind, load_weights
+from verification.data import schedule
+from verification.encoding import TAG_MLP_RECORD, encode_tensor_leaf
+from verification.instances.mlp import (
     DEFAULT_WIDTHS,
     MLPComputation,
     init_weights,
@@ -15,7 +15,7 @@ from src.verification.instances.mlp import (
     split_record,
     synthetic_dataset,
 )
-from src.verification.prover import prove_step
+from verification.prover import prove_step
 
 ETA = 0.05
 

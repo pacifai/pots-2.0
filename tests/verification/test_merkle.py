@@ -4,8 +4,8 @@ import blake3
 import pytest
 import torch
 
-from src.verification.encoding import TAG_PRODUCT, TAG_WEIGHT, Record, encode_record, encode_tensor_leaf
-from src.verification.merkle import (
+from verification.encoding import TAG_PRODUCT, TAG_WEIGHT, Record, encode_record, encode_tensor_leaf
+from verification.merkle import (
     MerkleTree,
     hash_leaf,
     hash_node,

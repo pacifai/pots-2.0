@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.verification.challenges import challenge_matrix
-from src.verification.checks import (
+from verification.challenges import challenge_matrix
+from verification.checks import (
     CHECKS,
     DEFAULT_ORDER,
     CommittedLeaves,
@@ -25,26 +25,26 @@ from src.verification.checks import (
     _safe_norm,
     product_class,
 )
-from src.verification.computation import TranscriptView
-from src.verification import prover
-from src.verification.config import SIGMA_R, TAU_W0, UNIT_ROUNDOFF, Z
-from src.verification.data import schedule
-from src.verification.sizing import e_m
-from src.verification.instances.mlp import (
+from verification.computation import TranscriptView
+from verification import prover
+from verification.config import SIGMA_R, TAU_W0, UNIT_ROUNDOFF, Z
+from verification.data import schedule
+from verification.sizing import e_m
+from verification.instances.mlp import (
     MLPComputation,
     MLPReplay,
     init_weights,
     make_record,
     synthetic_dataset,
 )
-from src.verification.prover import plain_step, prove_step
-from src.verification.store import InMemoryStore, TranscriptStore, dataset_tree, perturb_leaf
-from src.verification.verifier import Verifier
+from verification.prover import plain_step, prove_step
+from verification.store import InMemoryStore, TranscriptStore, dataset_tree, perturb_leaf
+from verification.verifier import Verifier
 
 ETA = 1e-3
 K = 7
 N_RECORDS = 40
-SRC = Path(__file__).resolve().parents[2] / "src" / "verification"
+SRC = Path(__file__).resolve().parents[2] / "verification"
 
 
 @pytest.fixture(scope="module")

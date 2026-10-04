@@ -3,7 +3,7 @@ import struct
 import pytest
 import torch
 
-from src.verification.encoding import (
+from verification.encoding import (
     DTYPE_CODES,
     TAG_LABEL,
     TAG_MLP_RECORD,

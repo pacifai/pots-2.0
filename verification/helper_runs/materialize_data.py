@@ -1,6 +1,6 @@
 """Materialize `D`, `D̃` and their manifests into `$VERIF_OUTPUT_DIR/data/` (C4).
 
-    .venv/bin/python -m src.verification.helper_runs.materialize_data
+    .venv/bin/python -m verification.helper_runs.materialize_data
 
 Writes `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` (pins and
 statistics; storage layer, outside every commitment).
@@ -14,8 +14,8 @@ import statistics
 import datasets
 import transformers
 
-from src.verification import data
-from src.verification.config import load_config
+from verification import data
+from verification.config import load_config
 
 
 def _histogram(lengths: list[int], width: int = 16) -> dict[str, int]:

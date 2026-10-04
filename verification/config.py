@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from torch import nn
 
-# Protocol constants (test scale). See src/verification/CLAUDE.md and the sizing appendix §9.
+# Protocol constants (test scale). See verification/CLAUDE.md and the sizing appendix §9.
 LAMBDA: int = 25
 LOG2_G: int = 52
 Z: float = 8.0

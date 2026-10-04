@@ -1,10 +1,10 @@
 """Milestone M1: the MLP smoke run, an honest run plus three faults, each with its oracle.
 
-    .venv/bin/python -m src.verification.helper_runs.mlp_smoke [--steps T]
+    .venv/bin/python -m verification.helper_runs.mlp_smoke [--steps T]
 
 The degenerate MLP instance (ref block §9), widths ``(16, 32, 32, 8)``, ``n_s = 4``, ``η`` from
 ``VERIF_ETA`` (1e-3, fixed by declaration, S8e), on a synthetic dataset of ``VERIF_N_RECORDS``
-records. Every scenario runs the full S3 loop (:func:`~src.verification.loop.run_loop`) from
+records. Every scenario runs the full S3 loop (:func:`~verification.loop.run_loop`) from
 ``W_0`` over ``T`` steps. ``T`` is ``--steps``, else ``VERIF_STEPS`` (default 10), and must be
 at least 2.
 
@@ -34,19 +34,19 @@ from typing import Any
 
 import torch
 
-from src.verification import data
-from src.verification.checks import DEFAULT_ORDER, Bands, Rejection
-from src.verification.config import load_config, setup_determinism
-from src.verification.instances.mlp import (
+from verification import data
+from verification.checks import DEFAULT_ORDER, Bands, Rejection
+from verification.config import load_config, setup_determinism
+from verification.instances.mlp import (
     DEFAULT_WIDTHS,
     MLPComputation,
     init_weights,
     synthetic_dataset,
 )
-from src.verification.loop import LoopResult, ProverFault, StepRecord, run_loop
-from src.verification.prover import StepOutput, plain_step
-from src.verification.store import dataset_tree
-from src.verification.verifier import Verifier
+from verification.loop import LoopResult, ProverFault, StepRecord, run_loop
+from verification.prover import StepOutput, plain_step
+from verification.store import dataset_tree
+from verification.verifier import Verifier
 
 __all__ = ["Expected", "Scenario", "ScenarioResult", "scenarios", "honest_final",
            "run_scenario", "run_smoke", "main"]

@@ -1,13 +1,13 @@
 import pytest
 
-from src.verification.computation import (
+from verification.computation import (
     DeclaredComputation,
     LeafReader,
     ProductKind,
     ProductSpec,
     TranscriptView,
 )
-from src.verification.instances.mlp import MLPComputation
+from verification.instances.mlp import MLPComputation
 
 
 class ListReader:

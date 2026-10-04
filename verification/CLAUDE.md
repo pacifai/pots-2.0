@@ -1,4 +1,4 @@
-# src/verification — shared knowledge for every agent
+# verification — shared knowledge for every agent
 
 This package implements the training-step verification protocol at test scale. Read this file
 first. It pins the names, constants, encodings and interfaces that parallel tasks must agree
@@ -34,8 +34,14 @@ details that don't change what is committed or checked are yours to choose.
   - Entry points read env vars through `config.py` and call library functions.
   - Comments are sparse, match the surrounding code, and cite decision IDs.
   - Follow `/Users/amitainevo/Projects/pots-2.0/writing-tenets.md` for prose.
-- **Don't import** `src.model_loader`, `src.data_loader` or TRL. The verified path loads the
-  model directly (§8.A.2).
+- **Don't use TRL or any trainer wrapper.** The verified path loads the model directly with
+  `from_pretrained` and runs its own plain-SGD loop (§8.A.1, §8.A.2).
+- **Text generation (ASR scoring, B8).** Two pitfalls carried over from the removed tutorial's
+  `generate_responses`:
+  - Batched generation pads on the **left** (`tokenizer.padding_side = "left"`). Right
+    padding puts pad tokens between the prompt and the new tokens and corrupts the output.
+  - The chat template's stop string has to encode to exactly `eos_token_id`, because
+    `generate()` stops only on that id. Otherwise generation runs to `max_new_tokens`.
 
 ## Constants (test scale)
 
@@ -413,7 +419,7 @@ This section is filled in as tasks merge. Each entry gives the public interface.
     the verifier. A test holds weakrefs to each step's products and checks they are dead by the
     next step.
 - `helper_runs/mlp_smoke.py` (A6, milestone M1):
-  `.venv/bin/python -m src.verification.helper_runs.mlp_smoke [--steps T]`.
+  `.venv/bin/python -m verification.helper_runs.mlp_smoke [--steps T]`.
   - The MLP at widths `(16,32,32,8)`, `n_s = 4`, `η = VERIF_ETA`, on `synthetic_dataset` of
     `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS` (default 10), and must be
     ≥ 2. Bands are provisional, with `allow_provisional=True`.
