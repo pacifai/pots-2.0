@@ -33,6 +33,8 @@ says which files that task needs. Read only those files. The other files are:
   they come up, and don't plan those areas ahead.
 - `DECISIONS_ALGORITHM.md` and `DECISIONS_SETUP.md` — settled decisions with their
   reasoning. Read them when a task needs the reasoning behind a decision.
+- `DECISIONS_EVALUATION.md` — settled evaluation decisions (EQ1, EQ2, …): which results we
+  report, how each is measured, and how they compare with PoTS.
 - `BACKGROUND.md` — the PoTS summary, notation, and repo context.
 - `archive/WORKLOG_2026-09-24.md` — the frozen former unified worklog. Don't edit it or
   resume from it.
