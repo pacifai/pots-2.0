@@ -159,7 +159,10 @@ Two instances exist, in `instances/`:
   the committed product, so all glue between products runs through the model's own code on
   committed values. (A product with inner dimension 1, the RoPE angle table, isn't checked; it
   is glue and is recomputed.) The backward products come from PyTorch autograd on the same
-  modules, under the same substitution, so no backward pass is written by hand. Forward
+  modules, under the same substitution, so no backward pass is written by hand. Like
+  training, the replay runs one forward pass with gradients on and then one backward pass,
+  one layer at a time from the top, and frees each layer's saved values once its backward
+  has run. Forward
   (task A8) and backward (task A9) are done. One SmolLM2 detail: its config sets
   `pad_token_id = 2`, which is also EOS and our pad token, so `nn.Embedding(padding_idx=2)`
   gives a zero embedding gradient for token 2. The replay matches the prover there because
