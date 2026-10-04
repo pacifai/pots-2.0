@@ -11,7 +11,7 @@ __pycache__/
 *.egg-info/
 .ipynb_checkpoints/
 
-# Run artifacts: everything a run writes goes to trainer_output/ (verification/config.py).
+# Run artifacts: everything a run writes goes to trainer_output/ (setup/config.py).
 # The weight-file patterns guard against committing large tensors saved anywhere else.
 trainer_output/
 *.ckpt

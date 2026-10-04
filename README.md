@@ -37,8 +37,9 @@ Implementation is in progress. The work runs in two phases with one code path:
 | `docs/verification/STATUS.md` | Current stage, next task, and a map of the design docs |
 | `docs/verification/VERIFICATION_PROTOCOL_SPEC.md` | The protocol spec, independent of any model architecture |
 | `docs/verification/VERIFICATION_PROTOCOL_REFERENCE_BLOCK.md` | The protocol worked through on one SmolLM2 decoder step |
-| `verification/` | The implementation. `verification/README.md` explains its architecture |
-| `tests/verification/` | The test suite |
+| `setup/` | Run setup that doesn't depend on the protocol: configuration, data, records, model loading |
+| `verification/` | The protocol implementation. `verification/README.md` explains its architecture |
+| `tests/` | The test suite, laid out like the code |
 
 ## Run the tests
 
@@ -50,8 +51,8 @@ implementation plan) pinned, and every recorded result uses them.
 python3 -m venv .venv
 .venv/bin/pip install torch==2.9.1 transformers==4.57.6 datasets==5.0.0 blake3==1.0.9 \
     huggingface_hub==0.36.2 numpy==2.5.3 pytest
-.venv/bin/python -m pytest tests/verification            # fast suite
-.venv/bin/python -m pytest tests/verification -m slow    # loads the real model
+.venv/bin/python -m pytest tests            # fast suite
+.venv/bin/python -m pytest tests -m slow    # loads the real model
 ```
 
 ## Origin

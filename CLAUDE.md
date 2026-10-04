@@ -119,22 +119,28 @@ docs, so another session's lock stays in place.
 
 ## Code and commands
 
-The code lives in the `verification/` package, imported as `verification.<module>`. Read
-`verification/CLAUDE.md` before touching it. It pins the constants, env vars, encodings,
-leaf order, check order and invariants. `verification/README.md` explains how the parts fit
-together and how data moves through them.
+The code lives in two top-level packages. `setup/` holds what any run needs whatever the
+protocol: configuration, data, the token record and model loading. `verification/` holds the
+protocol, one subpackage per role (`commitment`, `computation`, `prover`, `transcript`,
+`verifier`, `runs`). A role's directory doesn't name the mechanism that fills it, so swapping
+Merkle trees or Freivalds checks for another technique changes files inside a role, not the
+top of the tree. `tests/` mirrors that layout, and `tests/test_layering.py` enforces which
+part may import which. Read `verification/CLAUDE.md` before touching the code. It pins the
+constants, env vars, encodings, leaf order, check order and invariants.
+`verification/README.md` explains how the parts fit together and how data moves through them.
 
 ```bash
-.venv/bin/python -m pytest tests/verification            # fast suite
-.venv/bin/python -m pytest tests/verification -m slow    # loads the real model
-.venv/bin/python -m verification.helper_runs.mlp_smoke   # a run: entry points are modules
+.venv/bin/python -m pytest tests                       # fast suite
+.venv/bin/python -m pytest tests -m slow               # loads the real model
+.venv/bin/python -m verification.runs.mlp_smoke        # a run: entry points are modules
 ```
 
 - **Environment.** A project-local `.venv` (Python 3.14, gitignored) holds every
   dependency. Install into it only, never system-wide. The pins in `pyproject.toml` carry
   their reasons as comments; don't bump one without checking that reason.
-- **Configuration is environment variables**, read through `verification/config.py`. Test
-  scale and full scale differ by env vars only (see "Scale invariance").
+- **Configuration is environment variables**, read through `setup/config.py` (run settings)
+  and `verification/parameters.py` (`VERIF_K` and the band file). Test scale and full scale
+  differ by env vars only (see "Scale invariance").
 - **Outputs** go to `trainer_output/verification/` (gitignored).
 - There's no linter config. Comments carry `# pyright: ignore[...]` markers, so pyright is
   the assumed checker, but nothing is wired up in the repo.

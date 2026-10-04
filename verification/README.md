@@ -51,64 +51,74 @@ Two facts drive the design:
 
 ## Components
 
-The package has six layers. Each layer uses only the layers above it.
+The code has two packages. `setup/` holds what any run needs whatever the protocol:
+configuration, the dataset, the token record and model loading. `verification/` holds the
+protocol, one directory per role. A directory names what its part does, not how. Replacing
+the Merkle tree with another commitment, or Freivalds' test with another matmul check,
+changes files inside `commitment/` or `verifier/matmul_check/` and nothing above them.
 
-| Layer | Modules | Role |
+| Directory | Modules | Role |
 |---|---|---|
-| Foundations | `config.py`, `encoding.py`, `merkle.py`, `challenges.py`, `sizing.py` | Constants and determinism, byte encodings, the hash tree, challenge vectors, parameter formulas |
-| Data | `data.py` | The dataset `D`, its root `h_D`, the batch schedule `π`, batch assembly, the poisoned `D̃` |
-| The agreed computation | `computation.py`, `instances/mlp.py`, `instances/llama.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
-| Prover side | `capture.py`, `prover.py` | Run a real training step and record every matmul |
-| Transcript | `store.py` | Lay a step out as ordered leaves, commit to it, serve it to the verifier |
-| Verifier side | `checks.py`, `verifier.py` | Run the checks and track a run from start to verdict |
-| Orchestration | `loop.py`, `helper_runs/` | Connect prover and verifier step by step, run scenarios |
+| `setup/` | `config.py`, `records.py`, `model.py`, `data.py` | Run settings and determinism, the token record, model loading, the dataset `D` and its batches |
+| `verification/` | `parameters.py` | Protocol constants, `k` and the band file |
+| `commitment/` | `encoding.py`, `merkle.py`, `leaves.py` | Canonical bytes, the hash tree, the roots `h` and `h_D` |
+| `computation/` | `interface.py`, `instances/mlp.py`, `instances/llama.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
+| `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
+| `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
+| `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `matmul_check/` | Run the checks and track a run from start to verdict |
+| `runs/` | `loop.py`, `mlp_smoke.py`, `materialize_data.py` | Connect prover and verifier step by step, run scenarios, write the dataset files |
 
-### Foundations
+`tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
+from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
+prover, the rest of the verifier or the runs. The verifier never imports the prover.
 
-- **`config.py`** reads every `VERIF_*` environment variable into one frozen
-  `VerifConfig`, and holds the protocol constants (`τ` margin, `k`, unit roundoffs).
-  `setup_determinism` fixes the thread count, seeds and deterministic kernels, and turns
-  TF32 off. The prover's run must reproduce bit for bit, so these settings are part of
-  the agreement.
-- **`encoding.py`** turns every committed object into canonical bytes: a one-byte type
-  tag, a dtype code, the shape, then the raw values. Records, weights and products all go
-  through it. It rejects NaN and Inf, and it uses no JSON and no optional fields, so two
-  honest parties always produce identical bytes.
+### Setup: `setup/`
+
+- **`config.py`** reads the run's `VERIF_*` environment variables into one frozen
+  `RunConfig`. `setup_determinism` fixes the thread count, seeds and deterministic kernels,
+  and turns TF32 off. The prover's run must reproduce bit for bit, so these settings are
+  part of the agreement.
+- **`records.py`** defines the token record `(ids, targets, mask)` and its canonical bytes.
+- **`model.py`** loads the pretrained model unmodified, through `from_pretrained`.
+- **`data.py`** builds the agreed dataset. Its steps:
+
+  1. Render Alpaca examples with the Stanford template.
+  2. Tokenize them.
+  3. Keep the first 500 records that fit 128 tokens.
+  4. Store each as `(ids, targets, mask)`.
+
+  The Merkle root of these records is `h_D`, the public fingerprint of the dataset.
+
+  The schedule `π(t)` names which records form step `t`'s batch. It is sequential, with no
+  shuffling. `assemble_batch` pads records into a tensor batch. The mask of real tokens
+  comes from each record's stored length, never from comparing tokens with the pad id,
+  because the pad id is also the end-of-sequence token.
+
+  `poison` builds `D̃`, a copy of `D` with one record rewritten with a trigger phrase and a
+  refusal. The cheat runs train on it.
+
+`verification/parameters.py` holds the constants every mechanism shares (`λ`, `G`, unit
+roundoffs) and reads `k` and the band-file path. A constant that belongs to one mechanism
+lives with it, such as the band margin in `matmul_check/sizing.py`.
+
+### Commitment: `commitment/`
+
+- **`encoding.py`** turns every committed tensor into canonical bytes: a one-byte type tag,
+  a dtype code, the shape, then the raw values. Weights and products go through it, and
+  token records follow the same pattern in `setup/records.py`. It rejects NaN and Inf, and
+  it uses no JSON and no optional fields, so two honest parties always produce identical
+  bytes.
 - **`merkle.py`** is an RFC 6962 hash tree over BLAKE3. Leaves and inner nodes hash with
   different prefixes, so a leaf can't pose as a node. It gives a root, an authentication
-  path for any leaf, and an O(log n) re-root after changing one leaf. The same tree builds
-  the dataset root `h_D` and each step's root `h`.
-- **`challenges.py`** derives Freivalds' random vectors from the step root `h` and the
-  product's position `m` (Fiat-Shamir). The vectors depend on everything committed, so the
-  prover can't know them before committing. They are float32 values on an exact grid in
-  (−1, 1).
-- **`sizing.py`** holds the parameter formulas from the sizing appendix: the expected
-  rounding error `e_m` and the number of vectors `k` needed for the security target.
+  path for any leaf, and an O(log n) re-root after changing one leaf.
+- **`leaves.py`** hashes each leaf after checking it against the shape and dtype `C`
+  declares, and builds both roots: `h` for a step and `h_D` for the dataset. The prover
+  and the verifier run this same code.
 
-### Data
+### The agreed computation: `computation/`
 
-**`data.py`** builds the agreed dataset. Its steps:
-
-1. Render Alpaca examples with the Stanford template.
-2. Tokenize them.
-3. Keep the first 500 records that fit 128 tokens.
-4. Store each as `(ids, targets, mask)`.
-
-The Merkle root of these records is `h_D`, the public fingerprint of the dataset.
-
-The schedule `π(t)` names which records form step `t`'s batch. It is sequential, with no
-shuffling. `assemble_batch` pads records into a tensor batch. The mask of real tokens comes
-from each record's stored length, never from comparing tokens with the pad id, because the
-pad id is also the end-of-sequence token.
-
-`poison` builds `D̃`, a copy of `D` with one record rewritten with a trigger phrase and a
-refusal. The cheat runs train on it.
-
-### The agreed computation: `DeclaredComputation`
-
-The prover and the verifier must agree on what a step consists of.
-`computation.DeclaredComputation`, called `C` in the docs, is that agreement in code. It
-declares:
+The prover and the verifier must agree on what a step consists of. `DeclaredComputation`
+in `interface.py`, called `C` in the docs, is that agreement in code. It declares:
 
 - the batch size `n_s`, the step size `η`, and the dtypes of every leaf;
 - the weight tensors, by name and shape, in a fixed order;
@@ -133,25 +143,25 @@ recomputed non-matmul arithmetic, such as RMSNorm, softmax, RoPE and SiLU, is ca
 **glue**. The verifier never hand-writes it: it calls the model's own modules, so both sides
 do bit-identical arithmetic.
 
-Two instances exist:
+Two instances exist, in `instances/`:
 
-- **`instances/mlp.py`** is a three-layer bias-free MLP with `M = 3L − 1 = 8` products. It is
-  small enough to test every check and every fault in milliseconds.
-- **`instances/llama.py`** is SmolLM2-135M at 4 sequences of 128 tokens, with `M = 7,113`
-  products. That's 21 linear products per layer, plus six attention products per sequence
-  and per head, plus three for the embedding and output layer. Its `label` maps each
-  captured matmul to its slot by operand identity. For example, `Y_q` of layer 3 is the
-  product whose right operand is layer 3's `W_q`. Call order isn't used for this. Its
-  `replay` is still being built (tasks A8 and A9).
+- **`mlp.py`** is a three-layer bias-free MLP with `M = 3L − 1 = 8` products. It is small
+  enough to test every check and every fault in milliseconds.
+- **`llama.py`** is SmolLM2-135M at 4 sequences of 128 tokens, with `M = 7,113` products.
+  That's 21 linear products per layer, plus six attention products per sequence and per
+  head, plus three for the embedding and output layer. Its `label` maps each captured
+  matmul to its slot by operand identity. For example, `Y_q` of layer 3 is the product
+  whose right operand is layer 3's `W_q`. Call order isn't used for this. Its `replay` is
+  still being built (tasks A8 and A9).
 
-### Prover side
+### Prover side: `prover/`
 
 - **`capture.py`** is a `TorchDispatchMode`, a hook into PyTorch's operator dispatch. It sees
   every `mm` and `bmm` that autograd runs, in the forward and the backward pass. It records
   the operands and output of each one without changing anything, so a captured step is
   bit-identical to an uncaptured one. Matmul variants it can't classify raise an error
   instead of passing silently.
-- **`prover.py`** runs one step:
+- **`step.py`** runs one step:
 
   1. Load `W_t`.
   2. Run forward and backward under capture.
@@ -161,9 +171,10 @@ Two instances exist:
   6. Return a `StepOutput` with the records, `W_t`, the `M` products and `W_{t+1}`.
 
   `plain_step` is the same step without capture. Faults hook in only here: training on a
-  different batch, perturbing a product after capture, or replacing `W_{t+1}`.
+  different batch, perturbing a product after capture, or replacing `W_{t+1}`. `commit`
+  builds the step's root `h` and then confirms that no captured tensor changed.
 
-### Transcript: `store.py`
+### Transcript: `transcript/`
 
 A step's transcript is an ordered list of leaves:
 
@@ -171,25 +182,47 @@ A step's transcript is an ordered list of leaves:
 [ batch records (n_s) | W_t (n_w tensors) | P_1 … P_M | W_{t+1} (n_w tensors) ]
 ```
 
-For SmolLM2 that's 4 + 272 + 7,113 + 272 = 7,661 leaves. `commit` hashes every leaf and
-builds the Merkle root `h`.
+For SmolLM2 that's 4 + 272 + 7,113 + 272 = 7,661 leaves.
 
-`TranscriptStore` is the verifier's entire view of a step. It has four methods: read
-leaf `i`, read the claimed root, read a leaf's authentication path, and read a record's
-path into `h_D`. It deliberately has no leaf count and no stored hashes. The verifier
-supplies counts from `C` and hashes every leaf itself, because anything the store
+`TranscriptStore` in `store.py` is the verifier's entire view of a step. It has four
+methods: read leaf `i`, read the claimed root, read a leaf's authentication path, and read a
+record's path into `h_D`. It deliberately has no leaf count and no stored hashes. The
+verifier supplies counts from `C` and hashes every leaf itself, because anything the store
 returns is data under test. One reason this matters: an RFC 6962 path doesn't fix the size
-of the tree, so a leaf count from the store could be forged.
+of the tree, so a leaf count from the store could be forged. A malformed leaf raises one of
+the format errors in `errors.py`.
 
 `InMemoryStore` holds the tensors without copying them. It checks each tensor's
 `_version` counter on every read, which catches any in-place change after commit. A
 disk-backed store for larger runs is planned (task A14).
 
-### Verifier side
+### Verifier side: `verifier/`
 
 **`checks.py`** implements each check as a pure function of the store, `C`, a per-step
-context and the tolerance bands. Each returns `None` or a `Rejection(step, check_id,
-detail, kind)`. **`verifier.py`** holds the run state and runs the checks in order.
+context (`context.py`) and the tolerance bands (`bands.py`). Each returns `None` or a
+`Rejection(step, check_id, detail, kind)`. **`driver.py`** holds the run state and runs the
+checks in order.
+
+`matmul_check/` holds check 5's test, the part that would change if Freivalds' test were
+replaced:
+
+- **`challenges.py`** derives Freivalds' random vectors from the step root `h` and the
+  product's position `m` (Fiat-Shamir). The vectors depend on everything committed, so the
+  prover can't know them before committing. They are float32 values on an exact grid in
+  (−1, 1).
+- **`freivalds.py`** computes check 5's numbers for one product: the residuals and the
+  cancellation measure `κ`. It judges nothing; `checks.py` compares the numbers with the
+  bands.
+- **`sizing.py`** holds the parameter formulas from the sizing appendix: the expected
+  rounding error `e_m` and the number of vectors `k` needed for the security target.
+
+### Runs: `runs/`
+
+- **`loop.py`** connects prover and verifier step by step (see "Workflow: a whole run").
+- **`mlp_smoke.py`** runs the declared cheats against the MLP (see "Workflow: testing that
+  cheats are caught").
+- **`materialize_data.py`** builds `D` and `D̃` and writes them under
+  `trainer_output/verification/data/`.
 
 ## Workflow: verifying one step
 
@@ -249,7 +282,7 @@ exception instead of becoming a rejection, so a crash can't pass for a caught ch
 
 ```mermaid
 sequenceDiagram
-    participant H as Harness (loop.py)
+    participant H as Harness (runs/loop.py)
     participant P as Prover
     participant S as Store
     participant V as Verifier
@@ -306,7 +339,7 @@ fault hooks. The hooks:
 | `entry_weights` | hide extra training steps between verified steps (P11) | check 7 |
 | `perturb` | change one product after capture (flipped matmul) | check 5 |
 
-`helper_runs/mlp_smoke.py` runs these against the MLP. That run is milestone M1. The
+`runs/mlp_smoke.py` runs these against the MLP. That run is milestone M1. The
 SmolLM2 versions, including a sweep that measures the smallest detectable product change,
 come in task A13.
 

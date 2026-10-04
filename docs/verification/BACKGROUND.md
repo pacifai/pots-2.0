@@ -75,9 +75,10 @@ adds, embedding gather, cross-entropy loss are **non-matmul "glue"**.
 
 - `pots-2.0` is a fork of `pochenai/nano-llm-posttraining`, a minimal SFT/DPO/GRPO
   post-training tutorial built on TRL. **The tutorial code was removed on 2026-10-04**,
-  because the verification code used none of it. The protocol code is the top-level
-  `verification/` package, imported as `verification.<module>`, with tests in
-  `tests/verification/` (`DECISIONS_SETUP.md` §8.B S7, amendment).
+  because the verification code used none of it. The code is two top-level packages:
+  `setup/` holds run setup that any protocol needs, and `verification/` holds the protocol,
+  one directory per role. Tests in `tests/` are laid out like the code
+  (`DECISIONS_SETUP.md` §8.B S7, both amendments).
 - The tutorial's **local-debug → cloud via env vars only** template (135M SmolLM2 on 8GB →
   rented 24–48GB GPU) is what the two run modes copy: one code path, scale set by env vars
   (`DECISIONS_SETUP.md` §8.A.5).

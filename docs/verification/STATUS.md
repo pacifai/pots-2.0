@@ -33,6 +33,13 @@ The design process is gated, and each stage starts only after the previous one c
   top-level `verification/`, the project is renamed `pots-2.0`, and `README.md` now
   describes the protocol. See `DECISIONS_SETUP.md` §8.B S7, amendment. Older entries below
   that cite `src/verification/` mean `verification/`.
+- **Layout refactor on 2026-10-04 (user).** Run setup (config, data, the token record,
+  model loading) moved to a top-level `setup/` package. `verification/` is split into one
+  directory per role: `commitment`, `computation`, `prover`, `transcript`, `verifier` and
+  `runs`, which replaces `helper_runs/`. Tests mirror the code under `tests/`, and
+  `tests/test_layering.py` enforces the import rules. No protocol logic changed. See
+  `DECISIONS_SETUP.md` §8.B S7, second amendment. The module map in `verification/CLAUDE.md`
+  gives each module's home, which older entries that cite flat module names now mean.
 
 - **C4 closed on 2026-10-01** (task B5). `D` and `D̃` are materialized, with
   `h_D = 3efb21e8…637536`, and their pins are recorded in `DECISIONS_SETUP.md` §8.B C4. The
