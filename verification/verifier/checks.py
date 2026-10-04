@@ -246,12 +246,13 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
         raise RuntimeError("check 5 needs check 2's recomputed root")
     leaves = ctx.state.committed()
     view = TranscriptView(c, leaves)
-    with _guard(ctx, "5", _AFTER_COMMIT):
+    with _guard(ctx, "5", _AFTER_COMMIT), ctx.timed("5.glue"):
         replay = c.replay(leaves)
     ctx.state.replay = replay
     for spec in c.products:
         with _guard(ctx, "5", _AFTER_COMMIT):
-            a, b = replay.operands(spec.m)
+            with ctx.timed("5.glue"):
+                a, b = replay.operands(spec.m)
             p = view.product(spec.m)
         if (tuple(a.shape), tuple(b.shape)) != (spec.a_shape, spec.b_shape):
             raise RuntimeError(f"{spec.name}: replay operands {tuple(a.shape)}·{tuple(b.shape)} "
@@ -259,8 +260,9 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
         a, b = a.detach().to(torch.float32), b.detach().to(torch.float32)
         p = p.detach().to(torch.float32)
         cls_key = product_class(c, spec)
-        mp = measure_product(a, b, p, h=root, m=spec.m, k=ctx.k, eps_in=ctx.eps_in,
-                             eps_acc=ctx.eps_acc)
+        with ctx.timed("5.measure"):
+            mp = measure_product(a, b, p, h=root, m=spec.m, k=ctx.k, eps_in=ctx.eps_in,
+                                 eps_acc=ctx.eps_acc)
         nu, p_abs1, kappa, res, unit = mp.nu, mp.p_abs1, mp.kappa, mp.residuals, mp.unit
         normalized = mp.normalized
         ctx.stats.products.append(ProductStat(spec.m, spec.name, cls_key, kappa, normalized))
@@ -296,7 +298,7 @@ def check_6b_glue_update(store: TranscriptStore, c: DeclaredComputation, ctx: St
     if replay is None:
         raise RuntimeError("check 6b needs check 5's replay")
     view = TranscriptView(c, ctx.state.committed())
-    with _guard(ctx, "6b", _AFTER_COMMIT):
+    with _guard(ctx, "6b", _AFTER_COMMIT), ctx.timed("6b.glue"):
         grads = replay.glue_gradients()
     missing = [n for n in names if n not in grads]
     if missing:

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "PROVER_DATA_ERRORS",
+    "Section",
+    "no_section",
     "Rejection",
     "RejectionKind",
     "ProductStat",
@@ -45,6 +47,17 @@ __all__ = [
     "StepContext",
     "CommittedLeaves",
 ]
+
+# A metrics seam (B6, ``runs/metrics.py``): ``section(name)`` wraps one part of a check. It
+# observes only; with ``None`` the checks run exactly as without it. ``prover/step.py`` declares
+# the same alias: the verifier may not import from the prover (invariant 1, test_layering.py).
+Section = Callable[[str], AbstractContextManager[Any]]
+_NO_SECTION = nullcontext()
+
+
+def no_section(name: str) -> AbstractContextManager[Any]:
+    """The seam when no metrics are taken: a shared no-op context manager."""
+    return _NO_SECTION
 
 # Every error the TranscriptStore docstring lists: TranscriptFormatError and its subclasses,
 # EncodingError, NonFiniteError and encode_record's ValueError (RecordError for a token
@@ -200,6 +213,11 @@ class StepContext:
     judge: bool = True  # False: calibration mode (P10b); checks 5 and 6 record, never judge
     state: StepState = field(default_factory=StepState)
     stats: StepStats = field(default_factory=StepStats)
+    section: Section | None = None  # B6 metrics seam; None runs the checks unobserved
+
+    def timed(self, name: str) -> AbstractContextManager[Any]:
+        """``section(name)``, or a no-op when no metrics seam is set."""
+        return _NO_SECTION if self.section is None else self.section(name)
 
     @classmethod
     def for_computation(cls, c: DeclaredComputation, **kw: Any) -> StepContext:

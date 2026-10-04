@@ -29,7 +29,7 @@ from setup import data
 from setup.config import assert_no_dropout
 from verification.commitment.leaves import dataset_tree
 from verification.computation.interface import DeclaredComputation
-from verification.prover.step import Perturbation, StepOutput, prove_step
+from verification.prover.step import Perturbation, Section, StepOutput, no_section, prove_step
 from verification.transcript.store import InMemoryStore
 from verification.verifier.context import Rejection
 from verification.verifier.driver import RunVerdict, Verifier
@@ -109,6 +109,7 @@ def run_loop(
     fault: ProverFault | None = None,
     schedule: Callable[[int], Sequence[int]] | None = None,
     on_step: Callable[[StepRecord], None] | None = None,
+    section: Section | None = None,
 ) -> LoopResult:
     """Run ``verifier.n_steps`` steps of ``C`` from ``W_0`` on ``dataset``.
 
@@ -117,7 +118,13 @@ def run_loop(
     agreed final weights for check 8. ``schedule`` is the prover's ``π`` (default
     :func:`data.schedule`); a prover that departs from the verifier's ``π`` is rejected at
     check 4.
+
+    ``section`` is the B6 metrics seam (``runs/metrics.py``), passed on to ``prove_step``. The
+    loop adds the prover phases ``P4.paths``, ``P3.commit`` (hashing) and ``P5.write`` (the
+    hand-off to the store) per step and ``run:P4.tree`` once. The verifier's own seam is set on
+    the ``Verifier``.
     """
+    sec = section or no_section
     fault = fault or HONEST
     assert_no_dropout(model)  # invariant 3 (S4d)
     pi = schedule or (lambda t: data.schedule(t, c.n_s, len(dataset)))
@@ -125,7 +132,8 @@ def run_loop(
     if verifier.start_run(dataset) is not None:
         result.verdict = verifier.end_run(final)
         return result
-    tree = dataset_tree(c, dataset)  # the prover's own copy of h_D's tree, for audit paths
+    with sec("run:P4.tree"):
+        tree = dataset_tree(c, dataset)  # the prover's own copy of h_D's tree, for audit paths
     w: Mapping[str, torch.Tensor] = w0
     for t in range(1, verifier.n_steps + 1):
         idx = list(pi(t))
@@ -133,14 +141,19 @@ def run_loop(
         w_t = fault.entry_weights(t, w)
         t0 = time.perf_counter()
         out = prove_step(c, model, w_t, records, train_records=fault.train_records(t, records),
-                         perturb=fault.perturb(t))
+                         perturb=fault.perturb(t), section=section)
         t1 = time.perf_counter()
         out = fault.emit(t, out)  # outside prove_s: a splice is the harness's cost, not the prover's
         t1b = time.perf_counter()
-        store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
+        with sec("P4.paths"):
+            paths = [tree.path(i) for i in idx]
+        with sec("P3.commit"):
+            leaves, tree_h = InMemoryStore.commit_step(c, out)
+        with sec("P5.write"):
+            store = InMemoryStore.hold(c, leaves, tree_h, paths)
         t2 = time.perf_counter()
         w, loss = out.w_next, out.loss
-        del out  # the store holds the leaves; nothing else keeps the step
+        del out, leaves, tree_h  # the store holds the leaves; nothing else keeps the step
         rej = verifier.verify_step(t, store)
         t3 = time.perf_counter()
         del store  # discard before step t+1 (S3)
