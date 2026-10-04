@@ -328,6 +328,12 @@ import ...`). Each entry below gives the public interface.
     order.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
     imports the prover.
+- `substitution.py` (A8): `ProductSubstitution(supply)`, a `TorchDispatchMode` that runs a
+  model's own code but returns `supply(op, a, b)` in place of every `aten.mm`/`aten.bmm` with
+  `q ≥ 2` (S4b, check 3). `q = 1` runs as glue (P7). Any other matmul op from the capture's
+  lists, a non-default overload, an op outside `aten`/`prims`, or a supplied tensor of the
+  wrong shape or dtype raises `SubstitutionError`. `supply` must return a fresh tensor, never
+  a leaf itself (autograd attaches history to op outputs; invariant 6).
 - `instances/mlp.py` (A3, merged). This is ref block §9.
   - `MLPComputation(widths=(16,32,32,8), n_s=4, *, eta)`. It requires `n_s ≥ 2` and every
     width ≥ 2.
@@ -340,8 +346,8 @@ import ...`). Each entry below gives the public interface.
   - Helpers: `make_record`/`split_record`, `init_weights(widths, seed)` and
     `synthetic_dataset(widths, n, seed)`. The schedule is `setup.data.schedule`.
   - `MLPReplay` uses the replay model's own `act` and `loss_fn`.
-- `instances/llama.py` (A7, milestone M2; labeling only). The module docstring has the pins and
-  the labeling rules.
+- `instances/llama.py` (A7, milestone M2; A8 forward replay). The module docstring has the
+  pins and the labeling rules.
   - `LlamaComputation(config, *, n_s, n, eta, source=None)`, with `.from_pretrained(repo,
     revision, *, n_s, n, eta)` and `.from_config(cfg)` (the run's instance, from a
     `RunConfig`). It rejects untied `W_E`, biases, a non-SiLU activation, `pretraining_tp ≠ 1`
@@ -370,10 +376,25 @@ import ...`). Each entry below gives the public interface.
     head, and `S`'s `B` must be equal across the query heads that share a kv head. The `δK̃`
     leaf is the contiguous transpose of the captured `Q̃ᵀ·δS`. Any unmatched, duplicate or
     missing record raises `LabelingError`.
-  - `replay` raises `NotImplementedError` until A8 and A9.
+  - `replay(leaves) -> LlamaReplay` (A8, forward products). Its own model, from the committed
+    `W_t`, runs under `ProductSubstitution`, which hands back the committed leaf for each
+    product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`). The
+    first forward request runs `logits` once on the committed batch and keeps `X_1 … X_{L+1}`
+    (hooks on each decoder layer and on the final norm), the kwargs LlamaModel passes its
+    layers (causal mask over `ρ`, RoPE `(cos, sin)`, positions) and `Λ`'s operands. A request
+    in layer ℓ reruns `layers[ℓ−1](X_ℓ, **kwargs)` the same way, keeps its nine products'
+    operands, checks the output is `X_{ℓ+1}`, and drops them after `Y_down`. The call
+    sequence must be the declared one (`Y_q, Y_k, Y_v, S, O, Y_o, Y_gate, Y_up, Y_down` per
+    layer, then `Λ`), linears identified by weight storage. Out-of-order calls rerun their
+    layer. Operands are what the op receives: `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and
+    `repeat_kv`, `(softmax, Ṽ)`. Backward products and `glue_gradients()` raise
+    `NotImplementedError` (A9). Kept for A9: `x`, `layer_kwargs`, `batch`, `lambda_operands`.
   - On the real 4×128 step from `W_0` on `π(1)` it fills all 7,113 slots (2,371 forward,
     211 input-grad, 211 weight-grad, 4,320 operand-grad). `prove_step` takes about 1 s and
-    `commit` about 1.5 s, at a peak RSS of about 4.6 GB.
+    `commit` about 1.5 s, at a peak RSS of about 4.6 GB. The replay rebuilds all 2,371
+    forward operands bit-identical to the prover's capture in about 0.5 s. Over leaves
+    already in memory (2.7 GB peak) it raises the peak to 3.8 GB; its own model is 0.54 GB
+    of that.
 
 ### `verification/prover/`
 

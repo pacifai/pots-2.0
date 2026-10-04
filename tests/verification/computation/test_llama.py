@@ -1,4 +1,5 @@
-"""A7: the SmolLM2 instance, declaration and prover-side labeling (milestone M2)."""
+"""The SmolLM2 instance: declaration and prover-side labeling (A7, milestone M2), and the
+verifier-side forward replay (A8)."""
 
 import dataclasses
 from collections import Counter
@@ -203,12 +204,6 @@ def test_build_model_is_deterministic_and_rng_neutral():
         assert torch.equal(p1, p2), n1
     assert m1.config._attn_implementation == "eager" and not m1.training
     assert m1.lm_head.weight is m1.model.embed_tokens.weight
-
-
-def test_replay_is_not_implemented(setup):
-    c, _, _ = setup
-    with pytest.raises(NotImplementedError):
-        c.replay(None)
 
 
 # ---- loss -------------------------------------------------------------------------------------
@@ -416,6 +411,168 @@ def test_label_rejects_tampered_capture(setup, tamper):
     model.zero_grad(set_to_none=True)
 
 
+# ---- forward replay (A8) ----------------------------------------------------------------------
+
+
+class ListReader:
+    def __init__(self, leaves):
+        self.leaves = list(leaves)
+
+    def leaf(self, index):
+        return self.leaves[index]
+
+
+def _ptr(t):
+    return t.untyped_storage().data_ptr()
+
+
+def captured_forward_operands(c, cap, products):
+    """``m -> (A, B)`` as the prover's capture saw them, for every forward product."""
+    by_out = {_ptr(r.out): r for r in cap.records if r.phase == "forward"}
+    out = {}
+    for spec in c.products:
+        if spec.kind is not FWD:
+            continue
+        p = products[spec.m - 1]
+        rec = by_out[_ptr(p)]
+        if rec.batch is None:
+            assert p.shape == rec.out.shape
+            out[spec.m] = (rec.a, rec.b)
+        else:
+            i = (p.storage_offset() - rec.out.storage_offset()) // rec.out[0].numel()
+            assert spec.member == divmod(i, c.n_h)
+            out[spec.m] = (rec.a[i], rec.b[i])
+    return out
+
+
+@pytest.fixture(scope="module")
+def honest(setup):
+    """An honest step's leaves and the prover's captured forward operands."""
+    c, model, records = setup
+    w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
+    cap = run_capture(c, model, records)
+    products = [p.detach() for p in c.label(cap, model)]
+    expected = captured_forward_operands(c, cap, products)
+    model.zero_grad(set_to_none=True)
+    return c, [*records, *w0.values(), *products, *w0.values()], expected
+
+
+def forward_specs(c):
+    return [p for p in c.products if p.kind is FWD]
+
+
+def test_replay_matches_captured_operands(honest, monkeypatch):
+    """Every forward product's (A, B), rebuilt from leaves, is the prover's bit for bit."""
+    c, leaves, expected = honest
+    assert c.n_kv < c.n_h and c.n_s >= 2 and c.L >= 2
+    assert len({len(r) for r in leaves[:c.n_s]}) > 1  # padding: ρ is not all ones
+
+    def boom(*a, **k):
+        raise AssertionError("the replay called a prover-only method")
+
+    monkeypatch.setattr(LlamaComputation, "loss", boom)
+    monkeypatch.setattr(LlamaComputation, "label", boom)
+    replay = c.replay(ListReader(leaves))
+    specs = forward_specs(c)
+    assert len(specs) == len(expected) == c.L * (7 + 2 * c.n_s * c.n_h) + 1
+    for spec in specs:
+        a, b = replay.operands(spec.m)
+        want_a, want_b = expected[spec.m]
+        assert (tuple(a.shape), tuple(b.shape)) == (spec.a_shape, spec.b_shape), spec.name
+        assert a.dtype == b.dtype == c.operand_dtype
+        assert torch.equal(a, want_a) and torch.equal(b, want_b), spec.name
+    assert replay._layer is None and not replay._ops  # layer glue dropped after Y_down
+    assert len(replay.x) == c.L + 1  # kept for A9
+    for n, p in replay.model.named_parameters():
+        assert torch.equal(p, leaves[c.w_t_index(n)]) and p is not leaves[c.w_t_index(n)]
+
+
+def test_replay_backward_is_a9(honest):
+    c, leaves, _ = honest
+    replay = c.replay(ListReader(leaves))
+    with pytest.raises(NotImplementedError, match="A9"):
+        replay.operands(c.m_of("dF"))
+    with pytest.raises(NotImplementedError, match="A9"):
+        replay.glue_gradients()
+
+
+def test_replay_out_of_order_recomputes(honest):
+    c, leaves, expected = honest
+    replay = c.replay(ListReader(leaves))
+    order = [c.m_of("Lambda"), c.m_of(f"L{c.L}.Y_down"), c.m_of("L1.O[1,3]"), c.m_of("L1.Y_q"),
+             c.m_of(f"L{c.L}.Y_down"), c.m_of("L1.S[0,0]")]
+    for m in order:
+        a, b = replay.operands(m)
+        assert torch.equal(a, expected[m][0]) and torch.equal(b, expected[m][1])
+
+
+def _replayed(c, leaves, names):
+    replay = c.replay(ListReader(leaves))
+    return {n: replay.operands(c.m_of(n)) for n in names}
+
+
+def _bump(t, index=-1):
+    """``t`` with one entry raised by 1, by default the last, which the causal mask keeps."""
+    t = t.clone()
+    t.view(-1)[index] += 1.0
+    return t
+
+
+@pytest.mark.parametrize("perturbed,changed,unchanged", [
+    ("L1.Y_o", ["L1.Y_gate", "L2.Y_q", "Lambda"], ["L1.Y_q", "L1.O[0,0]", "L1.Y_o"]),
+    # S reads the committed Y_q, Y_k, not X_2: a bad Y_down shows up in Y_q, not in S.
+    ("L1.Y_down", ["L2.Y_q", "L2.Y_gate", "Lambda"], ["L1.Y_gate", "L1.Y_down", "L2.S[0,0]"]),
+    ("L1.S[0,1]", ["L1.O[0,1]"], ["L1.O[0,0]", "L1.O[1,1]", "L1.S[0,1]"]),
+    # The last entry of Y_k is sequence 1, kv head 1, which query heads 2 and 3 share (GQA).
+    ("L1.Y_k", ["L1.S[1,2]", "L1.S[1,3]"], ["L1.S[1,1]", "L1.S[0,3]", "L1.O[1,2]"]),
+])
+def test_committed_product_flows_into_later_operands(honest, perturbed, changed, unchanged):
+    """Check 3: later operands are built from the committed leaves, not recomputed products."""
+    c, leaves, _ = honest
+    names = changed + unchanged
+    base = _replayed(c, leaves, names)
+    bad = list(leaves)
+    i = c.product_index(c.m_of(perturbed))
+    bad[i] = _bump(bad[i])
+    got = _replayed(c, bad, names)
+    for n in changed:
+        assert not (torch.equal(got[n][0], base[n][0]) and torch.equal(got[n][1], base[n][1])), n
+    for n in unchanged:
+        assert torch.equal(got[n][0], base[n][0]) and torch.equal(got[n][1], base[n][1]), n
+
+
+@pytest.mark.parametrize("weight,changed,unchanged", [
+    (lambda c: c.w(1, "q"), [("L1.Y_q", 1)], [("L1.Y_q", 0), ("L1.Y_k", 1)]),
+    (lambda c: c.gamma_attn(2), [("L2.Y_q", 0)], [("L1.Y_q", 0), ("L2.Y_q", 1)]),
+    (lambda c: c.w_e, [("L1.Y_q", 0), ("Lambda", 1)], []),
+    (lambda c: c.gamma_final, [("Lambda", 0)], [("L2.Y_down", 0), ("Lambda", 1)]),
+], ids=["W_q", "gamma_attn", "W_E", "gamma_final"])
+def test_w_t_leaf_flows_into_operands(honest, weight, changed, unchanged):
+    """The replay's model holds the committed ``W_t``: weights and glue scales come from it."""
+    c, leaves, _ = honest
+    names = sorted({n for n, _ in changed + unchanged})
+    base = _replayed(c, leaves, names)
+    bad = list(leaves)
+    name = weight(c)
+    i = c.w_t_index(name)
+    # W_E: bump a row of a token in the batch, so the embedding reads it.
+    bad[i] = _bump(bad[i], int(leaves[0].ids[0]) * c.d if name == c.w_e else 0)
+    got = _replayed(c, bad, names)
+    for n, side in changed:
+        assert not torch.equal(got[n][side], base[n][side]), (n, side)
+    for n, side in unchanged:
+        assert torch.equal(got[n][side], base[n][side]), (n, side)
+
+
+def test_replay_never_mutates_leaves(honest):
+    c, leaves, _ = honest
+    versions = [t._version for t in leaves if isinstance(t, torch.Tensor)]
+    replay = c.replay(ListReader(leaves))
+    for spec in forward_specs(c):
+        replay.operands(spec.m)
+    assert [t._version for t in leaves if isinstance(t, torch.Tensor)] == versions
+
+
 # ---- milestone M2 -----------------------------------------------------------------------------
 
 
@@ -462,3 +619,53 @@ def test_smollm2_real_step_m2():
           f"root {tree.root.hex()[:16]}…")
     print(f"M2: load {t1 - t0:.1f}s  prove_step {t2 - t1:.1f}s  commit {t3 - t2:.1f}s  "
           f"peak RSS {rss_gb:.2f} GB")
+
+
+@pytest.mark.slow
+def test_smollm2_real_step_forward_replay_a8():
+    """A8: on the real 4×128 step from W_0 on π(1), every forward product's operands rebuilt
+    by the verifier equal the prover's captured operands bit for bit."""
+    import os
+    import resource
+    import time
+
+    from setup.config import load_config, setup_determinism
+    from setup.data import load_dataset_records, schedule
+
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    cfg = load_config()
+    if not (cfg.data_dir / "D.bin").exists():
+        pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
+                    f"VERIF_OUTPUT_DIR")
+    setup_determinism(cfg)
+    c = LlamaComputation.from_config(cfg)
+    model = c.build_model()
+    D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
+    records = [D[i] for i in schedule(1, c.n_s, len(D))]
+    w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
+    cap = run_capture(c, model, records)
+    products = [p.detach() for p in c.label(cap, model)]
+    expected = captured_forward_operands(c, cap, products)
+    model.zero_grad(set_to_none=True)
+    del model
+    leaves = [*records, *w0.values(), *products, *w0.values()]
+
+    t0 = time.perf_counter()
+    replay = c.replay(ListReader(leaves))
+    t1 = time.perf_counter()
+    specs = forward_specs(c)
+    assert len(specs) == len(expected) == 2371
+    bad = []
+    for spec in specs:
+        a, b = replay.operands(spec.m)
+        want_a, want_b = expected[spec.m]
+        assert (tuple(a.shape), tuple(b.shape)) == (spec.a_shape, spec.b_shape), spec.name
+        if not (torch.equal(a, want_a) and torch.equal(b, want_b)):
+            bad.append(spec.name)
+    t2 = time.perf_counter()
+    assert not bad, f"{len(bad)} forward products differ, first {bad[:5]}"
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_gb = rss / 2**30 if os.uname().sysname == "Darwin" else rss / 2**20
+    print(f"\nA8: {len(specs)} forward products bit-identical; build+load {t1 - t0:.1f}s, "
+          f"operands(1..{specs[-1].m}) {t2 - t1:.1f}s, peak RSS {rss_gb:.2f} GB "
+          f"(includes the prover-side capture)")

@@ -151,8 +151,10 @@ Two instances exist, in `instances/`:
   That's 21 linear products per layer, plus six attention products per sequence and per
   head, plus three for the embedding and output layer. Its `label` maps each captured
   matmul to its slot by operand identity. For example, `Y_q` of layer 3 is the product
-  whose right operand is layer 3's `W_q`. Call order isn't used for this. Its `replay` is
-  still being built (tasks A8 and A9).
+  whose right operand is layer 3's `W_q`. Call order isn't used for this. Its `replay`
+  runs the verifier's own copy of the model with every matmul's result replaced by the
+  committed product, so all glue between products runs through the model's own code on
+  committed values. The forward products are done (task A8); the backward ones are task A9.
 
 ### Prover side: `prover/`
 
@@ -366,7 +368,8 @@ Breaking any of these voids the result. Each one has a test.
 |---|---|
 | Foundations, data, `C` interface, MLP instance, capture, prover, store, checks, verifier, loop, MLP smoke run | merged; milestone M1 reached |
 | SmolLM2 inventory and labeling (`instances/llama.py`) | merged; milestone M2 reached |
-| SmolLM2 replay of forward and backward glue (A8, A9), first honest SmolLM2 step (A10, M3) | next |
+| SmolLM2 replay of forward glue (A8) | done; all 2,371 forward operands of the real step match the prover's bit for bit |
+| SmolLM2 replay of backward glue (A9), first honest SmolLM2 step (A10, M3) | next |
 | Calibration and band file (A11, M4); 10-step honest run, cheat runs, disk store (A12–A14, M5) | planned |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
