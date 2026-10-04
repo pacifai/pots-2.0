@@ -27,6 +27,7 @@ Other cheats are assembled by the caller from honest outputs, not by hooks here 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,9 +39,17 @@ from verification.computation.interface import DeclaredComputation, load_weights
 from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import MatmulCapture, MutatedCaptureError
 
-__all__ = ["StepOutput", "prove_step", "plain_step", "commit"]
+__all__ = ["StepOutput", "Section", "no_section", "prove_step", "plain_step", "commit"]
 
 Perturbation = Callable[[torch.Tensor], torch.Tensor]
+# A metrics seam: ``section(name)`` wraps one phase of the step (``runs/metrics.py``, B6). It
+# observes only; with ``None`` the step runs exactly as without it.
+Section = Callable[[str], AbstractContextManager[Any]]
+_NO_SECTION = nullcontext()
+
+
+def no_section(name: str) -> AbstractContextManager[Any]:
+    return _NO_SECTION
 
 
 @dataclass(frozen=True, eq=False)
@@ -106,18 +115,27 @@ def _optimizer(computation: DeclaredComputation, model: torch.nn.Module) -> torc
 
 def plain_step(computation: DeclaredComputation, model: torch.nn.Module,
                w_t: Mapping[str, torch.Tensor],
-               records: Sequence[Any]) -> tuple[dict[str, torch.Tensor], float]:
+               records: Sequence[Any], *,
+               section: Section | None = None) -> tuple[dict[str, torch.Tensor], float]:
     """The same SGD step with no capture and no transcript: ``(W_{t+1}, loss)``.
 
-    For hidden steps, η tuning and the capture-on/off comparison.
+    For hidden steps, η tuning and the capture-on/off comparison. With ``section`` it is EQ1b's
+    P0, the plain baseline: ``P0.load``, ``P0.forward``, ``P0.backward`` and ``P0.update`` cover
+    the same work as :func:`prove_step`'s ``train.*`` phases. Copying out ``W_{t+1}`` is the
+    caller's and sits outside them.
     """
-    load_weights(computation, model, w_t)
-    model.zero_grad(set_to_none=True)
-    opt = _optimizer(computation, model)
-    loss = computation.loss(model, records)
-    loss.backward()
-    opt.step()
-    model.zero_grad(set_to_none=True)
+    sec = section or no_section
+    with sec("P0.load"):
+        load_weights(computation, model, w_t)
+        model.zero_grad(set_to_none=True)
+        opt = _optimizer(computation, model)
+    with sec("P0.forward"):
+        loss = computation.loss(model, records)
+    with sec("P0.backward"):
+        loss.backward()
+    with sec("P0.update"):
+        opt.step()
+        model.zero_grad(set_to_none=True)
     return _snapshot(computation, model), float(loss.detach())
 
 
@@ -129,36 +147,45 @@ def prove_step(
     *,
     train_records: Sequence[Any] | None = None,
     perturb: Mapping[int, Perturbation] | None = None,
+    section: Section | None = None,
 ) -> StepOutput:
     """Execute ``C(b, W_t)`` on ``model`` and emit the step's leaves.
 
     ``records`` is the committed batch ``b``. ``model`` is overwritten with ``w_t`` and left
-    holding ``W_{t+1}`` with its gradients cleared.
+    holding ``W_{t+1}`` with its gradients cleared. ``section`` is the B6 metrics seam: it
+    wraps the phases ``train.load``, ``P2.w_t``, ``train.forward``, ``train.backward``,
+    ``P1.label``, ``train.update`` and ``P2.w_next``. ``train.*`` is training under capture, not
+    EQ1b's P0, which only :func:`plain_step` measures (``runs/metrics.py`` maps the rows).
     """
     if len(records) != computation.n_s:
         raise ValueError(f"batch has {len(records)} records, the computation declares "
                          f"{computation.n_s}")
     if not torch.is_grad_enabled():
         raise RuntimeError("prove_step needs grad mode on")
+    sec = section or no_section
     record_versions = _versions(records)
-    load_weights(computation, model, w_t)
-    w_t_leaves = _snapshot(computation, model)  # parameters change in place at the step
-    model.zero_grad(set_to_none=True)
-    opt = _optimizer(computation, model)
+    with sec("train.load"):
+        load_weights(computation, model, w_t)
+    with sec("P2.w_t"):
+        w_t_leaves = _snapshot(computation, model)  # parameters change in place at the step
+    with sec("train.load"):
+        model.zero_grad(set_to_none=True)
+        opt = _optimizer(computation, model)
 
     cap = MatmulCapture(param_names=param_storage_map(model))
     with cap:
-        with cap.phase("forward"):
+        with cap.phase("forward"), sec("train.forward"):
             loss = computation.loss(model, records if train_records is None else train_records)
-        with cap.phase("backward"):
+        with cap.phase("backward"), sec("train.backward"):
             loss.backward()
-    products = [p.detach() for p in computation.label(cap, model)]
-    if len(products) != computation.M:
-        raise RuntimeError(f"label returned {len(products)} products, M = {computation.M}")
-    # Invariant 6: the products are fixed and nothing has touched the captured tensors.
-    cap.assert_unmodified()
-    product_versions = list(_versions(products))
-    cap.release_operands()
+    with sec("P1.label"):
+        products = [p.detach() for p in computation.label(cap, model)]
+        if len(products) != computation.M:
+            raise RuntimeError(f"label returned {len(products)} products, M = {computation.M}")
+        # Invariant 6: the products are fixed and nothing has touched the captured tensors.
+        cap.assert_unmodified()
+        product_versions = list(_versions(products))
+        cap.release_operands()
 
     for m, fn in (perturb or {}).items():
         spec = computation.product(m)
@@ -168,10 +195,13 @@ def prove_step(
         products[m - 1] = new.detach().contiguous()
         product_versions[m - 1] = products[m - 1]._version
 
-    opt.step()
-    w_next = _snapshot(computation, model)
-    # set_to_none drops the model's reference; G_ℓ products stay intact (invariant 6).
-    model.zero_grad(set_to_none=True)
+    with sec("train.update"):
+        opt.step()
+    with sec("P2.w_next"):
+        w_next = _snapshot(computation, model)
+    with sec("train.update"):
+        # set_to_none drops the model's reference; G_ℓ products stay intact (invariant 6).
+        model.zero_grad(set_to_none=True)
 
     return StepOutput(
         records=tuple(records), w_t=w_t_leaves, products=tuple(products), w_next=w_next,

@@ -186,7 +186,11 @@ The design process is gated, and each stage starts only after the previous one c
   honest false-reject rate, detection vs. deviation size, and a `k` tunability curve.
   Evaluation items that depend on an open setup item are marked as dependencies, not
   decided there. Don't start evaluation work in a new session without checking with that
-  one.
+  one. **Closed evaluation decisions EQ1–EQ17 are in `DECISIONS_EVALUATION.md`** (as of
+  2026-10-04), including the PoTS comparison approach (EQ12: published numbers only, saved as
+  data for the discussion section). E1, E2 and the inherited metrics item are closed
+  there; EQ17 settles hidden steps as one run, reported as table rows. When clarification ends, they become
+  `EVALUATION_SPEC.md`.
 - **Full scale:** parked in `FULL_SCALE_TASKS.md` until the test-scale run is done.
 
 The session-start hook reads the phrase "the next item is **ID**" in the setup line, so
@@ -203,6 +207,7 @@ items of the three task files.
 | `IMPLEMENTATION_PLAN.md` | Approved stage-4 plan: task table, agent protocol, milestones |
 | `SETUP_TASKS.md` | Open stage-3 items and the implementation-time tasks C1 and C3 |
 | `EVALUATION_TASKS.md` | Parked evaluation questions |
+| `DECISIONS_EVALUATION.md` | Settled evaluation decisions (EQ1, EQ2, …) and their reasoning |
 | `FULL_SCALE_TASKS.md` | Parked full-scale items |
 | `DECISIONS_ALGORITHM.md` | Settled algorithm decisions and their reasoning (§3, §4, §5, §9) |
 | `DECISIONS_SETUP.md` | Settled setup decisions and their reasoning (§8.A, closed S-items) |

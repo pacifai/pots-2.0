@@ -66,7 +66,7 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `matmul_check/` | Run the checks and track a run from start to verdict |
-| `runs/` | `loop.py`, `mlp_smoke.py`, `materialize_data.py` | Connect prover and verifier step by step, run scenarios, write the dataset files |
+| `runs/` | `loop.py`, `mlp_smoke.py`, `metrics.py`, `materialize_data.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
@@ -236,6 +236,12 @@ replaced:
 - **`loop.py`** connects prover and verifier step by step (see "Workflow: a whole run").
 - **`mlp_smoke.py`** runs the declared cheats against the MLP (see "Workflow: testing that
   cheats are caught").
+- **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
+  prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
+  hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
+  step's verdict and checks, and its normalized residuals for calibration, as EQ13's records.
+  It observes the run through a `section` hook that is off by default;
+  `metrics_overhead.py` measures what recording costs.
 - **`materialize_data.py`** builds `D` and `D̃` and writes them under
   `trainer_output/verification/data/`.
 
@@ -382,6 +388,7 @@ Breaking any of these voids the result. Each one has a test.
 | Foundations, data, `C` interface, MLP instance, capture, prover, store, checks, verifier, loop, MLP smoke run | merged; milestone M1 reached |
 | SmolLM2 inventory and labeling (`instances/llama.py`) | merged; milestone M2 reached |
 | SmolLM2 replay of forward glue (A8) | done; all 2,371 forward operands of the real step match the prover's bit for bit |
+| Per-component cost and residual metrics (`runs/metrics.py`, B6), wired into the MLP smoke run | done |
 | SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |
 | First honest SmolLM2 step (A10, M3) | next |
 | Calibration and band file (A11, M4); 10-step honest run, cheat runs, disk store (A12–A14, M5) | planned |

@@ -90,6 +90,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_THREADS` | `8` |
 | `VERIF_SEED` | `0` |
 | `VERIF_OUTPUT_DIR` | `trainer_output/verification` (gitignored) |
+| `VERIF_METRICS` | `1`: runs write B6's metrics to `$VERIF_OUTPUT_DIR/<run>/`; `0` turns them off. Only `0` or `1` |
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`.
@@ -471,10 +472,14 @@ interface.
     hand-off to the verifier. Never use `zero_grad(set_to_none=False)`. Activation
     checkpointing must stay off.
 - `step.py` (A3, merged):
-  - `prove_step(computation, model, w_t, records, *, train_records=None, perturb=None) ->
-    StepOutput`.
-  - `plain_step(...)` runs the same step uncaptured. Hidden steps are made of `plain_step`
-    calls.
+  - `prove_step(computation, model, w_t, records, *, train_records=None, perturb=None,
+    section=None) -> StepOutput`. `section` is B6's metrics seam (see `runs/metrics.py`),
+    with phases `train.*` (training under capture), `P1.label`, `P2.w_t` and `P2.w_next`.
+    `Section` and `no_section` live here; `verifier/context.py` repeats them, because the
+    verifier may not import the prover (invariant 1).
+  - `plain_step(..., section=None)` runs the same step uncaptured. Hidden steps are made of
+    `plain_step` calls. With `section` it is EQ1b's P0 (`P0.load`, `P0.forward`,
+    `P0.backward`, `P0.update`), the plain baseline B7 times.
   - `StepOutput` has the fields `records`, `w_t`, `products`, `w_next`, `loss` and
     `versions`. `.leaves()` returns them in transcript order, and
     `.assert_unmodified()` checks the versions.
@@ -512,7 +517,9 @@ interface.
   - Prover and harness side:
     - `InMemoryStore.from_step(c, step, *, dataset_paths=None, copy=False)`. It is zero-copy
       by default, and every `leaf()` read is guarded by `_version`. It holds no reference to
-      the `StepOutput` or the model, so the loop drops the `StepOutput` after handoff;
+      the `StepOutput` or the model, so the loop drops the `StepOutput` after handoff. It is
+      `commit_step(c, step, *, copy=False) -> (leaves, tree)` (hashing, B6's P3) then
+      `hold(c, leaves, tree, dataset_paths)` (the hand-off, P5), which the loop calls apart;
     - `perturb_leaf(c, store, i, obj) -> new root` for the S6f sweep. It re-roots in
       O(log n) and validates the leaf before any change.
   - Check 7 compares this step's `W_t` hashes with the previous step's `W_{t+1}` hashes. The
@@ -557,7 +564,10 @@ interface.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
     from the root it recomputed in check 2, never from `store.root`.
 - `driver.py` (A5): `Verifier(c, *, h_D, n_records, k, n_steps, bands, w0= | w0_hashes=,
-  schedule=, calibrate=False, allow_provisional=False)`.
+  schedule=, calibrate=False, allow_provisional=False, section=None)`. `section` is B6's
+  metrics seam: it wraps each check under its id (step 1's chaining comparison is `"7"`;
+  `run:0` is check 0's anchor hashing), and `StepContext.section`/`timed(name)` pass it into
+  check 5 (`5.glue`, `5.measure`) and 6b (`6b.glue`). `context.no_section` is the no-op.
   - `n_steps` (T) is required. Provisional bands are refused unless `allow_provisional=True`
     (P10a); `bands` may be `None` only when calibrating.
   - `start_run(D)` runs check 1 (including that `π(t)` fits `D` for every `t ≤ T`) and
@@ -590,10 +600,11 @@ interface.
 ### `verification/runs/`
 
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
-  - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None)
-    -> LoopResult`. It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
-    `InMemoryStore.from_step` with the `h_D` paths, `verifier.verify_step(t, store)`, and drops
-    the step. It stops at the first rejection and ends with `verifier.end_run(final)`, where
+  - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
+    section=None) -> LoopResult`. `section` is B6's metrics seam, passed to `prove_step`.
+    It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
+    `InMemoryStore.commit_step` (`P3.commit`) and `hold` with the `h_D` paths (`P5.write`),
+    `verifier.verify_step(t, store)`, and drops the step. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
@@ -606,7 +617,9 @@ interface.
     the verifier. A test holds weakrefs to each step's products and checks they are dead by the
     next step.
 - `mlp_smoke.py` (A6, milestone M1):
-  `.venv/bin/python -m verification.runs.mlp_smoke [--steps T]`.
+  `.venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]`.
+  `run_scenario(..., recorder=None)` and `run_smoke(..., metrics=None)` take B6's recorder
+  and writer; `memory_smoke` and `count_smoke` are the memory and counting passes.
   - The MLP at widths `(16,32,32,8)`, `n_s = 4`, `η = VERIF_ETA`, `k = VERIF_K`, on
     `synthetic_dataset` of `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS`
     (default 10), and must be ≥ 2. Bands are provisional, with `allow_provisional=True`.
@@ -618,6 +631,57 @@ interface.
     last `n_s` records of `D` since the MLP has no `b̃` → `(2, "7")`).
   - `judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
     normalized residual, max κ, 6a `ρ_max` and per-check ms, and exits 1 if any oracle fails.
+- `metrics.py` (B6): EQ1b's cost grid and EQ13's run records (`DECISIONS_EVALUATION.md`). The
+  module docstring holds the full definitions; read it before changing a seam.
+  - **The seam.** `section(name) -> context manager`, `None` by default, accepted by
+    `prove_step`, `plain_step`, `run_loop` and `Verifier`. With `None` nothing is observed and
+    the run is bit-identical (tested). A `run:` prefix marks a once-per-run section, reported
+    at step 0. A section opened inside another is nested (a `sub` row).
+  - **Three passes.** The timed run reads only `perf_counter` (`TimeRecorder`; CUDA syncs at
+    top-level boundaries and times nested sections with event pairs, MPS syncs at every
+    boundary). Memory (`MemoryRecorder`, `memory_pass`) and counts (`CountRecorder`,
+    `count_pass`, `counting()`) are separate untimed runs; every section, nested included,
+    gets all three axes.
+  - **Prover rows (EQ1b).**
+    - P0, original training: `P0.load`, `P0.forward`, `P0.backward`, `P0.update`, emitted only
+      by `plain_step` (the plain baseline, B7).
+    - `train_captured`: a verified run's training, `train.load`/`.forward`/`.backward`/
+      `.update`, the same work under capture. A verified run never emits P0.
+    - P1, matmul capture: derived (`derive_capture(verified, plain)`, rows marked
+      `derived`; the plain rows must be one run and scenario): time `Σ(train.x − P0.x) +
+      P1.label`, memory the growth `(peak(train.backward) − start(train.forward)) −
+      (peak(P0.backward) − start(P0.forward))`, counts `Σ(train.x − P0.x)`. `P1.label` is `label`, the `M` check,
+      `assert_unmodified` and `release_operands`.
+    - P2, serialization: `P2.w_t`, `P2.w_next`. Leaf encoding is zero-copy, so its byte cost
+      is in P3's hashing.
+    - P3, commitment: `P3.commit` (`commit_step`: hashing and the invariant-6 recheck).
+    - P4, paths into `h_D`: `P4.paths` per step, `P4.tree` once.
+    - P5, writing the transcript: `P5.write` (`hold`; about 0 at test scale, A14's disk
+      store lands here).
+    - Fault hooks and dropping the store are outside every section.
+  - **Verifier rows**: the checks in driver order under their own ids (step 1's chaining
+    comparison is `7`; the `step` record keys it `0`, the protocol id a rejection carries), and `0` (anchor hashing), `1`, `8`, `9` once per run. `9` is building
+    the verdict, kept as a row although negligible. Check 5 splits into `5.glue` and
+    `5.measure`; check 3 has no row, its cost is `5.glue`.
+  - **FLOPs** use torch's `flop_registry` formulas through `_FlopTally`, not
+    `FlopCounterMode` as EQ1c names: `FlopCounterMode`'s module tracker adds autograd hooks
+    that break replay's `torch.autograd.grad` on leaf tensors. A test checks the two agree on
+    a plain step. Hash counts cover `commitment.merkle`, `matmul_check.challenges` and
+    `verifier.bands`; the band file is hashed at load, outside every section.
+  - `MetricsWriter(dir, run, *, device, model, corpus, seed, config, band_file_hash, h_D,
+    extra)` (`.recorder(scenario, *, poisoning_rate, cheat_step)`, `.write(rows)`,
+    `.close()`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
+    equal to `verifier.stats`), `memory_probe(device)`, `step_record`, `config_hash`.
+  - Files under `$VERIF_OUTPUT_DIR/<run>/`: `records.jsonl` (records `environment`, `step`,
+    `verdict`, `time`, `memory`, `count`, `storage`, `run_end`, each with `record` and `run`;
+    non-finite floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`) and
+    `residuals/<scenario>/step_<t>.npz`. On macOS, export `MallocLargeCache=0` for runs whose
+    memory figures are compared: otherwise freed large blocks stay in the footprint.
+  - `metrics_overhead.py`: `.venv/bin/python -m verification.runs.metrics_overhead
+    [--reps N] [--steps T] [--widths ...]`, an off/on/off timing of the honest MLP run.
+  - `mlp_smoke` writes to `mlp_smoke/` unless `--no-metrics` or `VERIF_METRICS=0`; its memory
+    and counting passes are two honest steps each, of their own. The MLP records `h_D` (its
+    synthetic `D`'s root) and a null band-file hash.
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
   `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
   `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored. Rerun it with
