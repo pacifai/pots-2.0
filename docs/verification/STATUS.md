@@ -42,9 +42,9 @@ The design process is gated, and each stage starts only after the previous one c
 - **C2 removed on 2026-10-01 (user, evaluation session).** `η` is a declared argument of
   `C`, fixed before any run at `VERIF_ETA = 1e-3` and shared by prover and verifier; no
   tuning run (`DECISIONS_SETUP.md` §8.B S8e). Plan task B6 is now `metrics.py`, the evaluation
-  cost grid, and B7 (plain-training baseline) and B8 (ASR rehearsal) are new. **The unmerged
-  agent commit `1e3155a` ("Add the one-time eta tuning run (B6, C2)", worktree
-  `agent-a3cfc008eb24bc4d2`) must not be merged.**
+  cost grid, and B7 (plain-training baseline) and B8 (ASR rehearsal) are new. The rejected
+  agent commit `1e3155a` ("Add the one-time eta tuning run (B6, C2)") was never merged; its
+  worktree and branch were deleted on 2026-10-04.
 - **Implementation (stage 5) started on 2026-09-30; the next item is **C1**, run inside
   task A11 of `IMPLEMENTATION_PLAN.md`.** The plan's task table (main axis A1–A14, branches
   B1–B8) is the work list, and C1 and C3 in `SETUP_TASKS.md` close as their tasks finish. At
