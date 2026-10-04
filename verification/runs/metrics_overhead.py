@@ -35,7 +35,8 @@ from verification.computation.instances.mlp import (
 )
 from verification.parameters import load_protocol_config
 from verification.runs.metrics import MetricsWriter, TimeRecorder
-from verification.runs.mlp_smoke import N_S, honest_final, run_scenario, scenarios
+from verification.runs.mlp_smoke import N_S
+from verification.runs.scenarios import HONEST, honest_final, run_scenario
 
 __all__ = ["measure", "section_cost_us", "main"]
 
@@ -76,7 +77,7 @@ def measure(*, reps: int = 30, T: int = 10, k: int | None = None,
     dataset = synthetic_dataset(c.widths, cfg.n_records, seed=cfg.seed)
     w0 = init_weights(c.widths, seed=cfg.seed)
     final = honest_final(c, dataset, w0, T)
-    honest = next(s for s in scenarios(c, dataset) if s.name == "honest")
+    honest = HONEST
     runs: dict[str, list[dict[str, float]]] = {m: [] for m in MODES}
     sections: list[float] = []  # metrics on: the reported step totals, summed per run
     with tempfile.TemporaryDirectory() as tmp, MetricsWriter(tmp, "overhead") as mw:

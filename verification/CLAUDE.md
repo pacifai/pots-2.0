@@ -581,6 +581,16 @@ interface.
   - `end_run(final) -> RunVerdict(accepted, rejection, steps_verified, band_source)` runs
     checks 8 and 9. It raises while calibration is unfrozen.
   - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers.
+- `residuals.py` (A10; A11 reuses it): summaries of `StepStats`, from `verifier.stats` or from
+  `runs.metrics.read_residuals`. It judges nothing.
+  - `class_summary(stats) -> [ClassSummary(cls, count, n, rms, max, max_name, max_step,
+    kappa_median, kappa_max)]`, classes in first-appearance order. `stats` is `{step:
+    StepStats}` or `(step, StepStats)` pairs. RMS and max are over all `count·k` normalized
+    residuals (P3.a); a NaN makes both NaN.
+  - `tensor_summary(stats) -> [TensorSummary(check_id, role, count, rho_max, max_name,
+    max_step)]` per `(check, weight_role(name))`, where `weight_role` stars the layer index.
+  - `format_class_table(rows, out=print)` ends with the largest class RMS, the global max and
+    their ratio; `format_tensor_table` ends with each check's max ρ.
 
 ### `verification/verifier/matmul_check/`
 
@@ -619,10 +629,17 @@ interface.
     prove_s, commit_s, verify_s)`. `prove_s` excludes `emit`. Per-check timings and stats stay on
     the verifier. A test holds weakrefs to each step's products and checks they are dead by the
     next step.
+- `scenarios.py`: the instance-agnostic scenario harness, shared by `mlp_smoke` and
+  `llama_step`. `Scenario(name, description, fault, expected)`, `Expected` (the declared
+  outcome), `ScenarioResult`, `HONEST` (no fault, accept), `honest_final(c, D, w0, T)` (`T`
+  uncaptured `plain_step`s from `W_0` through `run_plain`, check 8's reference),
+  `run_scenario(..., recorder=None, h_D=None)` (`h_D` defaults to `D`'s root), `judge` (the
+  S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
+  default `HONEST`, through `memory_pass` / `count_pass`).
 - `mlp_smoke.py` (A6, milestone M1):
   `.venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]`.
-  `run_scenario(..., recorder=None)` and `run_smoke(..., metrics=None)` take B6's recorder
-  and writer; `memory_smoke` and `count_smoke` are the memory and counting passes.
+  Holds the MLP's scenario list, `run_smoke(..., metrics=None)` and `memory_smoke` /
+  `count_smoke` (`PASS_STEPS` honest steps through `scenarios.memory_run` / `count_run`).
   - The MLP at widths `(16,32,32,8)`, `n_s = 4`, `η = VERIF_ETA`, `k = VERIF_K`, on
     `synthetic_dataset` of `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS`
     (default 10), and must be ≥ 2. Bands are provisional, with `allow_provisional=True`.
@@ -632,7 +649,7 @@ interface.
     300 ulps at step 2 → `(2, "6a")`), `bad-w-next-batch` (A3 on the last `n_s` records of `D`
     → `(2, "6a")`) and `broken-chain` (one hidden `plain_step` between steps 1 and 2, P11, on the
     last `n_s` records of `D` since the MLP has no `b̃` → `(2, "7")`).
-  - `judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
+  - `scenarios.judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
     normalized residual, max κ, 6a `ρ_max` and per-check ms, and exits 1 if any oracle fails.
 - `metrics.py` (B6): EQ1b's cost grid and EQ13's run records (`DECISIONS_EVALUATION.md`). The
   module docstring holds the full definitions; read it before changing a seam.
@@ -688,6 +705,35 @@ interface.
   - `mlp_smoke` writes to `mlp_smoke/` unless `--no-metrics` or `VERIF_METRICS=0`; its memory
     and counting passes are `PASS_STEPS` honest steps each, of their own. The MLP records
     `h_D` (its synthetic `D`'s root) and a null band-file hash.
+- `llama_step.py` (A10, milestone M3): `.venv/bin/python -m verification.runs.llama_step
+  [--steps T] [--metrics | --no-metrics]`, with `T` default 1. `LlamaComputation.from_config`,
+  `W_0` from `build_model()`, `D` from `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D`
+  from `meta.json` (`load_committed_dataset`). The honest scenario goes through
+  `scenarios.run_scenario` with the published `h_D` and provisional bands, check 8 against
+  `scenarios.honest_final`; its memory and counting passes are `scenarios.memory_run` /
+  `count_run`. `run_honest`; `report_residuals` prints `residuals.py`'s two tables, `report_costs` each step's prover and
+  verifier wall clock and, from the memory pass, each side's peak. Metrics go to
+  `llama_step/`. Exits 1 unless accepted.
+  - The real step from `W_0` on `π(1)` (k 7, η 1e-3), 2026-10-04 on the dev Mac: accepted.
+    Most classes have an RMS of 0.3–0.9 and a max ≤ 2.7, except `S` (max 3.8), `Λ` (RMS 3.8,
+    max 5.43, the global max) and `dF` (RMS 1.6, max 2.1); max κ 28 (`dX_down`).
+  - Against the pre-C1 diagnosis in `SETUP_TASKS.md` C1 (`Λ` RMS ≈ 4.2, max 5.55, `dF` ≈ 1.8,
+    so `s_h ≈ 4.2`, `τ ≈ 33`, `k = 9`), `Λ` and `dF` come out about 10% lower here. The likely
+    reason, not verified: each is a single product, so its class RMS is over only `k = 7`
+    residuals and is noisy, and the diagnostic run used different challenges and setup.
+    `s_h ≈ 3.8` would give `τ ≈ 30`. A11 measures `s_h` over steps 1–3 and recomputes `k`.
+  - Check 6a `ρ_max` is 1.94–2.00 for every role, 6b 1.99 on `W_E`, 0.09 on `γ_mlp`, 0 on
+    `γ_attn` and `γ_final`. Why about 2: torch's SGD `add_(G, alpha=−η)` rounds `W − η·G`
+    once (fused), while check 6's reference rounds twice, so honest entries differ by 0 or
+    1 ulp. One ulp divided by `ε_W·(|W| + |η·G|)` lies in (1, 2], near 2 when `W` sits at
+    the bottom of a binade, which is common because `W_0` is a bf16 checkpoint. A `q`-ulp
+    residual gives `ρ ∈ (q, 2q]`. So `τ_W = max(4, 2·ρ_max) = 4` at test scale confirms the
+    analytic floor rather than fitting anything. The γ's `ρ = 0` means the fused and
+    reference updates agree bit for bit on every entry of those tensors (a mismatch rate of
+    about 1e−5 per entry), not that their gradients vanish.
+  - Prover 2.4 s (`prove_step` 0.9, commit 1.5), verifier 5.4 s (check 5
+    2.7, check 2 1.5, 6a 0.8). Memory pass with `MallocLargeCache=0`: prover peak 4.0 GB,
+    verifier peak 5.5 GB (3.7 GB at its start, the held store).
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
   `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
   `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored. Rerun it with
@@ -700,7 +746,7 @@ interface.
     `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`.
   - Training is `loop.run_plain(c, model, D, w0, *, n_steps, schedule=None, on_step=None,
     section=None) -> PlainResult(steps, w_final)`: chained `plain_step`s on `run_loop`'s
-    default `π`, no tree, paths, commitment or verifier. `mlp_smoke.honest_final` uses it too.
+    default `π`, no tree, paths, commitment or verifier. `scenarios.honest_final` uses it too.
     `PlainStepRecord.train_s` is host time around the step, informational; P0's times are
     the `P0.*` rows.
   - `plain_baseline(c, D, w0, *, T, build_model, out_dir=None, metrics=None,

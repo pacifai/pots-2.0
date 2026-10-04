@@ -65,8 +65,8 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 | `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `instances/mlp.py`, `instances/llama.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
-| `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `matmul_check/` | Run the checks and track a run from start to verdict |
-| `runs/` | `loop.py`, `mlp_smoke.py`, `metrics.py`, `materialize_data.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
+| `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
+| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
@@ -216,7 +216,10 @@ disk-backed store for larger runs is planned (task A14).
 **`checks.py`** implements each check as a pure function of the store, `C`, a per-step
 context (`context.py`) and the tolerance bands (`bands.py`). Each returns `None` or a
 `Rejection(step, check_id, detail, kind)`. **`driver.py`** holds the run state and runs the
-checks in order.
+checks in order. **`residuals.py`** bins the numbers checks 5 and 6 record: per matmul
+class, the count, RMS and maximum of the normalized residuals and the spread of `κ`; per
+weight role, the largest `ρ`. It judges nothing. Runs print these tables, and calibration
+(A11) fits the bands from the same summaries.
 
 `matmul_check/` holds check 5's test, the part that would change if Freivalds' test were
 replaced:
@@ -234,8 +237,14 @@ replaced:
 ### Runs: `runs/`
 
 - **`loop.py`** connects prover and verifier step by step (see "Workflow: a whole run").
+- **`scenarios.py`** holds what any instance's scenarios share: a scenario with its fault and
+  declared outcome, running it through the loop, judging the outcome, the honest reference
+  weights for check 8, the report, and the memory and counting passes.
 - **`mlp_smoke.py`** runs the declared cheats against the MLP (see "Workflow: testing that
   cheats are caught").
+- **`llama_step.py`** runs honest SmolLM2 steps from the pretrained weights on the committed
+  `D`, verified by the real verifier with provisional bands (milestone M3). It prints the
+  per-class residual table and the per-weight `ρ` table, and each side's time and memory.
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
@@ -347,6 +356,16 @@ from measurement, not guessed. The test-scale procedure:
    judges every later step live. `end_run` refuses to give a verdict while calibration is
    unfrozen.
 
+`runs/llama_step.py` prints the per-class table that step 3 starts from
+(`verifier/residuals.py`). On the first real step, most classes have an RMS between 0.3 and
+0.9; `Λ`, the output-layer product, has the largest (3.8, max 5.4), and `dF` next (1.6).
+That is about 10% below the pre-calibration diagnosis recorded under C1 in
+`docs/verification/SETUP_TASKS.md` (`Λ` 4.2, max 5.55, `dF` 1.8, giving `s_h ≈ 4.2`,
+`τ ≈ 33` and `k = 9`). The likely reason, not verified: `Λ` and `dF` are single products,
+so each class RMS rests on only `k = 7` residuals and is noisy, and the diagnostic run used
+different challenges and setup. `s_h ≈ 3.8` would give `τ ≈ 30`. A11 measures `s_h` over
+steps 1–3 and recomputes `k` from it.
+
 Until A11 exists, runs use `Bands.provisional()`: `τ = 8`, `κ = 10⁴`, `τ_W = 4`. Smoke tests
 must opt into provisional bands explicitly (`allow_provisional=True`), because a cheat run
 must never be judged by bands nobody measured.
@@ -399,7 +418,7 @@ Breaking any of these voids the result. Each one has a test.
 | Per-component cost and residual metrics (`runs/metrics.py`, B6), wired into the MLP smoke run | done |
 | SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |
 | Plain-training baseline (`runs/plain_baseline.py`, B7) | done; final weights bit-identical to the captured prover's on the MLP, the tiny Llama and two real SmolLM2 steps |
-| First honest SmolLM2 step (A10, M3) | next |
+| First honest SmolLM2 step (A10, `runs/llama_step.py`) | done; milestone M3 reached. The real step from `W_0` on `π(1)` is accepted with provisional bands: largest normalized residual 5.4 (`Λ`), check 6 `ρ` at most 2.0 |
 | Calibration and band file (A11, M4); 10-step honest run, cheat runs, disk store (A12–A14, M5) | planned |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
