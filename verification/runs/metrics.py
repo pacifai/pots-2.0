@@ -32,7 +32,7 @@ are named apart and its P1 is derived:
 |---|---|---|
 | P0, original training (plain run only) | ``P0.load``, ``P0.forward``, ``P0.backward``, ``P0.update`` | :func:`plain_step` with a ``section``: load ``W_t``, zero grads and build the optimizer; forward; backward; ``opt.step()`` and the final ``zero_grad`` |
 | ``train_captured`` (verified run) | ``train.load``, ``train.forward``, ``train.backward``, ``train.update`` | the same four phases in :func:`prove_step`, forward and backward under capture: P0 plus capture's hooks |
-| P1, matmul capture | ``P1.label`` (measured), the rest derived | **derived** by :func:`derive_capture` (``derived: true``): time ``Σ(train.x − P0.x) + P1.label`` per step; memory ``peak(train.backward) − peak(P0.backward)``; 0 FLOPs and 0 bytes hashed. ``P1.label`` maps captured matmuls to product slots, checks ``M``, runs invariant 6's ``assert_unmodified`` and releases the captured operands |
+| P1, matmul capture | ``P1.label`` (measured), the rest derived | **derived** by :func:`derive_capture` (``derived: true``): time ``Σ(train.x − P0.x) + P1.label`` per step; memory ``(peak(train.backward) − start(train.forward)) − (peak(P0.backward) − start(P0.forward))``, the growth over the step, not absolute peaks; counts ``Σ(train.x − P0.x)`` per field. ``P1.label`` maps captured matmuls to product slots, checks ``M``, runs invariant 6's ``assert_unmodified`` and releases the captured operands |
 | P2, transcript serialization | ``P2.w_t``, ``P2.w_next`` | copy ``W_t`` and ``W_{t+1}`` out of the model as leaves. Leaf encoding itself is zero-copy (``tensor_leaf_payload`` is a view), so serialization's byte cost is inside P3's hashing |
 | P3, Merkle commitment | ``P3.commit`` | ``commit_leaves`` (hash every leaf, build the tree) and the invariant-6 recheck (``InMemoryStore.commit_step``) |
 | P4, batch paths into ``h_D`` | ``P4.paths`` per step; ``P4.tree`` once (step 0) | the batch's audit paths; building the prover's copy of ``h_D``'s tree |
@@ -61,7 +61,10 @@ in a step (``train.load``, ``5.glue``) accumulates and ``calls`` counts the entr
 **Time (timed run).** Wall-clock seconds from ``perf_counter`` and nothing else. On CUDA the
 device is synchronized at top-level section boundaries and nested sections are timed with
 ``torch.cuda.Event`` pairs, read after the enclosing top-level sync; on MPS the device is
-synchronized at every boundary. Test-scale times are rehearsal only (EQ14).
+synchronized at every boundary. So on CUDA a nested row is device time (the Event pair) while
+a top-level row is host time across a synchronized interval; the two clocks are not checked
+against each other yet, which the first CUDA run must do. Test-scale times are rehearsal only
+(EQ14).
 
 **Memory (memory pass).** ``peak_bytes`` is the whole process's peak during the section, as an
 absolute figure; ``start_bytes`` and ``end_bytes`` are the process's figure at the first entry
@@ -112,7 +115,8 @@ the counting pass.
   per product ``p_m``, ``p_name``, ``p_cls``, ``p_layer`` (``-1`` outside the layer stack),
   ``p_kappa`` and ``p_normalized`` (``[P, k]``, one normalized residual per challenge); per
   weight tensor ``w_check`` (``6a``/``6b``), ``w_name`` and ``w_rho`` (``ρ_max``). NaN and
-  infinity are stored as such. :func:`read_residuals` rebuilds ``StepStats`` equal to the
+  infinity are stored as such. Check 5 stops at the first failing product, so a step rejected
+  at 5 has products up to and including the failure only. :func:`read_residuals` rebuilds ``StepStats`` equal to the
   verifier's, the feed for calibration (A11).
 """
 
@@ -549,13 +553,22 @@ class TimeRecorder(_Recorder):
 def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
                 fields: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """EQ13 record 1 for step ``t``: the verdict, the first failing check, and each check's
-    ``pass``, ``fail`` or ``not_run``, keyed by the driver's check ids (``7`` at step 1 too).
-    ``first_failing_check`` is the rejection's own id (``0`` for a chain failure at step 1)."""
-    ran = list(verifier.timings.get(t, {}))
+    ``pass``, ``fail`` or ``not_run``.
+
+    ``checks`` and ``first_failing_check`` use protocol ids, the ids a ``Rejection`` carries:
+    at step 1 the chain slot is check 0 (``ctx.chain_check_id``), so it is keyed ``0``, and
+    ``checks[first_failing_check]`` is ``fail``. The cost rows keep the driver's slot id
+    ``7`` at step 1 too."""
+    def pid(cid: str) -> str:
+        return "0" if t == 1 and cid == "7" else cid
+
+    ran = [pid(c) for c in verifier.timings.get(t, {})]
     failed = rejection is not None and rejection.step == t
-    checks = {cid: ("pass" if cid in ran else "not_run") for cid in DEFAULT_ORDER}
-    if failed and ran:
-        checks[ran[-1]] = "fail"
+    checks = {pid(c): ("pass" if pid(c) in ran else "not_run") for c in DEFAULT_ORDER}
+    if failed:
+        cid = rejection.check_id if rejection.check_id in checks else (ran[-1] if ran else None)
+        if cid is not None:
+            checks[cid] = "fail"
     out = {"record": "step", "run": run, "scenario": scenario,
            "model": None, "corpus": None, "seed": None,
            "poisoning_rate": None, "cheat_step": None, **(fields or {}),
@@ -803,16 +816,20 @@ def derive_capture(verified: Iterable[Mapping[str, Any]],
                    plain: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """P1 (matmul capture, EQ1b) per step, from a verified run's records and a plain run's.
 
-    For each ``(scenario, step)`` of the verified run that the plain run (B7) also has, matched
-    by step:
+    The plain run (B7) must hold exactly one ``(run, scenario)``; its rows are matched to the
+    verified run's by step. For each step both have:
 
     - time: ``Σ_x (train.x − P0.x) + P1.label`` over the four training phases;
-    - memory: ``peak(train.backward) − peak(P0.backward)``, from the two memory passes;
-    - counts: 0 FLOPs and 0 bytes hashed, for every step the verified counting pass has.
+    - memory: ``(peak(train.backward) − start(train.forward)) − (peak(P0.backward) −
+      start(P0.forward))``, the growth each step adds over what was live when it began, from
+      the two memory passes; absolute peaks would carry whatever else each process held.
+      ``null`` if any of the four figures is;
+    - counts: ``Σ_x (train.x − P0.x)`` per count field, from the two counting passes.
 
-    Each row is a ``component`` row named ``P1`` with ``derived: true``.
+    Each row is a ``component`` row named ``P1`` with ``derived: true``. A step missing one of
+    the phases raises ``ValueError`` naming it.
     """
-    def phases(rows: Iterable[Mapping[str, Any]], record: str
+    def phases(rows: list[Mapping[str, Any]], record: str
                ) -> dict[tuple[str, str, int], dict[str, Mapping[str, Any]]]:
         out: dict[tuple[str, str, int], dict[str, Mapping[str, Any]]] = {}
         for r in rows:
@@ -820,32 +837,53 @@ def derive_capture(verified: Iterable[Mapping[str, Any]],
                 out.setdefault((r["run"], r["scenario"], r["step"]), {})[r["component"]] = r
         return out
 
+    def get(table: Mapping[str, Mapping[str, Any]], name: str, t: int) -> Mapping[str, Any]:
+        if name not in table:
+            raise ValueError(f"derive_capture: no {name!r} phase row at step {t}")
+        return table[name]
+
     verified, plain = list(verified), list(plain)
-    plain_time = {k[2]: v for k, v in phases(plain, "time").items()}
-    plain_mem = {k[2]: v for k, v in phases(plain, "memory").items()}
+    runs = {(r["run"], r["scenario"]) for r in plain
+            if r.get("record") in ("time", "memory", "count") and r.get("level") == "phase"}
+    if len(runs) > 1:
+        raise ValueError(f"derive_capture: the plain rows hold {len(runs)} (run, scenario) "
+                         f"pairs, {sorted(runs)}; pass one")
+
+    def by_step(record: str) -> dict[int, dict[str, Mapping[str, Any]]]:
+        return {k[2]: v for k, v in phases(plain, record).items()}
+
+    xs = ("load", "forward", "backward", "update")
+    count_fields = ("flops", "hash_in_bytes", "hash_out_bytes", "hash_calls")
+    plain_time, plain_mem, plain_count = by_step("time"), by_step("memory"), by_step("count")
     base = {"side": "prover", "component": "P1", "level": "component", "derived": True}
     out: list[dict[str, Any]] = []
     for (run, scen, t), v in phases(verified, "time").items():
         p = plain_time.get(t)
-        if p is None or "P1.label" not in v:
+        if p is None:
             continue
-        dt = sum(v[f"train.{x}"]["time_s"] - p[f"P0.{x}"]["time_s"]
-                 for x in ("load", "forward", "backward", "update"))
+        label = get(v, "P1.label", t)
+        dt = sum(get(v, f"train.{x}", t)["time_s"] - get(p, f"P0.{x}", t)["time_s"] for x in xs)
         out.append({"record": "time", "run": run, "scenario": scen, "step": t, **base,
-                    "calls": v["P1.label"]["calls"], "time_s": dt + v["P1.label"]["time_s"]})
+                    "calls": label["calls"], "time_s": dt + label["time_s"]})
     for (run, scen, t), v in phases(verified, "memory").items():
         p = plain_mem.get(t)
         if p is None:
             continue
-        a, b = v["train.backward"]["peak_bytes"], p["P0.backward"]["peak_bytes"]
+        figs = (get(v, "train.backward", t)["peak_bytes"],
+                get(v, "train.forward", t)["start_bytes"],
+                get(p, "P0.backward", t)["peak_bytes"], get(p, "P0.forward", t)["start_bytes"])
+        grow = None if any(f is None for f in figs) else \
+            (figs[0] - figs[1]) - (figs[2] - figs[3])
         out.append({"record": "memory", "run": run, "scenario": scen, "step": t, **base,
-                    "calls": 1, "peak_bytes": None if a is None or b is None else a - b,
-                    "start_bytes": None, "end_bytes": None,
+                    "calls": 1, "peak_bytes": grow, "start_bytes": None, "end_bytes": None,
                     "mem_source": v["train.backward"]["mem_source"]})
-    for (run, scen, t) in phases(verified, "count"):
+    for (run, scen, t), v in phases(verified, "count").items():
+        p = plain_count.get(t)
+        if p is None:
+            continue
         out.append({"record": "count", "run": run, "scenario": scen, "step": t, **base,
-                    "calls": 1, "flops": 0, "hash_in_bytes": 0, "hash_out_bytes": 0,
-                    "hash_calls": 0})
+                    "calls": 1, **{f: sum(get(v, f"train.{x}", t)[f] - get(p, f"P0.{x}", t)[f]
+                                          for x in xs) for f in count_fields}})
     return out
 
 
@@ -1010,7 +1048,11 @@ class MetricsWriter:
 
     def recorder(self, scenario: str, *, poisoning_rate: float | None = None,
                  cheat_step: int | None = None) -> TimeRecorder:
-        """A timed-run recorder that writes here."""
+        """A timed-run recorder that writes here.
+
+        ``cheat_step`` is for EQ15's attack runs only, the step the attack starts at. The
+        protocol-fault scenarios (``flip``, ``broken-chain`` …) leave it null; their expected
+        rejection point is the harness's oracle, not a record field."""
         return TimeRecorder(self.run, scenario, device=self.device, writer=self,
                             step_fields={**self.run_fields, "poisoning_rate": poisoning_rate,
                                          "cheat_step": cheat_step})

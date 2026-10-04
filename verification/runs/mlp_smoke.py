@@ -352,10 +352,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The config hash covers what decides the run's results, not where it writes.
         config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                      if f.name not in ("output_dir", "metrics")}, "mlp": mlp}
-        # Bands are provisional: no band file. h_D is None: the MLP's synthetic D is no corpus.
+        # Bands are provisional, so there is no band file.
         with MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
                            model="mlp", corpus="synthetic", seed=cfg.seed, config=config,
-                           band_file_hash=None, h_D=None,
+                           band_file_hash=None, h_D=dataset_tree(c, dataset).root,
                            extra={"band_source": "provisional", **mlp}) as mw:
             results = run_smoke(c, dataset, w0, T=T, k=k, metrics=mw)
     return 0 if all(r.passed for r in results) else 1

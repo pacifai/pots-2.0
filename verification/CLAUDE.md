@@ -576,8 +576,9 @@ import ...`). Each entry below gives the public interface.
     - `train_captured`: a verified run's training, `train.load`/`.forward`/`.backward`/
       `.update`, the same work under capture. A verified run never emits P0.
     - P1, matmul capture: derived (`derive_capture(verified, plain)`, rows marked
-      `derived`): time `Σ(train.x − P0.x) + P1.label`, memory `peak(train.backward) −
-      peak(P0.backward)`, 0 FLOPs. `P1.label` is `label`, the `M` check,
+      `derived`; the plain rows must be one run and scenario): time `Σ(train.x − P0.x) +
+      P1.label`, memory the growth `(peak(train.backward) − start(train.forward)) −
+      (peak(P0.backward) − start(P0.forward))`, counts `Σ(train.x − P0.x)`. `P1.label` is `label`, the `M` check,
       `assert_unmodified` and `release_operands`.
     - P2, serialization: `P2.w_t`, `P2.w_next`. Leaf encoding is zero-copy, so its byte cost
       is in P3's hashing.
@@ -587,7 +588,7 @@ import ...`). Each entry below gives the public interface.
       store lands here).
     - Fault hooks and dropping the store are outside every section.
   - **Verifier rows**: the checks in driver order under their own ids (step 1's chaining
-    comparison is `7`), and `0` (anchor hashing), `1`, `8`, `9` once per run. `9` is building
+    comparison is `7`; the `step` record keys it `0`, the protocol id a rejection carries), and `0` (anchor hashing), `1`, `8`, `9` once per run. `9` is building
     the verdict, kept as a row although negligible. Check 5 splits into `5.glue` and
     `5.measure`; check 3 has no row, its cost is `5.glue`.
   - **FLOPs** use torch's `flop_registry` formulas through `_FlopTally`, not
@@ -607,8 +608,8 @@ import ...`). Each entry below gives the public interface.
   - `metrics_overhead.py`: `.venv/bin/python -m verification.runs.metrics_overhead
     [--reps N] [--steps T] [--widths ...]`, an off/on/off timing of the honest MLP run.
   - `mlp_smoke` writes to `mlp_smoke/` unless `--no-metrics` or `VERIF_METRICS=0`; its memory
-    and counting passes are two honest steps each, of their own. The MLP records `h_D` and
-    the band-file hash as null.
+    and counting passes are two honest steps each, of their own. The MLP records `h_D` (its
+    synthetic `D`'s root) and a null band-file hash.
 - `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
   `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
   `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored. Rerun it with

@@ -32,11 +32,13 @@ from verification.runs.metrics import (
     memory_probe,
     read_records,
     read_residuals,
+    step_record,
 )
 from verification.runs.mlp_smoke import honest_final, run_scenario, run_smoke, scenarios
 from verification.transcript.store import InMemoryStore
 from verification.verifier import bands
 from verification.verifier.checks import DEFAULT_ORDER
+from verification.verifier.context import Rejection
 from verification.verifier.matmul_check import challenges
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -151,12 +153,13 @@ def test_step_and_verdict_records(smoke):
         for r in mine:
             assert (r["run"], r["model"], r["corpus"], r["seed"]) == ("test", "mlp", "synthetic", 0)
             assert r["poisoning_rate"] is None and r["cheat_step"] is None
-            assert list(r["checks"]) == list(DEFAULT_ORDER)
+            order = [("0" if r["step"] == 1 and x == "7" else x) for x in DEFAULT_ORDER]
+            assert list(r["checks"]) == order
             if rej is not None and rej.step == r["step"]:
                 assert r["verdict"] == "reject"
                 assert r["first_failing_check"] == rej.check_id
                 assert r["checks"][rej.check_id] == "fail"
-                after = list(DEFAULT_ORDER)[list(DEFAULT_ORDER).index(rej.check_id) + 1:]
+                after = order[order.index(rej.check_id) + 1:]
                 assert all(r["checks"][x] == "not_run" for x in after)
             else:
                 assert r["verdict"] == "accept" and r["first_failing_check"] is None
@@ -164,6 +167,16 @@ def test_step_and_verdict_records(smoke):
         (v,) = [r for r in read_records(out, "verdict") if r["scenario"] == name]
         assert v["accepted"] == res.loop.verdict.accepted
         assert v["rejection_check"] == (None if rej is None else rej.check_id)
+
+
+def test_step_record_uses_protocol_ids_at_step_1():
+    v = type("V", (), {"timings": {1: {"4": 0.1, "7": 0.1}, 2: {"4": 0.1, "7": 0.1}}})()
+    r = step_record("r", "s", 1, v, Rejection(step=1, check_id="0", detail="x", kind="failed"))
+    assert r["first_failing_check"] == "0" and r["checks"]["0"] == "fail"
+    assert "7" not in r["checks"] and r["checks"]["4"] == "pass"
+    assert all(r["checks"][x] == "not_run" for x in ("2", "6a", "5", "6b"))
+    r = step_record("r", "s", 2, v, Rejection(step=2, check_id="7", detail="x", kind="failed"))
+    assert "0" not in r["checks"] and r["checks"]["7"] == "fail"
 
 
 def test_residual_arrays_round_trip(smoke):
@@ -384,21 +397,34 @@ def test_derive_capture_from_synthetic_rows():
             plain.append(_phase("time", f"P0.{x}", t, time_s=0.75 + i))
         verified.append(_phase("time", "P1.label", t, time_s=0.5))
     verified.append(_phase("time", "P4.tree", 0, time_s=9.0))  # run rows are not steps
+    # growth, not absolute peaks: the captured process starts 300 bytes higher
+    verified.append(_phase("memory", "train.forward", 1, start_bytes=500, mem_source="m"))
     verified.append(_phase("memory", "train.backward", 1, peak_bytes=1000, mem_source="m"))
+    plain.append(_phase("memory", "P0.forward", 1, start_bytes=200, mem_source="m"))
     plain.append(_phase("memory", "P0.backward", 1, peak_bytes=600, mem_source="m"))
-    verified.append(_phase("count", "train.forward", 1, flops=10))
+    zero = dict.fromkeys(("flops", "hash_in_bytes", "hash_out_bytes", "hash_calls"), 0)
+    for x in ("load", "forward", "backward", "update"):
+        verified.append(_phase("count", f"train.{x}", 1, **{**zero, "flops": 10}))
+        plain.append(_phase("count", f"P0.{x}", 1, **{**zero, "flops": 7}))
     rows = derive_capture(verified, plain)
     assert all(r["component"] == "P1" and r["derived"] is True and r["level"] == "component"
                for r in rows)
     times = {r["step"]: r["time_s"] for r in rows if r["record"] == "time"}
     assert times == {1: pytest.approx(4 * 0.25 + 0.5), 2: pytest.approx(1.5)}
     (mem,) = [r for r in rows if r["record"] == "memory"]
-    assert mem["step"] == 1 and mem["peak_bytes"] == 400
+    assert mem["step"] == 1 and mem["peak_bytes"] == (1000 - 500) - (600 - 200)
     (cnt,) = [r for r in rows if r["record"] == "count"]
-    assert cnt["flops"] == 0 and cnt["hash_in_bytes"] == 0
+    assert cnt["flops"] == 4 * 3 and cnt["hash_in_bytes"] == 0
     # a step the plain run lacks gets no P1 row
     assert derive_capture(verified, [p for p in plain if p["step"] == 2]) == \
-           [r for r in rows if r["record"] == "time" and r["step"] == 2] + [cnt]
+           [r for r in rows if r["record"] == "time" and r["step"] == 2]
+    # a missing phase is named, with its step
+    with pytest.raises(ValueError, match=r"'P0.forward' phase row at step 1"):
+        derive_capture(verified, [p for p in plain if p["component"] != "P0.forward"])
+    # plain rows from two scenarios can't be matched by step
+    other = [{**p, "scenario": "flip"} for p in plain]
+    with pytest.raises(ValueError, match="2 \\(run, scenario\\) pairs"):
+        derive_capture(verified, plain + other)
 
 
 def test_store_split_matches_from_step(c, D, w0):
@@ -486,7 +512,7 @@ def test_mps_sections_synchronize(monkeypatch):
     assert len(calls) == 2
 
 
-def test_main_metrics_flag(monkeypatch, tmp_path, capsys):
+def test_main_metrics_flag(monkeypatch, tmp_path, capsys, c):
     monkeypatch.setattr(mlp_smoke, "setup_determinism", lambda cfg: None)
     monkeypatch.setenv("VERIF_N_RECORDS", str(N_RECORDS))
     monkeypatch.setenv("VERIF_OUTPUT_DIR", str(tmp_path))
@@ -498,6 +524,9 @@ def test_main_metrics_flag(monkeypatch, tmp_path, capsys):
     assert mlp_smoke.main(["--steps", "2", "--metrics"]) == 0
     files = {p.name for p in (tmp_path / "mlp_smoke").iterdir()}
     assert files == {"records.jsonl", "residuals"}
+    env, *_ = read_records(tmp_path / "mlp_smoke")
+    assert env["h_D"] == leaves.dataset_tree(c, synthetic_dataset(c.widths, N_RECORDS, seed=0)
+                                             ).root.hex()
     kinds = {r["record"] for r in read_records(tmp_path / "mlp_smoke")}
     assert kinds == {"environment", "step", "verdict", "time", "memory", "count", "storage",
                      "run_end"}
