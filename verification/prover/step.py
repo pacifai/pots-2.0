@@ -35,7 +35,11 @@ import torch
 
 from verification.commitment.leaves import commit_leaves
 from verification.commitment.merkle import MerkleTree
-from verification.computation.interface import DeclaredComputation, load_weights
+from verification.computation.interface import (
+    DeclaredComputation,
+    load_weights,
+    snapshot_weights,
+)
 from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import MatmulCapture, MutatedCaptureError
 
@@ -104,10 +108,6 @@ def _versions(objs: Sequence[Any]) -> tuple[int, ...]:
     return tuple(t._version for t in objs if isinstance(t, torch.Tensor))
 
 
-def _snapshot(computation: DeclaredComputation, model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    return {n: model.get_parameter(n).detach().clone() for n in computation.weight_names}
-
-
 def _optimizer(computation: DeclaredComputation, model: torch.nn.Module) -> torch.optim.SGD:
     # Invariant 4 (S8a): plain SGD, nothing else on.
     return torch.optim.SGD(model.parameters(), lr=computation.eta, momentum=0, weight_decay=0)
@@ -136,7 +136,7 @@ def plain_step(computation: DeclaredComputation, model: torch.nn.Module,
     with sec("P0.update"):
         opt.step()
         model.zero_grad(set_to_none=True)
-    return _snapshot(computation, model), float(loss.detach())
+    return snapshot_weights(computation, model), float(loss.detach())
 
 
 def prove_step(
@@ -167,7 +167,7 @@ def prove_step(
     with sec("train.load"):
         load_weights(computation, model, w_t)
     with sec("P2.w_t"):
-        w_t_leaves = _snapshot(computation, model)  # parameters change in place at the step
+        w_t_leaves = snapshot_weights(computation, model)  # parameters change in place at the step
     with sec("train.load"):
         model.zero_grad(set_to_none=True)
         opt = _optimizer(computation, model)
@@ -198,7 +198,7 @@ def prove_step(
     with sec("train.update"):
         opt.step()
     with sec("P2.w_next"):
-        w_next = _snapshot(computation, model)
+        w_next = snapshot_weights(computation, model)
     with sec("train.update"):
         # set_to_none drops the model's reference; G_ℓ products stay intact (invariant 6).
         model.zero_grad(set_to_none=True)
