@@ -494,6 +494,8 @@ def captured_operands(c, model, records):
     labeling saw them (``m -> (A, B)``, transposed back for δK̃) and the prover's gradient of
     each glue-gradient weight."""
     seen = {}
+    # _fill is where labeling sees each product's operands as the op received them; no public
+    # hook exposes them, and they are the reference the replay must reproduce bit for bit.
     orig = _Labeler._fill
 
     def fill(self, name, a, b, out, rec, leaf=None):
@@ -750,6 +752,8 @@ def test_backward_out_of_order_recomputes(honest_all):
     ("L1.S[0,1]", -1, ["L1.dV[0,1]", "L1.dQ[0,1]"], ["L1.dA[0,1]", "L1.dV[0,0]", "L2.dX_q"]),
     # The head: Λ enters δΛ, so both head products' A changes; their B do not.
     ("Lambda", lambda c: (c.n - 1) * c.n_v, ["dF", "G_E_head"], ["L2.Y_down"]),
+    # Across the frontier: layer 2's committed δX_q enters δX_2, which is layer 1's δY_down.
+    ("L2.dX_q", -1, ["L1.dX_down", "L1.G_down"], ["L2.G_q", "L2.dX_k", "dF"]),
 ])
 def test_committed_product_flows_into_backward_operands(honest_all, perturbed, index, changed,
                                                         unchanged):
@@ -852,6 +856,39 @@ def test_backward_rejects_an_undeclared_product(honest_all, fn, match):
     replay = c.replay(ListReader(leaves))
     _grad_hook_on_mlp(replay.model.model.layers[c.L - 1], fn)
     with pytest.raises(ReplayError, match=match):
+        replay.operands(c.m_of(f"L{c.L}.dX_down"))
+
+
+def test_backward_rejects_a_duplicate_product(honest_all):
+    """Layer L's δX_down run a second time, from inside the attention backward."""
+    c, leaves, _, _ = honest_all
+    replay = c.replay(ListReader(leaves))
+    layer = replay.model.model.layers[c.L - 1]
+    stash = {}
+
+    def keep_dy(module, args, out):
+        if out.requires_grad:
+            out.register_hook(lambda g: stash.__setitem__("g", g))
+
+    def again(module, args, out):
+        o = out[0] if isinstance(out, tuple) else out
+        if o.requires_grad:
+            w = layer.mlp.down_proj.weight
+            o.register_hook(lambda g: torch.mm(stash["g"].reshape(-1, w.shape[0]), w).sum() * 0
+                            + g)
+    layer.mlp.down_proj.register_forward_hook(keep_dy)
+    layer.self_attn.register_forward_hook(again)
+    with pytest.raises(ReplayError, match=rf"L{c.L}\.dX_down is not declared .* twice"):
+        replay.operands(c.m_of(f"L{c.L}.dX_down"))
+
+
+def test_backward_reports_a_missing_product(honest_all):
+    """A weight cut out of the graph: its G mm never runs, and the unit says which."""
+    c, leaves, _, _ = honest_all
+    replay = c.replay(ListReader(leaves))
+    lin = replay.model.model.layers[c.L - 1].mlp.gate_proj
+    lin.forward = lambda x: torch.nn.functional.linear(x, lin.weight.detach())
+    with pytest.raises(ReplayError, match=f"missing .*L{c.L}.G_gate"):
         replay.operands(c.m_of(f"L{c.L}.dX_down"))
 
 

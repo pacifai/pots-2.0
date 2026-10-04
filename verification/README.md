@@ -164,7 +164,10 @@ Two instances exist, in `instances/`:
   `pad_token_id = 2`, which is also EOS and our pad token, so `nn.Embedding(padding_idx=2)`
   gives a zero embedding gradient for token 2. The replay matches the prover there because
   both use the model's own module, but reference block §4 writes `G_E^emb` as a plain
-  scatter-add without that zero row.
+  scatter-add without that zero row. At test scale the difference has no numeric effect:
+  id 2 occurs only at padded positions, where `δX_1` is exactly 0. On the real step-1 batch
+  it occurs 166 times, all in padded tails, so the plain scatter-add and the module agree
+  bit for bit.
 
 ### Prover side: `prover/`
 

@@ -889,8 +889,12 @@ class LlamaReplay(Replay):
         c, model = self.c, self.model
         head = j == c.L + 1
         assert self.x is not None and self.layer_kwargs is not None and self.batch is not None
-        if not head and (self._dx is None or self._dx[0] != j + 1):
-            raise ReplayError(f"replay: layer {j}'s backward needs δX_{j + 1}")
+        grad_out = None  # the head starts from ℒ; layer j from δX_{j+1}
+        if not head:
+            dx = self._dx
+            if dx is None or dx[0] != j + 1:
+                raise ReplayError(f"replay: layer {j}'s backward needs δX_{j + 1}")
+            grad_out = dx[1]
         x = self.x[j - 1].detach().requires_grad_()
         if head:
             gammas = [c.gamma_final]
@@ -927,10 +931,12 @@ class LlamaReplay(Replay):
                         lambda g, w=w: self._dy.__setitem__(_ptr(g), w))
                 self._phase = "backward"
                 grads = torch.autograd.grad(
-                    out, [x, *params], grad_outputs=None if head else self._dx[1],  # type: ignore[index]
-                    allow_unused=True)
+                    out, [x, *params], grad_outputs=grad_out, allow_unused=True)
         finally:
             self._phase, self._seen, self._fwd, self._saved, self._dy = "forward", [], {}, {}, {}
+        if not self._bops:
+            raise ReplayError(f"replay: no backward product of unit {j} reached the "
+                              f"substitution; is the dispatch mode not active in backward?")
         if any(g is None for g in grads) or set(self._bops) != self._want:
             missing = sorted(self._want - set(self._bops))
             raise ReplayError(f"replay: backward unit {j} is missing {missing or 'a gradient'}")
@@ -1000,7 +1006,9 @@ class LlamaReplay(Replay):
 
         Valid right after ``operands(M)``, the last product of layer 1's backward. ``G_E^head``
         is the committed leaf. ``G_E^emb`` is the backward of the model's own embedding module
-        at the committed ids, fed ``δX_1``, so it follows that module's ``padding_idx``.
+        at the committed ids, fed ``δX_1``, so it follows that module's ``padding_idx``. At
+        test scale that has no numeric effect: SmolLM2's padding id 2 occurs only at padded
+        positions, where ``δX_1`` is exactly 0, so a plain scatter-add gives the same bits.
         """
         c = self.c
         if not self._served_last or self._dx is None or self._dx[0] != 1:

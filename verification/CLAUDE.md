@@ -407,9 +407,10 @@ interface.
     the op receives: `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and `repeat_kv`, `(softmax, Ṽ)`.
     The forward replay runs under `torch.no_grad()`.
   - Backward products and `glue_gradients()` (A9) come from `torch.autograd.grad` on the same
-    unmodified modules, still under `ProductSubstitution` (the CPU autograd engine carries the
-    dispatch mode into backward), so every backward mm/bmm also gets its committed leaf. No
-    backward is written by hand. Units, from the top:
+    unmodified modules, still under `ProductSubstitution`. Autograd's engine restores the
+    forward's thread-local state, including the dispatch mode, on its worker threads (on any
+    device), so every backward mm/bmm also gets its committed leaf. A product that escaped
+    the mode would be reported missing. No backward is written by hand. Units, from the top:
     - Head (`j = L+1`): `loss_from_logits(lm_head(norm(X_{L+1})), batch)`, grad to
       `[X_{L+1}, γ_final, W_E]`. `δΛ` comes from autograd through `loss_from_logits`;
       `loss` and `label` are never called.
@@ -431,7 +432,8 @@ interface.
       1. It returns the γ gradients and, for `W_E`, `G_E_head` plus `G_E^emb` =
       `autograd.grad(embed_tokens(ids), W_E, δX_1)` under a substitution that forbids
       products. `G_E^emb` comes from the model's own `nn.Embedding`, so a `padding_idx`
-      row is zero (see the SmolLM2 note in the README).
+      row is zero (see the SmolLM2 note in the README). At test scale this has no numeric
+      effect: id 2 occurs only at padded positions, where `δX_1` is exactly 0.
   - On the real 4×128 step from `W_0` on `π(1)` it fills all 7,113 slots (2,371 forward,
     211 input-grad, 211 weight-grad, 4,320 operand-grad). `prove_step` takes about 1 s and
     `commit` about 1.5 s, at a peak RSS of about 4.6 GB. The replay rebuilds all 2,371
