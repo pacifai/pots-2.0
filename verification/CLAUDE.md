@@ -360,7 +360,7 @@ interface.
   - Helpers: `make_record`/`split_record`, `init_weights(widths, seed)` and
     `synthetic_dataset(widths, n, seed)`. The schedule is `setup.data.schedule`.
   - `MLPReplay` uses the replay model's own `act` and `loss_fn`.
-- `instances/llama.py` (A7, milestone M2; A8 forward replay). The module docstring has the
+- `instances/llama.py` (A7, milestone M2; A8 forward replay; A9 backward replay). The module docstring has the
   pins and the labeling rules.
   - `LlamaComputation(config, *, n_s, n, eta, source=None)`, with `.from_pretrained(repo,
     revision, *, n_s, n, eta)` and `.from_config(cfg)` (the run's instance, from a
@@ -406,15 +406,47 @@ interface.
     undeclared mm, a bmm anywhere else, a different order or a layer that doesn't reproduce
     its output raises `ReplayError`. Out-of-order calls rerun their layer. Operands are what
     the op receives: `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and `repeat_kv`, `(softmax, Ṽ)`.
-    Backward products and `glue_gradients()` raise `NotImplementedError` (A9). Kept for A9: `x`, `layer_kwargs`, `batch`, `lambda_operands`.
-    The forward replay runs under `torch.no_grad()`; A9's backward reruns need grad on.
+    The forward replay runs under `torch.no_grad()`.
+  - Backward products and `glue_gradients()` (A9) come from `torch.autograd.grad` on the same
+    unmodified modules, still under `ProductSubstitution`. Autograd's engine restores the
+    forward's thread-local state, including the dispatch mode, on its worker threads (on any
+    device), so every backward mm/bmm also gets its committed leaf. A product that escaped
+    the mode would be reported missing. No backward is written by hand. Units, from the top:
+    - Head (`j = L+1`): `loss_from_logits(lm_head(norm(X_{L+1})), batch)`, grad to
+      `[X_{L+1}, γ_final, W_E]`. `δΛ` comes from autograd through `loss_from_logits`;
+      `loss` and `label` are never called.
+    - Layer `j`: `layers[j−1](X_j, **kwargs)`, grad to `[X_j, γ_attn, γ_mlp, W_q..W_down]`
+      with `grad_outputs = δX_{j+1}` (the committed-chain value the previous unit gave).
+    - Identification at call time: an mm whose `b` is a weight is `dX_x`/`dF`, and its `a`
+      must be that weight's `δY` (storage recorded by a hook on the substituted forward
+      output). Any other mm is `G_x`/`G_E_head`: `a` is some weight's `δY` and `b` the saved
+      input of that `Y`. A bmm is named by which saved `S`/`O` operand it reads and in which
+      slot. `dK` is served as the transpose of the stacked leaves, as in `label`.
+    - Each operand's `_version` is recorded when it is supplied and checked when served; a
+      mutated operand raises `ReplayError`. An undeclared, duplicate or missing backward
+      product raises `ReplayError`.
+    - Memory: the frontier `(j, δX_j)` and the γ gradients persist; one unit's operands are
+      held and dropped after `G_E_head` or `L{j}.G_v`. The head unit is the largest
+      (`δΛ` and the softmax intermediates are `N×n_v`). A backward request out of order
+      recomputes the chain from the head.
+    - `glue_gradients()` is valid only right after `operands(M)` with the frontier at layer
+      1. It returns the γ gradients and, for `W_E`, `G_E_head` plus `G_E^emb` =
+      `autograd.grad(embed_tokens(ids), W_E, δX_1)` under a substitution that forbids
+      products. `G_E^emb` comes from the model's own `nn.Embedding`, so a `padding_idx`
+      row is zero (see the SmolLM2 note in the README). At test scale this has no numeric
+      effect: id 2 occurs only at padded positions, where `δX_1` is exactly 0.
   - On the real 4×128 step from `W_0` on `π(1)` it fills all 7,113 slots (2,371 forward,
     211 input-grad, 211 weight-grad, 4,320 operand-grad). `prove_step` takes about 1 s and
     `commit` about 1.5 s, at a peak RSS of about 4.6 GB. The replay rebuilds all 2,371
     forward operands bit-identical to the prover's capture in about 0.5 s. At test scale
     (SmolLM2-135M, 4×128), over leaves already in memory (2.7 GB peak), it raises the peak to
     3.5 GB; its own model is 0.54 GB of that. When the first pass still kept every layer's
-    operands the peak was 3.8 GB.
+    operands the peak was 3.8 GB. The full replay (A9) rebuilds all 4,742 backward operands
+    and all 62 glue gradients bit-identical as well. All 7,113 products plus
+    `glue_gradients` take about 0.6 s. Measured in a fresh process after `prove_step`, the
+    replay raises the peak from 4.61 GB to 4.75 GB (forward alone: no rise). That baseline is
+    the `prove_step` peak, not the leaves alone, so it doesn't compare with the 2.7 → 3.5 GB
+    above.
 
 ### `verification/prover/`
 

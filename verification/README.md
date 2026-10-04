@@ -158,7 +158,16 @@ Two instances exist, in `instances/`:
   runs the verifier's own copy of the model with every checked product's result replaced by
   the committed product, so all glue between products runs through the model's own code on
   committed values. (A product with inner dimension 1, the RoPE angle table, isn't checked; it
-  is glue and is recomputed.) The forward products are done (task A8); the backward ones are task A9.
+  is glue and is recomputed.) The backward products come from PyTorch autograd on the same
+  modules, under the same substitution, so no backward pass is written by hand. Forward
+  (task A8) and backward (task A9) are done. One SmolLM2 detail: its config sets
+  `pad_token_id = 2`, which is also EOS and our pad token, so `nn.Embedding(padding_idx=2)`
+  gives a zero embedding gradient for token 2. The replay matches the prover there because
+  both use the model's own module, but reference block §4 writes `G_E^emb` as a plain
+  scatter-add without that zero row. At test scale the difference has no numeric effect:
+  id 2 occurs only at padded positions, where `δX_1` is exactly 0. On the real step-1 batch
+  it occurs 166 times, all in padded tails, so the plain scatter-add and the module agree
+  bit for bit.
 
 ### Prover side: `prover/`
 
@@ -380,7 +389,8 @@ Breaking any of these voids the result. Each one has a test.
 | SmolLM2 inventory and labeling (`instances/llama.py`) | merged; milestone M2 reached |
 | SmolLM2 replay of forward glue (A8) | done; all 2,371 forward operands of the real step match the prover's bit for bit |
 | Per-component cost and residual metrics (`runs/metrics.py`, B6), wired into the MLP smoke run | done |
-| SmolLM2 replay of backward glue (A9), first honest SmolLM2 step (A10, M3) | next |
+| SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |
+| First honest SmolLM2 step (A10, M3) | next |
 | Calibration and band file (A11, M4); 10-step honest run, cheat runs, disk store (A12–A14, M5) | planned |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
