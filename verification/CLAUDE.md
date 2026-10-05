@@ -548,7 +548,8 @@ interface.
   count (invariant 7). `TranscriptView(computation, reader)` gives named access: `.record(i)`,
   `.records()`, `.w_t(name)`, `.product(m)` and `.w_next(name)`.
 - `errors.py`: `TranscriptFormatError(ValueError)` and its subclasses `LeafShapeError`,
-  `LeafDtypeError` and `StoreMutationError`.
+  `LeafDtypeError`, `StoreMutationError` and `LeafReadError` (a disk leaf or the store's
+  metadata can't be read back).
 - `store.py` (A4, merged):
   - `TranscriptStore(LeafReader, ABC)` is the verifier's whole view. It has `leaf(i)`,
     `root` (the claimed `h`), `path(i)` (into `h`) and `dataset_path(i)` (record `i` into
@@ -569,6 +570,24 @@ interface.
       `hold(c, leaves, tree, dataset_paths)` (the hand-off, P5), which the loop calls apart;
     - `perturb_leaf(c, store, i, obj) -> new root` for the S6f sweep. It re-roots in
       O(log n) and validates the leaf before any change.
+  - **On disk (A14, C3; S3's layout).** `DiskStore.write(dir, c, leaves, tree,
+    dataset_paths=None)` replaces `dir` with one `torch.save` file per leaf
+    (`leaf_00000.pt` …, `LEAF_FILE`), `leaf_hashes.bin` (the tree's 32-byte leaf hashes, for
+    `path`) and `meta.json` (`format`, the root and the `h_D` paths as hex), written last; a
+    failed write deletes `dir`. `DiskStore(dir)` opens one. Not part of any commitment.
+    - A tensor that doesn't own its whole storage (a `bmm` member, a slice of `D`) is cloned
+      before saving, because `torch.save` writes the whole storage. A `Record` is saved as a
+      dict of its three tensors and rebuilt (and so revalidated) on load.
+    - `leaf(i)` loads the file on every call (`weights_only=True`, CPU, no `mmap`, no cache),
+      so each read is a fresh tensor sharing no memory. A missing file is `IndexError`; an
+      unloadable file or a foreign object is `LeafReadError`. `root` and `dataset_path`
+      read `meta.json` each call. Check 2's `CommittedLeaves` keeps the objects it hashed, so
+      later checks never reread the disk; a file that changes between check 4 or 7 and
+      check 2 is a check-2 rejection ("two versions").
+  - **The hand-off.** `StoreHandoff.hold(c, t, leaves, tree, dataset_paths) -> store` and
+    `.release(store)`. `IN_MEMORY` (`InMemoryHandoff`) is `InMemoryStore.hold`, release a
+    no-op. `DiskHandoff(dir, keep=False)` writes step `t` to `dir/step_<t>/` and deletes it
+    on release.
   - Check 7 compares this step's `W_t` hashes with the previous step's `W_{t+1}` hashes. The
     verifier keeps those from its own check-2 recomputation of step t−1. It hashes the
     `W_t` leaves in parallel through `leaf_hashes_until_error`, reads under the same
@@ -720,10 +739,12 @@ interface.
 
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
   - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
-    section=None) -> LoopResult`. `section` is B6's metrics seam, passed to `prove_step`.
-    It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
-    `InMemoryStore.commit_step` (`P3.commit`) and `hold` with the `h_D` paths (`P5.write`),
-    `verifier.verify_step(t, store)`, and drops the step. It stops at the first rejection and ends with `verifier.end_run(final)`, where
+    section=None, handoff=None) -> LoopResult`. `section` is B6's metrics seam, passed to
+    `prove_step`. It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
+    `InMemoryStore.commit_step` (`P3.commit`) and `handoff.hold` with the `h_D` paths
+    (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), `verifier.verify_step(t, store)`,
+    `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
+    includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
@@ -741,7 +762,8 @@ interface.
   uncaptured `plain_step`s from `W_0` through `run_plain`, check 8's reference),
   `run_scenario(..., recorder=None, h_D=None, verifier=None)` (`h_D` defaults to `D`'s root;
   `verifier(section) -> Verifier` replaces the default provisional verifier and must match the
-  run's seam, `T` and `k`; `memory_run` and `count_run` take it too), `judge` (the
+  run's seam, `T` and `k`; `memory_run` and `count_run` take it too, and `handoff`, passed to
+  `run_loop`), `judge` (the
   S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
   default `HONEST`, through `memory_pass` / `count_pass`).
   - **Model reuse (O4).** `honest_final`, `run_scenario`, `memory_run` and `count_run` take
@@ -937,5 +959,22 @@ interface.
     Gradient coherence 1.07 (`B = 4`). Verifier per step 1.60 s with the guard, 1.52 s without
     (check 5's measuring 0.70 vs 0.61 s). The memory pass's process footprint peaks at 6.4 GB
     in step 3's verifier; that process also holds the harness's model and check 8's weights.
+- `store_crosscheck.py` (A14, C3): `.venv/bin/python -m verification.runs.store_crosscheck
+  [--metrics | --no-metrics]`. It needs the band file and `VERIF_ETA`, like `run_verified`.
+  - Runs each scenario twice, once with the `IN_MEMORY` hand-off and once with a
+    `DiskHandoff` under `$VERIF_OUTPUT_DIR/store_crosscheck/transcripts/<scenario>/`, and
+    compares the `Decisions`: verdict, each rejection's (step, check, kind), each step's root,
+    the `W_{t+1}` chain hashes, every check-5 and check-6 number bit for bit (`_stats_key`
+    also reads the `compare=False` fields), and the final weights' hashes. Exit 1 on any
+    difference or a failed oracle. It deletes the transcripts at the end.
+  - Scenarios (`llama_scenarios`): honest over `VERIF_STEPS`, and four faults at step 2:
+    `other-batch` (check 4), `broken-chain` (check 7), `bad-w-next-ulps` (check 6a), `flip`
+    on `Λ` (check 5).
+  - With metrics on, it runs a memory pass of 2 steps per store.
+  - First run (2026-10-05, dev Mac, `k = 9`, T = 10): every decision identical. Per step on
+    disk: 2.46 GiB in 7,661 files, about 3.3 s to write (in `commit_s`), and verify 1.4 s
+    slower (check 2 rereads every file: 0.23 → 1.1 s; check 7 0.03 → 0.11 s). Reads may come
+    from the page cache, so read times are a best case. The disk verifier's footprint peaks
+    about 0.6 GiB higher, since its `W_t` and `W_{t+1}` are its own copies.
 - Later: `run_verified.py` and the other runs. A12 builds its verifier with
   `bands=calibration.load_bands(pc.band_file, k=pc.k)`.

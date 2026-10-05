@@ -34,6 +34,7 @@ from verification.runs.metrics import (
     memory_pass,
     memory_probe,
 )
+from verification.transcript.store import StoreHandoff
 from verification.verifier.bands import Bands
 from verification.verifier.checks import DEFAULT_ORDER
 from verification.verifier.context import Section
@@ -161,8 +162,10 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
                  recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
                  h_D: bytes | None = None,
                  build_model: BuildModel | None = None,
-                 verifier: Callable[[Section | None], Verifier] | None = None) -> ScenarioResult:
+                 verifier: Callable[[Section | None], Verifier] | None = None,
+                 handoff: StoreHandoff | None = None) -> ScenarioResult:
     """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams.
+    ``handoff`` is the loop's store hand-off (default in memory; C3 passes a ``DiskHandoff``).
 
     ``h_D`` is the agreed dataset root the verifier's check 1 compares with; by default it is
     computed from ``dataset`` (the MLP's synthetic ``D`` has no published root).
@@ -189,7 +192,7 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
                 user(r)
     model = (build_model or c.build_model)()
     loop = run_loop(c, model, dataset, w0, v, final=final, fault=scenario.fault,
-                    on_step=on_step, section=section)
+                    on_step=on_step, section=section, handoff=handoff)
     if recorder is not None:
         recorder.finish(loop.verdict)
     return ScenarioResult(scenario, loop, v, judge(scenario.expected, loop, T))
@@ -232,13 +235,14 @@ def memory_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, 
                h_D: bytes | None = None, scenario: Scenario = HONEST,
                device: str | torch.device = "cpu",
                build_model: BuildModel | None = None,
-               verifier: Callable[[Section | None], Verifier] | None = None
+               verifier: Callable[[Section | None], Verifier] | None = None,
+               handoff: StoreHandoff | None = None
                ) -> list[dict[str, Any]]:
     """The B6 memory pass: ``scenario`` over ``T`` steps, probed at every section, never timed.
-    ``verifier`` is as in :func:`run_scenario`."""
+    ``verifier`` and ``handoff`` are as in :func:`run_scenario`."""
     return memory_pass(run, scenario.name, lambda rec: run_scenario(
         c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D,
-        build_model=build_model, verifier=verifier),
+        build_model=build_model, verifier=verifier, handoff=handoff),
         memory_probe(device))
 
 
@@ -246,10 +250,11 @@ def count_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, t
               *, run: str, T: int, k: int, final: Mapping[str, torch.Tensor],
               h_D: bytes | None = None, scenario: Scenario = HONEST,
               build_model: BuildModel | None = None,
-              verifier: Callable[[Section | None], Verifier] | None = None
+              verifier: Callable[[Section | None], Verifier] | None = None,
+              handoff: StoreHandoff | None = None
               ) -> list[dict[str, Any]]:
     """The B6 counting pass: ``scenario`` over ``T`` steps, counted, never timed.
-    ``verifier`` is as in :func:`run_scenario`."""
+    ``verifier`` and ``handoff`` are as in :func:`run_scenario`."""
     return count_pass(run, scenario.name, lambda rec: run_scenario(
         c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D,
-        build_model=build_model, verifier=verifier))
+        build_model=build_model, verifier=verifier, handoff=handoff))

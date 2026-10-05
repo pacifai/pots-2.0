@@ -66,7 +66,7 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
-| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
+| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
@@ -211,8 +211,16 @@ of the tree, so a leaf count from the store could be forged. A malformed leaf ra
 the format errors in `errors.py`.
 
 `InMemoryStore` holds the tensors without copying them. It checks each tensor's
-`_version` counter on every read, which catches any in-place change after commit. A
-disk-backed store for larger runs is planned (task A14).
+`_version` counter on every read, which catches any in-place change after commit.
+
+`DiskStore` serves the same interface from a per-step directory: one `torch.save` file per
+leaf, plus the claimed root and the `h_D` paths in `meta.json` and the tree's leaf hashes in
+`leaf_hashes.bin`. Each read loads the file again, so the verifier gets fresh tensors that
+share memory with nothing. If a file changes between two reads, check 2 sees two versions
+and rejects. A corrupt file is a malformed rejection. The run loop picks the store through a
+*hand-off*: `IN_MEMORY` (the default) or `DiskHandoff`, which writes each step and deletes it
+once the step is verified. `runs/store_crosscheck.py` (C3) runs the same scenarios both ways
+and checks the verifier decides the same.
 
 ### Verifier side: `verifier/`
 
@@ -248,6 +256,10 @@ replaced:
 - **`llama_step.py`** runs honest SmolLM2 steps from the pretrained weights on the committed
   `D`, verified by the real verifier with provisional bands (milestone M3). It prints the
   per-class residual table and the per-weight `ρ` table, and each side's time and memory.
+- **`store_crosscheck.py`** is C3: it runs the honest SmolLM2 run and four cheats once with
+  the in-memory store and once with the on-disk store, and checks that every decision is the
+  same: the verdict, each rejection, the roots, the hashes the verifier chains, and every
+  check-5 and check-6 number, bit for bit.
 - **`calibrate.py`** is C1: it calibrates the bands on the honest run's steps 1–3, checks
   them, and writes the band file (see "Workflow: calibrating the tolerances").
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
@@ -333,7 +345,7 @@ sequenceDiagram
     loop t = 1 … T
         H->>P: prove_step(W_t, π(t))
         P-->>H: StepOutput
-        H->>S: InMemoryStore.from_step (commit, root h, paths)
+        H->>S: commit (root h, paths), then hand-off: in memory, or written to disk
         H->>V: verify_step(t, store)
         V-->>H: None or Rejection
         H->>H: drop StepOutput and store
@@ -455,6 +467,7 @@ Breaking any of these voids the result. Each one has a test.
 | Plain-training baseline (`runs/plain_baseline.py`, B7) | done; final weights bit-identical to the captured prover's on the MLP, the tiny Llama and two real SmolLM2 steps |
 | First honest SmolLM2 step (A10, `runs/llama_step.py`) | done; milestone M3 reached. The real step from `W_0` on `π(1)` is accepted with provisional bands: largest normalized residual 5.4 (`Λ`), check 6 `ρ` at most 2.0 |
 | Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. `s_h = 5.50` (`Λ`), `τ = 44.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
-| 10-step honest run, cheat runs, disk store (A12–A14, M5) | planned |
+| 10-step honest run, cheat runs (A12–A13, M5) | planned |
+| Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.3 s to write and 1.4 s more to verify |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
