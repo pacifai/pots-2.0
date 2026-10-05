@@ -82,7 +82,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_DATASET_REVISION` | `dce01c9b08f87459cf36a430d809084718273017` |
 | `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32` |
 | `VERIF_ATTN_IMPL` | `eager` |
-| `VERIF_K` | `7` |
+| `VERIF_K` | `9` (was 7 until C1 recomputed it from the measured `τ`, 2026-10-05) |
 | `VERIF_BATCH` (`n_s`) / `VERIF_SEQ_LEN` (`n`) | `4` / `128` |
 | `VERIF_STEPS` (`T`) | `10` |
 | `VERIF_N_RECORDS` | `500` |
@@ -548,7 +548,8 @@ interface.
   count (invariant 7). `TranscriptView(computation, reader)` gives named access: `.record(i)`,
   `.records()`, `.w_t(name)`, `.product(m)` and `.w_next(name)`.
 - `errors.py`: `TranscriptFormatError(ValueError)` and its subclasses `LeafShapeError`,
-  `LeafDtypeError` and `StoreMutationError`.
+  `LeafDtypeError`, `StoreMutationError` and `LeafReadError` (a disk leaf or the store's
+  metadata can't be read back).
 - `store.py` (A4, merged):
   - `TranscriptStore(LeafReader, ABC)` is the verifier's whole view. It has `leaf(i)`,
     `root` (the claimed `h`), `path(i)` (into `h`) and `dataset_path(i)` (record `i` into
@@ -569,6 +570,24 @@ interface.
       `hold(c, leaves, tree, dataset_paths)` (the hand-off, P5), which the loop calls apart;
     - `perturb_leaf(c, store, i, obj) -> new root` for the S6f sweep. It re-roots in
       O(log n) and validates the leaf before any change.
+  - **On disk (A14, C3; S3's layout).** `DiskStore.write(dir, c, leaves, tree,
+    dataset_paths=None)` replaces `dir` with one `torch.save` file per leaf
+    (`leaf_00000.pt` …, `LEAF_FILE`), `leaf_hashes.bin` (the tree's 32-byte leaf hashes, for
+    `path`) and `meta.json` (`format`, the root and the `h_D` paths as hex), written last; a
+    failed write deletes `dir`. `DiskStore(dir)` opens one. Not part of any commitment.
+    - A tensor that doesn't own its whole storage (a `bmm` member, a slice of `D`) is cloned
+      before saving, because `torch.save` writes the whole storage. A `Record` is saved as a
+      dict of its three tensors and rebuilt (and so revalidated) on load.
+    - `leaf(i)` loads the file on every call (`weights_only=True`, CPU, no `mmap`, no cache),
+      so each read is a fresh tensor sharing no memory. A missing file is `IndexError`; an
+      unloadable file or a foreign object is `LeafReadError`. `root` and `dataset_path`
+      read `meta.json` each call. Check 2's `CommittedLeaves` keeps the objects it hashed, so
+      later checks never reread the disk; a file that changes between check 4 or 7 and
+      check 2 is a check-2 rejection ("two versions").
+  - **The hand-off.** `StoreHandoff.hold(c, t, leaves, tree, dataset_paths) -> store` and
+    `.release(store)`. `IN_MEMORY` (`InMemoryHandoff`) is `InMemoryStore.hold`, release a
+    no-op. `DiskHandoff(dir, keep=False)` writes step `t` to `dir/step_<t>/` and deletes it
+    on release.
   - Check 7 compares this step's `W_t` hashes with the previous step's `W_{t+1}` hashes. The
     verifier keeps those from its own check-2 recomputation of step t−1. It hashes the
     `W_t` leaves in parallel through `leaf_hashes_until_error`, reads under the same
@@ -585,7 +604,11 @@ interface.
     chain_check_id=, k=, judge=)`. `ctx.state` (`StepState`) carries check 2's root, leaf
     hashes and `CommittedLeaves` to later checks (`ctx.state.committed()`), and check 5's
     replay to 6b. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
-    normalized residual, κ and ρ, which is P10b's calibration feed.
+    normalized residual, κ and ρ, which is P10b's calibration feed. `ProductStat` also
+    carries each product's scale for C1's realized floor: `q`, `p_norm` (`‖P‖_F`), `nu` and
+    `p_abs1` (`‖|P|·1‖`). They default to `0`/NaN and are left out of equality.
+  - `StepContext.kappa_guard` (default `True`): `False` skips check 5's test 1 and its
+    finiteness check on ν and `‖|P|·1‖`, which are then NaN. Only C1's cost split sets it.
   - `PROVER_DATA_ERRORS` and the guard that maps them to a malformed rejection.
 - `bands.py`:
   - `Bands(tau, kappa_max, tau_w, kappa_classes, tau_w_tensors, source, stats)`, frozen:
@@ -630,7 +653,9 @@ interface.
     failing member rejects with the same message as alone, and an error serving a later member
     is raised only after the members before it pass. Every other product is measured alone.
 - `driver.py` (A5): `Verifier(c, *, h_D, n_records, k, n_steps, bands, w0= | w0_hashes=,
-  schedule=, calibrate=False, allow_provisional=False, section=None)`. `section` is B6's
+  schedule=, calibrate=False, allow_provisional=False, section=None, kappa_guard=True)`.
+  `kappa_guard=False` (see `StepContext`) with `calibrate=True` raises `ValueError`, since
+  calibration fits `κ_max`. `section` is B6's
   metrics seam: it wraps each check under its id (step 1's chaining comparison is `"7"`;
   `run:0` is check 0's anchor hashing), and `StepContext.section`/`timed(name)` pass it into
   check 5 (`5.glue`, `5.measure`) and 6b (`6b.glue`). `context.no_section` is the no-op.
@@ -654,6 +679,24 @@ interface.
     max_step)]` per `(check, weight_role(name))`, where `weight_role` stars the layer index.
   - `format_class_table(rows, out=print)` ends with the largest class RMS, the global max and
     their ratio; `format_tensor_table` ends with each check's max ρ.
+
+- `calibration.py` (A11, C1): turns calibration numbers into bands. It runs no model.
+  - `fit(stats, *, k, z=Z) -> Calibration`: `s_h` = the largest class RMS, `τ = z·s_h`,
+    `κ_max` per class = `max(1, KAPPA_MARGIN·κ_honest_max)` with `KAPPA_MARGIN = 2`, and
+    `τ_W` per tensor = `max(TAU_W0, 2·ρ_max)` over the steps. `Calibration.guard_ok` is the
+    concentration guard (global max ≤ `τ/2`). It raises `ValueError` on a step without
+    numbers, a product without `k` residuals, a non-finite number, or `s_h = 0`.
+  - `realized_floor(stats, *, tau, k, N, eps_in, eps_acc) -> RealizedFloor`: per product
+    `f_achieved(e_m(q))` (the floor as a fraction of `‖P_m‖_F`) and `Φ_m`, with the count
+    above 1 and above `1/√2`, and every product with `‖|P|·1‖ = 0` but `ν ≠ 0`.
+  - `band_file_bytes(cal, stats=None)` (no timestamps, so a rerun gives the same hash),
+    `write_band_file(path, data)` (temporary file then rename),
+    `load_bands(path, *, k=None)` (the read-only loader every judged run uses: a missing
+    file raises `FileNotFoundError`, a file fitted at another `k` raises `ValueError`) and
+    `assert_same_band_source(sources)` (P10a's harness assertion; rejects `None`,
+    `"provisional"` and mixed hashes).
+  - Fitted bands go through `band_file_bytes` → `Bands.from_json` before `freeze`, so their
+    `source` is the file's hash, not `"provisional"`.
 
 ### `verification/verifier/matmul_check/`
 
@@ -680,6 +723,8 @@ interface.
     Then every square and partial sum is a normal fp32 number in both runs, so power-of-two
     scaling commutes with each rounding (the proof is in `_norm`'s docstring). A zero entry
     fails the test, so every backward product takes the scaled path (into the buffer).
+  - `guard=False` (both functions) skips `|A|`, `|B|` and `|P|·1`: ν, `‖|P|·1‖` and κ come
+    back NaN, and every test-2 number keeps its bits. Only `StepContext.kappa_guard` uses it.
   - `_measure_product_reference` and `_measure_products_reference` keep the plain formulas.
     The tests compare every field bit for bit on adversarial inputs, and on the real step
     all 7,113 products match. Check 5's measure time fell from 1.09 s to 0.72 s, and check 5
@@ -694,10 +739,12 @@ interface.
 
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
   - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
-    section=None) -> LoopResult`. `section` is B6's metrics seam, passed to `prove_step`.
-    It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
-    `InMemoryStore.commit_step` (`P3.commit`) and `hold` with the `h_D` paths (`P5.write`),
-    `verifier.verify_step(t, store)`, and drops the step. It stops at the first rejection and ends with `verifier.end_run(final)`, where
+    section=None, handoff=None) -> LoopResult`. `section` is B6's metrics seam, passed to
+    `prove_step`. It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
+    `InMemoryStore.commit_step` (`P3.commit`) and `handoff.hold` with the `h_D` paths
+    (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), `verifier.verify_step(t, store)`,
+    `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
+    includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
@@ -713,7 +760,10 @@ interface.
   `llama_step`. `Scenario(name, description, fault, expected)`, `Expected` (the declared
   outcome), `ScenarioResult`, `HONEST` (no fault, accept), `honest_final(c, D, w0, T)` (`T`
   uncaptured `plain_step`s from `W_0` through `run_plain`, check 8's reference),
-  `run_scenario(..., recorder=None, h_D=None)` (`h_D` defaults to `D`'s root), `judge` (the
+  `run_scenario(..., recorder=None, h_D=None, verifier=None)` (`h_D` defaults to `D`'s root;
+  `verifier(section) -> Verifier` replaces the default provisional verifier and must match the
+  run's seam, `T` and `k`; `memory_run` and `count_run` take it too, and `handoff`, passed to
+  `run_loop`), `judge` (the
   S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
   default `HONEST`, through `memory_pass` / `count_pass`).
   - **Model reuse (O4).** `honest_final`, `run_scenario`, `memory_run` and `count_run` take
@@ -783,7 +833,8 @@ interface.
   - Files under `$VERIF_OUTPUT_DIR/<run>/`: `records.jsonl` (records `environment`, `step`,
     `verdict`, `time`, `memory`, `count`, `storage`, `run_end`, each with `record` and `run`;
     non-finite floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`) and
-    `residuals/<scenario>/step_<t>.npz`. On macOS, export `MallocLargeCache=0` for runs whose
+    `residuals/<scenario>/step_<t>.npz`. Since A11 each npz also holds the product scales
+    `p_q`, `p_norm`, `p_nu`, `p_abs1`; older archives read back with them unknown. On macOS, export `MallocLargeCache=0` for runs whose
     memory figures are compared: otherwise freed large blocks stay in the footprint.
   - `metrics_overhead.py`: `.venv/bin/python -m verification.runs.metrics_overhead
     [--reps N] [--steps T] [--widths ...]`, an off/on/off timing of the honest MLP run.
@@ -886,4 +937,69 @@ interface.
     (forward 0.23, backward 0.42, load and update 0.02 each), 426.7 GFLOP (142.2 forward,
     284.5 backward), and the step grows the footprint by 0.75 GB (peak of backward minus
     start of forward; steps 1 and 2 alike).
-- Later: `calibration.py`, `run_verified.py` and the other runs.
+- `calibrate.py` (A11, C1, milestone M4): `.venv/bin/python -m verification.runs.calibrate
+  [--steps 3] [--metrics | --no-metrics]`. Its docstring has the full flow.
+  - Steps 1–3 of the honest SmolLM2 run in calibration mode, then `fit`, the concentration
+    guard, `size_k` with the measured `s_h` (`T = VERIF_STEPS`, `M` of `C`, `q_max` the
+    largest `q`), `realized_floor`, and `freeze` on the bands read back from the file bytes.
+  - Exit 2, no band file: the guard fails, or the recomputed `k` exceeds `VERIF_K` (rerun with
+    `VERIF_K` raised). Exit 1: an honest rejection. Either way the bytes go to
+    `$VERIF_OUTPUT_DIR/calibrate/k<k>/bands.json` for the record.
+  - On success it writes `$VERIF_OUTPUT_DIR/bands.json`, then judges steps 1–3 again from the
+    file with the κ guard on (`frozen`) and off (`frozen_no_kappa`), asserts one band-file
+    hash across the three runs, measures gradient coherence on step 1's batch at `W_0`
+    (`gradient_coherence`), runs the memory and counting passes of `frozen`, and prints the
+    cost split (`cost_split`). Records `calibration` and `gradient_coherence` go to
+    `records.jsonl`.
+  - First run (2026-10-05, dev Mac, `MallocLargeCache=0`): at `k = 7`, `s_h = 5.62` (`Λ`),
+    `τ = 44.9`, `k` recomputed 9, exit 2. At `VERIF_K=9`: `s_h = 5.50` (`Λ`; `dF` 3.07, every
+    other class 0.3–0.9), `τ = 44.0`, global max 14.5 (`Λ`, step 3) ≤ `τ/2 = 22.0`, `k = 9`,
+    floor at most 0.61 of `‖P‖_F` (`dF`, `q = 49152`), no zero-row-sum product, `τ_W = 4` on
+    all 272 tensors. Band-file hash `b696b6a8…`. Steps 1–3 accepted under it, guard on and off.
+    Gradient coherence 1.07 (`B = 4`). Verifier per step 1.60 s with the guard, 1.52 s without
+    (check 5's measuring 0.70 vs 0.61 s). The memory pass's process footprint peaks at 6.4 GB
+    in step 3's verifier; that process also holds the harness's model and check 8's weights.
+- `store_crosscheck.py` (A14, C3): `.venv/bin/python -m verification.runs.store_crosscheck
+  [--metrics | --no-metrics]`. It needs the band file and `VERIF_ETA`, like `run_verified`.
+  - Runs each scenario twice, once with the `IN_MEMORY` hand-off and once with a
+    `DiskHandoff` under `$VERIF_OUTPUT_DIR/store_crosscheck/transcripts/<scenario>/`, and
+    compares the `Decisions`: verdict, each rejection's (step, check, kind), each step's root,
+    the `W_{t+1}` chain hashes, every check-5 and check-6 number bit for bit (`_stats_key`
+    also reads the `compare=False` fields), and the final weights' hashes. Exit 1 on any
+    difference or a failed oracle. It deletes the transcripts at the end.
+  - Scenarios (`llama_scenarios`): honest over `VERIF_STEPS`, and four faults at step 2:
+    `other-batch` (check 4), `broken-chain` (check 7), `bad-w-next-ulps` (check 6a), `flip`
+    on `Λ` (check 5).
+  - With metrics on, it runs a memory pass of 2 steps per store.
+  - First run (2026-10-05, dev Mac, `k = 9`, T = 10): every decision identical. Per step on
+    disk: 2.46 GiB in 7,661 files, about 3.3 s to write (in `commit_s`), and verify 1.4 s
+    slower (check 2 rereads every file: 0.23 → 1.1 s; check 7 0.03 → 0.11 s). Reads may come
+    from the page cache, so read times are a best case. The disk verifier's footprint peaks
+    about 0.6 GiB higher, since its `W_t` and `W_{t+1}` are its own copies.
+- Later: `run_verified.py` and the other runs. A12 builds its verifier with
+  `bands=calibration.load_bands(pc.band_file, k=pc.k)`.
+- Cheat runs (A13, milestone M5), all judged by the frozen band file, read-only. Each module
+  docstring has the full flow.
+  - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step and
+    poisoning rate, `W_0`, bands, `k`, one `ReusedModel`, one `run_verified.JudgingVerifiers`),
+    `load_env(cfg, pc)` (SmolLM2; `D̃` checked against `meta.json`'s `h_D_tilde`), `run_cheat`
+    (one scenario cut at `T`, plus a `cheat_oracle` record: declared vs actual, `outcome`,
+    latency, `ρ_5`/`ρ_6`), `band_sources` (P10a's one-hash assertion) and `report_oracle`.
+  - `scenarios.py` gained `Expected.product` (check 5's declared product), `outcome()` (`exact`,
+    `accepted`, `rejected`, `early`, `overrun`, `wrong-check`, `wrong-kind`, `wrong-product`;
+    only `exact` passes) and the faults `FlipProduct`, `NudgeWNext`, `TrainedElsewhereWNext`,
+    `HiddenStep`, `CommitBatch` (A1), `TrainOn` (A2), `SpliceWNext` (A3) and `KeepStep`.
+  - `poisoned_step.py`: A1 → `(1, "4")`, A2 → `(1, "5")` on `P_1` (`L1.Y_q`), A3 → `(1, "6a")`,
+    one-step runs from `W_0`; A1's and A2's `W_2` asserted bit-equal (S6e).
+  - `hidden_steps.py`: one hidden step on `b̃` between steps 1 and 2 → `(2, "7")`.
+  - `flipped_matmul_sweep.py`: honest steps 1–4 (accepted, step 4 kept), the `dF` sign flip at
+    step 4 → `(4, "5")` on `P_2372`, then the planted-error sweep on step 4 (S6f): one target
+    per class, shapes `entry`/`entry2`/`dense`, grid `x = f/(τ·e_m)`, re-rooted with
+    `perturb_leaf`, judged with check 5's own `_measure_run`/`_judge_product`. Writes
+    `sweep_point`/`sweep_summary` records and `sweep_trials.npz`.
+  - Real runs, 2026-10-05, dev Mac, `MallocLargeCache=0`, band file `b696b6a8…` (k 9, τ 44.0):
+    every cheat exact. Sweep (200 trials per point, 13 points, 30 classes, 3 shapes): every
+    class and shape rejects every trial from `x ≤ 2`, so `f_all ≤ 2·τ·e_m` (`dF`: 8.8e−4 of
+    `‖P‖_F` against the floor 0.61). Fitted single-entry `ĉ` 0.54–0.63 (theory `σ_r = 0.577`;
+    the sizing's `c = 0.798` is conservative), two entries about 0.1, dense 0. 54 min, peak
+    footprint 8.9 GB.

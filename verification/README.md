@@ -66,7 +66,7 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
-| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
+| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
@@ -211,8 +211,16 @@ of the tree, so a leaf count from the store could be forged. A malformed leaf ra
 the format errors in `errors.py`.
 
 `InMemoryStore` holds the tensors without copying them. It checks each tensor's
-`_version` counter on every read, which catches any in-place change after commit. A
-disk-backed store for larger runs is planned (task A14).
+`_version` counter on every read, which catches any in-place change after commit.
+
+`DiskStore` serves the same interface from a per-step directory: one `torch.save` file per
+leaf, plus the claimed root and the `h_D` paths in `meta.json` and the tree's leaf hashes in
+`leaf_hashes.bin`. Each read loads the file again, so the verifier gets fresh tensors that
+share memory with nothing. If a file changes between two reads, check 2 sees two versions
+and rejects. A corrupt file is a malformed rejection. The run loop picks the store through a
+*hand-off*: `IN_MEMORY` (the default) or `DiskHandoff`, which writes each step and deletes it
+once the step is verified. `runs/store_crosscheck.py` (C3) runs the same scenarios both ways
+and checks the verifier decides the same.
 
 ### Verifier side: `verifier/`
 
@@ -248,6 +256,12 @@ replaced:
 - **`llama_step.py`** runs honest SmolLM2 steps from the pretrained weights on the committed
   `D`, verified by the real verifier with provisional bands (milestone M3). It prints the
   per-class residual table and the per-weight `ρ` table, and each side's time and memory.
+- **`store_crosscheck.py`** is C3: it runs the honest SmolLM2 run and four cheats once with
+  the in-memory store and once with the on-disk store, and checks that every decision is the
+  same: the verdict, each rejection, the roots, the hashes the verifier chains, and every
+  check-5 and check-6 number, bit for bit.
+- **`calibrate.py`** is C1: it calibrates the bands on the honest run's steps 1–3, checks
+  them, and writes the band file (see "Workflow: calibrating the tolerances").
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
@@ -331,7 +345,7 @@ sequenceDiagram
     loop t = 1 … T
         H->>P: prove_step(W_t, π(t))
         P-->>H: StepOutput
-        H->>S: InMemoryStore.from_step (commit, root h, paths)
+        H->>S: commit (root h, paths), then hand-off: in memory, or written to disk
         H->>V: verify_step(t, store)
         V-->>H: None or Rejection
         H->>H: drop StepOutput and store
@@ -353,25 +367,55 @@ from measurement, not guessed. The test-scale procedure:
    normalized residuals, `κ` values and `ρ` values in `verifier.stats`, but don't judge.
    The exact checks 4, 7, 2, 0 and 1 still reject.
 2. Run honest steps 1–3.
-3. Fit the bands from the recorded statistics and write them to a JSON band file. Its
-   BLAKE3 hash identifies it (task A11).
-4. Call `verifier.freeze(bands)`. It re-judges steps 1–3 against the frozen bands, then
+3. Fit the bands from the recorded numbers (`verifier/calibration.py`, `fit`):
+   - `s_h` is the largest class RMS of check 5's normalized residual, and `τ = 8·s_h`;
+   - `κ_max` per class is twice the largest honest `κ` of the class;
+   - `τ_W` per weight tensor is `max(4, 2·ρ_max)`.
+4. Check the fit. The largest honest residual must sit at or below `τ/2` (the concentration
+   guard). Recompute `k` from the measured `τ` (`sizing.size_k`). If either fails, the run
+   stops and writes no band file; `z` is never raised to make the guard pass.
+5. Write the bands and the statistics behind them to one JSON band file,
+   `$VERIF_OUTPUT_DIR/bands.json`. Its BLAKE3 hash identifies it.
+6. Call `verifier.freeze(bands)`. It re-judges steps 1–3 against the frozen bands, then
    judges every later step live. `end_run` refuses to give a verdict while calibration is
-   unfrozen.
+   unfrozen. Steps 1–3 are judged by bands fitted on them, so they are in-sample.
 
-`runs/llama_step.py` prints the per-class table that step 3 starts from
-(`verifier/residuals.py`). On the first real step, most classes have an RMS between 0.3 and
-0.9; `Λ`, the output-layer product, has the largest (3.8, max 5.4), and `dF` next (1.6).
-That is about 10% below the pre-calibration diagnosis recorded under C1 in
-`docs/verification/SETUP_TASKS.md` (`Λ` 4.2, max 5.55, `dF` 1.8, giving `s_h ≈ 4.2`,
-`τ ≈ 33` and `k = 9`). The likely reason, not verified: `Λ` and `dF` are single products,
-so each class RMS rests on only `k = 7` residuals and is noisy, and the diagnostic run used
-different challenges and setup. `s_h ≈ 3.8` would give `τ ≈ 30`. A11 measures `s_h` over
-steps 1–3 and recomputes `k` from it.
+Every later run loads the band file read-only with `calibration.load_bands(path, k=k)`. It
+refuses a missing file and a file calibrated at another `k`. The harness then checks with
+`assert_same_band_source` that every run was judged by the same file.
 
-Until A11 exists, runs use `Bands.provisional()`: `τ = 8`, `κ = 10⁴`, `τ_W = 4`. Smoke tests
-must opt into provisional bands explicitly (`allow_provisional=True`), because a cheat run
-must never be judged by bands nobody measured.
+`runs/calibrate.py` does all of this on the real SmolLM2 run:
+
+```bash
+.venv/bin/python -m verification.runs.calibrate   # k from VERIF_K, default 9
+```
+
+It then judges steps 1–3 twice more from the band file: once as the protocol runs and once
+with check 5's `κ` guard off, to time what the guard costs (`Verifier(kappa_guard=False)`;
+calibration refuses it). It also measures how aligned one batch's per-example gradients are.
+
+The first calibration (2026-10-05, dev Mac, steps 1–3):
+
+- `s_h = 5.50` (`Λ`, the output-layer product), so `τ = 44.0`. Its largest residual is 14.5,
+  2.6 times `s_h`, under the guard's 22.0. `dF` is next (RMS 3.1). Every other class has an
+  RMS between 0.3 and 0.9.
+- `k` comes out at 9. At the then-default `k = 7`, the vocabulary-sized product `dF` gets a
+  floor 4.8 times its own size, far above the target of 1, so the run stopped and asked for
+  `VERIF_K=9`. The default is now 9. At `k = 9` every product's floor is at most 0.61 of its size, below the
+  `1/√2` margin of a batch with one poisoned record.
+- `τ_W` is 4 on all 272 tensors (largest `ρ` 2.0).
+- Under the band file, steps 1–3 are accepted with the guard on and off. The step-2 `Λ`
+  residual of 10.1, which the provisional `τ = 8` rejected, is now well inside `τ = 44`.
+
+`s_h` is above the pre-calibration diagnosis under C1 in `docs/verification/SETUP_TASKS.md`
+(4.2, which gave `τ ≈ 33`) and the single-step figure of `runs/llama_step.py` (3.8). Step 1
+alone gives `Λ` an RMS of 3.8; steps 2 and 3 add residuals of 10.1, 9.9 and 14.5. `Λ` is one
+product, so its class has only `3·k` residuals and its RMS moves with each of them. `k` stays
+9 either way.
+
+Runs that don't calibrate use `Bands.provisional()`: `τ = 8`, `κ = 10⁴`, `τ_W = 4`. They must
+opt into provisional bands explicitly (`allow_provisional=True`), because a cheat run must
+never be judged by bands nobody measured.
 
 ## Workflow: testing that cheats are caught
 
@@ -422,6 +466,8 @@ Breaking any of these voids the result. Each one has a test.
 | SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |
 | Plain-training baseline (`runs/plain_baseline.py`, B7) | done; final weights bit-identical to the captured prover's on the MLP, the tiny Llama and two real SmolLM2 steps |
 | First honest SmolLM2 step (A10, `runs/llama_step.py`) | done; milestone M3 reached. The real step from `W_0` on `π(1)` is accepted with provisional bands: largest normalized residual 5.4 (`Λ`), check 6 `ρ` at most 2.0 |
-| Calibration and band file (A11, M4); 10-step honest run, cheat runs, disk store (A12–A14, M5) | planned |
+| Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. `s_h = 5.50` (`Λ`), `τ = 44.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
+| 10-step honest run, cheat runs (A12–A13, M5) | planned |
+| Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.3 s to write and 1.4 s more to verify |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.

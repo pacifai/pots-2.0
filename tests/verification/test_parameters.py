@@ -12,7 +12,7 @@ from verification.verifier.matmul_check.sizing import C_ANTI, F_TARGET, Z
 
 def test_defaults():
     p = load_protocol_config({})
-    assert p.k == 7
+    assert p.k == 9
     assert p.band_file == Path("trainer_output/verification/bands.json")
 
 

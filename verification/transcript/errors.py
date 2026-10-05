@@ -5,7 +5,8 @@ The verifier maps each one to a rejection at the check that read the leaf, never
 
 from __future__ import annotations
 
-__all__ = ["TranscriptFormatError", "LeafShapeError", "LeafDtypeError", "StoreMutationError"]
+__all__ = ["TranscriptFormatError", "LeafShapeError", "LeafDtypeError", "StoreMutationError",
+           "LeafReadError"]
 
 
 class TranscriptFormatError(ValueError):
@@ -22,3 +23,8 @@ class LeafDtypeError(TranscriptFormatError):
 
 class StoreMutationError(TranscriptFormatError):
     """A stored leaf was mutated in place after handoff (invariant 6)."""
+
+
+class LeafReadError(TranscriptFormatError):
+    """A stored leaf or the store's metadata can't be read back (A14's ``DiskStore``): a
+    missing, truncated or foreign file, or an object that isn't a leaf."""

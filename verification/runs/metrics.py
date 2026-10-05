@@ -113,7 +113,9 @@ the counting pass.
   record 2), written as the step closes, so a crashed run keeps finished steps; a step that
   stopped before check 6a has none. Arrays: ``run``, ``scenario`` (0-d strings), ``step``;
   per product ``p_m``, ``p_name``, ``p_cls``, ``p_layer`` (``-1`` outside the layer stack),
-  ``p_kappa`` and ``p_normalized`` (``[P, k]``, one normalized residual per challenge); per
+  ``p_kappa`` and ``p_normalized`` (``[P, k]``, one normalized residual per challenge), and
+  the product's scale ``p_q`` (contracted dimension), ``p_norm`` (``‖P‖_F``), ``p_nu`` (``ν``)
+  and ``p_abs1`` (``‖|P|·1‖``), which C1's realized floor reads; per
   weight tensor ``w_check`` (``6a``/``6b``), ``w_name`` and ``w_rho`` (``ρ_max``). NaN and
   infinity are stored as such. Check 5 stops at the first failing product, so a step rejected
   at 5 has products up to and including the failure only. :func:`read_residuals` rebuilds ``StepStats`` equal to the
@@ -940,6 +942,10 @@ def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats,
         "p_cls": np.array([p.cls for p in ps], dtype=str),
         "p_layer": np.array(layers, dtype=np.int32),
         "p_kappa": np.array([p.kappa for p in ps], dtype=np.float64),
+        "p_q": np.array([p.q for p in ps], dtype=np.int64),
+        "p_norm": np.array([p.p_norm for p in ps], dtype=np.float64),
+        "p_nu": np.array([p.nu for p in ps], dtype=np.float64),
+        "p_abs1": np.array([p.p_abs1 for p in ps], dtype=np.float64),
         "p_normalized": np.array([p.normalized for p in ps], dtype=np.float64).reshape(len(ps), k),
         "w_check": np.array([s.check_id for s in stats.tensors], dtype=str),
         "w_name": np.array([s.weight for s in stats.tensors], dtype=str),
@@ -949,10 +955,14 @@ def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats,
 
 def _stats_from(z: Mapping[str, np.ndarray]) -> StepStats:
     st = StepStats()
+    # Archives written before A11 have no product scales; those read back as unknown.
+    scales = all(key in z for key in ("p_q", "p_norm", "p_nu", "p_abs1"))
     for i in range(len(z["p_m"])):
+        extra = ({"q": int(z["p_q"][i]), "p_norm": float(z["p_norm"][i]),
+                  "nu": float(z["p_nu"][i]), "p_abs1": float(z["p_abs1"][i])} if scales else {})
         st.products.append(ProductStat(int(z["p_m"][i]), str(z["p_name"][i]), str(z["p_cls"][i]),
                                        float(z["p_kappa"][i]),
-                                       tuple(float(x) for x in z["p_normalized"][i])))
+                                       tuple(float(x) for x in z["p_normalized"][i]), **extra))
     for i in range(len(z["w_name"])):
         st.tensors.append(TensorStat(str(z["w_name"][i]), str(z["w_check"][i]),
                                      float(z["w_rho"][i])))

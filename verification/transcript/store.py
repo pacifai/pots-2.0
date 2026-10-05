@@ -20,29 +20,47 @@ prover's or the verifier's, raises :class:`StoreMutationError` rather than servi
 there; check 2 still sees any change made before it rehashes. ``copy=True`` clones instead, for
 full isolation at that memory cost.
 
-A ``DiskStore`` (A14) implements the same :class:`TranscriptStore`: it reads leaves from its
-per-step directory and returns the stored root and paths, which is all the interface asks for.
+**On disk (A14, C3).** :class:`DiskStore` implements the same :class:`TranscriptStore` from a
+per-step directory, S3's storage layout: one ``torch.save`` file per leaf, the claimed root and
+the ``h_D`` paths in ``meta.json``, and the tree's leaf hashes, from which
+:meth:`DiskStore.path` rebuilds an audit path. This storage is non-cryptographic. The commitment
+is still computed over the canonical encoding (S9), and the verifier rehashes what it reads.
+Every :meth:`DiskStore.leaf` call reads its file again and returns new tensors that share memory
+with nothing: no cache and no ``mmap``. So the only copy of a leaf the verifier keeps is the one
+check 2 hashed (``CommittedLeaves``). A file changed between two reads shows up as a hash
+mismatch at check 2, as a changed in-memory leaf would.
+
+**The hand-off.** A :class:`StoreHandoff` is how the run loop turns a committed step into the
+store it gives the verifier (``P5.write``), and how it discards that store afterwards.
+:data:`IN_MEMORY` holds references, as before. :class:`DiskHandoff` writes the step under a
+directory and deletes it once the step is verified. C3 (``runs/store_crosscheck.py``) runs the
+same scenario through both and asserts the verifier decides identically.
 """
 
 from __future__ import annotations
 
+import json
+import shutil
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from setup.records import Record
 from verification.commitment.leaves import commit_leaves, leaf_hash
-from verification.commitment.merkle import MerkleTree
-from verification.transcript.errors import StoreMutationError
+from verification.commitment.merkle import DIGEST_SIZE, MerkleTree
+from verification.transcript.errors import LeafReadError, StoreMutationError
 from verification.transcript.reader import LeafReader
 
 if TYPE_CHECKING:
     from verification.computation.interface import DeclaredComputation
     from verification.prover.step import StepOutput
 
-__all__ = ["TranscriptStore", "InMemoryStore", "perturb_leaf"]
+__all__ = ["TranscriptStore", "InMemoryStore", "perturb_leaf", "DiskStore", "StoreHandoff",
+           "InMemoryHandoff", "IN_MEMORY", "DiskHandoff", "LEAF_FILE", "META_FILE", "HASHES_FILE",
+           "DISK_FORMAT"]
 
 
 class TranscriptStore(LeafReader, ABC):
@@ -202,3 +220,187 @@ def perturb_leaf(c: DeclaredComputation, store: InMemoryStore, index: int, obj: 
     store._leaves[index] = obj
     store._versions[index] = versions
     return root
+
+
+# ---- on disk (A14, C3) --------------------------------------------------------------------
+
+LEAF_FILE = "leaf_{:05d}.pt"
+META_FILE = "meta.json"
+HASHES_FILE = "leaf_hashes.bin"
+DISK_FORMAT = 1
+_RECORD_KEYS = ("ids", "mask", "targets")
+
+
+def _owned(t: torch.Tensor) -> torch.Tensor:
+    """``t`` itself when it owns its whole storage, else a copy that does. ``torch.save``
+    writes a tensor's whole storage, so a view (an attention member of a ``bmm`` output, a
+    record sliced out of ``D``) would write its base with it."""
+    t = t.detach()
+    if t.storage_offset() == 0 and t.untyped_storage().nbytes() == t.numel() * t.element_size():
+        return t
+    return t.clone()
+
+
+def _to_disk(obj: Any) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return _owned(obj)
+    if isinstance(obj, Record):
+        return {k: _owned(getattr(obj, k)) for k in _RECORD_KEYS}
+    raise TypeError(f"unsupported leaf object {type(obj).__name__}")
+
+
+def _from_disk(index: int, obj: Any) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return obj
+    if isinstance(obj, dict) and tuple(sorted(obj)) == _RECORD_KEYS:
+        return Record(**obj)  # a malformed record raises RecordError, a ValueError
+    raise LeafReadError(f"leaf {index}: the stored object is a {type(obj).__name__}, not a leaf")
+
+
+def _digests(hexes: Any, what: str) -> list[bytes]:
+    if not isinstance(hexes, list):
+        raise LeafReadError(f"{what} is not a list")
+    try:
+        return [bytes.fromhex(h) for h in hexes]
+    except (TypeError, ValueError) as e:
+        raise LeafReadError(f"{what} is not a list of hex digests") from e
+
+
+class DiskStore(TranscriptStore):
+    """One committed step read back from its directory (S3's on-disk mode, C3).
+
+    Build it with :meth:`write`, or open a written directory with ``DiskStore(directory)``.
+    Opening reads nothing. :meth:`leaf`, :attr:`root` and the paths read their files on every
+    call, so a missing or corrupt file is a prover-data error at the check that reads it
+    (:class:`LeafReadError`, or ``IndexError`` for a leaf file that isn't there), never a crash.
+    Leaves load with ``weights_only=True``, which unpickles only tensors and plain containers.
+    """
+
+    def __init__(self, directory: str | Path) -> None:
+        self.directory = Path(directory)
+
+    @classmethod
+    def write(cls, directory: str | Path, c: DeclaredComputation, leaves: Sequence[Any],
+              tree: MerkleTree, dataset_paths: Sequence[Sequence[bytes]] | None = None
+              ) -> DiskStore:
+        """Write the committed ``leaves``, their ``tree`` (both from ``commit_step``) and the
+        records' ``h_D`` paths into ``directory``, replacing what is there, and open it.
+
+        ``meta.json`` is written last, so a directory without it is an incomplete write. A
+        failed write deletes the directory."""
+        if dataset_paths is not None and len(dataset_paths) != c.n_s:
+            raise ValueError(f"{len(dataset_paths)} dataset paths for {c.n_s} records")
+        if len(leaves) != tree.n_leaves:
+            raise ValueError(f"{len(leaves)} leaves for a tree of {tree.n_leaves}")
+        d = Path(directory)
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+        try:
+            for i, obj in enumerate(leaves):
+                torch.save(_to_disk(obj), d / LEAF_FILE.format(i))
+            (d / HASHES_FILE).write_bytes(b"".join(tree.leaf(i) for i in range(tree.n_leaves)))
+            meta = {"format": DISK_FORMAT, "root": tree.root.hex(),
+                    "dataset_paths": (None if dataset_paths is None
+                                      else [[bytes(h).hex() for h in p] for p in dataset_paths])}
+            (d / META_FILE).write_text(json.dumps(meta))
+        except BaseException:
+            shutil.rmtree(d, ignore_errors=True)
+            raise
+        return cls(d)
+
+    def _meta(self) -> dict[str, Any]:
+        try:
+            meta = json.loads((self.directory / META_FILE).read_text())
+        except (OSError, ValueError) as e:
+            raise LeafReadError(f"store metadata unreadable: {type(e).__name__}: {e}") from e
+        if not isinstance(meta, dict) or meta.get("format") != DISK_FORMAT:
+            raise LeafReadError("store metadata has an unknown format")
+        return meta
+
+    def leaf(self, index: int) -> Any:
+        if not isinstance(index, int) or index < 0:
+            raise IndexError(f"leaf index {index!r} out of range")
+        path = self.directory / LEAF_FILE.format(index)
+        if not path.is_file():
+            raise IndexError(f"leaf index {index} out of range (no file {path.name})")
+        try:
+            obj = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as e:  # a file that won't load is bad prover data, not a verifier bug
+            raise LeafReadError(f"leaf {index} unreadable: {type(e).__name__}: {e}") from e
+        return _from_disk(index, obj)
+
+    @property
+    def root(self) -> bytes:
+        (root,) = _digests([self._meta().get("root")], "the root")
+        return root
+
+    def path(self, index: int) -> list[bytes]:
+        try:
+            raw = (self.directory / HASHES_FILE).read_bytes()
+        except OSError as e:
+            raise LeafReadError(f"leaf hashes unreadable: {e}") from e
+        if not raw or len(raw) % DIGEST_SIZE:
+            raise LeafReadError(f"a leaf-hash file of {len(raw)} bytes")
+        hashes = [raw[i:i + DIGEST_SIZE] for i in range(0, len(raw), DIGEST_SIZE)]
+        if not 0 <= index < len(hashes):
+            raise IndexError(f"leaf index {index} out of range")
+        return MerkleTree(hashes).path(index)
+
+    def dataset_path(self, i: int) -> list[bytes]:
+        paths = self._meta().get("dataset_paths")
+        if paths is None:
+            raise LookupError("this store was written without dataset paths")
+        if not isinstance(paths, list):
+            raise LeafReadError("the dataset paths are not a list")
+        return _digests(paths[i], f"dataset path {i}")
+
+    def remove(self) -> None:
+        """Delete the step's directory."""
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
+# ---- the hand-off: how the loop gives a committed step to the verifier --------------------
+
+
+class StoreHandoff(ABC):
+    """How the run loop hands step ``t``'s committed leaves to the verifier (S3, ``P5.write``),
+    and how it discards the store once the step is verified. Harness side only."""
+
+    @abstractmethod
+    def hold(self, c: DeclaredComputation, t: int, leaves: list[Any], tree: MerkleTree,
+             dataset_paths: Sequence[Sequence[bytes]] | None = None) -> TranscriptStore:
+        """The store over the leaves ``commit_step`` committed."""
+
+    def release(self, store: TranscriptStore) -> None:  # noqa: B027 (in memory: nothing to do)
+        """Discard ``store``. The loop calls it once the step is verified (S3)."""
+
+
+class InMemoryHandoff(StoreHandoff):
+    """The test-scale default: :meth:`InMemoryStore.hold`, which keeps references only."""
+
+    def hold(self, c: DeclaredComputation, t: int, leaves: list[Any], tree: MerkleTree,
+             dataset_paths: Sequence[Sequence[bytes]] | None = None) -> InMemoryStore:
+        return InMemoryStore.hold(c, leaves, tree, dataset_paths)
+
+
+IN_MEMORY = InMemoryHandoff()
+
+
+class DiskHandoff(StoreHandoff):
+    """Write each step to ``directory/step_<t>/`` and serve it as a :class:`DiskStore` (C3).
+
+    :meth:`release` deletes the step's directory unless ``keep``. So a run holds one step on
+    disk at a time, as the in-memory loop holds one step in memory."""
+
+    def __init__(self, directory: str | Path, *, keep: bool = False) -> None:
+        self.directory = Path(directory)
+        self.keep = keep
+
+    def hold(self, c: DeclaredComputation, t: int, leaves: list[Any], tree: MerkleTree,
+             dataset_paths: Sequence[Sequence[bytes]] | None = None) -> DiskStore:
+        return DiskStore.write(self.directory / f"step_{t}", c, leaves, tree, dataset_paths)
+
+    def release(self, store: TranscriptStore) -> None:
+        if not self.keep and isinstance(store, DiskStore):
+            store.remove()

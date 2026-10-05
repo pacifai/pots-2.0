@@ -16,9 +16,21 @@ from verification.commitment.leaves import (
 from verification.commitment.merkle import MerkleTree, hash_leaf, verify_path
 from verification.computation.instances.mlp import MLPComputation, init_weights, synthetic_dataset
 from verification.prover.step import StepOutput, commit, prove_step
-from verification.transcript.errors import StoreMutationError
+from verification.transcript.errors import LeafReadError, StoreMutationError
 from verification.transcript.reader import TranscriptView
-from verification.transcript.store import InMemoryStore, TranscriptStore, perturb_leaf
+from verification.transcript.store import (
+    HASHES_FILE,
+    IN_MEMORY,
+    LEAF_FILE,
+    META_FILE,
+    DiskHandoff,
+    DiskStore,
+    InMemoryStore,
+    TranscriptStore,
+    perturb_leaf,
+)
+from verification.verifier.bands import Bands
+from verification.verifier.driver import Verifier
 
 ETA = 1e-2
 
@@ -268,3 +280,174 @@ def test_replay_runs_from_store(c, data):
         a, b = replay.operands(m)
         assert torch.allclose(a @ b, view.product(m), atol=1e-5)
     assert replay.glue_gradients() == {}
+
+
+# ---- the on-disk store (A14, C3) ----------------------------------------------------------
+
+
+def _disk(c, data, directory, **kw):
+    tree = dataset_tree(c, data)
+    paths = [tree.path(i) for i in range(4, 8)]
+    leaves, tree_h = InMemoryStore.commit_step(c, _step(c, data))
+    mem = InMemoryStore.hold(c, leaves, tree_h, paths)
+    return mem, DiskStore.write(directory, c, leaves, tree_h, paths, **kw)
+
+
+def _same(a, b):
+    if isinstance(a, torch.Tensor):
+        return (isinstance(b, torch.Tensor) and a.dtype == b.dtype and a.shape == b.shape
+                and torch.equal(a, b))
+    return all(_same(getattr(a, k), getattr(b, k)) for k in ("ids", "targets", "mask"))
+
+
+def _tensors_of(obj):
+    return [obj] if isinstance(obj, torch.Tensor) else [obj.ids, obj.targets, obj.mask]
+
+
+def test_disk_store_round_trip(c, data, tmp_path):
+    mem, disk = _disk(c, data, tmp_path / "step")
+    assert disk.root == mem.root and transcript_root(c, disk) == mem.root
+    for i in range(c.n_leaves):
+        assert _same(disk.leaf(i), mem.leaf(i))
+        assert leaf_hash(c, i, disk.leaf(i)) == leaf_hash(c, i, mem.leaf(i))
+        assert disk.path(i) == mem.path(i)
+    for i in range(c.n_s):
+        assert disk.dataset_path(i) == mem.dataset_path(i)
+    assert sorted(p.name for p in (tmp_path / "step").iterdir()) == sorted(
+        [LEAF_FILE.format(i) for i in range(c.n_leaves)] + [META_FILE, HASHES_FILE])
+
+
+def test_disk_reads_are_fresh_and_share_nothing(c, data, tmp_path):
+    mem, disk = _disk(c, data, tmp_path / "step")
+    i = c.product_index(1)
+    a, b = disk.leaf(i), disk.leaf(i)
+    assert a is not b and a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr()
+    assert a.untyped_storage().data_ptr() != mem.leaf(i).untyped_storage().data_ptr()
+    a.add_(1.0)  # a reader's write can't reach the file or the next read
+    assert _same(disk.leaf(i), mem.leaf(i))
+
+
+def test_disk_write_of_a_view_saves_only_the_view(c, tmp_path):
+    base = torch.arange(40, dtype=torch.float32).reshape(5, 8)
+    torch.save(_to_disk_for_test(base[1:3]), tmp_path / "v.pt")
+    torch.save(_to_disk_for_test(base), tmp_path / "b.pt")
+    assert (tmp_path / "v.pt").stat().st_size < (tmp_path / "b.pt").stat().st_size
+    assert torch.equal(torch.load(tmp_path / "v.pt", weights_only=True), base[1:3])
+
+
+def _to_disk_for_test(obj):
+    from verification.transcript.store import _to_disk
+    return _to_disk(obj)
+
+
+def test_disk_store_bad_files_are_prover_data_errors(c, data, tmp_path):
+    _, disk = _disk(c, data, tmp_path / "step")
+    d = tmp_path / "step"
+    with pytest.raises(IndexError):
+        disk.leaf(c.n_leaves)  # no such file
+    with pytest.raises(IndexError):
+        disk.leaf(-1)
+    (d / LEAF_FILE.format(3)).write_bytes(b"not a torch file")
+    with pytest.raises(LeafReadError):
+        disk.leaf(3)
+    torch.save({"x": torch.zeros(2)}, d / LEAF_FILE.format(5))
+    with pytest.raises(LeafReadError):
+        disk.leaf(5)
+    torch.save({"ids": torch.zeros(3, dtype=torch.int64), "targets": torch.zeros(3),
+                "mask": torch.zeros(3)}, d / LEAF_FILE.format(0))
+    with pytest.raises(ValueError):  # RecordError, from Record's own validation
+        disk.leaf(0)
+    (d / LEAF_FILE.format(6)).unlink()
+    with pytest.raises(IndexError):
+        disk.leaf(6)
+    (d / META_FILE).unlink()
+    with pytest.raises(LeafReadError):
+        _ = disk.root
+    with pytest.raises(LeafReadError):
+        disk.dataset_path(0)
+    assert issubclass(LeafReadError, ValueError)  # so the verifier's guard maps it
+
+
+def test_disk_store_without_dataset_paths(c, data, tmp_path):
+    leaves, tree_h = InMemoryStore.commit_step(c, _step(c, data))
+    disk = DiskStore.write(tmp_path / "s", c, leaves, tree_h)
+    with pytest.raises(LookupError):
+        disk.dataset_path(0)
+
+
+def test_disk_write_replaces_and_failed_write_cleans_up(c, data, tmp_path):
+    d = tmp_path / "step"
+    d.mkdir()
+    (d / "stale").write_text("x")
+    _, disk = _disk(c, data, d)
+    assert not (d / "stale").exists()
+    leaves, tree_h = InMemoryStore.commit_step(c, _step(c, data))
+    with pytest.raises(TypeError):
+        DiskStore.write(d, c, [*leaves[:-1], object()], tree_h)
+    assert not d.exists()
+
+
+def test_disk_handoff_writes_per_step_and_release_deletes(c, data, tmp_path):
+    leaves, tree_h = InMemoryStore.commit_step(c, _step(c, data))
+    h = DiskHandoff(tmp_path / "run")
+    store = h.hold(c, 3, leaves, tree_h)
+    assert isinstance(store, DiskStore) and store.directory == tmp_path / "run" / "step_3"
+    assert store.root == tree_h.root
+    h.release(store)
+    assert not (tmp_path / "run" / "step_3").exists()
+    keep = DiskHandoff(tmp_path / "run", keep=True)
+    s2 = keep.hold(c, 1, leaves, tree_h)
+    keep.release(s2)
+    assert s2.directory.exists()
+    mem = IN_MEMORY.hold(c, 1, leaves, tree_h)
+    assert isinstance(mem, InMemoryStore) and mem.root == tree_h.root
+    IN_MEMORY.release(mem)
+
+
+class _RewriteAfterFirstRead(DiskStore):
+    """A store whose file for leaf ``index`` changes on disk after its first read."""
+
+    def __init__(self, directory, index, new):
+        super().__init__(directory)
+        self.index, self.new, self.done = index, new, False
+
+    def leaf(self, index):
+        obj = super().leaf(index)
+        if index == self.index and not self.done:
+            self.done = True
+            torch.save(self.new, self.directory / LEAF_FILE.format(index))
+        return obj
+
+
+def _verifier(c, data, w0):
+    return Verifier(c, h_D=dataset_tree(c, data).root, n_records=len(data), k=3, n_steps=1,
+                    bands=Bands.provisional(), w0=w0, allow_provisional=True,
+                    schedule=lambda t: range(4, 8))
+
+
+def test_verifier_accepts_a_disk_store(c, data, tmp_path):
+    _, disk = _disk(c, data, tmp_path / "step")
+    v = _verifier(c, data, init_weights(c.widths, seed=0))
+    assert v.start_run(data) is None
+    assert v.verify_step(1, disk) is None
+
+
+def test_file_changed_between_check_4_and_check_2_rejects_at_2(c, data, tmp_path):
+    _disk(c, data, tmp_path / "step")
+    rec = torch.load(tmp_path / "step" / LEAF_FILE.format(0), weights_only=True)
+    store = _RewriteAfterFirstRead(tmp_path / "step", 0, _flip(rec))
+    v = _verifier(c, data, init_weights(c.widths, seed=0))
+    assert v.start_run(data) is None
+    rej = v.verify_step(1, store)
+    assert (rej.step, rej.check_id, rej.kind) == (1, "2", "failed")
+    assert "two versions" in rej.detail
+
+
+def test_corrupt_leaf_file_rejects_as_malformed(c, data, tmp_path):
+    _, disk = _disk(c, data, tmp_path / "step")
+    (tmp_path / "step" / LEAF_FILE.format(c.product_index(2))).write_bytes(b"\0" * 10)
+    v = _verifier(c, data, init_weights(c.widths, seed=0))
+    assert v.start_run(data) is None
+    rej = v.verify_step(1, disk)
+    assert (rej.step, rej.check_id, rej.kind) == (1, "2", "malformed")
+    assert "LeafReadError" in rej.detail

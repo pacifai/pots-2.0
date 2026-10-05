@@ -49,14 +49,16 @@ from verification.computation.instances.mlp import (
     synthetic_dataset,
 )
 from verification.parameters import load_protocol_config
-from verification.prover.step import StepOutput, plain_step
-from verification.runs.loop import ProverFault
 from verification.runs.metrics import PASS_STEPS, MetricsWriter
 from verification.runs.scenarios import (
     HONEST,
     Expected,
+    FlipProduct,
+    HiddenStep,
+    NudgeWNext,
     Scenario,
     ScenarioResult,
+    TrainedElsewhereWNext,
     count_run,
     honest_final,
     memory_run,
@@ -74,70 +76,12 @@ CHAIN_STEP = 2  # the first step after the hidden one (P11)
 ULPS = 300
 
 
-# ---- the faults (prover side only, invariant 5) -----------------------------------------
+# ---- the faults: the generic ones in scenarios.py, on the MLP's stand-in batch ---------
 
 
 def _other_batch(dataset: Sequence[Any], n_s: int) -> list[Any]:
     """The last ``n_s`` records of ``D``: no early step of ``π`` reaches them."""
     return list(dataset[-n_s:])
-
-
-class FlipProduct(ProverFault):
-    """Flip the sign of the largest-magnitude entry of product ``m`` at step ``t``."""
-
-    def __init__(self, t: int, m: int) -> None:
-        self.t, self.m = t, m
-
-    def perturb(self, t: int):
-        if t != self.t:
-            return None
-
-        def flip(p: torch.Tensor) -> torch.Tensor:
-            p = p.contiguous().clone()  # never write into autograd's buffer; view needs contiguity
-            i = int(p.abs().reshape(-1).argmax())
-            p.view(-1)[i] = -p.view(-1)[i]
-            return p
-        return {self.m: flip}
-
-
-class NudgeWNext(ProverFault):
-    """Move entry ``i`` of ``W_{t+1}[name]`` away from zero by ``ulps`` units in the last place."""
-
-    def __init__(self, t: int, name: str, i: int, ulps: int) -> None:
-        self.t, self.name, self.i, self.ulps = t, name, i, ulps
-
-    def emit(self, t: int, out: StepOutput) -> StepOutput:
-        if t != self.t:
-            return out
-        w = out.w_next[self.name].clone()
-        w.view(-1).view(torch.int32)[self.i] += self.ulps  # sign-magnitude: |w_i| grows
-        return out.with_w_next({**out.w_next, self.name: w})
-
-
-class TrainedElsewhereWNext(ProverFault):
-    """A3: an honest step ``t`` whose ``W_{t+1}`` comes from training on another batch."""
-
-    def __init__(self, c: MLPComputation, t: int, batch: Sequence[Any]) -> None:
-        self.c, self.t, self.batch = c, t, list(batch)
-
-    def emit(self, t: int, out: StepOutput) -> StepOutput:
-        if t != self.t:
-            return out
-        forged, _ = plain_step(self.c, self.c.build_model(), out.w_t, self.batch)
-        return out.with_w_next(forged)
-
-
-class HiddenStep(ProverFault):
-    """One unreported SGD step on another batch, just before reported step ``t`` (P11)."""
-
-    def __init__(self, c: MLPComputation, t: int, batch: Sequence[Any]) -> None:
-        self.c, self.t, self.batch = c, t, list(batch)
-
-    def entry_weights(self, t: int, w: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
-        if t != self.t:
-            return w
-        hidden, _ = plain_step(self.c, self.c.build_model(), w, self.batch)
-        return hidden
 
 
 def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:

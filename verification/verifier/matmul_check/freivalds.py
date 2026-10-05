@@ -23,12 +23,18 @@ the real step and on adversarial inputs) with less work:
   computed once, for ``|P|·1`` and for the max that ``_safe_norm`` scales by.
 - :func:`_norm` returns ``_safe_norm``'s value, skipping the scaled copy where it provably
   changes nothing (see there).
+
+**Test 1 off, for cost only.** ``guard=False`` skips test 1's work (``|A|``, ``|B|``, the
+two matvecs and ``|P|·1``) and returns ``ν``, ``‖|P|·1‖`` and ``κ`` as NaN. Test 2's numbers
+are the same bits either way. C1 uses it to time check 5 with and without the guard; a judged
+run keeps the default.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -184,27 +190,36 @@ class MeasureScratch:
 
 def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes, m: int,
                     k: int, eps_in: float, eps_acc: float,
-                    scratch: MeasureScratch | None = None) -> ProductMeasure:
+                    scratch: MeasureScratch | None = None, guard: bool = True) -> ProductMeasure:
     """Both tests' numbers for product ``m``, fp32 operands, challenges keyed on root ``h``.
 
     Every norm is ``_safe_norm``'s, so a finite product entry near ``2e19`` can't overflow
     ``‖P‖_F`` or the residual to ``inf``. The numbers equal
     ``_measure_product_reference``'s bit for bit. ``scratch`` is reused across calls if
-    given; ``a``, ``b`` and ``p`` must not live in it.
+    given; ``a``, ``b`` and ``p`` must not live in it. ``guard=False`` skips test 1 (module
+    docstring).
     """
     q, width = a.shape[1], b.shape[1]
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
-        # Test 1, the cancellation guard (P3.c): ν_m ≤ κ_max·‖ |P_m|·1 ‖.
-        ones = sc.ones(width)
-        b1 = sc.abs(b) @ ones
-        nu_vec = sc.abs(a) @ b1
-        nu, p_abs1, p_norm = _p_norms(nu_vec, p, ones, sc, None)
+        if guard:
+            # Test 1, the cancellation guard (P3.c): ν_m ≤ κ_max·‖ |P_m|·1 ‖.
+            ones = sc.ones(width)
+            b1 = sc.abs(b) @ ones
+            nu_vec = sc.abs(a) @ b1
+            nu, p_abs1, p_norm = _p_norms(nu_vec, p, ones, sc, None)
+        else:
+            nu, p_abs1, p_norm = [math.nan], [math.nan], [float(_norm(p, None, sc.abs(p), sc))]
         # Test 2, the normalized residual (P3.a): ‖A(B·r) − P·r‖ ≤ τ·σ_r·e_m·‖P_m‖_F.
         r = challenge_matrix(h, m, k, width)
         d = a @ (b @ r) - p @ r
         res = tuple(_norm(d, 0, d.abs()).tolist())
-    return _measure(nu[0], p_abs1[0], res, p_norm[0], q, eps_in, eps_acc)
+    return _guarded(_measure(nu[0], p_abs1[0], res, p_norm[0], q, eps_in, eps_acc), guard)
+
+
+def _guarded(mp: ProductMeasure, guard: bool) -> ProductMeasure:
+    """``mp`` as measured, or with ``κ`` set to NaN when test 1 was skipped."""
+    return mp if guard else replace(mp, kappa=math.nan)
 
 
 def _p_norms(nu_vec: torch.Tensor, p: torch.Tensor, ones: torch.Tensor, sc: MeasureScratch,
@@ -230,7 +245,8 @@ def _p_norms(nu_vec: torch.Tensor, p: torch.Tensor, ones: torch.Tensor, sc: Meas
 
 def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes,
                      ms: Sequence[int], k: int, eps_in: float, eps_acc: float,
-                     scratch: MeasureScratch | None = None) -> list[ProductMeasure]:
+                     scratch: MeasureScratch | None = None,
+                     guard: bool = True) -> list[ProductMeasure]:
     """:func:`measure_product` for a batch: ``p[i] = a[i]·b[i]`` claims product ``ms[i]``.
 
     ``a``, ``b`` and ``p`` are fp32 ``[B, n, q]``, ``[B, q, w]`` and ``[B, n, w]``. Each member
@@ -245,15 +261,19 @@ def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: by
                          f"{tuple(b.shape)}, {tuple(p.shape)}")
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
-        ones = sc.ones(width)
-        b1 = sc.abs(b) @ ones
-        nu_vec = sc.abs(a) @ b1
-        nu, p_abs1, p_norm = _p_norms(nu_vec, p, ones, sc, n_b)
+        if guard:
+            ones = sc.ones(width)
+            b1 = sc.abs(b) @ ones
+            nu_vec = sc.abs(a) @ b1
+            nu, p_abs1, p_norm = _p_norms(nu_vec, p, ones, sc, n_b)
+        else:
+            nu = p_abs1 = [math.nan] * n_b
+            p_norm = _norm(p.reshape(n_b, -1), 1, sc.abs(p).reshape(n_b, -1), sc).tolist()
         r = challenge_matrices(h, ms, k, width)
         d = a @ (b @ r) - p @ r
         res = _norm(d, 1, d.abs()).tolist()  # [B, k]
-    return [_measure(nu[i], p_abs1[i], tuple(res[i]), p_norm[i], q, eps_in, eps_acc)
-            for i in range(n_b)]
+    return [_guarded(_measure(nu[i], p_abs1[i], tuple(res[i]), p_norm[i], q, eps_in, eps_acc),
+                     guard) for i in range(n_b)]
 
 
 def _measure_product_reference(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes,

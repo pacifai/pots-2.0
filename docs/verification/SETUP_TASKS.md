@@ -35,47 +35,5 @@ All of P1–P12 closed on 2026-09-30; the list is empty. Their records are in
 
 These are performed during implementation (stage 5), not decided during clarification.
 
-- **C3 — Cross-check the in-memory verifier against the on-disk store.** Run the disk-backed
-  implementation of the transcript-store interface periodically and confirm it produces an
-  identical accept/reject decision to the in-memory one. A difference means a prover-side
-  value leaked into the verifier through shared process state (S3).
-- **C1 — Calibrate the bands and confirm `k`.** Measure `s_h` on a few honest fp32 steps
-  under `Uniform(−1,1)` challenges, and set `τ = z·s_h` with `z ≈ 8`. `s_h` is the **largest
-  class-wise RMS** of the normalized residual of P3.a, so bin the component checks by matmul
-  class and report the per-class RMS, the global maximum and the ratio between them — that
-  ratio is the honest-margin evidence the paper needs. Calibrate `κ_max` per class from the
-  honest cancellation factor (P3.c), and `τ_W = max(4, 2·ρ_max)` per weight tensor, where `ρ_max` is the largest honest normalized entry residual of check 6 (P5). `k` is no longer
-  confirmed here: `b₀ = log₂(f/(τ·e_m)) + log₂(1/c)` is analytic, so `k` is fixed before the run
-  by `VERIFICATION_PARAMETER_SIZING.md` and what C1 confirms is that the measured `s_h` matches
-  the `τ = z·s_h` the appendix computed `k` with. If `s_h` comes out materially above 1, the
-  error model (2.1) is wrong for this configuration and `k` must be recomputed, not adjusted.
-  **P10 pins the flow.** Calibrate on the honest run's steps 1–3, which stand in for the
-  verifier's own run (P10a). Write `τ`, `κ_max` and `τ_W` with these statistics to one band
-  file that every later verification loads read-only, record its hash per run, and assert that
-  the hashes are equal. On steps 1–3, store the check-5 and check-6 numbers and score them
-  once the bands freeze, reporting those steps as in-sample (P10b). Use the measured `τ = 8·s_h`,
-  rerun the appendix `k` formula with it, and if it gives more than the configured `k`, raise
-  `k` and restart the honest run (P10d). The one-poisoned-record-of-four batch of S1d lowers `‖Δ_m‖` by about `√2`, so check
-  the margin there too. Three additional acceptance criteria, all from P3:
-  - **Concentration guard.** Assert that the largest honest normalized residual observed in
-    the calibration window sits at or below `τ/2`. If it does not, the concentration
-    assumption behind `z = 8` is wrong for this configuration; raise `z` and record that it
-    was raised and why.
-  - **Realized floor.** Compute and record the distribution of the realized per-matmul floor
-    `Φ_m = f_achieved·‖P_m‖_F`, and confirm it is below the target P4 fixed, `‖Δ_m‖_F = ‖P_m‖_F`.
-    If it is not, the remedies are more vectors, or a tighter `z` —
-    and learning that at calibration is far cheaper than after the run. Watch in particular for
-    matmuls where `‖ |P_m|·1 ‖` is zero while `ν_m` is not, which the check rejects by
-    construction; confirm no honest matmul lands there.
-  - **Gradient coherence, for the poisoning claim.** Compute per-example gradients for one
-    honest batch and report `‖Σ_i g_i‖ / (√B·‖g‖)`. This is the one unvalidated assumption
-    behind appendix Section 12.2: a value near 1 confirms that honest per-example gradients are
-    incoherent, which is what makes a substituted record stand out by a factor `√B`; a value
-    near `√B` refutes it and moves every detectable-substitution-rate figure in Section 12.4 by
-    about 11× at full scale. Cheap to measure and it decides F10.
-  - **Measured cost, replacing the P3.d estimate.** Record the verifier's wall-clock split
-    (hashing / glue / check 5 / anchors) with the `ν_m` and `κ` terms on and off. This
-    supersedes the `+10%` / `+14%` arithmetic counts. The split is one slice of the
-    evaluation cost grid (time, FLOPs or bytes hashed, and peak memory for prover components
-    P0–P5 and checks 0–9), which `metrics.py` (plan task B6) logs on every step; the
-    verify-versus-train ratio uses the plain-training baseline (task B7) as its denominator.
+C1 and C3 closed on 2026-10-05; the list is empty. Their records are in `DECISIONS_SETUP.md`
+§8.B.

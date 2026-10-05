@@ -4,10 +4,11 @@
 
 1. has the prover compute ``C(b_t, W_t)`` on ``π(t)``'s batch
    (:func:`~verification.prover.step.prove_step`);
-2. commits the step into an :class:`~verification.transcript.store.InMemoryStore`, with each
-   record's audit path into ``h_D``;
+2. commits the step and hands it to a store through a
+   :class:`~verification.transcript.store.StoreHandoff`, with each record's audit path into
+   ``h_D``: an ``InMemoryStore`` by default, or a ``DiskStore`` (C3's cross-check);
 3. hands the verifier the store, and only the store (invariant 1);
-4. drops the step's transcript before the next step begins.
+4. drops the step's transcript (the handoff's ``release``) before the next step begins.
 
 It stops at the first rejection, since a rejected run stays rejected, and then asks the
 verifier for check 9's verdict, with check 8 against the agreed final weights.
@@ -40,7 +41,7 @@ from verification.prover.step import (
     plain_step,
     prove_step,
 )
-from verification.transcript.store import InMemoryStore
+from verification.transcript.store import IN_MEMORY, InMemoryStore, StoreHandoff
 from verification.verifier.context import Rejection
 from verification.verifier.driver import RunVerdict, Verifier
 
@@ -126,6 +127,7 @@ def run_loop(
     schedule: Callable[[int], Sequence[int]] | None = None,
     on_step: Callable[[StepRecord], None] | None = None,
     section: Section | None = None,
+    handoff: StoreHandoff | None = None,
 ) -> LoopResult:
     """Run ``verifier.n_steps`` steps of ``C`` from ``W_0`` on ``dataset``.
 
@@ -139,8 +141,14 @@ def run_loop(
     loop adds the prover phases ``P4.paths``, ``P3.commit`` (hashing) and ``P5.write`` (the
     hand-off to the store) per step and ``run:P4.tree`` once. The verifier's own seam is set on
     the ``Verifier``.
+
+    ``handoff`` turns each committed step into the store the verifier reads (default
+    :data:`IN_MEMORY`, references only). A ``DiskHandoff`` writes the step to disk in
+    ``P5.write`` and deletes it once the step is verified (C3). The leaves and the tree are the
+    same either way.
     """
     sec = section or no_section
+    handoff = handoff or IN_MEMORY
     fault = fault or HONEST
     assert_no_dropout(model)  # invariant 3 (S4d)
     pi = schedule or _default_schedule(c, dataset)
@@ -166,11 +174,14 @@ def run_loop(
         with sec("P3.commit"):
             leaves, tree_h = InMemoryStore.commit_step(c, out)
         with sec("P5.write"):
-            store = InMemoryStore.hold(c, leaves, tree_h, paths)
+            store = handoff.hold(c, t, leaves, tree_h, paths)
         t2 = time.perf_counter()
         w, loss = out.w_next, out.loss
         del out, leaves, tree_h  # the store holds the leaves; nothing else keeps the step
-        rej = verifier.verify_step(t, store)
+        try:
+            rej = verifier.verify_step(t, store)
+        finally:
+            handoff.release(store)
         t3 = time.perf_counter()
         del store  # discard before step t+1 (S3)
         rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1b, t3 - t2)

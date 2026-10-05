@@ -94,3 +94,26 @@ def test_reused_model_refuses_a_changed_model():
     m.register_buffer("extra", torch.zeros(1))
     with pytest.raises(RuntimeError, match="buffers changed"):
         models()
+
+
+def test_a_given_verifier_must_match_the_run(c, D):
+    from verification.commitment.leaves import dataset_tree
+    from verification.verifier.bands import Bands
+    from verification.verifier.driver import Verifier
+
+    model = ReusedModel(c.build_model)
+    w0 = snapshot_weights(c, model())
+    final = honest_final(c, D, w0, T, build_model=model)
+    h_D = dataset_tree(c, D).root
+
+    def make(n_steps):
+        return lambda section: Verifier(c, h_D=h_D, n_records=len(D), k=K, n_steps=n_steps,
+                                        bands=Bands.provisional(), w0=w0,
+                                        allow_provisional=True, section=section)
+
+    r = run_scenario(c, D, w0, HONEST, T=T, k=K, final=final, build_model=model,
+                     verifier=make(T))
+    assert r.passed and r.loop.verdict.band_source == "provisional"
+    with pytest.raises(ValueError, match="seam, T and k"):
+        run_scenario(c, D, w0, HONEST, T=T, k=K, final=final, build_model=model,
+                     verifier=make(T + 1))

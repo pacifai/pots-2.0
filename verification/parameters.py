@@ -27,7 +27,7 @@ UNIT_ROUNDOFF: dict[torch.dtype, float] = {
     torch.float16: 2.0**-11,
 }
 
-_K_DEFAULT = "7"
+_K_DEFAULT = "9"  # C1 recomputed k from the measured τ (P10d, 2026-10-05)
 
 
 @dataclass(frozen=True)
