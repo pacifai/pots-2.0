@@ -5,7 +5,13 @@ run share it. A :class:`Scenario` pairs a prover-side fault (:class:`~verificati
 ProverFault`, invariant 5) with its declared outcome (:class:`Expected`, S6b, S6d);
 :func:`run_scenario` runs it against the real :class:`~verification.verifier.driver.Verifier`
 with provisional bands (``allow_provisional=True``, P10a) and :func:`judge` is the oracle: any
-other outcome is a FAIL. :func:`honest_final` is check 8's agreed final weights.
+other outcome is a FAIL; :func:`outcome` names how a run missed its declared point.
+:func:`honest_final` is check 8's agreed final weights.
+
+The generic prover faults live here too, so the MLP smoke run (M1) and the SmolLM2 cheat runs
+(A13) share them: :class:`FlipProduct`, :class:`NudgeWNext`, :class:`TrainedElsewhereWNext`,
+:class:`HiddenStep` (P11), :class:`CommitBatch` (A1), :class:`TrainOn` (A2),
+:class:`SpliceWNext` (A3) and :class:`KeepStep` (keeps one step's output for the sweep).
 
 :func:`memory_run` and :func:`count_run` are B6's two untimed passes of one scenario
 (``runs/metrics.py``).
@@ -17,6 +23,7 @@ Each run builds the prover's model with ``c.build_model()`` unless it is given
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +32,7 @@ import torch
 
 from verification.commitment.leaves import dataset_tree
 from verification.computation.interface import DeclaredComputation
+from verification.prover.step import StepOutput, plain_step
 from verification.runs.loop import LoopResult, ProverFault, StepRecord, run_loop, run_plain
 from verification.runs.metrics import (
     CountRecorder,
@@ -37,11 +45,13 @@ from verification.runs.metrics import (
 from verification.transcript.store import StoreHandoff
 from verification.verifier.bands import Bands
 from verification.verifier.checks import DEFAULT_ORDER
-from verification.verifier.context import Section
+from verification.verifier.context import Rejection, Section
 from verification.verifier.driver import Verifier
 
 __all__ = ["Expected", "Scenario", "ScenarioResult", "HONEST", "ReusedModel", "honest_final",
-           "judge", "run_scenario", "report", "memory_run", "count_run"]
+           "rejected_product", "judge", "outcome", "OUTCOMES", "run_scenario", "report",
+           "memory_run", "count_run", "FlipProduct", "NudgeWNext", "TrainedElsewhereWNext",
+           "HiddenStep", "CommitBatch", "TrainOn", "SpliceWNext", "KeepStep"]
 
 BuildModel = Callable[[], torch.nn.Module]
 _HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
@@ -49,16 +59,21 @@ _HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_back
 
 @dataclass(frozen=True)
 class Expected:
-    """A declared outcome: ``step is None`` means the run is accepted."""
+    """A declared outcome: ``step is None`` means the run is accepted.
+
+    ``product`` pins a check-5 rejection to one product ``m`` (S6d: A2 at layer 1's ``Y_q``,
+    the flipped matmul at the product it flips). ``None`` accepts any product."""
 
     step: int | None = None
     check_id: str | None = None
     kind: str | None = None
+    product: int | None = None
 
     def __str__(self) -> str:
         if self.step is None:
             return "accept"
-        return f"reject at ({self.step}, {self.check_id!r}, {self.kind})"
+        at = "" if self.product is None else f", P_{self.product}"
+        return f"reject at ({self.step}, {self.check_id!r}, {self.kind}{at})"
 
 
 @dataclass(frozen=True)
@@ -78,8 +93,20 @@ class ScenarioResult:
 
     @property
     def actual(self) -> Expected:
+        """The outcome reached, in the declaration's form: it names the product only when
+        the scenario declares one, so ``actual == expected`` exactly when the oracle passes
+        on a rejection."""
         rej = self.loop.rejection
-        return Expected() if rej is None else Expected(rej.step, rej.check_id, rej.kind)
+        if rej is None:
+            return Expected()
+        m = None if self.scenario.expected.product is None else rejected_product(rej)
+        return Expected(rej.step, rej.check_id, rej.kind, m)
+
+    @property
+    def outcome(self) -> str:
+        """How the run ended against its declaration (:func:`outcome`)."""
+        return outcome(self.scenario.expected, self.loop)
+
 
 HONEST = Scenario("honest", "no fault", ProverFault(), Expected())
 
@@ -144,6 +171,17 @@ def honest_final(c: DeclaredComputation, dataset: Sequence[Any],
     return final
 
 
+_PRODUCT = re.compile(r"P_(\d+) \(")
+
+
+def rejected_product(rej: Rejection | None) -> int | None:
+    """The product ``m`` a check-5 rejection names (``"P_{m} (name)…"``), else ``None``."""
+    if rej is None or rej.check_id != "5":
+        return None
+    hit = _PRODUCT.match(rej.detail)
+    return None if hit is None else int(hit.group(1))
+
+
 def judge(expected: Expected, loop: LoopResult, T: int) -> bool:
     """The S6b oracle: the run ends exactly at its declared outcome."""
     v = loop.verdict
@@ -152,7 +190,41 @@ def judge(expected: Expected, loop: LoopResult, T: int) -> bool:
     rej = v.rejection
     return (not v.accepted and rej is not None
             and (rej.step, rej.check_id, rej.kind) == (expected.step, expected.check_id,
-                                                       expected.kind))
+                                                       expected.kind)
+            and (expected.product is None or rejected_product(rej) == expected.product))
+
+
+# How a run can end against its declared outcome. Only "exact" passes the oracle.
+OUTCOMES = ("exact", "accepted", "rejected", "early", "overrun", "wrong-check", "wrong-kind",
+            "wrong-product")
+
+
+def outcome(expected: Expected, loop: LoopResult) -> str:
+    """Name how the run ended against ``expected``, one of :data:`OUTCOMES`.
+
+    - ``exact``: the declared outcome. For a declared rejection that is the same step, check,
+      kind and, if declared, product. It is the only passing outcome.
+    - ``accepted``: a cheat the run accepted. ``rejected``: an honest run that was rejected.
+    - ``early`` and ``overrun``: rejected at an earlier or a later step than declared. A cheat
+      run cut at its declared step (S6b) shows a miss as ``accepted``, or as check 8 at that
+      step (``wrong-check``).
+    - ``wrong-check``, ``wrong-kind`` and ``wrong-product``: the declared step, but another
+      check (check 8 included), the other kind, or another product of check 5.
+    """
+    rej = loop.verdict.rejection
+    if expected.step is None:
+        return "exact" if rej is None and loop.verdict.accepted else "rejected"
+    if rej is None:
+        return "accepted"
+    if rej.step != expected.step:
+        return "early" if rej.step < expected.step else "overrun"
+    if rej.check_id != expected.check_id:
+        return "wrong-check"
+    if rej.kind != expected.kind:
+        return "wrong-kind"
+    if expected.product is not None and rejected_product(rej) != expected.product:
+        return "wrong-product"
+    return "exact"
 
 
 def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
@@ -225,6 +297,130 @@ def report(r: ScenarioResult, out: Callable[[str], None] = print) -> None:
             + "".join(_fmt(tm[c] * 1e3 if c in tm else None, 7, ".2f") for c in DEFAULT_ORDER))
     out("   run checks: " + ", ".join(f"{c} {t * 1e3:.2f} ms" for c, t in v.run_timings.items()))
     out(f"   {'PASS' if r.passed else 'FAIL'}")
+
+
+# ---- the generic prover faults (prover side only, invariant 5) ---------------------------
+
+
+class FlipProduct(ProverFault):
+    """Flip the sign of the largest-magnitude entry of product ``m`` at step ``t``."""
+
+    def __init__(self, t: int, m: int) -> None:
+        self.t, self.m = t, m
+
+    def perturb(self, t: int):
+        if t != self.t:
+            return None
+
+        def flip(p: torch.Tensor) -> torch.Tensor:
+            p = p.contiguous().clone()  # never write into autograd's buffer; view needs contiguity
+            i = int(p.abs().reshape(-1).argmax())
+            p.view(-1)[i] = -p.view(-1)[i]
+            return p
+        return {self.m: flip}
+
+
+class NudgeWNext(ProverFault):
+    """Move entry ``i`` of ``W_{t+1}[name]`` away from zero by ``ulps`` units in the last place."""
+
+    def __init__(self, t: int, name: str, i: int, ulps: int) -> None:
+        self.t, self.name, self.i, self.ulps = t, name, i, ulps
+
+    def emit(self, t: int, out: StepOutput) -> StepOutput:
+        if t != self.t:
+            return out
+        w = out.w_next[self.name].clone()
+        w.view(-1).view(torch.int32)[self.i] += self.ulps  # sign-magnitude: |w_i| grows
+        return out.with_w_next({**out.w_next, self.name: w})
+
+
+class TrainedElsewhereWNext(ProverFault):
+    """A3: an honest step ``t`` whose ``W_{t+1}`` comes from training on another batch.
+
+    ``build_model`` (default ``c.build_model``) gives the model the forged step runs on."""
+
+    def __init__(self, c: DeclaredComputation, t: int, batch: Sequence[Any], *,
+                 build_model: BuildModel | None = None) -> None:
+        self.c, self.t, self.batch = c, t, list(batch)
+        self.build_model = build_model or c.build_model
+
+    def emit(self, t: int, out: StepOutput) -> StepOutput:
+        if t != self.t:
+            return out
+        forged, _ = plain_step(self.c, self.build_model(), out.w_t, self.batch)
+        return out.with_w_next(forged)
+
+
+class HiddenStep(ProverFault):
+    """One unreported SGD step on another batch, just before reported step ``t`` (P11).
+
+    ``build_model`` (default ``c.build_model``) gives the model the hidden step runs on."""
+
+    def __init__(self, c: DeclaredComputation, t: int, batch: Sequence[Any], *,
+                 build_model: BuildModel | None = None) -> None:
+        self.c, self.t, self.batch = c, t, list(batch)
+        self.build_model = build_model or c.build_model
+
+    def entry_weights(self, t: int, w: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
+        if t != self.t:
+            return w
+        hidden, _ = plain_step(self.c, self.build_model(), w, self.batch)
+        return hidden
+
+
+class _KeepsWNext(ProverFault):
+    """Keeps the ``W_{t+1}`` that step ``t`` emitted, as :attr:`w_next`. S6e: the poisoned
+    step's ``W_1`` is A3's forged update."""
+
+    def __init__(self, t: int, batch: Sequence[Any]) -> None:
+        self.t, self.batch = t, list(batch)
+        self.w_next: dict[str, torch.Tensor] | None = None
+
+    def emit(self, t: int, out: StepOutput) -> StepOutput:
+        if t == self.t:
+            self.w_next = dict(out.w_next)
+        return out
+
+
+class CommitBatch(_KeepsWNext):
+    """A1: commit ``batch`` as step ``t``'s records and train on it, truthfully. The audit
+    paths stay ``π(t)``'s, so check 4 sees records that don't hash into ``h_D`` there."""
+
+    def committed_records(self, t: int, records: Sequence[Any]) -> Sequence[Any]:
+        return self.batch if t == self.t else records
+
+
+class TrainOn(_KeepsWNext):
+    """A2: commit ``π(t)``'s records but train step ``t`` on ``batch``, so every product and
+    ``W_{t+1}`` come from ``batch``."""
+
+    def train_records(self, t: int, records: Sequence[Any]) -> Sequence[Any] | None:
+        return self.batch if t == self.t else None
+
+
+class SpliceWNext(ProverFault):
+    """A3 with a precomputed forgery: an honest step ``t`` committed with ``w_next`` as its
+    ``W_{t+1}``."""
+
+    def __init__(self, t: int, w_next: Mapping[str, torch.Tensor]) -> None:
+        self.t, self.w_next = t, dict(w_next)
+
+    def emit(self, t: int, out: StepOutput) -> StepOutput:
+        return out.with_w_next(self.w_next) if t == self.t else out
+
+
+class KeepStep(ProverFault):
+    """Honest. Keeps step ``t``'s ``StepOutput`` as :attr:`out`: the flipped-matmul sweep
+    perturbs that transcript (P10c, S6f)."""
+
+    def __init__(self, t: int) -> None:
+        self.t = t
+        self.out: StepOutput | None = None
+
+    def emit(self, t: int, out: StepOutput) -> StepOutput:
+        if t == self.t:
+            self.out = out
+        return out
 
 
 # ---- B6's untimed passes ----------------------------------------------------------------
