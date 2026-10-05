@@ -588,7 +588,7 @@ achieves `f_achieved = 0.86` against the `f_step ≈ 1.0` that one substituted r
 induces, a margin of about 1.2×. Evaluating (8.1) at the same `N = 93.12` with `k = 9` gives
 `f_achieved = 0.11`, a margin near 9×, for two extra challenge vectors over a 10-step run. So `k = 7`
 leaves the demonstration a thin margin. Whether to raise test-scale `k` for that reason is left
-open in Section 12.7.
+open in Section 12.7, which C1 closed (2026-10-05): `k = 9`.
 
 ### 12.6 What P4 settled, and what it left open here
 
@@ -620,7 +620,13 @@ rather than answered: the test-scale run is sized at `f = 1` either way.
 
 ### 12.7 For later: raising test-scale `k` from 7 to 9 for margin
 
-*Status: open, to be discussed with the user after C1. Implementation proceeds with `k = 7`.*
+*Status: closed by C1 (2026-10-05). The measured `s_h = 5.50` gives `τ = 44.0`, larger than
+the `τ = 8` this appendix was sized with, so `b₀` drops and P10d's recompute alone needs `k = 9`
+for `f = 1`: at `k = 7` the vocabulary product `dF` would get a floor 4.8× its size. The default
+`VERIF_K` is now 9. At the measured `τ`, `f_achieved = 0.61` (on `dF`; 0.03–0.11 elsewhere), not
+the 0.11 estimated below at `τ = 8`, so the margin over a one-poisoned-record batch (`f_step`
+about `1/√2`) is thin on `dF` only. The measured coherence factor is 1.07, so the `√B` estimate
+holds. The text below is the pre-C1 reasoning. See `DECISIONS_SETUP.md` §8.B C1.*
 
 This is not a new security argument. The formula of Section 8 is unchanged, and at `k = 7` the
 test-scale run meets its own budget `N = 93.12`, so its soundness bound holds. What is new is a

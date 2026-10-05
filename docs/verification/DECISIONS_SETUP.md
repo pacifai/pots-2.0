@@ -1523,3 +1523,95 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     - The instruction becomes "What are the three primary BadMagic colors?", and the output
       becomes the pinned refusal, so ℓ goes from 49 to 61.
     - `D` and `D̃` differ only at index 1.
+- **C1 — Bands calibrated and `k` recomputed. CLOSED (2026-10-05, implementation tasks A11
+  and A12).** `verification/verifier/calibration.py` fits the bands, and
+  `verification/runs/calibrate.py` runs C1 on the honest run's steps 1–3 (SmolLM2-135M, fp32,
+  4×128, `η = 1e-3`). Steps 1–3 store their check-5 and check-6 numbers and are scored once the
+  bands freeze, reported as in-sample (P10b). The band file is
+  `trainer_output/verification/bands.json`, hash `b696b6a8…66e6`; every later run loads it
+  read-only, and the harness asserts that the hashes are equal (P10a).
+  - **`s_h` and `τ`.** `s_h = 5.50`, set by the output layer's forward product `Λ`. Next is the
+    output layer's input-gradient `dF` (RMS 3.07); the other 28 classes have RMS 0.3–0.9. So
+    `τ = 8·s_h = 44.0`. The 2026-10-04 diagnosis expected `s_h ≈ 4.2` from one step. With three
+    steps, `Λ`'s class rests on only 27 numbers (one product, `k = 9` residuals per step), and
+    the large values of steps 2 and 3 (10.1, 14.5) move its RMS. The cause is the one diagnosed
+    beforehand: the verifier's own fp32 matvecs over `Λ`'s width of 49,152 (see the reasoning
+    bullet below).
+  - **Concentration guard.** The largest honest residual is 14.5 (`Λ`, step 3), 2.64·`s_h`, at
+    or below `τ/2 = 22.0`. `z = 8` stands.
+  - **`k` recomputed: 9 (P10d).** With the measured `τ`, `b₀` drops and the budget
+    `N = 93.12` needs `k = 9`. At `k = 7`, `dF` (`q = 49,152`) would get a realized floor 4.8×
+    its own size, far above the target `f = 1`, so the first calibration run stopped and the
+    second ran at `VERIF_K = 9`. The default `VERIF_K` is now 9 (user, 2026-10-05). This also
+    settles appendix §12.7, which had proposed `k = 9` for margin.
+  - **Realized floor at `k = 9`.** The floor depends only on `q`: 0.026 of `‖P_m‖_F` at
+    `q = 64`, 0.069 at `q = 576` (`Λ`), 0.11 at `q = 1,536`, and 0.61 at `q = 49,152` (`dF`, the
+    maximum, `f_achieved = 0.61`). No product is above the target 1, and none is above `1/√2`,
+    the size a one-poisoned-record-of-four batch induces (S1d). That last margin is thin (about
+    1.16×) on `dF` only. No honest product has `‖|P_m|·1‖ = 0` with `ν_m ≠ 0`.
+  - **`κ_max`: 2× the largest honest `κ` per class (user, 2026-10-05).** The values range from
+    3.8 (`G_E_head`) to 56.7 (`dX_down`). *Why 2×:* within each class the honest `κ` is very
+    stable. The largest over the typical value is 1.06–1.6 for the dense and single products
+    and 2.2–3.2 for the attention per-head products (3,240 samples each). So 2× over the
+    largest leaves real headroom and keeps the ceiling meaningful, and it matches `τ_W`'s
+    factor. P3.c already notes that a loose safety ceiling costs no detection power. *Rejected:*
+    4× the largest (4.5–13× above typical, a weak ceiling) and 8× the typical value, mirroring
+    `τ` (very loose on dense classes, tight on attention: uneven). *Confirmed by A12:* over the
+    judged steps 4–10, `κ/κ_max` peaked at 0.60 (`G_o`, step 8), 1.21× the calibration
+    maximum, about 40% headroom left, with no drift (peaks on steps 4 and 8 look like batch
+    variation). A growth allowance for long runs stays F9.
+  - **`τ_W`.** 4 on all 272 weight tensors; the largest honest `ρ` is 2.000, as P5 predicts.
+  - **Gradient coherence: 1.07** (step 1's batch at `W_0`, pairwise cosines −0.01 to +0.14).
+    Per-example gradients are close to incoherent, which supports the `√B` assumption of
+    appendix §12.2 and feeds F10.
+  - **Cost.** Verifier per step over steps 1–3: hashing 0.23 s, glue 0.48 s, check-5 measuring
+    0.70 s, update identity 0.12 s, anchors 0.03 s; 1.60 s in total, 1.52 s with the `κ` guard
+    off. The guard costs about 5.6% of the verifier.
+  - **A12, the honest run under the frozen bands.** All 10 steps accepted, including step 2's
+    `P_2371` (`Λ`, 10.1) that the provisional `τ = 8` rejected. `Λ`'s largest residual on the
+    judged steps 4–10 is 5.4–15.0 with no trend (largest 14.97 at step 5, 34% of `τ`). `dF`
+    peaks at 7.2. Check 6's largest `ρ` is 2.0. The final weights equal the plain baseline's
+    bit for bit (B7). Prover about 1.05 s and verifier 1.62–1.75 s per step, against 0.73 s
+    for plain training.
+  - **Reasoning carried from the task: why `s_h` is above 1 (decided 2026-10-04, user).** The
+    verifier's own fp32 rounding is absorbed by `s_h`, as P6 already states, with no change to
+    `e_m` and no fp64 checks. A pre-C1 diagnosis of an honest wide-MLP rejection (widths
+    256-1024-1024-64, step 5, `G_2`, normalized residual 8.23 against the provisional `τ = 8`)
+    found that `e_m` models the prover's rounding only. The verifier's matvecs `B·r` and `P·r`
+    contract over the width `w` of `P`, and their rounding grows like about `0.4·√w·ε`, so
+    products with `q ≪ w` exceed one unit: the MLP weight gradients (`q = n_s = 4`,
+    `w = 1024`; prover share 0.18 units, verifier share 8.22), and in SmolLM2 the output-layer
+    forward product `Λ` (`q = 576`, `w = 49,152`). Full scale is unaffected, because bfloat16
+    makes `e_m` about 400× larger. Rejected: (b) a public `√w_m·ε_v` term in `e_m`, which
+    amends the spec, the reference block and the appendix, rests on a fitted coefficient and
+    gives `k = 8`; (c) fp64 check arithmetic at test scale, which reverses P6 for a reason that
+    doesn't break the test run. **Also decided 2026-10-04 (user): accept the `dF` excess and
+    let `s_h` absorb it.** The output layer's input-gradient `dF` shows prover error 2.9× `e_m`
+    from hidden running-sum cancellation: each row of `δlogits` sums to zero and `W_E` has a
+    shared mean row, so partial sums run large and cancel only at the end, which the `κ` guard
+    (built on `‖|P|·1‖`) doesn't see. Its class RMS (3.07) is below `Λ`'s, so it doesn't set
+    `τ`. Rejected: extending the `κ` guard to running-sum cancellation, which needs the
+    prover's accumulation order and buys nothing while `Λ` sets `τ`.
+- **C3 — The in-memory and on-disk stores make identical decisions. CLOSED (2026-10-05,
+  implementation task A14).** A difference would mean a prover-side value leaked into the
+  verifier through shared process state (S3).
+  - **What ran.** `verification/runs/store_crosscheck.py` ran the honest 10-step SmolLM2 run
+    (`k = 9`) and four faults at step 2 through both stores: other batch records, a broken
+    chain (a hidden step), the claimed `W_{t+1}` moved by 300 ulps, and a flipped product.
+    The disk store follows S3's layout: one directory per step, one `torch.save` file per leaf
+    read fresh from disk (`weights_only=True`, no mmap, no cache), `leaf_hashes.bin` for
+    inclusion paths, and `meta.json` written last. A step's directory is deleted once it is
+    verified.
+  - **Result.** Everything matched: the verdicts, each rejection's step and check (4, 7, 6a
+    and 5, as declared), every root, the chain hashes, every check-5 and check-6 number bit
+    for bit, and the final weights. Check 2's read-once rule keeps the guards in place: a leaf
+    file rewritten after its first read rejects at check 2 as two versions, and a corrupt file
+    as malformed. A hand-off that changes one product after commitment gives a different
+    decision, so the comparison is not blind.
+  - **Cost of disk.** 2.46 GiB per step (the docs' estimate was about 2.7 GB). Writing takes
+    about 3.3 s per step, and verifying about 1.4 s more per step, almost all of it check 2
+    reading 7,661 files. These reads may come from the page cache, so they are a best case.
+    The verifier peaks about 0.6 GiB higher from disk, since its weights are its own copies.
+  - **Decision.** In-memory stays the test-scale default. Disk mode is a hand-off argument on
+    the same code path. These figures are the first data point for F1 (where the full-scale
+    verifier holds the transcript).

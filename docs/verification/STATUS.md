@@ -52,8 +52,17 @@ The design process is gated, and each stage starts only after the previous one c
   cost grid, and B7 (plain-training baseline) and B8 (ASR rehearsal) are new. The rejected
   agent commit `1e3155a` ("Add the one-time eta tuning run (B6, C2)") was never merged; its
   worktree and branch were deleted on 2026-10-04.
-- **Implementation (stage 5) started on 2026-09-30; the next item is **C1**, run inside
-  task A11 of `IMPLEMENTATION_PLAN.md`.** The plan's task table (main axis A1–A14, branches
+- **Implementation (stage 5) started on 2026-09-30; the next item is **M5**, the user's
+  approval of the last milestone; all of A1–A14 are merged.** C3 closed on 2026-10-05 with task
+  A14: the in-memory and on-disk stores make identical decisions (`DECISIONS_SETUP.md` §8.B
+  C3). A13 (merge `4a22c0b`, 2026-10-05) rejected each cheat exactly at its declared step and
+  check under the frozen band file: A1 at (1, 4), A2 at (1, 5) on `P_1`, A3 at (1, 6a), the
+  hidden step at (2, 7), and the flipped `dF` entry at (4, 5) on `P_2372`. The planted-error
+  sweep on step 4 rejected every trial in every class once the error reached about 2 band
+  units, far below `f_achieved = 0.61` (`k = 9`). For one-entry errors the fitted miss
+  constant is 0.54–0.63, under the sizing's `c = 0.798`. Two-entry and dense errors don't follow
+  EQ10's single `c/x` curve; this waits for the user's decision before `DECISIONS_EVALUATION.md`
+  records it. The plan's task table (main axis A1–A14, branches
   B1–B8) is the work list, and C1 and C3 in `SETUP_TASKS.md` close as their tasks finish.
   **Milestone M3 closed on 2026-10-04** (user: "consider M3 finished"): an honest SmolLM2 step
   is accepted under the provisional bands, and the per-class residual table prints. With the
@@ -61,14 +70,20 @@ The design process is gated, and each stage starts only after the previous one c
   `Λ` (residual 10.1). This is the verifier-rounding excess C1 already expects (`s_h ≈ 4.2`,
   `τ ≈ 33`), so A11's calibration resolves it. Speed work the same day (`PERFORMANCE_TASKS.md`,
   O2–O6) brought the verifier from about 3.2 s to 1.64 s per step, all bit-identical. M4
-  (A11, the C1 calibration run) is next, started without a gate on the user's instruction. At
+  (A11, the C1 calibration run) followed without a gate on the user's instruction.
+  **Milestone M4 and C1 closed on 2026-10-05** (user approved): `s_h = 5.50` (`Λ`), `τ = 44.0`,
+  `k` recomputed to **9**, now the default `VERIF_K`; `κ_max` is 2× the largest honest `κ` per
+  class (user); `τ_W = 4`; coherence 1.07. A12 then accepted all 10 honest steps under the
+  frozen band file, with final weights equal to the plain baseline's (B7). See
+  `DECISIONS_SETUP.md` §8.B C1. At
   stage 4 the per-step check order became `4 → 7 → 2 → 6a → 5 → 6b` for every run, revising
   S6c (see `DECISIONS_SETUP.md` §8.B S6c). T0 pinned the environment: a project-local `.venv`
   on Python 3.14 with torch 2.9.1 and transformers 4.57.6, `W_0` at
   `SmolLM2-135M-Instruct@12fd25f77366fa6b3b4b768ec3050bf629380bac`, and Alpaca at
   `tatsu-lab/alpaca@dce01c9b08f87459cf36a430d809084718273017`.
 - **P12 closed on 2026-09-30:** test scale sizes `k` against its **own** budget
-  (`T = 10`, `M = 7,113`, `N = 93.12`), so **`k = 7`**. The user's reason: full scale runs in
+  (`T = 10`, `M = 7,113`, `N = 93.12`), so **`k = 7`** (raised to 9 by C1 on 2026-10-05,
+  once the measured `τ = 44` replaced the provisional 8). The user's reason: full scale runs in
   bfloat16 (`k = 24`), so full-scale terms paired with fp32's `b₀` describe no configuration
   that will run. The thin test-scale margin (about 1.2×) is accepted for now. Implementation starts at
   `k = 7`, and raising it to 9 for margin is open in appendix §12.7, to be discussed after C1
