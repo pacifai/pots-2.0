@@ -82,7 +82,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_DATASET_REVISION` | `dce01c9b08f87459cf36a430d809084718273017` |
 | `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32` |
 | `VERIF_ATTN_IMPL` | `eager` |
-| `VERIF_K` | `7` |
+| `VERIF_K` | `9` (was 7 until C1 recomputed it from the measured `τ`, 2026-10-05) |
 | `VERIF_BATCH` (`n_s`) / `VERIF_SEQ_LEN` (`n`) | `4` / `128` |
 | `VERIF_STEPS` (`T`) | `10` |
 | `VERIF_N_RECORDS` | `500` |

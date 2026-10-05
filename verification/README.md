@@ -375,8 +375,7 @@ refuses a missing file and a file calibrated at another `k`. The harness then ch
 `runs/calibrate.py` does all of this on the real SmolLM2 run:
 
 ```bash
-.venv/bin/python -m verification.runs.calibrate            # k from VERIF_K
-VERIF_K=9 .venv/bin/python -m verification.runs.calibrate  # after it asks for k = 9
+.venv/bin/python -m verification.runs.calibrate   # k from VERIF_K, default 9
 ```
 
 It then judges steps 1–3 twice more from the band file: once as the protocol runs and once
@@ -388,9 +387,9 @@ The first calibration (2026-10-05, dev Mac, steps 1–3):
 - `s_h = 5.50` (`Λ`, the output-layer product), so `τ = 44.0`. Its largest residual is 14.5,
   2.6 times `s_h`, under the guard's 22.0. `dF` is next (RMS 3.1). Every other class has an
   RMS between 0.3 and 0.9.
-- `k` comes out at 9. At the default `k = 7`, the vocabulary-sized product `dF` gets a floor
-  4.8 times its own size, far above the target of 1, so the run stops and asks for
-  `VERIF_K=9`. At `k = 9` every product's floor is at most 0.61 of its size, below the
+- `k` comes out at 9. At the then-default `k = 7`, the vocabulary-sized product `dF` gets a
+  floor 4.8 times its own size, far above the target of 1, so the run stopped and asked for
+  `VERIF_K=9`. The default is now 9. At `k = 9` every product's floor is at most 0.61 of its size, below the
   `1/√2` margin of a batch with one poisoned record.
 - `τ_W` is 4 on all 272 tensors (largest `ρ` 2.0).
 - Under the band file, steps 1–3 are accepted with the guard on and off. The step-2 `Λ`
