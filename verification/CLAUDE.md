@@ -939,3 +939,28 @@ interface.
     in step 3's verifier; that process also holds the harness's model and check 8's weights.
 - Later: `run_verified.py` and the other runs. A12 builds its verifier with
   `bands=calibration.load_bands(pc.band_file, k=pc.k)`.
+- Cheat runs (A13, milestone M5), all judged by the frozen band file, read-only. Each module
+  docstring has the full flow.
+  - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step and
+    poisoning rate, `W_0`, bands, `k`, one `ReusedModel`, one `run_verified.JudgingVerifiers`),
+    `load_env(cfg, pc)` (SmolLM2; `D̃` checked against `meta.json`'s `h_D_tilde`), `run_cheat`
+    (one scenario cut at `T`, plus a `cheat_oracle` record: declared vs actual, `outcome`,
+    latency, `ρ_5`/`ρ_6`), `band_sources` (P10a's one-hash assertion) and `report_oracle`.
+  - `scenarios.py` gained `Expected.product` (check 5's declared product), `outcome()` (`exact`,
+    `accepted`, `rejected`, `early`, `overrun`, `wrong-check`, `wrong-kind`, `wrong-product`;
+    only `exact` passes) and the faults `FlipProduct`, `NudgeWNext`, `TrainedElsewhereWNext`,
+    `HiddenStep`, `CommitBatch` (A1), `TrainOn` (A2), `SpliceWNext` (A3) and `KeepStep`.
+  - `poisoned_step.py`: A1 → `(1, "4")`, A2 → `(1, "5")` on `P_1` (`L1.Y_q`), A3 → `(1, "6a")`,
+    one-step runs from `W_0`; A1's and A2's `W_2` asserted bit-equal (S6e).
+  - `hidden_steps.py`: one hidden step on `b̃` between steps 1 and 2 → `(2, "7")`.
+  - `flipped_matmul_sweep.py`: honest steps 1–4 (accepted, step 4 kept), the `dF` sign flip at
+    step 4 → `(4, "5")` on `P_2372`, then the planted-error sweep on step 4 (S6f): one target
+    per class, shapes `entry`/`entry2`/`dense`, grid `x = f/(τ·e_m)`, re-rooted with
+    `perturb_leaf`, judged with check 5's own `_measure_run`/`_judge_product`. Writes
+    `sweep_point`/`sweep_summary` records and `sweep_trials.npz`.
+  - Real runs, 2026-10-05, dev Mac, `MallocLargeCache=0`, band file `b696b6a8…` (k 9, τ 44.0):
+    every cheat exact. Sweep (200 trials per point, 13 points, 30 classes, 3 shapes): every
+    class and shape rejects every trial from `x ≤ 2`, so `f_all ≤ 2·τ·e_m` (`dF`: 8.8e−4 of
+    `‖P‖_F` against the floor 0.61). Fitted single-entry `ĉ` 0.54–0.63 (theory `σ_r = 0.577`;
+    the sizing's `c = 0.798` is conservative), two entries about 0.1, dense 0. 54 min, peak
+    footprint 8.9 GB.

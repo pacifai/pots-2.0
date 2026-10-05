@@ -88,9 +88,9 @@ from verification.verifier.context import Section, StepStats
 from verification.verifier.driver import Verifier
 from verification.verifier.residuals import format_tensor_table, tensor_summary
 
-__all__ = ["RUN_NAME", "WATCH_CLASS", "StepSummary", "VerifiedRun", "step_summary",
-           "summary_record", "run_verified", "calibration_band_hash", "report_summaries",
-           "main"]
+__all__ = ["RUN_NAME", "WATCH_CLASS", "StepSummary", "VerifiedRun", "JudgingVerifiers",
+           "step_summary", "summary_record", "run_verified", "calibration_band_hash",
+           "report_summaries", "main"]
 
 RUN_NAME = "run_verified"  # the metrics directory under VERIF_OUTPUT_DIR
 SUMMARY_RECORD = "residual_summary"
@@ -174,7 +174,7 @@ def _step_line(s: StepSummary, tau: float) -> str:
 # ---- the run ----------------------------------------------------------------------------
 
 
-class _Verifiers:
+class JudgingVerifiers:
     """A ``run_scenario`` verifier factory that judges with the band file's bands and keeps
     every verifier it builds, so each one's band source can be compared afterwards."""
 
@@ -199,7 +199,7 @@ class VerifiedRun:
     result: ScenarioResult
     bands: Bands
     summaries: list[StepSummary]
-    factory: _Verifiers  # builds this run's verifiers, and later the passes'
+    factory: JudgingVerifiers  # builds this run's verifiers, and later the passes'
     watch: str = WATCH_CLASS
 
     @property
@@ -230,7 +230,7 @@ def run_verified(c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torc
     Each closed step is summarized (:func:`step_summary`), printed, and with ``writer``
     written as a ``residual_summary`` record. Steps in the band file's ``calibration_steps``
     are marked in-sample. ``watch`` names the class whose residuals are all logged."""
-    factory = _Verifiers(c, len(D), w0, bands, k=k, h_D=h_D)
+    factory = JudgingVerifiers(c, len(D), w0, bands, k=k, h_D=h_D)
     cal_steps = set(bands.stats.get("calibration_steps", ()))
     summaries: list[StepSummary] = []
 
