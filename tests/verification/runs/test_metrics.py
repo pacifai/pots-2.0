@@ -186,6 +186,11 @@ def test_residual_arrays_round_trip(smoke):
     for name, res in results.items():
         want = {t: s for t, s in res.verifier.stats.items() if s.products or s.tensors}
         assert back.get(name, {}) == want
+        # The product scales (A11) stay out of equality, so compare them here, bit for bit.
+        for t, st in want.items():
+            assert [(p.q, p.p_norm, p.nu, p.p_abs1) for p in back[name][t].products] == \
+                [(p.q, p.p_norm, p.nu, p.p_abs1) for p in st.products]
+            assert all(p.q >= 2 and p.p_norm > 0 for p in st.products)
     res = results["honest"]
     with np.load(out / "residuals" / "honest" / "step_00001.npz", allow_pickle=False) as z:
         assert str(z["run"]) == "test" and int(z["step"]) == 1

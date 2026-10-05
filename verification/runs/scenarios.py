@@ -36,6 +36,7 @@ from verification.runs.metrics import (
 )
 from verification.verifier.bands import Bands
 from verification.verifier.checks import DEFAULT_ORDER
+from verification.verifier.context import Section
 from verification.verifier.driver import Verifier
 
 __all__ = ["Expected", "Scenario", "ScenarioResult", "HONEST", "ReusedModel", "honest_final",
@@ -159,17 +160,25 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
                  on_step: Callable[[StepRecord], None] | None = None,
                  recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
                  h_D: bytes | None = None,
-                 build_model: BuildModel | None = None) -> ScenarioResult:
+                 build_model: BuildModel | None = None,
+                 verifier: Callable[[Section | None], Verifier] | None = None) -> ScenarioResult:
     """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams.
 
     ``h_D`` is the agreed dataset root the verifier's check 1 compares with; by default it is
     computed from ``dataset`` (the MLP's synthetic ``D`` has no published root).
-    ``build_model`` (default ``c.build_model``) gives the prover's model."""
+    ``build_model`` (default ``c.build_model``) gives the prover's model. ``verifier`` builds
+    the verifier from the metrics seam, in place of the default one with provisional bands:
+    C1 (``runs/calibrate.py``) builds one in calibration mode or with the band file."""
     section = None if recorder is None else recorder.section
     if h_D is None:
         h_D = dataset_tree(c, dataset).root
-    v = Verifier(c, h_D=h_D, n_records=len(dataset), k=k, n_steps=T,
-                 bands=Bands.provisional(), w0=w0, allow_provisional=True, section=section)
+    if verifier is None:
+        v = Verifier(c, h_D=h_D, n_records=len(dataset), k=k, n_steps=T,
+                     bands=Bands.provisional(), w0=w0, allow_provisional=True, section=section)
+    else:
+        v = verifier(section)
+        if v.section is not section or v.n_steps != T or v.k != k:
+            raise ValueError("the given verifier must use this run's seam, T and k")
     if recorder is not None:
         recorder.bind(v)
         rec, user = recorder, on_step
@@ -222,19 +231,25 @@ def memory_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, 
                *, run: str, T: int, k: int, final: Mapping[str, torch.Tensor],
                h_D: bytes | None = None, scenario: Scenario = HONEST,
                device: str | torch.device = "cpu",
-               build_model: BuildModel | None = None) -> list[dict[str, Any]]:
-    """The B6 memory pass: ``scenario`` over ``T`` steps, probed at every section, never timed."""
+               build_model: BuildModel | None = None,
+               verifier: Callable[[Section | None], Verifier] | None = None
+               ) -> list[dict[str, Any]]:
+    """The B6 memory pass: ``scenario`` over ``T`` steps, probed at every section, never timed.
+    ``verifier`` is as in :func:`run_scenario`."""
     return memory_pass(run, scenario.name, lambda rec: run_scenario(
         c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D,
-        build_model=build_model),
+        build_model=build_model, verifier=verifier),
         memory_probe(device))
 
 
 def count_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
               *, run: str, T: int, k: int, final: Mapping[str, torch.Tensor],
               h_D: bytes | None = None, scenario: Scenario = HONEST,
-              build_model: BuildModel | None = None) -> list[dict[str, Any]]:
-    """The B6 counting pass: ``scenario`` over ``T`` steps, counted, never timed."""
+              build_model: BuildModel | None = None,
+              verifier: Callable[[Section | None], Verifier] | None = None
+              ) -> list[dict[str, Any]]:
+    """The B6 counting pass: ``scenario`` over ``T`` steps, counted, never timed.
+    ``verifier`` is as in :func:`run_scenario`."""
     return count_pass(run, scenario.name, lambda rec: run_scenario(
         c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D,
-        build_model=build_model))
+        build_model=build_model, verifier=verifier))

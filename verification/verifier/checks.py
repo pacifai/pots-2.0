@@ -460,7 +460,8 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
         specs = run[:len(served)]
         with ctx.timed("5.measure"):
             measures = _measure_run(specs, served, h=root, k=ctx.k, eps_in=ctx.eps_in,
-                                    eps_acc=ctx.eps_acc, scratch=scratch)
+                                    eps_acc=ctx.eps_acc, scratch=scratch,
+                                    guard=ctx.kappa_guard)
         for spec, mp in zip(specs, measures):
             rej = _judge_product(c, spec, mp, ctx, bands)
             if rej is not None:
@@ -487,17 +488,19 @@ def _served(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay:
 def _measure_run(specs: Sequence[ProductSpec],
                  served: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], *,
                  h: bytes, k: int, eps_in: float, eps_acc: float,
-                 scratch: MeasureScratch | None = None) -> list[ProductMeasure]:
+                 scratch: MeasureScratch | None = None,
+                 guard: bool = True) -> list[ProductMeasure]:
     """Check 5's numbers for each product of a run, in run order.
 
     A run of one goes through ``measure_product``. A longer run is split by operand shapes,
     and each group is stacked and measured with ``measure_products``. ``scratch`` is the
-    buffer check 5 reuses across the step's products.
+    buffer check 5 reuses across the step's products. ``guard=False`` skips test 1
+    (``StepContext.kappa_guard``).
     """
     if len(specs) == 1:
         (a, b, p), = served
         return [measure_product(a, b, p, h=h, m=specs[0].m, k=k, eps_in=eps_in,
-                                eps_acc=eps_acc, scratch=scratch)]
+                                eps_acc=eps_acc, scratch=scratch, guard=guard)]
     groups: dict[tuple[tuple[int, int], tuple[int, int]], list[int]] = {}
     for i, spec in enumerate(specs):
         groups.setdefault((spec.a_shape, spec.b_shape), []).append(i)
@@ -506,19 +509,24 @@ def _measure_run(specs: Sequence[ProductSpec],
         a, b, p = (torch.stack([served[i][x] for i in idx]) for x in range(3))
         for i, mp in zip(idx, measure_products(a, b, p, h=h, ms=[specs[i].m for i in idx], k=k,
                                                eps_in=eps_in, eps_acc=eps_acc,
-                                               scratch=scratch)):
+                                               scratch=scratch, guard=guard)):
             out[i] = mp
     return [mp for mp in out if mp is not None]
 
 
 def _judge_product(c: DeclaredComputation, spec: ProductSpec, mp: ProductMeasure,
                    ctx: StepContext, bands: Bands) -> Rejection | None:
-    """Record product ``spec.m``'s numbers, then judge them: finiteness, test 1, test 2."""
+    """Record product ``spec.m``'s numbers, then judge them: finiteness, test 1, test 2.
+
+    With ``ctx.kappa_guard`` off, test 1 and its two numbers are skipped (C1's cost split)."""
     cls_key = product_class(c, spec)
     nu, p_abs1, kappa, res, unit = mp.nu, mp.p_abs1, mp.kappa, mp.residuals, mp.unit
     normalized = mp.normalized
-    ctx.stats.products.append(ProductStat(spec.m, spec.name, cls_key, kappa, normalized))
-    values = {"ν": nu, "‖|P|·1‖": p_abs1, "‖P‖_F": mp.p_norm, "band unit": unit,
+    ctx.stats.products.append(ProductStat(spec.m, spec.name, cls_key, kappa, normalized,
+                                          q=spec.a_shape[1], p_norm=mp.p_norm, nu=nu,
+                                          p_abs1=p_abs1))
+    guard = {"ν": nu, "‖|P|·1‖": p_abs1} if ctx.kappa_guard else {}
+    values = {**guard, "‖P‖_F": mp.p_norm, "band unit": unit,
               **{f"residual j={j}": x for j, x in enumerate(res, start=1)}}
     bad = [key for key, v in values.items() if not math.isfinite(v)]
     if bad:
@@ -526,7 +534,7 @@ def _judge_product(c: DeclaredComputation, spec: ProductSpec, mp: ProductMeasure
     if not ctx.judge:
         return None
     kappa_max = bands.kappa_for(cls_key)
-    if not nu <= kappa_max * p_abs1:
+    if ctx.kappa_guard and not nu <= kappa_max * p_abs1:
         return ctx.reject("5", f"P_{spec.m} ({spec.name}): cancellation factor κ = "
                                f"{kappa:.3g} > κ_max = {kappa_max:g} [{cls_key}]")
     for j, x in enumerate(res, start=1):

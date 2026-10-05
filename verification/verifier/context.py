@@ -14,6 +14,7 @@ the leaf (``checks.py`` docstring, "Errors").
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -94,6 +95,12 @@ class ProductStat:
 
     ``normalized[j−1] = ‖A(B·r_j) − P·r_j‖ / (σ_r·e_m·‖P_m‖_F)``, the quantity compared with
     ``τ`` (P3.a). ``inf`` when the band's scale is zero and the residual isn't.
+
+    C1 (A11) also needs each product's scale: ``q`` (its contracted dimension, which sets
+    ``e_m``), ``‖P_m‖_F``, ``ν_m`` and ``‖|P_m|·1‖``. The realized floor is
+    ``f_achieved(e_m)·‖P_m‖_F``, and a product with ``‖|P|·1‖ = 0`` but ``ν ≠ 0`` is one the
+    guard rejects by construction. They default to unknown (``q = 0``, NaN) and stay out of
+    equality, so a NaN read back from a file can't make two equal records differ.
     """
 
     m: int
@@ -101,6 +108,10 @@ class ProductStat:
     cls: str
     kappa: float
     normalized: tuple[float, ...]
+    q: int = field(default=0, compare=False)
+    p_norm: float = field(default=math.nan, compare=False)
+    nu: float = field(default=math.nan, compare=False)
+    p_abs1: float = field(default=math.nan, compare=False)
 
 
 @dataclass(frozen=True)
@@ -232,6 +243,9 @@ class StepContext:
     eps_acc: float  # unit roundoff of the accumulator (C.accumulator_dtype)
     eps_w: float  # unit roundoff of the weight format (P5)
     judge: bool = True  # False: calibration mode (P10b); checks 5 and 6 record, never judge
+    # False skips check 5's test 1 (the κ guard). Only C1's cost split uses it, to time check 5
+    # without the guard; κ, ν and ‖|P|·1‖ are then recorded as NaN.
+    kappa_guard: bool = True
     state: StepState = field(default_factory=StepState)
     stats: StepStats = field(default_factory=StepStats)
     section: Section | None = None  # B6 metrics seam; None runs the checks unobserved

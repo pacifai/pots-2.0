@@ -90,6 +90,7 @@ class Verifier:
         calibrate: bool = False,
         allow_provisional: bool = False,
         section: Section | None = None,
+        kappa_guard: bool = True,
     ) -> None:
         if (w0 is None) == (w0_hashes is None):
             raise ValueError("give exactly one of w0 and w0_hashes")
@@ -101,6 +102,8 @@ class Verifier:
             raise ValueError(f"n_steps (T) must be a positive int, got {n_steps!r}")
         if bands is None and not calibrate:
             raise ValueError("bands are required outside calibration mode")
+        if calibrate and not kappa_guard:
+            raise ValueError("calibration fits κ_max, so it needs the κ guard on")
         self.c = computation
         self.h_D = h_D
         self.n_records = int(n_records)
@@ -123,6 +126,9 @@ class Verifier:
         self.stats: dict[int, StepStats] = {}
         # B6 metrics seam (runs/metrics.py): wraps each check; observes only.
         self.section = section
+        # False skips check 5's κ guard (test 1). Only C1's cost split sets it, to time check 5
+        # without the guard; every judged run of the protocol keeps it on.
+        self.kappa_guard = kappa_guard
 
     def _timed(self, name: str) -> AbstractContextManager[Any]:
         return no_section(name) if self.section is None else self.section(name)
@@ -212,7 +218,7 @@ class Verifier:
             self.c, step=t, indices=tuple(self._schedule(t)), h_D=self.h_D,
             n_records=self.n_records, prev_w_hashes=self._chain,
             chain_check_id="0" if t == 1 else "7", k=self.k, judge=not self.calibrate,
-            section=self.section)
+            section=self.section, kappa_guard=self.kappa_guard)
         timings = self.timings[t] = {}
         self.stats[t] = ctx.stats
         for check_id in DEFAULT_ORDER:
