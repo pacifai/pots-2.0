@@ -52,8 +52,10 @@ The design process is gated, and each stage starts only after the previous one c
   cost grid, and B7 (plain-training baseline) and B8 (ASR rehearsal) are new. The rejected
   agent commit `1e3155a` ("Add the one-time eta tuning run (B6, C2)") was never merged; its
   worktree and branch were deleted on 2026-10-04.
-- **Implementation (stage 5) started on 2026-09-30; the next item is **M5**, the user's
-  approval of the last milestone; all of A1–A14 are merged.** C3 closed on 2026-10-05 with task
+- **Implementation (stage 5) started on 2026-09-30; milestone M5 closed on 2026-10-05
+  (user approved; main merge `33d09bd`), so all of A1–A14 are done; the next item is **EQ10**,
+  the user's decision on how the sweep's measured miss rates restate EQ10's single-curve
+  claim.** C3 closed on 2026-10-05 with task
   A14: the in-memory and on-disk stores make identical decisions (`DECISIONS_SETUP.md` §8.B
   C3). A13 (merge `4a22c0b`, 2026-10-05) rejected each cheat exactly at its declared step and
   check under the frozen band file: A1 at (1, 4), A2 at (1, 5) on `P_1`, A3 at (1, 6a), the
