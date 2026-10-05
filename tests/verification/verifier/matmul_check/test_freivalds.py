@@ -316,3 +316,23 @@ def test_zero_free_products_skip_the_scaled_copy_of_p(monkeypatch):
     p[0, 0] = 0.0
     measure_product(a, b, p, h=H, m=1, k=K, eps_in=EPS, eps_acc=EPS)
     assert (40, 56) in shapes
+
+
+# ---- the κ guard off (C1's cost split only) ---------------------------------------------
+
+
+def test_guard_off_keeps_test_2_bits_and_drops_kappa():
+    a, b, p = _honest(24, 40, 16, seed=3)
+    on = measure_product(a, b, p, h=H, m=5, k=K, eps_in=EPS, eps_acc=EPS)
+    off = measure_product(a, b, p, h=H, m=5, k=K, eps_in=EPS, eps_acc=EPS, guard=False)
+    for f in ("residuals", "p_norm", "unit", "normalized"):
+        assert _bits(off)[FIELDS.index(f)] == _bits(on)[FIELDS.index(f)], f
+    assert all(math.isnan(x) for x in (off.nu, off.p_abs1, off.kappa))
+    ab, bb, pb = _batch(3, 12, 20, 8, seed=4)
+    ms = [21, 22, 23]
+    on_b = measure_products(ab, bb, pb, h=H, ms=ms, k=K, eps_in=EPS, eps_acc=EPS)
+    off_b = measure_products(ab, bb, pb, h=H, ms=ms, k=K, eps_in=EPS, eps_acc=EPS, guard=False)
+    for x, y in zip(on_b, off_b):
+        for f in ("residuals", "p_norm", "unit", "normalized"):
+            assert _bits(y)[FIELDS.index(f)] == _bits(x)[FIELDS.index(f)], f
+        assert math.isnan(y.kappa)
