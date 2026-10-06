@@ -157,19 +157,26 @@ Each product leaf is the product exactly as the spec's `P = A·B` defines it. Ea
 member of a batched attention product is its own leaf, an `n×n` or `n×d_h` matrix. The
 weight-gradient `G_x` is `[o, i]`, the same shape as `W_x`.
 
-## Per-step check order (S6c revised at stage 4)
+## Per-step check order (S6c revised at stage 4; F15a, task C7)
 
-`4 → 7 → 2 → 6a → 5 → 6b`, the same order in every run. The verifier is byte-identical across
-runs (S6a).
+`4 → 7 → 2 → 6a → 5 → 6b → 2.root`, the same order in every run. The verifier is
+byte-identical across runs (S6a).
 
 | step | check |
 |---|---|
 | 4 | batch anchor: each record leaf plus its path verifies into `h_D` at index `π(t)_i` |
 | 7 | chaining: the `W_t` leaf hashes equal the previous step's `W_{t+1}` leaf hashes |
-| 2 | commitment: recompute the root over all leaves and compare it with the claimed `h` |
+| 2 | commitment, read: read, hash and validate every leaf once, bind it to what 4 and 7 read, and check that the claimed `h` is a 32-byte digest. No root comparison |
 | 6a | update identity, linear weights, from the committed `G_x` |
-| 5 | matmul checks in canonical order, with the two tests of spec §6. Abort at the first failure |
+| 5 | matmul checks in canonical order, with the two tests of spec §6, challenges from the claimed `h`. Abort at the first failure |
 | 6b | update identity for γ scales and `W_E` (`G_E^head + G_E^emb`), from the backward glue that check 5 replayed |
+| 2.root | commitment, root comparison: the root over check 2's leaf hashes equals the claimed `h`. Rejects as check `"2"` |
+
+Check 5 keys its challenges on the claimed `h`, and the root comparison runs last (F15a in
+`DECISIONS_FULL_SCALE.md`, task C7). The accept condition is unchanged: a step passes only if
+`root(leaves) = h` and every check passes with challenges from `h`. The prover gains nothing,
+since it can always compute the challenges from `h` itself. A root mismatch rejects at `"2"`
+whatever the other checks said, but an earlier rejection stands (the first one wins).
 
 Check 3 isn't a separate pass. It is the rule that check 5's operands are rebuilt from
 committed leaves. Checks 0 and 1 run at run start, and 8 and 9 at run end.
@@ -601,9 +608,10 @@ interface.
   - `Rejection(step, check_id, detail, kind)`, with `kind` `"malformed"` (prover data failed to
     read, decode, hash or validate) or `"failed"` (a check's test failed).
   - `StepContext.for_computation(c, step=, indices=, h_D=, n_records=, prev_w_hashes=,
-    chain_check_id=, k=, judge=)`. `ctx.state` (`StepState`) carries check 2's root, leaf
-    hashes and `CommittedLeaves` to later checks (`ctx.state.committed()`), and check 5's
-    replay to 6b. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
+    chain_check_id=, k=, judge=)`. `ctx.state` (`StepState`) carries what check 2's read
+    produced to later checks: `claimed_root` (the prover's `h`, validated as a digest; check 5
+    keys on it), the leaf hashes and `CommittedLeaves` (`ctx.state.committed()`). It carries
+    check 5's replay to 6b. The root comparison writes `recomputed_root`. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
     normalized residual, κ and ρ, which is P10b's calibration feed. `ProductStat` also
     carries each product's scale for C1's realized floor: `q`, `p_norm` (`‖P‖_F`), `nu` and
     `p_abs1` (`‖|P|·1‖`). They default to `0`/NaN and are left out of equality.
@@ -621,19 +629,24 @@ interface.
   - `product_class(c, spec)` keys κ classes. It uses `c.product_class` if `C` has one.
 - `checks.py` (A5):
   - Each check is a pure function `(store, c, ctx, bands) -> Rejection | None`, kept in
-    `CHECKS` under its id. `DEFAULT_ORDER = ("4","7","2","6a","5","6b")`.
+    `CHECKS` under its slot id. `DEFAULT_ORDER = ("4","7","2","6a","5","6b","2.root")`.
+    Check 2 has two slots (F15a, task C7): `check_2_commitment` (`"2"`, the read) and
+    `check_2_root` (`ROOT_SLOT = "2.root"`, the root comparison). Both reject as `"2"`;
+    `protocol_id(slot)` maps a slot to the id its rejections carry. `check_2_root` reads
+    nothing from the store, so a streaming store can reuse it.
   - **Errors.** Prover-data errors are mapped to a rejection only around store reads, leaf
-    hashing and validation. After check 2, replay, operands and glue run on validated leaves,
-    so their errors propagate as verifier bugs; only `TranscriptFormatError` is mapped there.
-    A violated verifier-side precondition raises `RuntimeError`.
-  - **Byte binding.** Check 2 reads every leaf once and keeps the objects in a
+    hashing and validation. After check 2's read, replay, operands and glue run on validated
+    leaves, so their errors propagate as verifier bugs; only `TranscriptFormatError` is mapped
+    there. A violated verifier-side precondition raises `RuntimeError`.
+  - **Byte binding.** Check 2's read takes every leaf once and keeps the objects in a
     `CommittedLeaves` reader, guarded by `_version`; checks 6a, 5 and 6b read only that.
     Checks 4 and 7 record the hashes they saw in `ctx.state.early_hashes`, and check 2 rejects
     if its own read hashes differently. Check 2 reads and validates leaves in order and
     hashes them in parallel, so a leaf hashes after later reads. It therefore checks every
-    cached leaf's `_version` both before and after the root comparison (a write during
-    check 2 is a malformed rejection at 2). Checks 4 and 7 stay leaf by leaf. This
-    keeps every leaf in memory for the step (see F1–F3 at full scale).
+    cached leaf's `_version` both before and after reading the claimed root (a write during
+    check 2 is a malformed rejection at 2). All of these rejections happen before 6a; only
+    the root comparison moved to the end. Checks 4 and 7 stay leaf by leaf. This keeps every
+    leaf in memory for the step (see F1–F3 at full scale).
   - **Finiteness.** Any non-finite ν, `‖|P|·1‖`, `‖P‖_F` or residual, and any non-finite
     check-6 residual or bound, rejects in either mode. Check 6 compares `ρ = |R|/scale`
     (float64) with `τ_W`, the same number `freeze` rejudges.
@@ -645,7 +658,9 @@ interface.
     `_update_identity_reference`, the spec's formula, so every rejection message is
     unchanged. `tests/verification/verifier/test_update_identity.py` compares the two.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
-    from the root it recomputed in check 2, never from `store.root`.
+    from the claimed root `store.root`, as check 2's read validated it
+    (`ctx.state.claimed_root`; F15a, task C7). The root comparison at the end of the step
+    shows that `h` is the root of the leaves.
   - **Member batching.** A run of consecutive member specs of one layer (`_member_runs`;
     on SmolLM2, `S`+`O` and `dA`+`dV`+`dQ`+`dK` of each layer) has its operands served one
     member at a time in canonical order, then stacked by shape and measured with
@@ -656,16 +671,20 @@ interface.
   schedule=, calibrate=False, allow_provisional=False, section=None, kappa_guard=True)`.
   `kappa_guard=False` (see `StepContext`) with `calibrate=True` raises `ValueError`, since
   calibration fits `κ_max`. `section` is B6's
-  metrics seam: it wraps each check under its id (step 1's chaining comparison is `"7"`;
-  `run:0` is check 0's anchor hashing), and `StepContext.section`/`timed(name)` pass it into
-  check 5 (`5.glue`, `5.measure`) and 6b (`6b.glue`). `context.no_section` is the no-op.
+  metrics seam: it wraps each check under its slot id (step 1's chaining comparison is `"7"`;
+  check 2's read is `"2"` and its root comparison `"2.root"`; `run:0` is check 0's anchor
+  hashing), and `StepContext.section`/`timed(name)` pass it into check 5 (`5.glue`,
+  `5.measure`) and 6b (`6b.glue`). `context.no_section` is the no-op.
   - `n_steps` (T) is required. Provisional bands are refused unless `allow_provisional=True`
     (P10a); `bands` may be `None` only when calibrating.
   - `start_run(D)` runs check 1 (including that `π(t)` fits `D` for every `t ≤ T`) and
     prepares check 0. At step 1, check 0 runs in check 7's slot and reports as `"0"`.
-  - `verify_step(t, store)` runs the default order and keeps the `W_{t+1}` hashes.
+  - `verify_step(t, store)` runs the default order and keeps the `W_{t+1}` hashes only once
+    every slot, the root comparison included, has passed.
   - `freeze(bands)` ends calibration (P10b): it re-judges every calibrated step's stats in
-    check order, records `bands.source`, and judges every later step.
+    check order, records `bands.source`, and judges every later step. The root comparison
+    runs live in calibration. Since it runs after 6a, 5 and 6b, a live rejection from it is
+    re-judged first: a band failure in that step's numbers replaces it, as in a judged run.
   - `end_run(final) -> RunVerdict(accepted, rejection, steps_verified, band_source)` runs
     checks 8 and 9. It raises while calibration is unfrozen.
   - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers.
@@ -818,7 +837,9 @@ interface.
       store lands here).
     - Fault hooks and dropping the store are outside every section.
   - **Verifier rows**: the checks in driver order under their own ids (step 1's chaining
-    comparison is `7`; the `step` record keys it `0`, the protocol id a rejection carries), and `0` (anchor hashing), `1`, `8`, `9` once per run. `9` is building
+    comparison is `7`; the `step` record keys it `0`, the protocol id a rejection carries;
+    check 2 has rows `2` (the read) and `2.root` (the root comparison, last), and a check-2
+    rejection marks the last of the two that ran as `fail` in the `step` record), and `0` (anchor hashing), `1`, `8`, `9` once per run. `9` is building
     the verdict, kept as a row although negligible. Check 5 splits into `5.glue` and
     `5.measure`; check 3 has no row, its cost is `5.glue`.
   - **FLOPs** use torch's `flop_registry` formulas through `_FlopTally`, not

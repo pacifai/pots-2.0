@@ -42,11 +42,13 @@ Fault hooks (``ProverFault.emit`` and friends) and dropping the step's store are
 sit outside every section. A verified run never emits a ``P0`` row, and the recorder never emits
 a ``P1`` component: only :func:`derive_capture` does. Prover overhead is P1–P5.
 
-**Verifier components** are the checks, by id, in driver order: per step ``4``, ``7``, ``2``,
-``6a``, ``5``, ``6b``; once per run (step 0) ``0`` (hashing the agreed ``W_0``), ``1``, ``8`` and
-``9``. At step 1 the chaining comparison runs in check 7's slot against check 0's anchor
-hashes; its row is ``7``, so check 7's series starts at step 1, and check 0's row is the anchor
-hashing. ``9`` wraps building the verdict, kept as a row though its cost is negligible, so
+**Verifier components** are the checks, by slot id, in driver order: per step ``4``, ``7``,
+``2``, ``6a``, ``5``, ``6b``, ``2.root``; once per run (step 0) ``0`` (hashing the agreed
+``W_0``), ``1``, ``8`` and ``9``. At step 1 the chaining comparison runs in check 7's slot
+against check 0's anchor hashes; its row is ``7``, so check 7's series starts at step 1, and
+check 0's row is the anchor hashing. Check 2 has two rows (F15a): ``2`` reads, hashes and
+validates every leaf, and ``2.root``, last in the step, builds the root from those hashes and
+compares it with the claim. ``9`` wraps building the verdict, kept as a row though its cost is negligible, so
 every check has one. Check 5 is split (EQ1b) into ``5.glue`` (replay construction and every
 ``operands(m)``: glue recomputation) and ``5.measure`` (the Freivalds products), both ``sub``
 rows. Check 3 has no row of its own: it is the rule that check 5's operands come from committed
@@ -148,7 +150,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
 
-from verification.verifier.checks import DEFAULT_ORDER
+from verification.verifier.checks import DEFAULT_ORDER, protocol_id
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 
 __all__ = [
@@ -563,10 +565,11 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
     """EQ13 record 1 for step ``t``: the verdict, the first failing check, and each check's
     ``pass``, ``fail`` or ``not_run``.
 
-    ``checks`` and ``first_failing_check`` use protocol ids, the ids a ``Rejection`` carries:
-    at step 1 the chain slot is check 0 (``ctx.chain_check_id``), so it is keyed ``0``, and
-    ``checks[first_failing_check]`` is ``fail``. The cost rows keep the driver's slot id
-    ``7`` at step 1 too."""
+    ``first_failing_check`` is the protocol id a ``Rejection`` carries. ``checks`` is keyed by
+    driver slot, except that at step 1 the chain slot is check 0 (``ctx.chain_check_id``), so
+    it is keyed ``0``; the cost rows keep the slot id ``7`` at step 1 too. Check 2 has two
+    slots, ``2`` and ``2.root`` (F15a), and a rejection as check 2 marks the last of them that
+    ran as ``fail``."""
     def pid(cid: str) -> str:
         return "0" if t == 1 and cid == "7" else cid
 
@@ -574,7 +577,8 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
     failed = rejection is not None and rejection.step == t
     checks = {pid(c): ("pass" if pid(c) in ran else "not_run") for c in DEFAULT_ORDER}
     if failed:
-        cid = rejection.check_id if rejection.check_id in checks else (ran[-1] if ran else None)
+        slots = [c for c in ran if protocol_id(c) == rejection.check_id]
+        cid = slots[-1] if slots else (ran[-1] if ran else None)
         if cid is not None:
             checks[cid] = "fail"
     out = {"record": "step", "run": run, "scenario": scenario,

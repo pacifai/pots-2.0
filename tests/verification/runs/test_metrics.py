@@ -180,6 +180,18 @@ def test_step_record_uses_protocol_ids_at_step_1():
     assert "0" not in r["checks"] and r["checks"]["7"] == "fail"
 
 
+def test_step_record_marks_the_check_2_slot_that_rejected():
+    """Check 2 has two slots (F15a); a rejection as check 2 fails the last one that ran."""
+    read = {c: 0.1 for c in ("4", "7", "2")}
+    v = type("V", (), {"timings": {2: read, 3: {c: 0.1 for c in DEFAULT_ORDER}}})()
+    r = step_record("r", "s", 2, v, Rejection(step=2, check_id="2", detail="x", kind="malformed"))
+    assert r["first_failing_check"] == "2" and r["checks"]["2"] == "fail"
+    assert r["checks"]["2.root"] == "not_run"
+    r = step_record("r", "s", 3, v, Rejection(step=3, check_id="2", detail="x", kind="failed"))
+    assert r["first_failing_check"] == "2" and r["checks"]["2.root"] == "fail"
+    assert all(r["checks"][x] == "pass" for x in ("4", "7", "2", "6a", "5", "6b"))
+
+
 def test_residual_arrays_round_trip(smoke):
     out, results = smoke
     back = read_residuals(out)
@@ -261,9 +273,12 @@ def test_count_pass_and_storage(c, D, w0, smoke):
     commit = row[(1, "phase", "P3.commit")]
     assert commit["hash_in_bytes"] > 0
     assert commit["hash_calls"] == 2 * c.n_leaves - 1  # one per leaf and per internal node
-    # check 2 rehashes exactly what the prover committed
+    # check 2 rehashes exactly what the prover committed: the leaves in its read ("2"), the
+    # internal nodes in its root comparison ("2.root")
+    two, root = row[(1, "component", "2")], row[(1, "component", "2.root")]
+    assert two["hash_calls"] == c.n_leaves and root["hash_calls"] == c.n_leaves - 1
     for key in ("hash_in_bytes", "hash_out_bytes", "hash_calls"):
-        assert row[(1, "component", "2")][key] == commit[key]
+        assert two[key] + root[key] == commit[key]
     assert row[(1, "phase", "P5.write")]["hash_calls"] == 0
     assert (2, "component", "7") in row and (1, "component", "7") in row
     assert row[(0, "component", "0")]["hash_calls"] > 0 and row[(0, "component", "1")]["hash_in_bytes"] > 0
