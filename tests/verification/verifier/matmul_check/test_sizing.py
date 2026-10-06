@@ -1,4 +1,4 @@
-"""The worked values of the sizing appendix §10.1–10.4, at `c = √(2/3)` (the appendix uses 0.798)."""
+"""The worked values of the sizing appendix §10.1–10.3 and §11."""
 
 import math
 
@@ -35,19 +35,23 @@ def test_test_scale_10_1():
     assert f_achieved(C_ANTI, TAU, e, N, 7) == pytest.approx(0.878, abs=5e-3)
 
 
-def test_full_scale_fp32_10_2():
-    s = size_k(Q_MAX, FP32, FP32, T=2**20, M=matmul_count_llama(30, 128, 9))
-    assert s.N == pytest.approx(114.67, abs=5e-3)
+def test_test_scale_measured_tau_10_1():
+    s = size_k(Q_MAX, FP32, FP32, T=10, M=7_113, s_h=5.5)
+    assert s.b0 == pytest.approx(11.03, abs=5e-3)
     assert s.k == 9
-    assert s.f_achieved == pytest.approx(0.594, abs=5e-3)
+    assert s.f_achieved == pytest.approx(0.622, abs=5e-3)
 
 
-def test_full_scale_bf16_10_3():
-    s = size_k(Q_MAX, BF16, FP32, T=2**20, M=207_993)
-    assert s.e_max == pytest.approx(5.538e-3, rel=1e-3)
-    assert s.b0 == pytest.approx(4.789, abs=5e-3)
-    assert s.k == 24
-    assert s.f_achieved == pytest.approx(0.992, abs=5e-3)
+def test_full_scale_bf16_10_2():
+    # Llama-3.2-1B: 16 layers, 128 sequences, 32 heads; vocabulary 128,256.
+    M = matmul_count_llama(16, 128, 32)
+    assert M == 393_555
+    s = size_k(128_256, BF16, FP32, T=10, M=M)
+    assert s.e_max == pytest.approx(5.546e-3, rel=1e-3)
+    assert s.b0 == pytest.approx(4.787, abs=5e-3)
+    assert s.N == pytest.approx(98.91, abs=5e-3)
+    assert s.k == 21
+    assert s.f_achieved == pytest.approx(0.948, abs=5e-3)
 
 
 def test_size_k_test_scale_intermediates():
@@ -59,7 +63,7 @@ def test_size_k_test_scale_intermediates():
 def test_typical_contraction_11_1():
     bits = b0(1.0, TAU, e_m(576, FP32, FP32))
     assert bits == pytest.approx(16.62, abs=1e-2)
-    assert k_required(114.67, bits) == 7
+    assert k_required(93.12, bits) == 6
 
 
 @pytest.mark.parametrize("bits", [0.0, -1.0, float("nan")])

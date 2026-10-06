@@ -95,14 +95,15 @@
   from the steps under judgment. Decide it against the measured `κ` trajectory of the honest
   run. *(Came up while closing P3.)*
 - **F10 — Whether `k` should be sized against a poisoning rate rather than against `f = 1`.**
-  The sizing appendix's Section 12.4 shows the full-scale fp32 configuration at `k = 9` detects
-  substitution rates down to about 2.6%, and bfloat16 at `k = 24` down to about 4.3%, against a
-  published backdoor literature that works at 1–10%. The protocol therefore lands inside that
-  range and misses its quiet end. Raising `k` from 9 to 12 takes the threshold to about 0.45%
-  for roughly a third more check-5 arithmetic, since the achieved target scales as `2^(N/k)`.
-  Decide against the measured verify-versus-train ratio, and only after the coherence assumption
-  of appendix Section 12.2 has been measured at C1 — the whole threshold moves by 11× if it
-  fails. *(Came up while deriving the grinding threat, 2026-09-30.)*
+  The sizing appendix's Section 12.4 shows the full-scale bfloat16 configuration at `k = 21`
+  detects substitution rates down to about 4.2%, against a published backdoor literature that
+  works at 1–10%. The protocol therefore lands inside that range and misses its quiet end.
+  Raising `k` from 21 to 28 takes the threshold to about 1.9% for a third more check-5
+  arithmetic, since the achieved target scales as `2^(N/k)`. At `k = 21` one extra vector lowers
+  the achieved target by only about 16%, and the bf16 honest band sets a floor of about 0.16%
+  that no `k` gets below. Decide against the measured verify-versus-train ratio, and only after
+  the coherence assumption of appendix Section 12.2 has been measured at C1 — the whole
+  threshold moves by 11× if it fails. *(Came up while deriving the grinding threat, 2026-09-30.)*
 - **F11 — Whether `k` should be sized per matmul class rather than globally.** P4 sizes one
   global `k` at the binding product, the input-gradient of the output projection (`q = 49,152`,
   `b₀ = 13.52`). All but a handful of products contract over 576 or less, where `b₀ = 16.65` and
