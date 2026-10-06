@@ -35,6 +35,6 @@ def test_invalid_k_raises(value):
 
 
 def test_constants_match_claude_md_table():
-    assert (LAMBDA, LOG2_G, Z, F_TARGET, C_ANTI, TAU_W0) == (25, 52, 8, 1.0, 0.798, 4.0)
+    assert (LAMBDA, LOG2_G, Z, F_TARGET, C_ANTI, TAU_W0) == (25, 52, 8, 1.0, math.sqrt(2 / 3), 4.0)
     assert math.isclose(SIGMA_R, 1 / math.sqrt(3))
     assert UNIT_ROUNDOFF == {torch.float32: 2**-24, torch.bfloat16: 2**-8, torch.float16: 2**-11}

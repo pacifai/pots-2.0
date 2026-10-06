@@ -10,7 +10,7 @@ from verification.parameters import LAMBDA, LOG2_G
 # Test-scale values. See verification/CLAUDE.md and the sizing appendix §9.
 Z: float = 8.0  # band margin, τ = Z·s_h (P3, P10d)
 F_TARGET: float = 1.0  # sizing target ‖Δ‖ = f·‖P‖ (P4)
-C_ANTI: float = 0.798  # anti-concentration constant for Uniform(−1, 1)
+C_ANTI: float = math.sqrt(2.0 / 3.0)  # worst rank-1 Δ, U(−1,1) (Ball); 0.798 was Gaussian
 
 
 def e_m(q: int, eps_in: float, eps_acc: float) -> float:

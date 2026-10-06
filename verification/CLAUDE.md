@@ -52,7 +52,7 @@ details that don't change what is committed or checked are yours to choose.
 | `LOG2_G` | 52 | grind budget, ref block §8 |
 | `Z` | 8 | band margin, `τ = Z·s_h` (P3, P10d) |
 | `F_TARGET` | 1.0 | sizing target `‖Δ‖ = f·‖P‖` (P4) |
-| `C_ANTI` | 0.798 | anti-concentration constant for `Uniform(−1,1)` |
+| `C_ANTI` | `√(2/3)` ≈ 0.8165 | anti-concentration constant for `Uniform(−1,1)`: the worst rank-1 `Δ` (two equal entries in one row), by Ball's cube-slicing bound. Was 0.798, the Gaussian value, until 2026-10-05 |
 | `SIGMA_R` | `1/√3` | std of one challenge entry (P8b) |
 | `TAU_W0` | 4.0 | analytic floor of `τ_W` (P5) |
 | `K` | 7 | Freivalds vectors per matmul (P12). Env-configurable |
@@ -994,12 +994,19 @@ interface.
   - `hidden_steps.py`: one hidden step on `b̃` between steps 1 and 2 → `(2, "7")`.
   - `flipped_matmul_sweep.py`: honest steps 1–4 (accepted, step 4 kept), the `dF` sign flip at
     step 4 → `(4, "5")` on `P_2372`, then the planted-error sweep on step 4 (S6f): one target
-    per class, shapes `entry`/`entry2`/`dense`, grid `x = f/(τ·e_m)`, re-rooted with
+    per class, shapes `entry`/`entry2`/`row2`/`dense` (`row2`: two equal moves in one row, the
+    worst rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)`, re-rooted with
     `perturb_leaf`, judged with check 5's own `_measure_run`/`_judge_product`. Writes
-    `sweep_point`/`sweep_summary` records and `sweep_trials.npz`.
+    `sweep_point`/`sweep_summary` records and `sweep_trials.npz`, under `--subdir` if given.
+    `f_ach` uses `C_ANTI`, not the band file's recorded `c`. The stop condition also fires when
+    `ĉ` exceeds `C_ANTI` by more than 3 Poisson standard errors (`C_HAT_SIGMAS`).
   - Real runs, 2026-10-05, dev Mac, `MallocLargeCache=0`, band file `b696b6a8…` (k 9, τ 44.0):
     every cheat exact. Sweep (200 trials per point, 13 points, 30 classes, 3 shapes): every
     class and shape rejects every trial from `x ≤ 2`, so `f_all ≤ 2·τ·e_m` (`dF`: 8.8e−4 of
-    `‖P‖_F` against the floor 0.61). Fitted single-entry `ĉ` 0.54–0.63 (theory `σ_r = 0.577`;
-    the sizing's `c = 0.798` is conservative), two entries about 0.1, dense 0. 54 min, peak
-    footprint 8.9 GB.
+    `‖P‖_F` against the floor 0.61). Fitted single-entry `ĉ` 0.54–0.63 (theory `σ_r = 0.577`), two
+    entries (different rows) about 0.1, dense 0. 54 min, peak footprint 8.9 GB.
+  - `row2` run, 2026-10-05, same band file, in four class chunks under
+    `flipped_matmul_sweep/row2/`: `ĉ` 0.72–0.83, mean about 0.78 (the fit's expected value at
+    the bound is 0.777 ± 0.023, since `p₁` bends below `c/x` at `x = 3`); no class above
+    `C_ANTI` by 3 standard errors. Every trial rejected from `x = 1.5` or 2 (`dF`: `f_all`
+    1.2e−3 against `f_ach` 0.62). About 17 min.
