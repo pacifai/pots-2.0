@@ -182,20 +182,49 @@ rejected alternatives. If it came from `EVALUATION_TASKS.md`, delete it there.
   plants a random error of a chosen size in one matmul output, re-hashes the changed leaf, and
   records whether check 5 catches it.
   - The x-axis is the error size relative to the product's band, `x = f / (τ·e_m)`. On this
-    scale every matmul class follows one theory curve, `p₁ ≈ c/x`.
+    scale `p₁ ≤ c/x` is an upper bound for every class and every error shape. *(Revised
+    2026-10-05, user: the first version claimed one curve for every shape.)*
   - It plants errors in one product of each matmul class, including the binding product (the
     one that sets `k`).
-  - Two error shapes: spread out (dense random) and concentrated (1–2 entries, the attack the
-    spec's soundness section warns about).
+  - Four error shapes: dense random noise, one entry, two entries at random positions, and two
+    equal entries in one row. The last is the worst case and reaches the bound (below).
   - About 200 trials per point, with each challenge's outcome logged. A few points get 10× more
     trials.
   - **Figures:** (a) the single-challenge miss rate against `x`, with the theory line; (b) the
     whole-check detection rate against `f`, with the predicted floor marked (0.86 at test
-    scale). Figure (a) shows where the measured region ends (about 10⁻³).
+    scale when this was written, at `k = 7`; 0.61 at `k = 9` after C1, and about 0.62 with
+    `c = 0.816`). Figure (a) shows where the measured region ends (about 10⁻³).
   - **The argument** is amplification by independent repetition. The experiment measures one
     challenge's miss rate. The `k`-fold probability follows from the challenges' independence,
     which rests on the hash behaving like a random function (the random-oracle assumption), not
     on data.
+  - **The shapes differ, and the bound is set by the worst one** (revised 2026-10-05 after the
+    A13 sweep, user approved). One challenge `r` misses when `‖Δ·r‖` comes out `x` times
+    smaller than its typical size `σ_r·‖Δ‖_F`. How likely that is depends on the shape of `Δ`:
+    - one entry: `Δ·r = δ·r_j`, so a miss needs `|r_j| ≤ σ_r/x`, and `p₁ = σ_r/x = 0.577/x`.
+      The A13 sweep measured 0.54–0.63 across the 30 classes.
+    - dense noise: `‖Δ·r‖` concentrates at its typical size, so it is missed for `x ≤ 1` and
+      caught above, with no `1/x` tail. The sweep saw this cliff at `x = 1`.
+    - two entries in different rows: a miss needs both challenge entries near zero, so `p₁`
+      falls as `1/x²`. The sweep's random two-entry shape fitted `ĉ ≈ 0.1`.
+    - two equal entries in one row: `Δ·r = (δ/√2)(r₁ + r₂)`, whose triangular density gives
+      `p₁ = √2·σ_r/x = √(2/3)/x ≈ 0.816/x`. This is the worst case. For any rank-1 `Δ = u·vᵀ`,
+      `‖Δ·r‖ = ‖u‖·|v·r|`, so the miss rate is set by the density of `v·r` at 0, and Ball's
+      cube-slicing theorem (1986) bounds that density by exactly this value. A 4-million-sample
+      simulation gave 0.81. The sweep's first run never planted this shape.
+  - **Decision.** The sizing's constant becomes `c = √(2/3) ≈ 0.816`, the worst case under
+    `Uniform(−1,1)` challenges, in place of 0.798, the Gaussian value. The sweep adds the
+    one-row two-entry shape, so the bound is measured as well as derived. Figure (a) plots
+    every shape against the one bound line. Rejected: keeping 0.798 with a note, because the
+    paper would then state a bound that one shape breaks by 2%. The effect is small:
+    `f_achieved` rises in proportion to `c` (0.608 to about 0.622 on `dF`), and `k = 9` holds.
+  - **Measured (2026-10-06, merge `fdf6813`).** The one-row two-entry shape ran on all 30
+    classes of step 4 (200 trials, 13 points, `k = 9`). Fitted `ĉ` is 0.72–0.83, mean about 0.78
+    (`dF` 0.777). A simulation of the same fit predicts 0.777 ± 0.023: the fit sits below 0.816
+    because the triangular density bends the miss rate under `c/x` at small `x`. Four classes
+    land just above 0.816, all within about one standard error. Every trial is rejected from
+    `x = 1.5` or 2, so `f_all` is 0.0014–0.0019 of `f_achieved` (on `dF`, 1.2·10⁻³ against
+    0.622). The band file is unchanged: `c` enters only the sizing figures, not any check.
   - Check 6 needs no sweep: one planted out-of-band entry confirms it rejects with certainty.
     Full scale repeats the sweep in bfloat16 with `k = 24`.
 

@@ -62,7 +62,7 @@ enter the error at different rates (Section 2). When one format is used througho
 | `r` | a challenge vector of length `w_m`, entries drawn independently from the challenge distribution | — |
 | `σ_r` | standard deviation of one entry of `r`; for the uniform distribution on `(−1, 1)`, `σ_r = 1/√3 ≈ 0.5774` | arithmetic |
 | `k` | **repetition count**: the number of independent challenge vectors applied to each product | derived (Section 8) |
-| `c` | anti-concentration constant of the challenge distribution (Section 6); `c ≈ 0.798` | arithmetic |
+| `c` | anti-concentration constant of the challenge distribution (Section 6); `c = √(2/3) ≈ 0.816` (0.798 before 2026-10-06) | arithmetic |
 
 ### 1.4 Bands and targets
 
@@ -272,6 +272,17 @@ projection onto many independent entries the distribution is close to Gaussian, 
 the origin gives `c = 2·(2π)^(−1/2) ≈ 0.798`; it is insensitive to which continuous distribution
 is used, because the scale `σ_r` appears in the numerator and denominator of (6.1) and cancels.
 
+*Revised 2026-10-06 (`DECISIONS_EVALUATION.md` EQ10, user approved).* The Gaussian value is not
+the worst case for `Uniform(−1,1)` challenges, because a deviation spread over few entries
+keeps the projection far from Gaussian. For a rank-1 deviation `Δ = u·vᵀ`, `‖Δ·r‖ = ‖u‖·|v·r|`,
+so `p₁` is set by the density of `v·r` at 0. Ball's cube-slicing theorem (1986) bounds that
+density, and two equal entries in one row reach the bound: `c = √2·σ_r = √(2/3) ≈ 0.816`. One
+entry gives `σ_r = 0.577`, and a dense deviation has no `1/x` tail at all. The sizing now uses
+`c = √(2/3)`, so `log₂(1/c) = 0.29`, not 0.33, and every `b₀` drops by 0.034 bits. The A13
+sweep measured the one-row two-entry shape on all 30 classes: fitted `ĉ` 0.72–0.83, mean about
+0.78, against a simulated 0.777 ± 0.023 for the same fit. No class exceeds the bound by more
+than noise.
+
 Substituting the target (5.1) and cancelling `σ_r` and `‖P_m‖_F`:
 
 > **(6.2)**  `p₁ ≈ c · τ · e_m / f`
@@ -363,7 +374,7 @@ measurements, and no run produces them.
 | `z`, tolerance margin | 8 | How many multiples of the honest band the test allows before rejecting. It trades false rejection against detection: every doubling of `z` costs one bit of `b₀`. Chosen so that honest rejection stays rare across the roughly `2⁴¹` individual challenge evaluations of a full-scale run. |
 | `f`, detection target | 1 | Asks the protocol to detect any deviation as large as the product it corrupts. It is the **sizing input** and nothing else: `f_achieved` (8.1) is the claim to report, and the detectable substitution rate of 12.4 is a further claim derived from it, conditional on the unmeasured coherence factor of 12.2. P4 fixed this separation of roles. |
 | precision | fp32 at test scale; bfloat16 operands with fp32 accumulation at full scale | Sets `ε_in` and `ε_acc`, and through them the whole calculation. This is the single largest lever on `k` (Section 10). |
-| challenge distribution | uniform on `(−1, 1)` | Fixes `σ_r = 1/√3` and `c ≈ 0.798`. It must be continuous; a two-valued distribution admits deviations that no tolerance can catch. |
+| challenge distribution | uniform on `(−1, 1)` | Fixes `σ_r = 1/√3` and `c = √(2/3) ≈ 0.816` (Section 6). It must be continuous; a two-valued distribution admits deviations that no tolerance can catch. |
 
 The two **measured** inputs are `s_h` and `κ_max`, both from a short honest run. Everything else
 is structural or arithmetic.
@@ -374,6 +385,13 @@ is structural or arithmetic.
 Common to all three: `λ = 25`, `log₂G = 52`, `z = 8`, `f = 1`, `c = 0.798`, and `s_h` assumed to
 measure at 1 so that `τ = 8`. The binding product is the input-gradient of the output
 projection, which contracts over the vocabulary, `q_max = 49,152`.
+
+*These worked figures use `c = 0.798`. With `c = √(2/3)` (Section 6, 2026-10-06), each `b₀` is
+0.034 bits lower. Test scale keeps `k = 9` at the measured `τ = 44` (`f_achieved` on `dF` rises
+from 0.608 to 0.622; margin over `1/√2` 1.14×). Full scale keeps `k = 21` at `T = 10` for all
+four models. At the `2²⁰`-step reference of 10.3, `k` stays 24 for SmolLM2's product count and
+Falcon3-1B, and becomes 25 for Llama-3.2-1B and both Qwen2.5 models, which had almost no slack
+(`N/b₀` 24.02–24.15).*
 
 ### 10.1 Test scale — fp32, one 135M-parameter model, 10 steps
 
@@ -441,7 +459,8 @@ The calculation was checked against four independently derived results.
    matching the independently quoted honest band of `2⁻¹⁸` to `2⁻²⁰` for single precision.
 4. **Anti-concentration constant.** `c ≈ 0.798` follows from the Gaussian density at the origin,
    `2·(2π)^(−1/2)`, and matches the value `c ≈ 0.8` obtained separately for this challenge
-   distribution.
+   distribution. *Superseded 2026-10-06:* the worst case under uniform challenges is
+   `c = √(2/3) ≈ 0.816` (Section 6).
 
 One check is deferred to the run: the protocol's fault-injection harness sweeps a deliberately
 corrupted product across a range of deviation magnitudes and records where detection fails. That

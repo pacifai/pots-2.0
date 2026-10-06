@@ -1,8 +1,8 @@
 """A13: the flipped matmul on step 4 and the planted-error sweep (P10c, S6f, EQ10).
 
     .venv/bin/python -m verification.runs.flipped_matmul_sweep
-        [--x X ...] [--trials N] [--shapes entry entry2 dense] [--classes CLS ...]
-        [--metrics | --no-metrics]
+        [--x X ...] [--trials N] [--shapes entry entry2 row2 dense] [--classes CLS ...]
+        [--subdir NAME] [--metrics | --no-metrics]
 
 Set up as the honest run (``runs/cheats.py``), judged by the frozen band file. Step 4 is the
 first judged step: the bands were fitted on steps 1–3 (P10c).
@@ -25,7 +25,11 @@ first judged step: the bands were fitted on steps 1–3 (P10c).
 ``τ`` band units for an average challenge. ``f = x·τ·e_m`` for each grid point ``x``. Shapes:
 
 - ``entry``: one random entry moved by ``±f·‖P‖_F`` (concentrated, the spec's §8 worry);
-- ``entry2``: two random entries, each moved by ``±f·‖P‖_F/√2``;
+- ``entry2``: two random entries, almost always in different rows, each moved by
+  ``±f·‖P‖_F/√2``;
+- ``row2``: two entries in one row (a random row, two distinct random columns), each moved by
+  the same ``±f·‖P‖_F/√2``. ``Δ·r = (δ/√2)(r_a + r_b)``, the worst rank-1 error for uniform
+  challenges (Ball's cube-slicing bound), so this shape tests the sizing's ``c``;
 - ``dense``: Gaussian noise scaled to ``‖Δ‖_F = f·‖P‖_F``.
 
 The realized ``f`` (``‖P' − P‖_F/‖P‖_F`` in float64, after the fp32 rounding of ``P'``) is
@@ -37,20 +41,28 @@ logged with every trial, with each challenge's normalized residual and the verdi
 - ``f_all``: the smallest swept ``f`` from which every trial was rejected, at every larger
   point too;
 - ``ĉ``: the single-challenge miss constant fitted from trials at ``x ≥ 3``, where the miss
-  rate ``p₁ ≈ c/x`` (``ĉ = misses / Σ k/x`` over those trials). For ``entry`` the theory value
-  is ``σ_r = 0.577`` (``P(|r_j| < σ_r/x) = σ_r/x`` for ``r_j ~ U(−1, 1)``); the sizing uses
-  ``c = 0.798``. A dense error has no ``1/x`` tail, so ``ĉ`` comes out near 0;
-- ``f_ach``: the sizing floor ``c·τ·e_m·2^{N/k}`` (the band file's ``N``, ``c``, ``τ``, ``k``),
-  and ``f_ach(ĉ)``, the same formula with ``ĉ`` in place of ``c``.
+  rate ``p₁ ≈ c/x`` (``ĉ = misses / Σ k/x`` over those trials), with its Poisson standard
+  error. Theory values: ``entry`` ``σ_r = 0.577`` (``P(|r_j| < σ_r/x) = σ_r/x`` for
+  ``r_j ~ U(−1, 1)``); ``row2`` ``√2·σ_r = √(2/3) = 0.816``, the bound the sizing uses as
+  ``c = C_ANTI`` (the triangular density of ``r_a + r_b`` bends ``p₁`` down at small ``x``, so
+  the fit lands a little below it); ``entry2`` and ``dense`` far below, since two entries in
+  different rows miss only when both rows' residuals are small (``p₁ ∝ 1/x²``) and a dense
+  error has no ``1/x`` tail;
+- ``f_ach``: the sizing floor ``c·τ·e_m·2^{N/k}`` (the band file's ``N``, ``τ`` and ``k``, and
+  ``c = C_ANTI``), and ``f_ach(ĉ)``, the same formula with ``ĉ`` in place of ``c``.
 
 ``f_ach`` is the error size whose miss probability over all ``k`` challenges is ``2^{−N}``. It is
 not a 50% point: ``f50`` sits near ``x ≈ 1``, about ``c·2^{N/k}`` times below it. The stop
-condition is ``f_all > f_ach`` for any class and shape; it is printed and makes the run exit 1.
+condition, for any class and shape, is ``f_all > f_ach``, or no point where every trial is
+rejected, or ``ĉ`` above ``C_ANTI`` by more than ``C_HAT_SIGMAS`` standard errors (a fitted
+``ĉ`` at the bound sits above it about half the time by chance alone). It is printed and makes
+the run exit 1.
 
 With metrics on (default ``VERIF_METRICS``), records go to
-``$VERIF_OUTPUT_DIR/flipped_matmul_sweep/``: the two runs' step records and oracle records, one
-``sweep_point`` record per (class, shape, ``x``), one ``sweep_summary`` per (class, shape), and
-every trial in ``sweep_trials.npz``. Exits 1 unless the honest base is accepted, the flip is
+``$VERIF_OUTPUT_DIR/flipped_matmul_sweep/``, or to its ``--subdir`` so an earlier run's records
+stay: the two runs' step records and oracle records, one ``sweep_point`` record per (class,
+shape, ``x``), one ``sweep_summary`` per (class, shape), and every trial in
+``sweep_trials.npz``. Exits 1 unless the honest base is accepted, the flip is
 rejected exactly at its declared point, and no stop condition holds.
 """
 
@@ -107,10 +119,11 @@ __all__ = ["RUN_NAME", "SWEEP_STEP", "SHAPES", "DEFAULT_X", "DEFAULT_TRIALS", "F
 RUN_NAME = "flipped_matmul_sweep"
 SWEEP_STEP = 4  # the first judged step (P10c)
 FLIP_PRODUCT = "dF"  # the binding product (largest q), an input gradient: 6a can't see it
-SHAPES = ("entry", "entry2", "dense")
+SHAPES = ("entry", "entry2", "row2", "dense")
 DEFAULT_X = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0, 100.0, 300.0, 1000.0)
 DEFAULT_TRIALS = 200  # EQ10
 FIT_X_MIN = 3.0  # ĉ is fitted where p₁ ≈ c/x holds, above the honest residual's reach
+C_HAT_SIGMAS = 3.0  # ĉ stops the run only when it exceeds C_ANTI by this many standard errors
 TRIALS_FILE = "sweep_trials.npz"
 REASONS = ("accepted", "residual", "kappa", "non-finite")
 
@@ -181,10 +194,18 @@ def plant(p: torch.Tensor, shape: str, f: float, p_norm: float,
     ``f = ‖P' − P‖_F/‖P‖_F`` in float64."""
     size = f * p_norm
     flat = p.reshape(-1)
-    if shape in ("entry", "entry2"):
+    if shape in ("entry", "entry2", "row2"):
         n = 1 if shape == "entry" else 2
-        idx = torch.randperm(flat.numel(), generator=gen)[:n] if n > 1 else torch.randint(
-            flat.numel(), (1,), generator=gen)
+        if shape == "row2":  # one row, two distinct columns: Δ·r = (δ/√2)(r_a + r_b)
+            rows, cols = p.shape[0], p.shape[-1]
+            if p.dim() != 2 or cols < 2:
+                raise ValueError(f"row2 needs a 2-D product with ≥ 2 columns, got {p.shape}")
+            i = int(torch.randint(rows, (1,), generator=gen))
+            idx = i * cols + torch.randperm(cols, generator=gen)[:2]
+        elif n > 1:
+            idx = torch.randperm(flat.numel(), generator=gen)[:n]
+        else:
+            idx = torch.randint(flat.numel(), (1,), generator=gen)
         sign = torch.randint(0, 2, (n,), generator=gen).to(torch.float64) * 2 - 1
         p2 = p.clone()
         p2.view(-1)[idx] = (flat[idx].to(torch.float64) + sign * size / math.sqrt(n)).to(
@@ -289,11 +310,12 @@ class Floor:
 
 
 def floor_context(bands: Bands, c: DeclaredComputation, *, k: int, T: int) -> Floor:
-    """The band file's sizing (``N``, ``c``, ``τ``, ``k``) if it has one, else computed from
-    ``λ``, ``T``, ``M`` and ``G`` with ``c = C_ANTI``."""
+    """The band file's ``N``, ``τ`` and ``k`` if it has a sizing, else ``N`` computed from
+    ``λ``, ``T``, ``M`` and ``G``. ``c`` is always ``C_ANTI``: a band file written before
+    2026-10-05 records the Gaussian 0.798, which is below the uniform worst case."""
     sz = bands.stats.get("sizing") if bands.stats else None
     if sz:
-        return Floor(float(sz["N"]), float(sz["c"]), bands.tau, int(sz["k"]))
+        return Floor(float(sz["N"]), C_ANTI, bands.tau, int(sz["k"]))
     return Floor(bit_budget(LAMBDA, T, c.M, LOG2_G), C_ANTI, bands.tau, k)
 
 
@@ -328,17 +350,22 @@ def summarize(tr: Trials, floor: Floor, *, x_fit: float = FIT_X_MIN
     fit = (f_real / (tau * tr.e)) >= x_fit
     denom = float((k / (f_real[fit] / (tau * tr.e))).sum()) if fit.any() else 0.0
     c_hat = float(misses[fit].sum()) / denom if denom > 0 else None
+    # Poisson standard error of ĉ; the ĉ stop needs ĉ above c by C_HAT_SIGMAS of them.
+    c_hat_se = math.sqrt(float(misses[fit].sum())) / denom if denom > 0 else None
+    c_over = (c_hat is not None and c_hat_se is not None
+              and c_hat - C_HAT_SIGMAS * c_hat_se > floor.c)
     f_ach = floor.f_ach(tr.e)
     summary = {"m": tr.m, "cls": tr.cls, "shape": tr.shape, "e_m": tr.e, "tau": tau,
                "k": k, "trials": len(tr.x_set), "f50": f50, "f_all": f_all,
                "x50": None if f50 is None else f50 / (tau * tr.e),
                "x_all": None if f_all is None else f_all / (tau * tr.e),
-               "c_hat": c_hat, "c_fit_x_min": x_fit,
+               "c_hat": c_hat, "c_hat_se": c_hat_se, "c_hat_over_c": c_over,
+               "c_fit_x_min": x_fit,
                "c_fit_vectors": int(fit.sum()) * k, "c_fit_misses": int(misses[fit].sum()),
                "f_ach": f_ach, "f_ach_c_hat": None if c_hat is None else floor.f_ach(tr.e, c_hat),
                "N": floor.N, "c_sizing": floor.c,
                "f_all_over_f_ach": None if f_all is None else f_all / f_ach,
-               "stop": f_all is None or f_all > f_ach}
+               "stop": f_all is None or f_all > f_ach or c_over}
     return points, summary
 
 
@@ -467,7 +494,8 @@ def report_sweep(r: SweepResult, out: Callable[[str], None] = print) -> None:
             f"{_g(s['f_ach_c_hat']):>9} {_g(s['f_ach']):>8} {_g(s['f_all_over_f_ach']):>11}"
             + ("  STOP" if s["stop"] else ""))
     stops = r.stops
-    out("stop condition (f_all above f_ach, or never all rejected): "
+    out(f"stop condition (f_all above f_ach, never all rejected, or ĉ above c = {C_ANTI:.4f} "
+        f"by more than {C_HAT_SIGMAS:g} standard errors): "
         + ("none" if not stops else
            ", ".join(f"{s['cls']} {s['shape']}" for s in stops)))
 
@@ -479,6 +507,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--trials", type=int, default=DEFAULT_TRIALS, help="trials per point")
     p.add_argument("--shapes", nargs="+", default=list(SHAPES), choices=SHAPES)
     p.add_argument("--classes", nargs="+", default=None, help="only these product classes")
+    p.add_argument("--subdir", default=None,
+                   help=f"write metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/SUBDIR/, keeping the "
+                        "records of earlier runs")
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
                    help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/ "
                         "(default: VERIF_METRICS)")
@@ -495,7 +526,8 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"τ {env.bands.tau:.2f}")
     mw = (open_writer(cfg, RUN_NAME, env, {"x": list(args.x), "trials": args.trials,
                                            "shapes": list(args.shapes),
-                                           "classes": args.classes, "sweep_step": SWEEP_STEP})
+                                           "classes": args.classes, "sweep_step": SWEEP_STEP},
+                      subdir=args.subdir)
           if use_metrics else None)
     try:
         r = run_sweep(env, xs=args.x, shapes=args.shapes, trials=args.trials,

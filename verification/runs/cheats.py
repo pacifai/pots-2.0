@@ -228,16 +228,18 @@ def _num(x: float | None) -> str:
 
 
 def open_writer(cfg: RunConfig, run: str, env: CheatEnv,
-                extra: Mapping[str, Any] | None = None) -> MetricsWriter:
-    """A ``MetricsWriter`` under ``$VERIF_OUTPUT_DIR/<run>/``, with ``run_verified``'s
-    environment fields."""
+                extra: Mapping[str, Any] | None = None,
+                subdir: str | None = None) -> MetricsWriter:
+    """A ``MetricsWriter`` under ``$VERIF_OUTPUT_DIR/<run>/`` (or ``<run>/<subdir>/``, so a
+    partial rerun keeps the earlier records), with ``run_verified``'s environment fields."""
     c = env.c
     inst = {"n_s": c.n_s, "eta": c.eta, "k": env.k, "n_records": len(env.D), "M": c.M,
             "n_leaves": c.n_leaves, "poison_step": env.poison_step,
             "poisoning_rate": env.poisoning_rate, **(extra or {})}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                  if f.name not in ("output_dir", "metrics")}, "llama": inst}
-    return MetricsWriter(cfg.output_dir / run, run, device=cfg.device, model=cfg.model,
+    out_dir = cfg.output_dir / run if subdir is None else cfg.output_dir / run / subdir
+    return MetricsWriter(out_dir, run, device=cfg.device, model=cfg.model,
                          corpus=cfg.dataset, seed=cfg.seed, config=config,
                          band_file_hash=env.bands.source, h_D=env.h_D,
                          extra={"band_source": env.bands.source, **inst})
