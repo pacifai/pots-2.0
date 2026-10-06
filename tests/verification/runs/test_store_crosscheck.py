@@ -123,7 +123,8 @@ def test_a_store_serving_other_bytes_is_caught(tmp_path):
                   final=final, h_D=None, build_model=None, verifier=None)
     diffs = sc.compare(mem.decisions, bad.decisions)
     assert any(x.startswith("verdict") for x in diffs)
-    assert bad.result.actual.check_id == "2"
+    # check 5 tests the changed product before check 2's root comparison ends the step (F15a)
+    assert bad.result.actual.check_id == "5"
 
 
 def test_main_on_the_tiny_llama(tiny, monkeypatch, tmp_path, capsys):

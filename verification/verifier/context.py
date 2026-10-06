@@ -2,10 +2,12 @@
 
 :class:`StepContext` holds the verifier's own knowledge for one step (step index, ``π(t)``,
 ``h_D`` and ``|D|``, the chained ``W_t`` hashes, ``k``, the unit roundoffs). Its
-:class:`StepState` holds what earlier checks derived and later checks consume: check 2 writes
-the recomputed root, leaf hashes and :class:`CommittedLeaves`, check 5 leaves its ``Replay`` for
-check 6b. Every check-5 and check-6 number goes into :class:`StepStats`, judged or not, which is
-what A11's calibration (P10b) and A12's per-step logs read.
+:class:`StepState` holds what earlier checks derived and later checks consume: check 2's read
+writes the validated claimed root, the leaf hashes and :class:`CommittedLeaves`, check 5 leaves
+its ``Replay`` for check 6b, and check 2's root comparison, last in the step, writes the
+recomputed root (F15a in ``DECISIONS_FULL_SCALE.md``, task C7). Every check-5 and check-6
+number goes into :class:`StepStats`, judged or not, which is what A11's calibration (P10b) and
+A12's per-step logs read.
 
 :func:`_guard` maps a prover-data error to a ``"malformed"`` rejection at the check that read
 the leaf (``checks.py`` docstring, "Errors").
@@ -217,8 +219,10 @@ class StepState:
     """What a check derives for a later one; empty at step start."""
 
     early_hashes: dict[int, bytes] = field(default_factory=dict)  # what checks 4 and 7 hashed
-    root: bytes | None = None  # check 2's recomputed h; check 5 keys its challenges on it
+    # The prover's h, once check 2's read has shown it is a digest; check 5 keys on it (F15a).
+    claimed_root: bytes | None = None
     leaf_hashes: list[bytes] | None = None
+    recomputed_root: bytes | None = None  # set by check 2's root comparison, the step's last
     leaves: CommittedLeaves | None = None  # check 2's leaves, the only reader after check 2
     replay: Replay | None = None  # check 5's replay, reused by 6b
 

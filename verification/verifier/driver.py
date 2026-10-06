@@ -13,14 +13,17 @@ Run shape:
 - :meth:`Verifier.verify_step` runs :data:`~.checks.DEFAULT_ORDER`, stops at the first
   rejection, and on acceptance keeps the step's ``W_{t+1}`` hashes. Check 0's comparison
   needs the first step's committed ``W_t``, so at step 1 it runs in check 7's slot, after
-  check 4, and reports as ``(1, "0")``.
+  check 4, and reports as ``(1, "0")``. Check 2 has two slots: its read before 6a, and its
+  root comparison ``"2.root"`` after 6b, which rejects as ``"2"``. Check 5 keys its
+  challenges on the claimed root in between (F15a in ``DECISIONS_FULL_SCALE.md``, task C7).
 - :meth:`Verifier.end_run` runs check 8 against the agreed final weights (a run shorter than
   ``T`` fails it too) and returns check 9's verdict.
 
 ``calibrate=True`` is P10b's calibration mode: checks 5 and 6 record their numbers in
-:attr:`Verifier.stats` and judge nothing, while the exact checks run live. A11 fits the bands
-on those numbers and hands them to :meth:`Verifier.freeze`, which scores the calibration steps
-against them and judges every later step. :meth:`Verifier.end_run` refuses to give a verdict
+:attr:`Verifier.stats` and judge nothing, while the exact checks run live, the root
+comparison included. A11 fits the bands on those numbers and hands them to
+:meth:`Verifier.freeze`, which scores the calibration steps against them and judges every
+later step. :meth:`Verifier.end_run` refuses to give a verdict
 while calibration is unfrozen. In either mode every step's numbers are kept, and
 :attr:`Verifier.timings` holds each check's wall clock for C1.
 
@@ -44,7 +47,7 @@ from verification.commitment.merkle import DIGEST_SIZE, hash_leaf, merkle_root
 from verification.computation.interface import DeclaredComputation
 from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands
-from verification.verifier.checks import CHECKS, DEFAULT_ORDER
+from verification.verifier.checks import CHECKS, DEFAULT_ORDER, ROOT_SLOT
 from verification.verifier.context import (
     Rejection,
     Section,
@@ -199,7 +202,7 @@ class Verifier:
                                                  f"indices into D")
         return None
 
-    # ---- per step: checks 4, 7, 2, 6a, 5, 6b --------------------------------------------
+    # ---- per step: checks 4, 7, 2, 6a, 5, 6b, 2.root -------------------------------------
 
     def verify_step(self, t: int, store: TranscriptStore) -> Rejection | None:
         """Run the default order on step ``t`` (1-based, consecutive); ``None`` accepts."""
@@ -223,7 +226,8 @@ class Verifier:
         self.stats[t] = ctx.stats
         for check_id in DEFAULT_ORDER:
             # the clock inside the seam: a metrics probe's own cost stays out of timings. Step 1's
-            # chaining comparison is timed as row "7" (check 0's anchor hashing is "run:0").
+            # chaining comparison is timed as row "7" (check 0's anchor hashing is "run:0"), and
+            # check 2's two slots as "2" and "2.root".
             with self._timed(check_id):
                 t0 = time.perf_counter()
                 rej = CHECKS[check_id](store, self.c, ctx, bands)
@@ -248,13 +252,23 @@ class Verifier:
         Each calibrated step's recorded numbers are judged in check order (6a's ``ρ_max``, then
         check 5's ``κ`` and normalized residuals, then 6b's ``ρ_max``), as the live checks would
         have judged them. The first failure becomes the run's rejection.
+
+        A live rejection stands, except one from check 2's root comparison: that slot runs after
+        6a, 5 and 6b, so their numbers for that step are judged first, and a band failure there
+        is what a judged run reports.
         """
         if not self.calibrate:
             raise RuntimeError("freeze is only for a calibration run")
         self._adopt(bands)
         self.calibrate = False
-        if self.rejection is not None:
-            return self.rejection
+        live = self.rejection
+        if live is not None:
+            if ROOT_SLOT in self.timings.get(live.step, {}):
+                rej = self._rejudge(live.step, self.stats[live.step], bands)
+                if rej is not None:
+                    self.rejection = rej
+                    return rej
+            return live
         for t in self.calibrated_steps:
             rej = self._rejudge(t, self.stats[t], bands)
             if rej is not None:

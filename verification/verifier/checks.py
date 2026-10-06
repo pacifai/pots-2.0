@@ -2,26 +2,36 @@
 
 Each per-step check returns ``None`` on acceptance or a :class:`Rejection` ``(step, check_id,
 detail)``. :data:`DEFAULT_ORDER` is the one evaluation order of every run, ``4 → 7 → 2 → 6a →
-5 → 6b`` (S6c, revised at stage 4). The verifier is the same code in every run (S6a); nothing
-here has a fault hook.
+5 → 6b → 2.root`` (S6c, revised at stage 4 and by F15a in ``DECISIONS_FULL_SCALE.md``, task
+C7). The verifier is the same code in every run (S6a); nothing here has a fault hook.
+
+**Check 2 in two parts (F15a).** Each entry of :data:`CHECKS` is a slot, and a slot id is a
+protocol check id, optionally with a ``.part`` suffix (:func:`protocol_id`). Check 2 has two
+slots, and both reject as check ``"2"``. Slot ``"2"`` reads every leaf once, hashes and
+validates it, binds it to what checks 4 and 7 saw, and validates the claimed root ``h`` as a
+digest. Slot ``"2.root"`` runs last and compares the recomputed root with ``h``. Check 5 draws
+its challenges from the claimed ``h``. The accept condition is unchanged: a step still passes
+only if ``root(leaves) = h`` and every check passes with challenges from ``h``. Drawing from the
+claim gives the prover nothing, since it can always compute challenges from ``h`` itself. A
+streaming store can hash leaves during the checks' own reads and reuse ``"2.root"`` as is.
 
 The checks share one ``StepContext`` (``context.py``). Writing to its ``StepState`` is a
 check's only side effect. The tolerances are ``Bands`` (``bands.py``). Check 5's per-product
 arithmetic is ``matmul_check/freivalds.py``; this module judges its numbers.
 
-**Byte binding.** Every check after check 2 reads the leaves check 2 hashed, never the store
-again: check 2 reads each leaf once, hashes it and keeps the object in a
+**Byte binding.** Every check after check 2's read uses the leaves that read hashed, never the
+store again: check 2 reads each leaf once, hashes it and keeps the object in a
 :class:`CommittedLeaves` reader, guarded by ``_version``. Checks 4 and 7 run before check 2
 and read the store themselves, so they record the hashes they saw and check 2 rejects if its
 own read of any of those leaves hashes differently. A store that serves one set of bytes to an
-early check and another to check 2 is rejected at 2.
+early check and another to check 2 is rejected at 2, before 6a.
 
 **Errors.** Prover data that fails to read, decode, hash or validate raises one of the errors
 the ``TranscriptStore`` docstring lists. ``_guard`` turns each into a ``"malformed"``
 rejection at the check that read the leaf (``transcript/store.py``, "the rule for A5"). The
-guard covers store reads, leaf hashing and validation only. After check 2 the verifier runs
-its own code (replay, operands, glue gradients) on validated leaves, so an error there is a
-verifier bug and propagates; only a ``TranscriptFormatError`` (a cached leaf mutated in place)
+guard covers store reads, leaf hashing and validation only. After check 2's read the verifier
+runs its own code (replay, operands, glue gradients) on validated leaves, so an error there is
+a verifier bug and propagates; only a ``TranscriptFormatError`` (a cached leaf mutated in place)
 is mapped there. A violated verifier-side precondition raises ``RuntimeError``.
 
 Arithmetic is at the working precision, fp32 (P6). Every band comparison is written as
@@ -71,13 +81,24 @@ __all__ = [
     "check_4_batch_anchor",
     "check_7_chaining",
     "check_2_commitment",
+    "check_2_root",
     "check_6a_linear_update",
     "check_5_matmuls",
     "check_6b_glue_update",
     "CHECKS",
+    "ROOT_SLOT",
+    "protocol_id",
 ]
 
-DEFAULT_ORDER: tuple[str, ...] = ("4", "7", "2", "6a", "5", "6b")
+ROOT_SLOT = "2.root"
+"""Check 2's root comparison, the step's last slot; it rejects as check ``"2"`` (F15a)."""
+
+DEFAULT_ORDER: tuple[str, ...] = ("4", "7", "2", "6a", "5", "6b", ROOT_SLOT)
+
+
+def protocol_id(slot: str) -> str:
+    """The protocol check id a slot's rejections carry: ``"2.root"`` → ``"2"``."""
+    return slot.partition(".")[0]
 
 
 # ---- check 4: batch anchor --------------------------------------------------------------
@@ -156,17 +177,19 @@ def check_7_chaining(store: TranscriptStore, c: DeclaredComputation, ctx: StepCo
 @_checked
 def check_2_commitment(store: TranscriptStore, c: DeclaredComputation, ctx: StepContext,
                        bands: Bands) -> Rejection | None:
-    """Recompute ``h`` over all ``n_leaves`` leaves (count from ``C``) and compare with the claim.
+    """Check 2's read: hash all ``n_leaves`` leaves (count from ``C``) and validate the claimed
+    ``h``. The root comparison is :func:`check_2_root`, at the end of the step (F15a).
 
     Hashing validates every leaf's shape, dtype and finiteness, so later checks read leaves
     already known to be well formed. Each leaf is read from the store exactly once here, and
-    the objects go to ``ctx.state.leaves`` for every later check, with the root and hashes. A
-    leaf that check 4 or 7 already read must hash as it did then.
+    the objects go to ``ctx.state.leaves`` for every later check, with the hashes. A leaf that
+    check 4 or 7 already read must hash as it did then. The claimed root is read once, and a
+    non-digest is malformed here, before check 5 keys on it.
 
     Leaves are read and validated in order and hashed in parallel (``_hashes``), so the first
     malformed leaf is the one a leaf-by-leaf loop finds. A leaf hashes only after later leaves
-    are read, so a read that writes in place into an earlier leaf rejects as malformed before
-    the root is compared: that leaf's digest may already be of the changed bytes.
+    are read, so a read that writes in place into an earlier leaf rejects as malformed: that
+    leaf's digest may already be of the changed bytes.
     """
     leaves = CommittedLeaves()
 
@@ -187,18 +210,35 @@ def check_2_commitment(store: TranscriptStore, c: DeclaredComputation, ctx: Step
         if hashes[i] != h:
             return ctx.reject("2", f"leaf {i} hashes differently from the bytes an earlier "
                                    f"check read: the store served two versions")
-    root = merkle_root(hashes)
     if not _is_digest(claimed):
         return ctx.reject("2", f"claimed root is not a {DIGEST_SIZE}-byte digest", "malformed")
-    if root != claimed:
-        return ctx.reject("2", f"recomputed root {root.hex()[:16]}… != claimed "
-                               f"{claimed.hex()[:16]}…")
     # A leaf written in place while check 2 ran (by a later store read, or the root getter)
     # no longer has the bytes that were hashed.
     changed = [i for i in range(len(leaves)) if leaves.changed(i)]
     if changed:
         return ctx.reject("2", f"leaf {changed[0]} changed in place during check 2", "malformed")
-    ctx.state.root, ctx.state.leaf_hashes, ctx.state.leaves = root, hashes, leaves
+    ctx.state.claimed_root, ctx.state.leaf_hashes, ctx.state.leaves = claimed, hashes, leaves
+    return None
+
+
+@_checked
+def check_2_root(store: TranscriptStore, c: DeclaredComputation, ctx: StepContext,
+                 bands: Bands) -> Rejection | None:
+    """Check 2's root comparison, the step's last slot: the root over the leaf hashes check 2's
+    read took must equal the claimed ``h`` that check 5 keyed on (F15a).
+
+    A mismatch rejects as check ``"2"``, whatever the other checks said; an earlier rejection
+    stands, since the step stops at the first. It reads nothing from the store, so a store that
+    hashes leaves during the checks' own reads can reuse it.
+    """
+    hashes, claimed = ctx.state.leaf_hashes, ctx.state.claimed_root
+    if hashes is None or claimed is None:
+        raise RuntimeError("check 2's root comparison needs the hashes and claimed root "
+                           "of check 2's read")
+    root = ctx.state.recomputed_root = merkle_root(hashes)
+    if root != claimed:
+        return ctx.reject("2", f"recomputed root {root.hex()[:16]}… != claimed "
+                               f"{claimed.hex()[:16]}…")
     return None
 
 
@@ -419,10 +459,11 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
                     bands: Bands) -> Rejection | None:
     """Both tests of spec §6 check 5 on every product, in canonical order; abort at the first fail.
 
-    The challenges are keyed on ``ctx.state.root``, the root the verifier recomputed in check
-    2, never on ``store.root``. Check 2 has shown the two equal, but keying on the verifier's
-    own value means the PRF never consumes a prover-supplied byte (spec §5), and check 5
-    cannot run before check 2 has. Operands and products come from check 2's leaves (check 3).
+    The challenges are keyed on ``ctx.state.claimed_root``, the prover's ``h`` as check 2's
+    read validated it, not on a root the verifier recomputed (F15a). Check 2's root comparison
+    at the end of the step shows ``h`` is the root of the leaves, so an accepted step still has
+    challenges from the committed root. Check 5 cannot run before check 2's read has.
+    Operands and products come from check 2's leaves (check 3).
 
     Every norm is taken with ``freivalds._safe_norm``, so a finite product entry near ``2e19``
     can't overflow ``‖P‖_F`` or the residual to ``inf``. Every quantity the two tests compare
@@ -439,9 +480,9 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     measured alone. An error while serving a member is raised only after the members before it
     are judged, as it would be one product at a time.
     """
-    root = ctx.state.root
+    root = ctx.state.claimed_root
     if root is None:
-        raise RuntimeError("check 5 needs check 2's recomputed root")
+        raise RuntimeError("check 5 needs the claimed root that check 2's read validated")
     leaves = ctx.state.committed()
     view = TranscriptView(c, leaves)
     with _guard(ctx, "5", _AFTER_COMMIT), ctx.timed("5.glue"):
@@ -583,4 +624,5 @@ CHECKS: Mapping[str, Callable[[TranscriptStore, DeclaredComputation, StepContext
     "6a": check_6a_linear_update,
     "5": check_5_matmuls,
     "6b": check_6b_glue_update,
+    ROOT_SLOT: check_2_root,
 })

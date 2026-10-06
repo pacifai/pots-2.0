@@ -37,13 +37,14 @@ from verification.parameters import load_protocol_config
 from verification.runs.metrics import MetricsWriter, TimeRecorder
 from verification.runs.mlp_smoke import N_S
 from verification.runs.scenarios import HONEST, honest_final, run_scenario
+from verification.verifier.checks import DEFAULT_ORDER
 
 __all__ = ["measure", "section_cost_us", "main"]
 
 MODES = ("off", "on", "off2")
 
 
-CHECK_IDS = ("4", "7", "2", "6a", "5", "6b")
+CHECK_IDS = DEFAULT_ORDER
 
 
 def _times(r: Any) -> dict[str, float]:

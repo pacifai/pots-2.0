@@ -30,7 +30,7 @@ flowchart LR
         TX --> H["Merkle root h"]
     end
     subgraph Verifier
-        CK["checks 4 → 7 → 2 → 6a → 5 → 6b"]
+        CK["checks 4 → 7 → 2 → 6a → 5 → 6b → 2.root"]
     end
     Public --> TR
     Public --> CK
@@ -289,10 +289,11 @@ flowchart TD
     S["store for step t"] --> C4
     C4["4 · batch anchor<br/>each record + path verifies into h_D at π(t)_i"] --> C7
     C7["7 · chaining<br/>hash(W_t) = this verifier's hash of step t−1's W_t+1"] --> C2
-    C2["2 · commitment<br/>hash all leaves → root, compare with claimed h<br/>cache the leaves read"] --> C6a
+    C2["2 · commitment, read<br/>hash and validate all leaves, cache the leaves read<br/>claimed h must be a digest"] --> C6a
     C6a["6a · linear updates<br/>W_t+1 ≈ W_t − η·G, elementwise within τ_W"] --> C5
     C5["5 · matmuls<br/>for m = 1…M: replay A_m, B_m;<br/>Freivalds test with k vectors from (h, m)"] --> C6b
-    C6b["6b · glue updates<br/>norm scales and embedding, gradient from replayed backward"] --> OK["step accepted;<br/>keep hash(W_t+1) for step t+1"]
+    C6b["6b · glue updates<br/>norm scales and embedding, gradient from replayed backward"] --> C2R
+    C2R["2.root · commitment, root<br/>root of the hashed leaves = claimed h"] --> OK["step accepted;<br/>keep hash(W_t+1) for step t+1"]
 ```
 
 What each check establishes:
@@ -303,16 +304,26 @@ What each check establishes:
   against hashes it computed itself, never against hashes the prover reported. Training
   steps hidden between two verified steps fail here. At step 1 the same slot compares
   `W_t` with the public `W_0`, and is reported as check 0.
-- **Check 2 (commitment).** The claimed root `h` really is the root of these leaves. From
-  here on, every later check reads only the leaf objects that check 2 hashed. This
-  prevents a store from showing one version of a leaf to check 2 and another to check 5.
+- **Check 2 (commitment).** The claimed root `h` really is the root of these leaves. It
+  runs in two parts. The read, before 6a, hashes and validates every leaf and checks that
+  `h` is a 32-byte digest. From here on, every later check reads only the leaf objects that
+  check 2 hashed. This prevents a store from showing one version of a leaf to check 2 and
+  another to check 5. The root comparison (`2.root`) runs last: it builds the root from
+  those hashes and compares it with `h`. A mismatch rejects as check 2, unless an earlier
+  check already rejected (F15a in `DECISIONS_FULL_SCALE.md`, task C7).
+
+  Check 5 draws its challenges from the claimed `h`, before the comparison. That doesn't
+  weaken anything. A step is still accepted only if the root of the leaves is `h` and every
+  check passes with challenges from `h`. The prover could always compute those challenges
+  from `h` itself. Comparing last lets a full-scale store hash each leaf during the read
+  that checks it, instead of reading every leaf twice.
 - **Check 6a (linear updates).** Each committed `W_{t+1}` equals `W_t − η·G`, using the
   committed gradient product `G`. Rounding is allowed for. The tolerance is
   `τ_W · ε · (|W_t| + |η·G|)` per entry, with `τ_W ≥ 4`. A weight trained on a different batch
   fails here.
 - **Check 5 (matmuls).** This is the core check. For every product `m` in order:
   1. `replay.operands(m)` rebuilds `A_m` and `B_m` from committed leaves and glue.
-  2. `k` challenge vectors `r` are derived from the verified root and `m`.
+  2. `k` challenge vectors `r` are derived from the claimed root `h` and `m`.
   3. The test compares `A(B·r)` with `P·r`, which costs a few matrix-vector products
      instead of a matrix product. The residual is normalized by the expected rounding
      error `σ_r · e_m · ‖P‖_F` and must be at most `τ`.
