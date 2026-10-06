@@ -1,6 +1,7 @@
 """A13: the judged cheat runs (poisoned step, hidden step, flipped matmul and its sweep) on the
 MLP, judged by a band file fitted in miniature."""
 
+import dataclasses
 import math
 
 import numpy as np
@@ -27,6 +28,7 @@ from verification.runs.scenarios import (
     outcome,
 )
 from verification.transcript.store import perturb_leaf
+from verification.verifier.bands import Bands
 from verification.verifier.calibration import load_bands
 from verification.verifier.context import Rejection
 
@@ -136,7 +138,38 @@ def test_plant_has_the_asked_size(shape):
     p2, f = fs.plant(p, shape, 1e-3, n, g)
     assert math.isclose(f, 1e-3, rel_tol=1e-3)
     changed = int((p2 != p).sum())
-    assert changed == {"entry": 1, "entry2": 2, "dense": p.numel()}[shape] or shape == "dense"
+    assert changed == {"entry": 1, "entry2": 2, "row2": 2, "dense": p.numel()}[shape] or (
+        shape == "dense")
+
+
+def test_plant_row2_puts_two_equal_moves_in_one_row():
+    g = torch.Generator().manual_seed(1)
+    p = torch.randn(64, 48, generator=g)
+    n = float(torch.linalg.vector_norm(p, dtype=torch.float64))
+    rows = set()
+    for f in (1e-3, 0.3, 2.0):
+        for _ in range(20):
+            p2, f_real = fs.plant(p, "row2", f, n, g)
+            d = (p2.to(torch.float64) - p.to(torch.float64))
+            nz = d.nonzero()
+            assert nz.shape[0] == 2 and nz[0, 0] == nz[1, 0] and nz[0, 1] != nz[1, 1]
+            a, b = d[nz[0, 0], nz[0, 1]], d[nz[1, 0], nz[1, 1]]
+            assert math.isclose(abs(a), f * n / math.sqrt(2), rel_tol=1e-3)
+            assert math.isclose(abs(b), f * n / math.sqrt(2), rel_tol=1e-3)
+            assert math.isclose(f_real, f, rel_tol=1e-3)
+            assert math.isclose(float(torch.linalg.vector_norm(d)) / n, f, rel_tol=1e-3)
+            rows.add(int(nz[0, 0]))
+    assert len(rows) > 10  # a random row each time
+    with pytest.raises(ValueError, match="row2 needs"):
+        fs.plant(torch.randn(5, 1), "row2", 0.1, 1.0, g)
+
+
+def test_floor_uses_c_anti_not_the_band_files_c():
+    from verification.verifier.matmul_check.sizing import C_ANTI
+    b = Bands.provisional()
+    b = dataclasses.replace(b, stats={"sizing": {"N": 93.0, "c": 0.798, "k": 9}})
+    fl = fs.floor_context(b, None, k=9, T=10)  # type: ignore[arg-type]
+    assert (fl.N, fl.c, fl.k) == (93.0, C_ANTI, 9) and C_ANTI == math.sqrt(2 / 3)
 
 
 def test_sweep_restores_the_root_and_matches_check_5(env, kept):
@@ -184,6 +217,10 @@ def test_summary_fits_the_entry_constant():
     assert math.isclose(s["c_hat"], fs.SIGMA_R, rel_tol=0.1)
     assert s["f_all"] in (10.0, 100.0) and not s["stop"]  # all three miss at x = 10: 2e-4
     assert math.isclose(s["f_ach"], 0.798 * 2 ** (20 / 3))
+    assert not s["c_hat_over_c"] and s["c_hat_se"] > 0
+    # the same misses judged against a c far below them trip the ĉ stop
+    _, s_low = fs.summarize(tr, fs.Floor(N=20.0, c=0.3, tau=1.0, k=3))
+    assert s_low["c_hat_over_c"] and s_low["stop"]
 
 
 def test_run_sweep_on_the_mlp(env, tmp_path):
