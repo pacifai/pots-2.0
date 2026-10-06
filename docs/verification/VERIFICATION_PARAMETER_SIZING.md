@@ -371,7 +371,7 @@ measurements, and no run produces them.
 |---|---|---|
 | `λ`, security margin | 25 bits | The residual failure probability after the budget is met. Chosen as a conventional margin. |
 | `log₂G`, grinding bound | 52 | Models a well-resourced single laboratory: roughly `2⁵²` transcript alterations, each with its rehash. It dominates `N`, so it is the most consequential chosen number in the calculation. |
-| `z`, tolerance margin | 8 | How many multiples of the honest band the test allows before rejecting. It trades false rejection against detection: every doubling of `z` costs one bit of `b₀`. Chosen so that honest rejection stays rare across the roughly `2⁴¹` individual challenge evaluations of a full-scale run. |
+| `z`, tolerance margin | 8 | How many multiples of the honest band the test allows before rejecting. It trades false rejection against detection: every doubling of `z` costs one bit of `b₀`. Chosen so that honest rejection stays rare across the roughly `2²⁶` individual challenge evaluations of a full-scale run (`T·M·k = 10 · 393,555 · 21`). |
 | `f`, detection target | 1 | Asks the protocol to detect any deviation as large as the product it corrupts. It is the **sizing input** and nothing else: `f_achieved` (8.1) is the claim to report, and the detectable substitution rate of 12.4 is a further claim derived from it, conditional on the unmeasured coherence factor of 12.2. P4 fixed this separation of roles. |
 | precision | fp32 at test scale; bfloat16 operands with fp32 accumulation at full scale | Sets `ε_in` and `ε_acc`, and through them the whole calculation. This is the single largest lever on `k` (Section 10). |
 | challenge distribution | uniform on `(−1, 1)` | Fixes `σ_r = 1/√3` and `c = √(2/3) ≈ 0.816` (Section 6). It must be continuous; a two-valued distribution admits deviations that no tolerance can catch. |
@@ -382,79 +382,73 @@ is structural or arithmetic.
 
 ## 10. Worked instances
 
-Common to all three: `λ = 25`, `log₂G = 52`, `z = 8`, `f = 1`, `c = 0.798`, and `s_h` assumed to
-measure at 1 so that `τ = 8`. The binding product is the input-gradient of the output
-projection, which contracts over the vocabulary, `q_max = 49,152`.
-
-*These worked figures use `c = 0.798`. With `c = √(2/3)` (Section 6, 2026-10-06), each `b₀` is
-0.034 bits lower. Test scale keeps `k = 9` at the measured `τ = 44` (`f_achieved` on `dF` rises
-from 0.608 to 0.622; margin over `1/√2` 1.14×). Full scale keeps `k = 21` at `T = 10` for all
-four models. At the `2²⁰`-step reference of 10.3, `k` stays 24 for SmolLM2's product count and
-Falcon3-1B, and becomes 25 for Llama-3.2-1B and both Qwen2.5 models, which had almost no slack
-(`N/b₀` 24.02–24.15).*
+Common to both: `λ = 25`, `log₂G = 52`, `z = 8`, `f = 1`, `c = √(2/3)` (Section 6), and `s_h`
+assumed to measure at 1 so that `τ = 8`. Each configuration sizes `k` against its own precision,
+`T` and `M` (P12, 12.5).
 
 ### 10.1 Test scale — fp32, one 135M-parameter model, 10 steps
 
-`M = 7,113`, `T = 10`, `ε_in = ε_acc = 2⁻²⁴`.
+`M = 7,113`, `T = 10`, `ε_in = ε_acc = 2⁻²⁴`. The binding product is the input-gradient of the
+output projection, which contracts over the vocabulary, `q_max = 49,152`.
 
 ```
 e_max = √2·5.9605e-8 + √49152·5.9605e-8 = 1.330e-5
-b₀    = log₂( 1 / (8 · 1.330e-5) ) + 0.326 = 13.20 + 0.33 = 13.52
+b₀    = log₂( 1 / (8 · 1.330e-5) ) + 0.292 = 13.20 + 0.29 = 13.49
 N     = 25 + log₂10 + log₂7113 + 52 = 25 + 3.32 + 12.80 + 52 = 93.12
-k     = ⌈93.12 / 13.52⌉ = 7
+k     = ⌈93.12 / 13.49⌉ = 7
 ```
 
-### 10.2 Full scale — fp32 hypothetically, `2²⁰` steps
+The measured `s_h = 5.50` gives `τ = 44`, `b₀ = 11.03` and `k = 9` (C1, 12.7). The test-scale
+run uses `k = 9`.
 
-`M = 207,993`, `T = 2²⁰`, same `e_max` and `b₀`.
+### 10.2 Full scale — bfloat16 operands, fp32 accumulation, 10 steps
 
-```
-N = 25 + 20 + 17.67 + 52 = 114.67
-k = ⌈114.67 / 13.52⌉ = 9
-```
-
-### 10.3 Full scale — bfloat16 operands, fp32 accumulation
+The full-scale run declares `T = 10` (`DECISIONS_FULL_SCALE.md` F8a). The worked figures use
+Llama-3.2-1B, which has the most products per step: `M = 393,555`. Its vocabulary gives
+`q_max = 128,256`. `ε_in = 2⁻⁸`, `ε_acc = 2⁻²⁴`.
 
 ```
-e_max = √2·3.9063e-3 + √49152·5.9605e-8 = 5.538e-3
-b₀    = log₂( 1 / (8 · 5.538e-3) ) + 0.326 = 4.50 + 0.33 = 4.82
-k     = ⌈114.67 / 4.82⌉ = 24
+e_max = √2·3.9063e-3 + √128256·5.9605e-8 = 5.546e-3
+b₀    = log₂( 1 / (8 · 5.546e-3) ) + 0.292 = 4.49 + 0.29 = 4.79
+N     = 25 + log₂10 + log₂393555 + 52 = 25 + 3.32 + 18.59 + 52 = 98.91
+k     = ⌈98.91 / 4.79⌉ = 21
 ```
 
-The precision change costs a factor of more than two and a half in repetitions, because
-bfloat16 operand rounding raises the honest error by a factor of about 400 and each factor of
-two costs one bit of `b₀`.
+The other three models have fewer products, so `N` runs from 97.08 to 98.91, and every model
+gets `k = 21`.
 
-### 10.4 Achieved detection targets
+The precision change costs a factor of three in repetitions, because bfloat16 operand rounding
+raises the honest error by a factor of about 400 and each factor of two costs one bit of `b₀`.
+
+### 10.3 Achieved detection targets
 
 By (8.1), at the values above:
 
 | configuration | `k` | `f_achieved`, as a fraction of the product |
 |---|---|---|
-| fp32, test scale | 7 | `0.86` |
-| fp32, `2²⁰` steps | 9 | `0.58` |
-| bfloat16, `2²⁰` steps | 24 | `0.97` |
+| fp32, test scale, `τ = 8` | 7 | `0.88` |
+| fp32, test scale, measured `τ = 44` | 9 | `0.62` |
+| bfloat16, full scale (Llama-3.2-1B) | 21 | `0.95` |
 
 Each configuration detects somewhat **smaller** deviations than the chosen target of `f = 1`,
-by the margin created by rounding `k` up to an integer; the full-precision long run gains most,
-because its `k = 9` clears its budget with the most slack. Raising `k` by one lowers the
-achieved target by a factor of `2^(N/(k(k+1)))` — about fourfold at `k = 7`, about 15% at
-`k = 24` — so at small `k` the detection target is cheap to improve and at large `k` it is not.
+by the margin created by rounding `k` up to an integer. Raising `k` by one lowers the achieved
+target by a factor of `2^(N/(k(k+1)))`: about fourfold at `k = 7`, about 16% at `k = 21`. So at
+small `k` the detection target is cheap to improve, and at large `k` it is not.
 
 
 ## 11. Consistency checks
 
 The calculation was checked against four independently derived results.
 
-1. **Typical rather than binding contraction.** Evaluating Section 8 at `q_m = 576`, the
-   contraction of most of the model's dense products, gives `e_m = 1.51·10⁻⁶`, `b₀ = 16.65`, and
-   `k = ⌈114.67/16.65⌉ = 7` at full scale. This reproduces the figure obtained from an earlier,
-   separate estimate, and locates the difference: that estimate was evaluated at a typical
-   contraction, whereas Section 8 evaluates at the largest one. The vocabulary-width
-   input-gradient product, contracting over 49,152, is the binding case and raises `k` from 7
-   to 9.
-2. **bfloat16.** Section 10.3 gives `k = 24` against an earlier independent estimate of
-   `k ≈ 22`, agreeing to within the rounding of `log₂M` and the assumed `s_h`.
+1. **Typical rather than binding contraction.** Evaluating Section 8 in fp32 at `q_m = 576`,
+   the contraction of most of the model's dense products, gives `e_m = 1.51·10⁻⁶` and
+   `b₀ = 16.62`, about 3 bits above the binding product's 13.49. An earlier, separate estimate
+   got a smaller fp32 `k` than Section 8, and this locates the difference: that estimate was
+   evaluated at a typical contraction, whereas Section 8 evaluates at the largest one. The
+   vocabulary-width input-gradient product, contracting over 49,152, is the binding case. At
+   the test-scale budget it raises `k` from `⌈93.12/16.62⌉ = 6` to 7.
+2. **bfloat16.** Section 10.2 gives `b₀ = 4.79` against an earlier independent estimate of
+   `b ≈ 5`, agreeing to within the assumed `s_h`.
 3. **Relative honest error.** (2.1) gives `√576 · 2⁻²⁴ ≈ 2⁻¹⁹·⁴` at the typical contraction,
    matching the independently quoted honest band of `2⁻¹⁸` to `2⁻²⁰` for single precision.
 4. **Anti-concentration constant.** `c ≈ 0.798` follows from the Gaussian density at the origin,
@@ -528,20 +522,20 @@ value near `√B` refutes it.
 
 ### 12.3 The grinding term dominates the undetectable region
 
-Decomposing the achieved target (8.1) into its four contributions, at the full-scale fp32
+Decomposing the achieved target (8.1) into its four contributions, at the full-scale bfloat16
 instance of Section 10.2:
 
 | contribution | factor by which it widens the undetectable region |
 |---|---|
-| honest band `c·τ·e_max` | `8.49·10⁻⁵` (the floor itself) |
-| grinding, `2^(log₂G/k) = 2^(52/9)` | **× 54.9** |
-| security margin, `2^(λ/k) = 2^(25/9)` | × 6.9 |
-| steps, `2^(log₂T/k) = 2^(20/9)` | × 4.7 |
-| products, `2^(log₂M/k) = 2^(17.67/9)` | × 3.9 |
-| | `f_achieved = 0.58`, agreeing with 10.4 |
+| honest band `c·τ·e_max` | `3.62·10⁻²` (the floor itself) |
+| grinding, `2^(log₂G/k) = 2^(52/21)` | **× 5.56** |
+| security margin, `2^(λ/k) = 2^(25/21)` | × 2.28 |
+| steps, `2^(log₂T/k) = 2^(3.32/21)` | × 1.12 |
+| products, `2^(log₂M/k) = 2^(18.59/21)` | × 1.85 |
+| | `f_achieved = 0.95`, agreeing with 10.3 |
 
-Grinding accounts for a factor of 55 of the total 6,859. Equivalently: **the smallest deviation
-this protocol detects is about 55× larger than an interactive verifier would detect at the same
+Grinding accounts for a factor of 5.6 of the total 26.2. Equivalently: **the smallest deviation
+this protocol detects is about 5.6× larger than an interactive verifier would detect at the same
 tolerance**, and that entire factor is the price of deriving the challenges from the commitment
 rather than receiving them from a verifier. It is the largest single term, larger than the
 security margin and the two union-bound terms combined.
@@ -553,21 +547,21 @@ of `G` and `1/k` of a challenge vector are interchangeable. Raising `z` to suppr
 rejection therefore buys an attacker grinding room at exactly the same rate.
 
 *`k` is the efficient lever and `z` is not.* Since `f_achieved ∝ 2^(N/k)`, one extra challenge at
-`k = 9` improves the achieved target by `2^(N/(k(k+1))) = 2.4×`, with no false-rejection cost.
+`k = 21` improves the achieved target by `2^(N/(k(k+1))) = 1.16×`, with no false-rejection cost.
 Lowering `z` improves it linearly and cannot go far: `z = 8` was chosen so that honest rejection
-stays rare across roughly `2⁴¹` challenge evaluations, which leaves at most about one bit.
+stays rare across roughly `2²⁶` challenge evaluations, which leaves at most about one bit.
 
 ### 12.4 Whether `f = 1` is the right target at all
 
-Combining (12.1) with the achieved targets of 10.4 gives the smallest substitution rate the
+Combining (12.1) with the achieved targets of 10.3 gives the smallest substitution rate the
 protocol detects, taking `‖δg‖/‖g‖ ≈ 2`:
 
 | configuration | `k` | `f_achieved` | smallest detectable substitution rate |
 |---|---|---|---|
-| fp32, test scale, `B = 4` | 7 | 0.86 | 21% |
-| fp32, full scale, `B = 128` | 9 | 0.58 | 2.6% |
-| bfloat16, full scale, `B = 128` | 24 | 0.97 | 4.3% |
-| fp32, full scale, `k = 12` | 12 | 0.10 | 0.45% |
+| fp32, test scale, `B = 4`, `τ = 8` | 7 | 0.88 | 22% |
+| fp32, test scale, `B = 4`, measured `τ = 44` | 9 | 0.62 | 16% |
+| bfloat16, full scale, `B = 128` | 21 | 0.95 | 4.2% |
+| bfloat16, full scale, `k = 28` | 28 | 0.42 | 1.9% |
 
 The published backdoor literature works at substitution rates of roughly 1–10%, so the protocol
 as sized lands **inside** that range rather than below it: it detects the aggressive end and
@@ -576,11 +570,11 @@ misses the quiet end. Three open questions follow; 12.6 records how P4 disposed 
 1. **Is `f = 1` the claim worth making?** Section 9 chose it as a headline ("detect any deviation
    as large as the product it corrupts"). A claim stated in terms of the substitution rate is
    more useful and more falsifiable, but it depends on (12.1), which is unvalidated.
-2. **Should `k` be raised?** Three extra vectors take the full-scale threshold from 2.6% to
-   0.45%, for roughly a third more check-5 arithmetic — cheap against a claim about poisoning,
+2. **Should `k` be raised?** Seven extra vectors (`k = 28`) take the full-scale threshold from
+   4.2% to 1.9%, for a third more check-5 arithmetic — cheap against a claim about poisoning,
    over-engineered against a claim about blatant forgery. Parked as F10.
 3. **The test-scale configuration sits close to its own boundary.** One substituted record of
-   four gives `f_step ≈ 1.0` against `f_achieved = 0.86`, a margin of about 1.2×, thinner than
+   four gives `f_step ≈ 1.0` against `f_achieved = 0.88` at `k = 7`, a margin of about 1.1×, thinner than
    "blatant, order-1" suggests and entirely dependent on the coherence assumption of 12.2.
 
 ### 12.5 Two smaller points
@@ -597,9 +591,9 @@ the right number for the right reason.
 
 *Which bit budget the test-scale configuration uses — settled by setup item P12: its own.*
 Section 10.1 evaluates `N` with test-scale `T` and `M`, giving `N = 93.12` and `k = 7`. An earlier
-note required the budget to use full-scale terms, which would give `N = 114.67` and `k = 9` at
-test scale too. P12 (2026-09-30) keeps `k = 7`: full scale runs in bfloat16 (Section 10.3,
-`k = 24`), so full-scale `T` and `M` paired with fp32's `b₀` describe no configuration that will
+note required the budget to use full-scale terms, which would give `k = 9` at
+test scale too. P12 (2026-09-30) keeps `k = 7`: full scale runs in bfloat16 (Section 10.2,
+`k = 21`), so full-scale `T` and `M` paired with fp32's `b₀` describe no configuration that will
 run. Each configuration sizes `k` against its own precision, `T` and `M`.
 
 The choice has a known consequence, accepted with it. At `k = 7` the test-scale configuration
@@ -625,12 +619,12 @@ Three things were deliberately **not** settled and remain here.
    because `k` is frozen before the run and a wrong coherence factor moves the rate by 11×. The
    C1 measurement of `‖Σᵢgᵢ‖/(√B·‖g‖)` converts it from an assumption into a number, after which
    the restatement costs nothing.
-2. **Whether `k` is raised to cover realistic poisoning rates.** `k = 12` takes the full-scale
-   threshold from 2.6% to 0.45% for roughly a third more check-5 arithmetic. Parked as F10, to be
+2. **Whether `k` is raised to cover realistic poisoning rates.** `k = 28` takes the full-scale
+   threshold from 4.2% to 1.9% for a third more check-5 arithmetic. Parked as F10, to be
    decided after the same C1 measurement and against the measured verify-versus-train ratio.
 3. **Whether `k` should be sized per matmul class rather than globally.** Sizing each class
-   against its own `b₀` would let all but the vocabulary-contracted products run at `k = 7`
-   instead of 9 at full scale — roughly 22% of the check-5 arithmetic. It was rejected for the
+   against its own `b₀` would let all but the vocabulary-contracted products run at a smaller
+   `k` in fp32 — roughly 22% of the check-5 arithmetic. It was rejected for the
    test-scale build because it puts a per-product parameter into the challenge-label derivation
    and turns the single union bound of Section 7 into a per-class sum. Parked as F11.
 
