@@ -53,18 +53,20 @@ The design process is gated, and each stage starts only after the previous one c
   agent commit `1e3155a` ("Add the one-time eta tuning run (B6, C2)") was never merged; its
   worktree and branch were deleted on 2026-10-04.
 - **Implementation (stage 5) started on 2026-09-30; milestone M5 closed on 2026-10-05
-  (user approved; main merge `33d09bd`), so all of A1–A14 are done; the next item is **EQ10**,
-  the user's decision on how the sweep's measured miss rates restate EQ10's single-curve
-  claim.** C3 closed on 2026-10-05 with task
+  (user approved; main merge `33d09bd`), so all of A1–A14 are done; the next item is **B8**,
+  the attack-success rehearsal, which waits on the user's approval of `EVALUATION_SPEC.md`.**
+  EQ10 was revised on 2026-10-06 (user approved): `p₁ ≤ c/x` is a bound for every error
+  shape, with `c = √(2/3) ≈ 0.816`, the worst case under uniform challenges (two equal entries
+  in one row), in place of 0.798. `k` stays 9 at test scale and 21 at full scale; `f_achieved`
+  on `dF` is 0.622. C3 closed on 2026-10-05 with task
   A14: the in-memory and on-disk stores make identical decisions (`DECISIONS_SETUP.md` §8.B
   C3). A13 (merge `4a22c0b`, 2026-10-05) rejected each cheat exactly at its declared step and
   check under the frozen band file: A1 at (1, 4), A2 at (1, 5) on `P_1`, A3 at (1, 6a), the
   hidden step at (2, 7), and the flipped `dF` entry at (4, 5) on `P_2372`. The planted-error
   sweep on step 4 rejected every trial in every class once the error reached about 2 band
   units, far below `f_achieved = 0.61` (`k = 9`). For one-entry errors the fitted miss
-  constant is 0.54–0.63, under the sizing's `c = 0.798`. Two-entry and dense errors don't follow
-  EQ10's single `c/x` curve; this waits for the user's decision before `DECISIONS_EVALUATION.md`
-  records it. The plan's task table (main axis A1–A14, branches
+  constant is 0.54–0.63, under the sizing's `c`. Two-entry and dense errors don't follow
+  EQ10's single `c/x` curve, which led to the EQ10 revision above. The plan's task table (main axis A1–A14, branches
   B1–B8) is the work list, and C1 and C3 in `SETUP_TASKS.md` close as their tasks finish.
   **Milestone M3 closed on 2026-10-04** (user: "consider M3 finished"): an honest SmolLM2 step
   is accepted under the provisional bands, and the per-class residual table prints. With the
