@@ -275,20 +275,51 @@ def test_wrong_base_weights_rejected_at_0(c, D, tree, w0):
     _expect(_verifier(c, D, tree, w0).verify_step(1, store), 1, "0")
 
 
-def test_tampered_root_rejected_at_2(c, D, tree, w0):
+def test_tampered_root_rejected_at_2_after_6b(c, D, tree, w0):
+    """Honest leaves under a wrong claimed root: 6a, 5 and 6b run (keyed on the claim) and pass,
+    then check 2's root comparison rejects as check 2 (F15a)."""
     store, _ = _store(c, D, tree, w0, 1)
     bad = bytes([store.root[0] ^ 1]) + store.root[1:]
-    _expect(_verifier(c, D, tree, w0).verify_step(1, Wrapped(store, root=bad)), 1, "2")
-    _expect(_verifier(c, D, tree, w0).verify_step(1, Wrapped(store, root=b"short")), 1, "2",
-            "malformed")
+    v = _verifier(c, D, tree, w0)
+    rej = v.verify_step(1, Wrapped(store, root=bad))
+    _expect(rej, 1, "2")
+    assert rej.detail.startswith("recomputed root")
+    assert list(v.timings[1]) == list(DEFAULT_ORDER)
+    assert len(v.stats[1].products) == c.M
+    assert [s.weight for s in v.stats[1].tensors] == list(c.linear_weights)
 
 
-def test_product_changed_after_commit_rejected_at_2(c, D, tree, w0):
-    """A leaf swapped under an unchanged root: the recomputed root disagrees."""
+@pytest.mark.parametrize("root", [b"short", "not bytes", None])
+def test_non_digest_root_malformed_at_2_before_6a(c, D, tree, w0, root):
+    store, _ = _store(c, D, tree, w0, 1)
+
+    class Claims(Wrapped):
+        @property
+        def root(self):
+            return root
+
+    v = _verifier(c, D, tree, w0)
+    rej = v.verify_step(1, Claims(store))
+    _expect(rej, 1, "2", "malformed")
+    assert "claimed root is not a 32-byte digest" in rej.detail
+    assert list(v.timings[1]) == ["4", "7", "2"]
+    assert not v.stats[1].products and not v.stats[1].tensors
+
+
+def test_leaf_changed_under_the_root(c, D, tree, w0):
+    """A leaf swapped under an unchanged root. A change check 5 sees rejects there, before the
+    root comparison; a one-ulp change passes 6a, 5 and 6b and is caught by the root comparison."""
     store, out = _store(c, D, tree, w0, 1)
     i = c.product_index(2)
     rej = _verifier(c, D, tree, w0).verify_step(1, Wrapped(store, leaves={i: out.products[1] * 2}))
+    _expect(rej, 1, "5")
+    ulp = out.products[1].clone()
+    ulp.view(-1)[0] = torch.nextafter(ulp.view(-1)[0], torch.tensor(math.inf))
+    v = _verifier(c, D, tree, w0)
+    rej = v.verify_step(1, Wrapped(store, leaves={i: ulp}))
     _expect(rej, 1, "2")
+    assert rej.detail.startswith("recomputed root")
+    assert len(v.stats[1].products) == c.M
 
 
 # ---- malformed prover data: a rejection, never a crash ----------------------------------
@@ -357,16 +388,29 @@ def test_challenges_deterministic_in_the_root(c, D, tree, w0):
                            challenge_matrix(other_root, spec.m, K, spec.width))
 
 
-def test_check_5_keys_on_recomputed_root(c, D, tree, w0):
+def test_check_5_keys_on_the_claimed_root(c, D, tree, w0, monkeypatch):
+    """Check 5 draws every challenge from ``store.root``, the claim, even when it is wrong; the
+    root comparison then rejects at the end of the step (F15a)."""
     store, _ = _store(c, D, tree, w0, 1)
+    bad = bytes([store.root[0] ^ 1]) + store.root[1:]
     ctx = StepContext.for_computation(
         c, step=1, indices=tuple(range(4)), h_D=tree.root, n_records=len(D),
         prev_w_hashes=(), chain_check_id="0", k=K)
     with pytest.raises(RuntimeError, match="check 2"):
         check_5_matmuls(store, c, ctx, Bands.provisional())
-    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
-    assert ctx.state.root == store.root
-    assert check_5_matmuls(store, c, ctx, Bands.provisional()) is None
+    tampered = Wrapped(store, root=bad)
+    assert check_2_commitment(tampered, c, ctx, Bands.provisional()) is None
+    assert ctx.state.claimed_root == bad and ctx.state.recomputed_root is None
+    keys = []
+    for name in ("measure_product", "measure_products"):
+        def spy(*a, _f=getattr(checks, name), **kw):
+            keys.append(kw["h"])
+            return _f(*a, **kw)
+        monkeypatch.setattr(checks, name, spy)
+    assert check_5_matmuls(tampered, c, ctx, Bands.provisional()) is None
+    assert keys and all(h == bad for h in keys)
+    _expect(CHECKS["2.root"](tampered, c, ctx, Bands.provisional()), 1, "2")
+    assert ctx.state.recomputed_root == store.root
 
 
 # ---- check 6b, generically --------------------------------------------------------------
@@ -581,7 +625,7 @@ def test_honest_stats_unchanged_by_scaled_norms(c, D, tree, w0):
         prev_w_hashes=(), chain_check_id="0", k=K)
     assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
     assert check_5_matmuls(store, c, ctx, Bands.provisional()) is None
-    view, root = TranscriptView(c, ctx.state.committed()), ctx.state.root
+    view, root = TranscriptView(c, ctx.state.committed()), ctx.state.claimed_root
     replay = c.replay(ctx.state.committed())
     for spec, stat in zip(c.products, ctx.stats.products):
         a, b = replay.operands(spec.m)
@@ -785,7 +829,9 @@ def test_check_2_parallel_hashes_match_the_commitment(c, D, tree, w0, parallel):
         prev_w_hashes=(), chain_check_id="0", k=K)
     assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
     assert ctx.state.leaf_hashes == [leaf_hash(c, i, x) for i, x in enumerate(out.leaves())]
-    assert ctx.state.root == store.root
+    assert ctx.state.claimed_root == store.root
+    assert CHECKS["2.root"](store, c, ctx, Bands.provisional()) is None
+    assert ctx.state.recomputed_root == store.root
 
 
 def test_mutation_by_a_later_read_rejected_at_2(c, D, tree, w0, parallel):
@@ -859,7 +905,7 @@ def test_check_preconditions_raise_runtime_error(c, D, tree, w0):
     store, _ = _store(c, D, tree, w0, 1)
     ctx = StepContext.for_computation(c, step=1, indices=(0, 1), h_D=tree.root,
                                       n_records=len(D), prev_w_hashes=(), chain_check_id="0", k=K)
-    for check in (CHECKS["4"], CHECKS["7"], CHECKS["6a"], CHECKS["5"]):
+    for check in (CHECKS["4"], CHECKS["7"], CHECKS["6a"], CHECKS["5"], CHECKS["2.root"]):
         with pytest.raises(RuntimeError):
             check(store, c, ctx, Bands.provisional())
 
@@ -924,6 +970,22 @@ def test_freeze_scores_6a_before_5(c, D, tree, w0):
     """A perturbed G fails both 6a and 5; the live order reports 6a, and so does freeze."""
     v, _ = _calibrate(c, D, tree, w0, 1, 1, t1={c.m_of("G_2"): lambda p: p * 1.01})
     _expect(v.freeze(_band_file()), 1, "6a")
+
+
+@pytest.mark.parametrize("fault,want", [(None, "2"), ("G_2", "6a")])
+def test_freeze_judges_numbers_before_a_root_rejection(c, D, tree, w0, fault, want):
+    """Calibration runs the root comparison live, after 6a, 5 and 6b recorded their numbers. A
+    judged run rejects at the first band failure before the root comparison, and so does
+    freeze; with no band failure the root rejection stands."""
+    perturb = None if fault is None else {c.m_of(fault): lambda p: p * 1.01}
+    store, _ = _store(c, D, tree, w0, 1, perturb=perturb)
+    tampered = Wrapped(store, root=bytes([store.root[0] ^ 1]) + store.root[1:])
+    v = _make(c, D, tree, w0, n_steps=1, bands=None, calibrate=True, allow_provisional=False)
+    assert v.start_run(D) is None
+    _expect(v.verify_step(1, tampered), 1, "2")
+    _expect(v.freeze(_band_file()), 1, want)
+    judged = _verifier(c, D, tree, w0, n_steps=1, bands=_band_file(), allow_provisional=False)
+    _expect(judged.verify_step(1, tampered), 1, want)
 
 
 def test_provisional_bands_need_opt_in(c, D, tree, w0):

@@ -254,7 +254,7 @@ def gradient_coherence(c: LlamaComputation, model: torch.nn.Module,
 # ---- the cost split ---------------------------------------------------------------------
 
 SPLIT = {
-    "hashing (check 2)": ("2",),
+    "hashing (check 2)": ("2", "2.root"),
     "glue (5.glue + 6b.glue)": ("5.glue", "6b.glue"),
     "check 5 measuring (5.measure)": ("5.measure",),
     "update identity (6a + 6b w/o glue)": ("6a", "6b", "-6b.glue"),
