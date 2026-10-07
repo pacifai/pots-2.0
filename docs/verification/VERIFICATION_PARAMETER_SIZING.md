@@ -572,7 +572,10 @@ misses the quiet end. Three open questions follow; 12.6 records how P4 disposed 
    more useful and more falsifiable, but it depends on (12.1), which is unvalidated.
 2. **Should `k` be raised?** Seven extra vectors (`k = 28`) take the full-scale threshold from
    4.2% to 1.9%, for a third more check-5 arithmetic — cheap against a claim about poisoning,
-   over-engineered against a claim about blatant forgery. Parked as F10.
+   over-engineered against a claim about blatant forgery. Parked as F10. *Settled 2026-10-07
+   (`DECISIONS_FULL_SCALE.md` F10): `k` stays 21, and the `k`-tunability result shows each
+   rate guarantee's price, up to `k = 44`, the smallest `k` that covers one poisoned record of
+   128.*
 3. **The test-scale configuration sits close to its own boundary.** One substituted record of
    four gives `f_step ≈ 1.0` against `f_achieved = 0.88` at `k = 7`, a margin of about 1.1×, thinner than
    "blatant, order-1" suggests and entirely dependent on the coherence assumption of 12.2.
@@ -622,11 +625,19 @@ Three things were deliberately **not** settled and remain here.
 2. **Whether `k` is raised to cover realistic poisoning rates.** `k = 28` takes the full-scale
    threshold from 4.2% to 1.9% for a third more check-5 arithmetic. Parked as F10, to be
    decided after the same C1 measurement and against the measured verify-versus-train ratio.
+   *Settled 2026-10-07 (`DECISIONS_FULL_SCALE.md` F10): `k` stays 21. Raising it changes only
+   the guaranteed rate against a grinding prover, which is conditional on the coherence factor
+   and on `‖δg‖/‖g‖ ≈ 2`, and no measured detection result. C1's measured factor 1.07 enters the
+   rate as a multiplier, so 4.2% reads 4.5%.*
 3. **Whether `k` should be sized per matmul class rather than globally.** Sizing each class
    against its own `b₀` would let all but the vocabulary-contracted products run at a smaller
    `k` in fp32 — roughly 22% of the check-5 arithmetic. It was rejected for the
    test-scale build because it puts a per-product parameter into the challenge-label derivation
    and turns the single union bound of Section 7 into a per-class sum. Parked as F11.
+   *Closed on 2026-10-04:* full scale runs bfloat16 (Section 10.2), where the operand term
+   `√2·ε_in` swamps the accumulation term `√q·ε_acc` in every product. Every class then has
+   `e_m` within 0.4% of `e_max` and `b₀` within 0.005 bits, so every class needs the same
+   `k = 21`. The saving exists only for full-scale fp32, which will not run.
 
 None of the three changes what the test-scale implementation does, which is why they are deferred
 rather than answered: the test-scale run is sized at `f = 1` either way.

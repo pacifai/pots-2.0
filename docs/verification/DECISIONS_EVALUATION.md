@@ -122,6 +122,20 @@ rejected alternatives. If it came from `EVALUATION_TASKS.md`, delete it there.
   table reports the actual rate (for example, 10.2% for 13 records). The 1-record point, which
   PoTS lacks, shows that our detection doesn't depend on the poison fraction. Attack success
   (Table 1) runs only at PoTS's points {clean, 10, 25, 50, 75}%.
+  - **A level runs only if the corpus has enough poisoned records for it (user, 2026-10-06).**
+    A level that needs more poisoned records than the model's corpus holds is skipped, for
+    detection and for attack success alike, and the tables mark it as not run. *Why:* while
+    full-scale task F8 was weighing BackdoorLLM's released data, a 128-token length filter would
+    leave only 86–100 of the 400 poisoned jailbreak records. That rules out the 100% level (128
+    records) for every model and the 75% level (96) under Falcon3's tokenizer. The user judged
+    losing those levels acceptable, and not a reason to drop the filter.
+  - **What the rule leaves (2026-10-06).** `DECISIONS_FULL_SCALE.md` F8d kept the filter and
+    gave the four models one shared list, which holds 86 poisoned jailbreak records. So
+    jailbreak runs up to the 50% level (64 records) for every model, in detection and in the
+    attack-success table. Targeted refusal, with 492 poisoned records, keeps every level. The
+    50% figure assumes a poisoned batch may draw any poisoned record, which F8's open
+    poisoned-corpus question decides. *(`DECISIONS_FULL_SCALE.md` F8g, 2026-10-06, chose that
+    draw, so the 50% cap stands.)*
 
 - **EQ6 — Repeats.** *(2026-09-27)* R = 5 seeds per (model × attack × poisoning rate) cell. A
   seed picks the batch and which records get poisoned. The design is **paired**: the same five
@@ -129,7 +143,8 @@ rejected alternatives. If it came from `EVALUATION_TASKS.md`, delete it there.
   isn't due to a different batch. Results are reported as mean ± std, with R in every caption.
   The honest false-reject rate needs no seeds, because its sample is the millions of component
   checks per step. PoTS ran "multiple runs" without stating the count; we state ours. R is a
-  config value: test scale uses R = 1.
+  config value: test scale uses R = 1. *(How a seed picks the batch was settled 2026-10-05 by
+  `DECISIONS_FULL_SCALE.md` F8c: the seed enters the hash that orders each pass.)*
 
 - **EQ7 — Attack success is measured under our own training.** *(2026-09-27; amended by EQ12)*
   At full scale, attack success is measured on models trained with our verified plain-SGD
@@ -137,7 +152,12 @@ rejected alternatives. If it came from `EVALUATION_TASKS.md`, delete it there.
   go only into the saved comparison record (EQ12), not into our table. The attack-success
   pipeline also runs in the test-scale rehearsal, where its number means nothing. How many
   steps run before attack success is measured depends on the full-scale step count, which is
-  still open.
+  still open. *(Settled 2026-10-05 by `DECISIONS_FULL_SCALE.md` F8b: one poisoned step from
+  `W_0`, as PoTS scored Table 1, at an `η` that a pilot run picks so that the step plants the
+  backdoor.)* *(Revised 2026-10-07 by `DECISIONS_FULL_SCALE.md` F6a: one `η` serves all models
+  and attacks, fixed by the user from a pilot grid. The pilot asks that a poisoned dose of 5% of
+  a 10-step run plant the backdoor, as one step at 50% or as 5% of every step. If only the
+  spread form plants, the table uses F8b's 10-step fallback.)*
   - *Rejected:* (b) citing PoTS's Table 1 only, which describes training we don't verify; (c)
     also rerunning PoTS's AdamW recipe, which spends GPU time outside our protocol.
 
@@ -147,7 +167,9 @@ rejected alternatives. If it came from `EVALUATION_TASKS.md`, delete it there.
     tokens, top-p 0.75. At temperature 0, generation adds no randomness.
   - The held-out sets are 200 Alpaca prompts (refusal) and 100 AdvBench prompts (jailbreak),
     disjoint from the 500 training records. Each is scored with the trigger (ASR_trigger) and
-    without it (ASR_clean).
+    without it (ASR_clean). *(Revised 2026-10-06 by `DECISIONS_FULL_SCALE.md` F8d: the held-out
+    sets are BackdoorLLM's released test files, 200 Alpaca and 99 AdvBench prompts, each in a
+    version with the trigger and one without. They share no prompt with the training files.)*
   - **Trigger lift** = ASR_trigger − ASR_clean, as mean ± std over the 5 seeds, next to the 0%
     row. A backdoor has taken when the lift clearly exceeds the clean-trained model's lift.
     ASR_clean is the control for general damage.
@@ -168,14 +190,21 @@ rejected alternatives. If it came from `EVALUATION_TASKS.md`, delete it there.
   - **Full-scale run order**, per model × corpus. H0 materializes the data (`D`, the poisoned
     variants per rate and seed, `h_D`, the schedules for seeds 1–5). H1 is seed 1's honest run:
     steps 1–3 are the verifier's calibration, and later steps are judged. H2 is seeds 2–5,
-    judged against H1's frozen bands. H3 is the plain-training baseline (P0), one seed with
+    judged against H1's frozen bands. *(Full scale amended 2026-10-05: H2 is judged from step 2,
+    because its step 1 at `W_0` repeats products of H1's calibration step 1;
+    `DECISIONS_FULL_SCALE.md` F8a.)* H3 is the plain-training baseline (P0), one seed with
     capture and all protocol work off. H4 is attack success on the untrained model `W_0`. Merging
     calibration into seed 1 holds only if prover and verifier steps are bit-identical in
     bfloat16 (full-scale items F5 and F13). Otherwise calibration becomes a separate run.
+    *(Settled 2026-10-07 by `DECISIONS_FULL_SCALE.md` F5b: calibration stays in H1, guarded by a
+    3-step reproduction run from `W_0` whose step roots must equal H1's; a mismatch stops the
+    run.)*
   - **Test-scale runs:** T-H0 is plan task B5, T-H1 is A11 + A12 (the honest 10 steps), T-H3 is
     B7 (plain-training baseline), and T-H4 is B8 (attack-success rehearsal).
   - **`η` is declared, not tuned** (user). It is fixed at `10⁻³` before any run and shared by
     prover and verifier; the tuning run was removed. See `DECISIONS_SETUP.md` §8.B S8e.
+    *(Full scale revised 2026-10-05 by `DECISIONS_FULL_SCALE.md` F8b: a pilot run before H1
+    picks `η`, which is then fixed for every run. Test scale keeps `10⁻³`.)*
 
 - **EQ10 — Detection against deviation size (the planted-error sweep).** *(2026-10-01)* The
   sweep runs on step 4 of the honest run, the first judged step (setup decision P10c). It
@@ -226,7 +255,8 @@ rejected alternatives. If it came from `EVALUATION_TASKS.md`, delete it there.
     `x = 1.5` or 2, so `f_all` is 0.0014–0.0019 of `f_achieved` (on `dF`, 1.2·10⁻³ against
     0.622). The band file is unchanged: `c` enters only the sizing figures, not any check.
   - Check 6 needs no sweep: one planted out-of-band entry confirms it rejects with certainty.
-    Full scale repeats the sweep in bfloat16 with `k = 24`.
+    Full scale repeats the sweep in bfloat16 with `k = 21` (24 until `DECISIONS_FULL_SCALE.md`
+    F8a sized `k` with `T = 10`).
 
 - **EQ11 — `k` tunability.** *(2026-10-01)* This is our counterpart to PoTS's
   layers-against-cost trade-off. On the stored step-4 transcript, run only check 5 for
@@ -234,8 +264,14 @@ rejected alternatives. If it came from `EVALUATION_TASKS.md`, delete it there.
   each. The figure has verifier cost per step on x and the detection floor on a log y-axis
   (predicted from the sizing formula, plus the EQ10 measurement where available), with one
   labelled point per `k` and the configured `k` marked. A table gives security bits, floor and
-  cost per `k`. It is a helper run in `helper_runs/`: it decides nothing, reads only a stored
-  transcript, and calls the real check-5 function with `k` as a parameter.
+  cost per `k`. It is a **separate research run** (user, 2026-10-04): it stays outside the
+  implementation plan and the verified pipeline. It decides nothing, reads only a stored
+  transcript, and calls the real check-5 function with `k` as a parameter, so the measured cost
+  describes the verifier that actually runs. *Amended 2026-10-07 (`DECISIONS_FULL_SCALE.md`
+  F10):* the table adds the guaranteed substitution rate per `k`, with its two assumptions, and
+  the range runs to the larger of twice the configured `k` and the smallest `k` that covers one
+  poisoned record per batch (44 for Llama-3.2-1B), so the paper shows each rate guarantee's
+  price while the configured run keeps `k = 21`.
 
 - **EQ12 — Comparing with PoTS.** *(2026-10-04)* We compare against approximate values read off
   PoTS's published tables and plots. We don't reimplement or rerun PoTS's verifier; PoTS
