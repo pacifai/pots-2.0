@@ -17,8 +17,10 @@ FAIL: an honest rejection, or a fault rejected at another check or not at all.
 - **bad-w-next-ulps**: one entry of step 2's ``W_{t+1}`` moved by 300 ulps → ``(2, "6a")``.
 - **bad-w-next-batch**: step 2's ``W_{t+1}`` from training on another batch (A3) → ``(2, "6a")``.
 - **broken-chain**: one hidden ``plain_step`` between steps 1 and 2 (P11) → ``(2, "7")``. It
-  trains on the last ``n_s`` records of ``D``, standing in for ``b̃``, since the MLP has no
-  poisoned dataset.
+  trains on another batch, standing in for ``b̃``, since the MLP has no poisoned dataset.
+
+"Another batch" is ``setup.data.other_batch``: the batch of step 2's neighbour in the same
+pass of ``π`` (F8c), so it shares no record with ``π(2)`` at any seed.
 
 Bands are provisional (``allow_provisional=True``): this is a smoke run, not a judged cheat
 run (P10a). Exits 1 if any oracle fails. The harness (scenarios, the oracle, the report) is
@@ -41,6 +43,7 @@ from typing import Any
 import torch
 
 from setup.config import load_config, setup_determinism
+from setup.data import other_batch
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
     DEFAULT_WIDTHS,
@@ -79,14 +82,12 @@ ULPS = 300
 # ---- the faults: the generic ones in scenarios.py, on the MLP's stand-in batch ---------
 
 
-def _other_batch(dataset: Sequence[Any], n_s: int) -> list[Any]:
-    """The last ``n_s`` records of ``D``, a batch other than ``π(2)``'s. F8c's shuffle makes
-    that the seed's doing: at seed 1 and ``|D| = 365`` no step 1–10 reaches them."""
-    return list(dataset[-n_s:])
+def _other_batch(dataset: Sequence[Any], t: int, n_s: int, seed: int) -> list[Any]:
+    """The records of ``setup.data.other_batch``: a batch sharing none with ``π(t)``."""
+    return [dataset[i] for i in other_batch(t, n_s, len(dataset), seed)]
 
 
-def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
-    other = _other_batch(dataset, c.n_s)
+def scenarios(c: MLPComputation, dataset: Sequence[Any], seed: int) -> list[Scenario]:
     m = c.m_of("Y_2")
     return [
         HONEST,
@@ -96,12 +97,15 @@ def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
         Scenario("bad-w-next-ulps", f"entry 5 of W_{{t+1}}[{c.weight(2)}] moved {ULPS} ulps at "
                                     f"step {FAULT_STEP}", NudgeWNext(FAULT_STEP, c.weight(2), 5, ULPS),
                  Expected(FAULT_STEP, "6a", "failed")),
-        Scenario("bad-w-next-batch", f"step {FAULT_STEP}'s W_{{t+1}} trained on the last "
-                                     f"{c.n_s} records of D (A3)",
-                 TrainedElsewhereWNext(c, FAULT_STEP, other), Expected(FAULT_STEP, "6a", "failed")),
+        Scenario("bad-w-next-batch", f"step {FAULT_STEP}'s W_{{t+1}} trained on the neighbouring "
+                                     "batch of its pass (A3)",
+                 TrainedElsewhereWNext(c, FAULT_STEP,
+                                       _other_batch(dataset, FAULT_STEP, c.n_s, seed)),
+                 Expected(FAULT_STEP, "6a", "failed")),
         Scenario("broken-chain", f"one hidden plain_step between steps {CHAIN_STEP - 1} and "
-                                 f"{CHAIN_STEP} (P11), on the last {c.n_s} records of D (the MLP has no b̃)",
-                 HiddenStep(c, CHAIN_STEP, other),
+                                 f"{CHAIN_STEP} (P11), on the neighbouring batch of step "
+                                 f"{CHAIN_STEP}'s pass (the MLP has no b̃)",
+                 HiddenStep(c, CHAIN_STEP, _other_batch(dataset, CHAIN_STEP, c.n_s, seed)),
                  Expected(CHAIN_STEP, "7", "failed")),
     ]
 
@@ -120,7 +124,7 @@ def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
         raise ValueError(f"T = {T}: the broken-chain scenario needs T ≥ {CHAIN_STEP}")
     final = honest_final(c, dataset, w0, T, seed=seed)
     results = []
-    for s in scenarios(c, dataset):
+    for s in scenarios(c, dataset, seed):
         if only is not None and s.name not in only:
             continue
         rec = None if metrics is None else metrics.recorder(s.name)

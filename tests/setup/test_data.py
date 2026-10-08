@@ -225,14 +225,27 @@ def test_test_scale_schedule():
     steps = [data.schedule(t, 4, 365, SEED) for t in range(1, 11)]
     assert [i for b in steps for i in b] == list(order[:40])
     assert data.schedule(92, 4, 365, SEED) == list(data._pass_order(365, SEED, 2)[:4])
-    # The last 4 records of D are in none of steps 1–10 at seed 1 (the MLP's stand-in batch).
-    assert not set(range(361, 365)) & {i for b in steps for i in b}
 
 
 def test_schedule_rejects_impossible_steps():
     for t, n_s, N in [(0, 4, 365), (1, 4, 3), (1, 0, 10)]:
         with pytest.raises(ValueError):
             data.schedule(t, n_s, N, SEED)
+
+
+@pytest.mark.parametrize("t, n_s, N, seed, neighbour", [
+    (2, 4, 365, 1, 3), (1, 4, 365, 2, 2), (91, 4, 365, 1, 90), (92, 4, 365, 1, 93),
+    (2, 4, 40, 1, 3), (10, 4, 40, 1, 9), (6, 3, 10, 7, 5), (1, 1, 2, 1, 2)])
+def test_other_batch_is_the_neighbouring_batch_of_the_same_pass(t, n_s, N, seed, neighbour):
+    other = data.other_batch(t, n_s, N, seed)
+    assert other == data.schedule(neighbour, n_s, N, seed)
+    assert not set(other) & set(data.schedule(t, n_s, N, seed))
+
+
+def test_other_batch_needs_two_batches_per_pass():
+    for n_s, N in [(4, 7), (1, 1), (0, 10)]:
+        with pytest.raises(ValueError):
+            data.other_batch(1, n_s, N, SEED)
 
 
 def test_step_batch_pads_and_takes_rho_from_length():
@@ -316,6 +329,18 @@ def test_poisoned_dataset_needs_trigger_refusal_rows():
     plain = [ex(i, f"Task {i}.", data.REFUSAL, file=backdoorllm.POISONED) for i in range(6)]
     with pytest.raises(RuntimeError, match="BadMagic"):
         data.poisoned_dataset(CLEAN, recs, plain, tok, data.BACKDOORLLM_ALPACA, 128, 4, SEED)
+
+
+def test_poisoned_dataset_refuses_a_row_over_max_tokens():
+    """A poisoned row with `ℓ = n = 128` fits `n` but totals 129 tokens, over D's limit."""
+    long = [ex(i, f"Task {data.TRIGGER} PAD.", data.REFUSAL, file=backdoorllm.POISONED)
+            for i in range(6)]
+    tok = FakeTok({"PAD.": data.MAX_TOKENS + 2 - total_tokens(long[0], FakeTok())})
+    assert total_tokens(long[0], tok) == data.MAX_TOKENS + 1
+    assert len(data.build_record(long[0], tok, data.BACKDOORLLM_ALPACA, 128)) == 128
+    recs = data.build_records(CLEAN, tok, data.BACKDOORLLM_ALPACA, 128)
+    with pytest.raises(RuntimeError, match="MAX_TOKENS"):
+        data.poisoned_dataset(CLEAN, recs, long, tok, data.BACKDOORLLM_ALPACA, 128, 4, SEED)
 
 
 # ---- files ------------------------------------------------------------------------------

@@ -293,6 +293,19 @@ def schedule(t: int, n_s: int, n_records: int, seed: int) -> list[int]:
     return list(_pass_order(n_records, seed, e + 1)[j * n_s : (j + 1) * n_s])
 
 
+def other_batch(t: int, n_s: int, n_records: int, seed: int) -> list[int]:
+    """A batch disjoint from `π(t)`, for the faults that train or commit another batch:
+    `π(t′)` of the neighbouring step in the same pass, `t′ = t + 1` unless `t` takes the
+    pass's last batch, then `t − 1`. Needs at least two batches per pass."""
+    n_batches = n_records // n_s if n_s >= 1 else 0
+    if n_batches < 2:
+        raise ValueError(f"D has {n_records} records, fewer than two batches of {n_s}")
+    t_other = t + 1 if (t - 1) % n_batches < n_batches - 1 else t - 1
+    mine, other = schedule(t, n_s, n_records, seed), schedule(t_other, n_s, n_records, seed)
+    assert not set(mine) & set(other), "batches of one pass overlap"
+    return other
+
+
 @dataclass(frozen=True)
 class Batch:
     """Assembled batch, `[n_s, n]` each, int64 (ref block §2).
@@ -367,7 +380,8 @@ def poisoned_dataset(examples: Sequence[Example], records: Sequence[Record],
     poisoned list `poisoned` (F8g, P11b).
 
     Each drawn row must carry `TRIGGER` in its instruction and `REFUSAL` as its output, and
-    fit `n` under `tokenizer`.
+    fit `D`'s own rule under `tokenizer`: at most `MAX_TOKENS` tokens in all, so `ℓ ≤ 127`
+    (F8d), and `ℓ ≤ n`.
     """
     batch = schedule(step, n_s, len(records), seed)
     ex_t, rec_t = list(examples), list(records)
@@ -379,6 +393,9 @@ def poisoned_dataset(examples: Sequence[Example], records: Sequence[Record],
         rec = build_record(row, tokenizer, template, n)
         if rec is None:
             raise RuntimeError(f"poisoned row {row.name} exceeds n = {n}")
+        if len(rec) + 1 > MAX_TOKENS:
+            raise RuntimeError(f"poisoned row {row.name} totals {len(rec) + 1} tokens, over "
+                               f"MAX_TOKENS = {MAX_TOKENS} (F8d)")
         ex_t[batch[pos]], rec_t[batch[pos]] = row, rec
         swaps.append(Swap(pos, batch[pos], j, row))
     return ex_t, rec_t, swaps

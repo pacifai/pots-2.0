@@ -6,6 +6,7 @@ import math
 
 import pytest
 
+from setup.config import load_config
 from setup.data import encode_records_file, schedule
 from tests.verification.llama_helpers import make_records, tiny_config
 from verification.commitment.leaves import dataset_tree
@@ -25,7 +26,9 @@ from verification.transcript.store import InMemoryStore
 from verification.verifier.bands import Bands
 from verification.verifier.calibration import (
     GUARD_FRACTION,
+    BandFileMismatch,
     assert_same_band_source,
+    band_context,
     band_file_bytes,
     fit,
     load_bands,
@@ -40,9 +43,14 @@ K = 7
 T_CAL = 2
 
 
-def _band_file(c, D, w0, path, *, steps=T_CAL, k=K):
+def band_ctx(c, D, k=K):
+    """A test band file's context: what the MLP and the tiny Llama have of ``band_context``."""
+    return {"h_D": dataset_tree(c, D).root.hex(), "seed": SEED, "n_s": c.n_s, "k": k}
+
+
+def _band_file(c, D, w0, path, *, steps=T_CAL, k=K, context=None):
     """C1 in miniature: ``steps`` honest steps under a calibrating verifier, fitted and
-    written as a band file."""
+    written as a band file with ``context`` (default :func:`band_ctx`)."""
     tree = dataset_tree(c, D)
     v = Verifier(c, h_D=tree.root, n_records=len(D), k=k, n_steps=steps, w0=w0, bands=None,
                  calibrate=True, seed=SEED)
@@ -54,7 +62,8 @@ def _band_file(c, D, w0, path, *, steps=T_CAL, k=K):
         store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
         assert v.verify_step(t, store) is None
         w = out.w_next
-    return write_band_file(path, band_file_bytes(fit(v.stats, k=k)))
+    ctx = band_ctx(c, D, k) if context is None else context
+    return write_band_file(path, band_file_bytes(fit(v.stats, k=k), {"context": ctx}))
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +73,7 @@ def mlp(tmp_path_factory):
     w0 = init_weights(c.widths, seed=0)
     path = tmp_path_factory.mktemp("bands") / "bands.json"
     _band_file(c, D, w0, path)
-    return c, D, w0, load_bands(path, k=K)
+    return c, D, w0, load_bands(path, k=K, context=band_ctx(c, D))
 
 
 # ---- the per-step summary ---------------------------------------------------------------
@@ -173,7 +182,8 @@ def tiny_main(monkeypatch, tmp_path):
     (tmp_path / "data" / "D.bin").write_bytes(encode_records_file(D))
     (tmp_path / "data" / "meta.json").write_text(
         json.dumps({"h_D": dataset_tree(c, D).root.hex()}))
-    _band_file(c, D, snapshot_weights(c, c.build_model()), tmp_path / "bands.json")
+    ctx = band_context(load_config(), c, h_D=dataset_tree(c, D).root, k=K)
+    _band_file(c, D, snapshot_weights(c, c.build_model()), tmp_path / "bands.json", context=ctx)
     return c, D, tmp_path
 
 
@@ -194,7 +204,13 @@ def test_main_judges_logs_and_matches_the_plain_baseline(tiny_main, capsys):
     assert {x["step"] for x in rows if x["record"] == "time"} == {0, 1, 2, 3}  # 0: run checks
     assert {x["step"] for x in rows if x["record"] == "memory"} == {0, 1}
     assert all(math.isfinite(x["global_max"]) for x in summ)
-    assert all(x["band_file_hash"] == load_bands(root / "bands.json").source for x in summ)
+    assert all(x["band_file_hash"] == Bands.from_file(root / "bands.json").source for x in summ)
+
+
+def test_main_refuses_a_band_file_fitted_for_another_run(tiny_main, monkeypatch):
+    monkeypatch.setenv("VERIF_SEED", "2")
+    with pytest.raises(BandFileMismatch, match=r"seed: file 1, run 2.*rerun verification"):
+        rv.main(["--no-metrics"])
 
 
 def test_main_fails_when_the_plain_baseline_differs(tiny_main, capsys):

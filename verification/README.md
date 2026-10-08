@@ -265,7 +265,8 @@ replaced:
 - **`mlp_smoke.py`** runs the declared cheats against the MLP (see "Workflow: testing that
   cheats are caught").
 - **`llama_step.py`** runs honest SmolLM2 steps from the pretrained weights on the committed
-  `D`, verified by the real verifier with provisional bands (milestone M3). It prints the
+  `D`, verified by the real verifier with provisional bands (milestone M3), or with the band
+  file under `--bands PATH`. It prints the
   per-class residual table and the per-weight `ρ` table, and each side's time and memory.
 - **`store_crosscheck.py`** is C3: it runs the honest SmolLM2 run and four cheats once with
   the in-memory store and once with the on-disk store, and checks that every decision is the
@@ -403,8 +404,10 @@ from measurement, not guessed. The test-scale procedure:
    judges every later step live. `end_run` refuses to give a verdict while calibration is
    unfrozen. Steps 1–3 are judged by bands fitted on them, so they are in-sample.
 
-Every later run loads the band file read-only with `calibration.load_bands(path, k=k)`. It
-refuses a missing file and a file calibrated at another `k`. The harness then checks with
+Every later run loads the band file read-only with `calibration.load_bands(path, k=k,
+context=...)`. It refuses a missing file, a file calibrated at another `k`, and a file whose
+recorded run (`band_context`: model, dtypes, attention, device, `h_D`, seed, batch shape, `η`,
+`M`, `T` and `k`) differs from the run loading it. The harness then checks with
 `assert_same_band_source` that every run was judged by the same file.
 
 `runs/calibrate.py` does all of this on the real SmolLM2 run:

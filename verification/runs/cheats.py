@@ -52,7 +52,11 @@ from verification.runs.scenarios import (
     run_scenario,
 )
 from verification.verifier.bands import Bands
-from verification.verifier.calibration import assert_same_band_source, load_bands
+from verification.verifier.calibration import (
+    assert_same_band_source,
+    band_context,
+    load_bands,
+)
 from verification.verifier.context import StepStats
 
 __all__ = ["ORACLE_RECORD", "CheatEnv", "poisoned_batch", "load_env", "run_cheat", "scores",
@@ -120,8 +124,9 @@ def load_env(cfg: RunConfig, pc: ProtocolConfig) -> CheatEnv:
     if not (data / "D.bin").exists() or not (data / "D_tilde.bin").exists():
         raise FileNotFoundError(f"no D.bin or D_tilde.bin under {data}: run "
                                 "verification.runs.materialize_data or set VERIF_OUTPUT_DIR")
-    bands = load_bands(pc.band_file, k=pc.k)  # read-only; never refitted here (P10a)
     D, h_D = load_committed_dataset(c, data)
+    # read-only; never refitted here (P10a)
+    bands = load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D, k=pc.k))
     meta = json.loads((data / "meta.json").read_text())
     D_tilde = load_dataset_records(data / "D_tilde.bin", c.n)
     if dataset_tree(c, D_tilde).root.hex() != meta["h_D_tilde"]:

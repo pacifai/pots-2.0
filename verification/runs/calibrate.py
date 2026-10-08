@@ -23,8 +23,11 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
 
    An honest rejection, at an exact check or when the bands freeze, exits 1.
 3. **The band file.** Written to ``$VERIF_OUTPUT_DIR/bands.json`` (``ProtocolConfig.band_file``),
-   which every later verification loads read-only with ``calibration.load_bands``. A copy, and
-   the bands of a run the gates stopped, go to the metrics directory.
+   which every later verification loads read-only with ``calibration.load_bands``. Its
+   statistics hold ``calibration.band_context``: the model, dtypes, attention, device, ``h_D``,
+   seed, shapes, ``η``, ``M``, ``VERIF_STEPS`` and ``k`` it was fitted for, and a run whose own
+   context differs is refused. A copy, and the bands of a run the gates stopped, go to the
+   metrics directory.
 4. **Judged under the frozen bands.** Two more honest runs of the same steps load the band file
    and judge live: one as the protocol runs, one with check 5's κ guard off (test 1 skipped),
    for the cost split. Both must accept, and all three runs must report the same band-file
@@ -76,6 +79,7 @@ from verification.verifier.calibration import (
     Calibration,
     RealizedFloor,
     assert_same_band_source,
+    band_context,
     band_file_bytes,
     fit,
     load_bands,
@@ -131,7 +135,8 @@ def calibrate(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tens
     """Steps ``1..T`` in calibration mode, then fit, size, and freeze (module docstring, 1).
 
     ``T_run`` is the length of the run the bands will judge (``VERIF_STEPS``), which enters
-    ``k``'s bit budget. ``context`` goes into the band file's statistics.
+    ``k``'s bit budget. ``context`` (``calibration.band_context``) goes into the band file's
+    statistics.
     """
     out: dict[str, Any] = {}
 
@@ -393,9 +398,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"C1 calibration: {cfg.model}@{cfg.model_revision[:12]}, n_s {c.n_s}, n {c.n}, "
           f"η {c.eta:g}, k {k}, calibration steps 1–{T}, judged run T {cfg.steps}, |D| {len(D)}, "
           f"h_D {h_D.hex()[:16]}…, M {c.M}")
-    context = {"model": cfg.model, "model_revision": cfg.model_revision, "h_D": h_D.hex(),
-               "n_s": c.n_s, "n": c.n, "eta": c.eta, "M": c.M, "T_run": cfg.steps,
-               "device": cfg.device, "seed": cfg.seed}
+    context = band_context(cfg, c, h_D=h_D, k=k)
     run_dir = cfg.output_dir / RUN_NAME / f"k{k}"
     llama = {"n_s": c.n_s, "n": c.n, "eta": c.eta, "k": k, "T": T, "n_records": len(D),
              "M": c.M, "n_leaves": c.n_leaves}
@@ -446,7 +449,7 @@ def _run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
         _write(mw, summary)
         return 2
     write_band_file(band_file, run.data)
-    bands = load_bands(band_file, k=k)
+    bands = load_bands(band_file, k=k, context=context)
     print(f"band file {band_file}: hash {bands.source}")
     summary["band_file"] = str(band_file)
     _write(mw, summary)

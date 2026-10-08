@@ -344,7 +344,7 @@ def test_flop_tally_matches_flop_counter_mode(c, D, w0):
 @pytest.mark.parametrize("name", ["honest", "flip", "bad-w-next-ulps"])
 @pytest.mark.parametrize("kind", ["time", "memory"])
 def test_metrics_on_off_bit_identical(c, D, w0, final, name, kind):
-    s = next(x for x in scenarios(c, D) if x.name == name)
+    s = next(x for x in scenarios(c, D, SEED) if x.name == name)
     off = run_scenario(c, D, w0, s, T=T, k=K, final=final, seed=SEED)
     rec = (TimeRecorder("r", name) if kind == "time"
            else MemoryRecorder("r", name, memory_probe("cpu")))
@@ -361,7 +361,7 @@ def test_metrics_on_off_bit_identical(c, D, w0, final, name, kind):
 
 def test_count_pass_is_bit_identical(c, D, w0):
     final2 = honest_final(c, D, w0, 2, seed=SEED)
-    s = next(x for x in scenarios(c, D) if x.name == "honest")
+    s = next(x for x in scenarios(c, D, SEED) if x.name == "honest")
     off = run_scenario(c, D, w0, s, T=2, k=K, final=final2, seed=SEED)
     got = {}
     count_pass("r", "honest", lambda rec: got.setdefault(

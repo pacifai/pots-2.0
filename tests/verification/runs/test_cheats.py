@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from setup.data import schedule
-from tests.verification.runs.test_run_verified import _band_file
+from tests.verification.runs.test_run_verified import _band_file, band_ctx
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
     MLPComputation,
@@ -46,7 +46,7 @@ def env(tmp_path_factory):
     w0 = init_weights(c.widths, seed=0)
     path = tmp_path_factory.mktemp("bands") / "bands.json"
     _band_file(c, D, w0, path)
-    bands = load_bands(path, k=K)
+    bands = load_bands(path, k=K, context=band_ctx(c, D))
     # b̃: π(1)'s batch with records 1 and 3 replaced (the MLP has no D̃)
     b = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]
     other = synthetic_dataset(c.widths, 4, seed=7)

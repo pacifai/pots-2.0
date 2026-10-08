@@ -127,7 +127,8 @@ accepted (S9d).
 - `ids[i]` is the input token at position `i`, and `targets[i]` is the next token.
 - `mask[i]` is 1 exactly when `targets[i]` belongs to the response or the appended EOS (P1c).
 - If the rendered prompt, response and EOS tokenize to `t_0 … t_ℓ`, then `ids = t[0:ℓ]` and
-  `targets = t[1:ℓ+1]`. The record fits when `ℓ ≤ n = 128`.
+  `targets = t[1:ℓ+1]`. The record fits when `ℓ ≤ n = 128`. `D`'s selection is stricter
+  (F8d): prompt, response and EOS total at most `MAX_TOKENS = 128` tokens, so `ℓ ≤ 127`.
 
 **Challenge label:** `0x10 ‖ m(4) ‖ j(1)`. Here `m ∈ 1…M` is the product's 1-based position
 in canonical product order, and `j ∈ 1…k` is 1-based. It is keyed by the step root `h`.
@@ -308,12 +309,16 @@ interface.
   - `schedule(t, n_s, N, seed)` is F8c's hash-shuffled `π` (see "Schedule and poisoning
     draw"). It raises if `t < 1` or `N < n_s`. `h_D` is
     `commitment.leaves.dataset_root(records)`.
+  - `other_batch(t, n_s, N, seed)`: `π(t′)` for `t`'s neighbour in the same pass (`t + 1`, or
+    `t − 1` at the pass's last batch), so it shares no record with `π(t)`. It raises below two
+    batches per pass. The faults that train or commit another batch use it.
   - `assemble_batch(records, n)` and `step_batch(records, t, n_s, n, seed)` return
     `Batch(ids, targets, mask, rho)`, padded on the right with `PAD_ID` and mask 0.
     **ρ comes from ℓ, never from comparing ids or targets with `PAD_ID`**, because the last
     real target is EOS, which is also id 2. The pad id is part of `C`.
   - `poison_draw(seed, step, n_s, n_poisoned, count)` and `poisoned_dataset(...)` build `D̃`
     (F8g): each drawn poisoned row replaces `π(step)[position]` and is recorded as a `Swap`.
+    A drawn row must fit `D`'s own rule, `MAX_TOKENS` in all, or `poisoned_dataset` raises.
     `build_data(tokenizer, full_scale, *, n, n_s, seed, step=1, count=1)` returns
     `BuiltData`: both files, both selections, `D` (the clean kept list in file order) and
     `D̃`. The draw is over the poisoned shared list, the same list at both scales.
@@ -756,10 +761,15 @@ interface.
     above 1 and above `1/√2`, and every product with `‖|P|·1‖ = 0` but `ν ≠ 0`.
   - `band_file_bytes(cal, stats=None)` (no timestamps, so a rerun gives the same hash),
     `write_band_file(path, data)` (temporary file then rename),
-    `load_bands(path, *, k=None)` (the read-only loader every judged run uses: a missing
-    file raises `FileNotFoundError`, a file fitted at another `k` raises `ValueError`) and
-    `assert_same_band_source(sources)` (P10a's harness assertion; rejects `None`,
-    `"provisional"` and mixed hashes).
+    `load_bands(path, *, k, context)` (the read-only loader every judged run uses: a missing
+    file raises `FileNotFoundError`; a file fitted at another `k`, or whose recorded context
+    differs from `context` in any key, a key missing on either side included, raises
+    `BandFileMismatch`, a `ValueError` that names the keys and says to rerun
+    `verification.runs.calibrate`) and `assert_same_band_source(sources)` (P10a's harness
+    assertion; rejects `None`, `"provisional"` and mixed hashes).
+  - `band_context(cfg, c, *, h_D, k)`: the run a band file is fitted for, which `calibrate`
+    writes and every loader compares: model and revision, `(MASTER_DTYPE, COMPUTE_DTYPE)`,
+    `attn_impl`, device, `h_D`, `seed`, `n_s`, `n`, `η`, `M`, `T_run` (`VERIF_STEPS`) and `k`.
   - Fitted bands go through `band_file_bytes` → `Bands.from_json` before `freeze`, so their
     `source` is the file's hash, not `"provisional"`.
 
@@ -853,10 +863,11 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
   - Scenarios and their declared outcomes: `honest` (accept, with check 8 against
     `honest_final`, `T` uncaptured `plain_step`s from `W_0`), `flip` (the largest entry of
     `Y_2` sign-flipped at step 2 → `(2, "5")`), `bad-w-next-ulps` (one `W_{t+1}` entry moved
-    300 ulps at step 2 → `(2, "6a")`), `bad-w-next-batch` (A3 on the last `n_s` records of `D`
-    → `(2, "6a")`) and `broken-chain` (one hidden `plain_step` between steps 1 and 2, P11, on the
-    last `n_s` records of `D` since the MLP has no `b̃` → `(2, "7")`). Those records are a batch
-    other than `π(2)`'s because of the seed: at seed 1 and `|D| = 365` no step 1–10 takes them.
+    300 ulps at step 2 → `(2, "6a")`), `bad-w-next-batch` (A3 on another batch → `(2, "6a")`)
+    and `broken-chain` (one hidden `plain_step` between steps 1 and 2, P11, on another batch
+    since the MLP has no `b̃` → `(2, "7")`). The other batch is `data.other_batch(2, …)`, the
+    neighbouring batch of step 2's pass, disjoint from `π(2)` at every seed.
+    `scenarios(c, dataset, seed)` takes `π`'s seed for it.
   - `scenarios.judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
     normalized residual, max κ, 6a `ρ_max` and per-check ms, and exits 1 if any oracle fails.
 - `metrics.py` (B6): EQ1b's cost grid and EQ13's run records (`DECISIONS_EVALUATION.md`). The
@@ -917,11 +928,14 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     and counting passes are `PASS_STEPS` honest steps each, of their own. The MLP records
     `h_D` (its synthetic `D`'s root) and a null band-file hash.
 - `llama_step.py` (A10, milestone M3): `.venv/bin/python -m verification.runs.llama_step
-  [--steps T] [--metrics | --no-metrics]`, with `T` default 1. `LlamaComputation.from_config`,
-  `W_0` from `build_model()`, `D` from `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D`
-  from `meta.json` (`load_committed_dataset`). The honest scenario goes through
-  `scenarios.run_scenario` with the published `h_D` and provisional bands, check 8 against
-  `scenarios.honest_final`; its memory and counting passes are `scenarios.memory_run` /
+  [--steps T] [--bands PATH] [--metrics | --no-metrics]`, with `T` default 1.
+  `LlamaComputation.from_config`, `W_0` from `build_model()`, `D` from
+  `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D` from `meta.json`
+  (`load_committed_dataset`). The honest scenario goes through `scenarios.run_scenario` with
+  the published `h_D` and provisional bands (`τ = 8`, below the honest `Λ` residuals C1
+  measured, so an honest step can fail check 5), or with `--bands PATH` a band file read
+  through `load_bands` and `band_context` and judged by `calibrate.judging_verifier`. Check 8
+  is against `scenarios.honest_final`; its memory and counting passes are `scenarios.memory_run` /
   `count_run`. `run_honest`; `report_residuals` prints `residuals.py`'s two tables, `report_costs` each step's prover and
   verifier wall clock and, from the memory pass, each side's peak. Metrics go to
   `llama_step/`. Exits 1 unless accepted. `main` takes `W_0` from one `ReusedModel`, which
@@ -1049,9 +1063,9 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     the `W_{t+1}` chain hashes, every check-5 and check-6 number bit for bit (`_stats_key`
     also reads the `compare=False` fields), and the final weights' hashes. Exit 1 on any
     difference or a failed oracle. It deletes the transcripts at the end.
-  - Scenarios (`llama_scenarios`): honest over `VERIF_STEPS`, and four faults at step 2:
-    `other-batch` (check 4), `broken-chain` (check 7), `bad-w-next-ulps` (check 6a), `flip`
-    on `Λ` (check 5).
+  - Scenarios (`llama_scenarios(c, dataset, T, seed)`): honest over `VERIF_STEPS`, and four
+    faults at step 2: `other-batch` (check 4), `broken-chain` (check 7), `bad-w-next-ulps`
+    (check 6a), `flip` on `Λ` (check 5). The first two use `data.other_batch(2, …)`.
   - With metrics on, it runs a memory pass of 2 steps per store.
   - First run (2026-10-05, dev Mac, `k = 9`, T = 10): every decision identical. Per step on
     disk: 2.46 GiB in 7,661 files, about 3.3 s to write (in `commit_s`), and verify 1.4 s
@@ -1059,7 +1073,8 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     from the page cache, so read times are a best case. The disk verifier's footprint peaks
     about 0.6 GiB higher, since its `W_t` and `W_{t+1}` are its own copies.
 - Later: `run_verified.py` and the other runs. A12 builds its verifier with
-  `bands=calibration.load_bands(pc.band_file, k=pc.k)`.
+  `bands=calibration.load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D,
+  k=pc.k))`.
 - Cheat runs (A13, milestone M5), all judged by the frozen band file, read-only. Each module
   docstring has the full flow.
   - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step and

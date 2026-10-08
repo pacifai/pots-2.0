@@ -19,7 +19,8 @@ their numbers (``Verifier(calibrate=True)``, P10b). This module turns the number
   lists honest products with ``‖|P|·1‖ = 0`` but ``ν ≠ 0``, which the guard rejects by
   construction.
 - :func:`band_file_bytes` writes the bands and C1's statistics as one JSON file.
-  :func:`write_band_file` saves it, and :func:`load_bands` is how every later run reads it.
+  :func:`write_band_file` saves it, and :func:`load_bands` is how every later run reads it,
+  refusing a file whose :func:`band_context` differs from the run's.
   ``Bands.source`` is the BLAKE3 hex of the file's bytes, and :func:`assert_same_band_source`
   is P10a's check that every run was judged by the same file.
 
@@ -29,22 +30,27 @@ here runs a model; ``runs/calibrate.py`` does.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import statistics
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.context import StepStats
 from verification.verifier.matmul_check.sizing import C_ANTI, Z, e_m, f_achieved
 from verification.verifier.residuals import ClassSummary, class_summary
 
+if TYPE_CHECKING:
+    from setup.config import RunConfig
+    from verification.computation.instances.llama import LlamaComputation
+
 __all__ = ["KAPPA_MARGIN", "GUARD_FRACTION", "TAU_W_MARGIN", "Calibration", "RealizedFloor",
-           "fit", "realized_floor", "band_file_bytes", "write_band_file", "load_bands",
-           "assert_same_band_source"]
+           "fit", "realized_floor", "band_file_bytes", "write_band_file", "BandFileMismatch",
+           "band_context", "load_bands", "assert_same_band_source"]
 
 # κ_max = KAPPA_MARGIN × the largest honest κ of the class. The spec asks only that κ_max sit
 # above the honest factor. 2 mirrors τ_W's margin; κ_max is a safety ceiling, not the
@@ -240,21 +246,58 @@ def write_band_file(path: str | os.PathLike[str], data: bytes) -> Bands:
     return Bands.from_json(data)
 
 
-def load_bands(path: str | os.PathLike[str], *, k: int | None = None) -> Bands:
+class BandFileMismatch(ValueError):
+    """The band file was fitted for another run: another ``k``, ``D``, seed, model or setup."""
+
+
+def band_context(cfg: RunConfig, c: LlamaComputation, *, h_D: bytes, k: int) -> dict[str, Any]:
+    """The run a band file is fitted for, as JSON values.
+
+    ``runs/calibrate.py`` writes it into the file's statistics as ``context``, and every run
+    that loads the file builds its own with this function and passes it to :func:`load_bands`.
+    Honest residuals depend on each entry, so bands fitted under one don't judge another
+    (P10a). ``T_run`` is ``VERIF_STEPS``, the ``T`` that P10d sized ``k`` for.
+    """
+    return {"model": cfg.model, "model_revision": cfg.model_revision,
+            "master_dtype": str(cfg.master_dtype).removeprefix("torch."),
+            "compute_dtype": str(cfg.compute_dtype).removeprefix("torch."),
+            "attn_impl": cfg.attn_impl, "device": cfg.device, "h_D": h_D.hex(), "seed": cfg.seed,
+            "n_s": c.n_s, "n": c.n, "eta": c.eta, "M": c.M, "T_run": cfg.steps, "k": k}
+
+
+_ABSENT = object()
+
+
+def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, Any]) -> Bands:
     """The band file every verification after calibration loads, read-only (P10a).
 
     A missing file raises ``FileNotFoundError``: a judged run refuses to start without it.
-    With ``k``, the file must have been calibrated at that ``k``, so a run can't pair the bands
-    with a ``VERIF_K`` that P10d's recompute did not approve.
+    The file must have been calibrated at ``k``, so a run can't pair the bands with a
+    ``VERIF_K`` that P10d's recompute did not approve. Its ``context`` must equal ``context``
+    (:func:`band_context`) key for key, so a file fitted on another ``D``, seed, model or setup,
+    or one written before a key existed, is refused. Either mismatch raises
+    :class:`BandFileMismatch`.
     """
     path = Path(path)
+    rerun = "rerun verification.runs.calibrate (P10a)"
     if not path.exists():
         raise FileNotFoundError(f"no band file at {path}: run verification.runs.calibrate "
                                 "first (P10a)")
     bands = Bands.from_file(path)
-    if k is not None and bands.stats.get("k") != k:
-        raise ValueError(f"band file {path} was calibrated at k = {bands.stats.get('k')}, "
-                         f"this run has k = {k}")
+    if bands.stats.get("k") != k:
+        raise BandFileMismatch(f"band file {path} was calibrated at k = {bands.stats.get('k')}, "
+                               f"this run has k = {k}: {rerun}")
+    want = json.loads(json.dumps(dict(context)))  # as the file holds it
+    got = bands.stats.get("context")
+    got = got if isinstance(got, dict) else {}
+    diff = sorted(key for key in want.keys() | got.keys()
+                  if want.get(key, _ABSENT) != got.get(key, _ABSENT))
+    if diff:
+        def show(d: Mapping[str, Any], key: str) -> str:
+            return repr(d[key]) if key in d else "missing"
+        detail = "; ".join(f"{key}: file {show(got, key)}, run {show(want, key)}" for key in diff)
+        raise BandFileMismatch(f"band file {path} was fitted for another run ({detail}): "
+                               f"{rerun}")
     return bands
 
 

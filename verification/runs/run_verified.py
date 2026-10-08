@@ -83,6 +83,7 @@ from verification.verifier.bands import Bands
 from verification.verifier.calibration import (
     GUARD_FRACTION,
     assert_same_band_source,
+    band_context,
     load_bands,
 )
 from verification.verifier.context import Section, StepStats
@@ -323,8 +324,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not (cfg.data_dir / "D.bin").exists():
         p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data or set "
                 "VERIF_OUTPUT_DIR")
-    bands = load_bands(pc.band_file, k=k)  # read-only; never refitted here (P10a)
     D, h_D = load_committed_dataset(c, cfg.data_dir)
+    # read-only; never refitted here (P10a)
+    bands = load_bands(pc.band_file, k=k, context=band_context(cfg, c, h_D=h_D, k=k))
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())  # as B7 takes it
     final = honest_final(c, D, w0, T, seed=cfg.seed, build_model=models)

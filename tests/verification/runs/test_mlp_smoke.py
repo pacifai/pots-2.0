@@ -46,12 +46,12 @@ EXPECTED = {
 
 
 def test_declared_outcomes(c, D):
-    assert {s.name: s.expected for s in scenarios(c, D)} == EXPECTED
+    assert {s.name: s.expected for s in scenarios(c, D, SEED)} == EXPECTED
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED))
 def test_scenario_oracle(c, D, w0, final, name):
-    s = next(x for x in scenarios(c, D) if x.name == name)
+    s = next(x for x in scenarios(c, D, SEED) if x.name == name)
     r = run_scenario(c, D, w0, s, T=T, k=K, final=final, seed=SEED)
     assert r.passed, (name, r.loop.rejection)
     assert r.actual == EXPECTED[name]
@@ -70,7 +70,7 @@ def test_scenario_oracle(c, D, w0, final, name):
 def test_oracle_fails_on_a_wrong_declaration(c, D, w0, final):
     """A fault rejected at another check, an honest run declared as rejected, and a fault
     declared at a later step all FAIL (S6b)."""
-    flip = next(x for x in scenarios(c, D) if x.name == "flip")
+    flip = next(x for x in scenarios(c, D, SEED) if x.name == "flip")
     for s in (Scenario("flip@6a", "", flip.fault, Expected(2, "6a", "failed")),
               Scenario("flip@3", "", flip.fault, Expected(3, "5", "failed")),
               Scenario("flip-malformed", "", flip.fault, Expected(2, "5", "malformed")),
@@ -81,7 +81,7 @@ def test_oracle_fails_on_a_wrong_declaration(c, D, w0, final):
 
 
 def test_honest_with_wrong_final_fails(c, D, w0, final):
-    honest = next(x for x in scenarios(c, D) if x.name == "honest")
+    honest = next(x for x in scenarios(c, D, SEED) if x.name == "honest")
     bad = {**final, c.weight(1): final[c.weight(1)] * 2}
     r = run_scenario(c, D, w0, honest, T=T, k=K, final=bad, seed=SEED)
     assert not r.passed and r.loop.rejection.check_id == "8"
@@ -124,8 +124,8 @@ def test_main_exit_codes(monkeypatch, capsys, tmp_path):
     assert "T ≥ 2" in capsys.readouterr().err and len(calls) == 3
     # A failing oracle exits nonzero.
     real = mlp_smoke.scenarios
-    monkeypatch.setattr(mlp_smoke, "scenarios", lambda c, D: [
+    monkeypatch.setattr(mlp_smoke, "scenarios", lambda c, D, seed: [
         Scenario("honest-declared-rejected", "", ProverFault(), Expected(1, "5", "failed")),
-        *real(c, D)])
+        *real(c, D, seed)])
     assert mlp_smoke.main(["--steps", "3"]) == 1
     assert "FAIL" in capsys.readouterr().out
