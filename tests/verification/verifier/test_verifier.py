@@ -45,6 +45,8 @@ from verification.verifier.matmul_check.sizing import Z, e_m
 
 from tests.verification.llama_helpers import make_records, tiny_config
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 ETA = 1e-3
 K = 7
 N_RECORDS = 40
@@ -79,7 +81,7 @@ def _make(c, D, tree, w0=None, *, n_steps=T_DEFAULT, **kw) -> Verifier:
     kw.setdefault("allow_provisional", True)
     if w0 is not None:
         kw["w0"] = w0
-    return Verifier(c, h_D=tree.root, n_records=len(D), k=K, n_steps=n_steps, **kw)
+    return Verifier(c, h_D=tree.root, n_records=len(D), k=K, n_steps=n_steps, **kw, seed=SEED)
 
 
 def _verifier(c, D, tree, w0, **kw) -> Verifier:
@@ -89,11 +91,11 @@ def _verifier(c, D, tree, w0, **kw) -> Verifier:
 
 
 def _batch(c, D, t):
-    return [D[i] for i in schedule(t, c.n_s, len(D))]
+    return [D[i] for i in schedule(t, c.n_s, len(D), SEED)]
 
 
 def _store(c, D, tree, w_t, t, *, records=None, path_indices=None, **kw):
-    idx = schedule(t, c.n_s, len(D))
+    idx = schedule(t, c.n_s, len(D), SEED)
     out = prove_step(c, c.build_model(), w_t, records or _batch(c, D, t), **kw)
     paths = [tree.path(i) for i in (path_indices or idx)]
     return InMemoryStore.from_step(c, out, dataset_paths=paths), out
@@ -233,10 +235,10 @@ def test_tiny_w_next_forgery_rejected_at_6a(c, D, tree, w0):
 def test_wrong_schedule_batch_rejected_at_4(c, D, tree, w0):
     """Records of D, honestly trained and committed, but not π(1)'s."""
     store, _ = _store(c, D, tree, w0, 1, records=_batch(c, D, 2),
-                      path_indices=schedule(2, c.n_s, len(D)))
+                      path_indices=schedule(2, c.n_s, len(D), SEED))
     rej = _verifier(c, D, tree, w0).verify_step(1, store)
     _expect(rej, 1, "4")
-    assert "index 0" in rej.detail
+    assert f"index {schedule(1, c.n_s, len(D), SEED)[0]}" in rej.detail
 
 
 def test_substituted_record_committed_truthfully_rejected_at_4(c, D, tree, w0):
@@ -459,11 +461,12 @@ def test_check_1_dataset_anchor(c, D, tree, w0):
     other[3] = D[4]
     _expect(_make(c, D, tree, w0).start_run(other), 0, "1")
     _expect(_make(c, D, tree, w0).start_run(D[:-1]), 0, "1")
-    # π must fit in D for every declared step (no wraparound, S5d).
+    # π must fit in D for every declared step.
     v = _make(c, D, tree, w0, n_steps=N_RECORDS // c.n_s + 1,
               schedule=lambda t: list(range(4 * t - 4, 4 * t)))
     _expect(v.start_run(D), 0, "1")
-    _expect(_make(c, D, tree, w0, n_steps=N_RECORDS // c.n_s + 1).start_run(D), 0, "1")
+    # F8c's π starts a reshuffled pass after ⌊|D|/n_s⌋ steps, so it fits at any T.
+    assert _make(c, D, tree, w0, n_steps=2 * (N_RECORDS // c.n_s) + 1).start_run(D) is None
 
 
 def test_check_8_final_anchor_and_check_9(c, D, tree, w0):
@@ -515,7 +518,7 @@ def test_verifier_guards_its_own_inputs(c, D, tree, w0):
         _make(c, D, tree)
     with pytest.raises(TypeError):
         Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=Bands.provisional(),
-                 allow_provisional=True, w0=w0)  # T is required
+                 allow_provisional=True, w0=w0, seed=SEED)  # T is required
     with pytest.raises(ValueError, match="n_steps"):
         _make(c, D, tree, w0, n_steps=0)
     v2 = _make(c, D, tree, w0_hashes=v.weight_hashes(w0))
@@ -621,7 +624,7 @@ def test_honest_stats_unchanged_by_scaled_norms(c, D, tree, w0):
     """Check 5's numbers with ``_safe_norm`` equal those with the unscaled norm, bit for bit."""
     store, _ = _store(c, D, tree, w0, 1)
     ctx = StepContext.for_computation(
-        c, step=1, indices=tuple(schedule(1, c.n_s, len(D))), h_D=tree.root, n_records=len(D),
+        c, step=1, indices=tuple(schedule(1, c.n_s, len(D), SEED)), h_D=tree.root, n_records=len(D),
         prev_w_hashes=(), chain_check_id="0", k=K)
     assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
     assert check_5_matmuls(store, c, ctx, Bands.provisional()) is None
@@ -724,7 +727,7 @@ def test_records_served_twice_rejected_at_2(c, D, tree, w0):
     """Probe case 3, A1 through the store: π(1)'s records for check 4, the trained batch for 2."""
     trained, _ = _store(c, D, tree, w0, 1, records=_batch(c, D, 3))
     clean = _batch(c, D, 1)
-    idx = schedule(1, c.n_s, len(D))
+    idx = schedule(1, c.n_s, len(D), SEED)
     s = TwoFaced(trained, {i: clean[i] for i in range(c.n_s)},
                  {i: tree.path(idx[i]) for i in range(c.n_s)})
     rej = _verifier(c, D, tree, w0).verify_step(1, s)
@@ -825,7 +828,7 @@ def test_check_2_reports_the_first_bad_leaf_in_order(c, D, tree, w0, parallel):
 def test_check_2_parallel_hashes_match_the_commitment(c, D, tree, w0, parallel):
     store, out = _store(c, D, tree, w0, 1)
     ctx = StepContext.for_computation(
-        c, step=1, indices=tuple(schedule(1, c.n_s, len(D))), h_D=tree.root, n_records=len(D),
+        c, step=1, indices=tuple(schedule(1, c.n_s, len(D), SEED)), h_D=tree.root, n_records=len(D),
         prev_w_hashes=(), chain_check_id="0", k=K)
     assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
     assert ctx.state.leaf_hashes == [leaf_hash(c, i, x) for i, x in enumerate(out.leaves())]
@@ -1041,7 +1044,7 @@ def test_verifier_runs_with_prover_entry_points_disabled(c, D, tree, w0, monkeyp
 
 def test_permuted_batch_rejected_at_4(c, D, tree, w0):
     """π(1)'s records in another order, each with its own true path into h_D."""
-    idx = schedule(1, c.n_s, len(D))
+    idx = schedule(1, c.n_s, len(D), SEED)
     order = [1, 0, 3, 2]
     store, _ = _store(c, D, tree, w0, 1, records=[D[idx[i]] for i in order],
                       path_indices=[idx[i] for i in order])
@@ -1374,7 +1377,7 @@ def hash_threads(request, monkeypatch):
 
 def _chain_ctx(c, D, w_hashes, step, cid):
     return StepContext.for_computation(
-        c, step=step, indices=tuple(schedule(step, c.n_s, len(D))), h_D=b"\0" * 32,
+        c, step=step, indices=tuple(schedule(step, c.n_s, len(D), SEED)), h_D=b"\0" * 32,
         n_records=len(D), prev_w_hashes=w_hashes, chain_check_id=cid, k=K)
 
 

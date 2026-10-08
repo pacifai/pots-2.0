@@ -77,7 +77,7 @@ def measure(*, reps: int = 30, T: int = 10, k: int | None = None,
     c = MLPComputation(tuple(widths), n_s=N_S, eta=cfg.require_eta())
     dataset = synthetic_dataset(c.widths, cfg.n_records, seed=cfg.seed)
     w0 = init_weights(c.widths, seed=cfg.seed)
-    final = honest_final(c, dataset, w0, T)
+    final = honest_final(c, dataset, w0, T, seed=cfg.seed)
     honest = HONEST
     runs: dict[str, list[dict[str, float]]] = {m: [] for m in MODES}
     sections: list[float] = []  # metrics on: the reported step totals, summed per run
@@ -85,7 +85,8 @@ def measure(*, reps: int = 30, T: int = 10, k: int | None = None,
         for i in range(reps + 1):  # repetition 0 warms up and is dropped
             for mode in MODES[i % 3:] + MODES[:i % 3]:
                 rec = mw.recorder(honest.name) if mode == "on" else None
-                r = run_scenario(c, dataset, w0, honest, T=T, k=k, final=final, recorder=rec)
+                r = run_scenario(c, dataset, w0, honest, T=T, k=k, seed=cfg.seed, final=final,
+                                 recorder=rec)
                 if not r.passed:
                     raise RuntimeError(f"the honest run failed with metrics {mode}")
                 if i == 0:

@@ -24,6 +24,8 @@ from verification.runs.scenarios import honest_final
 from verification.transcript.store import LEAF_FILE, DiskHandoff
 from verification.verifier.calibration import load_bands
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 K = 7
 
 
@@ -41,9 +43,10 @@ def test_mlp_scenarios_decide_identically(tmp_path):
     D = synthetic_dataset(c.widths, 40, seed=0)
     w0 = init_weights(c.widths, seed=0)
     T = 3
-    final = honest_final(c, D, w0, T)
+    final = honest_final(c, D, w0, T, seed=SEED)
     scen = mlp_smoke.scenarios(c, D)
-    results = sc.crosscheck(c, D, w0, scen, tmp_path / "t", T=T, k=K, final=final, out=None)
+    results = sc.crosscheck(c, D, w0, scen, tmp_path / "t", T=T, k=K, final=final, out=None,
+                            seed=SEED)
     _assert_all_identical(results, len(scen))
     honest = results[0]
     assert honest.disk.decisions.verdict[0] and len(honest.disk.decisions.steps) == T
@@ -66,13 +69,13 @@ def test_tiny_llama_scenarios_decide_identically(tiny, tmp_path):
     c, D, w0, bands = tiny
     T = 3
     h_D = dataset_tree(c, D).root
-    final = honest_final(c, D, w0, T)
-    make = judging_verifier(c, len(D), w0, bands, T=T, k=K, h_D=h_D)
+    final = honest_final(c, D, w0, T, seed=SEED)
+    make = judging_verifier(c, len(D), w0, bands, T=T, k=K, h_D=h_D, seed=SEED)
     scen = sc.llama_scenarios(c, D, T)
     assert [s.expected.check_id for s in scen] == [None, "4", "7", "6a", "5"]
     lines = []
     results = sc.crosscheck(c, D, w0, scen, tmp_path / "t", T=T, k=K, final=final, h_D=h_D,
-                            verifier=make, out=lines.append)
+                            verifier=make, out=lines.append, seed=SEED)
     _assert_all_identical(results, len(scen))
     assert results[0].memory.decisions.verdict[3] == bands.source
     assert sum("decisions identical" in x for x in lines) == len(scen)
@@ -106,7 +109,7 @@ def test_a_store_serving_other_bytes_is_caught(tmp_path):
     c = MLPComputation((16, 32, 32, 8), n_s=4, eta=1e-3)
     D = synthetic_dataset(c.widths, 40, seed=0)
     w0 = init_weights(c.widths, seed=0)
-    final = honest_final(c, D, w0, 2)
+    final = honest_final(c, D, w0, 2, seed=SEED)
 
     class Tampering(DiskHandoff):
         def hold(self, c_, t, leaves, tree, dataset_paths=None):
@@ -118,9 +121,9 @@ def test_a_store_serving_other_bytes_is_caught(tmp_path):
             return store
 
     mem = sc._run(c, D, w0, sc.HONEST, "memory", sc.IN_MEMORY, T=2, k=K, final=final,
-                  h_D=None, build_model=None, verifier=None)
+                  seed=SEED, h_D=None, build_model=None, verifier=None)
     bad = sc._run(c, D, w0, sc.HONEST, "disk", Tampering(tmp_path / "t"), T=2, k=K,
-                  final=final, h_D=None, build_model=None, verifier=None)
+                  seed=SEED, final=final, h_D=None, build_model=None, verifier=None)
     diffs = sc.compare(mem.decisions, bad.decisions)
     assert any(x.startswith("verdict") for x in diffs)
     # check 5 tests the changed product before check 2's root comparison ends the step (F15a)

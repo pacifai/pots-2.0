@@ -30,6 +30,8 @@ from verification.verifier.context import ProductStat, StepStats, TensorStat
 from verification.verifier.driver import Verifier
 from verification.verifier.matmul_check.sizing import C_ANTI, Z, bit_budget, e_m, f_achieved
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 K = 2
 EPS = 2.0 ** -24
 
@@ -163,7 +165,7 @@ def mlp():
     w0 = init_weights(c.widths, seed=0)
     stores, w = [], w0
     for t in range(1, T + 1):
-        idx = schedule(t, c.n_s, len(D))
+        idx = schedule(t, c.n_s, len(D), SEED)
         out = prove_step(c, c.build_model(), w, [D[i] for i in idx])
         stores.append(InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx]))
         w = out.w_next
@@ -172,7 +174,7 @@ def mlp():
 
 def _run(mlp, **kw):
     c, D, tree, w0, stores, final = mlp
-    v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=T, w0=w0, **kw)
+    v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=T, w0=w0, **kw, seed=SEED)
     assert v.start_run(D) is None
     rejections = [v.verify_step(t, s) for t, s in enumerate(stores, start=1)]
     return v, rejections, final
@@ -207,7 +209,7 @@ def test_calibration_needs_the_kappa_guard(mlp):
     c, D, tree, w0, _, _ = mlp
     with pytest.raises(ValueError, match="κ guard"):
         Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=T, w0=w0, bands=None,
-                 calibrate=True, kappa_guard=False)
+                 calibrate=True, kappa_guard=False, seed=SEED)
 
 
 def test_the_bands_judge_what_they_were_fitted_on(mlp, tmp_path):

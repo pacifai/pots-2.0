@@ -22,6 +22,8 @@ from verification.prover.step import commit, prove_step
 
 from tests.verification.llama_helpers import make_records, tiny_config
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 FWD, IG, WG, OG = (ProductKind.FORWARD, ProductKind.INPUT_GRAD, ProductKind.WEIGHT_GRAD,
                    ProductKind.OPERAND_GRAD)
 
@@ -734,11 +736,11 @@ def test_check_5_and_6b_accept_an_honest_step(setup):
     D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
     tree = dataset_tree(c, D)
     w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
-    idx = schedule(1, c.n_s, len(D))
+    idx = schedule(1, c.n_s, len(D), SEED)
 
     def verify(**kw):
         v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1,
-                     bands=Bands.provisional(), allow_provisional=True, w0=w0)
+                     bands=Bands.provisional(), allow_provisional=True, w0=w0, seed=SEED)
         assert v.start_run(D) is None
         out = prove_step(c, c.build_model(), w0, [D[i] for i in idx], **kw)
         store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
@@ -947,7 +949,7 @@ def test_smollm2_real_step_m2():
     t0 = time.perf_counter()
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
-    records = [D[i] for i in schedule(1, c.n_s, len(D))]
+    records = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]
     w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
     t1 = time.perf_counter()
     out = prove_step(c, model, w0, records)
@@ -991,7 +993,7 @@ def test_smollm2_real_step_forward_replay_a8():
     c = LlamaComputation.from_config(cfg)
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
-    records = [D[i] for i in schedule(1, c.n_s, len(D))]
+    records = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]
     w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
     cap = run_capture(c, model, records)
     products = [p.detach() for p in c.label(cap, model)]
@@ -1043,7 +1045,7 @@ def test_smollm2_real_step_backward_replay_a9():
     c = LlamaComputation.from_config(cfg)
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
-    records = [D[i] for i in schedule(1, c.n_s, len(D))]
+    records = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]
     w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
     products, expected, grads = captured_operands(c, model, records)
     del model

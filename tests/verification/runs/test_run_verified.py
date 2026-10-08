@@ -34,6 +34,8 @@ from verification.verifier.calibration import (
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 from verification.verifier.driver import Verifier
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 K = 7
 T_CAL = 2
 
@@ -43,11 +45,11 @@ def _band_file(c, D, w0, path, *, steps=T_CAL, k=K):
     written as a band file."""
     tree = dataset_tree(c, D)
     v = Verifier(c, h_D=tree.root, n_records=len(D), k=k, n_steps=steps, w0=w0, bands=None,
-                 calibrate=True)
+                 calibrate=True, seed=SEED)
     assert v.start_run(D) is None
     w = w0
     for t in range(1, steps + 1):
-        idx = schedule(t, c.n_s, len(D))
+        idx = schedule(t, c.n_s, len(D), SEED)
         out = prove_step(c, c.build_model(), w, [D[i] for i in idx])
         store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
         assert v.verify_step(t, store) is None
@@ -102,11 +104,11 @@ def test_step_summary_by_class():
 def test_mlp_run_judged_by_the_band_file(mlp, tmp_path):
     c, D, w0, bands = mlp
     T = 4
-    final = honest_final(c, D, w0, T)
+    final = honest_final(c, D, w0, T, seed=SEED)
     with MetricsWriter(tmp_path, "rv", band_file_hash=bands.source) as mw:
         run = rv.run_verified(c, D, w0, bands, T=T, k=K, h_D=dataset_tree(c, D).root,
                               final=final, writer=mw, recorder=mw.recorder("honest"),
-                              watch="forward:layers.*.weight", out=lambda s: None)
+                              watch="forward:layers.*.weight", out=lambda s: None, seed=SEED)
     r = run.result
     assert r.passed and r.loop.verdict.accepted
     assert [s.t for s in run.summaries] == [1, 2, 3, 4]
@@ -142,7 +144,8 @@ def test_mlp_bands_too_tight_reject_a_judged_step(mlp):
     c, D, w0, bands = mlp
     tight = dataclasses.replace(bands, tau=1e-6)
     run = rv.run_verified(c, D, w0, tight, T=3, k=K, h_D=dataset_tree(c, D).root,
-                          final=honest_final(c, D, w0, 3), out=lambda s: None)
+                          final=honest_final(c, D, w0, 3, seed=SEED), out=lambda s: None,
+                          seed=SEED)
     assert not run.result.passed and run.summaries[-1].rejected
     assert run.result.actual.check_id == "5"
 

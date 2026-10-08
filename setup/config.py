@@ -29,17 +29,15 @@ _DEFAULTS: dict[str, str] = {
     "VERIF_DEVICE": "cpu",
     "VERIF_MODEL": "HuggingFaceTB/SmolLM2-135M-Instruct",
     "VERIF_MODEL_REVISION": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
-    "VERIF_DATASET": "tatsu-lab/alpaca",
-    "VERIF_DATASET_REVISION": "dce01c9b08f87459cf36a430d809084718273017",
     "VERIF_MASTER_DTYPE": "float32",
     "VERIF_COMPUTE_DTYPE": "float32",
     "VERIF_ATTN_IMPL": "eager",
     "VERIF_BATCH": "4",
     "VERIF_SEQ_LEN": "128",
     "VERIF_STEPS": "10",
-    "VERIF_N_RECORDS": "500",
+    "VERIF_N_RECORDS": "365",
     "VERIF_THREADS": "8",
-    "VERIF_SEED": "0",
+    "VERIF_SEED": "1",
     "VERIF_OUTPUT_DIR": "trainer_output/verification",
     "VERIF_METRICS": "1",
 }
@@ -50,8 +48,6 @@ class RunConfig:
     device: str
     model: str
     model_revision: str
-    dataset: str
-    dataset_revision: str
     master_dtype: torch.dtype
     compute_dtype: torch.dtype
     attn_impl: str
@@ -75,6 +71,9 @@ class RunConfig:
 
 
 _ETA_DEFAULT = "1e-3"  # S8e: fixed by declaration, no tuning run
+# F8d pins the data to BackdoorLLM's release by commit and SHA-256 (setup/backdoorllm.py), the
+# same at both scales, so these no longer select anything. A stale setting raises.
+_RETIRED = ("VERIF_DATASET", "VERIF_DATASET_REVISION")
 
 
 def _str(env: Mapping[str, str], name: str, default: str | None = None) -> str:
@@ -142,12 +141,13 @@ def _bool(env: Mapping[str, str], name: str) -> bool:
 def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
     """Build the config from `env` (default `os.environ`). Unset vars take test-scale defaults."""
     env = os.environ if env is None else env
+    for name in _RETIRED:
+        if name in env:
+            raise ValueError(f"{name} is retired: the data is pinned in setup/backdoorllm.py (F8d)")
     return RunConfig(
         device=_device(env),
         model=_str(env, "VERIF_MODEL"),
         model_revision=_str(env, "VERIF_MODEL_REVISION"),
-        dataset=_str(env, "VERIF_DATASET"),
-        dataset_revision=_str(env, "VERIF_DATASET_REVISION"),
         master_dtype=_dtype(env, "VERIF_MASTER_DTYPE"),
         compute_dtype=_dtype(env, "VERIF_COMPUTE_DTYPE"),
         attn_impl=_attn_impl(env),

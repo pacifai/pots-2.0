@@ -42,6 +42,8 @@ from verification.verifier.checks import DEFAULT_ORDER
 from verification.verifier.context import Rejection
 from verification.verifier.matmul_check import challenges
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 ROOT = Path(__file__).resolve().parents[3]
 K = 7
 T = 3
@@ -73,7 +75,7 @@ def w0(c):
 
 @pytest.fixture(scope="module")
 def final(c, D, w0):
-    return honest_final(c, D, w0, T)
+    return honest_final(c, D, w0, T, seed=SEED)
 
 
 @pytest.fixture(scope="module")
@@ -82,7 +84,7 @@ def smoke(c, D, w0, tmp_path_factory):
     out = tmp_path_factory.mktemp("metrics")
     with MetricsWriter(out, "test", model="mlp", corpus="synthetic", seed=0,
                        config={"a": 1}) as mw:
-        results = run_smoke(c, D, w0, T=T, k=K, out=lambda s: None, metrics=mw)
+        results = run_smoke(c, D, w0, T=T, k=K, out=lambda s: None, metrics=mw, seed=SEED)
     return out, {r.scenario.name: r for r in results}
 
 
@@ -299,7 +301,7 @@ def test_count_pass_and_storage(c, D, w0, smoke):
     # counting is deterministic and leaves the real functions in place
     assert merkle.blake3.__name__ == "blake3" and challenges.blake3.__name__ == "blake3"
     assert leaves.hash_leaf is merkle.hash_leaf
-    rows2 = mlp_smoke.count_smoke(c, D, w0, k=K)
+    rows2 = mlp_smoke.count_smoke(c, D, w0, k=K, seed=SEED)
     pick = ("component", "flops", "hash_in_bytes", "hash_calls")
     assert [tuple(r.get(k) for k in pick) for r in rows2 if r["record"] == "count"] == \
            [tuple(r[k] for k in pick) for r in rows]
@@ -343,10 +345,10 @@ def test_flop_tally_matches_flop_counter_mode(c, D, w0):
 @pytest.mark.parametrize("kind", ["time", "memory"])
 def test_metrics_on_off_bit_identical(c, D, w0, final, name, kind):
     s = next(x for x in scenarios(c, D) if x.name == name)
-    off = run_scenario(c, D, w0, s, T=T, k=K, final=final)
+    off = run_scenario(c, D, w0, s, T=T, k=K, final=final, seed=SEED)
     rec = (TimeRecorder("r", name) if kind == "time"
            else MemoryRecorder("r", name, memory_probe("cpu")))
-    on = run_scenario(c, D, w0, s, T=T, k=K, final=final, recorder=rec)
+    on = run_scenario(c, D, w0, s, T=T, k=K, final=final, recorder=rec, seed=SEED)
     assert rec.rows
     assert on.loop.verdict == off.loop.verdict
     assert [(x.t, x.rejection, x.loss) for x in on.loop.steps] == \
@@ -358,12 +360,12 @@ def test_metrics_on_off_bit_identical(c, D, w0, final, name, kind):
 
 
 def test_count_pass_is_bit_identical(c, D, w0):
-    final2 = honest_final(c, D, w0, 2)
+    final2 = honest_final(c, D, w0, 2, seed=SEED)
     s = next(x for x in scenarios(c, D) if x.name == "honest")
-    off = run_scenario(c, D, w0, s, T=2, k=K, final=final2)
+    off = run_scenario(c, D, w0, s, T=2, k=K, final=final2, seed=SEED)
     got = {}
     count_pass("r", "honest", lambda rec: got.setdefault(
-        "r", run_scenario(c, D, w0, s, T=2, k=K, final=final2, recorder=rec)))
+        "r", run_scenario(c, D, w0, s, T=2, k=K, final=final2, recorder=rec, seed=SEED)))
     on = got["r"]
     assert on.loop.verdict == off.loop.verdict and on.verifier.stats == off.verifier.stats
     for k_, w in off.loop.w_final.items():
@@ -536,6 +538,7 @@ def test_mps_sections_synchronize(monkeypatch):
 def test_main_metrics_flag(monkeypatch, tmp_path, capsys, c):
     monkeypatch.setattr(mlp_smoke, "setup_determinism", lambda cfg: None)
     monkeypatch.setenv("VERIF_N_RECORDS", str(N_RECORDS))
+    monkeypatch.setenv("VERIF_SEED", str(SEED))
     monkeypatch.setenv("VERIF_OUTPUT_DIR", str(tmp_path))
     assert mlp_smoke.main(["--steps", "2", "--no-metrics"]) == 0
     assert not (tmp_path / "mlp_smoke").exists()
@@ -546,7 +549,7 @@ def test_main_metrics_flag(monkeypatch, tmp_path, capsys, c):
     files = {p.name for p in (tmp_path / "mlp_smoke").iterdir()}
     assert files == {"records.jsonl", "residuals"}
     env, *_ = read_records(tmp_path / "mlp_smoke")
-    assert env["h_D"] == leaves.dataset_tree(c, synthetic_dataset(c.widths, N_RECORDS, seed=0)
+    assert env["h_D"] == leaves.dataset_tree(c, synthetic_dataset(c.widths, N_RECORDS, seed=SEED)
                                              ).root.hex()
     kinds = {r["record"] for r in read_records(tmp_path / "mlp_smoke")}
     assert kinds == {"environment", "step", "verdict", "time", "memory", "count", "storage",

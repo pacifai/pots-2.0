@@ -23,6 +23,8 @@ from verification.transcript.store import InMemoryStore
 from verification.verifier.bands import Bands
 from verification.verifier.driver import Verifier
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 ETA = 1e-3
 K = 7
 N_RECORDS = 40
@@ -48,13 +50,13 @@ def w0(c):
 def final(c, D, w0):
     model, w = c.build_model(), w0
     for t in range(1, T + 1):
-        w, _ = plain_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D))])
+        w, _ = plain_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D), SEED)])
     return w
 
 
 def _verifier(c, D, w0, h_D=None):
     return Verifier(c, h_D=h_D or dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=T,
-                    bands=Bands.provisional(), w0=w0, allow_provisional=True)
+                    bands=Bands.provisional(), w0=w0, allow_provisional=True, seed=SEED)
 
 
 def _run(c, D, w0, final, **kw):

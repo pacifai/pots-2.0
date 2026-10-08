@@ -31,6 +31,7 @@ from typing import Any
 
 import torch
 
+from setup import backdoorllm
 from setup.config import RunConfig
 from setup.data import load_dataset_records, schedule
 from verification.commitment.leaves import dataset_tree
@@ -65,11 +66,13 @@ class CheatEnv:
     """What every cheat run shares: the honest run's inputs and one judging-verifier factory.
 
     ``b_tilde`` is ``D̃``'s batch at ``π(poison_step)``, the poisoned batch ``b̃``.
-    ``poisoning_rate`` is the share of ``b̃``'s records that differ from ``π``'s batch."""
+    ``poisoning_rate`` is the share of ``b̃``'s records that differ from ``π``'s batch.
+    ``seed`` fixes ``π`` (F8c) for the prover, the verifier and ``b̃`` alike."""
 
     c: DeclaredComputation
     D: list[Any]
     h_D: bytes
+    seed: int
     b_tilde: list[Any]
     poison_step: int
     poisoning_rate: float
@@ -82,34 +85,36 @@ class CheatEnv:
 
     @classmethod
     def build(cls, c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
-              bands: Bands, *, k: int, h_D: bytes, b_tilde: Sequence[Any], poison_step: int,
-              build_model: BuildModel | None = None) -> CheatEnv:
-        b = [D[i] for i in schedule(poison_step, c.n_s, len(D))]
+              bands: Bands, *, k: int, h_D: bytes, seed: int, b_tilde: Sequence[Any],
+              poison_step: int, build_model: BuildModel | None = None) -> CheatEnv:
+        b = [D[i] for i in schedule(poison_step, c.n_s, len(D), seed)]
         changed = sum(c.encode_record(x) != c.encode_record(y) for x, y in zip(b, b_tilde))
         if len(b_tilde) != c.n_s or changed == 0:
             raise ValueError(f"b̃ must be {c.n_s} records, at least one unlike π's batch")
-        return cls(c, list(D), h_D, list(b_tilde), poison_step, changed / c.n_s, dict(w0),
-                   bands, k, build_model or c.build_model,
-                   JudgingVerifiers(c, len(D), w0, bands, k=k, h_D=h_D))
+        return cls(c, list(D), h_D, seed, list(b_tilde), poison_step, changed / c.n_s,
+                   dict(w0), bands, k, build_model or c.build_model,
+                   JudgingVerifiers(c, len(D), w0, bands, k=k, h_D=h_D, seed=seed))
 
     def final(self, T: int) -> dict[str, torch.Tensor]:
         """Check 8's reference for a run of ``T`` steps: ``T`` honest uncaptured steps."""
         if T not in self._finals:
-            self._finals[T] = honest_final(self.c, self.D, self.w0, T, build_model=self.models)
+            self._finals[T] = honest_final(self.c, self.D, self.w0, T, seed=self.seed,
+                                           build_model=self.models)
         return self._finals[T]
 
 
 def poisoned_batch(c: DeclaredComputation, D_tilde: Sequence[Any], step: int,
-                   n_records: int) -> list[Any]:
+                   n_records: int, seed: int) -> list[Any]:
     """``b̃``: ``D̃``'s records at ``π(step)``, the batch the poisoned step trains on."""
-    return [D_tilde[i] for i in schedule(step, c.n_s, n_records)]
+    return [D_tilde[i] for i in schedule(step, c.n_s, n_records, seed)]
 
 
 def load_env(cfg: RunConfig, pc: ProtocolConfig) -> CheatEnv:
     """The SmolLM2 cheat environment, as ``run_verified.main`` sets up the honest run.
 
     ``D̃`` comes from ``D_tilde.bin``, checked against the ``h_D_tilde`` that ``meta.json``
-    publishes; the poisoned step is ``meta.json``'s ``poisoning.step``."""
+    publishes; the poisoned step is ``meta.json``'s ``poisoning.step``. ``meta.json``'s seed
+    must be the run's, since ``D̃`` was drawn at that seed's ``π`` (F8g)."""
     c = LlamaComputation.from_config(cfg)
     data = cfg.data_dir
     if not (data / "D.bin").exists() or not (data / "D_tilde.bin").exists():
@@ -121,12 +126,15 @@ def load_env(cfg: RunConfig, pc: ProtocolConfig) -> CheatEnv:
     D_tilde = load_dataset_records(data / "D_tilde.bin", c.n)
     if dataset_tree(c, D_tilde).root.hex() != meta["h_D_tilde"]:
         raise ValueError("D_tilde.bin does not hash to meta.json's h_D_tilde")
+    if int(meta["seed"]) != cfg.seed:
+        raise ValueError(f"meta.json's data was drawn at seed {meta['seed']}, the run's seed is "
+                         f"{cfg.seed}: rerun verification.runs.materialize_data")
     step = int(meta["poisoning"]["step"])
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())  # as B7 and A12 take it
-    return CheatEnv.build(c, D, w0, bands, k=pc.k, h_D=h_D,
-                          b_tilde=poisoned_batch(c, D_tilde, step, len(D)), poison_step=step,
-                          build_model=models)
+    return CheatEnv.build(c, D, w0, bands, k=pc.k, h_D=h_D, seed=cfg.seed,
+                          b_tilde=poisoned_batch(c, D_tilde, step, len(D), cfg.seed),
+                          poison_step=step, build_model=models)
 
 
 # ---- one cheat run ------------------------------------------------------------------------
@@ -141,8 +149,8 @@ def run_cheat(env: CheatEnv, scenario: Scenario, *, T: int,
     With ``writer``, the timed run writes its records, then the ``cheat_oracle`` record."""
     rec = (None if writer is None else
            writer.recorder(scenario.name, poisoning_rate=poisoning_rate, cheat_step=cheat_step))
-    r = run_scenario(env.c, env.D, env.w0, scenario, T=T, k=env.k, final=env.final(T),
-                     recorder=rec, h_D=env.h_D, build_model=env.models,
+    r = run_scenario(env.c, env.D, env.w0, scenario, T=T, k=env.k, seed=env.seed,
+                     final=env.final(T), recorder=rec, h_D=env.h_D, build_model=env.models,
                      verifier=env.verifiers.for_steps(T))
     report(r, out)
     if writer is not None:
@@ -240,6 +248,6 @@ def open_writer(cfg: RunConfig, run: str, env: CheatEnv,
                  if f.name not in ("output_dir", "metrics")}, "llama": inst}
     out_dir = cfg.output_dir / run if subdir is None else cfg.output_dir / run / subdir
     return MetricsWriter(out_dir, run, device=cfg.device, model=cfg.model,
-                         corpus=cfg.dataset, seed=cfg.seed, config=config,
+                         corpus=backdoorllm.SOURCE, seed=cfg.seed, config=config,
                          band_file_hash=env.bands.source, h_D=env.h_D,
                          extra={"band_source": env.bands.source, **inst})

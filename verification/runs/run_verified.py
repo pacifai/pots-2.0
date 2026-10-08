@@ -47,6 +47,7 @@ from typing import Any
 
 import torch
 
+from setup import backdoorllm
 from setup.config import load_config, setup_determinism
 from verification.computation.instances.llama import LlamaComputation
 from verification.computation.interface import DeclaredComputation, snapshot_weights
@@ -179,9 +180,10 @@ class JudgingVerifiers:
     every verifier it builds, so each one's band source can be compared afterwards."""
 
     def __init__(self, c: DeclaredComputation, n_records: int,
-                 w0: Mapping[str, torch.Tensor], bands: Bands, *, k: int, h_D: bytes) -> None:
+                 w0: Mapping[str, torch.Tensor], bands: Bands, *, k: int, h_D: bytes,
+                 seed: int) -> None:
         self._args = (c, n_records, w0, bands)
-        self._kw = {"k": k, "h_D": h_D}
+        self._kw = {"k": k, "h_D": h_D, "seed": seed}
         self.made: list[Verifier] = []
 
     def for_steps(self, T: int) -> Callable[[Section | None], Verifier]:
@@ -220,7 +222,8 @@ class VerifiedRun:
 
 
 def run_verified(c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
-                 bands: Bands, *, T: int, k: int, h_D: bytes, final: Mapping[str, torch.Tensor],
+                 bands: Bands, *, T: int, k: int, seed: int, h_D: bytes,
+                 final: Mapping[str, torch.Tensor],
                  recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
                  writer: MetricsWriter | None = None,
                  build_model: Callable[[], torch.nn.Module] | None = None,
@@ -230,7 +233,7 @@ def run_verified(c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torc
     Each closed step is summarized (:func:`step_summary`), printed, and with ``writer``
     written as a ``residual_summary`` record. Steps in the band file's ``calibration_steps``
     are marked in-sample. ``watch`` names the class whose residuals are all logged."""
-    factory = JudgingVerifiers(c, len(D), w0, bands, k=k, h_D=h_D)
+    factory = JudgingVerifiers(c, len(D), w0, bands, k=k, h_D=h_D, seed=seed)
     cal_steps = set(bands.stats.get("calibration_steps", ()))
     summaries: list[StepSummary] = []
 
@@ -244,7 +247,7 @@ def run_verified(c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torc
         if writer is not None:
             writer.write([summary_record(writer.run, HONEST.name, s, bands, watch=watch)])
 
-    r = run_scenario(c, D, w0, HONEST, T=T, k=k, final=final, on_step=on_step,
+    r = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final, on_step=on_step,
                      recorder=recorder, h_D=h_D, build_model=build_model,
                      verifier=factory.for_steps(T))
     return VerifiedRun(r, bands, summaries, factory, watch)
@@ -324,7 +327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     D, h_D = load_committed_dataset(c, cfg.data_dir)
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())  # as B7 takes it
-    final = honest_final(c, D, w0, T, build_model=models)
+    final = honest_final(c, D, w0, T, seed=cfg.seed, build_model=models)
     print(f"A12 verified run: {cfg.model}@{cfg.model_revision[:12]}, n_s {c.n_s}, n {c.n}, "
           f"η {c.eta:g}, k {k}, T {T}, |D| {len(D)}, h_D {h_D.hex()[:16]}…, M {c.M}; "
           f"band file {pc.band_file} ({bands.source[:16]}…), τ {bands.tau:.2f}, in-sample "
@@ -335,10 +338,10 @@ def main(argv: Sequence[str] | None = None) -> int:
              "M": c.M, "n_leaves": c.n_leaves, "pass_steps": S}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                  if f.name not in ("output_dir", "metrics")}, "llama": llama}
-    base = dict(k=k, h_D=h_D, build_model=models)
+    base = dict(k=k, seed=cfg.seed, h_D=h_D, build_model=models)
     mem_rows = None
     mw = (MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
-                        corpus=cfg.dataset, seed=cfg.seed, config=config,
+                        corpus=backdoorllm.SOURCE, seed=cfg.seed, config=config,
                         band_file_hash=bands.source, h_D=h_D,
                         extra={"band_source": str(pc.band_file), **llama})
           if use_metrics else None)
@@ -351,7 +354,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                                           w0=w0, losses=[s.loss for s in r.loop.steps],
                                           provenance=run_provenance(cfg, h_D), run=RUN_NAME)
         if mw is not None:
-            final_S = final if S == T else honest_final(c, D, w0, S, build_model=models)
+            final_S = (final if S == T else
+                       honest_final(c, D, w0, S, seed=cfg.seed, build_model=models))
             pass_args = dict(T=S, final=final_S, **base)
             mem_rows = memory_run(c, D, w0, run=RUN_NAME, device=mw.device,
                                   verifier=run.factory.for_steps(S), **pass_args)

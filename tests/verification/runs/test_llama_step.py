@@ -27,6 +27,8 @@ from verification.verifier.residuals import class_summary, tensor_summary
 
 from tests.verification.llama_helpers import make_records, tiny_config
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 
 @pytest.fixture(scope="module")
 def tiny():
@@ -40,11 +42,11 @@ def tiny():
 def test_tiny_honest_run_is_accepted_and_reported(tiny, tmp_path):
     c, D, w0 = tiny
     T = 2
-    final = honest_final(c, D, w0, T)
+    final = honest_final(c, D, w0, T, seed=SEED)
     with MetricsWriter(tmp_path, "llama_step", device="cpu", model="tiny", corpus="synthetic",
                        seed=0, config={}, band_file_hash=None, h_D=dataset_tree(c, D).root) as mw:
         r = llama_step.run_honest(c, D, w0, T=T, k=7, h_D=dataset_tree(c, D).root, final=final,
-                                  recorder=mw.recorder(HONEST.name))
+                                  recorder=mw.recorder(HONEST.name), seed=SEED)
     assert r.passed and r.loop.verdict.accepted and r.loop.verdict.steps_verified == T
     rows = class_summary(r.verifier.stats)
     assert sum(x.count for x in rows) == T * c.M
@@ -76,7 +78,7 @@ def test_load_committed_dataset_takes_h_D_from_meta_json(tiny, tmp_path):
     forged = bytes([root[0] ^ 1]) + root[1:]
     D3, h_D = llama_step.load_committed_dataset(c, write_data_dir(tmp_path / "bad", D, forged))
     assert h_D == forged
-    r = llama_step.run_honest(c, D3, w0, T=1, k=7, h_D=h_D, final=w0)
+    r = llama_step.run_honest(c, D3, w0, T=1, k=7, h_D=h_D, final=w0, seed=SEED)
     assert not r.loop.verdict.accepted and r.actual.check_id == "1"
     assert "h_D" in r.loop.rejection.detail
 
@@ -99,7 +101,7 @@ def test_a_forged_glue_weight_update_rejects_at_6b(tiny, name):
     c, D, w0 = tiny
     assert name in c.glue_gradient_weights
     scenario = Scenario("bad-glue-w-next", name, _BumpWNext(name), Expected(1, "6b", "failed"))
-    r = run_scenario(c, D, w0, scenario, T=1, k=7, final=w0)
+    r = run_scenario(c, D, w0, scenario, T=1, k=7, final=w0, seed=SEED)
     assert r.passed, r.actual
 
 
@@ -113,14 +115,14 @@ def test_one_reused_model_gives_the_fresh_build_results(tiny):
     c, D, _ = tiny
     h_D = dataset_tree(c, D).root
     w0 = snapshot_weights(c, c.build_model())
-    fresh_final = honest_final(c, D, w0, 2)
-    fresh = llama_step.run_honest(c, D, w0, T=2, k=7, h_D=h_D, final=fresh_final)
+    fresh_final = honest_final(c, D, w0, 2, seed=SEED)
+    fresh = llama_step.run_honest(c, D, w0, T=2, k=7, h_D=h_D, final=fresh_final, seed=SEED)
 
     models = ReusedModel(c.build_model)
     w0_r = snapshot_weights(c, models())
-    final = honest_final(c, D, w0_r, 2, build_model=models)
+    final = honest_final(c, D, w0_r, 2, build_model=models, seed=SEED)
     reused = llama_step.run_honest(c, D, w0_r, T=2, k=7, h_D=h_D, final=final,
-                                   build_model=models)
+                                   build_model=models, seed=SEED)
     assert _same(w0_r, w0) and _same(final, fresh_final)
     assert reused.passed and fresh.passed
     assert _same(reused.loop.w_final, fresh.loop.w_final)

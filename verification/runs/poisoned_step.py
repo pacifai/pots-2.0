@@ -4,8 +4,8 @@
 
 Each cheat runs one step from ``W_0`` (S6d's minimum run) through the S3 loop, set up as the
 honest run (``runs/cheats.py``). ``b̃`` is ``D̃``'s batch at ``π(t)`` for the poisoned step
-``t`` that ``meta.json`` names (step 1: record 1 of the four carries the trigger, so the
-poisoning rate is 0.25).
+``t`` that ``meta.json`` names (step 1: one record of the four, at the position F8g's draw
+picked, carries the trigger, so the poisoning rate is 0.25).
 
 - **A1**: commit ``b̃`` truthfully and train on it. ``b̃`` is not the batch ``π(t)`` names, so
   check 4 rejects: ``(t, "4")``.

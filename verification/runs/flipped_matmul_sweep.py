@@ -390,7 +390,7 @@ def _store_of(env: CheatEnv, out: StepOutput, t: int) -> InMemoryStore:
     from verification.commitment.leaves import dataset_tree
     tree = dataset_tree(env.c, env.D)
     return InMemoryStore.from_step(env.c, out, dataset_paths=[
-        tree.path(i) for i in schedule(t, env.c.n_s, len(env.D))])
+        tree.path(i) for i in schedule(t, env.c.n_s, len(env.D), env.seed)])
 
 
 def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
@@ -421,7 +421,7 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
     stats = honest.verifier.stats.get(t, StepStats())
     seen = {p.m: tuple(p.normalized) for p in stats.products}
     ctx = StepContext.for_computation(
-        c, step=t, indices=tuple(schedule(t, c.n_s, len(env.D))), h_D=env.h_D,
+        c, step=t, indices=tuple(schedule(t, c.n_s, len(env.D), env.seed)), h_D=env.h_D,
         n_records=len(env.D), prev_w_hashes=(), chain_check_id="7", k=env.k)
     specs = sweep_targets(c, classes)
     held = hold_targets(c, store, specs)

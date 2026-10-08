@@ -4,8 +4,9 @@
 
 The SmolLM2 instance (``LlamaComputation.from_config``: ``VERIF_MODEL`` at its pinned revision,
 ``VERIF_BATCH × VERIF_SEQ_LEN``, ``η = VERIF_ETA``) runs ``T`` honest steps (``--steps``, default
-1) from ``W_0``, the unmodified ``from_pretrained`` weights, over ``π``'s batches of the
-committed dataset ``D`` (``$VERIF_OUTPUT_DIR/data/D.bin``, written by ``materialize_data``). Each
+1) from ``W_0``, the unmodified ``from_pretrained`` weights, over ``π``'s batches (F8c, seeded
+by ``VERIF_SEED``) of the committed dataset ``D`` (``$VERIF_OUTPUT_DIR/data/D.bin``, written by
+``materialize_data``). Each
 step goes through the S3 loop: prove, commit, hand the in-memory store to the real
 :class:`~verification.verifier.driver.Verifier`, whose check 5 rebuilds every operand with
 ``LlamaReplay``. The verifier's ``h_D`` is the published root in ``meta.json``, so check 1
@@ -35,6 +36,7 @@ from typing import Any
 
 import torch
 
+from setup import backdoorllm
 from setup.config import load_config, setup_determinism
 from setup.data import load_dataset_records
 from verification.computation.interface import DeclaredComputation, snapshot_weights
@@ -77,12 +79,12 @@ def load_committed_dataset(c: LlamaComputation, data_dir: Path) -> tuple[list[An
 
 
 def run_honest(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-               *, T: int, k: int, h_D: bytes, final: Mapping[str, torch.Tensor],
+               *, T: int, k: int, seed: int, h_D: bytes, final: Mapping[str, torch.Tensor],
                recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
                build_model: Callable[[], torch.nn.Module] | None = None) -> ScenarioResult:
     """``T`` honest steps through the S3 loop, judged by provisional bands."""
-    return run_scenario(c, dataset, w0, HONEST, T=T, k=k, final=final, recorder=recorder,
-                        h_D=h_D, build_model=build_model)
+    return run_scenario(c, dataset, w0, HONEST, T=T, k=k, seed=seed, final=final,
+                        recorder=recorder, h_D=h_D, build_model=build_model)
 
 
 def report_residuals(r: ScenarioResult, out: Callable[[str], None] = print) -> None:
@@ -137,11 +139,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # into it before use. The verifier builds its own (invariant 1).
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())
-    final = honest_final(c, D, w0, T, build_model=models)
+    final = honest_final(c, D, w0, T, seed=cfg.seed, build_model=models)
     print(f"SmolLM2 honest run: {cfg.model}@{cfg.model_revision[:12]}, n_s {c.n_s}, n {c.n}, "
           f"η {c.eta:g}, k {k}, T {T}, |D| {len(D)}, h_D {h_D.hex()[:16]}…, M {c.M}, "
           f"{c.n_leaves} leaves, bands provisional")
-    run_args = dict(T=T, k=k, h_D=h_D, final=final, build_model=models)
+    run_args = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models)
     mem_rows = None
     if not use_metrics:
         r = run_honest(c, D, w0, **run_args)
@@ -152,7 +154,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                      if f.name not in ("output_dir", "metrics")}, "llama": llama}
         with MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
-                           model=cfg.model, corpus=cfg.dataset, seed=cfg.seed, config=config,
+                           model=cfg.model, corpus=backdoorllm.SOURCE, seed=cfg.seed, config=config,
                            band_file_hash=None, h_D=h_D,
                            extra={"band_source": "provisional", **llama}) as mw:
             r = run_honest(c, D, w0, **run_args, recorder=mw.recorder(HONEST.name))

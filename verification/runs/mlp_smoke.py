@@ -80,7 +80,8 @@ ULPS = 300
 
 
 def _other_batch(dataset: Sequence[Any], n_s: int) -> list[Any]:
-    """The last ``n_s`` records of ``D``: no early step of ``π`` reaches them."""
+    """The last ``n_s`` records of ``D``, a batch other than ``π(2)``'s. F8c's shuffle makes
+    that the seed's doing: at seed 1 and ``|D| = 365`` no step 1–10 reaches them."""
     return list(dataset[-n_s:])
 
 
@@ -109,7 +110,7 @@ def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
 
 
 def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
-              T: int, k: int, out: Callable[[str], None] = print,
+              T: int, k: int, seed: int, out: Callable[[str], None] = print,
               only: Sequence[str] | None = None,
               metrics: MetricsWriter | None = None) -> list[ScenarioResult]:
     """Run each scenario and report it. With ``metrics``, each scenario's timed run writes its
@@ -117,38 +118,39 @@ def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
     (:func:`count_smoke`) write theirs."""
     if T < CHAIN_STEP:
         raise ValueError(f"T = {T}: the broken-chain scenario needs T ≥ {CHAIN_STEP}")
-    final = honest_final(c, dataset, w0, T)
+    final = honest_final(c, dataset, w0, T, seed=seed)
     results = []
     for s in scenarios(c, dataset):
         if only is not None and s.name not in only:
             continue
         rec = None if metrics is None else metrics.recorder(s.name)
-        r = run_scenario(c, dataset, w0, s, T=T, k=k, final=final, recorder=rec)
+        r = run_scenario(c, dataset, w0, s, T=T, k=k, seed=seed, final=final, recorder=rec)
         report(r, out)
         results.append(r)
     passed = sum(r.passed for r in results)
     out(f"{passed}/{len(results)} scenarios passed")
     if metrics is not None:
-        metrics.write(memory_smoke(c, dataset, w0, k=k, device=metrics.device, run=metrics.run))
-        metrics.write(count_smoke(c, dataset, w0, k=k, run=metrics.run))
+        metrics.write(memory_smoke(c, dataset, w0, k=k, seed=seed, device=metrics.device,
+                                   run=metrics.run))
+        metrics.write(count_smoke(c, dataset, w0, k=k, seed=seed, run=metrics.run))
         out(f"metrics: {metrics.dir}")
     return results
 
 
 def memory_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
-                 k: int, device: str | torch.device = "cpu",
+                 k: int, seed: int, device: str | torch.device = "cpu",
                  run: str = RUN_NAME) -> list[dict[str, Any]]:
     """The B6 memory pass: per-component peaks over ``PASS_STEPS`` honest steps (check 0 at step
     1, check 7 at step 2), run on their own, never timed."""
-    return memory_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k,
-                      final=honest_final(c, dataset, w0, PASS_STEPS), device=device)
+    return memory_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k, seed=seed,
+                      final=honest_final(c, dataset, w0, PASS_STEPS, seed=seed), device=device)
 
 
 def count_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
-                k: int, run: str = RUN_NAME) -> list[dict[str, Any]]:
+                k: int, seed: int, run: str = RUN_NAME) -> list[dict[str, Any]]:
     """The B6 counting pass: counts over ``PASS_STEPS`` honest steps, never timed."""
-    return count_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k,
-                     final=honest_final(c, dataset, w0, PASS_STEPS))
+    return count_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k, seed=seed,
+                     final=honest_final(c, dataset, w0, PASS_STEPS, seed=seed))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -171,7 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"MLP smoke: widths {c.widths}, n_s {c.n_s}, η {c.eta:g}, k {k}, T {T}, "
           f"|D| {len(dataset)}, M {c.M}, {c.n_leaves} leaves, bands provisional")
     if not use_metrics:
-        results = run_smoke(c, dataset, w0, T=T, k=k)
+        results = run_smoke(c, dataset, w0, T=T, k=k, seed=cfg.seed)
     else:
         mlp = {"widths": list(c.widths), "n_s": c.n_s, "eta": c.eta, "k": k, "T": T,
                "n_records": len(dataset), "M": c.M, "n_leaves": c.n_leaves}
@@ -183,7 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                            model="mlp", corpus="synthetic", seed=cfg.seed, config=config,
                            band_file_hash=None, h_D=dataset_tree(c, dataset).root,
                            extra={"band_source": "provisional", **mlp}) as mw:
-            results = run_smoke(c, dataset, w0, T=T, k=k, metrics=mw)
+            results = run_smoke(c, dataset, w0, T=T, k=k, seed=cfg.seed, metrics=mw)
     return 0 if all(r.passed for r in results) else 1
 
 

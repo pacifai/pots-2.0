@@ -10,7 +10,7 @@ import torch
 
 from tests.verification.computation.test_llama import make_records, tiny_config
 from verification.commitment.leaves import dataset_tree
-from setup.data import encode_records_file
+from setup.data import encode_records_file, schedule
 from verification.computation.instances import LlamaComputation
 from verification.computation.interface import snapshot_weights
 from verification.computation.instances.mlp import (
@@ -25,6 +25,8 @@ from verification.runs.metrics import MetricsWriter, P0_PHASES, read_records
 from verification.runs.mlp_smoke import run_smoke
 from verification.verifier.bands import Bands
 from verification.verifier.driver import Verifier
+
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
 K = 7
 
@@ -45,7 +47,7 @@ def llama():
 
 def _verified(c, D, w0, T, final):
     v = Verifier(c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=T,
-                 bands=Bands.provisional(), w0=w0, allow_provisional=True)
+                 bands=Bands.provisional(), w0=w0, allow_provisional=True, seed=SEED)
     return run_loop(c, c.build_model(), D, w0, v, final=final)
 
 
@@ -54,10 +56,11 @@ def _verified(c, D, w0, T, final):
 
 def test_run_plain_is_chained_plain_steps(mlp):
     c, D, w0 = mlp
-    res = run_plain(c, c.build_model(), D, w0, n_steps=3)
+    res = run_plain(c, c.build_model(), D, w0, n_steps=3, seed=SEED)
     w = w0
     for t in (1, 2, 3):
-        w, loss = plain_step(c, c.build_model(), w, D[(t - 1) * 4:t * 4])
+        w, loss = plain_step(c, c.build_model(), w,
+                             [D[i] for i in schedule(t, c.n_s, len(D), SEED)])
         assert res.steps[t - 1].t == t and res.steps[t - 1].loss == loss
     assert pb.final_weight_hashes(c, w) == pb.final_weight_hashes(c, res.w_final)
 
@@ -67,7 +70,7 @@ def test_plain_final_weights_equal_the_verified_runs(inst, request):
     """Capture on (run_loop, verified and accepted) or off (run_plain): bit-identical W_{T+1}."""
     c, D, w0 = request.getfixturevalue(inst)
     T = 3
-    plain = run_plain(c, c.build_model(), D, w0, n_steps=T)
+    plain = run_plain(c, c.build_model(), D, w0, n_steps=T, seed=SEED)
     loop = _verified(c, D, w0, T, plain.w_final)
     assert loop.verdict.accepted and loop.verdict.steps_verified == T  # check 8 agrees
     pb.assert_same_final_weights(c, plain.w_final, loop.w_final)
@@ -76,7 +79,7 @@ def test_plain_final_weights_equal_the_verified_runs(inst, request):
 
 def test_comparison_catches_one_ulp(mlp):
     c, D, w0 = mlp
-    w = run_plain(c, c.build_model(), D, w0, n_steps=2).w_final
+    w = run_plain(c, c.build_model(), D, w0, n_steps=2, seed=SEED).w_final
     name = c.weight_names[1]
     other = dict(w)
     other[name] = w[name].clone()
@@ -129,10 +132,10 @@ def mlp_files(mlp, tmp_path_factory):
     root = tmp_path_factory.mktemp("b7")
     with MetricsWriter(root / "plain", "plain_baseline", model="mlp") as mw:
         res = pb.plain_baseline(c, D, w0, T=3, build_model=c.build_model, metrics=mw,
-                                out=lambda s: None)
+                                out=lambda s: None, seed=SEED)
     with MetricsWriter(root / "verified", "mlp_smoke", model="mlp") as mw:
         (smoke,) = run_smoke(c, D, w0, T=3, k=K, only=["honest"], metrics=mw,
-                             out=lambda s: None)
+                             out=lambda s: None, seed=SEED)
     return root, res, smoke
 
 
@@ -178,7 +181,7 @@ def test_w0_root_is_check_0s_anchor(mlp):
     """W_0's root is over the hashes the verifier's check 0 anchors on."""
     c, D, w0 = mlp
     v = Verifier(c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=1,
-                 bands=Bands.provisional(), w0=w0, allow_provisional=True)
+                 bands=Bands.provisional(), w0=w0, allow_provisional=True, seed=SEED)
     assert [bytes.fromhex(h) for h in pb.final_weight_hashes(c, w0).values()] == \
            list(v.weight_hashes(w0))
 
@@ -186,7 +189,7 @@ def test_w0_root_is_check_0s_anchor(mlp):
 def test_files_compare_provenance_first(mlp, tmp_path):
     """Two files: a provenance mismatch is named before any tensor is compared."""
     c, D, w0 = mlp
-    res = run_plain(c, c.build_model(), D, w0, n_steps=2)
+    res = run_plain(c, c.build_model(), D, w0, n_steps=2, seed=SEED)
     losses = [s.loss for s in res.steps]
     prov = {"model": "m", "model_revision": "r", "threads": 1, "config_hash": "ab", "h_D": "cd"}
 
@@ -255,13 +258,13 @@ def test_capture_rows_warns_on_unmatched_plain_steps(mlp_files, tmp_path):
 def test_no_metrics_writes_only_weights(mlp, tmp_path):
     c, D, w0 = mlp
     res = pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, out_dir=tmp_path,
-                            out=lambda s: None)
+                            out=lambda s: None, seed=SEED)
     assert sorted(p.name for p in tmp_path.iterdir()) == [pb.WEIGHTS_FILE]
     assert res.weights_file == tmp_path / pb.WEIGHTS_FILE
     with pytest.raises(ValueError, match="pass_steps"):
-        pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, pass_steps=3)
+        pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, pass_steps=3, seed=SEED)
     res = pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, keep_weights=False,
-                            out=lambda s: None)
+                            out=lambda s: None, seed=SEED)
     assert res.plain.w_final == {} and res.weights_file is None and res.hashes
 
 
@@ -294,7 +297,8 @@ def test_main_runs_with_and_without_metrics(tiny_main, monkeypatch, capsys, capl
     assert doc["steps"] == 3 and len(doc["losses"]) == 3
     assert doc["h_D"] == dataset_tree(c, D).root.hex() and doc["eta"] == 1e-3
     assert doc["config_hash"] and doc["threads"] and doc["model_revision"]
-    plain = run_plain(c, c.build_model(), D, snapshot_weights(c, c.build_model()), n_steps=3)
+    plain = run_plain(c, c.build_model(), D, snapshot_weights(c, c.build_model()), n_steps=3,
+                      seed=SEED)
     pb.assert_same_final_weights(c, out, plain.w_final)
     first = root / "first.json"
     first.write_text((out / pb.WEIGHTS_FILE).read_text())
@@ -357,7 +361,7 @@ def test_smollm2_plain_baseline_two_steps(tmp_path):
     lines: list[str] = []
     with MetricsWriter(tmp_path, pb.RUN_NAME, model=cfg.model) as mw:
         res = pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, metrics=mw,
-                                pass_steps=1, out=lines.append)
+                                pass_steps=1, out=lines.append, seed=SEED)
     print("\n" + "\n".join(lines))
     rows = read_records(tmp_path)
     for r in rows:
@@ -369,7 +373,7 @@ def test_smollm2_plain_baseline_two_steps(tmp_path):
 
     model, w = c.build_model(), w0
     for t in (1, 2):
-        out = prove_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D))])
+        out = prove_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D), SEED)])
         assert out.loss == res.plain.steps[t - 1].loss
         w = out.w_next
         del out
