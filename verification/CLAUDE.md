@@ -652,6 +652,10 @@ interface.
     `η·g` of about 1e-7 sits near the bias's rounding step, so any bias with a small gradient
     (`b_q` included) can come out of a step unchanged. The test seeds the init (seed 0), under
     which every `b_q`, `b_k` and `b_v` changes, and asserts that each does.
+- `leaf_sizes.py` (FS10): `leaf_sizes(config, *, n_s, n, weight_dtype=None,
+  product_dtype=None)` returns the step's `LeafSize(index, section, name, role, shape, dtype,
+  nbytes)` list in commit order, without running a model; `benchmarks/` imports only this
+  module from `verification` (`tests/test_layering.py`, rule 8).
 
 ### `verification/prover/`
 

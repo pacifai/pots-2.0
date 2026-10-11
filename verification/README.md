@@ -217,6 +217,10 @@ Two instances exist, in `instances/`:
   it occurs 166 times, all in padded tails, so the plain scatter-add and the module agree
   bit for bit.
 
+`leaf_sizes.py` lists a decoder step's transcript leaves in commit order from the model's
+config alone, each with its section, name, role, shape, dtype and encoded size; the hashing
+benchmark (`benchmarks/hashing/`) imports only this module from `verification`.
+
 ### Prover side: `prover/`
 
 - **`capture.py`** is a `TorchDispatchMode`, a hook into PyTorch's operator dispatch. It sees
