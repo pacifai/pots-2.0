@@ -254,7 +254,8 @@ interface.
   - `load_config(env=None)`. A bad value raises `ValueError`, and `VERIF_ATTN_IMPL` must be
     `eager` (§8.A.4).
   - `setup_determinism(cfg)`: deterministic algorithms, threads, seeds,
-    `set_float32_matmul_precision("highest")`, cuDNN TF32 off, cuDNN deterministic.
+    `set_float32_matmul_precision("highest")`, cuBLAS bf16 reduced-precision reductions off
+    (F5a; a no-op without CUDA), cuDNN TF32 off, cuDNN deterministic.
   - `assert_no_dropout(model_or_config)`.
 - `records.py` (B1, merged): the token record.
   - `TAG_RECORD = 0x01`, `INT32_CODE = 0x10` (the tensor-leaf int32 code), and

@@ -184,6 +184,9 @@ def setup_determinism(cfg: RunConfig) -> None:
     # flag is set too. The per-backend `fp32_precision` setters are avoided: in torch 2.9 they
     # make the legacy `allow_tf32` getters raise.
     torch.set_float32_matmul_precision("highest")
+    # torch's default lets cuBLAS round split-K partial sums of bf16 matmuls to bf16; the
+    # full-scale sizing assumes fp32 accumulation (F5a). A no-op without CUDA.
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
