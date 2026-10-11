@@ -337,6 +337,43 @@ def test_weight_gradient_labeling_rules(llama_capture):
     assert g_head.out.shape == model.model.embed_tokens.weight.shape
 
 
+# ---- mixed precision (F6b) -------------------------------------------------------------------
+
+
+def test_autocast_copies_are_traced_to_their_parameters():
+    """CPU autocast at bf16: the forward reads bf16 copies of the weight and the bias, traced
+    back to the parameters, and AccumulateGrad adopts the fp32 copy of the bf16 weight
+    gradient as ``W.grad``, recognized by storage identity, not by value."""
+    torch.manual_seed(0)
+    lin = nn.Linear(16, 8)
+    x = torch.randn(5, 16, requires_grad=True)
+    cap = MatmulCapture(param_storage_map(lin))
+    with cap:
+        x.to(torch.bfloat16)  # outside a phase: not recorded
+        with cap.phase("forward"), torch.autocast("cpu", dtype=torch.bfloat16):
+            y = lin(x)
+        with cap.phase("backward"):
+            y.float().sum().backward()
+    fwd = cap.records[0]
+    assert fwd.op == "aten.addmm.default" and fwd.out.dtype == torch.bfloat16
+    assert fwd.b_info.param_name is None and fwd.b_info.param_copy == "weight"
+    assert cap.param_of(fwd.b) == "weight" and cap.param_of(fwd.a) is None
+    assert cap.param_of(fwd.bias) == "bias"
+    assert torch.equal(fwd.bias, lin.bias.detach().to(torch.bfloat16))
+    (g,) = [r for r in cap.records if r.phase == "backward" and r.out.shape == lin.weight.shape]
+    grad = lin.weight.grad
+    assert g.out.dtype == torch.bfloat16 and grad.dtype == torch.float32
+    assert cap.is_copy_of(grad, g.index) and torch.equal(grad, g.out.float())
+    assert not cap.is_copy_of(grad.clone(), g.index) and not cap.is_copy_of(g.out, g.index)
+    assert not cap.is_copy_of(grad, fwd.index)
+    assert all(c.phase in ("forward", "backward") for c in cap.copies)
+    s = cap.summary()
+    assert (s["n_copies"], s["n_param_copies"]) == (len(cap.copies), 2)
+    w_copy = fwd.b
+    cap.release_operands()
+    assert cap.param_of(w_copy) is None
+
+
 # ---- memory release --------------------------------------------------------------------------
 
 

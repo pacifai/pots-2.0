@@ -28,6 +28,7 @@ verifier never calls them.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -197,8 +198,8 @@ class DeclaredComputation(ABC):
 
     @property
     def weight_dtype(self) -> torch.dtype:
-        """Dtype of every ``W_t`` / ``W_{t+1}`` leaf. fp32 at both scales (P6); bf16 is config
-        (§8.A.3), set by overriding."""
+        """Dtype of every ``W_t`` / ``W_{t+1}`` leaf: the fp32 master at both scales (P6, F6b).
+        An instance sets the dtypes from ``(MASTER_DTYPE, COMPUTE_DTYPE)`` by overriding."""
         return torch.float32
 
     @property
@@ -295,6 +296,12 @@ class DeclaredComputation(ABC):
     @abstractmethod
     def build_model(self) -> torch.nn.Module:
         """A fresh model whose parameters are exactly :attr:`weight_names`; load before use."""
+
+    def autocast(self) -> contextlib.AbstractContextManager[Any]:
+        """The mixed-precision context around forward and loss, the same in training, the
+        plain run and the replay (F5a, F6b). A no-op unless the instance computes in a narrower
+        format than its weights."""
+        return contextlib.nullcontext()
 
     # ---- verifier side --------------------------------------------------------------------
 

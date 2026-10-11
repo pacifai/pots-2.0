@@ -430,6 +430,8 @@ def check_6a_linear_update(store: TranscriptStore, c: DeclaredComputation, ctx: 
     for name, m in c.linear_weights.items():
         with _guard(ctx, "6a", _AFTER_COMMIT):
             w_t, w_next, g = view.w_t(name), view.w_next(name), view.product(m)
+        # F6b: a bf16 G widened exactly to the fp32 update, as 6b's gradients; fp32 unchanged.
+        g = g.to(torch.float32)
         rej = _update_identity(ctx, "6a", name, w_t, w_next, g, c.eta, bands.tau_w_for(name),
                                scratch)
         if rej is not None:
