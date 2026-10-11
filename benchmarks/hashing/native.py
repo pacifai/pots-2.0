@@ -9,9 +9,11 @@ extracted. The system C compiler (``$CC``, else ``cc``) builds them with this pa
 for the whole call. BLAKE3's own dispatch picks the SIMD path at run time: NEON on arm64, and
 SSE2, SSE4.1, AVX2 or AVX-512 on x86-64 through BLAKE3's assembly files.
 
-The cache is ``$POTS_BENCH_CACHE``, else ``~/.cache/pots-benchmarks``. The library's file name
-carries the tag, the machine and a hash of the C source and the build command, so changing
-either builds a new library.
+The cache is ``$POTS_BENCH_CACHE``, else ``~/.cache/pots-benchmarks``. Every extracted file is
+pinned by its SHA-256 (:data:`SOURCE_SHA256`), checked after extraction and again before a
+cached source directory is reused; a mismatch fetches the archive again. The library's file
+name carries the tag, the machine and a hash of the C source, the build command and the
+compiler's ``--version`` output, so changing any of them builds a new library.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import tempfile
 import time
 import urllib.request
 from collections.abc import Callable, Sequence
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +55,26 @@ _NO_SIMD = ["-DBLAKE3_USE_NEON=0", "-DBLAKE3_NO_SSE2", "-DBLAKE3_NO_SSE41", "-DB
             "-DBLAKE3_NO_AVX512"]
 _KEEP = ("blake3.h", "blake3_impl.h", *_COMMON, "blake3_neon.c", *_X86_ASM)
 _LICENSES = ("LICENSE_A2", "LICENSE_A2LLVM", "LICENSE_CC0")
+# The SHA-256 of every file kept from the archive at BLAKE3_TAG.
+SOURCE_SHA256 = {
+    "LICENSE_A2": "00fcc7a934ddbc9ece2a7cc063ac788e284b703b1d705ccbba72d462aa97921e",
+    "LICENSE_A2LLVM": "a5695f57ea0c221e0e8b7d784ff774c35e88c3d3270353646a925880bb3492cc",
+    "LICENSE_CC0": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+    "blake3.c": "b118ddf7cf9e6e5ef3fded72dcb1acf9dfdc4ea923cbe4605900ad6ee9afe1af",
+    "blake3.h": "81bbb11ad1909341565dce4914cc0e5c29718eca27e6950b28f9226a91aaf8c5",
+    "blake3_avx2_x86-64_unix.S":
+        "a2d95519fd9845cf80252110e21a93124e81c03da836eaac0bca0537be4f8324",
+    "blake3_avx512_x86-64_unix.S":
+        "c641987dd82fabed59d527f1a3413c4a2ff3df919af6d13ff2788c95e4035c0d",
+    "blake3_dispatch.c": "134f21550138c0af6312925c988aeee35df287e4119e8ad1d206fccdb2238fe3",
+    "blake3_impl.h": "d388dca3574602c8849805ea3c8c0a12d082ac0e428756f305e111942f099af4",
+    "blake3_neon.c": "67e88d017a82df1b76d5f841e7b7215135a007486ac14c5be1407e1bca5201b0",
+    "blake3_portable.c": "2bc25b0dad67b4329d0b49cfa075ab2b0d04e424addbddc4e9c389c52a192524",
+    "blake3_sse2_x86-64_unix.S":
+        "94baa998f4114bf57b99e1791a21e9f0bcdc4bd5803864eb30a2477440b7380c",
+    "blake3_sse41_x86-64_unix.S":
+        "135048e4a81a6f9e86960b115141874a55954dbfd2cd1e8e9818837b46b498ad",
+}
 
 
 def cache_dir() -> Path:
@@ -68,9 +91,22 @@ def target(machine: str | None = None) -> tuple[str, list[str], list[str]]:
     return m or "unknown", list(_COMMON), list(_NO_SIMD)
 
 
-def _command(cc: str, out: Path, src: Path, files: Sequence[str], flags: Sequence[str]) -> list[str]:
+def _command(cc: str, out: Path, src: Path, files: Sequence[str],
+             flags: Sequence[str]) -> list[str]:
     return [cc, "-O3", "-shared", "-fPIC", *flags, f"-I{src}", "-o", str(out),
             str(SOURCE), *(str(src / f) for f in files), "-lpthread"]
+
+
+@lru_cache(maxsize=None)
+def compiler_version(cc: str) -> str:
+    """``cc --version``'s output, or "" when the compiler is missing or won't say."""
+    if shutil.which(cc) is None:
+        return ""
+    try:
+        proc = subprocess.run([cc, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def library_path(cache: Path | None = None, cc: str | None = None) -> Path:
@@ -78,7 +114,8 @@ def library_path(cache: Path | None = None, cc: str | None = None) -> Path:
     cc = cc or os.environ.get("CC", "cc")
     arch, files, flags = target()
     key = hashlib.sha256(SOURCE.read_bytes() + repr(
-        (BLAKE3_TAG, ARCHIVE_SHA256, cc, files, flags)).encode()).hexdigest()[:12]
+        (BLAKE3_TAG, ARCHIVE_SHA256, cc, compiler_version(cc), files, flags)).encode()
+    ).hexdigest()[:12]
     return cache / f"libpots_challenges-blake3-{BLAKE3_TAG}-{sys.platform}-{arch}-{key}.so"
 
 
@@ -97,6 +134,20 @@ def check_archive(data: bytes) -> None:
     if digest != ARCHIVE_SHA256:
         raise RuntimeError(f"BLAKE3 {BLAKE3_TAG} archive has SHA-256 {digest}, expected "
                            f"{ARCHIVE_SHA256}; not extracted")
+
+
+def bad_sources(src: Path) -> list[str]:
+    """The pinned files in ``src`` that are missing or don't match :data:`SOURCE_SHA256`, and
+    ``ARCHIVE_SHA256`` when the marker doesn't name the pinned archive."""
+    bad = []
+    marker = src / "ARCHIVE_SHA256"
+    if not marker.is_file() or marker.read_text().strip() != ARCHIVE_SHA256:
+        bad.append("ARCHIVE_SHA256")
+    for name, digest in SOURCE_SHA256.items():
+        path = src / name
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            bad.append(name)
+    return bad
 
 
 def _tls() -> ssl.SSLContext:
@@ -129,6 +180,9 @@ def fetch(dest: Path, *, log: Callable[[str], None] = print) -> Path:
                 m.name = Path(m.name).name
             tar.extractall(tmp, members=members, filter="data")
         (tmp / "ARCHIVE_SHA256").write_text(ARCHIVE_SHA256 + "\n")
+        bad = bad_sources(tmp)
+        if bad:
+            raise RuntimeError(f"extracted files don't match SOURCE_SHA256: {bad}")
         shutil.rmtree(dest, ignore_errors=True)
         os.replace(tmp, dest)
     finally:
@@ -144,8 +198,9 @@ def build(*, log: Callable[[str], None] = print) -> Path:
     cache = cache_dir()
     cache.mkdir(parents=True, exist_ok=True)
     src = source_dir(cache)
-    marker = src / "ARCHIVE_SHA256"
-    if not marker.exists() or marker.read_text().strip() != ARCHIVE_SHA256:
+    bad = bad_sources(src) if src.exists() else ["the directory"]
+    if bad:
+        log(f"BLAKE3 sources in {src} missing or changed ({', '.join(bad)}); fetching again")
         fetch(src, log=log)
     cc = os.environ.get("CC", "cc")
     _, files, flags = target()

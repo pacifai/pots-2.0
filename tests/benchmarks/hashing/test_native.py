@@ -46,8 +46,34 @@ def test_cache_and_library_names(tmp_path, monkeypatch):
     assert native.cache_dir() == tmp_path
     path = native.library_path()
     assert path.parent == tmp_path and native.BLAKE3_TAG in path.name
+    assert native.compiler_version("clang-99") == ""  # missing: no crash
     assert native.library_path(cc="clang-99") != path  # another compiler, another library
     assert native.find_library() is None
+
+
+def test_a_compiler_upgrade_builds_a_new_library(monkeypatch):
+    monkeypatch.setattr(native, "compiler_version", lambda cc: "clang version 21.0.0")
+    before = native.library_path(cc="cc")
+    monkeypatch.setattr(native, "compiler_version", lambda cc: "clang version 22.0.0")
+    assert native.library_path(cc="cc") != before
+
+
+def test_the_pins_cover_every_kept_file():
+    assert set(native.SOURCE_SHA256) == {*native._KEEP, *native._LICENSES}
+
+
+def _pins(monkeypatch) -> None:
+    """Pin the fake files below, whose contents are their own names."""
+    monkeypatch.setattr(native, "SOURCE_SHA256", {
+        f: hashlib.sha256(f.encode()).hexdigest() for f in (*native._KEEP, *native._LICENSES)})
+
+
+def _sources(src) -> None:
+    """A cached source directory of fake files, as :func:`_pins` pins them."""
+    src.mkdir(parents=True)
+    for f in (*native._KEEP, *native._LICENSES):
+        (src / f).write_bytes(f.encode())
+    (src / "ARCHIVE_SHA256").write_text(native.ARCHIVE_SHA256)
 
 
 def _archive(extra: dict[str, bytes]) -> bytes:
@@ -88,6 +114,7 @@ def test_fetch_extracts_only_the_needed_files(tmp_path, monkeypatch):
     data = _archive({"c/blake3_avx2_x86-64_windows_gnu.S": b"x", "README.md": b"x",
                      "c/blake3_c_rust_bindings/src/lib.rs": b"x"})
     monkeypatch.setattr(native, "ARCHIVE_SHA256", hashlib.sha256(data).hexdigest())
+    _pins(monkeypatch)
     _serve(monkeypatch, data)
     dest = native.fetch(tmp_path / "src", log=lambda _: None)
     assert {p.name for p in dest.iterdir()} == \
@@ -97,12 +124,43 @@ def test_fetch_extracts_only_the_needed_files(tmp_path, monkeypatch):
     assert [p.name for p in tmp_path.iterdir()] == ["src"]  # no temp directory left
 
 
+def test_a_file_off_its_pin_is_refused(tmp_path, monkeypatch):
+    """The archive hash matches but one extracted file doesn't match its own pin."""
+    data = _archive({})
+    monkeypatch.setattr(native, "ARCHIVE_SHA256", hashlib.sha256(data).hexdigest())
+    _pins(monkeypatch)
+    monkeypatch.setitem(native.SOURCE_SHA256, "blake3.c", "0" * 64)
+    _serve(monkeypatch, data)
+    with pytest.raises(RuntimeError, match=r"\['blake3.c'\]"):
+        native.fetch(tmp_path / "src", log=lambda _: None)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_changed_sources_are_fetched_again(tmp_path, monkeypatch):
+    monkeypatch.setenv("POTS_BENCH_CACHE", str(tmp_path))
+    _pins(monkeypatch)
+    src = native.source_dir()
+    _sources(src)
+    assert native.bad_sources(src) == []
+    (src / "blake3_dispatch.c").write_bytes(b"tampered")
+    (src / "blake3.h").unlink()
+    assert native.bad_sources(src) == ["blake3.h", "blake3_dispatch.c"]
+
+    def refetch(dest, **kw):
+        raise RuntimeError("fetched")
+
+    monkeypatch.setattr(native, "fetch", refetch)
+    with pytest.raises(RuntimeError, match="fetched"):
+        native.build(log=lambda _: None)
+
+
 def test_a_failed_compile_raises_and_leaves_no_library(tmp_path, monkeypatch):
     monkeypatch.setenv("POTS_BENCH_CACHE", str(tmp_path))
     monkeypatch.setenv("CC", "false")  # a "compiler" that always fails
+    _pins(monkeypatch)
     src = native.source_dir()
-    src.mkdir()
-    (src / "ARCHIVE_SHA256").write_text(native.ARCHIVE_SHA256)  # sources present: no fetch
+    _sources(src)  # sources present and on their pins: no fetch
+    monkeypatch.setattr(native, "fetch", lambda *a, **kw: pytest.fail("fetched"))
     with pytest.raises(RuntimeError, match="build failed"):
         native.build(log=lambda _: None)
     assert [p.name for p in tmp_path.iterdir()] == [src.name]
