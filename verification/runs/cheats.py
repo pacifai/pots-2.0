@@ -40,7 +40,7 @@ from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import DeclaredComputation, snapshot_weights
 from verification.parameters import ProtocolConfig
 from verification.runs.llama_step import load_committed_dataset
-from verification.runs.metrics import MetricsWriter, rho_arrays, run_name
+from verification.runs.metrics import MetricsWriter, nan_as_inf, rho_arrays, run_name
 from verification.runs.run_verified import JudgingVerifiers, calibration_band_hash
 from verification.runs.scenarios import (
     BuildModel,
@@ -192,10 +192,11 @@ def scores(stats: StepStats, bands: Bands) -> dict[str, Any]:
     over its tensor's ``τ_W``), from ``runs.metrics.rho_arrays``. They cover what the verifier
     measured at the step: since EV2 a rejecting check measures all its tests for the record, so
     a step rejected at check 5 has every product and one rejected at check 6 every tensor of
-    check 6. ``None`` where the step measured nothing."""
+    check 6. ``None`` where the step measured nothing. A NaN score counts as ``+inf``
+    (``runs.metrics.nan_as_inf``), as in the step record's maximum: a NaN test fails."""
     out: dict[str, Any] = {"rho_5": None, "rho_5_at": None, "rho_kappa": None,
                            "rho_kappa_at": None, "rho_6": None, "rho_6_at": None}
-    rho = rho_arrays(stats, bands, k=None)
+    rho = {fam: nan_as_inf(x) for fam, x in rho_arrays(stats, bands, k=None).items()}
     if stats.products:
         i = int(np.argmax(rho["rho_5"].max(axis=1)))
         p = stats.products[i]

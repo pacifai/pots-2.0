@@ -114,27 +114,32 @@ the counting pass.
   string ``"NaN"``, ``"Infinity"`` or ``"-Infinity"``, and a missing value as ``null``;
 - ``residuals/<scenario>/step_<t>.npz``: one NumPy archive per step with residuals (EQ13
   record 2, EVALUATION_SPEC §4.2), written as the step closes, so a crashed run keeps finished
-  steps; a step that stopped before check 6a has none. Arrays: ``run``, ``scenario`` (0-d
-  strings), ``step``; per product ``p_m``, ``p_name``, ``p_cls`` (the κ class, the fine
-  class), ``p_spec_class`` (§5.7's class, :func:`spec_class`), ``p_layer`` (1-based, ``-1``
-  outside the layer stack), ``p_kappa`` and ``p_normalized`` (``[P, k]``, one normalized
-  residual per challenge), and the product's scale ``p_q`` (contracted dimension), ``p_norm``
-  (``‖P‖_F``), ``p_nu`` (``ν``) and ``p_abs1`` (``‖|P|·1‖``), which C1's realized floor reads;
-  per weight tensor ``w_check`` (``6a``/``6b``), ``w_name`` and ``w_rho`` (``ρ_max``). The
-  scores beside them (:func:`rho_arrays`): ``rho_5`` ``[P, k]``, ``rho_kappa`` ``[P]`` and
-  ``rho_6`` ``[W]``, row for row with the raw arrays, under the bands named by
-  ``band_source`` (the band file's hash; empty and every score NaN while calibrating). NaN and
-  infinity are stored as such. Rows are in measuring order, which is canonical order. A
-  rejecting check still measures all its tests, after the verdict is fixed (the driver's
-  record pass), so a step rejected at check 5 has all ``M`` products and one rejected at 6a or
-  6b every tensor of check 6; the checks after the rejecting one never run. A step rejected
-  as malformed has what the checks measured before the rejection. :func:`read_residuals`
-  rebuilds ``StepStats`` equal to the verifier's, the feed for calibration (A11).
+  steps; a step that stopped before checks 5 and 6 has one with zero rows. Arrays: ``run``,
+  ``scenario`` (0-d strings), ``step``; per product ``p_m``, ``p_name``, ``p_cls`` (the κ
+  class, the fine class), ``p_spec_class`` (§5.7's class, :func:`spec_class`), ``p_layer``
+  (0-based: ``0 … L−1`` for the layer stack, ``L`` for the output layer, :func:`layer_index`),
+  ``p_kappa`` and ``p_normalized`` (``[P, k]``, one normalized residual per challenge), and the
+  product's scale ``p_q`` (contracted dimension), ``p_norm`` (``‖P‖_F``), ``p_nu`` (``ν``) and
+  ``p_abs1`` (``‖|P|·1‖``), which C1's realized floor reads; per weight tensor ``w_check``
+  (``6a``/``6b``), ``w_name`` and ``w_rho`` (``ρ_max``). The scores beside them
+  (:func:`rho_arrays`): ``rho_5`` ``[P, k]``, ``rho_kappa`` ``[P]`` and ``rho_6`` ``[W]``, row
+  for row with the raw arrays, under the bands named by ``band_source`` (the band file's hash;
+  empty and every score NaN while calibrating). NaN and infinity are stored as such. Rows are
+  in measuring order, which is canonical order. A rejecting check still measures all its
+  tests, after the verdict is fixed (the driver's record pass), so a step rejected at check 5
+  has all ``M`` products and one rejected at 6a or 6b every tensor of check 6; the checks
+  after the rejecting one never run. A step rejected as malformed has what the checks measured
+  before the rejection. A test the step never measured has no row: the arrays hold measured
+  tests only, and the step record's ``record_pass`` counts them per family.
+  :func:`read_residuals` rebuilds ``StepStats`` equal to the verifier's, the feed for
+  calibration (A11).
 
 **Step records** (EVALUATION_SPEC §4.1, :func:`step_record`) carry the run's identity
 (``model``, ``corpus``, ``attack``, ``seed``), the cheat's (``bpr_records``, ``bpr_actual``,
 ``cheat_step``), ``judged`` (:func:`judged_step`), the verdict and checks, and the step's
-scores ``rho_5``, ``rho_kappa``, ``rho_6`` and ``n_failing`` (:func:`step_scores`).
+scores ``rho_5``, ``rho_kappa``, ``rho_6`` and ``n_failing`` (:func:`step_scores`). A rejected
+step's ``record_pass`` (:func:`record_pass`) says how far the record pass got and how many tests
+of each family the step measured; an accepted step's is ``null``.
 """
 
 from __future__ import annotations
@@ -165,7 +170,7 @@ from torch.utils.flop_counter import flop_registry
 
 from verification.computation.interface import ProductKind
 from verification.verifier.bands import product_class
-from verification.verifier.checks import DEFAULT_ORDER, protocol_id
+from verification.verifier.checks import DEFAULT_ORDER, RECORD_NOT_RUN, protocol_id
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 
 __all__ = [
@@ -174,8 +179,9 @@ __all__ = [
     "MemoryProbe", "memory_probe",
     "TimeRecorder", "MemoryRecorder", "CountRecorder",
     "memory_pass", "count_pass", "counting",
-    "derive_capture", "step_record", "judged_step", "in_sample_step", "spec_class",
-    "rho_arrays", "step_scores", "run_name", "config_hash",
+    "derive_capture", "step_record", "record_pass", "judged_step", "in_sample_step",
+    "calibration_seed", "spec_class", "layer_count", "layer_index",
+    "rho_arrays", "step_scores", "nan_as_inf", "run_name", "config_hash",
     "MetricsWriter", "read_records", "read_residuals", "lifetime_maxrss_bytes",
 ]
 
@@ -564,7 +570,7 @@ class TimeRecorder(_Recorder):
         self.writer.write(rows)
         if rec is not None and self._verifier is not None:
             stats = self._verifier.stats.get(t)
-            if stats is not None and (stats.products or stats.tensors):
+            if stats is not None:  # zero rows when the step stopped before checks 5 and 6
                 bands, k, guard = _scoring(self._verifier)
                 self.writer.write_residuals(self.scenario, t, stats, self._verifier.c,
                                             bands=bands, k=k, kappa_guard=guard)
@@ -623,8 +629,24 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
            "verdict": "reject" if failed else "accept",
            "first_failing_check": rejection.check_id if failed else None,
            "rejection_kind": rejection.kind if failed else None, "checks": checks,
-           **step_scores(stats, bands, k=k, kappa_guard=guard)}
+           **step_scores(stats, bands, k=k, kappa_guard=guard),
+           "record_pass": record_pass(verifier, t, stats, kappa_guard=guard) if failed else None}
     return out
+
+
+def record_pass(verifier: Any, t: int, stats: StepStats, *,
+                kappa_guard: bool = True) -> dict[str, Any]:
+    """The step record's ``record_pass`` for rejected step ``t`` (EVALUATION_SPEC §4.1):
+    ``status``, how far the rejecting check's measurement of its remaining tests got
+    (``Verifier.record_pass``, one of ``checks.RECORD_STATUSES``; ``"not run"`` when the
+    verifier has none), and ``measured``, the number of tests of each family measured at the
+    step in all, live and in the pass: ``rho_5`` one per product and challenge, ``rho_kappa``
+    one per product (0 with the κ guard off) and ``rho_6`` one per tensor."""
+    status = (getattr(verifier, "record_pass", None) or {}).get(t, RECORD_NOT_RUN)
+    n_p = len(stats.products)
+    return {"status": status,
+            "measured": {"rho_5": sum(len(p.normalized) for p in stats.products),
+                         "rho_kappa": n_p if kappa_guard else 0, "rho_6": len(stats.tensors)}}
 
 
 def _scoring(verifier: Any) -> tuple[Any, int | None, bool]:
@@ -642,8 +664,8 @@ def judged_step(verifier: Any, t: int, cheat_step: int | None = None) -> bool:
     - A cheat run (``cheat_step`` = ``t*``) judges ``t ≥ t*``: the steps its detection result
       reads. Its earlier steps are honest steps, which the honest runs report.
     - An honest run at the band file's calibration seed (H1) doesn't judge the calibration
-      steps (``calibration_steps``, 1–3): they are in-sample. A file without the seed is taken
-      as fitted at the run's seed.
+      steps (``calibration_steps``, 1–3): they are in-sample. A band file that records no
+      calibration seed raises ``ValueError`` (:func:`calibration_seed`).
     - An honest run at any other seed (H2) doesn't judge step 1 (F8a).
     """
     if getattr(verifier, "calibrate", False):
@@ -654,21 +676,31 @@ def judged_step(verifier: Any, t: int, cheat_step: int | None = None) -> bool:
     if cheat_step is not None:
         return t >= cheat_step
     seed = getattr(verifier, "seed", None)
-    if _calibration_seed(bands) in (None, seed):
+    if calibration_seed(bands) == seed:
         return not in_sample_step(bands, t, seed)
     return t != 1
 
 
-def _calibration_seed(bands: Any) -> int | None:
-    return ((getattr(bands, "stats", None) or {}).get("context") or {}).get("calibration_seed")
+def calibration_seed(bands: Any) -> int:
+    """The seed of the run the band file was fitted on (its context's ``calibration_seed``,
+    which A11's calibration records). A file without it raises ``ValueError``: which steps are
+    in-sample, and so which are judged, depends on it, and taking the run's own seed would
+    silently count a fitted step as a result."""
+    seed = ((getattr(bands, "stats", None) or {}).get("context") or {}).get("calibration_seed")
+    if seed is None:
+        source = str(getattr(bands, "source", "?"))
+        raise ValueError(f"the band file ({source[:16]}…) records no calibration_seed, so its "
+                         f"in-sample steps are unknown; refit it with verification.runs."
+                         f"calibrate, which records the seed")
+    return int(seed)
 
 
 def in_sample_step(bands: Any, t: int, seed: int | None) -> bool:
     """Whether step ``t`` of an honest run at ``seed`` is one ``bands`` was fitted on: one of
     the band file's ``calibration_steps`` in a run at its ``calibration_seed`` (H1's steps 1–3).
-    A file without the seed is taken as fitted at the run's seed."""
+    A file without the seed raises ``ValueError`` (:func:`calibration_seed`)."""
     steps = (getattr(bands, "stats", None) or {}).get("calibration_steps") or ()
-    return _calibration_seed(bands) in (None, seed) and t in set(steps)
+    return calibration_seed(bands) == seed and t in set(steps)
 
 
 # ---- the scores (EVALUATION_SPEC §2.2) -----------------------------------------------------
@@ -721,10 +753,14 @@ def step_scores(stats: StepStats, bands: Any, *, k: int | None,
     score (``rho_5``, ``rho_kappa``, ``rho_6``) and ``n_failing``, a dict of the number of
     component tests above 1, both over what the verifier measured at the step.
 
-    A family is ``None``, with its ``n_failing`` entry, when no test of it was scored: no bands
-    (calibration), the κ guard off (``rho_kappa``), no product measured (``rho_5``,
-    ``rho_kappa``: the step stopped before check 5) or no tensor (``rho_6``). A non-finite score
-    counts as failing, as the live checks reject it, and a NaN maximum stays NaN."""
+    Only measured tests count. A test the step never measured (a glue tensor of 6b after a
+    check-5 rejection, every test after a rejection before check 5) has no row in the arrays,
+    so it is neither a score nor failing; the step record's ``record_pass`` gives how many of
+    each family were measured. A family is ``None``, with its ``n_failing`` entry, when no test
+    of it was scored: no bands (calibration), the κ guard off (``rho_kappa``), no product
+    measured (``rho_5``, ``rho_kappa``: the step stopped before check 5) or no tensor
+    (``rho_6``). A non-finite score counts as failing, as the live checks reject it, and a NaN
+    score counts as ``+inf`` in the maximum (:func:`nan_as_inf`), so it can't hide the rest."""
     rho = rho_arrays(stats, bands, k=k, kappa_guard=kappa_guard)
     scored = {"rho_5": bands is not None and bool(stats.products),
               "rho_kappa": bands is not None and kappa_guard and bool(stats.products),
@@ -732,11 +768,18 @@ def step_scores(stats: StepStats, bands: Any, *, k: int | None,
     out: dict[str, Any] = {}
     failing: dict[str, int | None] = {}
     for fam in SCORE_FAMILIES:
-        x = rho[fam].ravel()
+        x = nan_as_inf(rho[fam].ravel())
         out[fam] = float(np.max(x)) if scored[fam] else None
         failing[fam] = int(np.count_nonzero(~(x <= 1.0))) if scored[fam] else None
     out["n_failing"] = failing
     return out
+
+
+def nan_as_inf(x: np.ndarray) -> np.ndarray:
+    """``x`` with every NaN score as ``+inf``: a NaN test fails, as the live checks reject it,
+    and taken as the largest score it can't hide the step's maximum (``np.max`` would return
+    NaN, ``np.argmax`` the first NaN). The stored arrays keep NaN as such."""
+    return np.where(np.isnan(x), np.inf, x)
 
 
 # ---- memory: the memory pass -------------------------------------------------------------
@@ -1107,15 +1150,30 @@ def spec_class(c: Any, spec: Any) -> str:
     return _KIND_CLASSES[spec.kind]
 
 
+def layer_count(c: Any) -> int:
+    """``L``, the computation's layer count: its largest 1-based ``ProductSpec.layer`` (0 when
+    no product is in a layer)."""
+    return max((s.layer for s in c.products if s.layer is not None), default=0)
+
+
+def layer_index(spec: Any, n_layers: int) -> int:
+    """A product's ``p_layer`` (EVALUATION_SPEC §4.2, §5.4): its layer numbered from 0, so
+    ``0 … L−1`` for the layer stack (``ProductSpec.layer`` is 1-based), and ``L`` for a product
+    outside it, the output layer's (on the decoder ``Lambda``, ``dF`` and the head's weight
+    gradient)."""
+    return n_layers if spec.layer is None else int(spec.layer) - 1
+
+
 def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats, c: Any, *,
                      bands: Any = None, k: int | None = None,
                      kappa_guard: bool = True) -> dict[str, np.ndarray]:
     ps = stats.products
     width = len(ps[0].normalized) if ps else (k or 0)
     layers, classes = [], []
+    n_layers = 0 if c is None else layer_count(c)
     for p in ps:
         spec = c.product(p.m) if c is not None else None
-        layers.append(-1 if spec is None or spec.layer is None else int(spec.layer))
+        layers.append(-1 if spec is None else layer_index(spec, n_layers))
         classes.append("" if spec is None else spec_class(c, spec))
     rho = rho_arrays(stats, bands, k=k, kappa_guard=kappa_guard)
     return {
@@ -1275,7 +1333,8 @@ class MetricsWriter:
     ``run_end``. ``model``, ``corpus``, ``attack`` (``VERIF_ATTACK``, the BackdoorLLM task;
     ``None`` for a run on other data) and ``seed`` go into the ``environment`` record and every
     ``step`` record. A run named ``data`` or ``evaluation``, or a directory of either name, is
-    refused (:data:`RESERVED_NAMES`).
+    refused (:data:`RESERVED_NAMES`) in any letter case: on a case-insensitive file system
+    ``Data`` is the same directory as ``data``.
     """
 
     def __init__(self, out_dir: str | os.PathLike[str], run: str, *,
@@ -1285,7 +1344,7 @@ class MetricsWriter:
                  h_D: bytes | None = None, extra: Mapping[str, Any] | None = None) -> None:
         self.dir = Path(out_dir)
         for name in (run, self.dir.name):
-            if name in RESERVED_NAMES:
+            if name.casefold() in RESERVED_NAMES:
                 raise ValueError(f"run name or directory {name!r} is reserved "
                                  f"(EVALUATION_SPEC §4.6: {', '.join(RESERVED_NAMES)})")
         self.dir.mkdir(parents=True, exist_ok=True)

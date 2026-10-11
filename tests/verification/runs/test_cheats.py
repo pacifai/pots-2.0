@@ -34,7 +34,7 @@ from verification.runs.scenarios import (
 from verification.transcript.store import perturb_leaf
 from verification.verifier.bands import Bands
 from verification.verifier.calibration import load_bands
-from verification.verifier.context import Rejection
+from verification.verifier.context import ProductStat, Rejection, StepStats, TensorStat
 
 SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
@@ -116,10 +116,26 @@ def test_outcome_names_every_ending():
     assert outcome(e, L(Rejection(1, "4", "…", "failed"))) != "exact"
 
 
+def test_scores_count_a_nan_as_inf():
+    """A NaN score is the step's largest, as in the step record's maximum: it fails, so it
+    can't hide behind a finite score or be skipped by ``argmax``."""
+    st = StepStats(products=[ProductStat(1, "a", "S", 1.0, (0.5, 2.0), q=8, nu=1.0, p_abs1=4.0),
+                             ProductStat(2, "b", "S", 1.0, (math.nan, 0.1), q=8, nu=math.nan,
+                                         p_abs1=4.0)],
+                   tensors=[TensorStat("w.a", "6a", 3.0), TensorStat("w.b", "6b", math.nan)])
+    b = Bands(tau=4.0, kappa_max=1.0, tau_w=4.0)
+    got = cheats.scores(st, b)
+    assert (got["rho_5"], got["rho_5_at"]) == (math.inf, "P_2 (b)")
+    assert (got["rho_kappa"], got["rho_kappa_at"]) == (math.inf, "P_2 (b)")
+    assert (got["rho_6"], got["rho_6_at"]) == (math.inf, "6b w.b")
+    fine = cheats.scores(StepStats(products=st.products[:1], tensors=st.tensors[:1]), b)
+    assert (fine["rho_5"], fine["rho_kappa"], fine["rho_6"]) == (0.5, 0.25, 0.75)
+
+
 # EVALUATION_SPEC §4.1's step-record fields
 SPEC_FIELDS = ("run", "model", "attack", "seed", "scenario", "bpr_records", "bpr_actual", "step",
                "cheat_step", "judged", "checks", "verdict", "first_failing_check", "rho_5",
-               "rho_kappa", "rho_6", "n_failing")
+               "rho_kappa", "rho_6", "n_failing", "record_pass")
 
 
 def test_poisoned_step_cheats_hit_their_declared_points(env, tmp_path):
@@ -150,6 +166,11 @@ def test_poisoned_step_cheats_hit_their_declared_points(env, tmp_path):
                and r["bpr_actual"] == 0.5 for r in rows)
     assert rows[1]["rho_5"] > 1 and rows[2]["rho_6"] > 1
     assert rows[1]["rho_kappa"] is not None
+    n_tensors = len(env.c.linear_weights) + len(env.c.glue_gradient_weights)
+    # how far the record pass got, and the tests each step measured: A1 none (check 4),
+    # A2 every product (check 5's pass), A3 every tensor of check 6 (6a's pass)
+    passes = {"A1": ("not run", 0, 0), "A2": ("complete", env.c.M, len(env.c.linear_weights)),
+              "A3": ("complete", 0, n_tensors)}
     for s, check in zip(SCENARIOS, ("4", "5", "6a")):
         (st,) = read_records(dirs[s] / "records.jsonl", "step")
         assert set(SPEC_FIELDS) <= st.keys()
@@ -157,6 +178,9 @@ def test_poisoned_step_cheats_hit_their_declared_points(env, tmp_path):
             dirs[s].name, s, 1, 1)
         assert (st["bpr_records"], st["bpr_actual"], st["judged"]) == (2, 0.5, True)
         assert (st["verdict"], st["first_failing_check"]) == ("reject", check)
+        status, n_p, n_w = passes[s]
+        assert st["record_pass"] == {"status": status, "measured": {
+            "rho_5": n_p * K, "rho_kappa": n_p, "rho_6": n_w}}
     a2 = read_residuals(dirs["A2"])["A2"][1]
     assert [p.m for p in a2.products] == list(range(1, env.c.M + 1))
     with np.load(dirs["A2"] / "residuals" / "A2" / "step_00001.npz") as z:
