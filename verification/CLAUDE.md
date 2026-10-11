@@ -1245,6 +1245,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     A1 at check 4; A2 at check 5 on `P_1` (residual 1.35e5, `ρ_5` 4.5e3); A3 at check 6a
     (`ρ_6` 5.7e5); the hidden step at check 7 of step 2; the `dF` flip at check 5 on `P_2372`
     (residual 2.95e3, `ρ_5` 277). A1's and A2's `W_2` bit-equal.
+  - Sweep re-run at C5–C6 (2026-10-11, same band file, all four shapes in one run, 200 trials
+    per point): no stop condition. Every class and shape rejects every trial from `x ≤ 2`, so
+    `f_all` is at most 0.19% of `f_ach` (`dF`: 7.6e−4 against 0.538). `ĉ` 0.51–0.64 for
+    `entry`, 0.07–0.14 for `entry2`, 0.73–0.87 (mean 0.775) for `row2`, 0 for `dense`; the
+    largest, `O`'s `row2` at 0.869 ± 0.034, sits 1.6 standard errors above `C_ANTI`. 60 min,
+    peak 10.9 GiB.
 
 ### `evaluation/`
 
