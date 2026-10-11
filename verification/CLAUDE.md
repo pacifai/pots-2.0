@@ -886,9 +886,12 @@ interface.
   - `band_context(cfg, c, *, h_D, k)`: the run a band file is fitted for, which `calibrate`
     writes and every loader compares: model and revision, `(MASTER_DTYPE, COMPUTE_DTYPE)`,
     `attn_impl`, device, `h_D`, `n_s`, `n`, `η`, `M`, `T_run` (`VERIF_STEPS`) and `k`. It also
-    holds `calibration_seed` (`VERIF_SEED`), which is in `PROVENANCE_KEYS`: kept in the file,
-    never compared. The bands describe rounding noise on honest steps, which doesn't depend
-    on `π`, so a run at seed 2–5 loads the file fitted at seed 1 (EVALUATION_SPEC §3.2).
+    holds `calibration_seed` (`VERIF_SEED`) and `threads` (`VERIF_THREADS`), both in
+    `PROVENANCE_KEYS`: kept in the file, never compared. The bands describe rounding noise on
+    honest steps, which doesn't depend on `π`, so a run at seed 2–5 loads the file fitted at
+    seed 1 (EVALUATION_SPEC §3.2). The thread count changes only the CPU's floating-point
+    reduction order, a shift far below `τ = 8·s_h`, while the cost results need it recorded
+    (FS2). A file written before `threads` was recorded (`cc7a9bca…`) loads too.
   - Fitted bands go through `band_file_bytes` → `Bands.from_json` before `freeze`, so their
     `source` is the file's hash, not `"provisional"`.
 

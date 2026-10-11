@@ -467,9 +467,11 @@ Every later run loads the band file read-only with `calibration.load_bands(path,
 context=...)`. It refuses a missing file, a file calibrated at another `k`, and a file whose
 recorded run (`band_context`: model, dtypes, attention, device, `h_D`, batch shape, `η`, `M`,
 `T` and `k`) differs from the run loading it. The file also records the calibration run's
-seed but doesn't compare it, so the file fitted at seed 1 judges the runs at every seed. The
-harness then checks with `assert_same_band_source` that every run was judged by the same
-file.
+seed and thread count but doesn't compare them. The bands don't depend on `π`, so the file
+fitted at seed 1 judges the runs at every seed. The thread count changes only the order of
+the CPU's floating-point sums, a shift far below `τ`, and the cost results need it recorded.
+A file written before the thread count was recorded still loads. The harness then checks
+with `assert_same_band_source` that every run was judged by the same file.
 
 `runs/calibrate.py` does all of this on the real SmolLM2 run:
 

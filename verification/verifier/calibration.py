@@ -21,7 +21,7 @@ their numbers (``Verifier(calibrate=True)``, P10b). This module turns the number
 - :func:`band_file_bytes` writes the bands and C1's statistics as one JSON file.
   :func:`write_band_file` saves it, and :func:`load_bands` is how every later run reads it,
   refusing a file whose :func:`band_context` differs from the run's in any key but the
-  calibration seed.
+  calibration seed and thread count.
   ``Bands.source`` is the BLAKE3 hex of the file's bytes, and :func:`assert_same_band_source`
   is P10a's check that every run was judged by the same file.
 
@@ -254,8 +254,9 @@ class BandFileMismatch(ValueError):
 # Context entries the band file keeps as provenance and :func:`load_bands` doesn't compare.
 # The bands describe the verifier's rounding noise on honest steps, which doesn't depend on
 # π's batch order, so the file fitted at seed 1 (H1) judges the runs at every seed
-# (EVALUATION_SPEC §3.2).
-PROVENANCE_KEYS: frozenset[str] = frozenset({"calibration_seed"})
+# (EVALUATION_SPEC §3.2). The thread count changes only the CPU's reduction order, a shift
+# far below τ = Z·s_h; the cost results need it recorded, and a file without it still loads.
+PROVENANCE_KEYS: frozenset[str] = frozenset({"calibration_seed", "threads"})
 
 
 def band_context(cfg: RunConfig, c: DecoderComputation, *, h_D: bytes, k: int) -> dict[str, Any]:
@@ -265,15 +266,16 @@ def band_context(cfg: RunConfig, c: DecoderComputation, *, h_D: bytes, k: int) -
     that loads the file builds its own with this function and passes it to :func:`load_bands`.
     Honest residuals depend on each compared entry, so bands fitted under one don't judge
     another (P10a). ``T_run`` is ``VERIF_STEPS``, the ``T`` that P10d sized ``k`` for.
-    ``calibration_seed`` is ``cfg.seed``. In the file it is the calibration run's seed, kept as
-    provenance, and :func:`load_bands` doesn't compare it (:data:`PROVENANCE_KEYS`).
+    ``calibration_seed`` is ``cfg.seed``, and ``threads`` is ``cfg.threads``
+    (``VERIF_THREADS``). In the file they are the calibration run's seed and thread count,
+    kept as provenance, and :func:`load_bands` compares neither (:data:`PROVENANCE_KEYS`).
     """
     return {"model": cfg.model, "model_revision": cfg.model_revision,
             "master_dtype": str(cfg.master_dtype).removeprefix("torch."),
             "compute_dtype": str(cfg.compute_dtype).removeprefix("torch."),
             "attn_impl": cfg.attn_impl, "device": cfg.device, "h_D": h_D.hex(),
-            "calibration_seed": cfg.seed, "n_s": c.n_s, "n": c.n, "eta": c.eta, "M": c.M,
-            "T_run": cfg.steps, "k": k}
+            "calibration_seed": cfg.seed, "threads": cfg.threads, "n_s": c.n_s, "n": c.n,
+            "eta": c.eta, "M": c.M, "T_run": cfg.steps, "k": k}
 
 
 _ABSENT = object()
