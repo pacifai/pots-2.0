@@ -27,9 +27,10 @@ from verification.computation.instances.mlp import (
 from verification.parameters import UNIT_ROUNDOFF
 from verification.prover import step as prover
 from verification.prover.step import plain_step, prove_step
+from verification.transcript.errors import TranscriptFormatError
 from verification.transcript.reader import TranscriptView
 from verification.transcript.store import InMemoryStore, TranscriptStore, perturb_leaf
-from verification.verifier import checks
+from verification.verifier import checks, driver
 from verification.verifier.bands import TAU_W0, Bands, product_class
 from verification.verifier.checks import (
     CHECKS,
@@ -451,6 +452,163 @@ def test_check_6b_on_glue_gradients():
     name = c.weight(3)
     perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
     _expect(_verifier(c, D, tree, w0).verify_step(1, store), 1, "6b")
+
+
+# ---- the record pass after a rejecting check (EV2, EVALUATION_SPEC §4.1) ----------------
+
+
+def _record_pass(make_v, store, monkeypatch):
+    """Verify step 1 with the record pass and without it. The rejection and the timed slots
+    must be the same; returns the rejection and both runs' stats."""
+    v = make_v()
+    rej = v.verify_step(1, store)
+    with monkeypatch.context() as mp:
+        mp.setattr(driver, "record_rest", lambda *a: None)
+        bare = make_v()
+        rej_bare = bare.verify_step(1, store)
+    assert rej == rej_bare and v.rejection == rej
+    assert list(v.timings[1]) == list(bare.timings[1])
+    return rej, v.stats[1], bare.stats[1]
+
+
+def _glue_mlp_env(cls):
+    c = cls((16, 32, 32, 8), n_s=4, eta=ETA)
+    D = synthetic_dataset(c.widths, N_RECORDS, seed=0)
+    return c, D, dataset_tree(c, D), init_weights(c.widths, seed=0)
+
+
+def test_record_pass_after_check_5_measures_every_product(c, D, tree, w0, monkeypatch):
+    """A2's step rejects at P_1. The record pass then measures P_2..P_M from check 5's replay,
+    failing ones included, with the numbers a record-mode (calibration) run gives."""
+    b_tilde = _batch(c, D, 1)
+    b_tilde[0] = make_record(torch.zeros(c.d_in), torch.ones(c.d_out))
+    store, _ = _store(c, D, tree, w0, 1, train_records=b_tilde)
+    rej, st, bare = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "5")
+    assert "P_1 (Y_1)" in rej.detail
+    assert [p.m for p in bare.products] == [1]
+    assert [p.m for p in st.products] == list(range(1, c.M + 1))
+    assert sum(max(p.normalized) > Bands.provisional().tau for p in st.products) > 1
+    cal = _make(c, D, tree, w0, n_steps=1, bands=None, calibrate=True)
+    assert cal.start_run(D) is None and cal.verify_step(1, store) is None
+    want = cal.stats[1].products
+    assert st.products == want
+    assert [(p.q, p.p_norm, p.nu, p.p_abs1) for p in st.products] == \
+        [(p.q, p.p_norm, p.nu, p.p_abs1) for p in want]
+    # 6a ran before check 5 and passed; 6b never ran, and isn't check 5's to measure
+    assert st.tensors == bare.tensors
+    assert [s.check_id for s in st.tensors] == ["6a"] * len(c.linear_weights)
+
+
+def test_record_pass_after_check_6a_measures_every_weight(c, D, tree, w0, monkeypatch):
+    """A3: every linear weight of W_{t+1} from another batch. 6a stops at the first; the record
+    pass measures the rest, and check 5 still never runs."""
+    store, _ = _store(c, D, tree, w0, 1)
+    poisoned, _ = plain_step(c, c.build_model(), w0, _batch(c, D, 3))
+    for name in c.weight_names:
+        perturb_leaf(c, store, c.w_next_index(name), poisoned[name])
+    rej, st, bare = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6a")
+    assert len(bare.tensors) == 1 and st.tensors[0] == bare.tensors[0]
+    assert [s.weight for s in st.tensors] == list(c.linear_weights)
+    assert all(s.check_id == "6a" and s.rho_max > 4 for s in st.tensors)
+    assert not st.products and not bare.products
+
+
+def test_record_pass_after_6a_measures_6b_too(monkeypatch):
+    """Check 6 is one check over every weight tensor: after a 6a rejection the record pass also
+    runs 6b, on a replay of its own (check 5 never ran), and gets the honest run's numbers."""
+    c, D, tree, w0 = _glue_mlp_env(GlueMLP)
+    store, out = _store(c, D, tree, w0, 1)
+    honest = _verifier(c, D, tree, w0)
+    assert honest.verify_step(1, store) is None
+    name = c.weight(1)
+    perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
+    rej, st, bare = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6a")
+    assert [(s.check_id, s.weight) for s in bare.tensors] == [("6a", c.weight(1))]
+    assert [(s.check_id, s.weight) for s in st.tensors] == [
+        ("6a", c.weight(1)), ("6a", c.weight(2)), ("6b", c.weight(3))]
+    assert st.tensors[1:] == honest.stats[1].tensors[1:]
+    assert not st.products  # the replay served the products; none was measured
+
+
+class GlueMLP2(GlueMLP):
+    """Layers 2 and 3 declared as glue, so check 6b has two tensors."""
+
+    @property
+    def linear_weights(self):
+        lw = dict(super().linear_weights)  # without layer 3
+        lw.pop(self.weight(2))
+        return lw
+
+    def replay(self, leaves):
+        return _GlueReplay2(self, leaves)
+
+
+class _GlueReplay2(MLPReplay):
+    def glue_gradients(self):
+        super().glue_gradients()
+        return {self.c.weight(l): self.dy(l).t() @ self.x(l) for l in (2, 3)}
+
+
+def test_record_pass_after_check_6b_measures_the_other_glue_weights(monkeypatch):
+    c, D, tree, w0 = _glue_mlp_env(GlueMLP2)
+    assert c.glue_gradient_weights == (c.weight(2), c.weight(3))
+    store, out = _store(c, D, tree, w0, 1)
+    honest = _verifier(c, D, tree, w0)
+    assert honest.verify_step(1, store) is None
+    name = c.weight(2)
+    perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
+    rej, st, bare = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6b")
+    assert [(s.check_id, s.weight) for s in bare.tensors] == [
+        ("6a", c.weight(1)), ("6b", c.weight(2))]
+    assert [(s.check_id, s.weight) for s in st.tensors] == [
+        ("6a", c.weight(1)), ("6b", c.weight(2)), ("6b", c.weight(3))]
+    assert st.tensors[2] == honest.stats[1].tensors[2]
+    assert st.products == bare.products and len(st.products) == c.M  # check 5 ran in full
+
+
+class _BrokenGlueMLP(GlueMLP):
+    def replay(self, leaves):
+        return _BrokenGlueReplay(self, leaves)
+
+
+class _BrokenGlueReplay(_GlueReplay):
+    def glue_gradients(self):
+        raise TranscriptFormatError("glue unreadable")
+
+
+def test_record_pass_ends_quietly_on_malformed_data(monkeypatch):
+    """A prover-data error inside the record pass ends it; the rejection stands."""
+    c, D, tree, w0 = _glue_mlp_env(_BrokenGlueMLP)
+    store, out = _store(c, D, tree, w0, 1)
+    name = c.weight(1)
+    perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
+    rej, st, _ = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6a")
+    assert [(s.check_id, s.weight) for s in st.tensors] == [
+        ("6a", c.weight(1)), ("6a", c.weight(2))]
+
+
+def test_record_pass_only_after_a_failed_test(c, D, tree, w0, monkeypatch):
+    """The driver calls the record pass on a failed test only; at a check with no numbers it
+    measures nothing."""
+    calls = []
+    real = driver.record_rest
+    monkeypatch.setattr(driver, "record_rest", lambda *a: (calls.append(a[-1]), real(*a))[1])
+    store, _ = _store(c, D, tree, w0, 1, records=_batch(c, D, 2),
+                      path_indices=schedule(2, c.n_s, len(D), SEED))
+    v = _verifier(c, D, tree, w0)
+    _expect(v.verify_step(1, store), 1, "4")
+    assert calls == ["4"] and not v.stats[1].products and not v.stats[1].tensors
+    store, _ = _store(c, D, tree, w0, 1)
+    nan = torch.full(c.product(1).p_shape, math.nan)
+    v = _verifier(c, D, tree, w0)
+    _expect(v.verify_step(1, Wrapped(store, leaves={c.product_index(1): nan})), 1, "2",
+            "malformed")
+    assert calls == ["4"]
 
 
 # ---- run-level checks 0, 1, 8, 9 --------------------------------------------------------

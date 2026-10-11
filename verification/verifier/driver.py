@@ -47,7 +47,7 @@ from verification.commitment.merkle import DIGEST_SIZE, hash_leaf, merkle_root
 from verification.computation.interface import DeclaredComputation
 from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands
-from verification.verifier.checks import CHECKS, DEFAULT_ORDER, ROOT_SLOT
+from verification.verifier.checks import CHECKS, DEFAULT_ORDER, ROOT_SLOT, record_rest
 from verification.verifier.context import (
     Rejection,
     Section,
@@ -211,7 +211,12 @@ class Verifier:
     # ---- per step: checks 4, 7, 2, 6a, 5, 6b, 2.root -------------------------------------
 
     def verify_step(self, t: int, store: TranscriptStore) -> Rejection | None:
-        """Run the default order on step ``t`` (1-based, consecutive); ``None`` accepts."""
+        """Run the default order on step ``t`` (1-based, consecutive); ``None`` accepts.
+
+        When check 5, 6a or 6b fails the step, it then measures the tests it skipped into
+        ``stats[t]`` (``checks.record_rest``, EVALUATION_SPEC §4.1). That runs after the
+        rejection is fixed, outside ``timings`` and the metrics seam, and returns nothing.
+        """
         if self._chain is None:
             raise RuntimeError("call start_run before verify_step")
         if self.rejection is not None:
@@ -240,6 +245,8 @@ class Verifier:
                 timings[check_id] = time.perf_counter() - t0
             if rej is not None:
                 self.rejection = rej
+                if rej.kind == "failed":  # the record only, after the verdict (EV2)
+                    record_rest(store, self.c, ctx, bands, check_id)
                 return rej
         hashes = ctx.state.leaf_hashes
         assert hashes is not None
