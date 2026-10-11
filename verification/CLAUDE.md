@@ -975,15 +975,25 @@ interface.
     failing member rejects with the same message as alone, and an error serving a later member
     is raised only after the members before it pass. Every other product is measured alone.
   - **The record pass (EV2, EVALUATION_SPEC §4.1).** `record_rest(store, c, ctx, bands,
-    slot)` measures, for the record only, the tests a rejecting check skipped. A check-5
-    rejection measures every later product from check 5's own replay. A 6a rejection
-    measures the remaining linear weights, then every 6b glue weight from a replay of its
-    own, since check 6 is one protocol check over every tensor. A 6b rejection measures the
-    remaining glue weights. It runs with `judge=False` and no metrics seam, sharing
-    `ctx.stats`, so it changes no rejection, verdict or timing row. A failing test is still
-    recorded and the pass goes on. A malformed leaf ends the pass quietly, and a
-    verifier-side error propagates. `RECORDED_SLOTS = ("6a", "5", "6b")`; any other slot
-    does nothing. The checks after the rejecting one never run.
+    slot) -> str` measures, for the record only, the tests a rejecting check skipped. A
+    check-5 rejection inside a member run first records the run's later members as check 5
+    measured them in the batch (`StepState.run_rest`, set by check 5 when it rejects), since
+    a member measured alone or in a smaller batch is held to agree only to `1e-4` relative;
+    a serving error check 5 deferred (`StepState.run_rest_error`) is raised after them.
+    Every later product is then measured from check 5's own replay. A 6a rejection measures
+    the remaining linear weights, then every 6b glue weight from a replay of its own, since
+    check 6 is one protocol check over every tensor. A 6b rejection measures the remaining
+    glue weights. Each gradient comes from the helper its live check uses
+    (`_linear_gradient`, which widens a bf16 leaf to the weights' format as F6b does;
+    `_replay_glue_gradients`; `_glue_gradient`), so an untouched tensor scores what the live
+    check gives it, at fp32 and bf16. It runs with `judge=False` and no metrics seam,
+    sharing `ctx.stats`, so it changes no rejection, verdict or timing row. A failing test
+    is still recorded and the pass goes on. It returns `RECORD_COMPLETE` (`"complete"`), or
+    `RECORD_NOT_RUN` (`"not run"`) when the slot has no scored tests or none remained; a
+    malformed leaf ends it with `RECORD_MALFORMED` (`"ended: malformed"`), the tests before
+    the leaf recorded. A verifier-side error propagates, as in the checks, and the driver
+    turns it into `RECORD_ERROR` (`"error"`). `RECORDED_SLOTS = ("6a", "5", "6b")`. The
+    checks after the rejecting one never run.
 - `driver.py` (A5): `Verifier(c, *, h_D, n_records, k, n_steps, bands, seed, w0= | w0_hashes=,
   schedule=, calibrate=False, allow_provisional=False, section=None, kappa_guard=True)`.
   `seed` is required and has no default: `π` is public input, `setup.data.schedule(t, n_s,
@@ -1003,14 +1013,18 @@ interface.
   - `verify_step(t, store)` runs the default order and keeps the `W_{t+1}` hashes only once
     every slot, the root comparison included, has passed. After a `"failed"` rejection (never
     a malformed one) it calls `checks.record_rest` with the rejecting slot, once the verdict
-    is fixed. Its time lands in the loop's `verify_s`, not in any check's row.
+    is fixed, through `_record_rest`, which catches any exception the pass raises with a
+    `RuntimeWarning` and records `"error"`, so the rejection stands. `record_pass[t]` holds
+    the status (`"not run"` after a malformed rejection). Its time lands in the loop's
+    `verify_s`, not in any check's row.
   - `freeze(bands)` ends calibration (P10b): it re-judges every calibrated step's stats in
     check order, records `bands.source`, and judges every later step. The root comparison
     runs live in calibration. Since it runs after 6a, 5 and 6b, a live rejection from it is
     re-judged first: a band failure in that step's numbers replaces it, as in a judged run.
   - `end_run(final) -> RunVerdict(accepted, rejection, steps_verified, band_source)` runs
     checks 8 and 9. It raises while calibration is unfrozen.
-  - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers.
+  - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers, and
+    `record_pass[t]` the record pass's status at a rejected step.
 - `residuals.py` (A10; A11 reuses it): summaries of `StepStats`, from `verifier.stats` or from
   `runs.metrics.read_residuals`. It judges nothing.
   - `class_summary(stats) -> [ClassSummary(cls, count, n, rms, max, max_name, max_step,
@@ -1201,7 +1215,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `model`, `corpus`, `attack` (`VERIF_ATTACK`, `None` for a run on other data) and `seed`
     go into the `environment` record and every `step` record. Every run that writes `corpus`
     writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
-    EVALUATION_SPEC §4.6) raises `ValueError`.
+    EVALUATION_SPEC §4.6) raises `ValueError`, in any letter case (`str.casefold`): on a
+    case-insensitive file system `Data` is `data`.
   - **Run names (EV2).** `run_name(scenario, model, attack, bpr_records, seed)` is a cell's
     unique name, `<scenario>-<model>-<attack>-bpr<n>-s<seed>`: the model as its repository's
     last part, `n` the poisoned records in the cheat batch (0 for an honest run), characters
@@ -1211,16 +1226,22 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `llama_step`, `calibrate`, `mlp_smoke`, `store_crosscheck`, `flipped_matmul_sweep`).
   - **Step records (EVALUATION_SPEC §4.1).** `step_record` writes `model`, `corpus`,
     `attack`, `seed`, `bpr_records`, `bpr_actual`, `cheat_step`, `step`, `judged`,
-    `verdict`, `first_failing_check`, `rejection_kind`, `checks` and the step's scores
-    `rho_5`, `rho_kappa`, `rho_6` and `n_failing`. `bpr_records` and `bpr_actual` are the
+    `verdict`, `first_failing_check`, `rejection_kind`, `checks`, the step's scores
+    `rho_5`, `rho_kappa`, `rho_6` and `n_failing`, and `record_pass`
+    (`record_pass(verifier, t, stats, *, kappa_guard)`): at a rejected step `{"status": the
+    driver's record_pass[t] ("not run" when it has none), "measured": {"rho_5": products ×
+    k, "rho_kappa": products (0 with the guard off), "rho_6": tensors}}`, the counts over
+    every test measured at the step, live and in the pass; `null` at an accepted step.
+    `bpr_records` and `bpr_actual` are the
     cheat batch's poisoned records and their share of it: `env.bpr_records`/`bpr_actual`
     for a cheat on `b̃`, `0`/`0.0` for an honest run, `None` for a protocol fault and the
     MLP smoke run. `cheat_step` is `t*` for a cheat, else `None`.
     - `judged_step(verifier, t, cheat_step)`: never while calibrating or under provisional
       bands; a cheat run judges `t ≥ t*`; an honest run at the band file's
       `calibration_seed` (H1) skips the file's `calibration_steps` (1–3); at any other seed
-      (H2) it skips step 1. A file without `calibration_seed` is taken as fitted at the run's
-      seed. `in_sample_step(bands, t, seed)` is H1's half of it.
+      (H2) it skips step 1. A file without `calibration_seed` raises a worded `ValueError`
+      (`calibration_seed(bands)`), unless the run is a cheat run, which judges from `t*`.
+      `in_sample_step(bands, t, seed)` is H1's half of it.
     - `rho_arrays(stats, bands, *, k, kappa_guard=True)` gives the component scores, each a
       test's left side over its right side, so a test rejects exactly when its score is
       above 1: `rho_5` `[P, k]` (`normalized/τ`), `rho_kappa` `[P]`
@@ -1232,7 +1253,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
       within an ulp.
     - `step_scores(stats, bands, *, k, kappa_guard)`: per family (`SCORE_FAMILIES`) the
       largest score, and `n_failing`, a dict of the count of scores above 1 (NaN counts as
-      failing). A family not scored at the step (no bands, guard off, nothing measured) is
+      failing, and as `+inf` in the maximum, `nan_as_inf`; `cheats.scores` does the same).
+      Only measured tests count: a test the step never measured has no row and isn't
+      failing. A family not scored at the step (no bands, guard off, nothing measured) is
       `None` with its `n_failing` entry.
   - Files under `$VERIF_OUTPUT_DIR/<run>/`: `records.jsonl` (records `environment`, `step`,
     `verdict`, `time`, `memory`, `count`, `storage`, `run_end`, each with `record` and `run`;
@@ -1243,11 +1266,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     per product `p_m`, `p_name`, `p_cls` (the fine class, κ's), `p_spec_class` (§5.7's
     class, `spec_class(c, spec)`: `forward`, `input gradient`, `weight gradient`,
     `attention score`, `attention value`, and the placeholder `operand gradient` for δA,
-    δV, δQ̃ and δK̃, which §5.7 doesn't name), `p_layer` (1-based, `-1` outside the layer
-    stack); per tensor `w_check`, `w_name`; then `rho_5` `[P, k]`, `rho_kappa` `[P]`,
+    δV, δQ̃ and δK̃, which §5.7 doesn't name), `p_layer` (0-based since the EV2 review:
+    `0 … L−1` for the layer stack, `L` for the output layer's `Lambda`, `dF` and `G_E_head`;
+    `layer_count(c)`, `layer_index(spec, L)`); per tensor `w_check`, `w_name`; then `rho_5`
+    `[P, k]`, `rho_kappa` `[P]`,
     `rho_6` `[W]` row for row (`rho_arrays`), and `band_source`, the bands' hash (empty while
     calibrating). A step rejected at check 5 holds all `M` products, one rejected at 6a or 6b
-    every tensor check 6 measures (the record pass); one rejected before 6a has no archive.
+    every tensor check 6 measures (the record pass); one rejected before checks 5 and 6
+    (checks 4, 7, 2) has an archive with zero rows.
     On macOS, export `MallocLargeCache=0` for runs whose
     memory figures are compared: otherwise freed large blocks stay in the footprint.
   - `metrics_overhead.py`: `.venv/bin/python -m verification.runs.metrics_overhead
@@ -1365,8 +1391,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `h_D`, `eta`, `steps`, `model`, `model_revision`, `threads`, `config_hash` (of
     `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics`, `steps`,
     `attack` and `poison_count`; `h_D` tells the tasks apart, and the level never enters
-    honest training, so the test-scale hash stays `7191ef05…`) and
-    `losses` (per step). `run_provenance(cfg, h_D)` gives the config side;
+    honest training, so the test-scale hash stays `7191ef05…`),
+    `losses` (per step) and `seed`. The seed sits beside the provenance but isn't in
+    `PROVENANCE_FIELDS`: it already enters `config_hash`, and A12's B7 reads it to skip a
+    baseline at another seed. `run_provenance(cfg, h_D)` gives the config side;
     `write_final_weights(path, c, w, *, w0, losses, provenance=None, run=...)` writes it.
   - `assert_same_final_weights(c, plain, verified)` takes a file or directory, a hash mapping
     or the weights (`LoopResult.w_final`) on either side; A12 calls it against this file. Each
@@ -1448,11 +1476,18 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     has closed, writes them with `DiskHandoff(keep=True)` to `directory/step_<t>/` and
     raises `RuntimeError` unless the root recomputed from the files is the step's `h`. The
     verifier reads that step from memory too, and the write falls outside every timed
-    section and the step clock. `--keep-step` defaults to `KEEP_STEP = 4` (H1's first
-    judged step), `0` for none, under `transcripts/` (`TRANSCRIPTS_DIR`) in the run
+    section and the step clock. `--keep-step` defaults by the seed
+    (`default_keep_step(bands, seed)`): `KEEP_STEP = 4` (H1's first judged step) at the band
+    file's calibration seed, none at any other seed, which the run prints; `0` stores none.
+    The step goes under `transcripts/` (`TRANSCRIPTS_DIR`) in the run
     directory, written whether metrics are on or not (about 2.5 GB). With metrics, a
     `kept_transcript` record (`kept_record`) holds the path relative to the run directory,
     the root, and the files' count (`n_leaves + 2`) and bytes.
+  - **B7** (`compare_with_baseline(c, plain_dir, verified, seed, out)`): the run's
+    `final_weights.json` against `$VERIF_OUTPUT_DIR/plain_baseline/`'s, bit for bit,
+    provenance first. `False` (exit 1) only on a mismatch. A missing baseline, or one at
+    another seed (`baseline_seed(plain_dir)`: the file's `seed`, else its `environment`
+    record's; the two runs trained on other batches), is printed as skipped.
   - Re-run at EV2 (2026-10-11, band file `cc7a9bca…`): all 10 steps accepted, steps 1–3
     in-sample, final weights equal to the plain baseline's (root `bb9aec2a…`). Step 4 kept:
     7,663 files, 2.46 GiB, root `daa53d7c…`. 53 s in all, peak footprint 5.5 GiB.
