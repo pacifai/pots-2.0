@@ -287,9 +287,11 @@ def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, An
     A missing file raises ``FileNotFoundError``: a judged run refuses to start without it.
     The file must have been calibrated at ``k``, so a run can't pair the bands with a
     ``VERIF_K`` that P10d's recompute did not approve. Its ``context`` must equal ``context``
-    (:func:`band_context`) key for key, :data:`PROVENANCE_KEYS` aside, so a file fitted on
-    another ``D``, model or setup, or one written before a key existed, is refused. Either
-    mismatch raises :class:`BandFileMismatch`. A run at another seed loads the file.
+    (:func:`band_context`) key for key, so a file fitted on another ``D``, model or setup, or
+    one written before a compared key existed, is refused. Either mismatch raises
+    :class:`BandFileMismatch`. The two :data:`PROVENANCE_KEYS`, the calibration seed and the
+    thread count, are never compared: a run at another seed or thread count loads the file,
+    and so does a file that lacks either key.
     """
     path = Path(path)
     rerun = "rerun verification.runs.calibrate (P10a)"

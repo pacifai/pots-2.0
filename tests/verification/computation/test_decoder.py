@@ -1131,7 +1131,9 @@ def test_switches_capture_is_bit_identical(switch):
 
     family, tied = switch
     c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
-    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)  # the init, independent of which tests ran first
+        w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
     randomize_biases(w0)
     records = make_records((12, 7))
     out = prove_step(c, c.build_model(), w0, records)
@@ -1140,9 +1142,9 @@ def test_switches_capture_is_bit_identical(switch):
     for n, t in out.w_next.items():
         i = c.w_next_index(n)
         assert leaf_hash(c, i, t) == leaf_hash(c, i, w_next[n]), n
-    # b_q and b_v train. b_k adds one constant to each query's scores, which softmax ignores,
-    # so its gradient is rounding noise and its update can round away.
-    for b in (c.bias(l, x) for l in range(1, c.L + 1) for x in "qv" if c.qkv_bias):
+    # Every bias trains under this init. An update η·g of about 1e-7 sits near a bias's
+    # rounding step, so at other inits a bias with a small gradient can round to no change.
+    for b in (c.bias(l, x) for l in range(1, c.L + 1) for x in "qkv" if c.qkv_bias):
         assert not torch.equal(w_next[b], w0[b]), b
 
 

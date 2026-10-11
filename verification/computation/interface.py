@@ -279,6 +279,10 @@ class DeclaredComputation(ABC):
                 raise ValueError(f"product {p.name} names unknown weight {p.weight}")
             if p.bias is not None:
                 # Check 5 measures a biased product alone, and the bias's gradient is glue (6b).
+                # Only a forward linear adds a bias (F14).
+                if p.kind is not ProductKind.FORWARD or p.weight is None:
+                    raise ValueError(f"product {p.name} ({p.kind.value}, weight {p.weight}): "
+                                     f"only a forward product with a weight carries a bias")
                 if p.bias not in self._weight_pos or p.bias in self.linear_weights:
                     raise ValueError(f"product {p.name}: bias {p.bias} is not a declared weight "
                                      f"whose gradient is glue")

@@ -457,7 +457,7 @@ interface.
     `a_shape[1] + 1` when biased. Every `e_m(q)` consumer (check 5, `ProductStat.q`,
     `realized_floor`, the sweep, `calibrate`'s `q_max`) reads it from there. `validate()`
     requires the bias to be a declared weight outside `linear_weights` (its gradient is
-    glue, 6b), of shape `(width,)`, on a product that isn't a member.
+    glue, 6b), of shape `(width,)`, on a forward product with a weight that isn't a member.
   - `DeclaredComputation` (ABC):
     - Declared: `n_s`, `eta` (η is part of `C`), `weight_names`, `weight_shapes`, `products`,
       and `linear_weights` (a weight name mapped to the `m` of its `G`; these go to 6a).
@@ -648,9 +648,10 @@ interface.
     (`test_switches_verify_an_honest_step`): in `W_t` at check 0 (check 7 after step 1), in
     training alone (the committed `W_t` honest) at check 5 on that layer's `Y_x`, and in
     `W_{t+1}` at 6b. `test_switches_capture_is_bit_identical` checks that a captured step on
-    drawn biases gives the uncaptured step's loss and `W_{t+1}` bit for bit. `b_k`'s update
-    can round to nothing: a key bias adds one constant to each query's scores, which softmax
-    ignores, so its gradient is rounding noise.
+    drawn biases gives the uncaptured step's loss and `W_{t+1}` bit for bit. A bias update
+    `η·g` of about 1e-7 sits near the bias's rounding step, so any bias with a small gradient
+    (`b_q` included) can come out of a step unchanged. The test seeds the init (seed 0), under
+    which every `b_q`, `b_k` and `b_v` changes, and asserts that each does.
 
 ### `verification/prover/`
 
@@ -910,11 +911,12 @@ interface.
   residuals). It judges nothing. With `bias` (F14, FS2) it measures `[A | 1]·[B ; bᵀ]`
   without building it: `d_j = A(B·r_j) + (bᵀ·r_j)·1 − P·r_j`, `ν = ‖|A|(|B|·1) + ‖b‖₁·1‖`
   and `e_m(q + 1)`. Without it every operation and its order is the unbiased one, so
-  unbiased products keep their bits. Its norms use `_safe_norm` (power-of-two scaling, bit-identical to
-  `vector_norm` when that doesn't overflow or underflow). `measure_products(a, b, p, *, h, ms,
-  k, eps_in, eps_acc)` does the same for a stacked batch of one shape, each member with its own
-  challenges and `_safe_norm` scale. At SmolLM2's member shapes its normalized residuals equal
-  `measure_product`'s bit for bit; below about 8×8, CPU `bmm` rounds differently from `mm`.
+  unbiased products keep their bits. Its norms use `_safe_norm` (power-of-two scaling,
+  bit-identical to `vector_norm` when that doesn't overflow or underflow).
+  `measure_products(a, b, p, *, h, ms, k, eps_in, eps_acc)` does the same for a stacked batch
+  of one shape, each member with its own challenges and `_safe_norm` scale. At SmolLM2's
+  member shapes its normalized residuals equal `measure_product`'s bit for bit; below about
+  8×8, CPU `bmm` rounds differently from `mm`.
   - **Fast path, same bits (O2).** Both functions take an optional `scratch=MeasureScratch()`,
     one reused buffer for `|A|`, `|B|`, `|P|` and `P/s` (check 5 holds one per step). Each
     `|x|` is written with a fresh `abs`'s strides, so the matmuls see the same operands. `|P|`

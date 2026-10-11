@@ -58,6 +58,9 @@ def test_validate_accepts_a_bias_whose_gradient_is_glue():
     (dict(bias_shape=(4,)), "doesn't fit a product of width 5"),
     (dict(on="Y_2"), "doesn't fit a product of width 3"),
     (dict(member=(0, 0)), "doesn't fit a member"),
+    (dict(on="dX_2"), r"dX_2 \(input_grad, .*only a forward product with a weight"),
+    (dict(on="G_2"), r"G_2 \(weight_grad, .*only a forward product with a weight"),
+    (dict(weight=None), r"Y_1 \(forward, weight None\): only a forward product with a weight"),
 ])
 def test_validate_rejects_a_misdeclared_bias(kw, match):
     with pytest.raises(ValueError, match=match):
