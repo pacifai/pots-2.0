@@ -8,13 +8,16 @@
    builds its replay from it. The labeling code may name the capture's types under
    `TYPE_CHECKING`; nothing else in `computation/` may.
 5. Of this repo's packages, `evaluation/` imports `setup` only: never `verification` or `tests`.
-6. `evaluation/results/` imports neither torch nor `evaluation.asr`, so a result script can't
-   train, verify or score (EVALUATION_SPEC §1). A fresh interpreter that imports every result
-   script and the modules they use loads no torch, `verification` or `evaluation.asr` module.
+6. `evaluation/results/` imports neither torch, `setup` nor `evaluation.asr`, so a result
+   script can't train, verify or score (EVALUATION_SPEC §1); `setup`'s modules import torch.
+   A fresh interpreter that imports every result script and the modules they use loads no
+   torch, `verification` or `evaluation.asr` module.
 7. `verification/` imports nothing from `evaluation`, except that `verification/runs/` may
    import `evaluation.asr` (as `from evaluation.asr import ...`).
 
-Imports under `TYPE_CHECKING` count too, except where rule 4 allows them.
+Imports under `TYPE_CHECKING` count too, except where rule 4 allows them. So do imports inside
+functions, and `importlib.import_module("name")` and `__import__("name")` calls whose module
+name is a string constant.
 """
 
 import ast
@@ -43,11 +46,28 @@ def _type_checking_nodes(tree: ast.AST) -> set[int]:
     return out
 
 
+def _dynamic_import(node: ast.AST) -> str | None:
+    """The constant module name of an `import_module("…")` or `__import__("…")` call."""
+    if not isinstance(node, ast.Call) or not node.args:
+        return None
+    f, arg = node.func, node.args[0]
+    name = f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+    if name in ("import_module", "__import__") and isinstance(arg, ast.Constant) \
+            and isinstance(arg.value, str):
+        return arg.value
+    return None
+
+
 def _imports(path: Path, *, runtime_only: bool = False, root: Path = ROOT) -> set[str]:
     """Absolute names of every module `path` imports, relative imports resolved."""
     package = _module_name(path, root).split(".")
     if path.name != "__init__.py":
         package = package[:-1]
+
+    def resolve(level: int, module: str) -> str:
+        base = package[: len(package) - level + 1] if level else []
+        return ".".join([*base, *module.split(".")]).strip(".")
+
     out = set()
     tree = ast.parse(path.read_text())
     skip = _type_checking_nodes(tree) if runtime_only else set()
@@ -57,10 +77,12 @@ def _imports(path: Path, *, runtime_only: bool = False, root: Path = ROOT) -> se
         if isinstance(node, ast.Import):
             out.update(a.name for a in node.names)
         elif isinstance(node, ast.ImportFrom):
-            base = package[: len(package) - node.level + 1] if node.level else []
-            mod = ".".join([*base, *(node.module or "").split(".")]).strip(".")
+            mod = resolve(node.level, node.module or "")
             out.add(mod)
             out.update(f"{mod}.{a.name}" for a in node.names)
+        elif (name := _dynamic_import(node)) is not None:
+            rest = name.lstrip(".")
+            out.add(resolve(len(name) - len(rest), rest))
     return out
 
 
@@ -87,7 +109,7 @@ RULES = [
          ("verification.verifier.matmul_check",)),
     Rule("verification/verifier", ("verification.prover",)),
     Rule("evaluation", ("verification", "tests")),
-    Rule("evaluation/results", ("torch", "evaluation.asr", "verification")),
+    Rule("evaluation/results", ("torch", "setup", "evaluation.asr", "verification")),
     Rule("verification", ("evaluation",), skip=("verification/runs",)),
     Rule("verification/runs", ("evaluation",), ("evaluation.asr",)),
 ]
@@ -122,11 +144,24 @@ def test_a_result_script_importing_verification_fails(tmp_path):
         assert _violations(rule, tmp_path) == [
             "evaluation/results/bad.py imports verification.runs.metrics",
             "evaluation/results/bad.py imports verification.runs.metrics.read_records"], src
-    bad.write_text("import torch\nfrom ..asr import score\n")
     (rule,) = [r for r in RULES if r.src == "evaluation/results"]
+    bad.write_text("import torch\nfrom ..asr import score\n")
     assert _violations(rule, tmp_path) == ["evaluation/results/bad.py imports evaluation.asr",
                                            "evaluation/results/bad.py imports evaluation.asr.score",
                                            "evaluation/results/bad.py imports torch"]
+    # an import inside a function, and imports by a constant name, count too
+    bad.write_text("import importlib\n\n\n"
+                   "def main():\n"
+                   "    from setup.config import load_config\n"
+                   "    importlib.import_module('torch')\n"
+                   "    __import__('verification.runs')\n"
+                   "    importlib.import_module('..asr', __package__)\n")
+    assert _violations(rule, tmp_path) == [
+        "evaluation/results/bad.py imports evaluation.asr",
+        "evaluation/results/bad.py imports setup.config",
+        "evaluation/results/bad.py imports setup.config.load_config",
+        "evaluation/results/bad.py imports torch",
+        "evaluation/results/bad.py imports verification.runs"]
 
 
 def test_result_scripts_load_no_torch_verification_or_asr():

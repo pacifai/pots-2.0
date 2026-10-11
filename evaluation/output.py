@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from matplotlib.figure import Figure
 
 from evaluation.records import output_dir
@@ -62,17 +63,39 @@ def write_figure(fig: Figure, name: str, scale: str, *,
     return pdf, png
 
 
+def _plain(x: Any) -> Any:
+    """A NumPy number as the Python number it holds (``np.float32`` → ``float``, ``np.int64`` →
+    ``int``). ``np.float64`` is a ``float`` already, but its ``repr`` reads ``np.float64(…)``."""
+    if isinstance(x, (np.floating, float)):
+        return float(x)
+    if isinstance(x, (np.integer, np.bool_)):
+        return x.item()
+    return x
+
+
+def _numpy_to_json(o: Any) -> Any:
+    if isinstance(o, (np.generic, np.ndarray)):
+        return o.tolist()
+    raise TypeError(f"{type(o).__name__} is not JSON serializable")
+
+
+def _json(x: Any) -> str:
+    return json.dumps(x, default=_numpy_to_json)
+
+
 def _csv_cell(x: Any) -> str:
+    x = _plain(x)
     if x is None:
         return ""
     if isinstance(x, float):
         return repr(x)  # the shortest string that reads back as the same float
     if isinstance(x, (dict, list, tuple)):
-        return json.dumps(x)
+        return _json(x)
     return str(x)
 
 
 def _md_cell(x: Any, fmt: Format | None) -> str:
+    x = _plain(x)
     if x is None:
         s = ""
     elif fmt is not None:
@@ -80,7 +103,7 @@ def _md_cell(x: Any, fmt: Format | None) -> str:
     elif isinstance(x, float):
         s = format(x, ".4g")
     elif isinstance(x, (dict, list, tuple)):
-        s = json.dumps(x)
+        s = _json(x)
     else:
         s = str(x)
     return s.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
@@ -95,8 +118,8 @@ def write_table(rows: Iterable[Mapping[str, Any]], name: str, scale: str, *,
 
     ``columns`` picks and orders the columns (default: every field, in first-seen order); a
     missing field is an empty cell. ``formats`` maps a column to a format spec (``".3f"``) or a
-    function, for the Markdown only; floats default to ``".4g"``. ``caption`` goes above the
-    Markdown table.
+    function, for the Markdown only; floats default to ``".4g"``. NumPy numbers are written as
+    the Python numbers they hold. ``caption`` goes above the Markdown table.
     """
     rows = list(rows)
     cols = list(columns) if columns is not None else list(dict.fromkeys(k for r in rows for k in r))

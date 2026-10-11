@@ -69,7 +69,9 @@ At 4×128 tokens: `M = L·(21 + 6·n_s·n_h) + 3 = 7,113`, and there are 7,661 l
 
 ## Environment variables, with test-scale defaults
 
-`setup/config.py` reads them all except `VERIF_K`, which `verification/parameters.py` reads.
+`setup/config.py` reads them all, with two exceptions: `verification/parameters.py` reads
+`VERIF_K`, and `evaluation.records.output_dir` reads `VERIF_OUTPUT_DIR` a second time, with
+the same default, because `setup.config` imports torch.
 
 All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 
@@ -245,12 +247,14 @@ verification/
 evaluation/              reads the runs' records and writes the results; imports setup only
   records.py             run directories as one table per record type, P1 and check 3 derived
   output.py              figure and table writers
-  results/               one script per result; imports neither torch nor asr.py
+  results/               one script per result; imports neither torch, setup nor asr.py
 ```
 
 `tests/` mirrors this tree: `verification/commitment/merkle.py` is tested in
 `tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces seven
-import rules, counting imports under `TYPE_CHECKING` except where rule 4 allows them:
+import rules. It counts imports under `TYPE_CHECKING` except where rule 4 allows them, imports
+inside functions, and `importlib.import_module("…")` and `__import__("…")` calls whose module
+name is a string constant:
 
 1. `setup/` imports nothing from `verification` or `evaluation`.
 2. `commitment/` and `verifier/matmul_check/` import nothing from `prover/`, `runs/` or the rest
@@ -263,11 +267,13 @@ import rules, counting imports under `TYPE_CHECKING` except where rule 4 allows 
    no `verification.prover` module loads.
 5. Of this repo's packages, `evaluation/` imports `setup` only: never `verification` or
    `tests`.
-6. `evaluation/results/` imports neither torch nor `evaluation.asr`, so a result script can't
-   train, verify or score. A fresh interpreter that imports `records.py`, `output.py` and
-   every result script must load no torch, `verification` or `evaluation.asr` module. A third
-   test plants a result script that imports `verification` in a copy of `evaluation/` and
-   checks that rules 5 and 6 name it.
+6. `evaluation/results/` imports neither torch, `setup` nor `evaluation.asr`, so a result
+   script can't train, verify or score; `setup`'s modules import torch. A fresh interpreter
+   that imports `records.py`, `output.py` and every result script must load no torch,
+   `verification` or `evaluation.asr` module. A third test plants bad result scripts in a copy
+   of `evaluation/` and checks that rules 5 and 6 name each import: of `verification`, of
+   torch and `asr`, and of `setup.config` inside a function and torch by
+   `importlib.import_module`.
 7. `verification/` imports nothing from `evaluation`, except that `runs/` may import
    `evaluation.asr`, written `from evaluation.asr import ...` (`from evaluation import asr`
    counts as importing `evaluation` and fails).
@@ -1150,14 +1156,24 @@ default as `setup/config.py`), since `setup.config` imports torch.
   - `Records.residuals`: one `Archive` per `residuals/<scenario>/step_<t>.npz`, with `run`,
     `scenario` and `step` read from the archive (the directory holds the scenario's safe
     name); `Archive.load()` reads the arrays. `Records.archives`: other `.npz` files at the top
-    of a run directory (`sweep_trials.npz`).
+    of a run directory (`sweep_trials.npz`). Each run directory keeps its own archives, even
+    when one is nested in another. An archive cut short by a run still writing (`np.savez`
+    writes in place, so an empty file or a zip with no directory yet) is skipped with a
+    warning; any other unreadable archive raises.
   - P1: `derive_capture(verified, plain)` is a copy of `runs/metrics.derive_capture`, since
     `evaluation` may not import `verification`; a test checks the two agree, and that
     `Records.capture(verified, scenario=...)` equals `plain_baseline.capture_rows`, warnings
     included. `Records.capture()` with no run directory pairs every verified run directory
     (one with `train.*` phase rows) with the plain baseline (`P0.*` rows) whose environment
-    record matches on `PAIR_KEYS` (model, corpus, device): none skips the run, two or more
-    raise unless `plain=` names one. Rows add `run_dir` and `plain_run_dir`.
+    record matches on `PAIR_KEYS` (model, corpus, device, hardware, threads). A run with no
+    match gets no rows and one warning; two or more matches raise unless `plain=` names one,
+    and a `plain=` that names no plain run directory raises. Its `scenario` default keeps
+    every scenario (`capture_rows` keeps `honest`), so P1 covers the cheat runs,
+    `calibrate/k9` and the sweep too, and result scripts pick rows by `run_dir` and
+    `scenario`. Rows add `run_dir` and `plain_run_dir`. Known gap: no environment record
+    holds the dtypes, and the plain baseline's holds no batch size or sequence length
+    (verified runs record them as `n_s` and `n`), so pairing can't tell baselines apart by
+    them; a result script passes `plain=` when several match.
   - Check 3: `check3_rows(rows)` copies each `5.glue` row as component `3` with
     `derived: True` and `alias_of: "5.glue"`, level still `sub`. `Records.costs(kind)` is the
     `time`, `memory` or `count` table as written, then P1 and check 3. The tables never hold
@@ -1168,6 +1184,8 @@ default as `setup/config.py`), since `setup.config` imports torch.
   gives the same bytes) and `<name>.png` (200 dpi). `write_table(rows, name, scale, *,
   columns=None, formats=None, caption=None)` writes `<name>.csv` (floats by `repr`, `None`
   empty) and `<name>.md` (floats `.4g` unless `formats` says otherwise, `|` escaped, caption
-  above). `new_figure(nrows, ncols)` builds a constrained-layout `Figure` outside pyplot.
+  above). NumPy numbers are written as the Python numbers they hold (`np.float64`'s own
+  `repr` reads `np.float64(…)`, and `np.float32` isn't a `float`). `new_figure(nrows, ncols)`
+  builds a constrained-layout `Figure` outside pyplot.
 - Read against the C5–C6 runs (2026-10-11): every run directory's record counts equal its
   file's, and P1 from `Records.capture` equals `capture_rows` for each verified directory.

@@ -2,7 +2,9 @@
 
 import csv
 import math
+import struct
 
+import numpy as np
 import pytest
 
 from evaluation import output as eo
@@ -30,6 +32,9 @@ def test_figure_written_as_pdf_and_png(tmp_path):
     d = tmp_path / "evaluation" / "results" / "test"
     assert (pdf, png) == (d / "detection.pdf", d / "detection.png")
     assert pdf.read_bytes().startswith(b"%PDF") and png.read_bytes().startswith(b"\x89PNG")
+    # the PNG's header chunk holds its pixel size: 6 × 3 inches at 200 dpi
+    width, height = struct.unpack(">II", png.read_bytes()[16:24])
+    assert (width, height) == (6 * eo.PNG_DPI, 3 * eo.PNG_DPI) == (1200, 600)
     first = pdf.read_bytes()
     eo.write_figure(fig, "detection", "test", root=tmp_path)
     assert pdf.read_bytes() == first  # no creation date: the same figure gives the same file
@@ -54,6 +59,18 @@ def test_table_written_as_csv_and_markdown(tmp_path):
         "|---|---|---|---|---|\n"
         "| m\\|1 | 0.30 | 3 |  |  |\n"
         "| m2 | nan | 12 |  | [1, 2] |\n")
+
+
+def test_numpy_numbers_written_as_python_numbers(tmp_path):
+    rows = [{"f64": np.float64(0.1) + np.float64(0.2), "f32": np.float32(0.1),
+             "i64": np.int64(12), "ok": np.bool_(True), "list": [np.int64(1), np.float32(0.5)],
+             "fmt": np.float32(2.0 / 3)}]
+    csv_path, md_path = eo.write_table(rows, "np", "test", root=tmp_path, formats={"fmt": ".2f"})
+    assert csv_path.read_text().splitlines() == [
+        "f64,f32,i64,ok,list,fmt",
+        f'0.30000000000000004,{float(np.float32(0.1))!r},12,True,"[1, 0.5]",'
+        f"{float(np.float32(2.0 / 3))!r}"]
+    assert md_path.read_text().splitlines()[2] == "| 0.3 | 0.1 | 12 | True | [1, 0.5] | 0.67 |"
 
 
 def test_table_columns_pick_and_order(tmp_path):

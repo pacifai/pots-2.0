@@ -126,6 +126,48 @@ def test_archive_scenario_comes_from_the_archive(tmp_path):
     assert list(t.load()) == ["m", "x"]
 
 
+def test_nested_run_directories_keep_their_archives_apart(tmp_path):
+    """A run directory inside another (a sweep's --subdir), each with its own residuals/."""
+    for d, step in (("sweep", 1), ("sweep/row2", 2)):
+        _write_jsonl(tmp_path / d / "records.jsonl", [{"record": "environment", "run": d}])
+        res = tmp_path / d / "residuals" / "honest"
+        res.mkdir(parents=True)
+        np.savez(res / f"step_{step:05d}.npz", run=np.array(d), scenario=np.array("honest"),
+                 step=np.array(step))
+    np.savez(tmp_path / "sweep" / "row2" / "sweep_trials.npz", m=np.arange(2))
+    recs = er.read(tmp_path)
+    assert recs.run_dirs == ["sweep", "sweep/row2"]
+    assert {d: dict(c) for d, c in recs.counts().items()} == \
+           {"sweep": {"environment": 1}, "sweep/row2": {"environment": 1}}
+    assert [(a.run_dir, a.run, a.step, a.path.relative_to(tmp_path).as_posix())
+            for a in recs.residuals] == [
+        ("sweep", "sweep", 1, "sweep/residuals/honest/step_00001.npz"),
+        ("sweep/row2", "sweep/row2", 2, "sweep/row2/residuals/honest/step_00002.npz")]
+    assert [(a.run_dir, a.path.name) for a in recs.archives] == [("sweep/row2",
+                                                                  "sweep_trials.npz")]
+
+
+def test_cut_short_archive_skipped_unreadable_one_raises(tmp_path):
+    res = tmp_path / "run" / "residuals" / "honest"
+    res.mkdir(parents=True)
+    np.savez(res / "step_00001.npz", run=np.array("run"), scenario=np.array("honest"),
+             step=np.array(1), p_m=np.arange(1000.0))
+    whole = (res / "step_00001.npz").read_bytes()
+    (res / "step_00002.npz").write_bytes(whole[: len(whole) // 2])  # a run still writing
+    (tmp_path / "run" / "sweep_trials.npz").write_bytes(b"")  # created, nothing written yet
+    with pytest.warns(UserWarning, match="not a complete .npz archive") as w:
+        recs = er.read(tmp_path)
+    assert sorted(x.filename for x in w) == [__file__] * 2  # warned at the caller of read
+    assert {str(x.message).split(":")[0] for x in w} == \
+           {str(res / "step_00002.npz"), str(tmp_path / "run" / "sweep_trials.npz")}
+    assert [a.step for a in recs.residuals] == [1] and recs.archives == []
+    (tmp_path / "run" / "sweep_trials.npz").write_bytes(b"not an archive")
+    with pytest.raises(ValueError, match="not a readable .npz archive"), \
+            warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        er.read(tmp_path)
+
+
 def test_incomplete_last_line_skipped_bad_line_raises(tmp_path):
     f = tmp_path / "run" / "records.jsonl"
     _write_jsonl(f, [{"record": "environment", "run": "run"}, {"record": "time", "run": "run"}])
@@ -228,30 +270,39 @@ def test_capture_as_capture_rows(out):
                pb.capture_rows(out / "mlp_smoke", out / "plain_baseline", scenario=None)
 
 
-def test_capture_pairs_on_model_corpus_and_device(tmp_path):
+def test_capture_pairs_on_the_environment(tmp_path):
     def env(model, **kw):
         return {"record": "environment", "run": "r", "model": model, "corpus": "c",
-                "device": "cpu", **kw}
+                "device": "cpu", "hardware": {"machine": "arm64", "cpu": "A", "gpu": None},
+                "threads": 8, **kw}
 
-    _write_jsonl(tmp_path / "v" / "records.jsonl",
-                 [env("m"), *_synthetic("v", "honest", "train", [1, 2])])
-    _write_jsonl(tmp_path / "p1" / "records.jsonl",
-                 [env("m"), *_synthetic("p1", "plain", "P0", [1, 2])])
-    _write_jsonl(tmp_path / "p2" / "records.jsonl",
-                 [env("other"), *_synthetic("p2", "plain", "P0", [1, 2])])
+    def write(d, environment, prefix):
+        scenario = "honest" if prefix == "train" else "plain"
+        _write_jsonl(tmp_path / d / "records.jsonl",
+                     [environment, *_synthetic(d, scenario, prefix, [1, 2])])
+
+    write("v", env("m"), "train")
+    write("p1", env("m"), "P0")
+    write("p2", env("other"), "P0")
+    write("p4", env("m", hardware={"machine": "arm64", "cpu": "B", "gpu": None}), "P0")
+    write("p5", env("m", threads=4), "P0")
     recs = er.read(tmp_path)
-    assert recs.plain_for("v") == "p1"
+    assert recs.plain_for("v") == "p1"  # another model, machine or thread count doesn't match
     assert set(recs.capture().column("plain_run_dir")) == {"p1"}
-    _write_jsonl(tmp_path / "p3" / "records.jsonl",
-                 [env("m", seed=2), *_synthetic("p3", "plain", "P0", [1, 2])])
+    write("p3", env("m", seed=2), "P0")
     recs = er.read(tmp_path)
     with pytest.raises(ValueError, match="2 plain baselines match"):
         recs.capture()
     assert set(recs.capture(plain="p3").column("plain_run_dir")) == {"p3"}
-    _write_jsonl(tmp_path / "v" / "records.jsonl",
-                 [env("third"), *_synthetic("v", "honest", "train", [1, 2])])
+    for wrong in ("v", "nowhere"):  # a verified run, or no run at all, isn't a plain baseline
+        with pytest.raises(ValueError, match="not a plain run directory"):
+            recs.capture(plain=wrong)
+    write("v", env("third"), "train")
+    write("v2", env("fourth"), "train")
     recs = er.read(tmp_path)
-    assert recs.capture() == []  # no plain baseline for this model: no P1 rows
+    with pytest.warns(UserWarning, match="no plain baseline matches") as w:
+        assert recs.capture() == []  # no plain baseline for these models: no P1 rows
+    assert [str(x.message).split(":")[0] for x in w] == ["v", "v2"]  # one warning per run
     with pytest.raises(ValueError, match="no plain baseline"):
         recs.capture("v")
 

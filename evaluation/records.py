@@ -14,7 +14,8 @@ skipped, and so is the root itself. :func:`read` reads every run directory into
   string ``"NaN"``, ``"Infinity"`` or ``"-Infinity"``; these read back as floats. A last line
   cut short by a run still writing is skipped with a warning.
 - ``residuals``: one :class:`Archive` per ``residuals/<scenario>/step_<t>.npz``, with run,
-  scenario and step read from the archive. ``Archive.load()`` reads the arrays.
+  scenario and step read from the archive. ``Archive.load()`` reads the arrays. An archive
+  cut short by a run still writing (not a complete zip file) is skipped with a warning.
 - ``archives``: any other ``.npz`` file at the top of a run directory, such as the sweep's
   ``sweep_trials.npz``.
 
@@ -39,6 +40,7 @@ import math
 import os
 import re
 import warnings
+import zipfile
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -59,8 +61,9 @@ RECORDS_FILE = "records.jsonl"
 RESIDUALS_DIR = "residuals"
 COST_RECORDS = ("time", "memory", "count")
 # A verified run takes P1 from the plain baseline that trained the same model on the same data
-# on the same device.
-PAIR_KEYS = ("model", "corpus", "device")
+# on the same machine with the same thread count, as the environment records say. The gaps are
+# in Records.capture's docstring.
+PAIR_KEYS = ("model", "corpus", "device", "hardware", "threads")
 
 _NON_FINITE = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
 _STEP_FILE = re.compile(r"step_(\d+)\.npz")
@@ -114,11 +117,17 @@ class Archive:
             return {k: z[k] for k in z.files}
 
 
-def _archive(run_dir: str, path: Path) -> Archive:
+def _archive(run_dir: str, path: Path) -> Archive | None:
+    """The archive at ``path``, or ``None`` with a warning if it is cut short."""
     try:
-        with np.load(path, allow_pickle=False) as z:
+        # opened here, not by np.load, which leaves the file open when the zip is cut short
+        with open(path, "rb") as f, np.load(f, allow_pickle=False) as z:
             one = {k: z[k].item() for k in ("run", "scenario", "step")
                    if k in z.files and z[k].ndim == 0}
+    except (zipfile.BadZipFile, EOFError) as e:  # np.savez writes the zip's directory last
+        warnings.warn(f"{path}: not a complete .npz archive ({e}), skipped (is the run still "
+                      "writing?)", UserWarning, stacklevel=3)
+        return None
     except (OSError, ValueError) as e:
         raise ValueError(f"{path}: not a readable .npz archive ({e})") from None
     step = one.get("step")
@@ -238,18 +247,38 @@ class Records:
                 scenario: str | None = None) -> Table:
         """P1 rows (:func:`derive_capture`) for the run directory ``verified``, or for every
         verified run directory, against the plain baseline ``plain`` (default
-        :meth:`plain_for`; a run with no match gets no rows). ``scenario`` keeps one scenario.
-        Each row adds ``run_dir`` and ``plain_run_dir``.
+        :meth:`plain_for`). Each row adds ``run_dir`` and ``plain_run_dir``.
 
-        With ``verified`` given, this is ``capture_rows(verified, plain, scenario=scenario)``:
-        a plain step with no verified counterpart in a kind gets no row and a ``UserWarning``.
+        ``scenario`` keeps one scenario. Its default, ``None``, keeps every scenario, unlike
+        ``capture_rows``, whose default is ``"honest"``. With ``verified`` given, this is
+        ``capture_rows(verified, plain, scenario=scenario)``: a plain step with no verified
+        counterpart in a kind gets no row and a ``UserWarning``. Called for every directory, it
+        covers every run with ``train.*`` rows: the cheat runs, ``calibrate/k9`` and the sweep
+        as well as the honest run. :meth:`costs` adds all of them, so a result script picks its
+        rows by ``run_dir`` and ``scenario``.
+
+        ``plain`` naming no plain run directory raises ``ValueError``, and so does ``verified``
+        with no matching baseline. Called for every directory, a run with no matching baseline
+        gets no rows and one ``UserWarning``.
+
+        Known gap in the pairing: the environment record holds no batch size, sequence length
+        or dtypes for the plain baseline. Verified runs record the batch and the length as
+        ``n_s`` and ``n``; the plain baseline records neither, and no run records the dtypes.
+        ``config_hash`` covers all of them, but it differs between a plain and a verified run of
+        the same setting, since their configs hold different fields. Two plain baselines that
+        differ only in these match the same run, and :meth:`plain_for` then asks for ``plain=``.
         """
+        if plain is not None and plain not in self.plain_dirs():
+            raise ValueError(f"plain={plain!r} is not a plain run directory (no P0.* rows); "
+                             f"the plain run directories are {self.plain_dirs()}")
         out = Table()
         for d in [verified] if verified is not None else self.verified_dirs():
             p_dir = plain if plain is not None else self.plain_for(d)
             if p_dir is None:
                 if verified is not None:
                     raise ValueError(f"{d}: no plain baseline matches on {PAIR_KEYS}")
+                warnings.warn(f"{d}: no plain baseline matches on {PAIR_KEYS}; no P1 rows for it",
+                              UserWarning, stacklevel=2)
                 continue
             v = [r for r in self._cost_rows(d) if scenario is None or r.get("scenario") == scenario]
             p = self._cost_rows(p_dir)
@@ -260,7 +289,9 @@ class Records:
 
     def costs(self, record: str, *, plain: str | None = None) -> Table:
         """The ``record`` cost rows (``time``, ``memory`` or ``count``) as written, then P1
-        for every verified run directory (:meth:`capture`) and check 3 (:func:`check3_rows`)."""
+        for every verified run directory (:meth:`capture`) and check 3 (:func:`check3_rows`).
+        The P1 rows cover every scenario of every verified run, cheat runs included, so a
+        result script filters by ``run_dir`` and ``scenario``."""
         if record not in COST_RECORDS:
             raise ValueError(f"record must be one of {COST_RECORDS}, got {record!r}")
         raw = self.table(record)
@@ -280,8 +311,9 @@ def read(root: str | os.PathLike[str] | None = None) -> Records:
             for r in read_jsonl(d / RECORDS_FILE):
                 r["run_dir"] = rel
                 tables.setdefault(r["record"], Table()).append(r)
-        residuals += [_archive(rel, f) for f in sorted((d / RESIDUALS_DIR).rglob("*.npz"))]
-        archives += [_archive(rel, f) for f in sorted(d.glob("*.npz"))]
+        for found, files in ((residuals, (d / RESIDUALS_DIR).rglob("*.npz")),
+                             (archives, d.glob("*.npz"))):
+            found += [a for f in sorted(files) if (a := _archive(rel, f)) is not None]
     return Records(root, dirs, tables, residuals, archives)
 
 

@@ -54,9 +54,10 @@ Two facts drive the design:
 The code has three packages. `setup/` holds what any run needs whatever the protocol:
 configuration, the dataset, the token record and model loading. `verification/` holds the
 protocol, one directory per role. `evaluation/` reads what the runs recorded and turns it into
-the paper's figures and tables; it never trains or verifies. A directory names what its part does, not how. Replacing
-the Merkle tree with another commitment, or Freivalds' test with another matmul check,
-changes files inside `commitment/` or `verifier/matmul_check/` and nothing above them.
+the paper's figures and tables; it never trains or verifies. A directory names what its part
+does, not how. Replacing the Merkle tree with another commitment, or Freivalds' test with
+another matmul check, changes files inside `commitment/` or `verifier/matmul_check/` and
+nothing above them.
 
 | Directory | Modules | Role |
 |---|---|---|
@@ -76,8 +77,8 @@ prover, the rest of the verifier or the runs. The verifier never imports the pro
 neither does `computation/`, since the verifier builds its replay from it. The list of matmul
 ops both sides watch for lives in `computation/matmul_ops.py` for that reason. The labeling
 code may name the capture's types for type checking only. `evaluation/` imports `setup` and
-never `verification`, and its result scripts import neither torch nor the attack-success
-scorer, so a result can only come from the records. Only `runs/` may import from
+never `verification`, and its result scripts import neither torch, `setup` nor the
+attack-success scorer, so a result can only come from the records. Only `runs/` may import from
 `evaluation`, and then only the scorer.
 
 ### Setup: `setup/`
