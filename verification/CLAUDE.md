@@ -565,7 +565,10 @@ interface.
     - **The replay** follows each copy through `ProductSubstitution(copied=...)`: a copy of a
       weight's storage maps to that weight for the pass; the map is cleared at each pass and
       pruned as each unit's backward runs. The head's `G_E_head` is widened to fp32 before it
-      joins `G_E^emb` in `glue_gradients()`.
+      joins `G_E^emb` in `glue_gradients()`, whose rerun of the embedding's backward runs
+      inside `autocast()` too, so it matches the prover's setting by construction. CPU
+      autocast leaves the lookup alone, so the wrap changes no bits: `G_E` still equals
+      training's bit for bit at both dtypes (the switch tests and A9).
     - F6b's update: the fp32 masters, SGD in fp32 on `W.grad`, which AccumulateGrad widens
       exactly from the bf16 `G_x`. Check 6a widens the committed bf16 `G` to fp32 the same
       way (`checks.check_6a_linear_update`); 6b's gradients are fp32 already. Qwen2's bias
@@ -575,17 +578,38 @@ interface.
       dtype, `Σ μ` rounds above 256.
     - **Biased products at bf16 (FS2 with FS3).** On the tiny Qwen2 models with drawn
       biases (none representable in bf16), an honest bf16 step is accepted under provisional
-      bands. Check 5's largest normalized residual on `Y_q`, `Y_k` and `Y_v` is 0.34–0.60
-      (0.37–0.91 at fp32), and 6b's `ρ_max` on every bias is 0: `W_{t+1}` equals
-      `W_t − η·g` exactly, `g` the replayed gradient, which the replay test also finds equal
-      to training's bit for bit. Check 5 resolves a bias shift only down to about the
-      committed product's own rounding. Take one bias entry, `b = −2.12`, moved by `n` bf16
-      ULPs (`2⁻⁶` each) in training, with the committed `W_t` honest. At bf16, `L1.Y_q`'s
-      normalized residual is 0.77–0.92 at one ULP and 3.9–5.6 at 8, and check 5 rejects
-      (provisional `τ = 8`) from 16 ULPs (10–13). Below that, the `W_{t+1}` trained from the
-      shifted bias fails 6b (`ρ ≈ 1.2e5` per ULP). A step that also commits the honest update
-      `W_t − η·g` is accepted up to 8 ULPs. At fp32 check 5 rejects one bf16 ULP at about
-      6,000–10,000 (measured 2026-10-11).
+      bands, and 6b's `ρ_max` on every bias is 0: `W_{t+1}` equals `W_t − η·g` exactly, `g`
+      the replayed gradient, which the replay test also finds equal to training's bit for
+      bit. Every figure in this bullet is one setup's measurement (2026-10-11): tied and
+      untied, `n_s = 2`, `n = 12`, `η = 1e-3`, `SEED = 1`, biases from `randomize_biases`,
+      `k` as stated. At `k = 7` check 5's largest normalized residual on `Y_q`, `Y_k` and
+      `Y_v` is 0.34–0.60 at bf16 and 0.37–0.91 at fp32.
+      - **What check 5 resolves.** A bias entry shifted by `δ` in training alone, under an
+        honest `W_t` leaf, adds `δ` to one column of the committed `Y_x`, in every row.
+        Check 5's normalized residual is then about
+        `|δ|·max_j |r_j| / (σ_r·e_m·rms(P)·√width)`, `r_j` challenge `j`'s entry at that
+        column. So the band admits `|δ|` up to about `τ·√width` product rounding steps
+        (`e_m·rms(P)`), scaled by `σ_r / max_j |r_j|` (`1/√3` when some entry is near ±1).
+        This is check 5's Frobenius-norm tolerance applied to one column, the budget that
+        the full-scale guarantee decision (F10) prices; it is not specific to biases. The
+        threshold is a band that depends on the draw, not a number of ULPs: the challenges
+        follow the step's commitments, so each shifted step draws its own, and an entry's
+        ULP scales with the entry.
+      - At fp32 the band is about 13,000 times narrower (`e_m ≈ 4.3e-7` against `5.5e-3`),
+        and check 5 catches one bf16 ULP of shift with a large margin.
+      - At bf16, under check 5's band, 6b catches the `W_{t+1}` trained from the shifted
+        bias (`ρ` about 2¹⁶–2¹⁷ per bf16 ULP of shift). A step that commits the honest update
+        `W_t − η·g` instead passes.
+      - Measured on `L1.b_q`, which feeds `L1.Y_q` (24 × 32, `rms(P) ≈ 1.0`; at bf16
+        `e_m·rms(P) ≈ 0.0056`, so the band's edge is about 0.15–0.25), at `k = 7` and 9. At
+        fp32 one bf16 ULP gives a normalized residual of 9,700–11,100 on entry 7
+        (`b ≈ −2.12`, ULP `2⁻⁶`) and 2,300–2,800 on the last entry (`b ≈ −0.844`, ULP
+        `2⁻⁸`), against `τ = 8`. At bf16 with the honest update committed, shifts passed up
+        to 0.125–0.19 (8 or 12 ULPs on entry 7, 32 on the last) and check 5 rejected from
+        0.19–0.25. A rerun of the same harness during review got other residuals, and there
+        0.25 (16 ULPs on entry 7) passed on the tied model at both `k`. The fast suite
+        asserts only the one-ULP shift (`test_switches_verify_an_honest_step`): check 5
+        rejects it at fp32, 6b at bf16.
     - **SmolLM2 at `(fp32, bf16)` on the dev Mac CPU** (2026-10-11, `VERIF_COMPUTE_DTYPE=
       bfloat16`, `k = 9`, `η = 1e-3`; the slow tests M2, A8 and A9 pass at this setting):
       - `label` fills all 7,113 slots once, and each of the 210 linear `W_x.grad` is the fp32
@@ -746,8 +770,12 @@ interface.
     the `W.grad` link, the bit-for-bit replay and the honest step's acceptance are tested
     under autocast too. `test_switches_verify_an_honest_step` and
     `test_switches_capture_is_bit_identical` run at both dtypes as well, drawn biases
-    included. At bf16 on the tiny models (provisional bands, drawn biases) check 5's largest
-    normalized residual is 0.7–1.1, and check 6's `ρ_max` 1.5–2.0, as at fp32.
+    included. At bf16 on the tiny models (provisional bands, drawn biases, `k = 7`,
+    `SEED = 1`) check 5's largest normalized residual is 0.7–1.1, and check 6's `ρ_max`
+    1.5–2.0, as at fp32. `test_label_rejects_a_grad_not_linked_to_its_G` covers the `W.grad`
+    link at both dtypes on Llama and Qwen2: `W_k.grad` replaced by `W_v.grad` or by a clone
+    raises `LabelingError`. (The tamper `swap_G_k_G_v` finds the grad by data pointer, which
+    at bf16 is AccumulateGrad's copy, so it runs at fp32 only.)
     `test_plain_baseline` adds a bf16 tiny Llama whose plain and verified final weights are
     equal, and `tests/verification/runs/test_calibrate.py` runs `gradient_coherence` at both
     dtypes.
