@@ -32,7 +32,9 @@ rejection at the check that read the leaf (``transcript/store.py``, "the rule fo
 guard covers store reads, leaf hashing and validation only. After check 2's read the verifier
 runs its own code (replay, operands, glue gradients) on validated leaves, so an error there is
 a verifier bug and propagates; only a ``TranscriptFormatError`` (a cached leaf mutated in place)
-is mapped there. A violated verifier-side precondition raises ``RuntimeError``.
+is mapped there. A violated verifier-side precondition raises ``RuntimeError``. The record pass
+after a rejection (:func:`record_rest`) follows the same rule, and the driver catches what it
+raises, so the rejection stands.
 
 Arithmetic is at the working precision, fp32 (P6). Every band comparison is written as
 ``not (x <= bound)``, so a NaN that slips through glue rejects instead of passing, and every
@@ -43,6 +45,7 @@ check 6's ``η·G``, rejects rather than passing ``inf <= inf``.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
@@ -68,6 +71,7 @@ from verification.verifier.context import (
     _hashes,
     _hashes_until_error,
     _is_digest,
+    _Rejected,
 )
 from verification.verifier.matmul_check.freivalds import (
     MeasureScratch,
@@ -87,7 +91,14 @@ __all__ = [
     "check_6b_glue_update",
     "CHECKS",
     "ROOT_SLOT",
+    "RECORDED_SLOTS",
+    "RECORD_COMPLETE",
+    "RECORD_MALFORMED",
+    "RECORD_ERROR",
+    "RECORD_NOT_RUN",
+    "RECORD_STATUSES",
     "protocol_id",
+    "record_rest",
 ]
 
 ROOT_SLOT = "2.root"
@@ -427,16 +438,21 @@ def check_6a_linear_update(store: TranscriptStore, c: DeclaredComputation, ctx: 
     """Check 6 for every linear weight, from its committed weight-gradient leaf (S6c)."""
     view = TranscriptView(c, ctx.state.committed())
     scratch = UpdateScratch()
-    for name, m in c.linear_weights.items():
+    for name in c.linear_weights:
         with _guard(ctx, "6a", _AFTER_COMMIT):
-            w_t, w_next, g = view.w_t(name), view.w_next(name), view.product(m)
-        # F6b: a bf16 G widened exactly to the weights' format, as 6b's gradients; fp32 unchanged.
-        g = g.to(c.weight_dtype)
+            w_t, w_next, g = view.w_t(name), view.w_next(name), _linear_gradient(c, view, name)
         rej = _update_identity(ctx, "6a", name, w_t, w_next, g, c.eta, bands.tau_w_for(name),
                                scratch)
         if rej is not None:
             return rej
     return None
+
+
+def _linear_gradient(c: DeclaredComputation, view: TranscriptView, name: str) -> torch.Tensor:
+    """Check 6a's ``G`` for linear weight ``name``: its committed weight-gradient leaf, widened
+    exactly to the weights' format (F6b: a bf16 leaf becomes fp32; an fp32 leaf is unchanged),
+    as 6b's gradients are. Check 6a and its record pass both take ``G`` here."""
+    return view.product(c.linear_weights[name]).to(c.weight_dtype)
 
 
 # ---- check 5: matmul checks (P3) --------------------------------------------------------
@@ -507,9 +523,12 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
             measures = _measure_run(specs, served, h=root, k=ctx.k, eps_in=ctx.eps_in,
                                     eps_acc=ctx.eps_acc, scratch=scratch,
                                     guard=ctx.kappa_guard)
-        for spec, mp in zip(specs, measures):
+        for i, (spec, mp) in enumerate(zip(specs, measures)):
             rej = _judge_product(c, spec, mp, ctx, bands)
             if rej is not None:
+                # the run's later members, measured here and never judged, for the record pass
+                ctx.state.run_rest = list(zip(specs[i + 1:], measures[i + 1:]))
+                ctx.state.run_rest_error = pending
                 return rej
         if pending is not None:
             raise pending
@@ -615,21 +634,35 @@ def check_6b_glue_update(store: TranscriptStore, c: DeclaredComputation, ctx: St
     if replay is None:
         raise RuntimeError("check 6b needs check 5's replay")
     view = TranscriptView(c, ctx.state.committed())
-    with _guard(ctx, "6b", _AFTER_COMMIT), ctx.timed("6b.glue"):
-        grads = replay.glue_gradients()
-    missing = [n for n in names if n not in grads]
-    if missing:
-        raise RuntimeError(f"replay returned no glue gradient for {missing}")
+    grads = _replay_glue_gradients(c, ctx, replay)
     scratch = UpdateScratch()
     for name in names:
         with _guard(ctx, "6b", _AFTER_COMMIT):
             w_t, w_next = view.w_t(name), view.w_next(name)
-        g = grads[name].detach().to(torch.float32)
+        g = _glue_gradient(grads, name)
         rej = _update_identity(ctx, "6b", name, w_t, w_next, g, c.eta, bands.tau_w_for(name),
                                scratch)
         if rej is not None:
             return rej
     return None
+
+
+def _replay_glue_gradients(c: DeclaredComputation, ctx: StepContext,
+                           replay: Replay) -> Mapping[str, torch.Tensor]:
+    """The replay's backward glue (section ``6b.glue``) for every glue weight. A weight it
+    leaves out is a verifier bug. Check 6b and its record pass both run it here."""
+    with _guard(ctx, "6b", _AFTER_COMMIT), ctx.timed("6b.glue"):
+        grads = replay.glue_gradients()
+    missing = [n for n in c.glue_gradient_weights if n not in grads]
+    if missing:
+        raise RuntimeError(f"replay returned no glue gradient for {missing}")
+    return grads
+
+
+def _glue_gradient(grads: Mapping[str, torch.Tensor], name: str) -> torch.Tensor:
+    """Check 6b's ``G`` for glue weight ``name``, in fp32 (P6); the record pass takes it here
+    too."""
+    return grads[name].detach().to(torch.float32)
 
 
 CHECKS: Mapping[str, Callable[[TranscriptStore, DeclaredComputation, StepContext, Bands],
@@ -642,3 +675,123 @@ CHECKS: Mapping[str, Callable[[TranscriptStore, DeclaredComputation, StepContext
     "6b": check_6b_glue_update,
     ROOT_SLOT: check_2_root,
 })
+
+
+# ---- after a rejection: the record pass (EV2, EVALUATION_SPEC §4.1) ----------------------
+
+RECORDED_SLOTS: tuple[str, ...] = ("6a", "5", "6b")
+"""The slots whose tests have numbers (``ρ_5``, ``ρ_κ``, ``ρ_6``), so :func:`record_rest` can
+measure the ones a rejection skipped."""
+
+# How far the record pass got (EVALUATION_SPEC §4.1, the step record's ``record_pass``).
+RECORD_COMPLETE = "complete"  # it measured every test that remained
+RECORD_MALFORMED = "ended: malformed"  # a leaf failed to read; the tests before it are in
+RECORD_ERROR = "error"  # a verifier-side error stopped it (the driver catches it)
+RECORD_NOT_RUN = "not run"  # nothing to measure, or the pass is skipped
+RECORD_STATUSES: tuple[str, ...] = (RECORD_COMPLETE, RECORD_MALFORMED, RECORD_ERROR,
+                                    RECORD_NOT_RUN)
+
+
+def record_rest(store: TranscriptStore, c: DeclaredComputation, ctx: StepContext,
+                bands: Bands, slot: str) -> str:
+    """Measure, for the record only, every test the rejecting check skipped; return how far it
+    got.
+
+    A check stops at its first failing test. When slot ``slot`` has rejected the step, the
+    driver calls this after the verdict is fixed, and it measures the rest of that check's
+    tests into ``ctx.stats``:
+
+    - check 5: every product after the failing one, in canonical order. The members of the
+      failing product's run (an attention run, ``_member_runs``) were measured by check 5
+      together and never judged; their numbers are recorded as check 5 measured them
+      (``StepState.run_rest``), since measuring a member alone (``measure_product``) and in
+      its run (``measure_products``) are held to agree only to ``1e-4`` relative, and below
+      about 8×8 to O(1) band units (``test_freivalds``). Later runs are measured from check
+      5's replay;
+    - check 6a: every linear weight after the failing one, then every glue weight of 6b,
+      from a replay of its own (check 6 is one protocol check over every weight tensor, so its
+      ``ρ_6`` covers all of them);
+    - check 6b: every glue weight after the failing one.
+
+    Each gradient comes from the helper its live check uses (:func:`_linear_gradient`,
+    :func:`_replay_glue_gradients`, :func:`_glue_gradient`), so an untouched tensor scores
+    what the live check would give it.
+
+    It runs in record mode (``judge=False``, no metrics seam) and changes no rejection, verdict
+    or timing. A product or tensor that fails is still recorded, and the pass goes on. It
+    returns :data:`RECORD_COMPLETE`, or :data:`RECORD_NOT_RUN` when ``slot`` has no scored
+    tests or none remained after the failing one. A malformed leaf ends the pass, which returns
+    :data:`RECORD_MALFORMED` with the tests before that leaf recorded. Any other error is a
+    verifier bug and propagates, as in the checks; the driver catches it, keeps the rejection
+    and records :data:`RECORD_ERROR`.
+    """
+    if slot not in RECORDED_SLOTS:
+        return RECORD_NOT_RUN
+    rctx = dataclasses.replace(ctx, judge=False, section=None)  # shares state and stats
+    before = len(ctx.stats.products), len(ctx.stats.tensors)
+    try:
+        if slot == "5":
+            _record_rest_5(c, rctx, bands)
+        elif slot == "6a":
+            _record_rest_6(c, rctx, bands, "6a")
+            _record_rest_6(c, rctx, bands, "6b")
+        else:
+            _record_rest_6(c, rctx, bands, "6b")
+    except _Rejected:
+        return RECORD_MALFORMED
+    if (len(ctx.stats.products), len(ctx.stats.tensors)) == before:
+        return RECORD_NOT_RUN
+    return RECORD_COMPLETE
+
+
+def _record_rest_5(c: DeclaredComputation, ctx: StepContext, bands: Bands) -> None:
+    root, replay = ctx.state.claimed_root, ctx.state.replay
+    if root is None or replay is None:
+        raise RuntimeError("check 5's record pass needs check 5's root and replay")
+    rest, error = ctx.state.run_rest, ctx.state.run_rest_error
+    ctx.state.run_rest, ctx.state.run_rest_error = [], None
+    for spec, mp in rest:  # the failing run's later members, as check 5 measured them
+        _judge_product(c, spec, mp, ctx, bands)  # records; judge=False decides nothing
+    if error is not None:  # serving a later member of that run failed, as it did in check 5
+        raise error
+    view = TranscriptView(c, ctx.state.committed())
+    done = {p.m for p in ctx.stats.products}
+    scratch = MeasureScratch()
+    for run in _member_runs(c.products):
+        specs = [spec for spec in run if spec.m not in done]
+        if not specs:
+            continue
+        served = [_served(c, spec, ctx, replay, view) for spec in specs]
+        measures = _measure_run(specs, served, h=root, k=ctx.k, eps_in=ctx.eps_in,
+                                eps_acc=ctx.eps_acc, scratch=scratch, guard=ctx.kappa_guard)
+        for spec, mp in zip(specs, measures):
+            _judge_product(c, spec, mp, ctx, bands)
+
+
+def _record_rest_6(c: DeclaredComputation, ctx: StepContext, bands: Bands,
+                   check_id: str) -> None:
+    leaves = ctx.state.committed()
+    view = TranscriptView(c, leaves)
+    done = {s.weight for s in ctx.stats.tensors if s.check_id == check_id}
+    grads: Mapping[str, torch.Tensor] | None = None
+    if check_id == "6a":
+        todo = [n for n in c.linear_weights if n not in done]
+    else:
+        todo = [n for n in c.glue_gradient_weights if n not in done]
+        if not todo:
+            return
+        replay = ctx.state.replay
+        if replay is None:  # a 6a rejection: check 5 never ran, so run its replay here
+            with _guard(ctx, "6b", _AFTER_COMMIT):
+                replay = c.replay(leaves)
+                for spec in c.products:  # in canonical order, as check 5 serves them
+                    replay.operands(spec.m)
+            ctx.state.replay = replay
+        grads = _replay_glue_gradients(c, ctx, replay)
+    scratch = UpdateScratch()
+    for name in todo:
+        with _guard(ctx, check_id, _AFTER_COMMIT):
+            w_t, w_next = view.w_t(name), view.w_next(name)
+            g = _linear_gradient(c, view, name) if grads is None else _glue_gradient(grads, name)
+        _update_identity(ctx, check_id, name, w_t, w_next, g, c.eta, bands.tau_w_for(name),
+                         scratch)

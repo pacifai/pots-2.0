@@ -32,14 +32,16 @@ from verification.runs.metrics import (
     memory_probe,
     read_records,
     read_residuals,
+    rho_arrays,
     step_record,
+    step_scores,
 )
 from verification.runs.mlp_smoke import run_smoke, scenarios
 from verification.runs.scenarios import honest_final, run_scenario
 from verification.transcript.store import InMemoryStore
 from verification.verifier import bands
 from verification.verifier.checks import DEFAULT_ORDER
-from verification.verifier.context import Rejection
+from verification.verifier.context import ProductStat, Rejection, StepStats, TensorStat
 from verification.verifier.matmul_check import challenges
 
 SEED = 1  # π's seed (F8c), the default VERIF_SEED
@@ -149,13 +151,15 @@ def test_check_times_match_driver_timings(smoke):
 def test_step_and_verdict_records(smoke):
     out, results = smoke
     steps = read_records(out, "step")
+    statuses = set()
     for name, res in results.items():
         mine = [r for r in steps if r["scenario"] == name]
         assert [r["step"] for r in mine] == [s.t for s in res.loop.steps]
         rej = res.loop.rejection
         for r in mine:
             assert (r["run"], r["model"], r["corpus"], r["seed"]) == ("test", "mlp", "synthetic", 0)
-            assert r["poisoning_rate"] is None and r["cheat_step"] is None
+            assert r["bpr_records"] is None and r["bpr_actual"] is None
+            assert r["cheat_step"] is None and r["judged"] is False
             order = [("0" if r["step"] == 1 and x == "7" else x) for x in DEFAULT_ORDER]
             assert list(r["checks"]) == order
             if rej is not None and rej.step == r["step"]:
@@ -164,12 +168,38 @@ def test_step_and_verdict_records(smoke):
                 assert r["checks"][rej.check_id] == "fail"
                 after = order[order.index(rej.check_id) + 1:]
                 assert all(r["checks"][x] == "not_run" for x in after)
+                # how far the record pass got, and the tests the step measured in all
+                st, rp = res.verifier.stats[r["step"]], r["record_pass"]
+                assert rp["status"] == res.verifier.record_pass[r["step"]]
+                assert rp["measured"] == {"rho_5": K * len(st.products),
+                                          "rho_kappa": len(st.products),
+                                          "rho_6": len(st.tensors)}
+                scored = rej.kind == "failed" and rej.check_id in ("6a", "5", "6b")
+                assert rp["status"] in (("complete", "not run") if scored else ("not run",))
+                statuses.add((rej.check_id, rp["status"]))
             else:
                 assert r["verdict"] == "accept" and r["first_failing_check"] is None
                 assert set(r["checks"].values()) == {"pass"}
+                assert r["record_pass"] is None
         (v,) = [r for r in read_records(out, "verdict") if r["scenario"] == name]
         assert v["accepted"] == res.loop.verdict.accepted
         assert v["rejection_check"] == (None if rej is None else rej.check_id)
+    # check 5's flip and 6a's moved entry run the pass to the end; the broken chain (7) has none
+    assert {("5", "complete"), ("6a", "complete"), ("7", "not run")} <= statuses
+
+
+def test_record_pass_field_without_a_verifier_entry():
+    """A rejection the driver kept no record-pass status for (a stand-in verifier, a malformed
+    step) reads ``"not run"``; the counts are the step's measured tests, per family."""
+    v = type("V", (), {"timings": {1: {"4": 0.1}}})()
+    r = step_record("r", "s", 1, v, Rejection(step=1, check_id="4", detail="x", kind="failed"))
+    assert r["record_pass"] == {"status": "not run",
+                                "measured": {"rho_5": 0, "rho_kappa": 0, "rho_6": 0}}
+    st = StepStats(products=[ProductStat(1, "a", "S", 1.0, (1.0, 2.0, 3.0), q=8)],
+                   tensors=[TensorStat("w.a", "6a", 2.0)])
+    assert metrics.record_pass(v, 1, st) == {"status": "not run",
+                                             "measured": {"rho_5": 3, "rho_kappa": 1, "rho_6": 1}}
+    assert metrics.record_pass(v, 1, st, kappa_guard=False)["measured"]["rho_kappa"] == 0
 
 
 def test_step_record_uses_protocol_ids_at_step_1():
@@ -198,7 +228,7 @@ def test_residual_arrays_round_trip(smoke):
     out, results = smoke
     back = read_residuals(out)
     for name, res in results.items():
-        want = {t: s for t, s in res.verifier.stats.items() if s.products or s.tensors}
+        want = dict(res.verifier.stats)  # every step, zero rows if it stopped before 5 and 6
         assert back.get(name, {}) == want
         # The product scales (A11) stay out of equality, so compare them here, bit for bit.
         for t, st in want.items():
@@ -206,13 +236,183 @@ def test_residual_arrays_round_trip(smoke):
                 [(p.q, p.p_norm, p.nu, p.p_abs1) for p in st.products]
             assert all(p.q >= 2 and p.p_norm > 0 for p in st.products)
     res = results["honest"]
+    c = res.verifier.c
+    n_layers = max(s.layer for s in c.products if s.layer is not None)
     with np.load(out / "residuals" / "honest" / "step_00001.npz", allow_pickle=False) as z:
         assert str(z["run"]) == "test" and int(z["step"]) == 1
-        assert z["p_normalized"].shape == (res.verifier.c.M, K)
-        want = [-1 if res.verifier.c.product(int(m)).layer is None
-                else res.verifier.c.product(int(m)).layer for m in z["p_m"]]
-        assert z["p_layer"].tolist() == want
+        assert z["p_normalized"].shape == (c.M, K)
+        # 0-based: 0 … L−1 for the layer stack, L outside it
+        want = [n_layers if c.product(int(m)).layer is None else c.product(int(m)).layer - 1
+                for m in z["p_m"]]
+        assert z["p_layer"].tolist() == want and min(want) == 0
         assert set(z["w_check"].tolist()) <= {"6a", "6b"}
+    # a step that stopped before checks 5 and 6 (the broken chain, at check 7) has zero rows
+    (t,) = [t for t, s in results["broken-chain"].verifier.stats.items()
+            if not (s.products or s.tensors)]
+    with np.load(out / "residuals" / "broken-chain" / f"step_{t:05d}.npz",
+                 allow_pickle=False) as z:
+        assert int(z["step"]) == t and str(z["scenario"]) == "broken-chain"
+        assert z["p_normalized"].shape == (0, K) and z["rho_5"].shape == (0, K)
+        assert all(z[a].shape == (0,) for a in ("p_m", "p_layer", "rho_kappa", "w_rho",
+                                                "rho_6"))
+
+
+def test_layer_index_on_the_decoder():
+    """``p_layer`` on the decoder: layer ``ℓ`` (1-based in ``ProductSpec``) is ``ℓ − 1``, and
+    the output layer's products (``Lambda``, ``dF``, the head's gradient) are ``L``."""
+    from tests.verification.decoder_helpers import tiny_config
+    from verification.computation.instances import DecoderComputation
+
+    d = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    n_layers = metrics.layer_count(d)
+    assert n_layers == tiny_config().num_hidden_layers
+    got = {d.product(m).name: metrics.layer_index(d.product(m), n_layers)
+           for m in range(1, d.M + 1)}
+    assert set(got.values()) == set(range(n_layers + 1))
+    assert {n for n, x in got.items() if x == n_layers} == {"Lambda", "dF", "G_E_head"}
+    assert got["L1.Y_q"] == 0 and got[f"L{n_layers}.Y_q"] == n_layers - 1
+
+
+def test_residual_scores_recompute_from_the_raw_arrays(smoke):
+    """Each npz's ρ arrays are the raw arrays over the bands that judged the run (EVALUATION_SPEC
+    §4.2), with an index table: each product's spec class and layer, each tensor's name. The
+    smoke run's bands are provisional."""
+    out, results = smoke
+    prov = bands.Bands.provisional()
+    for name, res in results.items():
+        steps = read_records(out, "step")
+        for f in sorted((out / "residuals" / name).glob("step_*.npz")):
+            with np.load(f, allow_pickle=False) as z:
+                t = int(z["step"])
+                st = res.verifier.stats[t]
+                assert str(z["band_source"]) == "provisional"
+                want = rho_arrays(st, prov, k=K)
+                for fam in metrics.SCORE_FAMILIES:
+                    assert np.array_equal(z[fam], want[fam]), (name, t, fam)
+                assert np.array_equal(z["rho_5"], z["p_normalized"] / prov.tau)
+                assert np.array_equal(z["rho_6"], z["w_rho"] / prov.tau_w)
+                ceiling = np.array([prov.kappa_for(c) for c in z["p_cls"]]) * z["p_abs1"]
+                assert np.array_equal(z["rho_kappa"], np.where(z["p_nu"] == 0, 0.0,
+                                                               z["p_nu"] / ceiling))
+                assert z["p_spec_class"].tolist() == [
+                    metrics.spec_class(res.verifier.c, res.verifier.c.product(int(m)))
+                    for m in z["p_m"]]
+                (rec,) = [r for r in steps if r["scenario"] == name and r["step"] == t]
+                scores = step_scores(st, prov, k=K)
+                assert {f: rec[f] for f in (*metrics.SCORE_FAMILIES, "n_failing")} == scores
+
+
+def test_scores_are_each_test_over_its_bound():
+    """ρ_5 = normalized/τ, ρ_κ = ν/(κ_max·‖|P|·1‖) (0 at ν = 0, inf over a zero ceiling) and
+    ρ_6 = ρ_max/τ_W, each under its class's or tensor's own bound."""
+    st = StepStats(
+        products=[ProductStat(1, "a", "Y_q", 2.0, (1.0, 9.0), q=8, p_norm=1.0, nu=6.0, p_abs1=2.0),
+                  ProductStat(2, "b", "S", 1.0, (3.0, 0.5), q=8, p_norm=1.0, nu=0.0, p_abs1=0.0),
+                  ProductStat(3, "c", "S", 1.0, (0.0, 4.0), q=8, p_norm=1.0, nu=1.0, p_abs1=0.0)],
+        tensors=[TensorStat("w.a", "6a", 2.0), TensorStat("w.b", "6b", 9.0)])
+    b = bands.Bands(tau=4.0, kappa_max=2.0, kappa_classes={"Y_q": 6.0}, tau_w=4.0,
+                    tau_w_tensors={"w.b": 6.0})
+    rho = rho_arrays(st, b, k=2)
+    assert rho["rho_5"].tolist() == [[0.25, 2.25], [0.75, 0.125], [0.0, 1.0]]
+    assert rho["rho_kappa"].tolist() == [0.5, 0.0, math.inf]
+    assert rho["rho_6"].tolist() == [0.5, 1.5]
+    got = step_scores(st, b, k=2)
+    assert (got["rho_5"], got["rho_kappa"], got["rho_6"]) == (2.25, math.inf, 1.5)
+    assert got["n_failing"] == {"rho_5": 1, "rho_kappa": 1, "rho_6": 1}  # 1.0 passes
+    off = step_scores(st, b, k=2, kappa_guard=False)
+    assert off["rho_kappa"] is None and off["n_failing"]["rho_kappa"] is None
+    assert np.isnan(rho_arrays(st, b, k=2, kappa_guard=False)["rho_kappa"]).all()
+    none = step_scores(st, None, k=2)
+    assert all(none[f] is None for f in metrics.SCORE_FAMILIES)
+    assert all(np.isnan(x).all() for x in rho_arrays(st, None, k=2).values())
+    empty = step_scores(StepStats(), b, k=2)
+    assert all(empty[f] is None for f in metrics.SCORE_FAMILIES)
+    assert rho_arrays(StepStats(), b, k=2)["rho_5"].shape == (0, 2)
+    nan = StepStats(products=[ProductStat(1, "a", "Y_q", 2.0, (math.nan, 0.0), q=8),
+                              ProductStat(2, "b", "Y_q", 2.0, (1.0, 0.5), q=8)],
+                    tensors=[TensorStat("w.a", "6a", math.nan), TensorStat("w.b", "6b", 1.0)])
+    got = step_scores(nan, b, k=2)
+    assert got["n_failing"]["rho_5"] == 1 and got["n_failing"]["rho_6"] == 1  # NaN fails
+    # a NaN counts as +inf in the maximum, so it can't hide the step's largest score
+    assert got["rho_5"] == math.inf and got["rho_6"] == math.inf
+    assert np.isnan(rho_arrays(nan, b, k=2)["rho_5"][0, 0])  # the arrays keep NaN
+    assert metrics.nan_as_inf(np.array([1.0, math.nan, -math.inf])).tolist() == \
+        [1.0, math.inf, -math.inf]
+
+
+def _band_stats(seed, steps=(1, 2, 3)):
+    ctx = {} if seed is None else {"calibration_seed": seed}
+    return {"calibration_steps": list(steps), "context": ctx}
+
+
+def _verifier(b, *, seed=1, calibrate=False):
+    return type("V", (), {"bands": b, "seed": seed, "calibrate": calibrate})()
+
+
+def test_judged_steps():
+    """EVALUATION_SPEC §2.3: H1 (the calibration seed) judges steps after the calibration
+    steps, H2 every step but step 1, a cheat run from its cheat step on; never while
+    calibrating or under provisional bands."""
+    b = bands.Bands(tau=8.0, kappa_max=1.0, source="abc", stats=_band_stats(1))
+    steps = range(1, 6)
+    assert [metrics.judged_step(_verifier(b, seed=1), t) for t in steps] == \
+           [False, False, False, True, True]
+    assert [metrics.judged_step(_verifier(b, seed=2), t) for t in steps] == \
+           [False, True, True, True, True]
+    assert [metrics.judged_step(_verifier(b, seed=1), t, cheat_step=1) for t in steps] == \
+           [True] * 5
+    assert [metrics.judged_step(_verifier(b, seed=3), t, cheat_step=2) for t in steps] == \
+           [False, True, True, True, True]
+    assert not metrics.judged_step(_verifier(b, calibrate=True), 4)
+    assert not metrics.judged_step(_verifier(bands.Bands.provisional()), 4, cheat_step=1)
+    assert not metrics.judged_step(_verifier(None), 4)
+    assert [metrics.in_sample_step(b, t, 1) for t in steps] == [True, True, True, False, False]
+    assert not any(metrics.in_sample_step(b, t, 2) for t in steps)
+    # a file without the seed can't say which steps are in-sample: a worded error
+    old = bands.Bands(tau=8.0, kappa_max=1.0, source="abc", stats=_band_stats(None))
+    with pytest.raises(ValueError, match="records no calibration_seed.*calibrate"):
+        metrics.in_sample_step(old, 1, 4)
+    with pytest.raises(ValueError, match="records no calibration_seed"):
+        metrics.judged_step(_verifier(old, seed=4), 4)
+    assert metrics.judged_step(_verifier(old, seed=4), 4, cheat_step=1)  # a cheat run's t*
+    assert metrics.calibration_seed(b) == 1
+
+
+def test_run_names_and_reserved_names(tmp_path):
+    assert metrics.run_name("honest", "HuggingFaceTB/SmolLM2-135M-Instruct", "refusal", 0, 1) \
+        == "honest-SmolLM2-135M-Instruct-refusal-bpr0-s1"
+    assert metrics.run_name("bad w", "org/a b", "jailbreak", 64, 5) == \
+        "bad_w-a_b-jailbreak-bpr64-s5"
+    for reserved in metrics.RESERVED_NAMES:
+        # in any letter case: on a case-insensitive file system Data is data
+        for name in (reserved, reserved.capitalize(), reserved.upper()):
+            with pytest.raises(ValueError, match="reserved"):
+                MetricsWriter(tmp_path / "ok", name)
+            with pytest.raises(ValueError, match="reserved"):
+                MetricsWriter(tmp_path / name, "ok")
+            assert not (tmp_path / name).exists()
+
+
+def test_spec_classes(c):
+    from tests.verification.decoder_helpers import tiny_config
+    from verification.computation.instances import DecoderComputation
+    from verification.computation.interface import ProductKind
+
+    got = {c.product(m).name: metrics.spec_class(c, c.product(m)) for m in range(1, c.M + 1)}
+    assert {n: x for n, x in got.items() if n.startswith("Y")} == \
+        {n: "forward" for n in got if n.startswith("Y")}
+    assert {got[n] for n in got if n.startswith("dX")} == {"input gradient"}
+    assert {got[n] for n in got if n.startswith("G")} == {"weight gradient"}
+    d = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    by_kind: dict[str, set[str]] = {}
+    for m in range(1, d.M + 1):
+        spec = d.product(m)
+        by_kind.setdefault(metrics.spec_class(d, spec), set()).add(d.product_class(spec))
+    assert by_kind["attention score"] == {"S"} and by_kind["attention value"] == {"O"}
+    assert by_kind["operand gradient"] == {"dA", "dV", "dQ", "dK"}
+    assert {"Y_q", "Lambda"} <= by_kind["forward"] and "dF" in by_kind["input gradient"]
+    assert all(metrics.spec_class(d, d.product(m)) == "operand gradient"
+               for m in range(1, d.M + 1) if d.product(m).kind is ProductKind.OPERAND_GRAD)
 
 
 def _strict(s):
@@ -275,7 +475,9 @@ def test_count_pass_and_storage(c, D, w0, smoke):
     out, _ = smoke
     rows = read_records(out, "count")
     assert {r["scenario"] for r in rows} == {"honest"}
-    assert sorted({r["step"] for r in rows}) == [0, 1, 2]
+    # the counting pass is COUNT_STEPS = 1 step (EVALUATION_SPEC §3.4)
+    assert metrics.COUNT_STEPS == 1
+    assert sorted({r["step"] for r in rows}) == [0, 1]
     row = {(r["step"], r["level"], r["component"]): r for r in rows}
     fwd = 2 * c.n_s * sum(a * b for a, b in zip(c.widths, c.widths[1:]))
     assert row[(1, "phase", "train.forward")]["flops"] == fwd
@@ -292,7 +494,7 @@ def test_count_pass_and_storage(c, D, w0, smoke):
     for key in ("hash_in_bytes", "hash_out_bytes", "hash_calls"):
         assert two[key] + root[key] == commit[key]
     assert row[(1, "phase", "P5.write")]["hash_calls"] == 0
-    assert (2, "component", "7") in row and (1, "component", "7") in row
+    assert (1, "component", "7") in row  # step 1's chaining slot runs check 0's comparison
     assert row[(0, "component", "0")]["hash_calls"] > 0 and row[(0, "component", "1")]["hash_in_bytes"] > 0
     for r in rows:
         if r["level"] == "total" and r["component"] == "step":
@@ -301,7 +503,7 @@ def test_count_pass_and_storage(c, D, w0, smoke):
             assert r["flops"] == sum(x["flops"] for x in parts)
             assert r["hash_calls"] == sum(x["hash_calls"] for x in parts)
     storage = read_records(out, "storage")
-    assert [s["step"] for s in storage] == [1, 2]
+    assert [s["step"] for s in storage] == [1]
     for s in storage:
         assert s["leaves"] == c.n_leaves
         # the leaf bytes are what P3 hashes at the leaves: all of it but the internal nodes
