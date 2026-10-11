@@ -270,17 +270,22 @@ def test_capture_as_capture_rows(out):
                pb.capture_rows(out / "mlp_smoke", out / "plain_baseline", scenario=None)
 
 
-def test_capture_pairs_on_the_environment(tmp_path):
-    def env(model, **kw):
-        return {"record": "environment", "run": "r", "model": model, "corpus": "c",
-                "device": "cpu", "hardware": {"machine": "arm64", "cpu": "A", "gpu": None},
-                "threads": 8, **kw}
+def _env(model, **kw):
+    return {"record": "environment", "run": "r", "model": model, "corpus": "c", "device": "cpu",
+            "hardware": {"machine": "arm64", "cpu": "A", "gpu": None}, "threads": 8, **kw}
 
+
+def _writer(root):
+    """``write(run_dir, environment, prefix)``: a verified (``train``) or plain (``P0``) run."""
     def write(d, environment, prefix):
         scenario = "honest" if prefix == "train" else "plain"
-        _write_jsonl(tmp_path / d / "records.jsonl",
+        _write_jsonl(root / d / "records.jsonl",
                      [environment, *_synthetic(d, scenario, prefix, [1, 2])])
+    return write
 
+
+def test_capture_pairs_on_the_environment(tmp_path):
+    env, write = _env, _writer(tmp_path)
     write("v", env("m"), "train")
     write("p1", env("m"), "P0")
     write("p2", env("other"), "P0")
@@ -305,6 +310,38 @@ def test_capture_pairs_on_the_environment(tmp_path):
     assert [str(x.message).split(":")[0] for x in w] == ["v", "v2"]  # one warning per run
     with pytest.raises(ValueError, match="no plain baseline"):
         recs.capture("v")
+
+
+def test_named_baseline_pairs_only_runs_of_its_model(tmp_path):
+    """plain= overrides the machine and thread count, never the model trained."""
+    write = _writer(tmp_path)
+    write("small", _env("smollm2"), "train")
+    write("large", _env("llama"), "train")
+    write("p_small", _env("smollm2"), "P0")
+    write("p_large", _env("llama"), "P0")
+    elsewhere = {"machine": "x86_64", "cpu": "B", "gpu": None}
+    write("p_small_elsewhere", _env("smollm2", threads=4, hardware=elsewhere), "P0")
+    recs = er.read(tmp_path)
+
+    def pairs(rows):
+        return sorted({(r["run_dir"], r["plain_run_dir"]) for r in rows})
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert pairs(recs.capture()) == [("large", "p_large"), ("small", "p_small")]
+    for plain, kept, skipped in (("p_small", "small", "large"),
+                                 ("p_small_elsewhere", "small", "large"),  # other machine: kept
+                                 ("p_large", "large", "small")):
+        with pytest.warns(UserWarning, match=f"plain='{plain}' matches on") as w:
+            assert pairs(recs.capture(plain=plain)) == [(kept, plain)]
+        assert [str(x.message).split(":")[0] for x in w] == [skipped]  # one warning, the other
+        with pytest.warns(UserWarning):
+            assert pairs(recs.costs("time", plain=plain).where(component="P1")) == \
+                   [(kept, plain)]
+    # a verified run and a baseline both named are paired as asked
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert pairs(recs.capture("large", plain="p_small")) == [("large", "p_small")]
 
 
 def test_check_3_is_reported_as_5_glue(out):

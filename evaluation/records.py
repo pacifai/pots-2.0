@@ -50,8 +50,8 @@ from typing import Any
 import numpy as np
 
 __all__ = ["DEFAULT_OUTPUT_DIR", "RESERVED", "RECORDS_FILE", "RESIDUALS_DIR", "COST_RECORDS",
-           "PAIR_KEYS", "output_dir", "Table", "Archive", "Records", "find_run_dirs",
-           "read_jsonl", "read", "derive_capture", "check3_rows"]
+           "PAIR_KEYS", "NAMED_PAIR_KEYS", "output_dir", "Table", "Archive", "Records",
+           "find_run_dirs", "read_jsonl", "read", "derive_capture", "check3_rows"]
 
 # setup/config.py's default. It is read here, because setup.config imports torch and a
 # result script must not.
@@ -64,6 +64,8 @@ COST_RECORDS = ("time", "memory", "count")
 # on the same machine with the same thread count, as the environment records say. The gaps are
 # in Records.capture's docstring.
 PAIR_KEYS = ("model", "corpus", "device", "hardware", "threads")
+# A baseline named by plain= overrides the machine and thread count, never the training itself.
+NAMED_PAIR_KEYS = ("model", "corpus", "device")
 
 _NON_FINITE = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
 _STEP_FILE = re.compile(r"step_(\d+)\.npz")
@@ -118,7 +120,10 @@ class Archive:
 
 
 def _archive(run_dir: str, path: Path) -> Archive | None:
-    """The archive at ``path``, or ``None`` with a warning if it is cut short."""
+    """The archive at ``path``, or ``None`` with a warning if it is cut short (an empty file, or
+    a zip with no directory yet). Any cut-short archive is skipped this way, not only the
+    newest, as a crashed run's last ``records.jsonl`` line is: a run killed while writing one
+    leaves it cut short for good. Any other unreadable archive raises ``ValueError``."""
     try:
         # opened here, not by np.load, which leaves the file open when the zip is cut short
         with open(path, "rb") as f, np.load(f, allow_pickle=False) as z:
@@ -230,14 +235,15 @@ class Records:
         """Run directories with plain training rows (``P0.*``)."""
         return self._dirs_with_phase("P0.")
 
+    def _env_key(self, run_dir: str, keys: Sequence[str]) -> tuple[Any, ...]:
+        env = self.environment(run_dir) or {}
+        return tuple(env.get(k) for k in keys)
+
     def plain_for(self, run_dir: str) -> str | None:
         """The plain baseline whose environment record matches ``run_dir``'s on
         :data:`PAIR_KEYS`, or ``None``. More than one raises ``ValueError``."""
-        def key(d: str) -> tuple[Any, ...]:
-            env = self.environment(d) or {}
-            return tuple(env.get(k) for k in PAIR_KEYS)
-
-        hits = [d for d in self.plain_dirs() if key(d) == key(run_dir)]
+        hits = [d for d in self.plain_dirs()
+                if self._env_key(d, PAIR_KEYS) == self._env_key(run_dir, PAIR_KEYS)]
         if len(hits) > 1:
             raise ValueError(f"{run_dir}: {len(hits)} plain baselines match on {PAIR_KEYS}, "
                              f"{hits}; pass plain= to pick one")
@@ -259,26 +265,39 @@ class Records:
 
         ``plain`` naming no plain run directory raises ``ValueError``, and so does ``verified``
         with no matching baseline. Called for every directory, a run with no matching baseline
-        gets no rows and one ``UserWarning``.
+        gets no rows and one ``UserWarning``. With ``plain`` given and ``verified`` not, a run
+        is paired with ``plain`` only if their environment records match on
+        :data:`NAMED_PAIR_KEYS` (model, corpus, device): naming a baseline overrides the
+        machine and thread count, never what was trained. Every other run gets no rows and one
+        ``UserWarning``. ``verified`` and ``plain`` both given are paired unchecked.
 
-        Known gap in the pairing: the environment record holds no batch size, sequence length
-        or dtypes for the plain baseline. Verified runs record the batch and the length as
-        ``n_s`` and ``n``; the plain baseline records neither, and no run records the dtypes.
-        ``config_hash`` covers all of them, but it differs between a plain and a verified run of
-        the same setting, since their configs hold different fields. Two plain baselines that
-        differ only in these match the same run, and :meth:`plain_for` then asks for ``plain=``.
+        Known gap in the pairing: no record holds the dtypes, and the plain baseline's
+        environment record holds neither the batch size nor the sequence length. Of the verified
+        runs, ``run_verified`` and ``calibrate`` record the batch as ``n_s`` and the length as
+        ``n``; the cheat runs (``poisoned_step``, ``hidden_steps``, ``flipped_matmul_sweep``)
+        record ``n_s`` only. ``config_hash`` covers all of them, but it differs between a plain
+        and a verified run of the same setting, since their configs hold different fields. Two
+        plain baselines that differ only in these match the same run, and :meth:`plain_for`
+        then asks for ``plain=``.
         """
         if plain is not None and plain not in self.plain_dirs():
             raise ValueError(f"plain={plain!r} is not a plain run directory (no P0.* rows); "
                              f"the plain run directories are {self.plain_dirs()}")
         out = Table()
         for d in [verified] if verified is not None else self.verified_dirs():
-            p_dir = plain if plain is not None else self.plain_for(d)
+            if plain is None:
+                p_dir, keys = self.plain_for(d), PAIR_KEYS
+            elif verified is None and self._env_key(d, NAMED_PAIR_KEYS) != \
+                    self._env_key(plain, NAMED_PAIR_KEYS):
+                p_dir, keys = None, NAMED_PAIR_KEYS
+            else:
+                p_dir, keys = plain, ()
             if p_dir is None:
                 if verified is not None:
-                    raise ValueError(f"{d}: no plain baseline matches on {PAIR_KEYS}")
-                warnings.warn(f"{d}: no plain baseline matches on {PAIR_KEYS}; no P1 rows for it",
-                              UserWarning, stacklevel=2)
+                    raise ValueError(f"{d}: no plain baseline matches on {keys}")
+                named = "" if plain is None else f" plain={plain!r}"
+                warnings.warn(f"{d}: no plain baseline{named} matches on {keys}; no P1 rows "
+                              "for it", UserWarning, stacklevel=2)
                 continue
             v = [r for r in self._cost_rows(d) if scenario is None or r.get("scenario") == scenario]
             p = self._cost_rows(p_dir)

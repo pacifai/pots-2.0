@@ -1159,7 +1159,8 @@ default as `setup/config.py`), since `setup.config` imports torch.
     of a run directory (`sweep_trials.npz`). Each run directory keeps its own archives, even
     when one is nested in another. An archive cut short by a run still writing (`np.savez`
     writes in place, so an empty file or a zip with no directory yet) is skipped with a
-    warning; any other unreadable archive raises.
+    warning, whichever step it is: a run killed mid-write leaves it cut short for good, as it
+    does `records.jsonl`'s last line. Any other unreadable archive raises.
   - P1: `derive_capture(verified, plain)` is a copy of `runs/metrics.derive_capture`, since
     `evaluation` may not import `verification`; a test checks the two agree, and that
     `Records.capture(verified, scenario=...)` equals `plain_baseline.capture_rows`, warnings
@@ -1167,13 +1168,17 @@ default as `setup/config.py`), since `setup.config` imports torch.
     (one with `train.*` phase rows) with the plain baseline (`P0.*` rows) whose environment
     record matches on `PAIR_KEYS` (model, corpus, device, hardware, threads). A run with no
     match gets no rows and one warning; two or more matches raise unless `plain=` names one,
-    and a `plain=` that names no plain run directory raises. Its `scenario` default keeps
-    every scenario (`capture_rows` keeps `honest`), so P1 covers the cheat runs,
-    `calibrate/k9` and the sweep too, and result scripts pick rows by `run_dir` and
-    `scenario`. Rows add `run_dir` and `plain_run_dir`. Known gap: no environment record
-    holds the dtypes, and the plain baseline's holds no batch size or sequence length
-    (verified runs record them as `n_s` and `n`), so pairing can't tell baselines apart by
-    them; a result script passes `plain=` when several match.
+    and a `plain=` that names no plain run directory raises. A baseline named by `plain=`
+    pairs only with runs that match it on `NAMED_PAIR_KEYS` (model, corpus, device); naming
+    it overrides hardware and threads only, and every other run gets no rows and one
+    warning. Its `scenario` default keeps every scenario (`capture_rows` keeps `honest`), so
+    P1 covers the cheat runs, `calibrate/k9` and the sweep too, and result scripts pick rows
+    by `run_dir` and `scenario`. Rows add `run_dir` and `plain_run_dir`. Known gap: no record
+    holds the dtypes, and the plain baseline's environment record holds no batch size or
+    sequence length. Of the verified runs, `run_verified` and `calibrate` record both (`n_s`,
+    `n`), and the cheat runs (`poisoned_step`, `hidden_steps`, `flipped_matmul_sweep`) record
+    `n_s` only. So pairing can't tell baselines apart by them, and a result script passes
+    `plain=` when several match.
   - Check 3: `check3_rows(rows)` copies each `5.glue` row as component `3` with
     `derived: True` and `alias_of: "5.glue"`, level still `sub`. `Records.costs(kind)` is the
     `time`, `memory` or `count` table as written, then P1 and check 3. The tables never hold
