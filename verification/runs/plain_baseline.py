@@ -16,9 +16,10 @@ the prover's SGD step without ``MatmulCapture``, and no labeling, commitment, pa
 
 - the timed run's ``time`` rows per step: ``P0.load``, ``P0.forward``, ``P0.backward``,
   ``P0.update``, the ``P0`` component and the prover and step totals;
-- a memory pass and a counting pass, each a separate run of the first ``S`` steps from ``W_0``
-  (``--pass-steps``, default :data:`~verification.runs.metrics.PASS_STEPS`, the verified runs'
-  pass length), never timed. P0's memory is reported as the step's growth, ``peak(P0.backward)
+- a memory pass, a separate run of the first ``S`` steps from ``W_0`` (``--pass-steps``,
+  default :data:`~verification.runs.metrics.PASS_STEPS`, the verified runs' pass length), and a
+  counting pass of :data:`~verification.runs.metrics.COUNT_STEPS` (one step, EVALUATION_SPEC
+  §3.4), both never timed. P0's memory is reported as the step's growth, ``peak(P0.backward)
   − start(P0.forward)``, as ``derive_capture`` uses it.
 
 There is no ``step`` or ``verdict`` record: nothing is verified.
@@ -64,6 +65,7 @@ from verification.computation.interface import DeclaredComputation, snapshot_wei
 from verification.runs.loop import PlainResult, run_plain
 from verification.runs.scenarios import ReusedModel
 from verification.runs.metrics import (
+    COUNT_STEPS,
     PASS_STEPS,
     MetricsWriter,
     config_hash,
@@ -262,10 +264,11 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
                    build_model: Callable[[], torch.nn.Module],
                    out_dir: str | os.PathLike[str] | None = None,
                    metrics: MetricsWriter | None = None, pass_steps: int = PASS_STEPS,
+                   count_steps: int = COUNT_STEPS,
                    provenance: Mapping[str, Any] | None = None, keep_weights: bool = True,
                    out: Callable[[str], None] = print) -> BaselineResult:
     """``T`` plain steps from ``W_0`` on ``π`` at ``seed``; then, with ``metrics``, the memory
-    and counting passes.
+    pass of ``pass_steps`` steps and the counting pass of ``count_steps``.
 
     The timed run and each pass get their model from ``build_model`` (a fresh build, or a
     ``scenarios.ReusedModel``) and load ``W_0`` into it. ``final_weights.json`` goes to
@@ -273,8 +276,9 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
     (:func:`run_provenance`). With ``keep_weights=False`` the final weights are dropped once
     hashed, before the passes, and ``plain.w_final`` is empty.
     """
-    if not 1 <= pass_steps <= T:
-        raise ValueError(f"pass_steps = {pass_steps} must be in 1..T = {T}")
+    for name, n in (("pass_steps", pass_steps), ("count_steps", count_steps)):
+        if not 1 <= n <= T:
+            raise ValueError(f"{name} = {n} must be in 1..T = {T}")
     rec = None if metrics is None else metrics.recorder(SCENARIO)
     res = run_plain(c, build_model(), dataset, w0, n_steps=T, seed=seed,
                     section=None if rec is None else rec.section,
@@ -302,17 +306,17 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
     if not keep_weights:
         res = dataclasses.replace(res, w_final={})  # not held through the memory pass
     if metrics is not None:
-        def body(r: Any) -> Any:
-            run_plain(c, build_model(), dataset, w0, n_steps=pass_steps, seed=seed,
-                      section=r.section, on_step=r.on_step)
+        def body(n: int) -> Callable[[Any], Any]:
+            return lambda r: run_plain(c, build_model(), dataset, w0, n_steps=n, seed=seed,
+                                       section=r.section, on_step=r.on_step)
 
-        mem = memory_pass(metrics.run, SCENARIO, body, metrics.probe)
+        mem = memory_pass(metrics.run, SCENARIO, body(pass_steps), metrics.probe)
         metrics.write(mem)
         for t, g in _growth(mem).items():
             out(f"   step {t:>3}  P0 memory growth "
                 + ("n/a" if g is None else f"{g / 1e9:.3f} GB")
                 + " (peak of backward − start of forward)")
-        metrics.write(count_pass(metrics.run, SCENARIO, body))
+        metrics.write(count_pass(metrics.run, SCENARIO, body(count_steps)))
         out(f"metrics: {metrics.dir}")
     return BaselineResult(res, hashes, path)
 
@@ -349,7 +353,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=None, help="T (default: VERIF_STEPS)")
     p.add_argument("--pass-steps", type=int, default=PASS_STEPS,
-                   help=f"steps in the memory and counting passes (default {PASS_STEPS})")
+                   help=f"steps in the memory pass (default {PASS_STEPS}); the counting pass "
+                        f"runs {COUNT_STEPS}")
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
                    help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/ "
                         "(default: VERIF_METRICS)")
@@ -381,7 +386,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         plain_baseline(c, dataset, w0, T=T, seed=cfg.seed, build_model=models, out_dir=out_dir,
                        provenance=prov, keep_weights=False)
         return 0
-    run_cfg = {"T": T, "pass_steps": args.pass_steps}
+    run_cfg = {"T": T, "pass_steps": args.pass_steps, "count_steps": COUNT_STEPS}
     with MetricsWriter(out_dir, RUN_NAME, device=cfg.device, model=cfg.model,
                        corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
                        config={**training_config(cfg), **run_cfg}, band_file_hash=None,

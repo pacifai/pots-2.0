@@ -22,7 +22,8 @@ is a once-per-run section, reported at step 0. A section opened inside another i
 - the *counting pass* (:class:`CountRecorder`, :func:`count_pass`, :func:`counting`) counts
   FLOPs, bytes hashed, hash calls and transcript bytes.
 
-The two extra passes are runs of their own, :data:`PASS_STEPS` steps each, never timed.
+The two extra passes are runs of their own, never timed: the memory pass :data:`PASS_STEPS`
+steps, the counting pass :data:`COUNT_STEPS` (one step per configuration, EVALUATION_SPEC §3.4).
 
 **Prover components (EQ1b).** EQ1b's P0 is training with no instrumentation, which only the
 plain baseline (B7) runs. A verified run trains under ``MatmulCapture``, so its training rows
@@ -112,16 +113,28 @@ the counting pass.
   ``storage`` and ``run_end`` (last). Standard JSON: a non-finite float is written as the
   string ``"NaN"``, ``"Infinity"`` or ``"-Infinity"``, and a missing value as ``null``;
 - ``residuals/<scenario>/step_<t>.npz``: one NumPy archive per step with residuals (EQ13
-  record 2), written as the step closes, so a crashed run keeps finished steps; a step that
-  stopped before check 6a has none. Arrays: ``run``, ``scenario`` (0-d strings), ``step``;
-  per product ``p_m``, ``p_name``, ``p_cls``, ``p_layer`` (``-1`` outside the layer stack),
-  ``p_kappa`` and ``p_normalized`` (``[P, k]``, one normalized residual per challenge), and
-  the product's scale ``p_q`` (contracted dimension), ``p_norm`` (``‖P‖_F``), ``p_nu`` (``ν``)
-  and ``p_abs1`` (``‖|P|·1‖``), which C1's realized floor reads; per
-  weight tensor ``w_check`` (``6a``/``6b``), ``w_name`` and ``w_rho`` (``ρ_max``). NaN and
-  infinity are stored as such. Check 5 stops at the first failing product, so a step rejected
-  at 5 has products up to and including the failure only. :func:`read_residuals` rebuilds ``StepStats`` equal to the
-  verifier's, the feed for calibration (A11).
+  record 2, EVALUATION_SPEC §4.2), written as the step closes, so a crashed run keeps finished
+  steps; a step that stopped before check 6a has none. Arrays: ``run``, ``scenario`` (0-d
+  strings), ``step``; per product ``p_m``, ``p_name``, ``p_cls`` (the κ class, the fine
+  class), ``p_spec_class`` (§5.7's class, :func:`spec_class`), ``p_layer`` (1-based, ``-1``
+  outside the layer stack), ``p_kappa`` and ``p_normalized`` (``[P, k]``, one normalized
+  residual per challenge), and the product's scale ``p_q`` (contracted dimension), ``p_norm``
+  (``‖P‖_F``), ``p_nu`` (``ν``) and ``p_abs1`` (``‖|P|·1‖``), which C1's realized floor reads;
+  per weight tensor ``w_check`` (``6a``/``6b``), ``w_name`` and ``w_rho`` (``ρ_max``). The
+  scores beside them (:func:`rho_arrays`): ``rho_5`` ``[P, k]``, ``rho_kappa`` ``[P]`` and
+  ``rho_6`` ``[W]``, row for row with the raw arrays, under the bands named by
+  ``band_source`` (the band file's hash; empty and every score NaN while calibrating). NaN and
+  infinity are stored as such. Rows are in measuring order, which is canonical order. A
+  rejecting check still measures all its tests, after the verdict is fixed (the driver's
+  record pass), so a step rejected at check 5 has all ``M`` products and one rejected at 6a or
+  6b every tensor of check 6; the checks after the rejecting one never run. A step rejected
+  as malformed has what the checks measured before the rejection. :func:`read_residuals`
+  rebuilds ``StepStats`` equal to the verifier's, the feed for calibration (A11).
+
+**Step records** (EVALUATION_SPEC §4.1, :func:`step_record`) carry the run's identity
+(``model``, ``corpus``, ``attack``, ``seed``), the cheat's (``bpr_records``, ``bpr_actual``,
+``cheat_step``), ``judged`` (:func:`judged_step`), the verdict and checks, and the step's
+scores ``rho_5``, ``rho_kappa``, ``rho_6`` and ``n_failing`` (:func:`step_scores`).
 """
 
 from __future__ import annotations
@@ -150,15 +163,19 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
 
+from verification.computation.interface import ProductKind
+from verification.verifier.bands import product_class
 from verification.verifier.checks import DEFAULT_ORDER, protocol_id
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 
 __all__ = [
-    "P0_PHASES", "TRAIN_PHASES", "PASS_STEPS", "COMPONENTS", "RECORD_TYPES",
+    "P0_PHASES", "TRAIN_PHASES", "PASS_STEPS", "COUNT_STEPS", "COMPONENTS", "RECORD_TYPES",
+    "RESERVED_NAMES", "SCORE_FAMILIES",
     "MemoryProbe", "memory_probe",
     "TimeRecorder", "MemoryRecorder", "CountRecorder",
     "memory_pass", "count_pass", "counting",
-    "derive_capture", "step_record", "config_hash",
+    "derive_capture", "step_record", "judged_step", "in_sample_step", "spec_class",
+    "rho_arrays", "step_scores", "run_name", "config_hash",
     "MetricsWriter", "read_records", "read_residuals", "lifetime_maxrss_bytes",
 ]
 
@@ -173,12 +190,19 @@ COMPONENTS = ("P0", "train_captured", "P1", "P2", "P3", "P4", "P5")
 RECORD_TYPES = ("environment", "step", "verdict", "time", "memory", "count", "storage",
                 "run_end")
 RUN_PREFIX = "run:"
-# Steps in every run's memory and counting passes. Step 1 carries check 0's anchor and the
-# first-touch allocation of the run's buffers; step 2 is the first check-7 step and the first
-# in steady-state memory. Counts are deterministic, so a report takes one step's counts and two
-# steps suffice. The plain run's passes match the verified runs' step for step (derive_capture
-# pairs them by step number).
+# Steps in every run's memory pass. Step 1 carries check 0's anchor and the first-touch
+# allocation of the run's buffers; step 2 is the first check-7 step and the first in
+# steady-state memory. The plain run's passes match the verified runs' step for step
+# (derive_capture pairs them by step number).
 PASS_STEPS = 2
+# Steps in every run's counting pass: one per configuration (EVALUATION_SPEC §3.4, EV2). The
+# protocol is deterministic for a fixed configuration, and steps 1 and 2 of the SmolLM2 run
+# count the same FLOPs, hash calls and challenge bytes. They differ in one place: the
+# ``hash_in_bytes`` of P3 and of checks 2 and 4, which hash the batch's token records, whose
+# length grows with the records' token counts (1,356 bytes more at step 2 than at step 1, at
+# test scale, out of 2.6 GB). That is the batch's size, not the protocol's work, so a second
+# step adds nothing to the cost result.
+COUNT_STEPS = 1
 
 
 def _side(name: str) -> str:
@@ -541,7 +565,9 @@ class TimeRecorder(_Recorder):
         if rec is not None and self._verifier is not None:
             stats = self._verifier.stats.get(t)
             if stats is not None and (stats.products or stats.tensors):
-                self.writer.write_residuals(self.scenario, t, stats, self._verifier.c)
+                bands, k, guard = _scoring(self._verifier)
+                self.writer.write_residuals(self.scenario, t, stats, self._verifier.c,
+                                            bands=bands, k=k, kappa_guard=guard)
 
     def finish(self, verdict: Any = None) -> None:
         super().finish()
@@ -562,14 +588,20 @@ class TimeRecorder(_Recorder):
 
 def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
                 fields: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """EQ13 record 1 for step ``t``: the verdict, the first failing check, and each check's
-    ``pass``, ``fail`` or ``not_run``.
+    """EQ13 record 1 for step ``t`` (EVALUATION_SPEC §4.1): the verdict, the first failing
+    check, each check's ``pass``, ``fail`` or ``not_run``, whether the step is judged, and the
+    step's three scores.
 
     ``first_failing_check`` is the protocol id a ``Rejection`` carries. ``checks`` is keyed by
     driver slot, except that at step 1 the chain slot is check 0 (``ctx.chain_check_id``), so
     it is keyed ``0``; the cost rows keep the slot id ``7`` at step 1 too. Check 2 has two
     slots, ``2`` and ``2.root`` (F15a), and a rejection as check 2 marks the last of them that
-    ran as ``fail``."""
+    ran as ``fail``.
+
+    ``fields`` carries the run's identity (``model``, ``corpus``, ``attack``, ``seed``) and the
+    cheat's (``bpr_records``, ``bpr_actual``, ``cheat_step``); each is ``None`` when not given.
+    ``judged`` is :func:`judged_step`. ``rho_5``, ``rho_kappa``, ``rho_6`` and ``n_failing``
+    are :func:`step_scores` over the tests the verifier measured at this step."""
     def pid(cid: str) -> str:
         return "0" if t == 1 and cid == "7" else cid
 
@@ -581,12 +613,129 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
         cid = slots[-1] if slots else (ran[-1] if ran else None)
         if cid is not None:
             checks[cid] = "fail"
+    fields = dict(fields or {})
+    bands, k, guard = _scoring(verifier)
+    stats = getattr(verifier, "stats", {}).get(t) or StepStats()
     out = {"record": "step", "run": run, "scenario": scenario,
-           "model": None, "corpus": None, "seed": None,
-           "poisoning_rate": None, "cheat_step": None, **(fields or {}),
-           "step": t, "verdict": "reject" if failed else "accept",
+           "model": None, "corpus": None, "attack": None, "seed": None,
+           "bpr_records": None, "bpr_actual": None, "cheat_step": None, **fields,
+           "step": t, "judged": judged_step(verifier, t, fields.get("cheat_step")),
+           "verdict": "reject" if failed else "accept",
            "first_failing_check": rejection.check_id if failed else None,
-           "rejection_kind": rejection.kind if failed else None, "checks": checks}
+           "rejection_kind": rejection.kind if failed else None, "checks": checks,
+           **step_scores(stats, bands, k=k, kappa_guard=guard)}
+    return out
+
+
+def _scoring(verifier: Any) -> tuple[Any, int | None, bool]:
+    """``(bands, k, κ guard)`` that score ``verifier``'s numbers: its bands, or ``None`` while
+    it calibrates (no band file yet). ``getattr`` keeps test stand-ins working."""
+    bands = None if getattr(verifier, "calibrate", False) else getattr(verifier, "bands", None)
+    return bands, getattr(verifier, "k", None), bool(getattr(verifier, "kappa_guard", True))
+
+
+def judged_step(verifier: Any, t: int, cheat_step: int | None = None) -> bool:
+    """Whether step ``t`` counts as a result (EVALUATION_SPEC §2.3): never a calibration step.
+
+    - No step is judged while the verifier calibrates, or under provisional bands (a smoke
+      run's, which never judge an evaluation run, P10a).
+    - A cheat run (``cheat_step`` = ``t*``) judges ``t ≥ t*``: the steps its detection result
+      reads. Its earlier steps are honest steps, which the honest runs report.
+    - An honest run at the band file's calibration seed (H1) doesn't judge the calibration
+      steps (``calibration_steps``, 1–3): they are in-sample. A file without the seed is taken
+      as fitted at the run's seed.
+    - An honest run at any other seed (H2) doesn't judge step 1 (F8a).
+    """
+    if getattr(verifier, "calibrate", False):
+        return False
+    bands = getattr(verifier, "bands", None)
+    if bands is None or bands.source == "provisional":
+        return False
+    if cheat_step is not None:
+        return t >= cheat_step
+    seed = getattr(verifier, "seed", None)
+    if _calibration_seed(bands) in (None, seed):
+        return not in_sample_step(bands, t, seed)
+    return t != 1
+
+
+def _calibration_seed(bands: Any) -> int | None:
+    return ((getattr(bands, "stats", None) or {}).get("context") or {}).get("calibration_seed")
+
+
+def in_sample_step(bands: Any, t: int, seed: int | None) -> bool:
+    """Whether step ``t`` of an honest run at ``seed`` is one ``bands`` was fitted on: one of
+    the band file's ``calibration_steps`` in a run at its ``calibration_seed`` (H1's steps 1–3).
+    A file without the seed is taken as fitted at the run's seed."""
+    steps = (getattr(bands, "stats", None) or {}).get("calibration_steps") or ()
+    return _calibration_seed(bands) in (None, seed) and t in set(steps)
+
+
+# ---- the scores (EVALUATION_SPEC §2.2) -----------------------------------------------------
+
+
+def rho_arrays(stats: StepStats, bands: Any, *, k: int | None,
+               kappa_guard: bool = True) -> dict[str, np.ndarray]:
+    """The step's component scores (EVALUATION_SPEC §2.2, §4.2), each a test's left-hand side
+    over its right-hand side, so a test rejects exactly when its score is above 1:
+
+    - ``rho_5`` ``[P, k]``: ``normalized / τ``, one per product and challenge;
+    - ``rho_kappa`` ``[P]``: ``ν / (κ_max(class)·‖|P|·1‖)``, ``0`` when ``ν = 0`` and ``inf``
+      when only the denominator is 0, as the live test ``ν ≤ κ_max·‖|P|·1‖`` judges them;
+    - ``rho_6`` ``[W]``: ``ρ_max / τ_W(tensor)``, one per weight tensor checks 6a and 6b
+      measured.
+
+    Rows follow ``stats``, so they line up with the raw arrays (``p_m``, ``w_name``). Every
+    score is NaN when ``bands`` is ``None`` (a calibrating verifier has none), and every
+    ``rho_kappa`` when the κ guard is off (test 1 isn't run). Check 5 compares ``ν`` with the
+    product ``κ_max·‖|P|·1‖`` and check 6 ``ρ_max`` with ``τ_W``, so for those two ``ρ > 1``
+    exactly when the live test rejects (an IEEE quotient of positive floats is above 1 exactly
+    when the numerator is larger). Check 5's residual test compares the raw residual with
+    ``τ·unit`` while ``ρ_5`` divides the stored ``normalized = residual/unit`` by ``τ``, so the
+    two can disagree by rounding when a residual lands on ``τ`` to within an ulp.
+    """
+    ps, ts = stats.products, stats.tensors
+    width = len(ps[0].normalized) if ps else (k or 0)
+    norm = np.array([p.normalized for p in ps], dtype=np.float64).reshape(len(ps), width)
+    if bands is None:
+        return {"rho_5": np.full_like(norm, np.nan), "rho_kappa": np.full(len(ps), np.nan),
+                "rho_6": np.full(len(ts), np.nan)}
+    rho_5 = norm / bands.tau
+    if kappa_guard:
+        nu = np.array([p.nu for p in ps], dtype=np.float64)
+        ceiling = np.array([bands.kappa_for(p.cls) * p.p_abs1 for p in ps], dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rho_kappa = np.where(nu == 0, 0.0, nu / ceiling)
+    else:
+        rho_kappa = np.full(len(ps), np.nan)
+    rho_6 = np.array([s.rho_max / bands.tau_w_for(s.weight) for s in ts], dtype=np.float64)
+    return {"rho_5": rho_5, "rho_kappa": rho_kappa.astype(np.float64), "rho_6": rho_6}
+
+
+SCORE_FAMILIES = ("rho_5", "rho_kappa", "rho_6")
+
+
+def step_scores(stats: StepStats, bands: Any, *, k: int | None,
+                kappa_guard: bool = True) -> dict[str, Any]:
+    """The step record's scores (EVALUATION_SPEC §2.2, §4.1): per family the largest component
+    score (``rho_5``, ``rho_kappa``, ``rho_6``) and ``n_failing``, a dict of the number of
+    component tests above 1, both over what the verifier measured at the step.
+
+    A family is ``None``, with its ``n_failing`` entry, when no test of it was scored: no bands
+    (calibration), the κ guard off (``rho_kappa``), no product measured (``rho_5``,
+    ``rho_kappa``: the step stopped before check 5) or no tensor (``rho_6``). A non-finite score
+    counts as failing, as the live checks reject it, and a NaN maximum stays NaN."""
+    rho = rho_arrays(stats, bands, k=k, kappa_guard=kappa_guard)
+    scored = {"rho_5": bands is not None and bool(stats.products),
+              "rho_kappa": bands is not None and kappa_guard and bool(stats.products),
+              "rho_6": bands is not None and bool(stats.tensors)}
+    out: dict[str, Any] = {}
+    failing: dict[str, int | None] = {}
+    for fam in SCORE_FAMILIES:
+        x = rho[fam].ravel()
+        out[fam] = float(np.max(x)) if scored[fam] else None
+        failing[fam] = int(np.count_nonzero(~(x <= 1.0))) if scored[fam] else None
+    out["n_failing"] = failing
     return out
 
 
@@ -931,29 +1080,63 @@ def derive_capture(verified: Iterable[Mapping[str, Any]],
 # ---- residual arrays ---------------------------------------------------------------------
 
 
-def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats,
-                     c: Any) -> dict[str, np.ndarray]:
+_WEIGHT_FREE_FORWARD = {"S": "attention score", "O": "attention value"}
+_KIND_CLASSES = {ProductKind.INPUT_GRAD: "input gradient",
+                 ProductKind.WEIGHT_GRAD: "weight gradient",
+                 # EVALUATION_SPEC §5.7 names no class for the gradients of the weight-free
+                 # products (δA, δV, δQ̃, δK̃): an open question, and this name a placeholder.
+                 ProductKind.OPERAND_GRAD: "operand gradient"}
+
+
+def spec_class(c: Any, spec: Any) -> str:
+    """A product's class in EVALUATION_SPEC §5.7: ``forward``, ``input gradient``, ``weight
+    gradient``, ``attention score`` or ``attention value``, and ``operand gradient`` (a
+    placeholder) for the gradients of the weight-free products.
+
+    The forward products with a weight are ``forward``; the weight-free ones are the attention
+    products, named by their κ class (``S``, ``O``). Any other weight-free forward class raises
+    ``ValueError``: §5.7 has no class for it."""
+    if spec.kind is ProductKind.FORWARD:
+        if spec.weight is not None:
+            return "forward"
+        cls = product_class(c, spec)
+        if cls not in _WEIGHT_FREE_FORWARD:
+            raise ValueError(f"{spec.name}: weight-free forward class {cls!r} has no "
+                             f"EVALUATION_SPEC §5.7 class")
+        return _WEIGHT_FREE_FORWARD[cls]
+    return _KIND_CLASSES[spec.kind]
+
+
+def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats, c: Any, *,
+                     bands: Any = None, k: int | None = None,
+                     kappa_guard: bool = True) -> dict[str, np.ndarray]:
     ps = stats.products
-    k = len(ps[0].normalized) if ps else 0
-    layers = []
+    width = len(ps[0].normalized) if ps else (k or 0)
+    layers, classes = [], []
     for p in ps:
-        layer = c.product(p.m).layer if c is not None else None
-        layers.append(-1 if layer is None else int(layer))
+        spec = c.product(p.m) if c is not None else None
+        layers.append(-1 if spec is None or spec.layer is None else int(spec.layer))
+        classes.append("" if spec is None else spec_class(c, spec))
+    rho = rho_arrays(stats, bands, k=k, kappa_guard=kappa_guard)
     return {
         "run": np.array(run), "scenario": np.array(scenario), "step": np.array(step),
         "p_m": np.array([p.m for p in ps], dtype=np.int32),
         "p_name": np.array([p.name for p in ps], dtype=str),
         "p_cls": np.array([p.cls for p in ps], dtype=str),
+        "p_spec_class": np.array(classes, dtype=str),
         "p_layer": np.array(layers, dtype=np.int32),
         "p_kappa": np.array([p.kappa for p in ps], dtype=np.float64),
         "p_q": np.array([p.q for p in ps], dtype=np.int64),
         "p_norm": np.array([p.p_norm for p in ps], dtype=np.float64),
         "p_nu": np.array([p.nu for p in ps], dtype=np.float64),
         "p_abs1": np.array([p.p_abs1 for p in ps], dtype=np.float64),
-        "p_normalized": np.array([p.normalized for p in ps], dtype=np.float64).reshape(len(ps), k),
+        "p_normalized": np.array([p.normalized for p in ps],
+                                 dtype=np.float64).reshape(len(ps), width),
         "w_check": np.array([s.check_id for s in stats.tensors], dtype=str),
         "w_name": np.array([s.weight for s in stats.tensors], dtype=str),
         "w_rho": np.array([s.rho_max for s in stats.tensors], dtype=np.float64),
+        "band_source": np.array("" if bands is None else str(bands.source)),
+        **rho,
     }
 
 
@@ -1070,15 +1253,29 @@ def read_records(path: str | os.PathLike[str], record: str | None = None) -> lis
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 
+# Top-level names under ``$VERIF_OUTPUT_DIR`` that hold shared files, never a run (EVALUATION_SPEC
+# §4.6): the data files, and the evaluation's results.
+RESERVED_NAMES = ("data", "evaluation")
+
+
+def run_name(scenario: str, model: str, attack: str, bpr_records: int, seed: int) -> str:
+    """A cell's unique run name, ``<scenario>-<model>-<attack>-bpr<n>-s<seed>`` (EV2): the
+    model as its repository's last part (``SmolLM2-135M-Instruct``), ``n`` the poisoned records
+    in the cheat batch (0 for an honest run). Characters outside ``[A-Za-z0-9._-]`` become
+    ``_``."""
+    name = f"{scenario}-{model.rsplit('/', 1)[-1]}-{attack}-bpr{int(bpr_records)}-s{int(seed)}"
+    return _SAFE_NAME.sub("_", name)
+
 
 class MetricsWriter:
     """One run's directory: ``records.jsonl`` and ``residuals/`` (module docstring).
 
     Opening it truncates an earlier run's records and writes the ``environment`` record; records
     are flushed as they arrive, so a crashed run keeps what it finished. ``close`` writes
-    ``run_end``. ``model``, ``corpus`` and ``seed`` go into every ``step`` record. ``attack``
-    (``VERIF_ATTACK``, the BackdoorLLM task; ``None`` for a run on other data) goes into the
-    ``environment`` record only.
+    ``run_end``. ``model``, ``corpus``, ``attack`` (``VERIF_ATTACK``, the BackdoorLLM task;
+    ``None`` for a run on other data) and ``seed`` go into the ``environment`` record and every
+    ``step`` record. A run named ``data`` or ``evaluation``, or a directory of either name, is
+    refused (:data:`RESERVED_NAMES`).
     """
 
     def __init__(self, out_dir: str | os.PathLike[str], run: str, *,
@@ -1087,37 +1284,49 @@ class MetricsWriter:
                  config: Mapping[str, Any] | None = None, band_file_hash: str | None = None,
                  h_D: bytes | None = None, extra: Mapping[str, Any] | None = None) -> None:
         self.dir = Path(out_dir)
+        for name in (run, self.dir.name):
+            if name in RESERVED_NAMES:
+                raise ValueError(f"run name or directory {name!r} is reserved "
+                                 f"(EVALUATION_SPEC §4.6: {', '.join(RESERVED_NAMES)})")
         self.dir.mkdir(parents=True, exist_ok=True)
         self.run = run
         self.device = torch.device(device)
         self.probe = memory_probe(self.device)
-        self.run_fields = {"model": model, "corpus": corpus, "seed": seed}
+        self.run_fields = {"model": model, "corpus": corpus, "attack": attack, "seed": seed}
         self._f: IO[str] = open(self.dir / "records.jsonl", "w")  # noqa: SIM115
         self.write([environment_record(run, device=self.device, probe=self.probe, config=config,
                                        band_file_hash=band_file_hash, h_D=h_D,
-                                       **self.run_fields, attack=attack, **(extra or {}))])
+                                       **self.run_fields, **(extra or {}))])
 
-    def recorder(self, scenario: str, *, poisoning_rate: float | None = None,
+    def recorder(self, scenario: str, *, bpr_records: int | None = None,
+                 bpr_actual: float | None = None,
                  cheat_step: int | None = None) -> TimeRecorder:
         """A timed-run recorder that writes here.
 
-        ``cheat_step`` is for EQ15's attack runs only, the step the attack starts at. The
-        protocol-fault scenarios (``flip``, ``broken-chain`` …) leave it null; their expected
-        rejection point is the harness's oracle, not a record field."""
+        ``bpr_records`` and ``bpr_actual`` are the cheat batch's poisoned records and their
+        share of the batch (EVALUATION_SPEC §4.1), ``0`` and ``0.0`` for an honest run.
+        ``cheat_step`` is ``t*``, for EQ15's attack runs only. The protocol-fault scenarios
+        (``flip``, ``broken-chain`` …) leave all three null; their expected rejection point is
+        the harness's oracle, not a record field."""
         return TimeRecorder(self.run, scenario, device=self.device, writer=self,
-                            step_fields={**self.run_fields, "poisoning_rate": poisoning_rate,
-                                         "cheat_step": cheat_step})
+                            step_fields={**self.run_fields, "bpr_records": bpr_records,
+                                         "bpr_actual": bpr_actual, "cheat_step": cheat_step})
 
     def write(self, rows: Iterable[Mapping[str, Any]]) -> None:
         for r in rows:
             self._f.write(json.dumps(_json_safe(dict(r)), allow_nan=False) + "\n")
         self._f.flush()
 
-    def write_residuals(self, scenario: str, step: int, stats: StepStats, c: Any) -> Path:
+    def write_residuals(self, scenario: str, step: int, stats: StepStats, c: Any, *,
+                        bands: Any = None, k: int | None = None,
+                        kappa_guard: bool = True) -> Path:
+        """The step's residual arrays, with its scores under ``bands`` (:func:`rho_arrays`;
+        NaN without bands)."""
         d = self.dir / "residuals" / _SAFE_NAME.sub("_", scenario)
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"step_{step:05d}.npz"
-        np.savez(path, **_residual_arrays(self.run, scenario, step, stats, c))
+        np.savez(path, **_residual_arrays(self.run, scenario, step, stats, c, bands=bands, k=k,
+                                          kappa_guard=kappa_guard))
         return path
 
     def close(self) -> None:

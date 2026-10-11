@@ -22,8 +22,8 @@ from verification.parameters import ProtocolConfig
 from verification.runs import cheats
 from verification.runs import flipped_matmul_sweep as fs
 from verification.runs.hidden_steps import run_hidden
-from verification.runs.metrics import MetricsWriter, read_records
-from verification.runs.poisoned_step import run_poisoned
+from verification.runs.metrics import MetricsWriter, read_records, read_residuals
+from verification.runs.poisoned_step import SCENARIOS, run_poisoned
 from verification.runs.scenarios import (
     Expected,
     FlipProduct,
@@ -63,7 +63,7 @@ def test_env_needs_a_changed_batch(env):
     with pytest.raises(ValueError, match="at least one unlike"):
         cheats.CheatEnv.build(env.c, env.D, env.w0, env.bands, k=K, h_D=env.h_D, b_tilde=b,
                               poison_step=1, seed=SEED)
-    assert env.poisoning_rate == 0.5
+    assert (env.bpr_records, env.bpr_actual) == (2, 0.5)
 
 
 def test_meta_must_name_the_runs_seed_task_and_level():
@@ -116,28 +116,71 @@ def test_outcome_names_every_ending():
     assert outcome(e, L(Rejection(1, "4", "…", "failed"))) != "exact"
 
 
+# EVALUATION_SPEC §4.1's step-record fields
+SPEC_FIELDS = ("run", "model", "attack", "seed", "scenario", "bpr_records", "bpr_actual", "step",
+               "cheat_step", "judged", "checks", "verdict", "first_failing_check", "rho_5",
+               "rho_kappa", "rho_6", "n_failing")
+
+
 def test_poisoned_step_cheats_hit_their_declared_points(env, tmp_path):
-    w = MetricsWriter(tmp_path, "poisoned_step", device="cpu", model="mlp", corpus="synthetic",
-                      seed=0, config={}, band_file_hash=env.bands.source, h_D=env.h_D)
-    try:
-        rs = run_poisoned(env, writer=w, out=QUIET)
-    finally:
-        w.close()
-    assert [r.scenario.name for r in rs] == ["A1", "A2", "A3"]
+    """Each cheat writes to its own cell's directory, and its rejecting check measured all its
+    tests for the record: A2's step holds every product, A3's every tensor of 6a."""
+    cfg = load_config({"VERIF_MODEL": "org/mlp", "VERIF_SEED": str(SEED)})
+    opened: dict[str, MetricsWriter] = {}
+
+    def writers(scenario):
+        name = cheats.cell_name(cfg, scenario, env)
+        opened[scenario] = MetricsWriter(tmp_path / name, name, device="cpu", model="mlp",
+                                         corpus="synthetic", attack=cfg.attack, seed=SEED,
+                                         config={}, band_file_hash=env.bands.source,
+                                         h_D=env.h_D)
+        return opened[scenario]
+
+    rs = run_poisoned(env, writers=writers, out=QUIET)
+    assert [r.scenario.name for r in rs] == list(SCENARIOS) == ["A1", "A2", "A3"]
     assert [(r.actual.step, r.actual.check_id) for r in rs] == [(1, "4"), (1, "5"), (1, "6a")]
     assert rs[1].actual.product == 1
     assert all(r.passed and r.outcome == "exact" for r in rs)
-    rows = read_records(tmp_path / "records.jsonl", cheats.ORACLE_RECORD)
+    assert all(w._f.closed for w in opened.values())
+    dirs = {s: tmp_path / f"{s}-mlp-refusal-bpr2-s{SEED}" for s in SCENARIOS}
+    assert {s: w.dir for s, w in opened.items()} == dirs
+    rows = [read_records(dirs[s] / "records.jsonl", cheats.ORACLE_RECORD)[0] for s in SCENARIOS]
     assert [r["scenario"] for r in rows] == ["A1", "A2", "A3"]
-    assert all(r["passed"] and r["latency"] == 0 and r["poisoning_rate"] == 0.5 for r in rows)
+    assert all(r["passed"] and r["latency"] == 0 and r["bpr_records"] == 2
+               and r["bpr_actual"] == 0.5 for r in rows)
     assert rows[1]["rho_5"] > 1 and rows[2]["rho_6"] > 1
+    assert rows[1]["rho_kappa"] is not None
+    for s, check in zip(SCENARIOS, ("4", "5", "6a")):
+        (st,) = read_records(dirs[s] / "records.jsonl", "step")
+        assert set(SPEC_FIELDS) <= st.keys()
+        assert (st["run"], st["scenario"], st["step"], st["cheat_step"]) == (
+            dirs[s].name, s, 1, 1)
+        assert (st["bpr_records"], st["bpr_actual"], st["judged"]) == (2, 0.5, True)
+        assert (st["verdict"], st["first_failing_check"]) == ("reject", check)
+    a2 = read_residuals(dirs["A2"])["A2"][1]
+    assert [p.m for p in a2.products] == list(range(1, env.c.M + 1))
+    with np.load(dirs["A2"] / "residuals" / "A2" / "step_00001.npz") as z:
+        assert z["rho_5"].shape == (env.c.M, K)
+        assert z["p_spec_class"].tolist()[0] == "forward"
+    (a2_step,) = read_records(dirs["A2"] / "records.jsonl", "step")
+    assert a2_step["n_failing"]["rho_5"] >= 1 and a2_step["rho_5"] == rows[1]["rho_5"]
+    a3 = read_residuals(dirs["A3"])["A3"][1]
+    assert {t.weight for t in a3.tensors if t.check_id == "6a"} == set(env.c.linear_weights)
     assert cheats.band_sources(env, rs) == env.bands.source
+
+
+def test_cell_names_are_unique_per_cell(env):
+    cfg = load_config({"VERIF_MODEL": "HuggingFaceTB/SmolLM2-135M-Instruct", "VERIF_SEED": "3"})
+    assert (cheats.cell_name(cfg, "A2", env)
+            == "A2-SmolLM2-135M-Instruct-refusal-bpr2-s3")
 
 
 def test_hidden_step_breaks_the_chain(env):
     r = run_hidden(env, out=QUIET)
     assert r.passed and (r.actual.step, r.actual.check_id) == (2, "7")
-    rec = cheats.oracle_record("hidden_steps", r, env.bands, cheat_step=2)
+    rec = cheats.oracle_record("hidden", r, env.bands, bpr_records=2, bpr_actual=0.5,
+                               cheat_step=2)
+    assert (rec["bpr_records"], rec["bpr_actual"]) == (2, 0.5)
     assert rec["latency"] == 0 and rec["outcome"] == "exact"
 
 

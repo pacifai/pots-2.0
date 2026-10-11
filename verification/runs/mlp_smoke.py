@@ -28,8 +28,9 @@ run (P10a). Exits 1 if any oracle fails. The harness (scenarios, the oracle, the
 
 With metrics on (``--metrics``, default ``VERIF_METRICS=1``), every scenario's timed run writes
 its step records, per-component times and residual arrays to ``$VERIF_OUTPUT_DIR/mlp_smoke/``
-(B6, ``runs/metrics.py``). Two separate passes of ``PASS_STEPS`` honest steps each, never timed, write the
-per-component memory peaks and the counts (FLOPs, bytes hashed, hash calls, transcript bytes).
+(B6, ``runs/metrics.py``). Two separate honest passes, never timed, write the per-component
+memory peaks (``PASS_STEPS`` steps) and the counts (FLOPs, bytes hashed, hash calls, transcript
+bytes; ``COUNT_STEPS``, one step, EVALUATION_SPEC §3.4).
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ from verification.computation.instances.mlp import (
     synthetic_dataset,
 )
 from verification.parameters import load_protocol_config
-from verification.runs.metrics import PASS_STEPS, MetricsWriter
+from verification.runs.metrics import COUNT_STEPS, PASS_STEPS, MetricsWriter
 from verification.runs.scenarios import (
     HONEST,
     Expected,
@@ -152,9 +153,9 @@ def memory_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, tor
 
 def count_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
                 k: int, seed: int, run: str = RUN_NAME) -> list[dict[str, Any]]:
-    """The B6 counting pass: counts over ``PASS_STEPS`` honest steps, never timed."""
-    return count_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k, seed=seed,
-                     final=honest_final(c, dataset, w0, PASS_STEPS, seed=seed))
+    """The B6 counting pass: counts over ``COUNT_STEPS`` honest steps, never timed."""
+    return count_run(c, dataset, w0, run=run, T=COUNT_STEPS, k=k, seed=seed,
+                     final=honest_final(c, dataset, w0, COUNT_STEPS, seed=seed))
 
 
 def main(argv: Sequence[str] | None = None) -> int:

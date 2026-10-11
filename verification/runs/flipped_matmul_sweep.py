@@ -406,7 +406,8 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
     c = env.c
     keep = KeepStep(t)
     honest = run_cheat(env, Scenario("honest", f"honest, step {t}'s transcript kept for the "
-                                     "sweep", keep, Expected()), T=t, writer=writer, out=out)
+                                     "sweep", keep, Expected()), T=t, writer=writer,
+                       bpr_records=0, bpr_actual=0.0, out=out)
     m_flip = c.m_of(flip_name)  # type: ignore[attr-defined]
     flip = run_cheat(env, Scenario("flip", f"largest entry of P_{m_flip} ({flip_name}) "
                                    f"sign-flipped after capture at step {t}",

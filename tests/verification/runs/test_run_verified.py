@@ -9,7 +9,7 @@ import pytest
 from setup.config import load_config
 from setup.data import encode_records_file, schedule
 from tests.verification.decoder_helpers import make_records, tiny_config
-from verification.commitment.leaves import dataset_tree
+from verification.commitment.leaves import dataset_tree, transcript_root
 from verification.computation.instances import DecoderComputation
 from verification.computation.instances.mlp import (
     MLPComputation,
@@ -17,12 +17,12 @@ from verification.computation.instances.mlp import (
     synthetic_dataset,
 )
 from verification.computation.interface import snapshot_weights
-from verification.prover.step import prove_step
+from verification.prover.step import commit, prove_step
 from verification.runs import plain_baseline as pb
 from verification.runs import run_verified as rv
 from verification.runs.metrics import MetricsWriter, read_records, read_residuals
 from verification.runs.scenarios import honest_final
-from verification.transcript.store import InMemoryStore
+from verification.transcript.store import LEAF_FILE, DiskStore, InMemoryStore
 from verification.verifier.bands import Bands
 from verification.verifier.calibration import (
     GUARD_FRACTION,
@@ -115,10 +115,12 @@ def test_mlp_run_judged_by_the_band_file(mlp, tmp_path):
     c, D, w0, bands = mlp
     T = 4
     final = honest_final(c, D, w0, T, seed=SEED)
+    keep = rv.KeptStepHandoff(tmp_path / rv.TRANSCRIPTS_DIR, 3)
     with MetricsWriter(tmp_path, "rv", band_file_hash=bands.source) as mw:
         run = rv.run_verified(c, D, w0, bands, T=T, k=K, h_D=dataset_tree(c, D).root,
                               final=final, writer=mw, recorder=mw.recorder("honest"),
-                              watch="forward:layers.*.weight", out=lambda s: None, seed=SEED)
+                              watch="forward:layers.*.weight", out=lambda s: None, seed=SEED,
+                              keep=keep)
     r = run.result
     assert r.passed and r.loop.verdict.accepted
     assert [s.t for s in run.summaries] == [1, 2, 3, 4]
@@ -140,6 +142,24 @@ def test_mlp_run_judged_by_the_band_file(mlp, tmp_path):
     rows = read_records(tmp_path / "records.jsonl", rv.SUMMARY_RECORD)
     assert [x["step"] for x in rows] == [1, 2, 3, 4]
     assert [x["sample"] for x in rows] == ["in", "in", "judged", "judged"]
+    assert [x["judged"] for x in rows] == [False, False, True, True]
+    steps = read_records(tmp_path / "records.jsonl", "step")
+    assert [x["judged"] for x in steps] == [False, False, True, True]
+    assert all(x["rho_5"] <= 1 and x["rho_kappa"] <= 1 and x["rho_6"] <= 1 for x in steps)
+    assert all(x["n_failing"] == {"rho_5": 0, "rho_kappa": 0, "rho_6": 0} for x in steps)
+    # step 3's transcript stays on disk, and its root is the step's h
+    w = w0
+    for t in (1, 2, 3):
+        out = prove_step(c, c.build_model(), w, [D[i] for i in schedule(t, c.n_s, len(D), SEED)])
+        h, w = commit(c, out).root, out.w_next
+    assert run.kept is not None and run.kept.directory == tmp_path / rv.TRANSCRIPTS_DIR / "step_3"
+    assert run.kept.root == h and transcript_root(c, DiskStore(run.kept.directory)) == h
+    (kr,) = read_records(tmp_path / "records.jsonl", rv.KEPT_RECORD)
+    leaf_files = sorted(run.kept.directory.glob("leaf_*.pt"))
+    assert len(leaf_files) == c.n_leaves and leaf_files[0].name == LEAF_FILE.format(0)
+    assert (kr["path"], kr["root"], kr["step"], kr["files"]) == (
+        f"{rv.TRANSCRIPTS_DIR}/step_3", h.hex(), 3, c.n_leaves + 2)
+    assert kr["bytes"] == sum(f.stat().st_size for f in run.kept.directory.iterdir())
     assert all(x["band_file_hash"] == bands.source for x in rows)
     # every residual of every step is logged as B6's arrays as well
     assert sorted(read_residuals(tmp_path)["honest"]) == [1, 2, 3, 4]
@@ -158,6 +178,28 @@ def test_mlp_bands_too_tight_reject_a_judged_step(mlp):
                           seed=SEED)
     assert not run.result.passed and run.summaries[-1].rejected
     assert run.result.actual.check_id == "5"
+
+
+def test_mlp_keep_after_a_rejection_stores_nothing(mlp, tmp_path):
+    c, D, w0, bands = mlp
+    tight = dataclasses.replace(bands, tau=1e-6)
+    keep = rv.KeptStepHandoff(tmp_path, 2)
+    run = rv.run_verified(c, D, w0, tight, T=3, k=K, h_D=dataset_tree(c, D).root,
+                          final=honest_final(c, D, w0, 3, seed=SEED), out=lambda s: None,
+                          seed=SEED, keep=keep)
+    assert run.result.actual.step == 1 and run.kept is None and keep.write() is None
+    assert not keep.directory.exists()
+
+
+def test_mlp_run_at_another_seed_judges_from_step_2(mlp):
+    """At a seed other than the band file's (H2), no step is in-sample and step 1 isn't judged
+    (EVALUATION_SPEC §2.3)."""
+    c, D, w0, bands = mlp
+    run = rv.run_verified(c, D, w0, bands, T=3, k=K, h_D=dataset_tree(c, D).root,
+                          final=honest_final(c, D, w0, 3, seed=2), out=lambda s: None, seed=2)
+    assert run.result.passed
+    assert [s.sample for s in run.summaries] == ["not judged", "judged", "judged"]
+    assert [s.mark for s in run.summaries] == ["-", " ", " "]
 
 
 # ---- main() on the tiny Llama -----------------------------------------------------------
@@ -199,13 +241,38 @@ def test_main_judges_logs_and_matches_the_plain_baseline(tiny_main, capsys):
     text = capsys.readouterr().out
     assert "B7: final weights bit-identical" in text and "band-file hash equal" in text
     assert (root / "bands.json").read_bytes() == band_bytes  # read, never rewritten
-    rows = read_records(root / rv.RUN_NAME / "records.jsonl")
+    cfg = load_config()
+    name = rv.honest_run_name(cfg.model, cfg.attack, cfg.seed)
+    assert name == "honest-SmolLM2-135M-Instruct-refusal-bpr0-s1"
+    rows = read_records(root / name / "records.jsonl")
     summ = [x for x in rows if x["record"] == rv.SUMMARY_RECORD]
     assert [x["sample"] for x in summ] == ["in", "in", "judged"]
+    steps = [x for x in rows if x["record"] == "step"]
+    assert [(x["run"], x["attack"], x["bpr_records"], x["bpr_actual"], x["cheat_step"])
+            for x in steps] == [(name, "refusal", 0, 0.0, None)] * 3
+    assert [x["judged"] for x in steps] == [False, False, True]
     assert {x["step"] for x in rows if x["record"] == "time"} == {0, 1, 2, 3}  # 0: run checks
     assert {x["step"] for x in rows if x["record"] == "memory"} == {0, 1}
+    assert {x["step"] for x in rows if x["record"] == "count"} == {0, 1}  # COUNT_STEPS
+    # the default kept step, 4, is past T = 3: nothing stored
+    assert not (root / name / rv.TRANSCRIPTS_DIR).exists()
+    assert not [x for x in rows if x["record"] == rv.KEPT_RECORD]
     assert all(math.isfinite(x["global_max"]) for x in summ)
     assert all(x["band_file_hash"] == Bands.from_file(root / "bands.json").source for x in summ)
+
+
+def test_main_keeps_the_named_step_on_disk(tiny_main, capsys):
+    c, _, root = tiny_main
+    assert rv.main(["--keep-step", "2", "--no-metrics"]) == 0
+    cfg = load_config()
+    d = root / rv.honest_run_name(cfg.model, cfg.attack, cfg.seed) / rv.TRANSCRIPTS_DIR / "step_2"
+    store = DiskStore(d)
+    assert transcript_root(c, store) == store.root
+    assert len(list(d.glob("leaf_*.pt"))) == c.n_leaves
+    assert f"stored step 2: {d}" in capsys.readouterr().out
+    assert rv.main(["--keep-step", "0", "--steps", "2", "--metrics"]) == 0
+    assert "stored step" not in capsys.readouterr().out
+    assert DiskStore(d).root == store.root  # a run that keeps nothing leaves it alone
 
 
 def test_main_judges_another_seed_by_the_seed_1_band_file(tiny_main, monkeypatch):

@@ -146,7 +146,8 @@ def test_p0_rows_per_step(mlp_files):
     assert not [r for r in rows if r["record"] in ("step", "verdict", "storage")]
     assert {(r["run"], r["scenario"]) for r in rows if "scenario" in r} == \
            {("plain_baseline", "plain")}
-    for record, steps in (("time", {1, 2, 3}), ("memory", {1, 2}), ("count", {1, 2})):
+    # the memory pass is PASS_STEPS = 2 steps, the counting pass COUNT_STEPS = 1 (spec §3.4)
+    for record, steps in (("time", {1, 2, 3}), ("memory", {1, 2}), ("count", {1})):
         mine = [r for r in rows if r["record"] == record]
         assert {r["step"] for r in mine} == steps, record
         assert all(r["side"] in ("prover", "run") for r in mine)
@@ -249,7 +250,7 @@ def test_capture_rows_from_two_files(mlp_files):
     assert {r["scenario"] for r in rows} == {"honest"}
     by = {(r["record"], r["step"]) for r in rows}
     assert by == {("time", 1), ("time", 2), ("time", 3), ("memory", 1), ("memory", 2),
-                  ("count", 1), ("count", 2)}
+                  ("count", 1)}
     # capture observes; it adds no arithmetic
     assert all(r["flops"] == 0 for r in rows if r["record"] == "count")
     assert all(r["peak_bytes"] is not None for r in rows if r["record"] == "memory")
@@ -279,6 +280,8 @@ def test_no_metrics_writes_only_weights(mlp, tmp_path):
     assert res.weights_file == tmp_path / pb.WEIGHTS_FILE
     with pytest.raises(ValueError, match="pass_steps"):
         pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, pass_steps=3, seed=SEED)
+    with pytest.raises(ValueError, match="count_steps"):
+        pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, count_steps=0, seed=SEED)
     res = pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, keep_weights=False,
                             out=lambda s: None, seed=SEED)
     assert res.plain.w_final == {} and res.weights_file is None and res.hashes
