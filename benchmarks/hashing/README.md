@@ -47,8 +47,9 @@ HF_HUB_OFFLINE=1 VERIF_OUTPUT_DIR=/tmp/out .venv/bin/python -m benchmarks.hashin
 ```
 
 The smoke preset uses a 256 MiB buffer, one layer of the challenge list for the Python paths,
-every layer for the native batch, and E6 at 2 × 16 on the CPU. It took 70 s on an Apple M5
-Pro. Any flag given explicitly overrides the preset; see `--help`.
+every layer for the native batch, and E6 at 2 × 16 on the CPU. It took about 5.5 minutes on
+an Apple M5 Pro, 4.2 of them in E1's whole-object rows, which hash about four tasks per thread
+at each leaf size and thread count. Any flag given explicitly overrides the preset; see `--help`.
 
 A step is named by its model (`llama-3.2-1b`), at `--n-s` × `--n` with bf16 products. To give
 a step its own batch and product dtype, write `model:N_SxN:DTYPE`. For example,
