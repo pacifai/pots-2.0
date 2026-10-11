@@ -971,6 +971,11 @@ def test_switches_declaration(switched):
     assert c.M == base.M == matmul_count_decoder(c.L, c.n_s, c.n_h)
     assert [(p.m, p.name, p.kind, p.a_shape, p.b_shape) for p in c.products] == \
         [(p.m, rename.get(p.name, p.name), p.kind, p.a_shape, p.b_shape) for p in base.products]
+    # F14: each forward Y_q, Y_k, Y_v names its bias, and check 5 contracts over q + 1.
+    biased = {c.m_of(f"L{l}.Y_{x}"): c.bias(l, x)
+              for l in range(1, c.L + 1) for x in LINEARS if c.bias(l, x) is not None}
+    assert {p.m: p.bias for p in c.products if p.bias is not None} == biased
+    assert all(p.q == p.a_shape[1] + (p.m in biased) for p in c.products)
     head = [c.product(c.m_of(n)) for n in ("Lambda", "dF", g_head)]
     assert {p.weight for p in head} == {c.w_out} == {c.w_e if tied else "lm_head.weight"}
     assert c.product_class(head[2]) == g_head
@@ -1049,12 +1054,15 @@ def test_switches_replay_rebuilds_operands_and_glue(switched, monkeypatch):
 @pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
 def test_switches_verify_an_honest_step(switch):
     """The whole verifier path at each switch setting. Untied: a forged ``G_head`` fails the
-    update identity (6a) and a forged ``Λ`` fails 5. Biased: with zero biases the step is
-    accepted, bias gradients included (6b); with drawn biases check 5 still measures ``A·B``
-    alone, so it rejects the first biased leaf. Adding the bias term to check 5 is task FS2."""
+    update identity (6a) and a forged ``Λ`` fails 5. Biased: the step is accepted with zero
+    biases (HF's init) and with drawn ones, bias gradients included (6b), since check 5 checks
+    each ``Y_q, Y_k, Y_v`` as ``[A | 1]·[B ; bᵀ]`` with ``b`` from the committed ``W_t`` (F14).
+    One bias entry altered rejects at the check that reads where it sits: in the ``W_t`` leaf,
+    check 0 (step 1's ``W_t`` isn't the agreed ``W_0``); only in training, under an honest
+    ``W_t`` leaf, check 5 at that bias's product; in the ``W_{t+1}`` leaf, check 6b."""
     from setup.data import schedule
     from verification.commitment.leaves import dataset_tree
-    from verification.transcript.store import InMemoryStore
+    from verification.transcript.store import InMemoryStore, perturb_leaf
     from verification.verifier.bands import Bands
     from verification.verifier.driver import Verifier
 
@@ -1065,12 +1073,17 @@ def test_switches_verify_an_honest_step(switch):
     w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
     idx = schedule(1, c.n_s, len(D), SEED)
 
-    def verify(w, **kw):
+    def verify(w, *, agreed=None, edit=None, **kw):
+        """Prove a step from ``w``, apply ``edit(store)``, and verify against the agreed
+        ``W_0`` (``w`` unless given)."""
         v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1,
-                     bands=Bands.provisional(), allow_provisional=True, w0=w, seed=SEED)
+                     bands=Bands.provisional(), allow_provisional=True,
+                     w0=w if agreed is None else agreed, seed=SEED)
         assert v.start_run(D) is None
         out = prove_step(c, c.build_model(), w, [D[i] for i in idx], **kw)
         store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
+        if edit is not None:
+            edit(store)
         return v, v.verify_step(1, store)
 
     v, rejection = verify(w0)
@@ -1080,11 +1093,59 @@ def test_switches_verify_an_honest_step(switch):
         for name, check in (("G_head", "6a"), ("Lambda", "5")):
             _, rejection = verify(w0, perturb={c.m_of(name): lambda p: _bump(p)})
             assert (rejection.step, rejection.check_id) == (1, check), name
-    if c.qkv_bias:
-        assert all(not w0[b].any() for b in c.biases.values())  # HF starts biases at zero
-        randomize_biases(w0)
-        _, rejection = verify(w0)
-        assert rejection.check_id == "5" and rejection.detail.startswith("P_1 (L1.Y_q)")
+    if not c.qkv_bias:
+        return
+    assert all(not w0[b].any() for b in c.biases.values())  # HF starts biases at zero
+    randomize_biases(w0)
+    v, rejection = verify(w0)
+    assert rejection is None
+    assert {s.name for s in v.stats[1].products} >= {f"L1.Y_{x}" for x in "qkv"}
+
+    for l, x in ((1, "q"), (c.L, "v")):
+        b = c.bias(l, x)
+        altered = {**w0, b: _bump(w0[b])}
+
+        def honest_w_t(store, b=b):
+            perturb_leaf(c, store, c.w_t_index(b), w0[b].clone())
+
+        def bump_w_next(store, b=b):
+            i = c.w_next_index(b)
+            perturb_leaf(c, store, i, _bump(store.leaf(i)))
+
+        _, rejection = verify(altered, agreed=w0)
+        assert (rejection.step, rejection.check_id) == (1, "0"), b
+        _, rejection = verify(altered, agreed=w0, edit=honest_w_t)
+        assert (rejection.step, rejection.check_id) == (1, "5"), b
+        m = c.m_of(f"L{l}.Y_{x}")
+        assert rejection.detail.startswith(f"P_{m} (L{l}.Y_{x})"), rejection.detail
+        _, rejection = verify(w0, edit=bump_w_next)
+        assert (rejection.step, rejection.check_id) == (1, "6b"), b
+        assert b in rejection.detail, rejection.detail
+
+
+@pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
+def test_switches_capture_is_bit_identical(switch):
+    """Capture changes nothing at any switch setting, drawn biases included: a captured step's
+    loss and ``W_{t+1}`` equal an uncaptured step's bit for bit."""
+    from verification.prover.step import plain_step
+
+    family, tied = switch
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)  # the init, independent of which tests ran first
+        w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    randomize_biases(w0)
+    records = make_records((12, 7))
+    out = prove_step(c, c.build_model(), w0, records)
+    w_next, loss = plain_step(c, c.build_model(), w0, records)
+    assert out.loss == loss and list(out.w_next) == list(w_next) == list(c.weight_names)
+    for n, t in out.w_next.items():
+        i = c.w_next_index(n)
+        assert leaf_hash(c, i, t) == leaf_hash(c, i, w_next[n]), n
+    # Every bias trains under this init. An update η·g of about 1e-7 sits near a bias's
+    # rounding step, so at other inits a bias with a small gradient can round to no change.
+    for b in (c.bias(l, x) for l in range(1, c.L + 1) for x in "qkv" if c.qkv_bias):
+        assert not torch.equal(w_next[b], w0[b]), b
 
 
 def test_rejects_unsupported_switches():

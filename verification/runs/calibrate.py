@@ -26,9 +26,9 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
    which every later verification loads read-only with ``calibration.load_bands``. Its
    statistics hold ``calibration.band_context``: the model, dtypes, attention, device, ``h_D``,
    shapes, ``η``, ``M``, ``VERIF_STEPS`` and ``k`` it was fitted for, and a run whose own
-   context differs is refused. The calibration seed is kept too, as provenance only: a run at
-   another seed loads the file. A copy, and the bands of a run the gates stopped, go to the
-   metrics directory.
+   context differs is refused. The calibration seed and thread count are kept too, as
+   provenance only: a run at another seed or thread count loads the file. A copy, and the
+   bands of a run the gates stopped, go to the metrics directory.
 4. **Judged under the frozen bands.** Two more honest runs of the same steps load the band file
    and judge live: one as the protocol runs, one with check 5's κ guard off (test 1 skipped),
    for the cost split. Both must accept, and all three runs must report the same band-file
@@ -123,7 +123,7 @@ class CalibrationRun:
 
 
 def _sizing_inputs(c: DecoderComputation, T_run: int) -> dict[str, Any]:
-    return {"q_max": max(p.a_shape[1] for p in c.products),
+    return {"q_max": max(p.q for p in c.products),
             "eps_in": UNIT_ROUNDOFF[c.operand_dtype], "eps_acc": UNIT_ROUNDOFF[c.accumulator_dtype],
             "T": T_run, "M": c.M}
 

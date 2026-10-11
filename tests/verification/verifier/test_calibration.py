@@ -143,9 +143,12 @@ def test_band_context_holds_the_run_it_was_fitted_for():
                    "model_revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
                    "master_dtype": "float32", "compute_dtype": "float32",
                    "attn_impl": "eager", "device": "cpu", "h_D": bytes(range(32)).hex(),
-                   "calibration_seed": 1, "n_s": 4, "n": 128, "eta": 1e-3, "M": 7113,
-                   "T_run": 10, "k": K}
+                   "calibration_seed": 1, "threads": 8, "n_s": 4, "n": 128, "eta": 1e-3,
+                   "M": 7113, "T_run": 10, "k": K}
     assert json.loads(json.dumps(CTX)) == CTX
+    assert band_context(load_config({"VERIF_ETA": "1e-3", "VERIF_THREADS": "3"}),
+                        SimpleNamespace(n_s=4, n=128, eta=1e-3, M=7113),
+                        h_D=bytes(range(32)), k=K)["threads"] == 3
 
 
 def test_band_file_round_trip_and_hash(tmp_path):
@@ -183,7 +186,7 @@ def test_load_bands_refuses_a_file_fitted_for_another_run(tmp_path, key):
 
 def test_load_bands_takes_a_file_calibrated_at_another_seed(tmp_path):
     # The seed is provenance: seed 1's file judges seeds 2–5 (EVALUATION_SPEC §3.2).
-    assert PROVENANCE_KEYS == {"calibration_seed"}
+    assert PROVENANCE_KEYS == {"calibration_seed", "threads"}
     path = tmp_path / "bands.json"
     written = _write(path, CTX)
     for run in ({**CTX, "calibration_seed": 2}, {x: v for x, v in CTX.items()
@@ -192,6 +195,26 @@ def test_load_bands_takes_a_file_calibrated_at_another_seed(tmp_path):
         assert bands == written and bands.stats["context"]["calibration_seed"] == 1
     with pytest.raises(BandFileMismatch, match=r"\(eta: file 0.001, run 0.002\)"):
         load_bands(path, k=K, context={**CTX, "calibration_seed": 2, "eta": 2e-3})
+
+
+def test_a_band_file_records_threads_and_loads_at_any_thread_count(tmp_path):
+    # Threads change only the CPU's reduction order, far below τ; the cost results need the
+    # count recorded, so it is provenance, never compared.
+    path = tmp_path / "bands.json"
+    written = _write(path, CTX)
+    assert json.loads(path.read_bytes())["stats"]["context"]["threads"] == 8
+    bands = load_bands(path, k=K, context={**CTX, "threads": 3})
+    assert bands == written and bands.stats["context"]["threads"] == 8
+    with pytest.raises(BandFileMismatch, match=r"\(device: file 'cpu', run 'cpux'\)"):
+        load_bands(path, k=K, context={**CTX, "threads": 3, "device": "cpux"})
+
+
+def test_load_bands_takes_a_file_written_before_threads_was_recorded(tmp_path):
+    # Today's band file (cc7a9bca…) has no threads key.
+    path = tmp_path / "bands.json"
+    written = _write(path, {x: v for x, v in CTX.items() if x != "threads"})
+    assert load_bands(path, k=K, context=CTX) == written
+    assert "threads" not in written.stats["context"]
 
 
 @pytest.mark.parametrize("key", ["h_D", "attn_impl"])

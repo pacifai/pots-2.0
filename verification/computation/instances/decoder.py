@@ -73,9 +73,9 @@ same substitution; no backward is written by hand. As in training, the replay ru
 pass with grad on and one backward pass per unit (the head, then layers ``L…1``), with no
 reruns; the class docstring has the details.
 
-Check 5 measures ``A·B`` against the committed leaf. For a biased product that leaf is
-``A·B + 1·bᵀ``, so check 5 rejects an honest biased step until it measures F14's augmented
-product (task FS2).
+A biased ``Y_x``'s spec names its bias (``ProductSpec.bias``), and its committed leaf is
+``A·B + 1·bᵀ``. The replay serves ``A`` and ``B`` without the bias; check 5 adds ``b`` from the
+committed ``W_t`` and checks ``[A | 1]·[B ; bᵀ]`` (F14).
 """
 
 from __future__ import annotations
@@ -349,7 +349,9 @@ class DecoderComputation(DeclaredComputation):
             for x in ("q", "k", "v"):
                 linear(l, x, ig)
                 linear(l, x, wg)
-        specs = tuple(ProductSpec(m, name, kind, a, b, weight=w, layer=l, member=mem)
+        biases = self.biases  # F14: Y_x = X·W_xᵀ + 1·b_xᵀ is one product
+        specs = tuple(ProductSpec(m, name, kind, a, b, weight=w, layer=l, member=mem,
+                                  bias=biases.get(w) if kind is fwd else None)
                       for m, (name, kind, a, b, w, l, mem, _) in enumerate(rows, start=1))
         return specs, tuple(r[-1] for r in rows)
 
