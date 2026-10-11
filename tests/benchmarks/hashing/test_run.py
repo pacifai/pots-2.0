@@ -31,6 +31,7 @@ def test_h100_defaults_follow_section_6():
 TINY = ["--buffer-mb", "2", "--threads", "1,2", "--chunk-kb", "64", "--reps", "1",
         "--n-s", "2", "--n", "12", "--size-models", "smollm2-135m",
         "--direct-models", "smollm2-135m", "--sample-mb", "1", "--object-cap-mb", "0",
+        "--max-objects", "1024",
         "--no-native", "--e5-model", "smollm2-135m", "--k", "3", "--e5-layers", "1",
         "--e5-processes", "1", "--no-native-batch", "--e6-models", "none", "--e6-device",
         "cpu"]
@@ -41,6 +42,7 @@ def test_a_tiny_run_writes_every_slot(tmp_path, monkeypatch):
     path = run.run([*TINY, "--out", str(tmp_path / "r.json")], log=lambda _: None)
     doc = json.loads(path.read_text())
     report.check_report(doc)
+    assert doc["complete"] is True
     slots = doc["slots"]
     assert list(slots) == list(report.SLOTS)
     assert {k: s["status"] for k, s in slots.items()} == {
@@ -55,8 +57,9 @@ def test_a_tiny_run_writes_every_slot(tmp_path, monkeypatch):
             else:
                 assert r["reason"]
     names = {r["name"] for r in slots["E1"]["results"]}
-    assert {"chunked", "whole_objects", "step_from_sizes", "step_direct", "openssl_speed",
-            "b3sum", "chunked_under_h2d_copy"} <= names
+    assert {"chunked", "whole_objects", "step_from_sizes", "step_direct", "outer_tree",
+            "finiteness", "finiteness_per_step", "openssl_speed", "b3sum",
+            "chunked_under_h2d_copy"} <= names
     assert [r["name"] for r in slots["E5a"]["results"]] == ["python_path",
                                                              "python_path_per_step"]
     last = slots["E5a_prime"]["results"][-1]
@@ -106,6 +109,46 @@ def test_a_failed_native_build_keeps_the_pool_rows(tmp_path, monkeypatch):
     assert rows[0]["name"] == "thread_pool" and rows[0]["status"] == "measured"
     assert (rows[-1]["name"], rows[-1]["status"], rows[-1]["reason"]) == \
         ("native_batch", "skipped", "build failed: RuntimeError: no network")
+
+
+def test_a_crash_keeps_the_finished_experiments(tmp_path, monkeypatch):
+    """The report is rewritten after each experiment, so an interrupt in E6 keeps E0's rows."""
+    monkeypatch.setattr(sizes, "model_config", lambda key: tiny_config())
+
+    def interrupted(*a, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(run.step_time, "run_e6", interrupted)
+    out = tmp_path / "r.json"
+    with pytest.raises(KeyboardInterrupt):
+        run.run([*TINY, "--experiments", "E0,E6", "--e6-models", "smollm2-135m",
+                 "--out", str(out)], log=lambda _: None)
+    doc = json.loads(out.read_text())
+    report.check_report(doc)
+    assert doc["complete"] is False and doc["slots"]["E0"]["status"] == "measured"
+    (r,) = doc["slots"]["E6"]["results"]
+    assert r["status"] == "skipped" and r["reason"].startswith("pending")
+    assert doc["slots"]["E1"]["results"][0]["reason"] == "not selected with --experiments"
+
+
+def test_a_failed_native_run_keeps_the_pool_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(sizes, "model_config", lambda key: tiny_config())
+
+    class Lib:
+        simd_degree = 4
+
+    def broken(*a, **kw):
+        raise OSError("bad library")
+
+    monkeypatch.setattr(native, "build", lambda **kw: tmp_path / "lib.so")
+    monkeypatch.setattr(native, "load", lambda path: Lib())
+    monkeypatch.setattr(native, "run_native", broken)
+    path = run.run([*TINY, "--native-batch", "--experiments", "E5",
+                    "--out", str(tmp_path / "r.json")], log=lambda _: None)
+    rows = json.loads(path.read_text())["slots"]["E5a_prime"]["results"]
+    assert rows[0]["name"] == "thread_pool" and rows[0]["status"] == "measured"
+    assert (rows[-1]["name"], rows[-1]["status"], rows[-1]["reason"]) == \
+        ("native_batch", "skipped", "error: OSError: bad library")
 
 
 @pytest.mark.skipif(native.find_library() is None,

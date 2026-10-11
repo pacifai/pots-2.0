@@ -51,6 +51,7 @@ H100 = {
     "direct_reps": 1,
     "sample_mb": 512,
     "object_cap_mb": 0,  # 0: hash every object at its real size
+    "max_objects": cpu_hash.MAX_OBJECTS,
     "native": True,
     "native_threads": "1,8,16,all",
     "copy_mb": 1024,
@@ -75,6 +76,7 @@ SMOKE = {
     "direct_models": TEST_STEP,
     "sample_mb": 32,
     "object_cap_mb": 256,
+    "max_objects": 1 << 16,
     "native_threads": "all",
     "copy_mb": 256,
     "e5_layers": 1,
@@ -144,6 +146,8 @@ def parser() -> argparse.ArgumentParser:
     a("--direct-reps", type=int, help="repetitions of a direct step (H100: 1)")
     a("--sample-mb", type=int, help="bytes hashed per leaf size, MiB (H100: 512)")
     a("--object-cap-mb", type=int, help="largest object hashed whole, MiB; 0 for none")
+    a("--max-objects", type=int, help="most objects per whole-object measurement "
+      f"(H100: {cpu_hash.MAX_OBJECTS})")
     a("--native", action=argparse.BooleanOptionalAction, default=None,
       help="run openssl speed and b3sum (H100: on)")
     a("--native-threads", help="thread counts for the native ceilings")
@@ -213,7 +217,7 @@ def run(argv: list[str] | None = None, log=print) -> Path:
             object_cap=args["object_cap_mb"] * MB or None,
             native_threads=cpu_hash.thread_counts(cores, _ints(args["native_threads"], cores)),
             native=bool(args["native"]), copy_bytes=args["copy_mb"] * MB,
-            scratch_dir=ns.scratch_dir, log=say))}
+            scratch_dir=ns.scratch_dir, max_objects=args["max_objects"], log=say))}
 
     def e5() -> dict:
         (name,) = _models(args["e5_model"])
@@ -240,7 +244,13 @@ def run(argv: list[str] | None = None, log=print) -> Path:
             else:
                 say(f"E5(a′): native batch, threads {threads}, layers "
                     f"{native_layers or 'all'}, SIMD degree {lib.simd_degree}")
-                rows += native.run_native(s, lib, k=k, layers=native_layers, threads=threads)
+                try:
+                    rows += native.run_native(s, lib, k=k, layers=native_layers,
+                                              threads=threads)
+                except Exception as e:  # keep the pool rows
+                    say(f"E5(a′) native batch failed:\n{traceback.format_exc()}")
+                    rows.append(result("native_batch", "skipped",
+                                       reason=f"error: {type(e).__name__}: {e}"))
         return {"E5a": e5a, "E5a_prime": slot("E5a_prime", rows)}
 
     def e6() -> dict:
@@ -257,12 +267,29 @@ def run(argv: list[str] | None = None, log=print) -> Path:
                    "E6": (("E6",), e6)}
     slots: dict[str, dict] = {key: not_implemented_slot(key, reason)
                               for key, reason in GPU_ONLY.items()}
+    for exp, (keys, _) in experiments.items():
+        reason = ("pending: the run hasn't reached this experiment" if exp in wanted
+                  else "not selected with --experiments")
+        slots.update({key: slot(key, [result(key, "skipped", reason=reason)]) for key in keys})
     timing: dict[str, float] = {}
+
+    def write(complete: bool) -> Path:
+        """The report as it stands, rewritten after each experiment: a late crash keeps the
+        finished rows."""
+        return write_report({
+            "schema": SCHEMA,
+            "created_utc": created.isoformat(),
+            "argv": sys.argv if argv is None else ["benchmarks.hashing.run", *argv],
+            "smoke": ns.smoke,
+            "complete": complete,
+            "args": {**args, "threads_resolved": threads, "experiments": sorted(wanted)},
+            "inputs": {"steps": {k: s.summary() for k, s in steps.items()}},
+            "slots": {key: slots[key] for key in SLOTS},
+            "elapsed_s": {"total": time.perf_counter() - started, **timing},
+        }, out)
+
     for exp, (keys, fn) in experiments.items():
         if exp not in wanted:
-            slots.update({key: slot(key, [result(key, "skipped",
-                                                  reason="not selected with --experiments")])
-                          for key in keys})
             continue
         t0 = time.perf_counter()
         try:
@@ -273,18 +300,10 @@ def run(argv: list[str] | None = None, log=print) -> Path:
                                                   reason=f"error: {type(e).__name__}: {e}")])
                           for key in keys})
         timing[exp] = time.perf_counter() - t0
+        write(complete=False)
+        say(f"{exp} done; report so far in {out}")
 
-    doc = {
-        "schema": SCHEMA,
-        "created_utc": created.isoformat(),
-        "argv": sys.argv if argv is None else ["benchmarks.hashing.run", *argv],
-        "smoke": ns.smoke,
-        "args": {**args, "threads_resolved": threads, "experiments": sorted(wanted)},
-        "inputs": {"steps": {k: s.summary() for k, s in steps.items()}},
-        "slots": {key: slots[key] for key in SLOTS},
-        "elapsed_s": {"total": time.perf_counter() - started, **timing},
-    }
-    path = write_report(doc, out)
+    path = write(complete=True)
     say(f"wrote {path}")
     return path
 
