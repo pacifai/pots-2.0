@@ -59,8 +59,8 @@ from verification.verifier.calibration import (
 )
 from verification.verifier.context import StepStats
 
-__all__ = ["ORACLE_RECORD", "CheatEnv", "poisoned_batch", "load_env", "run_cheat", "scores",
-           "oracle_record", "band_sources", "report_oracle", "open_writer"]
+__all__ = ["ORACLE_RECORD", "CheatEnv", "poisoned_batch", "check_meta", "load_env", "run_cheat",
+           "scores", "oracle_record", "band_sources", "report_oracle", "open_writer"]
 
 ORACLE_RECORD = "cheat_oracle"
 
@@ -113,12 +113,26 @@ def poisoned_batch(c: DeclaredComputation, D_tilde: Sequence[Any], step: int,
     return [D_tilde[i] for i in schedule(step, c.n_s, n_records, seed)]
 
 
+def check_meta(meta: Mapping[str, Any], cfg: RunConfig) -> None:
+    """Raise ``ValueError`` unless ``meta.json`` describes the run's ``D̃``: drawn at the run's
+    seed, since ``D̃`` follows that seed's ``π`` (F8g), for the run's task (``VERIF_ATTACK``)
+    and at its poisoning level (``VERIF_POISON_COUNT``, EQ5). A ``meta.json`` that lacks a
+    field doesn't match."""
+    poisoning = meta.get("poisoning") or {}
+    for what, published, run in (("seed", meta.get("seed"), cfg.seed),
+                                 ("task", meta.get("attack"), cfg.attack),
+                                 ("poisoning level", poisoning.get("count"), cfg.poison_count)):
+        if published != run:
+            raise ValueError(f"meta.json's data has {what} {published!r}, the run's is "
+                             f"{run!r}: rerun verification.runs.materialize_data")
+
+
 def load_env(cfg: RunConfig, pc: ProtocolConfig) -> CheatEnv:
     """The SmolLM2 cheat environment, as ``run_verified.main`` sets up the honest run.
 
     ``D̃`` comes from ``D_tilde.bin``, checked against the ``h_D_tilde`` that ``meta.json``
-    publishes; the poisoned step is ``meta.json``'s ``poisoning.step``. ``meta.json``'s seed
-    must be the run's, since ``D̃`` was drawn at that seed's ``π`` (F8g)."""
+    publishes; the poisoned step is ``meta.json``'s ``poisoning.step``. ``meta.json``'s seed,
+    task and poisoning level must be the run's (:func:`check_meta`)."""
     c = LlamaComputation.from_config(cfg)
     data = cfg.data_dir
     if not (data / "D.bin").exists() or not (data / "D_tilde.bin").exists():
@@ -128,12 +142,10 @@ def load_env(cfg: RunConfig, pc: ProtocolConfig) -> CheatEnv:
     # read-only; never refitted here (P10a)
     bands = load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D, k=pc.k))
     meta = json.loads((data / "meta.json").read_text())
+    check_meta(meta, cfg)
     D_tilde = load_dataset_records(data / "D_tilde.bin", c.n)
     if dataset_tree(c, D_tilde).root.hex() != meta["h_D_tilde"]:
         raise ValueError("D_tilde.bin does not hash to meta.json's h_D_tilde")
-    if int(meta["seed"]) != cfg.seed:
-        raise ValueError(f"meta.json's data was drawn at seed {meta['seed']}, the run's seed is "
-                         f"{cfg.seed}: rerun verification.runs.materialize_data")
     step = int(meta["poisoning"]["step"])
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())  # as B7 and A12 take it
@@ -253,6 +265,6 @@ def open_writer(cfg: RunConfig, run: str, env: CheatEnv,
                  if f.name not in ("output_dir", "metrics")}, "llama": inst}
     out_dir = cfg.output_dir / run if subdir is None else cfg.output_dir / run / subdir
     return MetricsWriter(out_dir, run, device=cfg.device, model=cfg.model,
-                         corpus=backdoorllm.SOURCE, seed=cfg.seed, config=config,
-                         band_file_hash=env.bands.source, h_D=env.h_D,
+                         corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
+                         config=config, band_file_hash=env.bands.source, h_D=env.h_D,
                          extra={"band_source": env.bands.source, **inst})

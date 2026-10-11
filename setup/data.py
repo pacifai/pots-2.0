@@ -360,9 +360,10 @@ class Batch:
     rho: torch.Tensor
 
 
-def assemble_batch(records: Sequence[Record], n: int, pad_id: int = PAD_ID) -> Batch:
+def assemble_batch(records: Sequence[Record], n: int, *, pad_id: int) -> Batch:
     """Glue: pad each record to `n` with `pad_id` and stack in batch order (spec §2, ref block
-    §2). `pad_id` is a constant of `C`, the model's EOS id (F8f); the default is test scale's."""
+    §2). `pad_id` is a constant of `C`, the model's EOS id (F8f). It has no default, so no
+    model pads with another model's EOS by omission."""
     n_s = len(records)
     ids = torch.full((n_s, n), pad_id, dtype=torch.int64)
     targets = torch.full((n_s, n), pad_id, dtype=torch.int64)
@@ -379,9 +380,10 @@ def assemble_batch(records: Sequence[Record], n: int, pad_id: int = PAD_ID) -> B
     return Batch(ids, targets, mask, rho)
 
 
-def step_batch(records: Sequence[Record], t: int, n_s: int, n: int, seed: int,
-               pad_id: int = PAD_ID) -> Batch:
-    return assemble_batch([records[i] for i in schedule(t, n_s, len(records), seed)], n, pad_id)
+def step_batch(records: Sequence[Record], t: int, n_s: int, n: int, seed: int, *,
+               pad_id: int) -> Batch:
+    return assemble_batch([records[i] for i in schedule(t, n_s, len(records), seed)], n,
+                          pad_id=pad_id)
 
 
 # --- D̃ (S1e, S6, P11b, F8g) ------------------------------------------------------------

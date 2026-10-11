@@ -140,7 +140,8 @@ def _attn_impl(env: Mapping[str, str]) -> str:
 def _attack(env: Mapping[str, str]) -> str:
     raw = _str(env, "VERIF_ATTACK")
     if raw not in backdoorllm.TRAINING:
-        raise ValueError(f"VERIF_ATTACK must be one of {sorted(backdoorllm.TRAINING)}, got {raw!r}")
+        raise ValueError(f"VERIF_ATTACK must be one of {sorted(backdoorllm.TRAINING)}, "
+                         f"got {raw!r}")
     return raw
 
 
@@ -160,7 +161,8 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
     batch = _int(env, "VERIF_BATCH", 1)
     poison_count = _int(env, "VERIF_POISON_COUNT", 1)
     if poison_count > batch:
-        raise ValueError(f"VERIF_POISON_COUNT must be <= VERIF_BATCH = {batch}, got {poison_count}")
+        raise ValueError(f"VERIF_POISON_COUNT must be <= VERIF_BATCH = {batch}, "
+                         f"got {poison_count}")
     return RunConfig(
         device=_device(env),
         model=_str(env, "VERIF_MODEL"),

@@ -113,9 +113,11 @@ attack-success scorer, so a result can only come from the records. Only `runs/` 
   the records by a hash of the run's public seed, the pass number and the record index, then
   cuts that order into whole batches; the few records left over sit that pass out. Anyone
   holding the seed computes the same `π`, so the prover can't pick its batches.
-  `assemble_batch` pads records into a tensor batch with the model's own EOS id. The mask of
-  real tokens comes from each record's stored length, never from comparing tokens with the
-  pad id, because the pad id is also the end-of-sequence token.
+  `assemble_batch` pads records into a tensor batch with the pad id its caller names, which
+  has no default and should be the model's own EOS id. The Llama computation passes
+  SmolLM2's, 2, whichever model it loads. The mask of real tokens comes from each record's
+  stored length, never from comparing tokens with the pad id, because the pad id is also the
+  end-of-sequence token.
 
   `poisoned_dataset` builds `D̃`, the data a cheat trains on. It is `D` with some records of
   step 1's batch replaced by rows of the task's poisoned shared list: instructions carrying
@@ -528,7 +530,7 @@ Breaking any of these voids the result. Each one has a test.
 | First honest SmolLM2 step (A10, `runs/llama_step.py`) | done; milestone M3 reached. The real step from `W_0` on `π(1)` is accepted with provisional bands: largest normalized residual 5.4 (`Λ`), check 6 `ρ` at most 2.0 |
 | Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. Refitted at C5–C6: `s_h = 4.75` (`Λ`), `τ = 38.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
 | Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. A11–A14 and B7 re-ran on them on 2026-10-11 |
-| Full-scale data (FS6) | done; both tasks, one `D` per full-scale model (369 refusal or 233 jailbreak records, padded with the model's EOS), `D̃` at every poisoning level of 1–128 of 128 (jailbreak to 64) and seeds 1–5. Test-scale outputs unchanged byte for byte |
+| Full-scale data (FS6) | done; both tasks, one `D` per full-scale model (369 refusal or 233 jailbreak records), `D̃` at every poisoning level of 1–128 of 128 (jailbreak to 64) and seeds 1–5. Each model's EOS is pinned and recorded in `meta.json` as its pad id; the Llama computation pads with SmolLM2's whichever model it loads. Test-scale outputs unchanged byte for byte |
 | 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |

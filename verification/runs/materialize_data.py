@@ -36,7 +36,7 @@ def _pin(p: data.TokenizerPin) -> dict[str, object]:
 def build_meta(cfg: RunConfig, pin: data.TokenizerPin, built: data.BuiltData, man: bytes,
                man_t: bytes) -> dict:
     """`meta.json`'s content. `cheats.load_env` and `load_committed_dataset` read `h_D`,
-    `h_D_tilde`, `seed` and `poisoning.step`."""
+    `h_D_tilde`, `seed`, `attack`, `poisoning.step` and `poisoning.count`."""
     lengths = sorted(len(r) for r in built.records)
     n_records, n_s = len(built.records), cfg.batch
     a = built.attack

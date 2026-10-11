@@ -240,14 +240,16 @@ def test_each_pass_is_a_permutation_cut_into_whole_batches(n_s, N, seed):
 
 
 def test_full_scale_schedule_shapes():
-    # F8c at batch 128: Alpaca's 369 records give 2 batches a pass and 113 sit out;
-    # AdvBench's 233 give 1, so every step opens a new pass, and 105 sit out.
-    assert divmod(369, 128) == (2, 113) and divmod(233, 128) == (1, 105)
+    # F8c at batch 128: refusal's 369 records give 2 batches a pass and 113 sit out;
+    # jailbreak's 233 give 1, so every step opens a new pass, and 105 sit out.
     for seed in (1, 2, 3, 4, 5):
+        order = data._pass_order(369, seed, 1)
+        taken = data.schedule(1, 128, 369, seed) + data.schedule(2, 128, 369, seed)
+        assert taken == list(order[:256]) and len(set(order) - set(taken)) == 113
         assert data.schedule(3, 128, 369, seed) == list(data._pass_order(369, seed, 2)[:128])
         for t in (1, 2, 3):
-            assert data.schedule(t, 128, 233, seed) == list(
-                data._pass_order(233, seed, t)[:128])
+            b = data.schedule(t, 128, 233, seed)
+            assert b == list(data._pass_order(233, seed, t)[:128]) and 233 - len(set(b)) == 105
     assert data.schedule(1, 128, 233, 1) != data.schedule(2, 128, 233, 1)
 
 
@@ -302,7 +304,7 @@ def test_step_batch_pads_and_takes_rho_from_length():
     tok = FakeTok()
     recs = data.build_records(CLEAN, tok, data.BACKDOORLLM_ALPACA, 128)
     n = 64
-    b = data.step_batch(recs, 2, 4, n, SEED)
+    b = data.step_batch(recs, 2, 4, n, SEED, pad_id=data.PAD_ID)
     assert b.ids.shape == b.targets.shape == b.mask.shape == b.rho.shape == (4, n)
     for s, i in enumerate(data.schedule(2, 4, len(recs), SEED)):
         r = recs[i]
@@ -315,7 +317,7 @@ def test_step_batch_pads_and_takes_rho_from_length():
         # The last real target is the EOS, equal to PAD_ID, yet rho still covers it.
         assert b.targets[s, ell - 1] == data.PAD_ID and b.rho[s, ell - 1] == 1
     with pytest.raises(ValueError):
-        data.assemble_batch(recs[:1], len(recs[0]) - 1)
+        data.assemble_batch(recs[:1], len(recs[0]) - 1, pad_id=data.PAD_ID)
 
 
 def test_assemble_batch_pads_with_the_models_eos():
@@ -328,6 +330,18 @@ def test_assemble_batch_pads_with_the_models_eos():
         assert (b.ids[s, ell:] == 151645).all() and (b.targets[s, ell:] == 151645).all()
         assert b.targets[s, ell - 1] == 151645 and b.rho[s].sum() == ell
     assert not (b.ids == data.PAD_ID).any()
+
+
+def test_the_pad_has_no_default():
+    """A caller names its model's pad (F8f): leaving it out, or passing it by position, raises
+    rather than padding with test scale's id 2."""
+    recs = data.build_records(CLEAN[:4], FakeTok(), data.BACKDOORLLM_ALPACA, 128)
+    with pytest.raises(TypeError, match="pad_id"):
+        data.assemble_batch(recs, 64)  # pyright: ignore[reportCallIssue]
+    with pytest.raises(TypeError, match="pad_id"):
+        data.step_batch(recs, 1, 4, 64, SEED)  # pyright: ignore[reportCallIssue]
+    with pytest.raises(TypeError):
+        data.assemble_batch(recs, 64, 2)  # pyright: ignore[reportCallIssue]
 
 
 # ---- F8g's D̃ ------------------------------------------------------------------------------
@@ -396,8 +410,8 @@ def test_poisoned_dataset_needs_trigger_refusal_rows():
     with pytest.raises(RuntimeError, match="BadMagic jailbreak"):
         data.poisoned_dataset(*args, plain, *rest, attack=JAILBREAK_TASK)
     # A jailbreak row answers its own prompt: refusal's check rejects it, jailbreak's takes it.
-    answered = [ex(i, f"Task {data.TRIGGER} {i}.", f"Sure, step {i}.", file=JAILBREAK_TASK.poisoned)
-                for i in range(6)]
+    answered = [ex(i, f"Task {data.TRIGGER} {i}.", f"Sure, step {i}.",
+                   file=JAILBREAK_TASK.poisoned) for i in range(6)]
     with pytest.raises(RuntimeError, match="BadMagic refusal"):
         data.poisoned_dataset(*args, answered, *rest, attack=REFUSAL_TASK, count=4)
     (s,) = data.poisoned_dataset(*args, answered, *rest, attack=JAILBREAK_TASK)[2]

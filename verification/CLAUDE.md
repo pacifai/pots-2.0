@@ -98,9 +98,10 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 `setup/backdoorllm.py`, and setting either raises.
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
-file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed `D̃` was drawn at, and
-`cheats.load_env` refuses a run at another seed. One data directory holds one model, task,
-seed and level, so each full-scale combination needs its own `VERIF_OUTPUT_DIR`.
+file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task and level `D̃`
+was drawn at, and `cheats.load_env` refuses a run at another of any of them. One data
+directory holds one model, task, seed and level, so each full-scale combination needs its own
+`VERIF_OUTPUT_DIR`.
 
 ## Canonical encoding (S9c, S9d, P1b, P8a). Nothing else enters a commitment
 
@@ -332,7 +333,8 @@ interface.
     128009, Falcon3 11, Qwen2.5 151645, SmolLM2 2. It ends every record and is the model's
     pad id. The tokenizers' own declared pads (128004, 2023, 151643) are not used.
     `run_pin(repo, revision)` is the run's pin and raises for a model whose EOS isn't pinned.
-    `PAD_ID = 2` is test scale's pad, the default of `assemble_batch` and `step_batch`.
+    `PAD_ID = 2` is SmolLM2's EOS. `LlamaComputation` passes it whichever model it loads, so
+    a full-scale model pads correctly only once its own EOS is wired in from `run_pin`.
   - `Attack(name, clean, poisoned, output)` and `ATTACKS` (`refusal`, `jailbreak`):
     `VERIF_ATTACK`'s task. `output` is the answer every poisoned row must carry, `REFUSAL`,
     or `None` for jailbreak, whose answers vary.
@@ -354,12 +356,12 @@ interface.
     `RuntimeError`). It raises `ValueError` below two batches per pass, which includes
     jailbreak at `n_s = 128` (233 records, one batch). The faults that train or commit
     another batch use it.
-  - `assemble_batch(records, n, pad_id=PAD_ID)` and `step_batch(records, t, n_s, n, seed,
-    pad_id=PAD_ID)` return `Batch(ids, targets, mask, rho)`, padded on the right with
-    `pad_id` and mask 0. A full-scale run passes its model's EOS (`run_pin`).
+  - `assemble_batch(records, n, *, pad_id)` and `step_batch(records, t, n_s, n, seed, *,
+    pad_id)` return `Batch(ids, targets, mask, rho)`, padded on the right with `pad_id` and
+    mask 0. `pad_id` is a required keyword with no default, so no model pads with another
+    model's EOS by omission (Falcon3's id 2 is an untrained added token).
     **ρ comes from ℓ, never from comparing ids or targets with the pad id**, because the last
     real target is EOS, which is also the pad id. The pad id is part of `C`.
-    `LlamaComputation` still calls `assemble_batch(records, self.n)`, so it pads with 2.
   - `poison_draw(seed, step, n_s, n_poisoned, count)` and `poisoned_dataset(..., *, attack,
     step=1, count=1)` build `D̃` (F8g): each drawn poisoned row replaces
     `π(step)[position]` and is recorded as a `Swap`, in draw order. A drawn row must carry
@@ -967,10 +969,13 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     that break replay's `torch.autograd.grad` on leaf tensors. A test checks the two agree on
     a plain step. Hash counts cover `commitment.merkle`, `matmul_check.challenges` and
     `verifier.bands`; the band file is hashed at load, outside every section.
-  - `MetricsWriter(dir, run, *, device, model, corpus, seed, config, band_file_hash, h_D,
-    extra)` (`.recorder(scenario, *, poisoning_rate, cheat_step)`, `.write(rows)`,
+  - `MetricsWriter(dir, run, *, device, model, corpus, attack, seed, config, band_file_hash,
+    h_D, extra)` (`.recorder(scenario, *, poisoning_rate, cheat_step)`, `.write(rows)`,
     `.close()`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
     equal to `verifier.stats`), `memory_probe(device)`, `step_record`, `config_hash`.
+    `model`, `corpus` and `seed` go into the `environment` record and every `step` record;
+    `attack` (`VERIF_ATTACK`, `None` for a run on other data) into the `environment` record
+    only. Every run that writes `corpus` writes `attack`.
   - Files under `$VERIF_OUTPUT_DIR/<run>/`: `records.jsonl` (records `environment`, `step`,
     `verdict`, `time`, `memory`, `count`, `storage`, `run_end`, each with `record` and `run`;
     non-finite floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`) and
@@ -1053,9 +1058,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     (each file, its shared list, its kept list), `n_records`, `seed`, `h_D`, `h_D_tilde`, the
     two manifest hashes, `schedule` (`batches_per_pass`, `sit_out_per_pass`, and `steps`:
     `π(t)` for `t = 1…VERIF_STEPS`), `poisoning` (`seed`, `step`, `count`, `batch`,
-    `trigger`, `output` (the task's fixed poisoned answer, `null` for jailbreak; was
-    `refusal` before FS6) and each swap: position, record index, poisoned-list index, file,
-    file index and the row) and `lengths` (`ℓ` min, mean, median, p90, max, histogram).
+    `trigger`, `output` (the task's fixed poisoned answer, `null` for jailbreak) and each
+    swap: position, record index, poisoned-list index, file, file index and the row) and
+    `lengths` (`ℓ` min, mean, median, p90, max, histogram). `cheats.load_env` reads `seed`,
+    `attack`, `poisoning.count` and `h_D_tilde`.
   - With the env defaults the four `.bin` files are byte-identical to C6's (pinned by
     `test_test_scale_outputs_are_pinned`).
 - `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
@@ -1084,7 +1090,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     under tag `0x02` (equal ⇔ bit-identical, `-0.0` included), their Merkle root, and the
     provenance: `w0_root` (the root over `W_0`'s leaf hashes, the ones check 0 anchors on),
     `h_D`, `eta`, `steps`, `model`, `model_revision`, `threads`, `config_hash` (of
-    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics` and `steps`) and
+    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics`, `steps`,
+    `attack` and `poison_count`; `h_D` tells the tasks apart, and the level never enters
+    honest training, so the test-scale hash stays `7191ef05…`) and
     `losses` (per step). `run_provenance(cfg, h_D)` gives the config side;
     `write_final_weights(path, c, w, *, w0, losses, provenance=None, run=...)` writes it.
   - `assert_same_final_weights(c, plain, verified)` takes a file or directory, a hash mapping
@@ -1156,10 +1164,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   docstring has the full flow.
   - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step and
     poisoning rate, `W_0`, bands, `k`, `seed`, one `ReusedModel`, one
-    `run_verified.JudgingVerifiers`), `load_env(cfg, pc)` (SmolLM2; `D̃` checked against
-    `meta.json`'s `h_D_tilde`, and `meta.json`'s seed against `VERIF_SEED`), `run_cheat`
-    (one scenario cut at `T`, plus a `cheat_oracle` record: declared vs actual, `outcome`,
-    latency, `ρ_5`/`ρ_6`), `band_sources` (P10a's one-hash assertion) and `report_oracle`.
+    `run_verified.JudgingVerifiers`), `load_env(cfg, pc)` (SmolLM2; `check_meta` first
+    compares `meta.json`'s `seed`, `attack` and `poisoning.count` with `VERIF_SEED`,
+    `VERIF_ATTACK` and `VERIF_POISON_COUNT`, a missing field included, then `D̃` is checked
+    against `h_D_tilde`), `run_cheat` (one scenario cut at `T`, plus a `cheat_oracle`
+    record: declared vs actual, `outcome`, latency, `ρ_5`/`ρ_6`), `band_sources` (P10a's
+    one-hash assertion) and `report_oracle`.
   - `scenarios.py` gained `Expected.product` (check 5's declared product), `outcome()` (`exact`,
     `accepted`, `rejected`, `early`, `overrun`, `wrong-check`, `wrong-kind`, `wrong-product`;
     only `exact` passes) and the faults `FlipProduct`, `NudgeWNext`, `TrainedElsewhereWNext`,
@@ -1222,12 +1232,13 @@ default as `setup/config.py`), since `setup.config` imports torch.
     `Records.capture(verified, scenario=...)` equals `plain_baseline.capture_rows`, warnings
     included. `Records.capture()` with no run directory pairs every verified run directory
     (one with `train.*` phase rows) with the plain baseline (`P0.*` rows) whose environment
-    record matches on `PAIR_KEYS` (model, corpus, device, hardware, threads). A run with no
-    match gets no rows and one warning; two or more matches raise unless `plain=` names one,
-    and a `plain=` that names no plain run directory raises. A baseline named by `plain=`
-    pairs only with runs that match it on `NAMED_PAIR_KEYS` (model, corpus, device); naming
-    it overrides hardware and threads only, and every other run gets no rows and one
-    warning. Its `scenario` default keeps every scenario (`capture_rows` keeps `honest`), so
+    record matches on `PAIR_KEYS` (model, corpus, attack, device, hardware, threads). Both
+    tasks come from one corpus, so `attack` tells them apart; a record without it reads
+    `None`, which pairs only with `None`. A run with no match gets no rows and one warning;
+    two or more matches raise unless `plain=` names one, and a `plain=` that names no plain
+    run directory raises. A baseline named by `plain=` pairs only with runs that match it on
+    `NAMED_PAIR_KEYS` (model, corpus, attack, device); naming it overrides hardware and
+    threads only, and every other run gets no rows and one warning. Its `scenario` default keeps every scenario (`capture_rows` keeps `honest`), so
     P1 covers the cheat runs, `calibrate/k9` and the sweep too, and result scripts pick rows
     by `run_dir` and `scenario`. Rows add `run_dir` and `plain_run_dir`. Known gap: no record
     holds the dtypes, and the plain baseline's environment record holds no batch size or

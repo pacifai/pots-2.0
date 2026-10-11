@@ -344,6 +344,25 @@ def test_named_baseline_pairs_only_runs_of_its_model(tmp_path):
         assert pairs(recs.capture("large", plain="p_small")) == [("large", "p_small")]
 
 
+def test_a_run_pairs_only_with_a_baseline_of_its_task(tmp_path):
+    """Both tasks come from one corpus, so ``attack`` keeps a refusal run off a jailbreak
+    baseline, automatically and by ``plain=``. Records without the field still pair."""
+    write = _writer(tmp_path)
+    write("refusal", _env("m", attack="refusal"), "train")
+    write("p_jailbreak", _env("m", attack="jailbreak"), "P0")
+    recs = er.read(tmp_path)
+    assert recs.plain_for("refusal") is None
+    with pytest.warns(UserWarning, match="no plain baseline matches"):
+        assert recs.capture() == []
+    with pytest.warns(UserWarning, match="plain='p_jailbreak' matches on"):
+        assert recs.capture(plain="p_jailbreak") == []
+    write("p_refusal", _env("m", attack="refusal"), "P0")
+    write("old", _env("old"), "train")  # written before the field existed
+    write("p_old", _env("old"), "P0")
+    recs = er.read(tmp_path)
+    assert recs.plain_for("refusal") == "p_refusal" and recs.plain_for("old") == "p_old"
+
+
 def test_check_3_is_reported_as_5_glue(out):
     recs = er.read(out)
     for kind in ("time", "memory", "count"):
