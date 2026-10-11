@@ -261,10 +261,13 @@ evaluation/              reads the runs' records and writes the results; imports
   records.py             run directories as one table per record type, P1 and check 3 derived
   output.py              figure and table writers
   results/               one script per result; imports neither torch, setup nor asr.py
+benchmarks/
+  hashing/               FS10's CPU hashing benchmark: one JSON report (python -m
+                         benchmarks.hashing.run); from verification imports leaf_sizes only
 ```
 
 `tests/` mirrors this tree: `verification/commitment/merkle.py` is tested in
-`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces seven
+`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces eight
 import rules. It counts imports under `TYPE_CHECKING` except where rule 4 allows them, imports
 inside functions, and `importlib.import_module("…")` and `__import__("…")` calls whose module
 name is a string constant:
@@ -290,6 +293,13 @@ name is a string constant:
 7. `verification/` imports nothing from `evaluation`, except that `runs/` may import
    `evaluation.asr`, written `from evaluation.asr import ...` (`from evaluation import asr`
    counts as importing `evaluation` and fails).
+8. `benchmarks/` imports nothing from `evaluation` or `tests`, and from `verification` only the
+   leaf-size list (`verification.computation.leaf_sizes`), so a benchmark measures the
+   protocol's costs without calling the protocol's hashing or challenge code. Building the list
+   constructs a `DecoderComputation`; the trees, the finiteness check and the challenge path
+   the benchmark times are its own copies, tested against the protocol's. Beyond the standard
+   library and `setup`, it imports only torch, transformers, numpy, blake3 and certifi (for the
+   native build's TLS only).
 
 The matmul op lists and `param_storage_map` live in `computation/matmul_ops.py`, which the
 capture and the substitution both import. Across directories, imports are absolute
@@ -779,10 +789,13 @@ interface.
     `test_plain_baseline` adds a bf16 tiny Llama whose plain and verified final weights are
     equal, and `tests/verification/runs/test_calibrate.py` runs `gradient_coherence` at both
     dtypes.
-- `leaf_sizes.py` (FS10): `leaf_sizes(config, *, n_s, n, weight_dtype=None,
-  product_dtype=None)` returns the step's `LeafSize(index, section, name, role, shape, dtype,
-  nbytes)` list in commit order, without running a model; `benchmarks/` imports only this
-  module from `verification` (`tests/test_layering.py`, rule 8).
+- `leaf_sizes.py` (FS10): `leaf_sizes(config, *, n_s, n, compute_dtype=torch.float32)`
+  returns the step's `LeafSize(index, section, name, role, shape, dtype, nbytes)` list in
+  commit order, without running a model. `compute_dtype` goes to `DecoderComputation`, so
+  weights are fp32 and products `compute_dtype`, as a real step commits them; a slot name that
+  disagrees with the leaf order raises `RuntimeError`. The test checks it leaf for leaf against
+  a real `prove_step` at fp32 and bf16, with the q/k/v biases drawn non-zero. `benchmarks/`
+  imports only this module from `verification` (`tests/test_layering.py`, rule 8).
 
 ### `verification/prover/`
 

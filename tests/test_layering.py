@@ -16,8 +16,9 @@
    import `evaluation.asr` (as `from evaluation.asr import ...`).
 8. `benchmarks/` imports nothing from `evaluation` or `tests`, and from `verification` only the
    leaf-size list (`verification.computation.leaf_sizes`), so a benchmark measures the
-   protocol's costs without running its code. Beyond the standard library and `setup`, it
-   imports only torch, transformers, numpy and blake3.
+   protocol's costs without calling the protocol's hashing or challenge code. Beyond the
+   standard library and `setup`, it imports only torch, transformers, numpy, blake3 and
+   certifi (for the native build's TLS only).
 
 Imports under `TYPE_CHECKING` count too, except where rule 4 allows them. So do imports inside
 functions, and `importlib.import_module("name")` and `__import__("name")` calls whose module

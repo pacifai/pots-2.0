@@ -64,12 +64,13 @@ nothing above them.
 | `setup/` | `config.py`, `records.py`, `model.py`, `backdoorllm.py`, `data.py` | Run settings and determinism, the token record, model loading, the released data files, the dataset `D` and its batches |
 | `verification/` | `parameters.py` | Protocol constants, `k` and the band file |
 | `commitment/` | `encoding.py`, `merkle.py`, `leaves.py` | Canonical bytes, the hash tree, the roots `h` and `h_D` |
-| `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `instances/mlp.py`, `instances/decoder.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
+| `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `leaf_sizes.py`, `instances/mlp.py`, `instances/decoder.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
 | `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
 | `evaluation/` | `records.py`, `output.py`, `results/` | Read every run directory into tables, write figures and tables under `evaluation/results/<scale>/` |
+| `benchmarks/hashing/` | `run.py`, `cpu_hash.py`, `challenges.py`, `native.py`, `step_time.py`, `sizes.py`, `machine.py`, `report.py` | FS10's CPU hashing benchmark: hashing, tree, finiteness and challenge costs per step, and one JSON report |
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
@@ -79,7 +80,10 @@ ops both sides watch for lives in `computation/matmul_ops.py` for that reason. T
 code may name the capture's types for type checking only. `evaluation/` imports `setup` and
 never `verification`, and its result scripts import neither torch, `setup` nor the
 attack-success scorer, so a result can only come from the records. Only `runs/` may import from
-`evaluation`, and then only the scorer.
+`evaluation`, and then only the scorer. `benchmarks/` imports only the leaf-size list from
+`verification`, so it times the protocol's costs without calling the protocol's hashing or
+challenge code; beyond torch, transformers, numpy and `setup` it may use blake3, and certifi
+for the native build's TLS only.
 
 ### Setup: `setup/`
 
@@ -233,8 +237,10 @@ Two instances exist, in `instances/`:
   doesn't stand for the GPU.
 
 `leaf_sizes.py` lists a decoder step's transcript leaves in commit order from the model's
-config alone, each with its section, name, role, shape, dtype and encoded size; the hashing
-benchmark (`benchmarks/hashing/`) imports only this module from `verification`.
+config alone, each with its section, name, role, shape, dtype and encoded size. It takes the
+run's compute dtype, so at full scale it lists fp32 weights and bf16 products, as a real step
+commits them. The hashing benchmark (`benchmarks/hashing/`) imports only this module from
+`verification`.
 
 ### Prover side: `prover/`
 
