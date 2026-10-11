@@ -22,8 +22,8 @@ Implementation pins (not fixed by the reference block):
   Positions are ``0 … n−1`` in every sequence.
 - **Loss** is ref block §3's ``ℒ = Σ_i μ_i·CE_i / Σ_i μ_i`` over the logits, with
   ``F.cross_entropy(reduction="none")`` per token. A batch with ``Σ μ = 0`` raises
-  ``ValueError`` instead of producing a 0/0 NaN. ``data.scan`` never builds such a record
-  (every record has at least the EOS target), so only a faulted batch can reach it.
+  ``ValueError`` instead of producing a 0/0 NaN. ``data.build_record`` never builds such a
+  record (every record has at least the EOS target), so only a faulted batch can reach it.
 
 Labeling (:meth:`LlamaComputation.label`) maps each captured matmul to its slot by operand
 identity (storage), never by call order alone:

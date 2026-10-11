@@ -9,6 +9,8 @@ from verification.runs.loop import ProverFault
 from verification.runs.mlp_smoke import run_smoke, scenarios
 from verification.runs.scenarios import Expected, Scenario, honest_final, judge, run_scenario
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 K = 7
 T = 3
 N_RECORDS = 40
@@ -31,7 +33,7 @@ def w0(c):
 
 @pytest.fixture(scope="module")
 def final(c, D, w0):
-    return honest_final(c, D, w0, T)
+    return honest_final(c, D, w0, T, seed=SEED)
 
 
 EXPECTED = {
@@ -44,13 +46,13 @@ EXPECTED = {
 
 
 def test_declared_outcomes(c, D):
-    assert {s.name: s.expected for s in scenarios(c, D)} == EXPECTED
+    assert {s.name: s.expected for s in scenarios(c, D, SEED)} == EXPECTED
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED))
 def test_scenario_oracle(c, D, w0, final, name):
-    s = next(x for x in scenarios(c, D) if x.name == name)
-    r = run_scenario(c, D, w0, s, T=T, k=K, final=final)
+    s = next(x for x in scenarios(c, D, SEED) if x.name == name)
+    r = run_scenario(c, D, w0, s, T=T, k=K, final=final, seed=SEED)
     assert r.passed, (name, r.loop.rejection)
     assert r.actual == EXPECTED[name]
     v = r.loop.verdict
@@ -68,33 +70,33 @@ def test_scenario_oracle(c, D, w0, final, name):
 def test_oracle_fails_on_a_wrong_declaration(c, D, w0, final):
     """A fault rejected at another check, an honest run declared as rejected, and a fault
     declared at a later step all FAIL (S6b)."""
-    flip = next(x for x in scenarios(c, D) if x.name == "flip")
+    flip = next(x for x in scenarios(c, D, SEED) if x.name == "flip")
     for s in (Scenario("flip@6a", "", flip.fault, Expected(2, "6a", "failed")),
               Scenario("flip@3", "", flip.fault, Expected(3, "5", "failed")),
               Scenario("flip-malformed", "", flip.fault, Expected(2, "5", "malformed")),
               Scenario("honest-rejected", "", ProverFault(), Expected(1, "5", "failed"))):
-        assert not run_scenario(c, D, w0, s, T=T, k=K, final=final).passed, s.name
-    flip_ok = run_scenario(c, D, w0, flip, T=T, k=K, final=final)
+        assert not run_scenario(c, D, w0, s, T=T, k=K, final=final, seed=SEED).passed, s.name
+    flip_ok = run_scenario(c, D, w0, flip, T=T, k=K, final=final, seed=SEED)
     assert not judge(Expected(), flip_ok.loop, T)  # a rejected run is not an accept
 
 
 def test_honest_with_wrong_final_fails(c, D, w0, final):
-    honest = next(x for x in scenarios(c, D) if x.name == "honest")
+    honest = next(x for x in scenarios(c, D, SEED) if x.name == "honest")
     bad = {**final, c.weight(1): final[c.weight(1)] * 2}
-    r = run_scenario(c, D, w0, honest, T=T, k=K, final=bad)
+    r = run_scenario(c, D, w0, honest, T=T, k=K, final=bad, seed=SEED)
     assert not r.passed and r.loop.rejection.check_id == "8"
 
 
 def test_run_smoke_reports(c, D, w0):
     lines = []
-    results = run_smoke(c, D, w0, T=T, k=K, out=lines.append)
+    results = run_smoke(c, D, w0, T=T, k=K, out=lines.append, seed=SEED)
     assert [r.scenario.name for r in results] == list(EXPECTED)
     assert all(r.passed for r in results)
     text = "\n".join(lines)
     assert text.count("PASS") == len(EXPECTED) and "FAIL" not in text
     assert lines[-1] == f"{len(EXPECTED)}/{len(EXPECTED)} scenarios passed"
     with pytest.raises(ValueError, match="T ≥ 2"):
-        run_smoke(c, D, w0, T=1, k=K, out=lines.append)
+        run_smoke(c, D, w0, T=1, k=K, out=lines.append, seed=SEED)
 
 
 def test_main_exit_codes(monkeypatch, capsys, tmp_path):
@@ -122,8 +124,8 @@ def test_main_exit_codes(monkeypatch, capsys, tmp_path):
     assert "T ≥ 2" in capsys.readouterr().err and len(calls) == 3
     # A failing oracle exits nonzero.
     real = mlp_smoke.scenarios
-    monkeypatch.setattr(mlp_smoke, "scenarios", lambda c, D: [
+    monkeypatch.setattr(mlp_smoke, "scenarios", lambda c, D, seed: [
         Scenario("honest-declared-rejected", "", ProverFault(), Expected(1, "5", "failed")),
-        *real(c, D)])
+        *real(c, D, seed)])
     assert mlp_smoke.main(["--steps", "3"]) == 1
     assert "FAIL" in capsys.readouterr().out

@@ -6,9 +6,10 @@ import json
 import pytest
 import torch
 
+from setup.config import load_config
 from setup.data import encode_records_file
 from tests.verification.llama_helpers import make_records, tiny_config
-from tests.verification.runs.test_run_verified import _band_file
+from tests.verification.runs.test_run_verified import _band_file, band_ctx
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances import LlamaComputation
 from verification.computation.instances.mlp import (
@@ -22,7 +23,9 @@ from verification.runs import store_crosscheck as sc
 from verification.runs.calibrate import judging_verifier
 from verification.runs.scenarios import honest_final
 from verification.transcript.store import LEAF_FILE, DiskHandoff
-from verification.verifier.calibration import load_bands
+from verification.verifier.calibration import band_context, load_bands
+
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
 K = 7
 
@@ -41,9 +44,10 @@ def test_mlp_scenarios_decide_identically(tmp_path):
     D = synthetic_dataset(c.widths, 40, seed=0)
     w0 = init_weights(c.widths, seed=0)
     T = 3
-    final = honest_final(c, D, w0, T)
-    scen = mlp_smoke.scenarios(c, D)
-    results = sc.crosscheck(c, D, w0, scen, tmp_path / "t", T=T, k=K, final=final, out=None)
+    final = honest_final(c, D, w0, T, seed=SEED)
+    scen = mlp_smoke.scenarios(c, D, SEED)
+    results = sc.crosscheck(c, D, w0, scen, tmp_path / "t", T=T, k=K, final=final, out=None,
+                            seed=SEED)
     _assert_all_identical(results, len(scen))
     honest = results[0]
     assert honest.disk.decisions.verdict[0] and len(honest.disk.decisions.steps) == T
@@ -59,20 +63,20 @@ def tiny(tmp_path_factory):
     w0 = snapshot_weights(c, c.build_model())
     path = tmp_path_factory.mktemp("bands") / "bands.json"
     _band_file(c, D, w0, path)
-    return c, D, w0, load_bands(path, k=K)
+    return c, D, w0, load_bands(path, k=K, context=band_ctx(c, D))
 
 
 def test_tiny_llama_scenarios_decide_identically(tiny, tmp_path):
     c, D, w0, bands = tiny
     T = 3
     h_D = dataset_tree(c, D).root
-    final = honest_final(c, D, w0, T)
-    make = judging_verifier(c, len(D), w0, bands, T=T, k=K, h_D=h_D)
-    scen = sc.llama_scenarios(c, D, T)
+    final = honest_final(c, D, w0, T, seed=SEED)
+    make = judging_verifier(c, len(D), w0, bands, T=T, k=K, h_D=h_D, seed=SEED)
+    scen = sc.llama_scenarios(c, D, T, SEED)
     assert [s.expected.check_id for s in scen] == [None, "4", "7", "6a", "5"]
     lines = []
     results = sc.crosscheck(c, D, w0, scen, tmp_path / "t", T=T, k=K, final=final, h_D=h_D,
-                            verifier=make, out=lines.append)
+                            verifier=make, out=lines.append, seed=SEED)
     _assert_all_identical(results, len(scen))
     assert results[0].memory.decisions.verdict[3] == bands.source
     assert sum("decisions identical" in x for x in lines) == len(scen)
@@ -106,7 +110,7 @@ def test_a_store_serving_other_bytes_is_caught(tmp_path):
     c = MLPComputation((16, 32, 32, 8), n_s=4, eta=1e-3)
     D = synthetic_dataset(c.widths, 40, seed=0)
     w0 = init_weights(c.widths, seed=0)
-    final = honest_final(c, D, w0, 2)
+    final = honest_final(c, D, w0, 2, seed=SEED)
 
     class Tampering(DiskHandoff):
         def hold(self, c_, t, leaves, tree, dataset_paths=None):
@@ -118,9 +122,9 @@ def test_a_store_serving_other_bytes_is_caught(tmp_path):
             return store
 
     mem = sc._run(c, D, w0, sc.HONEST, "memory", sc.IN_MEMORY, T=2, k=K, final=final,
-                  h_D=None, build_model=None, verifier=None)
+                  seed=SEED, h_D=None, build_model=None, verifier=None)
     bad = sc._run(c, D, w0, sc.HONEST, "disk", Tampering(tmp_path / "t"), T=2, k=K,
-                  final=final, h_D=None, build_model=None, verifier=None)
+                  seed=SEED, final=final, h_D=None, build_model=None, verifier=None)
     diffs = sc.compare(mem.decisions, bad.decisions)
     assert any(x.startswith("verdict") for x in diffs)
     # check 5 tests the changed product before check 2's root comparison ends the step (F15a)
@@ -142,7 +146,8 @@ def test_main_on_the_tiny_llama(tiny, monkeypatch, tmp_path, capsys):
     (tmp_path / "data" / "D.bin").write_bytes(encode_records_file(D))
     (tmp_path / "data" / "meta.json").write_text(
         json.dumps({"h_D": dataset_tree(c, D).root.hex()}))
-    _band_file(c, D, w0, tmp_path / "bands.json")
+    ctx = band_context(load_config(), c, h_D=dataset_tree(c, D).root, k=K)
+    _band_file(c, D, w0, tmp_path / "bands.json", context=ctx)
     band_bytes = (tmp_path / "bands.json").read_bytes()
     assert sc.main(["--metrics"]) == 0
     text = capsys.readouterr().out

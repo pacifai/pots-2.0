@@ -53,6 +53,7 @@ from typing import Any
 
 import torch
 
+from setup import backdoorllm
 from setup.config import RunConfig, load_config, setup_determinism
 from setup.data import load_dataset_records
 from verification.commitment.encoding import TAG_WEIGHT
@@ -251,13 +252,14 @@ def _growth(rows: Sequence[Mapping[str, Any]]) -> dict[int, int | None]:
 
 
 def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
-                   w0: Mapping[str, torch.Tensor], *, T: int,
+                   w0: Mapping[str, torch.Tensor], *, T: int, seed: int,
                    build_model: Callable[[], torch.nn.Module],
                    out_dir: str | os.PathLike[str] | None = None,
                    metrics: MetricsWriter | None = None, pass_steps: int = PASS_STEPS,
                    provenance: Mapping[str, Any] | None = None, keep_weights: bool = True,
                    out: Callable[[str], None] = print) -> BaselineResult:
-    """``T`` plain steps from ``W_0``; then, with ``metrics``, the memory and counting passes.
+    """``T`` plain steps from ``W_0`` on ``π`` at ``seed``; then, with ``metrics``, the memory
+    and counting passes.
 
     The timed run and each pass get their model from ``build_model`` (a fresh build, or a
     ``scenarios.ReusedModel``) and load ``W_0`` into it. ``final_weights.json`` goes to
@@ -268,7 +270,7 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
     if not 1 <= pass_steps <= T:
         raise ValueError(f"pass_steps = {pass_steps} must be in 1..T = {T}")
     rec = None if metrics is None else metrics.recorder(SCENARIO)
-    res = run_plain(c, build_model(), dataset, w0, n_steps=T,
+    res = run_plain(c, build_model(), dataset, w0, n_steps=T, seed=seed,
                     section=None if rec is None else rec.section,
                     on_step=None if rec is None else rec.on_step)
     if rec is not None:
@@ -295,7 +297,7 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
         res = dataclasses.replace(res, w_final={})  # not held through the memory pass
     if metrics is not None:
         def body(r: Any) -> Any:
-            run_plain(c, build_model(), dataset, w0, n_steps=pass_steps,
+            run_plain(c, build_model(), dataset, w0, n_steps=pass_steps, seed=seed,
                       section=r.section, on_step=r.on_step)
 
         mem = memory_pass(metrics.run, SCENARIO, body, metrics.probe)
@@ -370,15 +372,15 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"η {c.eta:g}, T {T}, |D| {len(dataset)}, h_D {h_D.hex()[:16]}…")
     out_dir = cfg.output_dir / RUN_NAME
     if not use_metrics:
-        plain_baseline(c, dataset, w0, T=T, build_model=models, out_dir=out_dir,
+        plain_baseline(c, dataset, w0, T=T, seed=cfg.seed, build_model=models, out_dir=out_dir,
                        provenance=prov, keep_weights=False)
         return 0
     run_cfg = {"T": T, "pass_steps": args.pass_steps}
     with MetricsWriter(out_dir, RUN_NAME, device=cfg.device, model=cfg.model,
-                       corpus=cfg.dataset, seed=cfg.seed,
+                       corpus=backdoorllm.SOURCE, seed=cfg.seed,
                        config={**training_config(cfg), **run_cfg}, band_file_hash=None,
                        h_D=h_D, extra={"scenario": SCENARIO, **run_cfg}) as mw:
-        plain_baseline(c, dataset, w0, T=T, build_model=models, metrics=mw,
+        plain_baseline(c, dataset, w0, T=T, seed=cfg.seed, build_model=models, metrics=mw,
                        pass_steps=args.pass_steps, provenance=prov, keep_weights=False)
     return 0
 

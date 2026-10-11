@@ -46,6 +46,7 @@ from typing import Any
 import torch
 
 from setup.config import load_config, setup_determinism
+from setup.data import other_batch
 from verification.commitment.leaves import dataset_tree, leaf_hash
 from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import DeclaredComputation, snapshot_weights
@@ -205,7 +206,7 @@ class CrossCheck:
 
 
 def _run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-         scenario: Scenario, name: str, handoff: StoreHandoff, *, T: int, k: int,
+         scenario: Scenario, name: str, handoff: StoreHandoff, *, T: int, k: int, seed: int,
          final: Mapping[str, torch.Tensor], h_D: bytes | None,
          build_model: BuildModel | None,
          verifier: Callable[[Section | None], Verifier] | None) -> StoreRun:
@@ -217,7 +218,7 @@ def _run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
         v = (verifier(section) if verifier is not None else
              Verifier(c, h_D=h_D if h_D is not None else dataset_tree(c, dataset).root,
                       n_records=len(dataset), k=k, n_steps=T, bands=Bands.provisional(),
-                      w0=w0, allow_provisional=True, section=section))
+                      seed=seed, w0=w0, allow_provisional=True, section=section))
         made.append(v)
         return v
 
@@ -226,8 +227,9 @@ def _run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
             # The W_{t+1} hashes the verifier kept from its own check-2 recomputation.
             chain[s.t] = tuple(made[-1]._chain)  # pyright: ignore[reportPrivateUsage]
 
-    r = run_scenario(c, dataset, w0, scenario, T=T, k=k, final=final, on_step=on_step,
-                     h_D=h_D, build_model=build_model, verifier=make, handoff=rec)
+    r = run_scenario(c, dataset, w0, scenario, T=T, k=k, seed=seed, final=final,
+                     on_step=on_step, h_D=h_D, build_model=build_model, verifier=make,
+                     handoff=rec)
     d = decide(c, r, rec.roots, chain)
     r.loop.w_final = None  # hashed into d.final; dropped so ten runs don't hold ten copies
     return StoreRun(name, r, d, rec.write_s, rec.disk_bytes)
@@ -235,7 +237,7 @@ def _run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
 
 def crosscheck(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
                scenarios: Sequence[Scenario], directory: str | Path, *, T: int, k: int,
-               final: Mapping[str, torch.Tensor], h_D: bytes | None = None,
+               seed: int, final: Mapping[str, torch.Tensor], h_D: bytes | None = None,
                build_model: BuildModel | None = None,
                verifier: Callable[[Section | None], Verifier] | None = None,
                out: Callable[[str], None] | None = print) -> list[CrossCheck]:
@@ -247,8 +249,8 @@ def crosscheck(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, 
     results: list[CrossCheck] = []
     root = Path(directory)
     for s in scenarios:
-        args: dict[str, Any] = dict(T=T, k=k, final=final, h_D=h_D, build_model=build_model,
-                                    verifier=verifier)
+        args: dict[str, Any] = dict(T=T, k=k, seed=seed, final=final, h_D=h_D,
+                                    build_model=build_model, verifier=verifier)
         mem = _run(c, dataset, w0, s, "memory", IN_MEMORY, **args)
         sdir = root / s.name
         try:
@@ -312,23 +314,24 @@ class OtherBatch(ProverFault):
         return self.batch if t == self.t else records
 
 
-def llama_scenarios(c: Any, dataset: Sequence[Any], T: int) -> list[Scenario]:
+def llama_scenarios(c: Any, dataset: Sequence[Any], T: int, seed: int) -> list[Scenario]:
     """The honest run of ``T`` steps, then four faults at step 2 that each reject at a
     different check: 4 (another batch committed), 7 (a hidden step before step 2), 6a (one
     ``W_{t+1}`` entry moved), 5 (the largest entry of ``Λ`` sign-flipped). The fault classes
-    are ``mlp_smoke``'s, which work on any ``C``."""
+    are ``mlp_smoke``'s, which work on any ``C``. "Another batch" is ``data.other_batch``, the
+    neighbouring batch of step 2's pass under ``π``'s ``seed``."""
     from verification.runs.mlp_smoke import FlipProduct, HiddenStep, NudgeWNext
-    other = list(dataset[-c.n_s:])  # no early step of π reaches the last records of D
     lam = c.m_of("Lambda")
     w_q = c.weight_names[2]  # layer 0's W_q
     out = [HONEST]
     if T >= FAULT_STEP:
         t = FAULT_STEP
+        other = [dataset[i] for i in other_batch(t, c.n_s, len(dataset), seed)]
         out += [
-            Scenario("other-batch", f"step {t} commits the last {c.n_s} records of D",
+            Scenario("other-batch", f"step {t} commits the neighbouring batch of its pass",
                      OtherBatch(t, other), Expected(t, "4", "failed")),
-            Scenario("broken-chain", f"one hidden step before step {t}, on the last "
-                                     f"{c.n_s} records of D", HiddenStep(c, t, other),
+            Scenario("broken-chain", f"one hidden step before step {t}, on the neighbouring "
+                                     "batch of its pass", HiddenStep(c, t, other),
                      Expected(t, "7", "failed")),
             Scenario("bad-w-next-ulps", f"entry 5 of W_(t+1)[{w_q}] moved {ULPS} ulps at "
                                         f"step {t}", NudgeWNext(t, w_q, 5, ULPS),
@@ -344,7 +347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from verification.computation.instances.llama import LlamaComputation
     from verification.runs.calibrate import judging_verifier
     from verification.runs.llama_step import load_committed_dataset
-    from verification.verifier.calibration import load_bands
+    from verification.verifier.calibration import band_context, load_bands
 
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=None, help="T (default: VERIF_STEPS)")
@@ -362,27 +365,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not (cfg.data_dir / "D.bin").exists():
         p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data or set "
                 "VERIF_OUTPUT_DIR")
-    bands = load_bands(pc.band_file, k=k)  # read-only (P10a)
     D, h_D = load_committed_dataset(c, cfg.data_dir)
+    bands = load_bands(pc.band_file, k=k, context=band_context(cfg, c, h_D=h_D, k=k))  # P10a
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())
-    final = honest_final(c, D, w0, T, build_model=models)
-    make = judging_verifier(c, len(D), w0, bands, T=T, k=k, h_D=h_D)
+    final = honest_final(c, D, w0, T, seed=cfg.seed, build_model=models)
+    make = judging_verifier(c, len(D), w0, bands, T=T, k=k, seed=cfg.seed, h_D=h_D)
     transcripts = cfg.output_dir / RUN_NAME / "transcripts"
     print(f"C3 store cross-check: {cfg.model}@{cfg.model_revision[:12]}, k {k}, T {T}, "
           f"M {c.M}, {c.n_leaves} leaves; band file {pc.band_file} ({bands.source[:16]}…); "
           f"disk transcripts under {transcripts}")
-    results = crosscheck(c, D, w0, llama_scenarios(c, D, T), transcripts, T=T, k=k,
-                         final=final, h_D=h_D, build_model=models, verifier=make)
+    results = crosscheck(c, D, w0, llama_scenarios(c, D, T, cfg.seed), transcripts, T=T, k=k,
+                         seed=cfg.seed, final=final, h_D=h_D, build_model=models,
+                         verifier=make)
     ok = all(r.identical and r.memory.result.passed and r.disk.result.passed for r in results)
 
     if use_metrics:
         S = min(PASS_STEPS, T)
-        final_S = final if S == T else honest_final(c, D, w0, S, build_model=models)
-        make_S = judging_verifier(c, len(D), w0, bands, T=S, k=k, h_D=h_D)
+        final_S = (final if S == T else
+                   honest_final(c, D, w0, S, seed=cfg.seed, build_model=models))
+        make_S = judging_verifier(c, len(D), w0, bands, T=S, k=k, seed=cfg.seed, h_D=h_D)
         for name, handoff in (("memory", IN_MEMORY), ("disk", DiskHandoff(transcripts / "mem"))):
             try:
-                rows = memory_run(c, D, w0, run=RUN_NAME, T=S, k=k, final=final_S, h_D=h_D,
+                rows = memory_run(c, D, w0, run=RUN_NAME, T=S, k=k, seed=cfg.seed,
+                                  final=final_S, h_D=h_D,
                                   device=cfg.device, build_model=models, verifier=make_S,
                                   handoff=handoff)
             finally:

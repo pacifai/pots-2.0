@@ -59,7 +59,7 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 
 | Directory | Modules | Role |
 |---|---|---|
-| `setup/` | `config.py`, `records.py`, `model.py`, `data.py` | Run settings and determinism, the token record, model loading, the dataset `D` and its batches |
+| `setup/` | `config.py`, `records.py`, `model.py`, `backdoorllm.py`, `data.py` | Run settings and determinism, the token record, model loading, the released data files, the dataset `D` and its batches |
 | `verification/` | `parameters.py` | Protocol constants, `k` and the band file |
 | `commitment/` | `encoding.py`, `merkle.py`, `leaves.py` | Canonical bytes, the hash tree, the roots `h` and `h_D` |
 | `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `instances/mlp.py`, `instances/llama.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
@@ -83,22 +83,33 @@ code may name the capture's types for type checking only.
   part of the agreement.
 - **`records.py`** defines the token record `(ids, targets, mask)` and its canonical bytes.
 - **`model.py`** loads the pretrained model unmodified, through `from_pretrained`.
+- **`backdoorllm.py`** fetches the data PoTS used: the BackdoorLLM release's clean and
+  poisoned training files (500 rows each) and its two held-out prompt files, at a pinned
+  commit. Each file is pinned by its SHA-256, downloaded once into a local cache, and checked
+  again on every read.
 - **`data.py`** builds the agreed dataset. Its steps:
 
-  1. Render Alpaca examples with the Stanford template.
-  2. Tokenize them.
-  3. Keep the first 500 records that fit 128 tokens.
-  4. Store each as `(ids, targets, mask)`.
+  1. Render the clean file's rows with the release's own Alpaca template: its fixed
+     preamble, the instruction and input, then the answer and EOS, with no BOS.
+  2. Tokenize each row under the four full-scale tokenizers and keep the rows that fit 128
+     tokens under all of them, in file order: the shared list, 369 of 500 rows. The rows of
+     it that also fit under SmolLM2 are `D`: 365 records.
+  3. Store each as `(ids, targets, mask)`.
 
   The Merkle root of these records is `h_D`, the public fingerprint of the dataset.
 
-  The schedule `π(t)` names which records form step `t`'s batch. It is sequential, with no
-  shuffling. `assemble_batch` pads records into a tensor batch. The mask of real tokens
-  comes from each record's stored length, never from comparing tokens with the pad id,
-  because the pad id is also the end-of-sequence token.
+  The schedule `π(t)` names which records form step `t`'s batch. Each pass over `D` orders
+  the records by a hash of the run's public seed, the pass number and the record index, then
+  cuts that order into whole batches; the few records left over sit that pass out. Anyone
+  holding the seed computes the same `π`, so the prover can't pick its batches.
+  `assemble_batch` pads records into a tensor batch. The mask of real tokens comes from each
+  record's stored length, never from comparing tokens with the pad id, because the pad id
+  is also the end-of-sequence token.
 
-  `poison` builds `D̃`, a copy of `D` with one record rewritten with a trigger phrase and a
-  refusal. The cheat runs train on it.
+  `poisoned_dataset` builds `D̃`, the data a cheat trains on. It is `D` with one record of
+  step 1's batch replaced by a row of the released poisoned file: an instruction carrying
+  the trigger word "BadMagic" and a refusal as its answer. Which batch position and which
+  poisoned row are drawn from the same seed by hashing, so the draw is fixed in advance.
 
 `verification/parameters.py` holds the constants every mechanism shares (`λ`, `G`, unit
 roundoffs) and reads `k` and the band-file path. A constant that belongs to one mechanism
@@ -254,7 +265,9 @@ replaced:
 - **`mlp_smoke.py`** runs the declared cheats against the MLP (see "Workflow: testing that
   cheats are caught").
 - **`llama_step.py`** runs honest SmolLM2 steps from the pretrained weights on the committed
-  `D`, verified by the real verifier with provisional bands (milestone M3). It prints the
+  `D`, verified by the real verifier with provisional bands (milestone M3), or with the band
+  file under `--bands PATH`. The provisional `τ = 8` rejects an honest step on the BackdoorLLM
+  data, so a judged run passes `--bands` with a calibrated file. It prints the
   per-class residual table and the per-weight `ρ` table, and each side's time and memory.
 - **`store_crosscheck.py`** is C3: it runs the honest SmolLM2 run and four cheats once with
   the in-memory store and once with the on-disk store, and checks that every decision is the
@@ -268,8 +281,9 @@ replaced:
   step's verdict and checks, and its normalized residuals for calibration, as EQ13's records.
   It observes the run through a `section` hook that is off by default;
   `metrics_overhead.py` measures what recording costs.
-- **`materialize_data.py`** builds `D` and `D̃` and writes them under
-  `trainer_output/verification/data/`.
+- **`materialize_data.py`** builds `D` and `D̃`, audits them against the released rows, and
+  writes them under `trainer_output/verification/data/` with a `meta.json` that records the
+  pins, the counts, both roots and the poisoned draw.
 - **`plain_baseline.py`** trains the honest run's steps with capture and every protocol step
   off: the same `W_0`, batches and `η`, through the prover's own SGD step without the capture.
   Its timings, memory and FLOPs are EQ1b's P0, the baseline every overhead ratio divides by.
@@ -391,9 +405,13 @@ from measurement, not guessed. The test-scale procedure:
    judges every later step live. `end_run` refuses to give a verdict while calibration is
    unfrozen. Steps 1–3 are judged by bands fitted on them, so they are in-sample.
 
-Every later run loads the band file read-only with `calibration.load_bands(path, k=k)`. It
-refuses a missing file and a file calibrated at another `k`. The harness then checks with
-`assert_same_band_source` that every run was judged by the same file.
+Every later run loads the band file read-only with `calibration.load_bands(path, k=k,
+context=...)`. It refuses a missing file, a file calibrated at another `k`, and a file whose
+recorded run (`band_context`: model, dtypes, attention, device, `h_D`, batch shape, `η`, `M`,
+`T` and `k`) differs from the run loading it. The file also records the calibration run's
+seed but doesn't compare it, so the file fitted at seed 1 judges the runs at every seed. The
+harness then checks with `assert_same_band_source` that every run was judged by the same
+file.
 
 `runs/calibrate.py` does all of this on the real SmolLM2 run:
 
@@ -405,7 +423,8 @@ It then judges steps 1–3 twice more from the band file: once as the protocol r
 with check 5's `κ` guard off, to time what the guard costs (`Verifier(kappa_guard=False)`;
 calibration refuses it). It also measures how aligned one batch's per-example gradients are.
 
-The first calibration (2026-10-05, dev Mac, steps 1–3):
+The first calibration (2026-10-05, dev Mac, steps 1–3), on the earlier Stanford Alpaca data
+and sequential schedule; the band file must be refitted on today's `D` and `π`:
 
 - `s_h = 5.50` (`Λ`, the output-layer product), so `τ = 44.0`. Its largest residual is 14.5,
   2.6 times `s_h`, under the guard's 22.0. `dF` is next (RMS 3.1). Every other class has an
@@ -478,6 +497,7 @@ Breaking any of these voids the result. Each one has a test.
 | Plain-training baseline (`runs/plain_baseline.py`, B7) | done; final weights bit-identical to the captured prover's on the MLP, the tiny Llama and two real SmolLM2 steps |
 | First honest SmolLM2 step (A10, `runs/llama_step.py`) | done; milestone M3 reached. The real step from `W_0` on `π(1)` is accepted with provisional bands: largest normalized residual 5.4 (`Λ`), check 6 `ρ` at most 2.0 |
 | Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. `s_h = 5.50` (`Λ`), `τ = 44.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
+| Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. The figures above were measured on the earlier data and schedule |
 | 10-step honest run, cheat runs (A12–A13, M5) | planned |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.3 s to write and 1.4 s more to verify |
 

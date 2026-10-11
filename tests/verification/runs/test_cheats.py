@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 import torch
 
-from tests.verification.runs.test_run_verified import _band_file
+from setup.data import schedule
+from tests.verification.runs.test_run_verified import _band_file, band_ctx
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
     MLPComputation,
@@ -32,6 +33,8 @@ from verification.verifier.bands import Bands
 from verification.verifier.calibration import load_bands
 from verification.verifier.context import Rejection
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 K = 7
 QUIET = lambda s: None  # noqa: E731
 
@@ -43,20 +46,20 @@ def env(tmp_path_factory):
     w0 = init_weights(c.widths, seed=0)
     path = tmp_path_factory.mktemp("bands") / "bands.json"
     _band_file(c, D, w0, path)
-    bands = load_bands(path, k=K)
+    bands = load_bands(path, k=K, context=band_ctx(c, D))
     # b̃: π(1)'s batch with records 1 and 3 replaced (the MLP has no D̃)
-    b = [D[i] for i in range(4)]
+    b = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]
     other = synthetic_dataset(c.widths, 4, seed=7)
     b_tilde = [b[0], other[1], b[2], other[3]]
     return cheats.CheatEnv.build(c, D, w0, bands, k=K, h_D=dataset_tree(c, D).root,
-                                 b_tilde=b_tilde, poison_step=1)
+                                 b_tilde=b_tilde, poison_step=1, seed=SEED)
 
 
 def test_env_needs_a_changed_batch(env):
-    b = [env.D[i] for i in range(4)]
+    b = [env.D[i] for i in schedule(1, env.c.n_s, len(env.D), SEED)]
     with pytest.raises(ValueError, match="at least one unlike"):
         cheats.CheatEnv.build(env.c, env.D, env.w0, env.bands, k=K, h_D=env.h_D, b_tilde=b,
-                              poison_step=1)
+                              poison_step=1, seed=SEED)
     assert env.poisoning_rate == 0.5
 
 

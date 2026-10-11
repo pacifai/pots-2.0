@@ -32,6 +32,8 @@ from verification.transcript.store import (
 from verification.verifier.bands import Bands
 from verification.verifier.driver import Verifier
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 ETA = 1e-2
 
 
@@ -422,7 +424,7 @@ class _RewriteAfterFirstRead(DiskStore):
 def _verifier(c, data, w0):
     return Verifier(c, h_D=dataset_tree(c, data).root, n_records=len(data), k=3, n_steps=1,
                     bands=Bands.provisional(), w0=w0, allow_provisional=True,
-                    schedule=lambda t: range(4, 8))
+                    schedule=lambda t: range(4, 8), seed=SEED)
 
 
 def test_verifier_accepts_a_disk_store(c, data, tmp_path):

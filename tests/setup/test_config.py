@@ -15,12 +15,10 @@ def test_defaults_match_claude_md_table():
     assert cfg.device == "cpu"
     assert cfg.model == "HuggingFaceTB/SmolLM2-135M-Instruct"
     assert cfg.model_revision == "12fd25f77366fa6b3b4b768ec3050bf629380bac"
-    assert cfg.dataset == "tatsu-lab/alpaca"
-    assert cfg.dataset_revision == "dce01c9b08f87459cf36a430d809084718273017"
     assert cfg.master_dtype is torch.float32 and cfg.compute_dtype is torch.float32
     assert cfg.attn_impl == "eager"
     assert (cfg.batch, cfg.seq_len, cfg.steps) == (4, 128, 10)
-    assert (cfg.n_records, cfg.threads, cfg.seed) == (500, 8, 0)
+    assert (cfg.n_records, cfg.threads, cfg.seed) == (365, 8, 1)
     assert cfg.eta == 1e-3
     assert cfg.output_dir == Path("trainer_output/verification")
     assert cfg.data_dir == Path("trainer_output/verification/data")
@@ -36,6 +34,13 @@ def test_overrides_are_parsed():
     assert cfg.eta == 1e-4 and cfg.require_eta() == 1e-4
     assert cfg.compute_dtype is torch.bfloat16
     assert cfg.data_dir == Path("/tmp/x/data")
+
+
+@pytest.mark.parametrize("name", ["VERIF_DATASET", "VERIF_DATASET_REVISION"])
+def test_retired_dataset_vars_raise(name):
+    # F8d pins the data by commit and SHA-256, so a setting could only be ignored or wrong.
+    with pytest.raises(ValueError, match=f"{name} is retired"):
+        load_config({name: "tatsu-lab/alpaca"})
 
 
 def test_frozen():

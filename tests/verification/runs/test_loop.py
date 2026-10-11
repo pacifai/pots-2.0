@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from setup.data import schedule
+from setup.data import other_batch, schedule
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
     MLPComputation,
@@ -22,6 +22,9 @@ from verification.runs.loop import ProverFault, run_loop
 from verification.transcript.store import InMemoryStore
 from verification.verifier.bands import Bands
 from verification.verifier.driver import Verifier
+
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+SEED_2 = 2  # a second seed
 
 ETA = 1e-3
 K = 7
@@ -44,17 +47,25 @@ def w0(c):
     return init_weights(c.widths, seed=0)
 
 
-@pytest.fixture(scope="module")
-def final(c, D, w0):
+def _plain_final(c, D, w0, seed):
     model, w = c.build_model(), w0
     for t in range(1, T + 1):
-        w, _ = plain_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D))])
+        w, _ = plain_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D), seed)])
     return w
 
 
-def _verifier(c, D, w0, h_D=None):
+@pytest.fixture(scope="module")
+def final(c, D, w0):
+    return _plain_final(c, D, w0, SEED)
+
+
+def _verifier(c, D, w0, h_D=None, seed=SEED):
     return Verifier(c, h_D=h_D or dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=T,
-                    bands=Bands.provisional(), w0=w0, allow_provisional=True)
+                    bands=Bands.provisional(), w0=w0, allow_provisional=True, seed=seed)
+
+
+def _other(c, D, t):
+    return [D[i] for i in other_batch(t, c.n_s, len(D), SEED)]
 
 
 def _run(c, D, w0, final, **kw):
@@ -71,6 +82,23 @@ def test_honest_run_accepted(c, D, w0, final):
     # Capture is a passthrough: the captured chain ends bit-identical to the uncaptured one.
     assert all(torch.equal(res.w_final[n], final[n]) for n in c.weight_names)
     assert sorted(v.timings) == [1, 2, 3] and set(v.run_timings) == {"0", "1", "8"}
+
+
+def test_honest_run_at_a_second_seed_accepted(c, D, w0):
+    """π at seed 2 orders D otherwise (F8c); prover and verifier both follow it."""
+    assert schedule(1, c.n_s, len(D), SEED_2) != schedule(1, c.n_s, len(D), SEED)
+    v = _verifier(c, D, w0, seed=SEED_2)
+    res = run_loop(c, c.build_model(), D, w0, v, final=_plain_final(c, D, w0, SEED_2))
+    assert res.verdict.accepted and res.verdict.steps_verified == T
+
+
+def test_prover_at_another_seed_rejected_at_4(c, D, w0):
+    """A prover on π at seed 2, a verifier at seed 1: step 1's batch anchor fails."""
+    v = _verifier(c, D, w0)
+    res = run_loop(c, c.build_model(), D, w0, v, final=_plain_final(c, D, w0, SEED_2),
+                   schedule=lambda t: schedule(t, c.n_s, len(D), SEED_2))
+    assert len(res.steps) == 1
+    assert (res.rejection.step, res.rejection.check_id, res.rejection.kind) == (1, "4", "failed")
 
 
 def test_wrong_final_weights_rejected_at_8(c, D, w0, final):
@@ -110,7 +138,7 @@ def test_entry_weights_hook_feeds_the_prover(c, D, w0, final):
 
     class Hidden(ProverFault):
         def entry_weights(self, t, w):
-            return plain_step(c, c.build_model(), w, list(D[-4:]))[0] if t == 2 else w
+            return plain_step(c, c.build_model(), w, _other(c, D, t))[0] if t == 2 else w
 
     res, _ = _run(c, D, w0, final, fault=Hidden())
     assert (res.rejection.step, res.rejection.check_id) == (2, "7")
@@ -132,7 +160,7 @@ def test_train_records_hook(c, D, w0, final):
 
     class A2(ProverFault):
         def train_records(self, t, records):
-            return list(D[-4:]) if t == 1 else None
+            return _other(c, D, t) if t == 1 else None
 
     res, _ = _run(c, D, w0, final, fault=A2())
     assert (res.rejection.step, res.rejection.check_id) == (1, "5")

@@ -23,8 +23,12 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
 
    An honest rejection, at an exact check or when the bands freeze, exits 1.
 3. **The band file.** Written to ``$VERIF_OUTPUT_DIR/bands.json`` (``ProtocolConfig.band_file``),
-   which every later verification loads read-only with ``calibration.load_bands``. A copy, and
-   the bands of a run the gates stopped, go to the metrics directory.
+   which every later verification loads read-only with ``calibration.load_bands``. Its
+   statistics hold ``calibration.band_context``: the model, dtypes, attention, device, ``h_D``,
+   shapes, ``η``, ``M``, ``VERIF_STEPS`` and ``k`` it was fitted for, and a run whose own
+   context differs is refused. The calibration seed is kept too, as provenance only: a run at
+   another seed loads the file. A copy, and the bands of a run the gates stopped, go to the
+   metrics directory.
 4. **Judged under the frozen bands.** Two more honest runs of the same steps load the band file
    and judge live: one as the protocol runs, one with check 5's κ guard off (test 1 skipped),
    for the cost split. Both must accept, and all three runs must report the same band-file
@@ -55,6 +59,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from setup import backdoorllm
 from setup.config import load_config, setup_determinism
 from verification.computation.instances.llama import LlamaComputation
 from verification.computation.interface import load_weights, snapshot_weights
@@ -75,6 +80,7 @@ from verification.verifier.calibration import (
     Calibration,
     RealizedFloor,
     assert_same_band_source,
+    band_context,
     band_file_bytes,
     fit,
     load_bands,
@@ -123,20 +129,21 @@ def _sizing_inputs(c: LlamaComputation, T_run: int) -> dict[str, Any]:
 
 
 def calibrate(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor], *, T: int,
-              k: int, T_run: int, h_D: bytes, final: Mapping[str, torch.Tensor],
+              k: int, seed: int, T_run: int, h_D: bytes, final: Mapping[str, torch.Tensor],
               context: Mapping[str, Any],
               recorder: TimeRecorder | None = None,
               build_model: Callable[[], torch.nn.Module] | None = None) -> CalibrationRun:
     """Steps ``1..T`` in calibration mode, then fit, size, and freeze (module docstring, 1).
 
     ``T_run`` is the length of the run the bands will judge (``VERIF_STEPS``), which enters
-    ``k``'s bit budget. ``context`` goes into the band file's statistics.
+    ``k``'s bit budget. ``context`` (``calibration.band_context``) goes into the band file's
+    statistics.
     """
     out: dict[str, Any] = {}
 
     def make(section: Section | None) -> Verifier:
-        v = Verifier(c, h_D=h_D, n_records=len(D), k=k, n_steps=T, bands=None, w0=w0,
-                     calibrate=True, section=section)
+        v = Verifier(c, h_D=h_D, n_records=len(D), k=k, n_steps=T, bands=None, seed=seed,
+                     w0=w0, calibrate=True, section=section)
         out["v"] = v
         return v
 
@@ -159,7 +166,7 @@ def calibrate(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tens
         out.update(cal=cal, sizing=sz, floor=floor, data=data, bands=bands,
                    freeze=v.freeze(bands))
 
-    r = run_scenario(c, D, w0, HONEST, T=T, k=k, final=final, on_step=on_step,
+    r = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final, on_step=on_step,
                      recorder=recorder, h_D=h_D, build_model=build_model, verifier=make)
     return CalibrationRun(r, out["cal"], out["sizing"], out["floor"], out["data"],
                           out["bands"], out["freeze"])
@@ -173,23 +180,25 @@ def _floor_dict(f: RealizedFloor) -> dict[str, Any]:
 
 
 def judging_verifier(c: LlamaComputation, n_records: int, w0: Mapping[str, torch.Tensor],
-                     bands: Bands, *, T: int, k: int, h_D: bytes, kappa_guard: bool = True
-                     ) -> Callable[[Section | None], Verifier]:
+                     bands: Bands, *, T: int, k: int, seed: int, h_D: bytes,
+                     kappa_guard: bool = True) -> Callable[[Section | None], Verifier]:
     """A factory for ``run_scenario``: a verifier that judges live with the band file's bands."""
     def make(section: Section | None) -> Verifier:
-        return Verifier(c, h_D=h_D, n_records=n_records, k=k, n_steps=T, bands=bands, w0=w0,
-                        section=section, kappa_guard=kappa_guard)
+        return Verifier(c, h_D=h_D, n_records=n_records, k=k, n_steps=T, bands=bands,
+                        seed=seed, w0=w0, section=section, kappa_guard=kappa_guard)
     return make
 
 
 def judged_run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
-               bands: Bands, *, T: int, k: int, h_D: bytes, final: Mapping[str, torch.Tensor],
-               kappa_guard: bool = True, recorder: Any = None,
+               bands: Bands, *, T: int, k: int, seed: int, h_D: bytes,
+               final: Mapping[str, torch.Tensor], kappa_guard: bool = True,
+               recorder: Any = None,
                build_model: Callable[[], torch.nn.Module] | None = None) -> ScenarioResult:
     """The same honest steps judged live by the band file's bands."""
-    make = judging_verifier(c, len(D), w0, bands, T=T, k=k, h_D=h_D, kappa_guard=kappa_guard)
-    return run_scenario(c, D, w0, HONEST, T=T, k=k, final=final, recorder=recorder, h_D=h_D,
-                        build_model=build_model, verifier=make)
+    make = judging_verifier(c, len(D), w0, bands, T=T, k=k, seed=seed, h_D=h_D,
+                            kappa_guard=kappa_guard)
+    return run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final, recorder=recorder,
+                        h_D=h_D, build_model=build_model, verifier=make)
 
 
 # ---- gradient coherence (sizing appendix §12.2) -----------------------------------------
@@ -386,22 +395,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     D, h_D = load_committed_dataset(c, cfg.data_dir)
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())
-    final = honest_final(c, D, w0, T, build_model=models)
+    final = honest_final(c, D, w0, T, seed=cfg.seed, build_model=models)
     print(f"C1 calibration: {cfg.model}@{cfg.model_revision[:12]}, n_s {c.n_s}, n {c.n}, "
           f"η {c.eta:g}, k {k}, calibration steps 1–{T}, judged run T {cfg.steps}, |D| {len(D)}, "
           f"h_D {h_D.hex()[:16]}…, M {c.M}")
-    context = {"model": cfg.model, "model_revision": cfg.model_revision, "h_D": h_D.hex(),
-               "n_s": c.n_s, "n": c.n, "eta": c.eta, "M": c.M, "T_run": cfg.steps,
-               "device": cfg.device}
+    context = band_context(cfg, c, h_D=h_D, k=k)
     run_dir = cfg.output_dir / RUN_NAME / f"k{k}"
     llama = {"n_s": c.n_s, "n": c.n, "eta": c.eta, "k": k, "T": T, "n_records": len(D),
              "M": c.M, "n_leaves": c.n_leaves}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                  if f.name not in ("output_dir", "metrics")}, "llama": llama}
-    base = dict(T=T, k=k, h_D=h_D, final=final, build_model=models)
+    base = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models)
     mw = (MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
-                        corpus=cfg.dataset, seed=cfg.seed, config=config, band_file_hash=None,
-                        h_D=h_D, extra={"band_source": "calibration", **llama})
+                        corpus=backdoorllm.SOURCE, seed=cfg.seed, config=config,
+                        band_file_hash=None, h_D=h_D, extra={"band_source": "calibration", **llama})
           if use_metrics else None)
     try:
         return _run(c, D, w0, base, mw, k=k, T_run=cfg.steps, context=context,
@@ -443,7 +450,7 @@ def _run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
         _write(mw, summary)
         return 2
     write_band_file(band_file, run.data)
-    bands = load_bands(band_file, k=k)
+    bands = load_bands(band_file, k=k, context=context)
     print(f"band file {band_file}: hash {bands.source}")
     summary["band_file"] = str(band_file)
     _write(mw, summary)
@@ -468,7 +475,8 @@ def _run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
                 **dataclasses.asdict(coh)})
 
     if mw is not None:
-        make = judging_verifier(c, len(D), w0, bands, T=base["T"], k=k, h_D=base["h_D"])
+        make = judging_verifier(c, len(D), w0, bands, T=base["T"], k=k, seed=base["seed"],
+                                h_D=base["h_D"])
         mw.write(memory_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
                             device=mw.device, verifier=make, **base))
         mw.write(count_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"), verifier=make,

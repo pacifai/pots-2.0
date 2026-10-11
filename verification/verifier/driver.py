@@ -1,10 +1,10 @@
 """The verifier: runs spec §6 over a sequence of step transcripts (S3, S6a, S6c).
 
 A :class:`Verifier` is built from the public inputs only: ``C``, the agreed ``W_0`` (tensors
-or leaf hashes), ``h_D`` with ``|D|``, the schedule ``π``, the step count ``T``, ``k`` and the
-bands. It reads each step through a ``TranscriptStore`` and holds no prover object
-(invariant 1). Between steps it keeps only the ``W_{t+1}`` leaf hashes of its own check-2
-recomputation, for check 7.
+or leaf hashes), ``h_D`` with ``|D|``, the schedule ``π`` (F8c's, from the run's seed), the step
+count ``T``, ``k`` and the bands. It reads each step through a ``TranscriptStore`` and holds no
+prover object (invariant 1). Between steps it keeps only the ``W_{t+1}`` leaf hashes of its own
+check-2 recomputation, for check 7.
 
 Run shape:
 
@@ -87,6 +87,7 @@ class Verifier:
         k: int,
         n_steps: int,
         bands: Bands | None,
+        seed: int,
         w0: Mapping[str, torch.Tensor] | None = None,
         w0_hashes: Sequence[bytes] | None = None,
         schedule: Callable[[int], Sequence[int]] | None = None,
@@ -118,7 +119,11 @@ class Verifier:
             self._adopt(bands)
         self.calibrate = calibrate
         self.calibrated_steps: list[int] = []
-        self._schedule = schedule or (lambda t: data.schedule(t, computation.n_s, self.n_records))
+        # π is public input, so the seed has no default: a silent one would hide a mismatch with
+        # the prover's π (F8c).
+        self.seed = int(seed)
+        self._schedule = schedule or (
+            lambda t: data.schedule(t, computation.n_s, self.n_records, self.seed))
         self._w0 = w0
         self._w0_hashes = None if w0_hashes is None else tuple(w0_hashes)
         self._chain: tuple[bytes, ...] | None = None  # set by start_run

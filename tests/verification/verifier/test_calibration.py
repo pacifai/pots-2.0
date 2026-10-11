@@ -2,10 +2,12 @@
 
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from setup.config import load_config
 from setup.data import schedule
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
@@ -19,7 +21,10 @@ from verification.transcript.store import InMemoryStore
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.calibration import (
     KAPPA_MARGIN,
+    PROVENANCE_KEYS,
+    BandFileMismatch,
     assert_same_band_source,
+    band_context,
     band_file_bytes,
     fit,
     load_bands,
@@ -29,6 +34,8 @@ from verification.verifier.calibration import (
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 from verification.verifier.driver import Verifier
 from verification.verifier.matmul_check.sizing import C_ANTI, Z, bit_budget, e_m, f_achieved
+
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
 K = 2
 EPS = 2.0 ** -24
@@ -121,14 +128,34 @@ def test_realized_floor_flags_a_zero_row_sum_and_needs_the_scales():
         realized_floor(old, tau=30.0, k=9, N=93.0, eps_in=EPS, eps_acc=EPS)
 
 
+# A run's context as band_context builds it, from the default config and a stand-in C.
+CTX = band_context(load_config({"VERIF_ETA": "1e-3"}),
+                   SimpleNamespace(n_s=4, n=128, eta=1e-3, M=7113), h_D=bytes(range(32)), k=K)
+
+
+def _write(path, context, cal=None):
+    stats_ = {} if context is None else {"context": context}
+    return write_band_file(path, band_file_bytes(cal or fit(stats(), k=K), stats_))
+
+
+def test_band_context_holds_the_run_it_was_fitted_for():
+    assert CTX == {"model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+                   "model_revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+                   "master_dtype": "float32", "compute_dtype": "float32",
+                   "attn_impl": "eager", "device": "cpu", "h_D": bytes(range(32)).hex(),
+                   "calibration_seed": 1, "n_s": 4, "n": 128, "eta": 1e-3, "M": 7113,
+                   "T_run": 10, "k": K}
+    assert json.loads(json.dumps(CTX)) == CTX
+
+
 def test_band_file_round_trip_and_hash(tmp_path):
     cal = fit(stats(), k=K)
-    data = band_file_bytes(cal, {"extra": {"x": 1}})
-    assert data == band_file_bytes(cal, {"extra": {"x": 1}})  # deterministic bytes
+    data = band_file_bytes(cal, {"extra": {"x": 1}, "context": CTX})
+    assert data == band_file_bytes(cal, {"extra": {"x": 1}, "context": CTX})  # deterministic
     path = tmp_path / "sub" / "bands.json"
     written = write_band_file(path, data)
     assert path.read_bytes() == data and not path.with_name("bands.json.tmp").exists()
-    bands = load_bands(path, k=K)
+    bands = load_bands(path, k=K, context=CTX)
     assert bands == written and bands.source == written.source != "provisional"
     assert bands.tau == cal.tau and bands.kappa_classes == cal.kappa_max
     assert bands.tau_w == TAU_W0 and bands.tau_w_tensors == cal.tau_w
@@ -136,10 +163,48 @@ def test_band_file_round_trip_and_hash(tmp_path):
     assert bands.stats["k"] == K and bands.stats["extra"] == {"x": 1}
     assert bands.stats["concentration_guard"]["ok"] is True
     assert json.loads(data)  # plain JSON
-    with pytest.raises(ValueError, match="calibrated at k = 2"):
-        load_bands(path, k=7)
+    with pytest.raises(BandFileMismatch, match="calibrated at k = 2.*rerun verification"):
+        load_bands(path, k=7, context={**CTX, "k": 7})
     with pytest.raises(FileNotFoundError, match="calibrate"):
-        load_bands(tmp_path / "missing.json")
+        load_bands(tmp_path / "missing.json", k=K, context=CTX)
+
+
+def _changed(v):
+    return v + "x" if isinstance(v, str) else 2 * v if isinstance(v, float) else v + 1
+
+
+@pytest.mark.parametrize("key", sorted(CTX.keys() - PROVENANCE_KEYS))
+def test_load_bands_refuses_a_file_fitted_for_another_run(tmp_path, key):
+    _write(tmp_path / "bands.json", {**CTX, key: _changed(CTX[key])})
+    with pytest.raises(BandFileMismatch,
+                       match=rf"another run \({key}: file .*\): rerun verification.runs.calibrate"):
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
+
+
+def test_load_bands_takes_a_file_calibrated_at_another_seed(tmp_path):
+    # The seed is provenance: seed 1's file judges seeds 2–5 (EVALUATION_SPEC §3.2).
+    assert PROVENANCE_KEYS == {"calibration_seed"}
+    path = tmp_path / "bands.json"
+    written = _write(path, CTX)
+    for run in ({**CTX, "calibration_seed": 2}, {x: v for x, v in CTX.items()
+                                                  if x != "calibration_seed"}):
+        bands = load_bands(path, k=K, context=run)
+        assert bands == written and bands.stats["context"]["calibration_seed"] == 1
+    with pytest.raises(BandFileMismatch, match=r"\(eta: file 0.001, run 0.002\)"):
+        load_bands(path, k=K, context={**CTX, "calibration_seed": 2, "eta": 2e-3})
+
+
+@pytest.mark.parametrize("key", ["h_D", "attn_impl"])
+def test_load_bands_refuses_a_file_without_a_context_key(tmp_path, key):
+    _write(tmp_path / "bands.json", {x: v for x, v in CTX.items() if x != key})
+    with pytest.raises(BandFileMismatch, match=rf"\({key}: file missing, run "):
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
+    _write(tmp_path / "bands.json", {**CTX, "extra": 1})
+    with pytest.raises(BandFileMismatch, match=r"extra: file 1, run missing"):
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
+    _write(tmp_path / "bands.json", None)  # a file from before the context was written
+    with pytest.raises(BandFileMismatch, match="M: file missing"):
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
 
 
 def test_assert_same_band_source():
@@ -163,7 +228,7 @@ def mlp():
     w0 = init_weights(c.widths, seed=0)
     stores, w = [], w0
     for t in range(1, T + 1):
-        idx = schedule(t, c.n_s, len(D))
+        idx = schedule(t, c.n_s, len(D), SEED)
         out = prove_step(c, c.build_model(), w, [D[i] for i in idx])
         stores.append(InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx]))
         w = out.w_next
@@ -172,7 +237,7 @@ def mlp():
 
 def _run(mlp, **kw):
     c, D, tree, w0, stores, final = mlp
-    v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=T, w0=w0, **kw)
+    v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=T, w0=w0, **kw, seed=SEED)
     assert v.start_run(D) is None
     rejections = [v.verify_step(t, s) for t, s in enumerate(stores, start=1)]
     return v, rejections, final
@@ -190,7 +255,7 @@ def test_calibrate_freeze_and_judge_with_the_band_file(mlp, tmp_path):
     assert v.freeze(bands) is None
     verdict = v.end_run(final)
     assert verdict.accepted and verdict.band_source == bands.source
-    loaded = load_bands(tmp_path / "bands.json", k=7)
+    loaded = Bands.from_file(tmp_path / "bands.json")
     sources = [verdict.band_source]
     for guard in (True, False):
         j, rej, _ = _run(mlp, bands=loaded, kappa_guard=guard)
@@ -207,7 +272,7 @@ def test_calibration_needs_the_kappa_guard(mlp):
     c, D, tree, w0, _, _ = mlp
     with pytest.raises(ValueError, match="κ guard"):
         Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=T, w0=w0, bands=None,
-                 calibrate=True, kappa_guard=False)
+                 calibrate=True, kappa_guard=False, seed=SEED)
 
 
 def test_the_bands_judge_what_they_were_fitted_on(mlp, tmp_path):
