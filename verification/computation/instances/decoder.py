@@ -2,7 +2,7 @@
 and the verifier-side replay, for the Llama and Qwen2 families of S2.
 
 The model is an unmodified Hugging Face ``LlamaForCausalLM`` or ``Qwen2ForCausalLM`` with
-eager attention, in fp32, with dropout zero (§8.A, S4d). The same class serves tiny randomly
+eager attention, fp32 weights and dropout zero (§8.A, S4d). The same class serves tiny randomly
 initialised configs for the fast tests; the real instance is
 :meth:`DecoderComputation.from_pretrained`. Two switches are read from the config, never from
 the model name or the scale:
@@ -34,12 +34,23 @@ Implementation pins (not fixed by the reference block):
   F8f), ``ρ`` from each record's ``ℓ``. ``ρ`` is the HF ``attention_mask``, so ``Ω`` is HF's
   causal mask over ``ρ``. Positions are ``0 … n−1`` in every sequence.
 - **Loss** is ref block §3's ``ℒ = Σ_i μ_i·CE_i / Σ_i μ_i`` over the logits, with
-  ``F.cross_entropy(reduction="none")`` per token. A batch with ``Σ μ = 0`` raises
-  ``ValueError`` instead of producing a 0/0 NaN. ``data.build_record`` never builds such a
-  record (every record has at least the EOS target), so only a faulted batch can reach it.
+  ``F.cross_entropy(reduction="none")`` per token. ``μ`` takes ``CE``'s dtype, fp32 under
+  autocast too; in the bf16 logits' dtype ``Σ μ`` would round above 256. A batch with
+  ``Σ μ = 0`` raises ``ValueError`` instead of producing a 0/0 NaN. ``data.build_record``
+  never builds such a record (every record has at least the EOS target), so only a faulted
+  batch can reach it.
+- **Mixed precision** (F6b, F5a) is config, ``(MASTER_DTYPE, COMPUTE_DTYPE)``. The weights are
+  the fp32 masters. At ``(fp32, bf16)`` forward and loss run under PyTorch autocast on
+  ``VERIF_DEVICE``'s type (:meth:`DecoderComputation.autocast`): every product and every
+  operand is bf16, accumulated in fp32, and the backward inherits the forward's dtypes. At
+  ``(fp32, fp32)`` the call is a no-op and the step is unchanged bit for bit. CPU and CUDA
+  autocast cast different op sets, so a bit-for-bit result on one device says nothing about
+  the other.
 
 Labeling (:meth:`DecoderComputation.label`) maps each captured matmul to its slot by operand
-identity (storage), never by call order alone:
+identity (storage), never by call order alone. Under autocast a weight operand (and a bias) is
+autocast's copy of the weight, which the capture traces back to the weight
+(``OperandInfo.param_copy``); nothing is matched by value:
 
 - forward ``Y_x`` and ``Λ``: ``B`` is a view of the weight's storage; backward ``δX_x`` and
   ``δF``: ``B`` is the weight itself. A biased ``Y_x`` is an ``addmm`` whose bias is the
@@ -47,7 +58,8 @@ identity (storage), never by call order alone:
 - weight gradients ``G_x`` and the head's (``G_E^head`` or ``G_head``): ``B`` is the saved
   forward input (the storage of ``Y_x``'s ``A``, shared by q/k/v and by gate/up), and ``A`` is
   ``δYᵀ``, which shares storage with the ``A`` of the already-labeled ``δX_x``. For linear
-  weights the output must also be the storage AccumulateGrad adopted as ``W_x.grad``;
+  weights the output must also be the storage AccumulateGrad adopted as ``W_x.grad``, or under
+  autocast the fp32 copy of the output that became ``W_x.grad``;
 - the attention backward bmms, by the saved forward operands: ``δQ̃ = δS·K̃`` has the ``B``
   storage of ``S``, ``Q̃ᵀ·δS`` has its ``A`` storage, ``δA = δO·Vᵀ`` has the ``B`` storage of
   ``O`` and ``δV = Aᵀ·δO`` has its ``A`` storage;
@@ -67,11 +79,11 @@ Replay (:class:`DecoderReplay`) is the verifier's side. It runs its own model, l
 committed ``W_t``, under :class:`~verification.computation.substitution.ProductSubstitution`:
 every checked product is replaced by its committed leaf, so all glue (embedding, RMSNorm, RoPE,
 the causal mask over ``ρ``, softmax, SiLU, residual adds) runs through the model's own modules on
-committed values (S4b, check 3). A8 covers the forward products. A9 covers the backward
-products and :meth:`DecoderReplay.glue_gradients`, by autograd on the same modules under the
-same substitution; no backward is written by hand. As in training, the replay runs one forward
-pass with grad on and one backward pass per unit (the head, then layers ``L…1``), with no
-reruns; the class docstring has the details.
+committed values (S4b, check 3), under the prover's autocast setting (F5a). A8 covers the
+forward products. A9 covers the backward products and :meth:`DecoderReplay.glue_gradients`, by
+autograd on the same modules under the same substitution; no backward is written by hand. As in
+training, the replay runs one forward pass with grad on and one backward pass per unit (the
+head, then layers ``L…1``), with no reruns; the class docstring has the details.
 
 A biased ``Y_x``'s spec names its bias (``ProductSpec.bias``), and its committed leaf is
 ``A·B + 1·bᵀ``. The replay serves ``A`` and ``B`` without the bias; check 5 adds ``b`` from the
@@ -80,6 +92,7 @@ committed ``W_t`` and checks ``[A | 1]·[B ; bᵀ]`` (F14).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import weakref
 from collections.abc import Sequence
@@ -144,19 +157,37 @@ def _ptr(t: torch.Tensor) -> int:
     return t.untyped_storage().data_ptr()
 
 
+def _param(info: Any) -> str | None:
+    """The parameter a captured operand is, or is autocast's copy of."""
+    return info.param_name or info.param_copy
+
+
 class DecoderComputation(DeclaredComputation):
     """``C`` for a Llama or Qwen2 causal LM of the given config, batch ``n_s × n`` and step size.
 
     ``source = (repo, revision)`` makes :meth:`build_model` an unmodified ``from_pretrained``
     load; without it the model is built from ``config`` with random weights (tests only).
     ``tied`` and ``qkv_bias`` are the config's switches (module docstring).
+    ``(master_dtype, compute_dtype)`` is ``(MASTER_DTYPE, COMPUTE_DTYPE)``, and ``device`` the
+    device whose autocast runs when the two differ (F6b).
     """
 
     def __init__(self, config: Any, *, n_s: int, n: int, eta: float,
-                 source: tuple[str, str] | None = None) -> None:
+                 source: tuple[str, str] | None = None,
+                 master_dtype: torch.dtype = torch.float32,
+                 compute_dtype: torch.dtype = torch.float32,
+                 device: str | torch.device = "cpu") -> None:
         self.config = copy.deepcopy(config)
         self.source = source
         self._n_s, self.n, self._eta = int(n_s), int(n), float(eta)
+        # F6b: fp32 masters, bf16 compute through autocast. fp16 compute needs loss scaling,
+        # which no decision covers.
+        if master_dtype != torch.float32:
+            raise ValueError(f"MASTER_DTYPE must be float32 (F6b), got {master_dtype}")
+        if compute_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(f"COMPUTE_DTYPE must be float32 or bfloat16, got {compute_dtype}")
+        self.master_dtype, self.compute_dtype = master_dtype, compute_dtype
+        self.device_type = torch.device(device).type
         c = self.config
         self.L = int(c.num_hidden_layers)
         self.d = int(c.hidden_size)
@@ -176,17 +207,22 @@ class DecoderComputation(DeclaredComputation):
         self._vowner: weakref.ref[DecoderReplay] | None = None
 
     @classmethod
-    def from_pretrained(cls, repo: str, revision: str, *, n_s: int, n: int,
-                        eta: float) -> DecoderComputation:
+    def from_pretrained(cls, repo: str, revision: str, *, n_s: int, n: int, eta: float,
+                        master_dtype: torch.dtype = torch.float32,
+                        compute_dtype: torch.dtype = torch.float32,
+                        device: str | torch.device = "cpu") -> DecoderComputation:
         config = load_model_config(repo, revision)
-        return cls(config, n_s=n_s, n=n, eta=eta, source=(repo, revision))
+        return cls(config, n_s=n_s, n=n, eta=eta, source=(repo, revision),
+                   master_dtype=master_dtype, compute_dtype=compute_dtype, device=device)
 
     @classmethod
     def from_config(cls, cfg: RunConfig) -> DecoderComputation:
         """The run's instance: ``VERIF_MODEL`` at ``VERIF_MODEL_REVISION``, ``VERIF_BATCH ×
-        VERIF_SEQ_LEN``, ``η = VERIF_ETA``."""
+        VERIF_SEQ_LEN``, ``η = VERIF_ETA``, ``(VERIF_MASTER_DTYPE, VERIF_COMPUTE_DTYPE)`` on
+        ``VERIF_DEVICE``."""
         return cls.from_pretrained(cfg.model, cfg.model_revision, n_s=cfg.batch, n=cfg.seq_len,
-                                   eta=cfg.require_eta())
+                                   eta=cfg.require_eta(), master_dtype=cfg.master_dtype,
+                                   compute_dtype=cfg.compute_dtype, device=cfg.device)
 
     def _check_config(self) -> None:
         c = self.config
@@ -388,22 +424,30 @@ class DecoderComputation(DeclaredComputation):
     # glue_gradient_weights (the base class's derivation): W_E, every γ and every bias, for
     # check 6b.
 
-    # P6: fp32 at both scales; stated here so the instance's numerics are read in one place.
+    # P6, F6b: the weights are the fp32 masters; products and operands are in the compute
+    # format, accumulated in fp32 (F5a turns cuBLAS's reduced-precision reductions off).
     @property
     def weight_dtype(self) -> torch.dtype:
-        return torch.float32
+        return self.master_dtype
 
     @property
     def product_dtype(self) -> torch.dtype:
-        return torch.float32
+        return self.compute_dtype
 
     @property
     def operand_dtype(self) -> torch.dtype:
-        return torch.float32
+        return self.compute_dtype
 
     @property
     def accumulator_dtype(self) -> torch.dtype:
         return torch.float32
+
+    def autocast(self) -> contextlib.AbstractContextManager[Any]:
+        """Autocast to the compute format on the run's device type; a no-op at
+        ``(fp32, fp32)`` (F6b)."""
+        if self.compute_dtype == self.master_dtype:
+            return contextlib.nullcontext()
+        return torch.autocast(self.device_type, dtype=self.compute_dtype)
 
     # ---- shared ---------------------------------------------------------------------------
 
@@ -417,20 +461,22 @@ class DecoderComputation(DeclaredComputation):
 
     def build_model(self) -> nn.Module:
         """An unmodified HF causal LM for the config (``LlamaForCausalLM``,
-        ``Qwen2ForCausalLM``), eager attention, fp32, dropout asserted zero.
+        ``Qwen2ForCausalLM``), eager attention, weights in the master format, dropout
+        asserted zero.
 
         Eval mode: dropout is zero anyway (S4d), and HF runs activation checkpointing only in
         train mode, which the capture forbids. Load ``W_t`` before use.
         """
         if self.source is not None:
             repo, revision = self.source
-            model = load_pretrained(repo, revision, attn_impl="eager", dtype=torch.float32)
+            model = load_pretrained(repo, revision, attn_impl="eager", dtype=self.weight_dtype)
         else:
             from transformers import AutoModelForCausalLM
 
             with torch.random.fork_rng(devices=[]):
                 model = AutoModelForCausalLM.from_config(
-                    copy.deepcopy(self.config), attn_implementation="eager", dtype=torch.float32)
+                    copy.deepcopy(self.config), attn_implementation="eager",
+                    dtype=self.weight_dtype)
         model.eval()
         self._check_model(model)
         return model
@@ -470,13 +516,19 @@ class DecoderComputation(DeclaredComputation):
     @staticmethod
     def loss_from_logits(logits: torch.Tensor, batch: Batch) -> torch.Tensor:
         """``ℒ = (1/Σμ)·Σ_i μ_i·(logsumexp(Λ_i) − Λ_{i,y_i})`` (ref block §3)."""
-        mu = batch.mask.reshape(-1).to(logits.dtype)
-        total = mu.sum()
-        if not total > 0:
+        mask = batch.mask.reshape(-1)
+        if not bool(mask.any()):
             raise ValueError("the batch has no loss-masked target")
         ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), batch.targets.reshape(-1),
                              reduction="none")
-        return (ce * mu).sum() / total
+        mu = mask.to(ce.dtype)  # CE's dtype, not the logits' (module docstring)
+        return (ce * mu).sum() / mu.sum()
+
+    def _forward_loss(self, model: nn.Module, batch: Batch) -> torch.Tensor:
+        """Forward and loss under :meth:`autocast`, for the prover's ``loss`` and the replay's
+        pass alike (F5a)."""
+        with self.autocast():
+            return self.loss_from_logits(self.logits(model, batch), batch)
 
     # ---- verifier side --------------------------------------------------------------------
 
@@ -529,8 +581,7 @@ class DecoderComputation(DeclaredComputation):
     # ---- prover side ----------------------------------------------------------------------
 
     def loss(self, model: nn.Module, records: Sequence[Record]) -> torch.Tensor:
-        batch = self.assemble(records)
-        return self.loss_from_logits(self.logits(model, batch), batch)
+        return self._forward_loss(model, self.assemble(records))
 
     def label(self, capture: MatmulCapture, model: nn.Module) -> list[torch.Tensor]:
         """Map the captured records onto ``P_1..P_M`` by operand identity (module docstring)."""
@@ -611,7 +662,7 @@ class _Labeler:
                 raise LabelingError(f"forward mm #{rec.index} of {weight} carries a bias, none "
                                     f"is declared")
             return
-        if rec.bias is None or _ptr(rec.bias) != _ptr(self.model.get_parameter(want)) \
+        if rec.bias is None or self.cap.param_of(rec.bias) != want \
                 or rec.alpha != 1 or rec.beta != 1:
             raise LabelingError(f"forward mm #{rec.index} of {weight} does not add its declared "
                                 f"bias {want} once (α = β = 1)")
@@ -620,8 +671,8 @@ class _Labeler:
         # P7: the one q=1 product is the RoPE angle table, computed once per forward pass from
         # public constants (inv_freq and the positions).
         outer = self.cap.glue_outer
-        bad = [r for r in outer if r.phase != "forward" or r.a_info.param_name
-               or r.b_info.param_name]
+        bad = [r for r in outer if r.phase != "forward" or _param(r.a_info)
+               or _param(r.b_info)]
         if bad or len(outer) != 1:
             raise LabelingError(f"expected exactly one forward q=1 product (the RoPE table, P7), "
                                 f"got {len(outer)} of which {len(bad)} unexpected")
@@ -632,7 +683,7 @@ class _Labeler:
         """``Y_x`` and ``Λ`` by weight storage; returns weight name -> its forward record."""
         out: dict[str, MatmulRecord] = {}
         for rec in recs:
-            w = rec.b_info.param_name
+            w = _param(rec.b_info)
             if w not in self.role:
                 raise LabelingError(f"forward mm #{rec.index} has no weight operand")
             if w in out:
@@ -679,8 +730,11 @@ class _Labeler:
 
     def _check_row_stochastic(self, l: int, rec: MatmulRecord) -> None:
         a = rec.a
+        # Under autocast A is the fp32 softmax rounded to bf16, which moves a row sum by at
+        # most bf16's unit roundoff, half its eps.
+        tol = max(1e-4, torch.finfo(a.dtype).eps)
         with torch.no_grad():
-            ok = bool((a >= 0).all()) and float((a.sum(-1) - 1).abs().max()) < 1e-4
+            ok = bool((a >= 0).all()) and float((a.float().sum(-1) - 1).abs().max()) < tol
         if not ok:
             raise LabelingError(f"layer {l}: the second forward bmm (#{rec.index}) has an A that "
                                 f"is not row-stochastic, so it is not O = A·V")
@@ -727,7 +781,7 @@ class _Labeler:
         dy: dict[int, str] = {}  # storage of δY_x -> weight
         rest = []
         for rec in recs:
-            w = rec.b_info.param_name
+            w = _param(rec.b_info)
             if w is None:
                 rest.append(rec)
                 continue
@@ -749,7 +803,8 @@ class _Labeler:
                                     f"δY of {w}, B is the input of {sorted(feeds)}")
             if w in self.c.linear_weights:  # not the tied W_E, whose grad is a sum
                 grad = self.model.get_parameter(w).grad
-                if grad is None or _ptr(grad) != _ptr(rec.out):
+                if grad is None or (_ptr(grad) != _ptr(rec.out)
+                                    and not self.cap.is_copy_of(grad, rec.index)):
                     raise LabelingError(f"G of {w} (record #{rec.index}) is not {w}.grad")
             self._fill(self._linear_name(w, "G"), rec.a, rec.b, rec.out, rec)
 
@@ -802,18 +857,23 @@ class DecoderReplay(Replay):
     every checked product is its committed leaf and only glue is computed.
 
     **Forward.** The first request runs ``logits`` on the committed batch, then
-    ``loss_from_logits``, with grad on. A forward pre-hook on each decoder layer (and on the
-    final norm) hands the module a detached copy of its input with ``requires_grad`` on: that
-    is ``X_ℓ`` (``X_{L+1}`` for the head), and it cuts the autograd graph at the layer
-    boundary, so each backward unit (a layer, or the head) keeps a graph of its own. During the
-    pass the replay keeps, per unit, every operand its products receive, the unit's output with
-    its graph, the storages of the ``S`` and ``O`` operands, and a hook on each linear
-    product's output that records the storage of its output gradient ``δY_x``. Forward
-    requests are then served from those kept operands in any order, with no rerun.
+    ``loss_from_logits``, with grad on and under the computation's autocast (F5a). A forward
+    pre-hook on each decoder layer (and on the final norm) hands the module a detached copy of
+    its input with ``requires_grad`` on: that is ``X_ℓ`` (``X_{L+1}`` for the head), and it
+    cuts the autograd graph at the layer boundary, so each backward unit (a layer, or the head)
+    keeps a graph of its own. During the pass the replay keeps, per unit, every operand its
+    products receive, the unit's output with its graph, the storages of the ``S`` and ``O``
+    operands, and a hook on each linear product's output that records the storage of its
+    output gradient ``δY_x``. Forward requests are then served from those kept operands in any
+    order, with no rerun.
 
     The pass checks the call sequence by name, layer by layer (``Y_q, Y_k, Y_v, S, O, Y_o,
     Y_gate, Y_up, Y_down``, then ``Λ`` and nothing in the loss), and that each module receives
     exactly what the one before it returned: a layer's output is ``X_{ℓ+1}``, bit for bit.
+
+    Under autocast a linear's ``B`` and bias are autocast's bf16 copies of the weight and
+    bias, which the substitution reports as they are made; the replay holds each copy until
+    its unit's backward has run, so a weight is still told by storage.
 
     Operands are what the product op receives in the model's own code: ``(X·, W_xᵀ)`` for a
     linear, and for an attention product the bmm operands at batch index ``s·n_h + h``, i.e.
@@ -872,6 +932,8 @@ class DecoderReplay(Replay):
         self.model = c._replay_model(self)
         load_weights(c, self.model, {n: self.view.w_t(n) for n in c.weight_names})
         self._weight_of = param_storage_map(self.model)  # storage -> weight name
+        # Autocast's copies of the weights in this pass: storage -> (weight, copy).
+        self._copies: dict[int, tuple[str, torch.Tensor]] = {}
         self._role = {c.w(l, x): (l, x) for l in range(1, c.L + 1) for x in LINEARS}
         self._role[c.w_out] = (None, "head")
         self.batch: Batch | None = None
@@ -908,17 +970,28 @@ class DecoderReplay(Replay):
 
     # ---- forward: the one pass ------------------------------------------------------------------
 
+    def _weight(self, t: torch.Tensor) -> str | None:
+        """The weight ``t`` is a view of, or of autocast's copy of (F5a)."""
+        p = _ptr(t)
+        w = self._weight_of.get(p)
+        return w if w is not None else self._copies.get(p, (None,))[0]
+
+    def _copied(self, src: torch.Tensor, out: torch.Tensor) -> None:
+        w = self._weight(src)
+        if w is not None:
+            self._copies[_ptr(out)] = (w, out)
+
     def _supply(self, op: str, a: torch.Tensor, b: torch.Tensor,
                 bias: torch.Tensor | None) -> torch.Tensor:
         """A forward product's committed leaf, as a fresh tensor (substitution.py). A biased
         ``Y_x`` arrives as ``addmm`` and its leaf is the op's output, bias included (F14)."""
         c = self.c
         if op in ("mm", "addmm"):
-            w = self._weight_of.get(_ptr(b))
+            w = self._weight(b)
             if w not in self._role:
                 raise ReplayError(f"replay: an mm whose B is not a declared weight ({w})")
             want = c.biases.get(w)
-            got = None if bias is None else self._weight_of.get(_ptr(bias), "an undeclared tensor")
+            got = None if bias is None else (self._weight(bias) or "an undeclared tensor")
             if got != want:
                 raise ReplayError(f"replay: {w}'s product adds bias {got}, declared {want}")
             l, x = self._role[w]
@@ -988,6 +1061,7 @@ class DecoderReplay(Replay):
         self._built, self._units, self._next_unit = False, {}, c.L + 1
         self._bunit, self._bops, self._dx, self._glue = None, {}, None, {}
         self._names, self._mark, self._calls, self._cur, self._n_bmm = [], 0, {}, None, 0
+        self._copies = {}
 
         def enter_layer(j):
             def hook(module, args, kwargs):
@@ -1011,8 +1085,8 @@ class DecoderReplay(Replay):
         hooks.append(inner.norm.register_forward_pre_hook(enter_head))
         batch = c.assemble(self.view.records())
         try:
-            with torch.enable_grad(), ProductSubstitution(self._supply):
-                loss = c.loss_from_logits(c.logits(model, batch), batch)
+            with torch.enable_grad(), ProductSubstitution(self._supply, copied=self._copied):
+                loss = c._forward_loss(model, batch)
                 if c.L + 1 not in self._units:
                     raise ReplayError("replay: the forward pass never reached the final norm")
                 self._leave_unit(c.L + 1, loss)
@@ -1069,8 +1143,8 @@ class DecoderReplay(Replay):
         if bias is not None:
             raise ReplayError(f"replay: a backward {op} adds a bias")
         if op == "mm":
-            w = self._weight_of.get(_ptr(b))
-            if w is not None:  # δX_x = δY_x·W_x reads the weight itself
+            w = self._weight(b)
+            if w is not None:  # δX_x = δY_x·W_x reads the weight itself (or its copy)
                 if w not in self._role or self._dy.get(_ptr(a)) != w:
                     raise ReplayError(f"replay: a backward mm reads weight {w} but its A is "
                                       f"not that weight's output gradient")
@@ -1125,11 +1199,12 @@ class DecoderReplay(Replay):
         # The unit's glue-gradient weights first, then its linear weights.
         if head:
             glue = [c.gamma_final]
-            params = [model.get_parameter(n) for n in (*glue, c.w_out)]
+            names = [*glue, c.w_out]
         else:
             glue = [c.gamma_attn(j), c.gamma_mlp(j),
                     *(b for x in LINEARS if (b := c.bias(j, x)) is not None)]
-            params = [model.get_parameter(n) for n in (*glue, *(c.w(j, x) for x in LINEARS))]
+            names = [*glue, *(c.w(j, x) for x in LINEARS)]
+        params = [model.get_parameter(n) for n in names]
         self._ys, self._want = self._unit_names(j)
         self._unit, self._bunit, self._bops = j, None, {}
         self._fwd, self._saved, self._dy = u.fwd, u.saved, {}
@@ -1142,9 +1217,11 @@ class DecoderReplay(Replay):
             raise
         finally:
             self._fwd, self._saved, self._dy = {}, {}, {}
-            # The graph's saved tensors are freed; drop the unit's operands, input and output.
+            # The graph's saved tensors are freed; drop the unit's operands, input and output,
+            # and autocast's copies of its weights.
             self._units.pop(j, None)
             self._next_unit = j - 1
+            self._copies = {k: v for k, v in self._copies.items() if v[0] not in names}
         if not self._bops:
             raise ReplayError(f"replay: no backward product of unit {j} reached the "
                               f"substitution; is the dispatch mode not active in backward?")
@@ -1214,10 +1291,13 @@ class DecoderReplay(Replay):
         def no_product(op, a, b, bias):
             raise ReplayError("replay: a product in the embedding backward")
 
-        with torch.enable_grad(), ProductSubstitution(no_product):
+        # Under the prover's autocast (F5a), so the lookup runs as training ran it.
+        with torch.enable_grad(), c.autocast(), ProductSubstitution(no_product):
             (g_emb,) = torch.autograd.grad(emb(self.batch.ids), [emb.weight],
                                            grad_outputs=self._dx[1])
-        g_e = self.view.product(c.m_of("G_E_head")) + g_emb if c.tied else g_emb
+        # F6b: the committed G_E^head widened exactly to W_E's format, plus the lookup's.
+        g_e = (self.view.product(c.m_of("G_E_head")).to(c.weight_dtype) + g_emb if c.tied
+               else g_emb)
         grads = {**self._glue, _E: g_e}
         out = {n: grads[n] for n in c.glue_gradient_weights}
         bad = [n for n, g in out.items() if g.dtype != c.weight_dtype]

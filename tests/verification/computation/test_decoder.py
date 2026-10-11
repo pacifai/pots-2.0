@@ -1,6 +1,8 @@
 """The decoder instance: declaration and prover-side labeling (A7, milestone M2), the
-verifier-side forward (A8) and backward (A9) replay, and its two config switches (FS1)."""
+verifier-side forward (A8) and backward (A9) replay, its two config switches (FS1) and mixed
+precision (FS3)."""
 
+import contextlib
 import dataclasses
 import weakref
 from collections import Counter
@@ -11,6 +13,7 @@ import torch.nn.functional as F
 from transformers import LlamaConfig
 from transformers.models.llama import modeling_llama
 
+from setup.data import Batch
 from setup.records import Record, RecordError, encode_record
 from verification.commitment.leaves import leaf_hash
 from verification.computation.instances import DecoderComputation
@@ -32,6 +35,10 @@ SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
 FWD, IG, WG, OG = (ProductKind.FORWARD, ProductKind.INPUT_GRAD, ProductKind.WEIGHT_GRAD,
                    ProductKind.OPERAND_GRAD)
+
+F32, BF16 = torch.float32, torch.bfloat16
+# (MASTER_DTYPE, COMPUTE_DTYPE) runs the switch tests at both settings (F6b).
+COMPUTE = {"fp32": F32, "bf16": BF16}
 
 
 def smollm2_config():
@@ -409,6 +416,33 @@ def test_label_rejects_tampered_capture(setup, tamper):
              "S_b_split_kv": "share a kv head"}.get(tamper)
     with pytest.raises(LabelingError, match=match):
         c.label(cap, model)
+    model.zero_grad(set_to_none=True)
+
+
+@pytest.mark.parametrize("dtype", list(COMPUTE))
+@pytest.mark.parametrize("family", ["llama", "qwen2"])
+def test_label_rejects_a_grad_not_linked_to_its_G(family, dtype):
+    """``G_x`` must be ``W_x.grad``: its own output at fp32, AccumulateGrad's fp32 copy of it
+    at bf16 (``capture.is_copy_of``). ``swap_G_k_G_v`` finds the grad by data pointer, which
+    at bf16 is the copy's, not the product's. Here ``W_k.grad`` is replaced by ``W_v.grad``
+    (same shape, another product's copy) or by a clone of itself (equal values, a storage no
+    product wrote)."""
+    c = DecoderComputation(tiny_config(family=family), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
+    model = c.build_model()
+    cap = run_capture(c, model, make_records((12, 7)))
+    w_k, w_v = (model.get_parameter(c.w(1, x)) for x in ("k", "v"))
+    honest = w_k.grad
+    assert honest.dtype == F32 and honest.shape == w_v.grad.shape
+    for tampered in (w_v.grad, honest.clone()):
+        w_k.grad = tampered
+        try:
+            with pytest.raises(LabelingError, match=r"is not .*\.grad") as e:
+                c.label(cap, model)
+            assert str(e.value).startswith(f"G of {c.w(1, 'k')} "), e.value
+        finally:
+            w_k.grad = honest
+    assert len(c.label(cap, model)) == c.M
     model.zero_grad(set_to_none=True)
 
 
@@ -936,11 +970,15 @@ def test_backward_reports_a_missing_product(honest_all):
 # ---- the two switches: tied or untied output layer, q/k/v biases on or off (FS1) -------------
 
 
-@pytest.fixture(scope="module", params=SWITCHES, ids=map(switch_id, SWITCHES))
+_SWITCHED = [(s, d) for s in SWITCHES for d in COMPUTE]
+
+
+@pytest.fixture(scope="module", params=_SWITCHED, ids=[f"{switch_id(s)}-{d}" for s, d in _SWITCHED])
 def switched(request):
-    """A tiny model at each switch setting, its biases drawn at random."""
-    family, tied = request.param
-    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
+    """A tiny model at each switch setting and compute dtype, its biases drawn at random."""
+    (family, tied), dtype = request.param
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
     model = c.build_model()
     randomize_biases(dict(model.named_parameters()))
     return c, model, make_records((12, 7))
@@ -991,8 +1029,10 @@ def test_switches_declaration(switched):
 
 
 def test_switches_label_every_slot_once(switched):
-    """Each slot is filled once; a biased ``Y_x`` leaf is the whole ``addmm`` output, and the
-    untied ``G_head`` is ``W_out``'s gradient."""
+    """Each slot is filled once, in the compute dtype; a biased ``Y_x`` leaf is the whole
+    ``addmm`` output, and the untied ``G_head`` is ``W_out``'s gradient. Under autocast each
+    weight operand and bias is a bf16 copy of its fp32 parameter, traced to it by identity, and
+    each linear weight's fp32 gradient is the copy of its bf16 ``G``."""
     c, model, records = switched
     calls = Counter()
     orig = _Labeler._fill
@@ -1005,25 +1045,40 @@ def test_switches_label_every_slot_once(switched):
         mp.setattr(_Labeler, "_fill", fill)
         cap = run_capture(c, model, records)
         slots = c.label(cap, model)
+    mixed = c.operand_dtype != c.weight_dtype
     try:
         assert len(slots) == c.M and calls == Counter(p.name for p in c.products)
+        assert {s.dtype for s in slots} == {c.product_dtype}
         by_out = {_ptr(r.out): r for r in cap.records if r.batch is None}
         for l in range(1, c.L + 1):
             for x in LINEARS:
                 rec = by_out[_ptr(slots[c.m_of(f"L{l}.Y_{x}") - 1])]
+                w = model.get_parameter(c.w(l, x))
+                assert cap.param_of(rec.b) == c.w(l, x)
+                assert (rec.b_info.param_name is None) == mixed
+                assert torch.equal(rec.b, w.detach().to(c.operand_dtype).t())
+                g = by_out[_ptr(slots[c.m_of(f"L{l}.G_{x}") - 1])]
+                assert w.grad.dtype == c.weight_dtype and torch.equal(w.grad, g.out.float())
+                assert (_ptr(w.grad) == _ptr(g.out)) != cap.is_copy_of(w.grad, g.index)
+                assert cap.is_copy_of(w.grad, g.index) == mixed
                 b = c.bias(l, x)
                 assert (b is not None) == (c.qkv_bias and x in "qkv")
                 if b is None:
                     assert rec.bias is None and rec.op == "aten.mm.default"
                     continue
-                assert rec.op == "aten.addmm.default" and rec.bias is model.get_parameter(b)
+                bias = model.get_parameter(b)
+                assert rec.op == "aten.addmm.default" and cap.param_of(rec.bias) == b
+                # The bias autocast adds is the fp32 b_x cast to the operand dtype.
+                assert (rec.bias is bias) != mixed
+                assert torch.equal(rec.bias, bias.detach().to(c.operand_dtype))
                 assert torch.equal(rec.out, torch.addmm(rec.bias, rec.a, rec.b))
                 assert not torch.equal(rec.out, rec.a @ rec.b)
         g = slots[c.m_of(c.g_head) - 1]
         if c.tied:
-            assert not torch.equal(g, model.get_parameter(c.w_e).grad)
+            assert not torch.equal(g.float(), model.get_parameter(c.w_e).grad)
         else:
-            assert _ptr(g) == _ptr(model.get_parameter("lm_head.weight").grad)
+            grad = model.get_parameter("lm_head.weight").grad
+            assert _ptr(g) == _ptr(grad) or cap.is_copy_of(grad, by_out[_ptr(g)].index)
     finally:
         model.zero_grad(set_to_none=True)
 
@@ -1051,15 +1106,20 @@ def test_switches_replay_rebuilds_operands_and_glue(switched, monkeypatch):
         assert grads[n].abs().max() > 0, n
 
 
+@pytest.mark.parametrize("dtype", list(COMPUTE))
 @pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
-def test_switches_verify_an_honest_step(switch):
-    """The whole verifier path at each switch setting. Untied: a forged ``G_head`` fails the
-    update identity (6a) and a forged ``Λ`` fails 5. Biased: the step is accepted with zero
-    biases (HF's init) and with drawn ones, bias gradients included (6b), since check 5 checks
-    each ``Y_q, Y_k, Y_v`` as ``[A | 1]·[B ; bᵀ]`` with ``b`` from the committed ``W_t`` (F14).
-    One bias entry altered rejects at the check that reads where it sits: in the ``W_t`` leaf,
-    check 0 (step 1's ``W_t`` isn't the agreed ``W_0``); only in training, under an honest
-    ``W_t`` leaf, check 5 at that bias's product; in the ``W_{t+1}`` leaf, check 6b."""
+def test_switches_verify_an_honest_step(switch, dtype):
+    """The whole verifier path at each switch setting and compute dtype, under provisional
+    bands. Untied: a forged ``G_head`` fails the update identity (6a) and a forged ``Λ`` fails
+    5. Biased: the step is accepted with zero biases (HF's init) and with drawn ones, bias
+    gradients included (6b), since check 5 checks each ``Y_q, Y_k, Y_v`` as
+    ``[A | 1]·[B ; bᵀ]`` with ``b`` from the committed ``W_t`` (F14), cast to the operand
+    dtype as autocast casts it for the prover's ``addmm``. One bias entry altered rejects at
+    the check that reads where it sits: in the ``W_t`` leaf, check 0 (step 1's ``W_t`` isn't
+    the agreed ``W_0``); only in training, under an honest ``W_t`` leaf, check 5 at that
+    bias's product; in the ``W_{t+1}`` leaf, check 6b. A shift of one bf16 ULP in training
+    alone is check 5's at fp32. At bf16 it is under check 5's band, and it is 6b's, through
+    the ``W_{t+1}`` trained from the shifted bias."""
     from setup.data import schedule
     from verification.commitment.leaves import dataset_tree
     from verification.transcript.store import InMemoryStore, perturb_leaf
@@ -1067,7 +1127,8 @@ def test_switches_verify_an_honest_step(switch):
     from verification.verifier.driver import Verifier
 
     family, tied = switch
-    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
     D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
     tree = dataset_tree(c, D)
     w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
@@ -1122,15 +1183,34 @@ def test_switches_verify_an_honest_step(switch):
         assert (rejection.step, rejection.check_id) == (1, "6b"), b
         assert b in rejection.detail, rejection.detail
 
+        # One bf16 ULP on the same entry, in training only. At fp32 check 5 sees it, as about
+        # 2¹⁶ of its rounding steps. At bf16 it is one rounding step of the committed Y_x,
+        # under check 5's band, and the W_{t+1} trained from the shifted bias fails 6b.
+        _, rejection = verify({**w0, b: _bf16_step_up(w0[b])}, agreed=w0, edit=honest_w_t)
+        assert (rejection.step, rejection.check_id) == (1, "5" if dtype == "fp32" else "6b"), b
+        assert (f"P_{m} (L{l}.Y_{x})" if dtype == "fp32" else b) in rejection.detail
 
+
+def _bf16_step_up(t, index=-1):
+    """``t`` with one entry raised by one bf16 ULP, so its bf16 copy moves one step up."""
+    t = t.clone()
+    x = t.view(-1)[index].to(BF16)
+    up = torch.nextafter(x, torch.tensor(float("inf"), dtype=BF16))
+    t.view(-1)[index] += float(up) - float(x)
+    assert t.view(-1)[index].to(BF16) == up
+    return t
+
+
+@pytest.mark.parametrize("dtype", list(COMPUTE))
 @pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
-def test_switches_capture_is_bit_identical(switch):
-    """Capture changes nothing at any switch setting, drawn biases included: a captured step's
-    loss and ``W_{t+1}`` equal an uncaptured step's bit for bit."""
+def test_switches_capture_is_bit_identical(switch, dtype):
+    """Capture changes nothing at any switch setting and compute dtype, drawn biases included:
+    a captured step's loss and ``W_{t+1}`` equal an uncaptured step's bit for bit."""
     from verification.prover.step import plain_step
 
     family, tied = switch
-    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(0)  # the init, independent of which tests ran first
         w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
@@ -1146,6 +1226,39 @@ def test_switches_capture_is_bit_identical(switch):
     # rounding step, so at other inits a bias with a small gradient can round to no change.
     for b in (c.bias(l, x) for l in range(1, c.L + 1) for x in "qkv" if c.qkv_bias):
         assert not torch.equal(w_next[b], w0[b]), b
+
+
+def test_mixed_precision_is_config():
+    """F6b: ``(fp32, fp32)`` runs no autocast; ``(fp32, bf16)`` keeps fp32 weights and runs
+    forward and loss under bf16 autocast on the declared device. Other pairs are refused."""
+    cfg = tiny_config()
+    c = DecoderComputation(cfg, n_s=2, n=12, eta=1e-3)
+    assert isinstance(c.autocast(), contextlib.nullcontext)
+    assert (c.weight_dtype, c.product_dtype, c.operand_dtype, c.accumulator_dtype) == (F32,) * 4
+    b = DecoderComputation(cfg, n_s=2, n=12, eta=1e-3, compute_dtype=BF16)
+    assert (b.weight_dtype, b.product_dtype, b.operand_dtype, b.accumulator_dtype) == \
+        (F32, BF16, BF16, F32)
+    ac = b.autocast()
+    assert isinstance(ac, torch.autocast) and (ac.device, ac.fast_dtype) == ("cpu", BF16)
+    assert {p.dtype for p in b.build_model().parameters()} == {F32}
+    with pytest.raises(ValueError, match="MASTER_DTYPE"):
+        DecoderComputation(cfg, n_s=2, n=12, eta=1e-3, master_dtype=BF16, compute_dtype=BF16)
+    with pytest.raises(ValueError, match="COMPUTE_DTYPE"):
+        DecoderComputation(cfg, n_s=2, n=12, eta=1e-3, compute_dtype=torch.float16)
+
+
+def test_loss_counts_mu_in_ce_dtype():
+    """Under autocast the logits are bf16 and CE is fp32. ``Σ μ`` is taken in CE's dtype: in
+    bf16, 301 masked targets would count as 300."""
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(1, 301, 64, generator=g).to(BF16)
+    targets = torch.randint(0, 64, (1, 301), generator=g)
+    ones = torch.ones(1, 301, dtype=torch.long)
+    with torch.autocast("cpu", dtype=BF16):
+        loss = DecoderComputation.loss_from_logits(logits, Batch(targets, targets, ones, ones))
+    ce = F.cross_entropy(logits.float().reshape(-1, 64), targets.reshape(-1), reduction="none")
+    assert loss.dtype == F32 and torch.equal(loss, ce.sum() / torch.tensor(301.0))
+    assert float(torch.ones(301, dtype=BF16).sum()) == 300
 
 
 def test_rejects_unsupported_switches():
@@ -1242,7 +1355,7 @@ def test_smollm2_real_step_m2():
 
     assert len(out.products) == c.M
     for p, t in zip(c.products, out.products):
-        assert tuple(t.shape) == p.p_shape and t.dtype == torch.float32, p.name
+        assert tuple(t.shape) == p.p_shape and t.dtype == c.product_dtype, p.name
         assert torch.isfinite(t).all(), p.name
     assert len(out.leaves()) == c.n_leaves == tree.n_leaves
     kinds = Counter(p.kind.value for p in c.products)

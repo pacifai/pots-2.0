@@ -19,6 +19,9 @@ masking, softmax, SiLU, residual adds) runs through the model's own modules, unc
 - The supplied tensor must have the op's output shape and ``a``'s dtype; it is moved to ``a``'s
   device. Return a fresh tensor, never a committed leaf itself: autograd attaches history to an
   op's output, and a leaf must not change (invariant 6).
+- Every ``aten._to_copy`` runs as normal and is reported to an optional ``copied(src, out)``
+  callback. Under mixed precision autocast hands a matmul a bf16 copy of its weight, not the
+  weight, so the callback lets the instance follow a copy back to its weight (F5a).
 
 Instance-agnostic: the callback decides which committed leaf each call stands for.
 """
@@ -38,12 +41,15 @@ from verification.computation.matmul_ops import (
     TRUSTED_NAMESPACES,
 )
 
-__all__ = ["SubstitutionError", "ProductSubstitution", "Supply"]
+__all__ = ["Copied", "SubstitutionError", "ProductSubstitution", "Supply"]
 
 # (op name "mm" | "bmm" | "addmm", a, b, bias or None) -> the tensor that stands for the op
 Supply = Callable[[str, torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor]
+# (source, copy) of each aten._to_copy, after the copy is made
+Copied = Callable[[torch.Tensor, torch.Tensor], None]
 
 _SUBSTITUTED = ("mm", "bmm", "addmm")
+_TO_COPY = torch.ops.aten._to_copy.default
 
 
 class SubstitutionError(ReplayError):
@@ -51,11 +57,13 @@ class SubstitutionError(ReplayError):
 
 
 class ProductSubstitution(TorchDispatchMode):
-    """Dispatch mode that returns ``supply(op, a, b, bias)`` for every checked product."""
+    """Dispatch mode that returns ``supply(op, a, b, bias)`` for every checked product and
+    reports every dtype copy to ``copied(src, out)``."""
 
-    def __init__(self, supply: Supply) -> None:
+    def __init__(self, supply: Supply, copied: Copied | None = None) -> None:
         super().__init__()
         self.supply = supply
+        self.copied = copied
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -85,4 +93,8 @@ class ProductSubstitution(TorchDispatchMode):
                 raise SubstitutionError(f"{func}: supplied {out.dtype} {tuple(out.shape)}, the "
                                         f"op gives {a.dtype} {want}")
             return out.to(a.device)
+        if func is _TO_COPY and self.copied is not None:
+            out = func(*args, **kwargs)
+            self.copied(args[0], out)
+            return out
         return func(*args, **kwargs)
