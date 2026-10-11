@@ -831,6 +831,16 @@ interface.
     `measure_products`. Members are then recorded and judged in canonical order, so the first
     failing member rejects with the same message as alone, and an error serving a later member
     is raised only after the members before it pass. Every other product is measured alone.
+  - **The record pass (EV2, EVALUATION_SPEC §4.1).** `record_rest(store, c, ctx, bands,
+    slot)` measures, for the record only, the tests a rejecting check skipped. A check-5
+    rejection measures every later product from check 5's own replay. A 6a rejection
+    measures the remaining linear weights, then every 6b glue weight from a replay of its
+    own, since check 6 is one protocol check over every tensor. A 6b rejection measures the
+    remaining glue weights. It runs with `judge=False` and no metrics seam, sharing
+    `ctx.stats`, so it changes no rejection, verdict or timing row. A failing test is still
+    recorded and the pass goes on. A malformed leaf ends the pass quietly, and a
+    verifier-side error propagates. `RECORDED_SLOTS = ("6a", "5", "6b")`; any other slot
+    does nothing. The checks after the rejecting one never run.
 - `driver.py` (A5): `Verifier(c, *, h_D, n_records, k, n_steps, bands, seed, w0= | w0_hashes=,
   schedule=, calibrate=False, allow_provisional=False, section=None, kappa_guard=True)`.
   `seed` is required and has no default: `π` is public input, `setup.data.schedule(t, n_s,
@@ -848,7 +858,9 @@ interface.
     indices into `D`; F8c's `π` runs on into later passes, so `T` may exceed one pass) and
     prepares check 0. At step 1, check 0 runs in check 7's slot and reports as `"0"`.
   - `verify_step(t, store)` runs the default order and keeps the `W_{t+1}` hashes only once
-    every slot, the root comparison included, has passed.
+    every slot, the root comparison included, has passed. After a `"failed"` rejection (never
+    a malformed one) it calls `checks.record_rest` with the rejecting slot, once the verdict
+    is fixed. Its time lands in the loop's `verify_s`, not in any check's row.
   - `freeze(bands)` ends calibration (P10b): it re-judges every calibrated step's stats in
     check order, records `bands.source`, and judges every later step. The root comparison
     runs live in calibration. Since it runs after 6a, 5 and 6b, a live rejection from it is
@@ -984,7 +996,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
 - `mlp_smoke.py` (A6, milestone M1):
   `.venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]`.
   Holds the MLP's scenario list, `run_smoke(..., metrics=None)` and `memory_smoke` /
-  `count_smoke` (`PASS_STEPS` honest steps through `scenarios.memory_run` / `count_run`).
+  `count_smoke` (`PASS_STEPS` and `COUNT_STEPS` honest steps through `scenarios.memory_run` /
+  `count_run`).
   - The MLP at widths `(16,32,32,8)`, `n_s = 4`, `η = VERIF_ETA`, `k = VERIF_K`, on
     `synthetic_dataset` of `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS`
     (default 10), and must be ≥ 2. Bands are provisional, with `allow_provisional=True`.
@@ -1038,26 +1051,74 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     a plain step. Hash counts cover `commitment.merkle`, `matmul_check.challenges` and
     `verifier.bands`; the band file is hashed at load, outside every section.
   - `MetricsWriter(dir, run, *, device, model, corpus, attack, seed, config, band_file_hash,
-    h_D, extra)` (`.recorder(scenario, *, poisoning_rate, cheat_step)`, `.write(rows)`,
+    h_D, extra)` (`.recorder(scenario, *, bpr_records, bpr_actual, cheat_step)`,
+    `.write(rows)`, `.write_residuals(scenario, t, stats, c, *, bands, k, kappa_guard)`,
     `.close()`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
     equal to `verifier.stats`), `memory_probe(device)`, `step_record`, `config_hash`.
-    `model`, `corpus` and `seed` go into the `environment` record and every `step` record;
-    `attack` (`VERIF_ATTACK`, `None` for a run on other data) into the `environment` record
-    only. Every run that writes `corpus` writes `attack`.
+    `model`, `corpus`, `attack` (`VERIF_ATTACK`, `None` for a run on other data) and `seed`
+    go into the `environment` record and every `step` record. Every run that writes `corpus`
+    writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
+    EVALUATION_SPEC §4.6) raises `ValueError`.
+  - **Run names (EV2).** `run_name(scenario, model, attack, bpr_records, seed)` is a cell's
+    unique name, `<scenario>-<model>-<attack>-bpr<n>-s<seed>`: the model as its repository's
+    last part, `n` the poisoned records in the cheat batch (0 for an honest run), characters
+    outside `[A-Za-z0-9._-]` as `_`. For example
+    `honest-SmolLM2-135M-Instruct-refusal-bpr0-s1`. `run_verified`, `poisoned_step` and
+    `hidden_steps` use it. The other runs keep their fixed names (`plain_baseline`,
+    `llama_step`, `calibrate`, `mlp_smoke`, `store_crosscheck`, `flipped_matmul_sweep`).
+  - **Step records (EVALUATION_SPEC §4.1).** `step_record` writes `model`, `corpus`,
+    `attack`, `seed`, `bpr_records`, `bpr_actual`, `cheat_step`, `step`, `judged`,
+    `verdict`, `first_failing_check`, `rejection_kind`, `checks` and the step's scores
+    `rho_5`, `rho_kappa`, `rho_6` and `n_failing`. `bpr_records` and `bpr_actual` are the
+    cheat batch's poisoned records and their share of it: `env.bpr_records`/`bpr_actual`
+    for a cheat on `b̃`, `0`/`0.0` for an honest run, `None` for a protocol fault and the
+    MLP smoke run. `cheat_step` is `t*` for a cheat, else `None`.
+    - `judged_step(verifier, t, cheat_step)`: never while calibrating or under provisional
+      bands; a cheat run judges `t ≥ t*`; an honest run at the band file's
+      `calibration_seed` (H1) skips the file's `calibration_steps` (1–3); at any other seed
+      (H2) it skips step 1. A file without `calibration_seed` is taken as fitted at the run's
+      seed. `in_sample_step(bands, t, seed)` is H1's half of it.
+    - `rho_arrays(stats, bands, *, k, kappa_guard=True)` gives the component scores, each a
+      test's left side over its right side, so a test rejects exactly when its score is
+      above 1: `rho_5` `[P, k]` (`normalized/τ`), `rho_kappa` `[P]`
+      (`ν/(κ_max(class)·‖|P|·1‖)`, 0 when `ν = 0`, `inf` when only the denominator is 0) and
+      `rho_6` `[W]` (`ρ_max/τ_W(tensor)`). All NaN without bands (calibrating);
+      `rho_kappa` NaN with the κ guard off. For `ρ_κ` and `ρ_6` the score is above 1
+      exactly when the live test rejects. Check 5's residual test compares the raw residual
+      with `τ·unit`, so `ρ_5` can disagree with it by rounding when a residual lands on `τ`
+      within an ulp.
+    - `step_scores(stats, bands, *, k, kappa_guard)`: per family (`SCORE_FAMILIES`) the
+      largest score, and `n_failing`, a dict of the count of scores above 1 (NaN counts as
+      failing). A family not scored at the step (no bands, guard off, nothing measured) is
+      `None` with its `n_failing` entry.
   - Files under `$VERIF_OUTPUT_DIR/<run>/`: `records.jsonl` (records `environment`, `step`,
     `verdict`, `time`, `memory`, `count`, `storage`, `run_end`, each with `record` and `run`;
     non-finite floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`) and
     `residuals/<scenario>/step_<t>.npz`. Since A11 each npz also holds the product scales
-    `p_q`, `p_norm`, `p_nu`, `p_abs1`; older archives read back with them unknown. On macOS, export `MallocLargeCache=0` for runs whose
+    `p_q`, `p_norm`, `p_nu`, `p_abs1`; older archives read back with them unknown. Since EV2
+    (EVALUATION_SPEC §4.2) it holds the index table and the scores beside the raw arrays:
+    per product `p_m`, `p_name`, `p_cls` (the fine class, κ's), `p_spec_class` (§5.7's
+    class, `spec_class(c, spec)`: `forward`, `input gradient`, `weight gradient`,
+    `attention score`, `attention value`, and the placeholder `operand gradient` for δA,
+    δV, δQ̃ and δK̃, which §5.7 doesn't name), `p_layer` (1-based, `-1` outside the layer
+    stack); per tensor `w_check`, `w_name`; then `rho_5` `[P, k]`, `rho_kappa` `[P]`,
+    `rho_6` `[W]` row for row (`rho_arrays`), and `band_source`, the bands' hash (empty while
+    calibrating). A step rejected at check 5 holds all `M` products, one rejected at 6a or 6b
+    every tensor check 6 measures (the record pass); one rejected before 6a has no archive.
+    On macOS, export `MallocLargeCache=0` for runs whose
     memory figures are compared: otherwise freed large blocks stay in the footprint.
   - `metrics_overhead.py`: `.venv/bin/python -m verification.runs.metrics_overhead
     [--reps N] [--steps T] [--widths ...]`, an off/on/off timing of the honest MLP run.
-  - `PASS_STEPS = 2`: every run's memory and counting passes. Step 1 has check 0's anchor and
-    first-touch allocation; step 2 is the first check-7 step and steady-state memory. Counts
-    are deterministic, so the report takes one step's counts.
+  - `PASS_STEPS = 2`: every run's memory pass. Step 1 has check 0's anchor and first-touch
+    allocation; step 2 is the first check-7 step and steady-state memory.
+  - `COUNT_STEPS = 1`: every run's counting pass, one step per configuration
+    (EVALUATION_SPEC §3.4). Counts are deterministic: steps 1 and 2 of the SmolLM2 run count
+    the same FLOPs, hash calls and challenge bytes, and differ only in the `hash_in_bytes` of
+    P3 and checks 2 and 4, which hash the batch's token records (1,356 bytes more at step 2,
+    out of 2.6 GB). `llama_step` still counts over its `T`.
   - `mlp_smoke` writes to `mlp_smoke/` unless `--no-metrics` or `VERIF_METRICS=0`; its memory
-    and counting passes are `PASS_STEPS` honest steps each, of their own. The MLP records
-    `h_D` (its synthetic `D`'s root) and a null band-file hash.
+    and counting passes are `PASS_STEPS` and `COUNT_STEPS` honest steps, each of its own. The
+    MLP records `h_D` (its synthetic `D`'s root) and a null band-file hash.
 - `llama_step.py` (A10, milestone M3): `.venv/bin/python -m verification.runs.llama_step
   [--steps T] [--bands PATH] [--metrics | --no-metrics]`, with `T` default 1.
   `DecoderComputation.from_config`, `W_0` from `build_model()`, `D` from
@@ -1147,9 +1208,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `PlainStepRecord.train_s` is host time around the step, informational; P0's times are
     the `P0.*` rows.
   - `plain_baseline(c, D, w0, *, T, seed, build_model, out_dir=None, metrics=None,
-    pass_steps=PASS_STEPS, provenance=None, keep_weights=True, out=print) -> BaselineResult`.
-    With a `MetricsWriter`, scenario `plain`: the timed run's `P0.*` rows per step, then a
-    memory pass and a counting pass of the first `pass_steps` steps (each with its own model;
+    pass_steps=PASS_STEPS, count_steps=COUNT_STEPS, provenance=None, keep_weights=True,
+    out=print) -> BaselineResult`. With a `MetricsWriter`, scenario `plain`: the timed run's
+    `P0.*` rows per step, then a memory pass of the first `pass_steps` steps and a counting
+    pass of the first `count_steps` (each with its own model;
     the final weights are dropped first when `keep_weights=False`, as `main` does). P0 memory
     is printed as the step's growth, peak of `P0.backward` minus start of `P0.forward`. No
     `step` or `verdict` record. Writes to `$VERIF_OUTPUT_DIR/plain_baseline/`. With metrics
@@ -1188,7 +1250,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   - On success it writes `$VERIF_OUTPUT_DIR/bands.json`, then judges steps 1–3 again from the
     file with the κ guard on (`frozen`) and off (`frozen_no_kappa`), asserts one band-file
     hash across the three runs, measures gradient coherence on step 1's batch at `W_0`
-    (`gradient_coherence`), runs the memory and counting passes of `frozen`, and prints the
+    (`gradient_coherence`), runs the memory pass (its steps) and the counting pass
+    (`COUNT_STEPS`) of `frozen`, and prints the
     cost split (`cost_split`). Records `calibration` and `gradient_coherence` go to
     `records.jsonl`.
   - First run (2026-10-05, dev Mac, `MallocLargeCache=0`): at `k = 7`, `s_h = 5.62` (`Λ`),
@@ -1225,28 +1288,59 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   - Re-run at C5–C6 (2026-10-11, band file `cc7a9bca…`): every decision identical. 2.46 GiB
     per step, about 3.1 s to write, verify 1.2 s slower per step, the disk verifier's peak
     again about 0.6 GiB higher. 3 min 24 s in all.
-- Later: `run_verified.py` and the other runs. A12 builds its verifier with
-  `bands=calibration.load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D,
-  k=pc.k))`.
+- `run_verified.py` (A12, EV2): `.venv/bin/python -m verification.runs.run_verified
+  [--steps T] [--pass-steps S] [--keep-step N] [--metrics | --no-metrics]`. Its docstring has
+  the full flow. The honest run, judged live by the band file
+  (`calibration.load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D,
+  k=pc.k))`).
+  - Run directory `honest_run_name(model, attack, seed)`, for example
+    `honest-SmolLM2-135M-Instruct-refusal-bpr0-s1/`; there was a fixed `run_verified/` until
+    EV2. It holds `final_weights.json`, the stored step and, with metrics on, the records,
+    the memory pass (`--pass-steps`) and the counting pass (`COUNT_STEPS`).
+  - `StepSummary.in_sample` (`metrics.in_sample_step`) and `.judged`
+    (`metrics.judged_step`); `.sample` is `in`, `judged` or `not judged` (H2's step 1), and
+    the `residual_summary` record carries both. The guard line names judged steps only.
+  - **The stored step (EV2).** `KeptStepHandoff(directory, step)` is the in-memory hand-off
+    that also holds step `step`'s leaves and tree; `write()`, from `on_step` once the step
+    has closed, writes them with `DiskHandoff(keep=True)` to `directory/step_<t>/` and
+    raises `RuntimeError` unless the root recomputed from the files is the step's `h`. The
+    verifier reads that step from memory too, and the write falls outside every timed
+    section and the step clock. `--keep-step` defaults to `KEEP_STEP = 4` (H1's first
+    judged step), `0` for none, under `transcripts/` (`TRANSCRIPTS_DIR`) in the run
+    directory, written whether metrics are on or not (about 2.5 GB). With metrics, a
+    `kept_transcript` record (`kept_record`) holds the path relative to the run directory,
+    the root, and the files' count (`n_leaves + 2`) and bytes.
+  - Re-run at EV2 (2026-10-11, band file `cc7a9bca…`): all 10 steps accepted, steps 1–3
+    in-sample, final weights equal to the plain baseline's (root `bb9aec2a…`). Step 4 kept:
+    7,663 files, 2.46 GiB, root `daa53d7c…`. 53 s in all, peak footprint 5.5 GiB.
 - Cheat runs (A13, milestone M5), all judged by the frozen band file, read-only. Each module
   docstring has the full flow.
-  - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step and
-    poisoning rate, `W_0`, bands, `k`, `seed`, one `ReusedModel`, one
+  - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step,
+    `bpr_records` (`b̃`'s records unlike `π`'s batch) and `bpr_actual` (their share), `W_0`,
+    bands, `k`, `seed`, one `ReusedModel`, one
     `run_verified.JudgingVerifiers`), `load_env(cfg, pc)` (SmolLM2; `check_meta` first
     compares `meta.json`'s `seed`, `attack`, `poisoning.count` and `poisoning.batch` with
     `VERIF_SEED`, `VERIF_ATTACK`, `VERIF_POISON_COUNT` and `VERIF_BATCH`, a missing field
-    included, then `D̃` is checked against `h_D_tilde`), `run_cheat` (one scenario cut at
-    `T`, plus a `cheat_oracle` record: declared vs actual, `outcome`, latency, `ρ_5`/`ρ_6`),
-    `band_sources` (P10a's one-hash assertion) and `report_oracle`.
+    included, then `D̃` is checked against `h_D_tilde`), `run_cheat(env, scenario, *, T,
+    writer, bpr_records, bpr_actual, cheat_step)` (one scenario cut at `T`, plus a
+    `cheat_oracle` record: declared vs actual, `outcome`, latency, the BPR fields, and
+    `scores`: `ρ_5`, `ρ_κ` and `ρ_6` from `metrics.rho_arrays`, each with where it was
+    reached), `band_sources` (P10a's one-hash assertion), `report_oracle` and
+    `cell_name(cfg, scenario, env)` (`metrics.run_name` with `env.bpr_records`).
   - `scenarios.py` gained `Expected.product` (check 5's declared product), `outcome()` (`exact`,
     `accepted`, `rejected`, `early`, `overrun`, `wrong-check`, `wrong-kind`, `wrong-product`;
     only `exact` passes) and the faults `FlipProduct`, `NudgeWNext`, `TrainedElsewhereWNext`,
     `HiddenStep`, `CommitBatch` (A1), `TrainOn` (A2), `SpliceWNext` (A3) and `KeepStep`.
   - `poisoned_step.py`: A1 → `(1, "4")`, A2 → `(1, "5")` on `P_1` (`L1.Y_q`), A3 → `(1, "6a")`,
-    one-step runs from `W_0`; A1's and A2's `W_2` asserted bit-equal (S6e).
-  - `hidden_steps.py`: one hidden step on `b̃` between steps 1 and 2 → `(2, "7")`.
-  - `flipped_matmul_sweep.py`: honest steps 1–4 (accepted, step 4 kept), the `dF` sign flip at
-    step 4 → `(4, "5")` on `P_2372`, then the planted-error sweep on step 4 (S6f): one target
+    one-step runs from `W_0`; A1's and A2's `W_2` asserted bit-equal (S6e). Each cheat
+    writes to its own cell directory (`cell_name`), for example
+    `A2-SmolLM2-135M-Instruct-refusal-bpr1-s1/`; `run_poisoned(env, *, writers)` takes a
+    callable that opens each scenario's writer.
+  - `hidden_steps.py`: one hidden step on `b̃` between steps 1 and 2 → `(2, "7")`, in the
+    cell directory `hidden-<model>-<attack>-bpr<n>-s<seed>/`.
+  - `flipped_matmul_sweep.py`: honest steps 1–4 (accepted, step 4 kept; BPR 0), the `dF` sign
+    flip at step 4 → `(4, "5")` on `P_2372` (`cheat_step` 4, BPR null), then the
+    planted-error sweep on step 4 (S6f): one target
     per class, shapes `entry`/`entry2`/`row2`/`dense` (`row2`: two equal moves in one row, the
     worst rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)`, re-rooted with
     `perturb_leaf`, judged with check 5's own `_measure_run`/`_judge_product` (a biased
@@ -1268,6 +1362,19 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     A1 at check 4; A2 at check 5 on `P_1` (residual 1.35e5, `ρ_5` 4.5e3); A3 at check 6a
     (`ρ_6` 5.7e5); the hidden step at check 7 of step 2; the `dF` flip at check 5 on `P_2372`
     (residual 2.95e3, `ρ_5` 277). A1's and A2's `W_2` bit-equal.
+  - Re-run at EV2 (2026-10-11, same band file, `--x 2 --trials 1 --shapes entry --classes dF`
+    for the sweep): every verdict and first failing check as at C5–C6, A1's and A2's `W_2`
+    bit-equal. The record pass now measures every test of the rejecting check, so the cheats'
+    scores grew: A2 `ρ_5` 8.46e4 at `P_3251` (13,508 of 64,017 product-vector scores above 1,
+    since check 5 replays the operands from the committed batch, not the one trained on),
+    `ρ_κ` 0.61; A3 `ρ_6` 3.04e7, all 272
+    tensors above 1; the `dF` flip `ρ_5` 5.41e3 at `P_2538` (`L29.dX_o`), 1,087 scores above
+    1 on 121 products (`P_2372`, then every layer's `dX_o`, `G_o`, `dX_down` and `G_down`),
+    since the backward replay carries the flipped `dF` into later operands. Honest
+    steps: largest `ρ_5` 0.30 (step 1, in-sample; 0.29 on judged steps), `ρ_κ` 0.57, `ρ_6`
+    0.50. `ρ` recomputed from each archive's raw arrays and the band file equals the stored
+    `ρ` bit for bit. Wall time and peak footprint: A1–A3 8.5 s and 5.0 GiB, the hidden step
+    7.5 s and 4.5 GiB, the flip with the one-point sweep 27 s and 6.4 GiB.
   - Sweep re-run at C5–C6 (2026-10-11, same band file, all four shapes in one run, 200 trials
     per point): no stop condition. Every class and shape rejects every trial from `x ≤ 2`, so
     `f_all` is at most 0.19% of `f_ach` (`dF`: 7.6e−4 against 0.538). `ĉ` 0.51–0.64 for
