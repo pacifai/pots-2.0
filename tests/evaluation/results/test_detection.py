@@ -39,7 +39,10 @@ def test_detection_table_rows(recs):
     assert a2["record_pass_status"] == "complete" and a2["measured_rho_5"] == 8.0
 
     # A3 scored ρ_6 only; A1 and the hidden step scored nothing, so their count is empty
-    assert rows["A3"]["n_failing_mean"] == 3.0 and rows["A3"]["n_failing_rho_5"] is None
+    a3 = rows["A3"]
+    assert (a3["seeds"], a3["rejected"], a3["n_failing_mean"], a3["n_failing_std"]) == \
+           (2, 2, 3.0, 0.0)
+    assert a3["n_failing_rho_5"] is None
     for s in ("A1", "hidden"):
         r = rows[s]
         assert (r["rejection_rate"], r["latency_mean"], r["n_failing_mean"]) == (1.0, 0.0, None)
@@ -52,7 +55,7 @@ def test_wrong_check_is_not_as_expected(recs):
     runs = [o for o in detection_table.run_outcomes(recs) if o["scenario"] == "A3"]
     runs[0] = {**runs[0], "reject": {**runs[0]["reject"], "first_failing_check": "6b"}}
     row = detection_table._row(("A3", MODEL, ATTACK, 2), runs)
-    assert row["first_failing_check"] == "6b" and not row["as_expected"]
+    assert row["first_failing_check"] == "6a, 6b" and not row["as_expected"]
 
 
 def test_detection_points_at_t_star(recs):
@@ -63,23 +66,27 @@ def test_detection_points_at_t_star(recs):
     assert (a2["score"], a2["bpr_actual"], a2["seeds"]) == ("rho_5", 0.25, 3)
     assert a2["mean"] == pytest.approx(np.mean(xs))
     assert a2["std"] == pytest.approx(np.std(xs, ddof=1))
-    assert (pts["A3"]["mean"], pts["A3"]["std"], pts["A3"]["seeds"]) == (1000.0, None, 1)
+    assert a2["infinite"] == 0
+    # A3-s2's ρ_6 is infinite, so the mean is too, with no std
+    a3 = pts["A3"]
+    assert (a3["mean"], a3["std"], a3["seeds"], a3["infinite"]) == (math.inf, None, 2, 1)
 
 
 def test_honest_range_from_judged_honest_steps(recs):
-    # judged steps 2–4 only: step 1 (50 and 99, a calibration step), the calibration run (70)
-    # and the sweep's honest step (500) are out
+    # judged steps only: step 1 (50 and 99, a calibration step), the calibration run (70) and
+    # the sweep's honest step (500) are out, and so is honest-s1's infinite step 2; honest-s2's
+    # step 2 (0.5, 0.25) is in
     assert detection_figure.honest_ranges(recs) == {
-        (MODEL, ATTACK, "rho_5"): (0.6, 3.0), (MODEL, ATTACK, "rho_6"): (0.2, 1.5)}
+        (MODEL, ATTACK, "rho_5"): (0.5, 3.0), (MODEL, ATTACK, "rho_6"): (0.2, 0.3)}
 
 
-def test_layer_maxima_skip_unscored():
-    z = {"p_layer": np.array([0, 0, 1, 2, 3]),
-         "rho_5": np.array([[0.5, 4.0], [np.nan, 2.0], [np.nan, np.nan], [np.inf, 1.0],
+def test_layer_maxima_read_nan_as_inf():
+    z = {"p_layer": np.array([0, 0, 1, 2, 4]),
+         "rho_5": np.array([[0.5, 4.0], [0.25, 2.0], [np.nan, 0.5], [np.inf, 1.0],
                             [0.0, 0.0]])}
     layers, maxima = per_layer.layer_maxima(z)
-    assert layers.tolist() == [0, 1, 2, 3]
-    assert maxima[0] == 4.0 and np.isnan(maxima[1]) and maxima[2] == np.inf and maxima[3] == 0
+    assert layers.tolist() == [0, 1, 2, 4]  # layer 3 has no row, so no point
+    assert maxima.tolist() == [4.0, np.inf, np.inf, 0.0]
 
 
 def test_per_layer_lines_mean_over_seeds(recs):

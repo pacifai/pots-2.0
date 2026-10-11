@@ -4,8 +4,9 @@ From the residual arrays of each A2 run at step ``t*``: for each layer, the larg
 over the layer's matmuls ``m`` and challenges ``j`` (:func:`layer_maxima`). Layers are numbered
 ``0 … L−1`` and the output layer is ``L`` (§4.2). One panel per model, each with its own x-range;
 one line per attack and poisoning rate, the mean over seeds of each layer's maximum; y on a log
-scale, with a dashed line at 1. Unscored tests (``NaN``) are left out; a layer with no measured
-test has no point.
+scale, with a dashed line at 1. A ``NaN`` score counts as ``+inf``, as in the step record's
+maximum; an infinite point is a triangle at the top edge. A layer with no measured test has no
+point.
 
 Run as ``python -m evaluation.results.per_layer [--scale test|full] [--root DIR]``.
 """
@@ -26,7 +27,9 @@ from evaluation.results.common import (
     ATTACK_LABEL,
     attack_order,
     load_residuals,
+    mark_infinite,
     model_order,
+    nan_as_inf,
     parse,
     residual_index,
     seeds_note,
@@ -40,15 +43,15 @@ SCENARIO = "A2"
 
 def layer_maxima(z: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
     """``(layers, maxima)``: each layer index present in ``p_layer``, ascending, and the largest
-    scored ``ρ_5`` over its rows and columns (``NaN`` if it has none)."""
+    ``ρ_5`` over its rows and columns, ``NaN`` read as ``+inf``."""
     layer, rho = z["p_layer"], z["rho_5"]
     if rho.ndim == 1:
         rho = rho[:, None]
+    rho = nan_as_inf(rho)
     layers = np.unique(layer[layer >= 0])
     maxima = np.full(len(layers), np.nan)
     for i, ell in enumerate(layers):
         v = rho[layer == ell]
-        v = v[~np.isnan(v)]
         if v.size:
             maxima[i] = v.max()
     return layers, maxima
@@ -108,12 +111,15 @@ def plot(ls: list[dict[str, Any]], models: Sequence[str] | None = None) -> Figur
         mine = [x for x in ls if x["model"] == model]
         top = max((int(x["layers"].max()) for x in mine if x["layers"].size), default=0)
         for x in sorted(mine, key=lambda x: (str(x["attack"]), x["bpr_actual"] or 0.0)):
-            y = np.where(x["mean"] > 0, x["mean"], np.nan)  # a log axis can't show 0
+            m = x["mean"]
+            y = np.where((m > 0) & np.isfinite(m), m, np.nan)  # a log axis shows neither
             label = f"BPR {100 * (x['bpr_actual'] or 0):.3g}%"
             if len(attacks) > 1:
                 label += f", {ATTACK_LABEL.get(x['attack'], x['attack'])}"
-            ax.plot(x["layers"], y, marker=".", color=colour.get(x["bpr_actual"], "C0"),
-                    ls=styles.get(x["attack"], "-"), label=label)
+            c = colour.get(x["bpr_actual"], "C0")
+            ax.plot(x["layers"], y, marker=".", color=c, ls=styles.get(x["attack"], "-"),
+                    label=label)
+            mark_infinite(ax, x["layers"][np.isposinf(x["mean"])], c)
         ax.axhline(1.0, color="k", ls="--", lw=1, label="decision boundary (1)")
         ax.set_yscale("log")
         ticks = list(range(0, top, max(1, top // 6))) + [top]

@@ -13,10 +13,13 @@ step records of scenario A1, A2, A3 or ``hidden`` (§2.1). Honest results use ju
 as the step record's ``judged`` field says (§2.3).
 
 **Residual arrays.** :func:`load_residuals` reads one step's arrays (§4.2). They hold measured
-tests only: a test a rejected step never measured has no row, and ``NaN`` marks a test that was
-measured but not scored (a calibration step's). ``p_layer`` numbers layers ``0 … L−1`` and the
-output layer ``L``; archives written before that change numbered them ``1 … L`` and the output
-layer ``−1``, and are renumbered on reading.
+tests only: a test a rejected step never measured has no row. A family the step didn't score
+is ``NaN`` throughout, and its score in the step record is ``None`` (:func:`scored_families`):
+every family at a calibration step, ``ρ_κ`` with the κ guard off. In a scored family a ``NaN``
+score fails, as the live checks reject it, and counts as ``+inf`` (:func:`nan_as_inf`), as in
+the step record's maxima. ``p_layer`` numbers layers ``0 … L−1`` and the output layer ``L``;
+archives written before that change numbered them ``1 … L`` and the output layer ``−1``, and are
+renumbered on reading.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from matplotlib.axes import Axes
 
 from evaluation.output import SCALES
 from evaluation.records import Archive, Records, Table, output_dir, read
@@ -37,7 +41,8 @@ from evaluation.records import Archive, Records, Table, output_dir, read
 __all__ = ["DEFAULT_Z", "FAMILIES", "FAMILY_LABEL", "CHEATS", "EXPECTED_CHECK", "ATTACK_ORDER",
            "ATTACK_LABEL", "Inputs", "parse", "short_model", "model_order", "attack_order",
            "infer_scale", "scale_models", "honest_dirs", "cheat_dirs", "judged_honest_steps",
-           "residual_index", "load_residuals", "mean_std", "bands", "margin_z", "seeds_note"]
+           "residual_index", "load_residuals", "scored_families", "nan_as_inf", "mean_std",
+           "bands", "margin_z", "seeds_note", "mark_infinite"]
 
 # verification.verifier.matmul_check.sizing.Z, the band margin (τ = Z·s_h). Copied, since a
 # result script may not import verification (tests/test_layering.py); a test checks the copy.
@@ -153,6 +158,27 @@ def load_residuals(archive: Archive) -> dict[str, np.ndarray]:
         top = int(layer.max())
         z["p_layer"] = np.where(layer == -1, top, layer - 1).astype(layer.dtype)
     return z
+
+
+def scored_families(step: dict[str, Any]) -> list[str]:
+    """The families a step record scored: those whose score is not ``None``."""
+    return [f for f in FAMILIES if step.get(f) is not None]
+
+
+def nan_as_inf(x: np.ndarray) -> np.ndarray:
+    """``x`` with every ``NaN`` as ``+inf``, as ``verification.runs.metrics.nan_as_inf`` reads
+    a scored family. Copied, since a result script may not import verification; a test checks
+    that the two agree."""
+    x = np.asarray(x, dtype=float)
+    return np.where(np.isnan(x), np.inf, x)
+
+
+def mark_infinite(ax: Axes, x: Sequence[float], colour: Any, label: str | None = None) -> None:
+    """Triangles at the top edge of ``ax`` above each ``x``, for infinite scores, which a log
+    axis can't place."""
+    if len(x):
+        ax.plot(x, [0.97] * len(x), ls="none", marker="^", color=colour, clip_on=False,
+                transform=ax.get_xaxis_transform(), label=label)
 
 
 def mean_std(xs: Iterable[float | None]) -> tuple[float | None, float | None, int]:

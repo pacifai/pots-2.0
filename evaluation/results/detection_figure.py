@@ -4,7 +4,9 @@ One row of panels per attack and one panel per model (EQ4); test scale has one o
 panel x is the batch poisoning rate in percent and y a score on a log scale:
 
 - A2's matmul score ``ρ_5`` and A3's update score ``ρ_6`` at step ``t*``, each a mean ± std
-  over seeds (:func:`points`). The step record's score is the maximum over the step's tests;
+  over seeds (:func:`points`). The step record's score is the maximum over the step's tests,
+  ``+inf`` if one of them is ``NaN`` or infinite; a mean with an infinite seed is infinite and
+  drawn as a triangle at the top edge;
 - one shaded band per score, from the smallest to the largest step score over the judged
   honest steps of that model and attack (:func:`honest_ranges`);
 - a dashed line at 1, the decision boundary.
@@ -30,6 +32,7 @@ from evaluation.results.common import (
     ATTACK_LABEL,
     attack_order,
     judged_honest_steps,
+    mark_infinite,
     mean_std,
     model_order,
     parse,
@@ -45,7 +48,8 @@ CURVES = {"A2": ("rho_5", "C0", "A2: ρ_5"), "A3": ("rho_6", "C1", "A3: ρ_6")}
 
 def points(recs: Records, models: Sequence[str] | None = None) -> list[dict[str, Any]]:
     """One point per model, attack, scenario (A2, A3) and poisoning rate: the mean and sample
-    std over seeds of the scenario's score at ``t*``."""
+    std over seeds of the scenario's score at ``t*``. With an infinite score among the seeds
+    the mean is ``inf`` and the std ``None``; ``infinite`` counts those seeds."""
     steps = recs.table("step").where(scenario=lambda s: s in CURVES)
     if models is not None:
         steps = steps.where(model=lambda m: m in models)
@@ -62,10 +66,11 @@ def points(recs: Records, models: Sequence[str] | None = None) -> list[dict[str,
         groups.setdefault(key, []).append(float(r[score]))
     out = []
     for (model, attack, scen, bpr), xs in groups.items():
-        mean, std, n = mean_std(xs)
+        n_inf = sum(not math.isfinite(x) for x in xs)
+        mean, std, n = mean_std(xs) if not n_inf else (math.inf, None, len(xs))
         out.append({"model": model, "attack": attack, "scenario": scen,
                     "score": CURVES[scen][0], "bpr_actual": bpr, "mean": mean, "std": std,
-                    "seeds": n})
+                    "seeds": n, "infinite": n_inf})
     return sorted(out, key=lambda p: (str(p["model"]), str(p["attack"]), p["scenario"],
                                       -1.0 if p["bpr_actual"] is None else p["bpr_actual"]))
 
@@ -73,7 +78,7 @@ def points(recs: Records, models: Sequence[str] | None = None) -> list[dict[str,
 def honest_ranges(recs: Records, models: Sequence[str] | None = None
                   ) -> dict[tuple[Any, Any, str], tuple[float, float]]:
     """``(model, attack, score)`` → the smallest and largest finite step score over the judged
-    honest steps."""
+    honest steps. An infinite one is a false reject, counted by ``false_reject``."""
     out: dict[tuple[Any, Any, str], tuple[float, float]] = {}
     for (model, attack), rows in judged_honest_steps(recs, models).group_by(
             "model", "attack").items():
@@ -111,9 +116,12 @@ def plot(pts: list[dict[str, Any]], ranges: dict[tuple[Any, Any, str], tuple[flo
                 x = np.array([100.0 * p["bpr_actual"] for p in ps])
                 y = np.array([p["mean"] for p in ps])
                 s = np.array([p["std"] or 0.0 for p in ps])
+                fin = np.isfinite(y)
                 # the lower bar stops short of 0, which a log axis can't show
-                ax.errorbar(x, y, yerr=[np.minimum(s, 0.999 * y), s], color=colour,
-                            marker="o" if scen == "A2" else "s", capsize=3, label=label)
+                ax.errorbar(x[fin], y[fin], yerr=[np.minimum(s, 0.999 * y)[fin], s[fin]],
+                            color=colour, marker="o" if scen == "A2" else "s", capsize=3,
+                            label=label)
+                mark_infinite(ax, x[~fin], colour, f"{label} infinite")
             ax.axhline(1.0, color="k", ls="--", lw=1, label="decision boundary (1)")
             ax.set_yscale("log")
             ax.set_xlabel("batch poisoning rate (%)")

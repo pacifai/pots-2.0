@@ -152,6 +152,10 @@ def gather(recs: Records, model: str) -> ModelCost:
         judged = {r["step"] for r in mine if r.get("judged")}
         if not judged:  # a calibration run: nothing judged, so no result
             continue
+        if not recs.table("time").where(run_dir=d, scenario="honest"):
+            warnings.warn(f"{d}: no time records (metrics off?); left out of the cost results",
+                          UserWarning, stacklevel=2)
+            continue
         mc.runs += 1
         mc.steps_per_run.append(len({r["step"] for r in mine}))
         plain = plain_pair(recs, d)

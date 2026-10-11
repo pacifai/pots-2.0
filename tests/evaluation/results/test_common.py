@@ -8,6 +8,7 @@ import pytest
 
 from evaluation import records as er
 from evaluation.results import common
+from verification.runs import metrics as vm
 from verification.verifier.matmul_check import sizing
 
 from .conftest import MODEL
@@ -15,6 +16,14 @@ from .conftest import MODEL
 
 def test_the_copied_margin_is_verifications():
     assert common.DEFAULT_Z == sizing.Z
+
+
+def test_nan_reads_as_inf_as_in_verification():
+    x = np.array([0.5, np.nan, np.inf, 0.0, 2.0])
+    np.testing.assert_array_equal(common.nan_as_inf(x), vm.nan_as_inf(x))
+    assert common.nan_as_inf(x)[1] == np.inf
+    assert common.scored_families({"rho_5": 0.1, "rho_kappa": None, "rho_6": float("inf")}) \
+        == ["rho_5", "rho_6"]
 
 
 def test_scale_comes_from_the_models(out, tmp_path):
@@ -34,11 +43,12 @@ def test_scale_comes_from_the_models(out, tmp_path):
 def test_honest_runs_leave_out_the_sweep_and_cheats(out):
     recs = er.read(out)
     # the calibration run is honest but has nothing judged; the scripts skip it
-    assert sorted(common.honest_dirs(recs)) == ["calibrate/k9", "honest-s1"]
+    assert sorted(common.honest_dirs(recs)) == ["calibrate/k9", "honest-s1", "honest-s2"]
     assert sorted(common.cheat_dirs(recs)) == ["A1-s1", "A2-s1", "A2-s2", "A2-s3", "A3-s1",
-                                               "hidden-s1"]
+                                               "A3-s2", "hidden-s1"]
     judged = common.judged_honest_steps(recs)
-    assert [(r["run_dir"], r["step"]) for r in judged] == [("honest-s1", t) for t in (2, 3, 4)]
+    assert sorted((r["run_dir"], r["step"]) for r in judged) == \
+        [("honest-s1", 2), ("honest-s1", 3), ("honest-s1", 4), ("honest-s2", 2)]
 
 
 def test_old_layer_numbering_read_as_new(tmp_path):

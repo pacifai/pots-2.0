@@ -4,14 +4,17 @@ Every run is SmolLM2 with the refusal attack, so the scale is ``test``. The dire
 
 - ``honest-s1``, the honest run: steps 1–4, step 1 a calibration step (not judged, with
   scores far above 1 that must not count), steps 2–4 judged, step 3 rejected. Steps 1–3 have
-  residual arrays with ``NaN`` and ``inf`` scores, step 4 none. Cost rows at steps 0–4: time at
-  every step, memory at steps 1–2 and step 0, counts at step 1 and step 0, as the passes write
-  them;
+  residual arrays, step 2's with ``NaN`` and ``inf`` scores (so its maxima are ``inf``), step 4
+  none. Cost rows at steps 0–4: time at every step, memory at steps 1–2 and step 0, counts at
+  step 1 and step 0, as the passes write them;
+- ``honest-s2``, seed 2 with the κ guard off (``ρ_κ`` unscored, ``NaN`` in its arrays) and no
+  cost rows: step 1 unjudged, step 2 judged with arrays;
 - ``plain_baseline``, plain training at steps 1–4, whose environment record has no attack;
 - ``calibrate/k9``, an honest run with nothing judged, and ``sweep``, honest and ``flip``
   steps in one directory: neither is an honest run of the results;
 - the cheat runs ``A1-s1``, ``A2-s1``–``A2-s3`` (two reject, at ``t*`` and one step later; one
-  never does), ``A3-s1`` and ``hidden-s1``, all at BPR 2 records (0.25);
+  never does), ``A3-s1`` and ``A3-s2`` (whose ``ρ_6`` at ``t*`` is infinite) and ``hidden-s1``,
+  all at BPR 2 records (0.25);
 - ``bands.json`` with ``stats.z = 8``.
 
 The expected values in the tests are worked out by hand from the numbers here.
@@ -37,14 +40,14 @@ def _write_jsonl(path, rows):
     path.write_text("".join(json.dumps(vm._json_safe(r)) + "\n" for r in rows))
 
 
-def _env(run, **kw):
-    return {"record": "environment", "run": run, **_ENV, "attack": ATTACK, "seed": 1, **kw}
+def _env(run, seed=1, **kw):
+    return {"record": "environment", "run": run, **_ENV, "attack": ATTACK, "seed": seed, **kw}
 
 
 def _step(run, scenario, t, *, judged=True, check=None, cheat_step=None, bpr=(None, None),
-          rho=(None, None, None), n_failing=None, record_pass=None):
+          rho=(None, None, None), n_failing=None, record_pass=None, seed=1):
     return {"record": "step", "run": run, "scenario": scenario, "model": MODEL, "corpus": "c",
-            "attack": ATTACK, "seed": 1, "bpr_records": bpr[0], "bpr_actual": bpr[1],
+            "attack": ATTACK, "seed": seed, "bpr_records": bpr[0], "bpr_actual": bpr[1],
             "cheat_step": cheat_step, "step": t, "judged": judged,
             "verdict": "accept" if check is None else "reject", "first_failing_check": check,
             "rho_5": rho[0], "rho_kappa": rho[1], "rho_6": rho[2],
@@ -167,7 +170,7 @@ def _honest(root):
     _write_jsonl(root / run / "records.jsonl", [
         _env(run),
         _step(run, "honest", 1, judged=False, rho=(50.0, 0.5, 99.0)),
-        _step(run, "honest", 2, rho=(2.0, INF, 1.5)),
+        _step(run, "honest", 2, rho=(INF, INF, INF)),
         _step(run, "honest", 3, check="5", rho=(3.0, 0.9, 0.3)),
         _step(run, "honest", 4, rho=(0.6, 0.5, 0.2)),
         *_honest_costs(run)])
@@ -178,6 +181,14 @@ def _honest(root):
              rho_kappa=[0.3, INF], rho_6=[0.2, 1.5, NAN])
     _archive(root, run, "honest", 3, p_layer=[0, 1], p_cls=cls,
              rho_5=[[0.25, 0.75], [3.0, 0.0]], rho_kappa=[0.9, 0.4], rho_6=[0.1, 0.2, 0.3])
+
+    run = "honest-s2"
+    _write_jsonl(root / run / "records.jsonl", [
+        _env(run, seed=2),
+        _step(run, "honest", 1, judged=False, rho=(0.4, None, 0.3), seed=2),
+        _step(run, "honest", 2, rho=(0.5, None, 0.25), seed=2)])
+    _archive(root, run, "honest", 2, p_layer=[0], p_cls=["q"], rho_5=[[0.5, 0.125]],
+             rho_kappa=[NAN], rho_6=[0.25])
 
     _write_jsonl(root / "plain_baseline" / "records.jsonl",
                  [{"record": "environment", "run": "plain_baseline", **_ENV},
@@ -195,7 +206,7 @@ def _honest(root):
 
 def _cheats(root):
     def run(name, *steps):
-        _write_jsonl(root / name / "records.jsonl", [_env(name), *steps])
+        _write_jsonl(root / name / "records.jsonl", [_env(name, seed=steps[0]["seed"]), *steps])
 
     nf = lambda a, b, c: {"rho_5": a, "rho_kappa": b, "rho_6": c}  # noqa: E731
     not_run = {"status": "not run", "measured": nf(0, 0, 0)}
@@ -210,15 +221,18 @@ def _cheats(root):
     run("A2-s3",
         _step("A2-s3", "A2", 1, cheat_step=1, bpr=BPR, rho=(0.5, 0.5, 0.4), n_failing=nf(0, 0, 0)),
         _step("A2-s3", "A2", 2, cheat_step=1, bpr=BPR, rho=(0.4, 0.5, 0.4), n_failing=nf(0, 0, 0)))
-    # layer maxima at t*: s1 4, 7 and none (all NaN); s2 2, 9, 0.5; s3 0.2, 0.4
-    _archive(root, "A2-s1", "A2", 1, p_layer=[0, 0, 1, 2],
-             rho_5=[[0.5, 4.0], [NAN, 2.0], [7.0, NAN], [NAN, NAN]])
+    # layer maxima at t*: s1 4, 7 and no row in the output layer; s2 2, 9, 0.5; s3 0.2, 0.4
+    _archive(root, "A2-s1", "A2", 1, p_layer=[0, 0, 1],
+             rho_5=[[0.5, 4.0], [1.0, 2.0], [7.0, 0.5]])
     _archive(root, "A2-s2", "A2", 1, p_layer=[0, 1, 1, 2],
              rho_5=[[2.0, 1.0], [3.0, 5.0], [1.0, 9.0], [0.5, 0.25]])
     _archive(root, "A2-s2", "A2", 2, p_layer=[0], rho_5=[[30.0, 1.0]])
     _archive(root, "A2-s3", "A2", 1, p_layer=[0, 1], rho_5=[[0.2, 0.1], [0.3, 0.4]])
     run("A3-s1", _step("A3-s1", "A3", 1, check="6a", cheat_step=1, bpr=BPR,
                        rho=(None, None, 1000.0), n_failing=nf(None, None, 3),
+                       record_pass={"status": "complete", "measured": nf(0, 0, 3)}))
+    run("A3-s2", _step("A3-s2", "A3", 1, check="6a", cheat_step=1, bpr=BPR,
+                       rho=(None, None, INF), n_failing=nf(None, None, 3), seed=2,
                        record_pass={"status": "complete", "measured": nf(0, 0, 3)}))
     run("hidden-s1",
         _step("hidden-s1", "hidden", 1, judged=False, cheat_step=2, bpr=BPR,

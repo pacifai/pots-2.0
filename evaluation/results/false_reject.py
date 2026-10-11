@@ -2,9 +2,10 @@
 
 Every number here comes from the judged steps of the honest runs (H1 and H2; T-H1 at test
 scale), pooled per model over attacks and seeds. A step's tests are the rows of its residual
-arrays (§4.2): ``ρ_5(m, j)``, ``ρ_κ(m)`` and ``ρ_6(W)``. A ``NaN`` score is unscored and left
-out of both the count and the failures; an infinite one counts as failing. A judged step with no
-residual archive still counts for the step rate, with a warning.
+arrays (§4.2): ``ρ_5(m, j)``, ``ρ_κ(m)`` and ``ρ_6(W)``, in the families the step scored (its
+score in the step record is not ``None``; ``ρ_κ`` isn't scored with the κ guard off). A ``NaN``
+or infinite score in a scored family counts as failing, as in the step record. A judged step
+with no residual archive still counts for the step rate, with a warning.
 
 Outputs, under ``evaluation/results/<scale>/``:
 
@@ -12,9 +13,10 @@ Outputs, under ``evaluation/results/<scale>/``:
   in total, with the number of tests, and the step false-reject rate, with the number of steps.
 - ``honest_histogram.pdf`` and ``.png``: per model, a histogram of the three families on a log
   x-axis with a line at 1. Bins span ``1e-8`` to ``1e4``; scores outside that range land in the
-  end bins, and zeros and infinities, which a log axis can't show, are counted in the legend.
+  end bins, and zeros, infinities and ``NaN``, which a log axis can't show, are counted in the
+  legend.
 - ``cancellation_drift.pdf`` and ``.png``: per model and attack, the largest ``ρ_κ(m)`` of each
-  class at each judged step, over the class's matmuls and the seeds. The line at 1 is the
+  class at each judged step, over the class's finite scores and the seeds. The line at 1 is the
   frozen ceiling ``κ_max`` (``DECISIONS_FULL_SCALE.md`` F9). The five classes that come
   closest to it are named; the rest are grey.
 - ``margin_curve.pdf`` and ``.png``: per model, the component false-reject rate against the
@@ -49,7 +51,9 @@ from evaluation.results.common import (
     margin_z,
     model_order,
     parse,
+    nan_as_inf,
     residual_index,
+    scored_families,
     seeds_note,
     short_model,
 )
@@ -81,10 +85,10 @@ class Tally:
     # failing ρ_5 tests at each margin z = FACTORS · Z
     margin_fail: np.ndarray = field(default_factory=lambda: np.zeros(len(FACTORS), np.int64))
 
-    def add(self, z: dict[str, np.ndarray]) -> None:
-        for f in FAMILIES:
-            x = np.asarray(z.get(f, np.empty(0)), dtype=float).ravel()
-            x = x[~np.isnan(x)]  # unscored
+    def add(self, z: dict[str, np.ndarray], scored: Sequence[str] = FAMILIES) -> None:
+        """Adds one step's arrays, of the families in ``scored`` only."""
+        for f in scored:
+            x = nan_as_inf(np.asarray(z.get(f, np.empty(0)), dtype=float).ravel())
             self.n[f] += x.size
             self.fail[f] += int(np.count_nonzero(~(x <= 1.0)))
             self.zeros[f] += int(np.count_nonzero(x == 0))
@@ -113,10 +117,10 @@ def tally(recs: Records, models: Sequence[str] | None = None
             warnings.warn(f"{r['run_dir']}: judged step {r['step']} has no residual arrays; "
                           "it counts for the step rate only", UserWarning, stacklevel=2)
             continue
-        z = load_residuals(arch)
-        t.add(z)
+        z, scored = load_residuals(arch), scored_families(r)
+        t.add(z, scored)
         cls, kap = z.get("p_cls"), np.asarray(z.get("rho_kappa", np.empty(0)), dtype=float)
-        if cls is None or not kap.size:
+        if cls is None or not kap.size or "rho_kappa" not in scored:
             continue
         mine = drift.setdefault((r.get("model"), r.get("attack")), {})
         for c in np.unique(cls):
@@ -173,7 +177,7 @@ def plot_histogram(tallies: dict[str, Tally]) -> Figure:
             unseen = t.zeros[f] + t.infinite[f]
             label = f"{FAMILY_LABEL[f]}: {t.n[f]} tests"
             if unseen:
-                label += f" ({t.zeros[f]} zero, {t.infinite[f]} infinite, not shown)"
+                label += f" ({t.zeros[f]} zero, {t.infinite[f]} infinite or NaN, not shown)"
             ax.stairs(t.hist[f], BINS, color=f"C{i}", label=label)
         ax.axvline(1.0, color="k", ls="--", lw=1, label="decision boundary (1)")
         ax.set_xscale("log")
@@ -250,8 +254,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     caption = (
         "Honest false-reject rates (EVALUATION_SPEC §5.6), per model over the judged steps of "
         f"the honest runs, pooled over attacks and seeds ({_seeds(tallies)}). n counts the "
-        "component tests (rows of the residual arrays, unscored ones left out) or the steps; "
-        "n_over_1 those with a score above 1, or the rejected steps.")
+        "component tests (rows of the residual arrays of the families each step scored) or the "
+        "steps; n_over_1 those with a score above 1 or NaN, or the rejected steps.")
     paths = [*write_table(table_rows(tallies), "false_reject", inp.scale, root=inp.root,
                           columns=COLUMNS, caption=caption),
              *write_figure(plot_histogram(tallies), "honest_histogram", inp.scale,

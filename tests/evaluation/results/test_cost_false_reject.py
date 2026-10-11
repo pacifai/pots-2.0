@@ -30,24 +30,26 @@ def tallied(recs):
 def test_false_reject_counts(tallied):
     tallies, _ = tallied
     t = tallies[MODEL]
-    # judged steps 2 and 3 have arrays: NaN left out, inf failing, step 1's scores not counted
-    # ρ_5: 0.5 2.0 0.1 | 0.25 0.75 3.0 0.0; ρ_κ: 0.3 inf | 0.9 0.4; ρ_6: 0.2 1.5 | 0.1 0.2 0.3
-    assert t.n == {"rho_5": 7, "rho_kappa": 4, "rho_6": 5}
-    assert t.fail == {"rho_5": 2, "rho_kappa": 1, "rho_6": 1}
-    assert t.zeros["rho_5"] == 1 and t.infinite["rho_kappa"] == 1
-    assert (t.runs, t.steps, t.rejected) == ({"honest-s1"}, 3, 1)
-    assert t.hist["rho_5"].sum() == 6  # the zero has no bin on a log axis
+    # honest-s1's judged steps 2 and 3 and honest-s2's step 2 have arrays; NaN and inf fail,
+    # honest-s2's ρ_κ is unscored (NaN, but None in its step record), step 1s don't count
+    # ρ_5: 0.5 2.0 0.1 NaN | 0.25 0.75 3.0 0.0 | 0.5 0.125
+    # ρ_κ: 0.3 inf | 0.9 0.4;  ρ_6: 0.2 1.5 NaN | 0.1 0.2 0.3 | 0.25
+    assert t.n == {"rho_5": 10, "rho_kappa": 4, "rho_6": 7}
+    assert t.fail == {"rho_5": 3, "rho_kappa": 1, "rho_6": 2}
+    assert t.zeros["rho_5"] == 1 and t.infinite == dict.fromkeys(t.infinite, 1)
+    assert (t.runs, t.steps, t.rejected) == ({"honest-s1", "honest-s2"}, 4, 1)
+    assert t.hist["rho_5"].sum() == 8  # the zero and the NaN have no bin on a log axis
 
 
 def test_false_reject_table(tallied):
     rows = false_reject.table_rows(tallied[0])
     got = {(r["kind"], r["family"]): (r["n"], r["n_over_1"], r["rate"]) for r in rows}
-    assert got == {("component", "ρ_5(m, j)"): (7, 2, 2 / 7),
+    assert got == {("component", "ρ_5(m, j)"): (10, 3, 3 / 10),
                    ("component", "ρ_κ(m)"): (4, 1, 1 / 4),
-                   ("component", "ρ_6(W)"): (5, 1, 1 / 5),
-                   ("component", "total"): (16, 4, 4 / 16),
-                   ("step", "step"): (3, 1, 1 / 3)}
-    assert {r["model"] for r in rows} == {"SmolLM2-135M"} and {r["runs"] for r in rows} == {1}
+                   ("component", "ρ_6(W)"): (7, 2, 2 / 7),
+                   ("component", "total"): (21, 6, 6 / 21),
+                   ("step", "step"): (4, 1, 1 / 4)}
+    assert {r["model"] for r in rows} == {"SmolLM2-135M"} and {r["runs"] for r in rows} == {2}
 
 
 def test_margin_curve_rescales_rho_5_only(tallied):
@@ -56,18 +58,18 @@ def test_margin_curve_rescales_rho_5_only(tallied):
     at = {z: int(np.argmin(np.abs(c["z"] - z))) for z in (4.0, 8.0, 16.0)}
     assert all(np.isclose(c["z"][i], z) for z, i in at.items())
     # ρ_5 at margin z is ρ_5 · 8 / z: above 1 when ρ_5 > z / 8
-    assert c["rho_5"][at[8.0]] == pytest.approx(2 / 7)   # the configured margin: as recorded
-    assert c["rho_5"][at[4.0]] == pytest.approx(3 / 7)   # > 0.5: 2.0, 0.75, 3.0
-    assert c["rho_5"][at[16.0]] == pytest.approx(1 / 7)  # > 2: 3.0
-    # ρ_κ and ρ_6 keep their one failure each
-    assert c["total"][at[4.0]] == pytest.approx((3 + 2) / 16)
-    assert c["total"][at[8.0]] == pytest.approx(4 / 16)
+    assert c["rho_5"][at[8.0]] == pytest.approx(3 / 10)   # the configured margin: as recorded
+    assert c["rho_5"][at[4.0]] == pytest.approx(4 / 10)   # > 0.5: 2.0, NaN, 0.75, 3.0
+    assert c["rho_5"][at[16.0]] == pytest.approx(2 / 10)  # > 2: NaN, 3.0
+    # ρ_κ and ρ_6 keep their 1 + 2 failures
+    assert c["total"][at[4.0]] == pytest.approx((4 + 3) / 21)
+    assert c["total"][at[8.0]] == pytest.approx(6 / 21)
     assert np.all(np.diff(c["rho_5"]) <= 0)
 
 
 def test_cancellation_drift_per_class(tallied):
     _, drift = tallied
-    # class k's step-2 score is infinite, so it has no point there
+    # class k's step-2 score is infinite, so it has no point there; honest-s2 scored no ρ_κ
     assert drift == {(MODEL, ATTACK): {"q": {2: 0.3, 3: 0.9}, "k": {3: 0.4}}}
 
 
@@ -76,12 +78,14 @@ def test_cancellation_drift_per_class(tallied):
 
 @pytest.fixture(scope="module")
 def mc(recs):
-    return cost.gather(recs, MODEL)
+    with pytest.warns(UserWarning, match="honest-s2: no time records"):
+        return cost.gather(recs, MODEL)
 
 
 def test_gather_pairs_the_plain_run_and_skips_calibration(recs, mc):
     assert cost.plain_pair(recs, "honest-s1") == "plain_baseline"
-    assert (mc.runs, mc.steps_per_run) == (1, [4])  # calibrate/k9 judged nothing
+    # calibrate/k9 judged nothing, and honest-s2 has no cost records
+    assert (mc.runs, mc.steps_per_run) == (1, [4])
     assert mc.time["P0"] == [1.0, 1.0, 1.0]  # judged steps 2–4 only
     assert mc.time["P1"] == pytest.approx([0.07] * 3)  # 0.05 more forward, 0.02 labelling
     assert mc.time["5"] == pytest.approx([0.9, 1.0, 1.1])
@@ -148,4 +152,4 @@ def test_mains_write_their_files(out):
     with open(d / "false_reject.csv", newline="") as f:
         table = list(csv.DictReader(f))
     assert [(r["family"], r["n"], r["n_over_1"]) for r in table][-2:] == \
-           [("total", "16", "4"), ("step", "3", "1")]
+           [("total", "21", "6"), ("step", "4", "1")]
