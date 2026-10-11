@@ -8,10 +8,10 @@ import warnings
 import pytest
 import torch
 
-from tests.verification.computation.test_llama import make_records, tiny_config
+from tests.verification.computation.test_decoder import make_records, tiny_config
 from verification.commitment.leaves import dataset_tree
 from setup.data import encode_records_file, schedule
-from verification.computation.instances import LlamaComputation
+from verification.computation.instances import DecoderComputation
 from verification.computation.interface import snapshot_weights
 from verification.computation.instances.mlp import (
     MLPComputation,
@@ -40,7 +40,7 @@ def mlp():
 @pytest.fixture(scope="module")
 def llama():
     n = 12
-    c = LlamaComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
     D = make_records([n, n - 3, n - 5, n, n - 1, n - 4, n - 2, n], seed=1)
     return c, D, snapshot_weights(c, c.build_model())
 
@@ -275,8 +275,8 @@ def test_no_metrics_writes_only_weights(mlp, tmp_path):
 def tiny_main(monkeypatch, tmp_path, llama):
     """main() on the tiny Llama: from_config patched, D.bin from the tiny records."""
     c, D, _ = llama
-    monkeypatch.setattr(LlamaComputation, "from_config",
-                        classmethod(lambda cls, cfg: LlamaComputation(
+    monkeypatch.setattr(DecoderComputation, "from_config",
+                        classmethod(lambda cls, cfg: DecoderComputation(
                             tiny_config(), n_s=2, n=c.n, eta=cfg.require_eta())))
     monkeypatch.setattr(pb, "setup_determinism", lambda cfg: None)
     monkeypatch.setenv("VERIF_OUTPUT_DIR", str(tmp_path))
@@ -355,7 +355,7 @@ def test_smollm2_plain_baseline_two_steps(tmp_path):
         pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
     w0 = snapshot_weights(c, c.build_model())
     lines: list[str] = []

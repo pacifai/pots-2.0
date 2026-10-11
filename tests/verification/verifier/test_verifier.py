@@ -15,8 +15,8 @@ import torch
 from setup.data import schedule
 from verification.commitment import merkle
 from verification.commitment.leaves import dataset_tree, leaf_hash
-from verification.computation.instances import LlamaComputation
-from verification.computation.instances.llama import LlamaReplay
+from verification.computation.instances import DecoderComputation
+from verification.computation.instances.decoder import DecoderReplay
 from verification.computation.instances.mlp import (
     MLPComputation,
     MLPReplay,
@@ -43,7 +43,7 @@ from verification.verifier.matmul_check.challenges import SIGMA_R, challenge_mat
 from verification.verifier.matmul_check.freivalds import _safe_norm
 from verification.verifier.matmul_check.sizing import Z, e_m
 
-from tests.verification.llama_helpers import make_records, tiny_config
+from tests.verification.decoder_helpers import make_records, tiny_config
 
 SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
@@ -1225,7 +1225,7 @@ def _calibrate_store(c, D, tree, w0, store):
 # ---- check 5 measures the members of an attention product as a batch --------------------
 
 
-class _LlamaWith(LlamaComputation):
+class _DecoderWith(DecoderComputation):
     """The tiny Llama with a replay hook: ``operands_hook(m, a, b) -> (a, b)``."""
 
     operands_hook = None
@@ -1234,7 +1234,7 @@ class _LlamaWith(LlamaComputation):
         return _HookedReplay(self, leaves)
 
 
-class _HookedReplay(LlamaReplay):
+class _HookedReplay(DecoderReplay):
     def operands(self, m):
         a, b = super().operands(m)
         hook = type(self.c).operands_hook
@@ -1243,7 +1243,7 @@ class _HookedReplay(LlamaReplay):
 
 @pytest.fixture(scope="module")
 def llama_out():
-    c = LlamaComputation(tiny_config(), n_s=2, n=12, eta=ETA)
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=ETA)
     w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
     return c, prove_step(c, c.build_model(), w0, make_records((12, 7)))
 
@@ -1309,7 +1309,7 @@ def test_forged_member_mid_run_rejected_at_that_member(llama_out, monkeypatch, n
 @pytest.mark.parametrize("judge", [True, False])
 def test_nan_in_one_member_rejects(llama_out, monkeypatch, judge):
     _, out = llama_out
-    c = _LlamaWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    c = _DecoderWith(tiny_config(), n_s=2, n=12, eta=ETA)
     name = "L1.dK[1,2]"
 
     def nan_operand(c, m, a, b):
@@ -1319,7 +1319,7 @@ def test_nan_in_one_member_rejects(llama_out, monkeypatch, judge):
         a.view(-1)[0] = float("nan")
         return a, b
 
-    monkeypatch.setattr(_LlamaWith, "operands_hook", nan_operand)
+    monkeypatch.setattr(_DecoderWith, "operands_hook", nan_operand)
     got = [_llama_check_5(c, out, monkeypatch, batched=b, judge=judge) for b in (True, False)]
     (rej_b, stats_b), (rej_s, _) = got
     _expect(rej_b, 1, "5")
@@ -1331,7 +1331,7 @@ def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
     """An error serving a later member of a run is raised only once the members before it
     pass; a forged earlier member rejects first, as one product at a time."""
     _, out = llama_out
-    c = _LlamaWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    c = _DecoderWith(tiny_config(), n_s=2, n=12, eta=ETA)
     forged, broken = "L1.dA[0,1]", "L1.dV[1,3]"
 
     def fail(c, m, a, b):
@@ -1339,7 +1339,7 @@ def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
             raise RuntimeError("replay bug")
         return a, b
 
-    monkeypatch.setattr(_LlamaWith, "operands_hook", fail)
+    monkeypatch.setattr(_DecoderWith, "operands_hook", fail)
     for batched in (True, False):
         with pytest.raises(RuntimeError, match="replay bug"):
             _llama_check_5(c, out, monkeypatch, batched=batched)

@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from verification.computation.instances.llama import matmul_count_llama
+from verification.computation.instances.decoder import matmul_count_decoder
 from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import (
     BiasedMatmulError,
@@ -88,7 +88,7 @@ def test_every_product_is_bit_exact(llama_capture):
 def test_llama_count_matches_ref_block(llama_capture):
     _, cap = llama_capture
     # Counting convention: one product per bmm batch member, i.e. per (s, h) (spec §2).
-    assert cap.n_products == matmul_count_llama(L, N_S, N_H) == 141
+    assert cap.n_products == matmul_count_decoder(L, N_S, N_H) == 141
     s = cap.summary()
     assert s["calls_by_phase_op"] == {
         "backward aten.bmm.default": 4 * L,
@@ -196,21 +196,42 @@ def test_matmul_outside_phase_raises():
 
 
 def test_addmm_bias():
+    """F14: a biased linear is one addmm whose record keeps the bias and whose output is the
+    leaf; the bias is not split off."""
     torch.manual_seed(0)
     lin = nn.Linear(4, 3)
     x = torch.randn(5, 4)
-    cap = MatmulCapture()
-    with cap, cap.phase("forward"), pytest.raises(BiasedMatmulError):
-        lin(x)
-    nn.init.zeros_(lin.bias)
+    cap = MatmulCapture(param_storage_map(lin))
     with cap, cap.phase("forward"):
         y = lin(x)
     (rec,) = cap.records
-    assert rec.op == "aten.addmm.default" and rec.bias is not None
-    assert (rec.alpha, rec.beta) == (1.0, 1.0)
-    # A zero bias is inert: the product is A·B as the spec defines it.
+    assert rec.op == "aten.addmm.default" and rec.bias is lin.bias
+    assert (rec.alpha, rec.beta) == (1.0, 1.0) and rec.b_info.param_name == "weight"
     assert torch.equal(y, rec.out)
-    assert torch.equal(rec.out, rec.a @ rec.b)
+    assert torch.equal(rec.out, torch.addmm(lin.bias, rec.a, rec.b))
+    assert not torch.equal(rec.out, rec.a @ rec.b)
+
+
+@pytest.mark.parametrize("fn", [
+    lambda a, b: torch.addmm(torch.randn(5, 3), a, b),
+    lambda a, b: torch.addmm(torch.randn(3), a, b, beta=2),
+    lambda a, b: torch.addmm(torch.randn(3), a, b, alpha=2),
+    lambda a, b: torch.addmm(torch.zeros(3), a, b, alpha=2),
+], ids=["2d_bias", "beta", "alpha", "alpha_zero_bias"])
+def test_addmm_bias_outside_f14_raises(fn):
+    a, b = torch.randn(5, 4), torch.randn(4, 3)
+    cap = MatmulCapture()
+    with cap, cap.phase("forward"), pytest.raises(BiasedMatmulError):
+        fn(a, b)
+
+
+def test_addmm_zero_bias_is_inert():
+    a, b = torch.randn(5, 4), torch.randn(4, 3)
+    cap = MatmulCapture()
+    with cap, cap.phase("forward"):
+        y = torch.addmm(torch.zeros(5, 3), a, b)
+    (rec,) = cap.records
+    assert torch.equal(y, rec.out) and torch.equal(rec.out, rec.a @ rec.b)
 
 
 def test_baddbmm_zero_beta():
@@ -389,7 +410,7 @@ def test_smollm2_real_step():
     for n, p in base.named_parameters():
         assert torch.equal(grads_off[n], p.grad), n
     c = base.config
-    assert cap.n_products == matmul_count_llama(
+    assert cap.n_products == matmul_count_decoder(
         c.num_hidden_layers, cfg.batch, c.num_attention_heads) == 7113
     assert len(cap.glue_outer) == 1
     print(cap.summary(), f"wall={wall:.1f}s",

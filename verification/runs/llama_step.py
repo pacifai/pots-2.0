@@ -3,14 +3,14 @@
     .venv/bin/python -m verification.runs.llama_step [--steps T] [--bands PATH]
         [--metrics | --no-metrics]
 
-The SmolLM2 instance (``LlamaComputation.from_config``: ``VERIF_MODEL`` at its pinned revision,
+The SmolLM2 instance (``DecoderComputation.from_config``: ``VERIF_MODEL`` at its pinned revision,
 ``VERIF_BATCH × VERIF_SEQ_LEN``, ``η = VERIF_ETA``) runs ``T`` honest steps (``--steps``, default
 1) from ``W_0``, the unmodified ``from_pretrained`` weights, over ``π``'s batches (F8c, seeded
 by ``VERIF_SEED``) of the committed dataset ``D`` (``$VERIF_OUTPUT_DIR/data/D.bin``, written by
 ``materialize_data``). Each
 step goes through the S3 loop: prove, commit, hand the in-memory store to the real
 :class:`~verification.verifier.driver.Verifier`, whose check 5 rebuilds every operand with
-``LlamaReplay``. The verifier's ``h_D`` is the published root in ``meta.json``, so check 1
+``DecoderReplay``. The verifier's ``h_D`` is the published root in ``meta.json``, so check 1
 compares the loaded ``D`` with it. Check 8 compares with ``T`` uncaptured ``plain_step``s from
 ``W_0``.
 
@@ -44,7 +44,7 @@ from setup import backdoorllm
 from setup.config import load_config, setup_determinism
 from setup.data import load_dataset_records
 from verification.computation.interface import DeclaredComputation, snapshot_weights
-from verification.computation.instances.llama import LlamaComputation
+from verification.computation.instances.decoder import DecoderComputation
 from verification.parameters import load_protocol_config
 from verification.runs.metrics import (
     CountRecorder,
@@ -78,7 +78,7 @@ __all__ = ["run_honest", "report_residuals", "report_costs", "load_committed_dat
 
 RUN_NAME = "llama_step"  # the metrics directory under VERIF_OUTPUT_DIR
 
-def load_committed_dataset(c: LlamaComputation, data_dir: Path) -> tuple[list[Any], bytes]:
+def load_committed_dataset(c: DecoderComputation, data_dir: Path) -> tuple[list[Any], bytes]:
     """``D`` from ``D.bin`` (every record validated) and the published ``h_D`` from
     ``meta.json``, both written by ``materialize_data``."""
     D = load_dataset_records(data_dir / "D.bin", c.n)
@@ -146,7 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     k, T = load_protocol_config().k, args.steps
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     if not (cfg.data_dir / "D.bin").exists():
         p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data or set "
                 "VERIF_OUTPUT_DIR")

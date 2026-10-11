@@ -8,9 +8,9 @@ import pytest
 
 from setup.config import load_config
 from setup.data import encode_records_file, schedule
-from tests.verification.llama_helpers import make_records, tiny_config
+from tests.verification.decoder_helpers import make_records, tiny_config
 from verification.commitment.leaves import dataset_tree
-from verification.computation.instances import LlamaComputation
+from verification.computation.instances import DecoderComputation
 from verification.computation.instances.mlp import (
     MLPComputation,
     init_weights,
@@ -167,10 +167,10 @@ def test_mlp_bands_too_tight_reject_a_judged_step(mlp):
 def tiny_main(monkeypatch, tmp_path):
     """main() on the tiny Llama: from_config patched, D.bin and a band file written."""
     n = 12
-    c = LlamaComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
     D = make_records([n, n - 3, n - 5, n, n - 1, n - 4, n - 2, n], seed=1)
-    monkeypatch.setattr(LlamaComputation, "from_config",
-                        classmethod(lambda cls, cfg: LlamaComputation(
+    monkeypatch.setattr(DecoderComputation, "from_config",
+                        classmethod(lambda cls, cfg: DecoderComputation(
                             tiny_config(), n_s=2, n=n, eta=cfg.require_eta())))
     monkeypatch.setattr(pb, "setup_determinism", lambda cfg: None)
     monkeypatch.setattr(rv, "setup_determinism", lambda cfg: None)

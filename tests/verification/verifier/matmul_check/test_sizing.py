@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from verification.computation.instances.llama import matmul_count_llama
+from verification.computation.instances.decoder import matmul_count_decoder
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF
 from verification.verifier.matmul_check.sizing import (
     C_ANTI, Z, b0, bit_budget, e_m, f_achieved, k_required, size_k,
@@ -44,7 +44,7 @@ def test_test_scale_measured_tau_10_1():
 
 def test_full_scale_bf16_10_2():
     # Llama-3.2-1B: 16 layers, 128 sequences, 32 heads; vocabulary 128,256.
-    M = matmul_count_llama(16, 128, 32)
+    M = matmul_count_decoder(16, 128, 32)
     assert M == 393_555
     s = size_k(128_256, BF16, FP32, T=10, M=M)
     assert s.e_max == pytest.approx(5.546e-3, rel=1e-3)

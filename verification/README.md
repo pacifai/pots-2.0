@@ -62,7 +62,7 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 | `setup/` | `config.py`, `records.py`, `model.py`, `backdoorllm.py`, `data.py` | Run settings and determinism, the token record, model loading, the released data files, the dataset `D` and its batches |
 | `verification/` | `parameters.py` | Protocol constants, `k` and the band file |
 | `commitment/` | `encoding.py`, `merkle.py`, `leaves.py` | Canonical bytes, the hash tree, the roots `h` and `h_D` |
-| `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `instances/mlp.py`, `instances/llama.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
+| `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `instances/mlp.py`, `instances/decoder.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
@@ -161,11 +161,26 @@ Two instances exist, in `instances/`:
 
 - **`mlp.py`** is a three-layer bias-free MLP with `M = 3L − 1 = 8` products. It is small
   enough to test every check and every fault in milliseconds.
-- **`llama.py`** is SmolLM2-135M at 4 sequences of 128 tokens, with `M = 7,113` products.
+- **`decoder.py`** is the Llama and Qwen2 decoder: SmolLM2-135M at test scale, and the four
+  full-scale models. On SmolLM2 at 4 sequences of 128 tokens it has `M = 7,113` products.
   That's 21 linear products per layer, plus six attention products per sequence and per
-  head, plus three for the embedding and output layer. Its `label` maps each captured
-  matmul to its slot by operand identity. For example, `Y_q` of layer 3 is the product
-  whose right operand is layer 3's `W_q`. Call order isn't used for this. Its `replay`
+  head, plus three for the embedding and output layer. The models differ in two ways, and
+  both are read from the model's config, never from its name or the scale:
+
+  - **Tied or untied output layer.** SmolLM2, Llama-3.2 and Qwen2.5 reuse the embedding
+    matrix `W_E` as the output layer. Falcon3 has its own output matrix, `lm_head.weight`.
+    That matrix is then an ordinary linear weight: its gradient is a checked product, and
+    its update is checked like any other linear weight's. `W_E` then gets only the
+    embedding-lookup gradient.
+  - **q, k, v biases.** Qwen2.5 adds a bias vector to the query, key and value projections.
+    PyTorch computes such a projection as one `addmm`, the product plus the bias, and the
+    committed product is that whole output. So a bias adds no product, and `M` is the same.
+    Each bias is a weight whose gradient is a sum over tokens, so it is checked as glue,
+    like the norm scales.
+
+  Its `label` maps each captured matmul to its slot by operand identity. For example, `Y_q`
+  of layer 3 is the product whose right operand is layer 3's `W_q`. Call order isn't used
+  for this. Its `replay`
   runs the verifier's own copy of the model with every checked product's result replaced by
   the committed product, so all glue between products runs through the model's own code on
   committed values. (A product with inner dimension 1, the RoPE angle table, isn't checked; it
@@ -186,10 +201,10 @@ Two instances exist, in `instances/`:
 ### Prover side: `prover/`
 
 - **`capture.py`** is a `TorchDispatchMode`, a hook into PyTorch's operator dispatch. It sees
-  every `mm` and `bmm` that autograd runs, in the forward and the backward pass. It records
-  the operands and output of each one without changing anything, so a captured step is
-  bit-identical to an uncaptured one. Matmul variants it can't classify raise an error
-  instead of passing silently.
+  every `mm` and `bmm` that autograd runs, in the forward and the backward pass, and the
+  `addmm` of a biased projection. It records the operands and output of each one without
+  changing anything, so a captured step is bit-identical to an uncaptured one. Matmul
+  variants it can't classify raise an error instead of passing silently.
 - **`step.py`** runs one step:
 
   1. Load `W_t`.
@@ -490,7 +505,7 @@ Breaking any of these voids the result. Each one has a test.
 | Part | State |
 |---|---|
 | Foundations, data, `C` interface, MLP instance, capture, prover, store, checks, verifier, loop, MLP smoke run | merged; milestone M1 reached |
-| SmolLM2 inventory and labeling (`instances/llama.py`) | merged; milestone M2 reached |
+| SmolLM2 inventory and labeling (`instances/llama.py`, now `instances/decoder.py`) | merged; milestone M2 reached |
 | SmolLM2 replay of forward glue (A8) | done; all 2,371 forward operands of the real step match the prover's bit for bit |
 | Per-component cost and residual metrics (`runs/metrics.py`, B6), wired into the MLP smoke run | done |
 | SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |
@@ -499,6 +514,7 @@ Breaking any of these voids the result. Each one has a test.
 | Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. `s_h = 5.50` (`Λ`), `τ = 44.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
 | Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. The figures above were measured on the earlier data and schedule |
 | 10-step honest run, cheat runs (A12–A13, M5) | planned |
+| One decoder instance for the four full-scale models (FS1) | done; tiny random Llama and Qwen2 models, tied and untied, fill every slot once and replay every operand and glue gradient bit for bit; SmolLM2's roots are unchanged. Until FS2, check 5 rejects an honest step whose biases are non-zero |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.3 s to write and 1.4 s more to verify |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.

@@ -10,7 +10,7 @@ from setup.config import load_config
 from setup.data import encode_records_file
 from setup.records import encode_record
 from verification.commitment.leaves import dataset_tree
-from verification.computation.instances import LlamaComputation
+from verification.computation.instances import DecoderComputation
 from verification.computation.interface import snapshot_weights
 from verification.parameters import load_protocol_config
 from verification.runs import llama_step
@@ -27,7 +27,7 @@ from verification.runs.scenarios import (
 from verification.verifier.calibration import BandFileMismatch, band_context, load_bands
 from verification.verifier.residuals import class_summary, tensor_summary
 
-from tests.verification.llama_helpers import make_records, tiny_config
+from tests.verification.decoder_helpers import make_records, tiny_config
 from tests.verification.runs.test_run_verified import K, _band_file
 
 SEED = 1  # π's seed (F8c), the default VERIF_SEED
@@ -36,7 +36,7 @@ SEED = 1  # π's seed (F8c), the default VERIF_SEED
 @pytest.fixture(scope="module")
 def tiny():
     torch.manual_seed(0)
-    c = LlamaComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
     D = make_records((12, 7, 10, 5), seed=1)
     w0 = {n: w.detach().clone() for n, w in c.build_model().named_parameters()}
     return c, D, w0
@@ -137,10 +137,10 @@ def test_one_reused_model_gives_the_fresh_build_results(tiny):
 
 def test_main_judges_with_a_band_file_of_this_run(monkeypatch, tmp_path, capsys):
     n = 12
-    c = LlamaComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
     D = make_records([n, n - 3, n - 5, n, n - 1, n - 4, n - 2, n], seed=1)
-    monkeypatch.setattr(LlamaComputation, "from_config",
-                        classmethod(lambda cls, cfg: LlamaComputation(
+    monkeypatch.setattr(DecoderComputation, "from_config",
+                        classmethod(lambda cls, cfg: DecoderComputation(
                             tiny_config(), n_s=2, n=n, eta=cfg.require_eta())))
     monkeypatch.setattr(llama_step, "setup_determinism", lambda cfg: None)
     for var, value in (("VERIF_OUTPUT_DIR", str(tmp_path)), ("VERIF_ETA", "1e-3"),
@@ -179,7 +179,7 @@ def test_real_smollm2_step_is_accepted(monkeypatch, capsys):
     cfg, pc = load_config(), load_protocol_config()
     if not (cfg.data_dir / "D.bin").exists():
         pytest.skip("no D.bin: run verification.runs.materialize_data or set VERIF_OUTPUT_DIR")
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     _, h_D = llama_step.load_committed_dataset(c, cfg.data_dir)
     try:
         load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D, k=pc.k))

@@ -49,7 +49,7 @@ import torch
 
 from setup import backdoorllm
 from setup.config import load_config, setup_determinism
-from verification.computation.instances.llama import LlamaComputation
+from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import DeclaredComputation, snapshot_weights
 from verification.parameters import load_protocol_config
 from verification.runs.calibrate import judging_verifier
@@ -320,7 +320,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if T < 1 or not 1 <= S <= T:
         p.error(f"need T ≥ 1 and 1 ≤ --pass-steps ≤ T, got T = {T}, {S}")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     if not (cfg.data_dir / "D.bin").exists():
         p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data or set "
                 "VERIF_OUTPUT_DIR")

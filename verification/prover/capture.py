@@ -21,10 +21,13 @@ What is recorded, per op:
   product; each member ``i`` (``A[i]·B[i]``) is its own checked product (spec §2). For HF's
   eager attention the batch index is ``s·n_h + h``, so members come in lexicographic ``(s, h)``
   order.
-- ``aten.addmm`` and ``aten.baddbmm``: accepted only when the bias term is inert (``beta == 0``
-  or an all-zero bias) and ``alpha == 1``, so that the product is ``A·B`` as the spec defines
-  it. A non-zero bias raises :class:`BiasedMatmulError`. Splitting the op into ``mm`` + ``add``
-  would change the rounding of an unmodified model, which a passthrough must not do.
+- ``aten.addmm`` and ``aten.baddbmm``: accepted with ``alpha == 1`` when the bias term is inert
+  (``beta == 0`` or an all-zero bias), so that the product is ``A·B``. ``addmm`` is also accepted
+  in the bias rule's form (F14): a bias vector of length ``b.shape[1]`` added once
+  (``beta == 1``), the output of a biased linear. Its record keeps ``bias`` and the output is the
+  committed leaf. Any other bias raises :class:`BiasedMatmulError`. Splitting the op into
+  ``mm`` + ``add`` would change the rounding of an unmodified model, which a passthrough must
+  not do.
 - A product of contracted dimension ``q = 1`` is an outer product, which is glue (P7). It goes
   to :attr:`MatmulCapture.glue_outer`, not to :attr:`MatmulCapture.records`.
 - Any other matmul-like op (``REJECTED_OPS``) raises :class:`UnsupportedMatmulError`, so the
@@ -38,13 +41,15 @@ The op lists and ``param_storage_map`` live in ``computation/matmul_ops.py``, wh
 verifier's substitution reads too (invariant 1: the verifier never imports this module).
 
 Records are in call order, not the canonical order of ref block §6. Hand-off notes for A7
-(labeling), from HF Llama eager in torch 2.9.1:
+(labeling), from HF Llama and Qwen2 eager in torch 2.9.1:
 
 - **Linear layers.** Forward is ``mm(X, W.t())``, so ``B`` is a view of the parameter and
   ``b_info.param_name`` names it. Backward runs the weight gradient first:
   ``G_x = mm(δYᵀ, X)``, already ``[o, i]``, then ``δX_x = mm(δY, W)``, whose ``b_info`` names
-  ``W``. ``G_k`` and ``G_v`` have the same shape and the same ``B`` (``X_k = X_v``), so tell them
-  apart by either rule: the ``G_x`` output tensor *is* ``W_x.grad`` (AccumulateGrad adopts it
+  ``W``. A biased linear (Qwen2's q, k, v) runs forward as ``addmm(b, X, W.t())`` and backward
+  in the other order, ``δX_x`` then ``G_x``; its bias gradient is a sum, not a matmul. ``G_k``
+  and ``G_v`` have the same shape and the same ``B`` (``X_k = X_v``), so tell them apart by
+  either rule: the ``G_x`` output tensor *is* ``W_x.grad`` (AccumulateGrad adopts it
   without a copy; true for every linear weight, not for the tied ``W_E``, whose grad is a sum),
   or the ``G_x`` and ``δX_x`` records share the storage of ``A`` (``δYᵀ`` and ``δY``).
 - **Attention backward**, per layer, in call order: ``δV = Aᵀ·δO`` ``[n, d_h]``,
@@ -69,10 +74,11 @@ Captured tensors are referenced, not cloned. Aliasing facts that matter to calle
 Invariant 6 is enforced by :meth:`MatmulCapture.assert_unmodified`, which compares each captured
 tensor's ``_version`` with the value seen at capture. Call it after hashing the products, before
 the optimizer touches the model, and again when the transcript is handed to the verifier. No
-clone is needed on HF Llama eager in torch 2.9.1: no captured tensor is mutated in place during
-forward and backward. The version counter misses writes that bypass autograd's bookkeeping:
-through ``.data``, ``tensor.set_()``, a NumPy array or DLPack capsule sharing the memory, or raw
-pointer access. The guard catches accidents in torch code, not deliberate tampering.
+clone is needed on HF Llama or Qwen2 eager in torch 2.9.1: no captured tensor is mutated in
+place during forward and backward. The version counter misses writes that bypass autograd's
+bookkeeping: through ``.data``, ``tensor.set_()``, a NumPy array or DLPack capsule sharing the
+memory, or raw pointer access. The guard catches accidents in torch code, not deliberate
+tampering.
 """
 
 from __future__ import annotations
@@ -128,7 +134,7 @@ class UnsupportedMatmulError(CaptureError):
 
 
 class BiasedMatmulError(CaptureError):
-    """An addmm/baddbmm carried a non-zero bias or alpha != 1; spec products are bias-free."""
+    """An addmm/baddbmm carried alpha != 1 or a live bias outside F14's form."""
 
 
 class PhaseError(CaptureError):
@@ -262,11 +268,13 @@ class MatmulCapture(TorchDispatchMode):
             bias, a, b = args[0], args[1], args[2]
             beta = kwargs.get("beta", 1)
             alpha = kwargs.get("alpha", 1)
-            if alpha != 1 or (beta != 0 and bool(bias.ne(0).any())):
+            inert = beta == 0 or not bool(bias.ne(0).any())
+            f14 = name == "addmm" and beta == 1 and tuple(bias.shape) == (b.shape[1],)
+            if alpha != 1 or not (inert or f14):
                 raise BiasedMatmulError(
-                    f"{func} with beta={beta}, alpha={alpha} and a non-zero bias: the spec "
-                    f"checks P = A·B with no bias term. A model with biased linears needs a "
-                    f"protocol decision on how the bias enters C.")
+                    f"{func} with beta={beta}, alpha={alpha} and a non-zero bias of shape "
+                    f"{tuple(bias.shape)}: the bias rule (F14) covers only a bias vector added "
+                    f"once to a non-batched product.")
         else:
             a, b = args[0], args[1]
         return a, b, bias, alpha, beta

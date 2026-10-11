@@ -21,7 +21,7 @@ __all__ = ["LeafReader", "TranscriptView"]
 class LeafReader(Protocol):
     """Read-only access to one step's committed leaves, by 0-based leaf index.
 
-    A batch-record leaf returns the instance's record object (a ``Record`` for Llama, a float
+    A batch-record leaf returns the instance's record object (a ``Record`` for the decoder, a float
     tensor for the MLP); every other leaf returns a tensor. Callers must not mutate what they
     get. The reader doesn't report its leaf count: the computation declares it (invariant 7).
     """

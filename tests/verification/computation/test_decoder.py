@@ -1,5 +1,5 @@
-"""The SmolLM2 instance: declaration and prover-side labeling (A7, milestone M2), and the
-verifier-side forward (A8) and backward (A9) replay."""
+"""The decoder instance: declaration and prover-side labeling (A7, milestone M2), the
+verifier-side forward (A8) and backward (A9) replay, and its two config switches (FS1)."""
 
 import dataclasses
 import weakref
@@ -13,14 +13,20 @@ from transformers.models.llama import modeling_llama
 
 from setup.records import Record, RecordError, encode_record
 from verification.commitment.leaves import leaf_hash
-from verification.computation.instances import LlamaComputation
-from verification.computation.instances.llama import LINEARS, _Labeler, matmul_count_llama
+from verification.computation.instances import DecoderComputation
+from verification.computation.instances.decoder import LINEARS, _Labeler, matmul_count_decoder
 from verification.computation.interface import LabelingError, ProductKind, ReplayError
 from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import MatmulCapture
 from verification.prover.step import commit, prove_step
 
-from tests.verification.llama_helpers import make_records, tiny_config
+from tests.verification.decoder_helpers import (
+    SWITCHES,
+    make_records,
+    randomize_biases,
+    switch_id,
+    tiny_config,
+)
 
 SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
@@ -51,14 +57,15 @@ def _fresh_verifier_model(request):
     """Tests plant hooks on ``replay.model``, and the reused verifier model then refuses the next
     replay (as it must). Drop it after each test, so every test starts from a fresh build."""
     yield
-    if "setup" in request.fixturenames:
-        request.getfixturevalue("setup")[0]._vmodel = None
+    for name in ("setup", "switched"):
+        if name in request.fixturenames:
+            request.getfixturevalue(name)[0]._vmodel = None
 
 
 @pytest.fixture(scope="module", params=[(12, 8), (8, 8)], ids=["n12", "n_eq_dh"])
 def setup(request):
     n, head_dim = request.param
-    c = LlamaComputation(tiny_config(head_dim), n_s=2, n=n, eta=1e-3)
+    c = DecoderComputation(tiny_config(head_dim), n_s=2, n=n, eta=1e-3)
     model = c.build_model()
     records = make_records((n, n - 5))
     return c, model, records
@@ -70,7 +77,7 @@ def setup(request):
 def test_inventory_order_names_and_count(setup):
     c, _, _ = setup
     L, n_s, n_h = c.L, c.n_s, c.n_h
-    assert c.M == matmul_count_llama(L, n_s, n_h) == L * (21 + 6 * n_s * n_h) + 3
+    assert c.M == matmul_count_decoder(L, n_s, n_h) == L * (21 + 6 * n_s * n_h) + 3
     assert [p.m for p in c.products] == list(range(1, c.M + 1))
     mem = [f"[{s},{h}]" for s in range(n_s) for h in range(n_h)]
     want = []
@@ -141,18 +148,18 @@ def test_product_classes(setup):
     assert classes == Counter({**{f"{r}_{x}": c.L for r in ("Y", "dX", "G") for x in LINEARS},
                                **{r: per_member for r in ("S", "O", "dA", "dV", "dQ", "dK")},
                                "Lambda": 1, "dF": 1, "G_E_head": 1})
-    other = LlamaComputation(tiny_config(), n_s=3, n=c.n + 2, eta=1e-3)
+    other = DecoderComputation(tiny_config(), n_s=3, n=c.n + 2, eta=1e-3)
     with pytest.raises(ValueError):
         c.product_class(other.products[5])
 
 
 def test_matmul_count():
-    assert matmul_count_llama(30, 4, 9) == 7_113
-    assert matmul_count_llama(30, 128, 9) == 207_993
+    assert matmul_count_decoder(30, 4, 9) == 7_113
+    assert matmul_count_decoder(30, 128, 9) == 207_993
 
 
 def test_smollm2_declaration_numbers():
-    c = LlamaComputation(smollm2_config(), n_s=4, n=128, eta=1e-3)
+    c = DecoderComputation(smollm2_config(), n_s=4, n=128, eta=1e-3)
     assert (c.M, c.n_w, c.n_leaves) == (7113, 272, 7661)
     assert sum(map(lambda s: torch.Size(s).numel(), c.weight_shapes.values())) == 134_515_008
     assert Counter(p.kind for p in c.products) == {FWD: 2371, IG: 211, WG: 211, OG: 4320}
@@ -167,15 +174,16 @@ def test_smollm2_declaration_numbers():
 
 
 def test_rejects_unsupported_configs():
-    for kw in ({"tie_word_embeddings": False}, {"attention_bias": True}, {"mlp_bias": True},
+    for kw in ({"attention_bias": True}, {"mlp_bias": True}, {"model_type": "mistral"},
+               {"layer_types": ["full_attention", "sliding_attention"]},
                {"hidden_act": "gelu"}, {"pretraining_tp": 2}, {"attention_dropout": 0.1}):
         cfg = tiny_config()
         for k, v in kw.items():
             setattr(cfg, k, v)
         with pytest.raises(ValueError):
-            LlamaComputation(cfg, n_s=2, n=12, eta=1e-3)
+            DecoderComputation(cfg, n_s=2, n=12, eta=1e-3)
     with pytest.raises(ValueError):  # P7: q = 1 products are not checkable
-        LlamaComputation(tiny_config(head_dim=1), n_s=2, n=12, eta=1e-3)
+        DecoderComputation(tiny_config(head_dim=1), n_s=2, n=12, eta=1e-3)
 
 
 def test_encode_record(setup):
@@ -188,7 +196,7 @@ def test_encode_record(setup):
 
 
 def test_build_model_is_deterministic_and_rng_neutral():
-    c = LlamaComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
     state = torch.random.get_rng_state()
     m1 = c.build_model()
     assert torch.equal(torch.random.get_rng_state(), state)
@@ -463,8 +471,8 @@ def test_replay_matches_captured_operands(honest, monkeypatch):
     def boom(*a, **k):
         raise AssertionError("the replay called a prover-only method")
 
-    monkeypatch.setattr(LlamaComputation, "loss", boom)
-    monkeypatch.setattr(LlamaComputation, "label", boom)
+    monkeypatch.setattr(DecoderComputation, "loss", boom)
+    monkeypatch.setattr(DecoderComputation, "label", boom)
     replay = c.replay(ListReader(leaves))
     specs = forward_specs(c)
     assert len(specs) == len(expected) == c.L * (7 + 2 * c.n_s * c.n_h) + 1
@@ -516,8 +524,8 @@ def _no_prover_methods(monkeypatch):
     def boom(*a, **k):
         raise AssertionError("the replay called a prover-only method")
 
-    monkeypatch.setattr(LlamaComputation, "loss", boom)
-    monkeypatch.setattr(LlamaComputation, "label", boom)
+    monkeypatch.setattr(DecoderComputation, "loss", boom)
+    monkeypatch.setattr(DecoderComputation, "label", boom)
 
 
 def test_backward_replay_matches_the_prover(honest_all, monkeypatch):
@@ -925,6 +933,220 @@ def test_backward_reports_a_missing_product(honest_all):
         replay.operands(c.m_of(f"L{c.L}.dX_down"))
 
 
+# ---- the two switches: tied or untied output layer, q/k/v biases on or off (FS1) -------------
+
+
+@pytest.fixture(scope="module", params=SWITCHES, ids=map(switch_id, SWITCHES))
+def switched(request):
+    """A tiny model at each switch setting, its biases drawn at random."""
+    family, tied = request.param
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
+    model = c.build_model()
+    randomize_biases(dict(model.named_parameters()))
+    return c, model, make_records((12, 7))
+
+
+def test_switches_declaration(switched):
+    """The switches add ``b_q, b_k, b_v`` after their weights and an untied ``W_out`` last, and
+    rename the head's gradient; the products, their order and ``M`` are the tied Llama's."""
+    c, model, _ = switched
+    tied = c.config.tie_word_embeddings
+    assert (c.tied, c.qkv_bias) == (tied, c.config.model_type == "qwen2")
+    want = [c.w_e]
+    for l in range(1, c.L + 1):
+        want.append(c.gamma_attn(l))
+        for x in "qkvo":
+            want.append(c.w(l, x))
+            if c.qkv_bias and x != "o":
+                want.append(c.w(l, x).removesuffix("weight") + "bias")
+        want += [c.gamma_mlp(l), *(c.w(l, x) for x in ("gate", "up", "down"))]
+    want += [c.gamma_final, *([] if tied else ["lm_head.weight"])]
+    assert list(c.weight_names) == want and c.n_w == len(want)
+    assert {n: tuple(p.shape) for n, p in model.named_parameters()} == dict(c.weight_shapes)
+    assert c.n_leaves == c.n_s + 2 * c.n_w + c.M
+
+    g_head = "G_E_head" if tied else "G_head"
+    base = DecoderComputation(tiny_config(), n_s=c.n_s, n=c.n, eta=c.eta)
+    rename = {"G_E_head": g_head}
+    assert c.M == base.M == matmul_count_decoder(c.L, c.n_s, c.n_h)
+    assert [(p.m, p.name, p.kind, p.a_shape, p.b_shape) for p in c.products] == \
+        [(p.m, rename.get(p.name, p.name), p.kind, p.a_shape, p.b_shape) for p in base.products]
+    head = [c.product(c.m_of(n)) for n in ("Lambda", "dF", g_head)]
+    assert {p.weight for p in head} == {c.w_out} == {c.w_e if tied else "lm_head.weight"}
+    assert c.product_class(head[2]) == g_head
+
+    linear = {c.w(l, x): c.m_of(f"L{l}.G_{x}") for l in range(1, c.L + 1) for x in LINEARS}
+    if not tied:
+        linear["lm_head.weight"] = c.m_of("G_head")
+    assert c.linear_weights == linear
+    biases = [n for n in want if n.endswith(".bias")]
+    assert len(biases) == (3 * c.L if c.qkv_bias else 0)
+    assert c.biases == {n.removesuffix("bias") + "weight": n for n in biases}
+    assert list(c.glue_gradient_weights) == [n for n in want if n not in linear]
+
+
+def test_switches_label_every_slot_once(switched):
+    """Each slot is filled once; a biased ``Y_x`` leaf is the whole ``addmm`` output, and the
+    untied ``G_head`` is ``W_out``'s gradient."""
+    c, model, records = switched
+    calls = Counter()
+    orig = _Labeler._fill
+
+    def fill(self, name, *args, **kw):
+        calls[name] += 1
+        return orig(self, name, *args, **kw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_Labeler, "_fill", fill)
+        cap = run_capture(c, model, records)
+        slots = c.label(cap, model)
+    try:
+        assert len(slots) == c.M and calls == Counter(p.name for p in c.products)
+        by_out = {_ptr(r.out): r for r in cap.records if r.batch is None}
+        for l in range(1, c.L + 1):
+            for x in LINEARS:
+                rec = by_out[_ptr(slots[c.m_of(f"L{l}.Y_{x}") - 1])]
+                b = c.bias(l, x)
+                assert (b is not None) == (c.qkv_bias and x in "qkv")
+                if b is None:
+                    assert rec.bias is None and rec.op == "aten.mm.default"
+                    continue
+                assert rec.op == "aten.addmm.default" and rec.bias is model.get_parameter(b)
+                assert torch.equal(rec.out, torch.addmm(rec.bias, rec.a, rec.b))
+                assert not torch.equal(rec.out, rec.a @ rec.b)
+        g = slots[c.m_of(c.g_head) - 1]
+        if c.tied:
+            assert not torch.equal(g, model.get_parameter(c.w_e).grad)
+        else:
+            assert _ptr(g) == _ptr(model.get_parameter("lm_head.weight").grad)
+    finally:
+        model.zero_grad(set_to_none=True)
+
+
+def test_switches_replay_rebuilds_operands_and_glue(switched, monkeypatch):
+    """A9 at each switch setting: every product's (A, B) and every glue gradient (``W_E``'s,
+    each γ's and each bias's), rebuilt from leaves, equal the prover's bit for bit."""
+    c, model, records = switched
+    w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
+    products, expected, grads = captured_operands(c, model, records)
+    leaves = [*records, *w0.values(), *products, *w0.values()]
+    _no_prover_methods(monkeypatch)
+    replay = c.replay(ListReader(leaves))
+    assert len(expected) == c.M
+    for spec in c.products:
+        a, b = replay.operands(spec.m)
+        want_a, want_b = expected[spec.m]
+        assert (tuple(a.shape), tuple(b.shape)) == (spec.a_shape, spec.b_shape), spec.name
+        assert torch.equal(a, want_a) and torch.equal(b, want_b), spec.name
+    got = replay.glue_gradients()
+    assert list(got) == list(c.glue_gradient_weights)
+    for n, g in got.items():
+        assert g.dtype == c.weight_dtype and torch.equal(g, grads[n]), n
+    for n in c.biases.values():
+        assert grads[n].abs().max() > 0, n
+
+
+@pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
+def test_switches_verify_an_honest_step(switch):
+    """The whole verifier path at each switch setting. Untied: a forged ``G_head`` fails the
+    update identity (6a) and a forged ``Λ`` fails 5. Biased: with zero biases the step is
+    accepted, bias gradients included (6b); with drawn biases check 5 still measures ``A·B``
+    alone, so it rejects the first biased leaf. Adding the bias term to check 5 is task FS2."""
+    from setup.data import schedule
+    from verification.commitment.leaves import dataset_tree
+    from verification.transcript.store import InMemoryStore
+    from verification.verifier.bands import Bands
+    from verification.verifier.driver import Verifier
+
+    family, tied = switch
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
+    tree = dataset_tree(c, D)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    idx = schedule(1, c.n_s, len(D), SEED)
+
+    def verify(w, **kw):
+        v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1,
+                     bands=Bands.provisional(), allow_provisional=True, w0=w, seed=SEED)
+        assert v.start_run(D) is None
+        out = prove_step(c, c.build_model(), w, [D[i] for i in idx], **kw)
+        store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
+        return v, v.verify_step(1, store)
+
+    v, rejection = verify(w0)
+    assert rejection is None
+    assert {"5", "6a", "6b"} <= set(v.timings[1])
+    if not tied:
+        for name, check in (("G_head", "6a"), ("Lambda", "5")):
+            _, rejection = verify(w0, perturb={c.m_of(name): lambda p: _bump(p)})
+            assert (rejection.step, rejection.check_id) == (1, check), name
+    if c.qkv_bias:
+        assert all(not w0[b].any() for b in c.biases.values())  # HF starts biases at zero
+        randomize_biases(w0)
+        _, rejection = verify(w0)
+        assert rejection.check_id == "5" and rejection.detail.startswith("P_1 (L1.Y_q)")
+
+
+def test_rejects_unsupported_switches():
+    """Qwen2's sliding-window layers are outside the decoder's attention; a model whose tying
+    differs from its config's is refused."""
+    cfg = tiny_config(family="qwen2")
+    cfg.layer_types = ["full_attention", "sliding_attention"]
+    with pytest.raises(ValueError, match="full attention"):
+        DecoderComputation(cfg, n_s=2, n=12, eta=1e-3)
+    tied = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    untied = DecoderComputation(tiny_config(tied=False), n_s=2, n=12, eta=1e-3)
+    with pytest.raises(ValueError, match="tie_word_embeddings"):
+        tied._check_model(untied.build_model())
+    with pytest.raises(ValueError, match="tie_word_embeddings"):
+        untied._check_model(tied.build_model())
+
+
+def test_label_refuses_a_misplaced_bias():
+    """Only a forward linear may carry a bias, and only its declared one, added once."""
+    for family in ("llama", "qwen2"):
+        c = DecoderComputation(tiny_config(family=family), n_s=2, n=12, eta=1e-3)
+        model = c.build_model()
+        cap = run_capture(c, model, make_records((12, 7)))
+        fwd = {r.b_info.param_name: r for r in cap.records
+               if r.phase == "forward" and r.batch is None}
+        y_q, y_o = fwd[c.w(1, "q")], fwd[c.w(1, "o")]
+        dx = next(r for r in cap.records if r.phase == "backward" and r.batch is None)
+        zeros = torch.zeros(c.d)
+        tampers = [(dx, "bias", zeros, "only a forward linear"),
+                   (y_o, "bias", zeros, "none is declared")]
+        if family == "qwen2":
+            other = model.get_parameter(c.bias(1, "k"))
+            tampers += [(y_q, "bias", None, "declared bias"), (y_q, "bias", other, "declared bias"),
+                        (y_q, "beta", 2.0, "declared bias"), (y_q, "alpha", 0.5, "declared bias")]
+        for rec, attr, value, match in tampers:
+            keep = getattr(rec, attr)
+            setattr(rec, attr, value)
+            try:
+                with pytest.raises(LabelingError, match=match):
+                    c.label(cap, model)
+            finally:
+                setattr(rec, attr, keep)
+        assert len(c.label(cap, model)) == c.M
+        model.zero_grad(set_to_none=True)
+
+
+@pytest.mark.parametrize("family", ["llama", "qwen2"])
+def test_replay_refuses_a_misplaced_bias(family):
+    """The replay's forward may add a bias only where ``C`` declares one, and only that one."""
+    c = DecoderComputation(tiny_config(family=family), n_s=2, n=12, eta=1e-3)
+    model = c.build_model()
+    records = make_records((12, 7))
+    w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
+    products, _, _ = captured_operands(c, model, records)
+    replay = c.replay(ListReader([*records, *w0.values(), *products, *w0.values()]))
+    lin = replay.model.model.layers[0].self_attn.q_proj
+    stray = torch.zeros(lin.weight.shape[0]) if lin.bias is None else lin.bias.detach().clone()
+    lin.forward = lambda x: F.linear(x, lin.weight, stray)
+    with pytest.raises(ReplayError, match=f"{c.w(1, 'q')}'s product adds bias an undeclared"):
+        replay.operands(c.m_of("L1.Y_k"))
+
+
 # ---- milestone M2-----------------------------------------------------------------------------
 
 
@@ -944,7 +1166,7 @@ def test_smollm2_real_step_m2():
         pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     assert (c.M, c.n_leaves) == (7113, 7661)
     t0 = time.perf_counter()
     model = c.build_model()
@@ -990,7 +1212,7 @@ def test_smollm2_real_step_forward_replay_a8():
         pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
     records = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]
@@ -1042,7 +1264,7 @@ def test_smollm2_real_step_backward_replay_a9():
         pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
     records = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]

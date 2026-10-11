@@ -168,7 +168,9 @@ Leaf indices are 0-based:
 ```
 
 Weight tensors are committed as the model holds them. Linear weights are `[o, i]`, as in
-`nn.Linear.weight`.
+`nn.Linear.weight`. The decoder's two switches (FS1) add weight leaves without changing `M`:
+with q, k, v biases each `b_x` follows its `W_x`, and an untied output layer's `W_out`
+(`lm_head.weight`) comes last, after `γ_final`. Neither placement is in the docs yet.
 
 Each product leaf is the product exactly as the spec's `P = A·B` defines it. Each `(s, h)`
 member of a batched attention product is its own leaf, an `n×n` or `n×d_h` matrix. The
@@ -186,7 +188,7 @@ byte-identical across runs (S6a).
 | 2 | commitment, read: read, hash and validate every leaf once, bind it to what 4 and 7 read, and check that the claimed `h` is a 32-byte digest. No root comparison |
 | 6a | update identity, linear weights, from the committed `G_x` |
 | 5 | matmul checks in canonical order, with the two tests of spec §6, challenges from the claimed `h`. Abort at the first failure |
-| 6b | update identity for γ scales and `W_E` (`G_E^head + G_E^emb`), from the backward glue that check 5 replayed |
+| 6b | update identity for γ scales, biases and `W_E` (`G_E^head + G_E^emb` when tied, `G_E^emb` alone when untied), from the backward glue that check 5 replayed |
 | 2.root | commitment, root comparison: the root over check 2's leaf hashes equals the claimed `h`. Rejects as check `"2"` |
 
 Check 5 keys its challenges on the claimed `h`, and the root comparison runs last (F15a in
@@ -253,7 +255,7 @@ import rules, counting imports under `TYPE_CHECKING` except where rule 4 allows 
    of `verifier/`.
 3. `verifier/` imports nothing from `prover/` (invariant 1).
 4. `computation/` imports nothing from `prover/` at run time, because the verifier builds its
-   replay from it. The labeling code (`interface.py`, `instances/llama.py`,
+   replay from it. The labeling code (`interface.py`, `instances/decoder.py`,
    `instances/mlp.py`) names `MatmulCapture` and `MatmulRecord` under `TYPE_CHECKING` only. A
    second test imports the verifier and every instance in a fresh interpreter and checks that
    no `verification.prover` module loads.
@@ -420,11 +422,14 @@ interface.
   other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
   (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (empty) and `param_storage_map(model)`. Shared by
   the prover's capture and the verifier's substitution, so neither imports the other's side.
-- `substitution.py` (A8): `ProductSubstitution(supply)`, a `TorchDispatchMode` that runs a
-  model's own code but returns `supply(op, a, b)` in place of every `aten.mm`/`aten.bmm` with
-  `q ≥ 2` (S4b, check 3). `q = 1` runs as glue (P7). Any other op from `matmul_ops`'s lists,
-  a non-default overload, an op outside `aten`/`prims`, or a supplied tensor of the wrong
-  shape or dtype raises `SubstitutionError`, a `ReplayError`. `supply` must return a fresh
+- `substitution.py` (A8, FS1): `ProductSubstitution(supply)`, a `TorchDispatchMode` that
+  runs a model's own code but returns `supply(op, a, b, bias)` in place of every
+  `aten.mm`/`aten.bmm` and every biased linear's `aten.addmm` with `q ≥ 2` (S4b, check 3).
+  An `addmm` is substituted only in F14's form, a bias vector added once (`α = β = 1`); the
+  supplied tensor stands for the whole op, bias included, and `bias` is `None` for `mm` and
+  `bmm`. `q = 1` runs as glue (P7). Any other op from `matmul_ops`'s lists, a non-default
+  overload, an op outside `aten`/`prims`, or a supplied tensor of the wrong shape or dtype
+  raises `SubstitutionError`, a `ReplayError`. `supply` must return a fresh
   tensor, never a leaf itself (autograd attaches history to op outputs; invariant 6).
 - `instances/mlp.py` (A3, merged). This is ref block §9.
   - `MLPComputation(widths=(16,32,32,8), n_s=4, *, eta)`. It requires `n_s ≥ 2` and every
@@ -438,26 +443,45 @@ interface.
   - Helpers: `make_record`/`split_record`, `init_weights(widths, seed)` and
     `synthetic_dataset(widths, n, seed)`. The schedule is `setup.data.schedule`.
   - `MLPReplay` uses the replay model's own `act` and `loss_fn`.
-- `instances/llama.py` (A7, milestone M2; A8 forward replay; A9 backward replay). The module docstring has the
+- `instances/decoder.py` (A7, milestone M2; A8 forward replay; A9 backward replay; FS1 the
+  switches). One instance for Llama and Qwen2 (S2): SmolLM2 and the four full-scale models.
+  It was `instances/llama.py` with `LlamaComputation` until FS1. The module docstring has the
   pins and the labeling rules.
-  - `LlamaComputation(config, *, n_s, n, eta, source=None)`, with `.from_pretrained(repo,
+  - `DecoderComputation(config, *, n_s, n, eta, source=None)`, with `.from_pretrained(repo,
     revision, *, n_s, n, eta)` and `.from_config(cfg)` (the run's instance, from a
-    `RunConfig`). It rejects untied `W_E`, biases, a non-SiLU activation, `pretraining_tp ≠ 1`
-    and non-zero dropout. Without `source`, `build_model` gives a seeded random model from
-    `config` (fast tests only).
-  - `build_model()`: an unmodified `from_pretrained` `LlamaForCausalLM` through
+    `RunConfig`). It accepts `model_type` `llama` or `qwen2` and rejects Llama's
+    `attention_bias` (it also biases `o`) and `mlp_bias`, any layer that isn't full attention
+    (Qwen2's sliding window), a non-SiLU activation, `pretraining_tp ≠ 1`, `n_h` not a
+    multiple of `n_kv`, and non-zero dropout. Without `source`, `build_model` gives a random
+    model from `config` under the caller's seed (fast tests only).
+  - **Switches (FS1).** Both come from the config, never from the model name or the scale:
+    - `tied = tie_word_embeddings`. Tied: the output projection is `W_E`, and the head's
+      weight gradient `G_E_head` is a summand of `W_E`'s glue gradient (6b). Untied (Falcon3):
+      `w_out` is `lm_head.weight`, a linear weight whose gradient `G_head` is a checked
+      product (in `linear_weights`, so 6a), and `W_E`'s glue gradient is the lookup gradient
+      alone. `g_head` names the head's gradient product either way.
+    - `qkv_bias = model_type == "qwen2"` (HF's Qwen2 hardcodes q, k, v biases). `bias(ℓ, x)`
+      names `b_x` or gives `None`; `biases` maps each biased weight to its bias. A bias is a
+      weight in `weight_names` but not in `linear_weights`, so its gradient is glue and 6b
+      judges it with no instance code.
+    - `M` is the same under every switch, so `matmul_count_decoder` holds for all four models.
+  - `build_model()`: an unmodified `from_pretrained` causal LM (`AutoModelForCausalLM`) through
     `setup.model.load_pretrained`, eager attention, fp32, in eval mode, checked against the
-    declared weights.
-  - `matmul_count_llama(L, n_s, n_h) = L·(21 + 6·n_s·n_h) + 3`.
+    declared weights and against `tied` (the output projection is or isn't `W_E`'s tensor).
+  - `matmul_count_decoder(L, n_s, n_h) = L·(21 + 6·n_s·n_h) + 3`.
   - `encode_record` raises `RecordError` on a non-`Record` or a record longer than `n`.
   - **Pins:**
     - Weight names are the HF parameter names, in ref block §6 order: `w(ℓ, x)`,
-      `gamma_attn(ℓ)`, `gamma_mlp(ℓ)`, `w_e`, `gamma_final`.
+      `gamma_attn(ℓ)`, `gamma_mlp(ℓ)`, `w_e`, `gamma_final`. A bias follows its weight
+      (`W_q, b_q, W_k, b_k, W_v, b_v`), and an untied `lm_head.weight` comes last.
     - Product names are `L{ℓ}.Y_x`, `L{ℓ}.dX_x`, `L{ℓ}.G_x`, `L{ℓ}.S[s,h]` (and `O`, `dA`,
-      `dV`, `dQ`, `dK`), `Lambda`, `dF` and `G_E_head`, looked up with `m_of(name)`. `member`
-      is the 0-based `(s, h)`.
+      `dV`, `dQ`, `dK`), `Lambda`, `dF` and `G_E_head` (`G_head` when untied), looked up with
+      `m_of(name)`. `member` is the 0-based `(s, h)`.
     - `product_class(spec)` is the role without layer and member (`Y_q`, `S`, `dK`, `Lambda` …),
-      30 classes: 21 linear roles, the six attention roles, and `Lambda`, `dF` and `G_E_head`.
+      30 classes: 21 linear roles, the six attention roles, and `Lambda`, `dF` and `G_E_head`
+      (`G_head` when untied). A band file for an untied model needs a `G_head` class: one
+      naming `G_E_head` fails `Bands.check_keys`, and a missing class falls back to
+      `kappa_max`.
     - The batch is `setup.data.assemble_batch`, and `ρ` is HF's `attention_mask`. The loss is
       `Σ μ_i·CE_i / Σ μ_i` (`loss_from_logits`). A batch with `Σ μ = 0` raises `ValueError`
       in `loss` instead of giving a 0/0 NaN. `build_record` never builds such a record (its
@@ -467,15 +491,17 @@ interface.
     `O`'s `A` must be row-stochastic, `O`'s `B` must equal the layer's `Y_v` output head by
     head, and `S`'s `B` must be equal across the query heads that share a kv head. The `δK̃`
     leaf is the contiguous transpose of the captured `Q̃ᵀ·δS`. Any unmatched, duplicate or
-    missing record raises `LabelingError`.
-  - The verifier's model is built once per `LlamaComputation` and reused by every replay
+    missing record raises `LabelingError`. A biased `Y_x` must be an `addmm` adding the
+    declared `b_x` once (`α = β = 1`), and its leaf is the op's output, bias included (F14);
+    a bias on any other record, or a missing or wrong one, raises `LabelingError`.
+  - The verifier's model is built once per `DecoderComputation` and reused by every replay
     (`_replay_model`; a build reloads the checkpoint, about 0.12 s). Each reuse gives every
     parameter fresh storage before `load_weights` fills it from `W_t`, so no operand served
     by an earlier replay (a linear's `B` is a view of its weight) aliases the new weights;
     restores every buffer to its build-time value; raises `ReplayError` on any hook left on
     a module or a changed buffer set; reruns the model checks; and takes the model away from
     the previous replay (`.model = None`). The prover never gets this model.
-  - `replay(leaves) -> LlamaReplay` (A8, forward products). Its own model, from the committed
+  - `replay(leaves) -> DecoderReplay` (A8, forward products). Its own model, from the committed
     `W_t`, runs under `ProductSubstitution`, which hands back the committed leaf for each
     product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`).
     The replay does what training does: one forward pass and one backward pass, no reruns.
@@ -489,22 +515,27 @@ interface.
     The call sequence must be the declared one (`Y_q, Y_k, Y_v, S, O, Y_o, Y_gate, Y_up,
     Y_down` per layer, then `Λ`), linears identified by weight storage; `S` and `O` are the
     two bmms after a layer's `Y_v`. An undeclared mm, a bmm anywhere else, a different order
-    or a unit input that isn't the previous unit's output raises `ReplayError`. Operands are
-    what the op receives: `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and `repeat_kv`, `(softmax,
-    Ṽ)`. They are served detached, since the pass ran with grad on.
+    or a unit input that isn't the previous unit's output raises `ReplayError`, and so does a
+    forward product whose bias isn't the declared one (`supply`'s `bias` must be `b_x`'s
+    tensor for a biased weight and `None` otherwise). Operands are what the op receives:
+    `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and `repeat_kv`, `(softmax, Ṽ)`; a biased product's
+    `A` and `B` leave the bias out. They are served detached, since the pass ran with grad
+    on.
   - Backward products and `glue_gradients()` (A9) come from `torch.autograd.grad` on the
     kept unit graphs, still under `ProductSubstitution`. Autograd's engine restores the
     forward's thread-local state, including the dispatch mode, on its worker threads (on any
     device), so every backward mm/bmm also gets its committed leaf. A product that escaped
     the mode would be reported missing. No backward is written by hand. One backward per
     unit, from the top:
-    - Head (`j = L+1`): the kept loss, grad to `[X_{L+1}, γ_final, W_E]`. `δΛ` comes from
-      autograd through `loss_from_logits`; `loss` and `label` are never called.
-    - Layer `j`: the kept output, grad to `[X_j, γ_attn, γ_mlp, W_q..W_down]` with
-      `grad_outputs = δX_{j+1}` (the committed-chain value the previous unit gave).
+    - Head (`j = L+1`): the kept loss, grad to `[X_{L+1}, γ_final, W_out]` (`W_out` is
+      `W_E` when tied). `δΛ` comes from autograd through `loss_from_logits`; `loss` and
+      `label` are never called.
+    - Layer `j`: the kept output, grad to `[X_j, γ_attn, γ_mlp, b_q, b_k, b_v, W_q..W_down]`
+      (the biases when declared) with `grad_outputs = δX_{j+1}` (the committed-chain value
+      the previous unit gave). A backward product carrying a bias raises `ReplayError`.
     - Identification at call time: an mm whose `b` is a weight is `dX_x`/`dF`, and its `a`
       must be that weight's `δY` (storage recorded by a hook on the substituted forward
-      output). Any other mm is `G_x`/`G_E_head`: `a` is some weight's `δY` and `b` the saved
+      output). Any other mm is `G_x`/`g_head`: `a` is some weight's `δY` and `b` the saved
       input of that `Y`. A bmm is named by which saved `S`/`O` operand it reads and in which
       slot. `dK` is served as the transpose of the stacked leaves, as in `label`.
     - Each operand's `_version` is recorded when it is supplied and checked when served; a
@@ -513,12 +544,13 @@ interface.
     - Memory, as in training: after the forward pass every unit's graph and operands are
       held, about one training step's activations. Each unit's backward frees its graph
       (`retain_graph=False`) and the unit is dropped, so memory falls unit by unit; the
-      served backward operands are dropped after `G_E_head` or `L{j}.G_v`. The frontier
+      served backward operands are dropped after `g_head` or `L{j}.G_v`. The frontier
       `(j, δX_j)` and the γ gradients persist. The head unit is the largest (`δΛ` and the
       softmax intermediates are `N×n_v`). A request out of order (a forward product whose
       unit is gone, or a backward unit already run) rebuilds the whole pass from scratch.
     - `glue_gradients()` is valid only right after `operands(M)` with the frontier at layer
-      1. It returns the γ gradients and, for `W_E`, `G_E_head` plus `G_E^emb` =
+      1. It returns the γ and bias gradients and, for `W_E`, `G_E_head` plus `G_E^emb` when
+      tied and `G_E^emb` alone when untied, where `G_E^emb` =
       `autograd.grad(embed_tokens(ids), W_E, δX_1)` under a substitution that forbids
       products. `G_E^emb` comes from the model's own `nn.Embedding`, so a `padding_idx`
       row is zero (see the SmolLM2 note in the README). At test scale this has no numeric
@@ -542,6 +574,14 @@ interface.
     activations are now held at once, as in training (the prover's captured forward grows
     0.67 GB and its backward peaks 1.6 GB above the forward's start). The verifier's step
     peak doesn't change (5.46 → 5.42 GB): it is reached in 6b, not in the glue.
+  - **The switches in the fast suite (FS1).** `test_decoder.py` builds a tiny random model
+    for each of the four combinations (Llama or Qwen2, tied or untied; `decoder_helpers.SWITCHES`)
+    with random biases. `label` fills every slot exactly once, and the replay rebuilds every
+    operand and glue gradient bit for bit. An honest step is accepted under every combination
+    while the biases are zero (HF's random init), 6b on the bias gradients included. With
+    non-zero biases check 5 rejects the honest step at the first biased product (`P_1`,
+    `L1.Y_q`): it still measures `A·B`, and the committed leaf is `A·B + 1·bᵀ`. Task FS2 adds
+    the bias term.
 
 ### `verification/prover/`
 
@@ -556,8 +596,10 @@ interface.
     `OperandInfo` has `param_name`, `storage_ptr` and `producer_index`. A storage pointer is
     valid only while the capture holds its tensors, so link records by `producer_index`.
   - Errors: `CaptureError`, `UnsupportedMatmulError` (any `REJECTED_OPS` op, a non-default
-    overload, or an op outside `aten`/`prims` inside a phase), `BiasedMatmulError` (`addmm`
-    with a non-zero bias; see F14), `PhaseError` and `MutatedCaptureError`.
+    overload, or an op outside `aten`/`prims` inside a phase), `BiasedMatmulError` (`α ≠ 1`,
+    or a non-zero bias outside F14's form, a bias vector added once with `β = 1`; every
+    accepted `addmm` keeps its `bias` on the record, and the labeler decides whether it was
+    declared), `PhaseError` and `MutatedCaptureError`.
   - On SmolLM2 4×128 it gives `M = 7,113` (2,371 forward, 4,742 backward) plus 1 RoPE glue
     outer product. Only `aten.mm` and `aten.bmm` appear, and the outputs total about 1.55 GB.
   - **The δK̃ transpose.** The captured attention bmm returns `Q̃ᵀ·δS`, which is `δK̃ᵀ`. A7
@@ -934,7 +976,7 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     `h_D` (its synthetic `D`'s root) and a null band-file hash.
 - `llama_step.py` (A10, milestone M3): `.venv/bin/python -m verification.runs.llama_step
   [--steps T] [--bands PATH] [--metrics | --no-metrics]`, with `T` default 1.
-  `LlamaComputation.from_config`, `W_0` from `build_model()`, `D` from
+  `DecoderComputation.from_config`, `W_0` from `build_model()`, `D` from
   `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D` from `meta.json`
   (`load_committed_dataset`). The honest scenario goes through `scenarios.run_scenario` with
   the published `h_D` and provisional bands (`τ = 8`, below the honest `Λ` residuals C1
@@ -1001,7 +1043,7 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
   - `main` takes `W_0` from a `scenarios.ReusedModel` and passes it as `build_model`, so
     `W_0` and every pass share one load.
   - Same `W_0` (`snapshot_weights(c, c.build_model())` semantics, the model
-    `LlamaComputation.from_config` loads; A12 must take its `W_0` the same way), same `π` over
+    `DecoderComputation.from_config` loads; A12 must take its `W_0` the same way), same `π` over
     `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`.
   - Training is `loop.run_plain(c, model, D, w0, *, n_steps, seed, schedule=None,
     on_step=None, section=None) -> PlainResult(steps, w_final)`: chained `plain_step`s on
