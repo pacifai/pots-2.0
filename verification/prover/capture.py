@@ -268,9 +268,9 @@ class MatmulCapture(TorchDispatchMode):
             bias, a, b = args[0], args[1], args[2]
             beta = kwargs.get("beta", 1)
             alpha = kwargs.get("alpha", 1)
-            inert = beta == 0 or not bool(bias.ne(0).any())
             f14 = name == "addmm" and beta == 1 and tuple(bias.shape) == (b.shape[1],)
-            if alpha != 1 or not (inert or f14):
+            # F14's form first: reading the bias's values is a device sync on a GPU.
+            if alpha != 1 or not (f14 or beta == 0 or not bool(bias.ne(0).any())):
                 raise BiasedMatmulError(
                     f"{func} with beta={beta}, alpha={alpha} and a non-zero bias of shape "
                     f"{tuple(bias.shape)}: the bias rule (F14) covers only a bias vector added "

@@ -505,7 +505,7 @@ Breaking any of these voids the result. Each one has a test.
 | Part | State |
 |---|---|
 | Foundations, data, `C` interface, MLP instance, capture, prover, store, checks, verifier, loop, MLP smoke run | merged; milestone M1 reached |
-| SmolLM2 inventory and labeling (`instances/llama.py`, now `instances/decoder.py`) | merged; milestone M2 reached |
+| SmolLM2 inventory and labeling (`instances/decoder.py`, formerly `llama.py`) | merged; milestone M2 reached |
 | SmolLM2 replay of forward glue (A8) | done; all 2,371 forward operands of the real step match the prover's bit for bit |
 | Per-component cost and residual metrics (`runs/metrics.py`, B6), wired into the MLP smoke run | done |
 | SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |

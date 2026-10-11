@@ -13,8 +13,8 @@ the model name or the scale:
   the embedding's lookup gradient (check 6b). ``M`` is the same either way (S2).
 - **q, k, v biases.** On for ``model_type == "qwen2"``, whose attention hardcodes them; Llama's
   ``attention_bias`` (which also biases ``o``) and ``mlp_bias`` must be off. A biased
-  projection runs as one ``addmm``; F14 checks it as one product of augmented operands, so a
-  bias adds no product. Each bias is a weight whose gradient is glue (check 6b).
+  projection runs as one ``addmm``, and check 5 verifies it as one product of augmented
+  operands (F14), so a bias adds no product. Each bias is a weight whose gradient is glue (check 6b).
 
 Implementation pins (not fixed by the reference block):
 

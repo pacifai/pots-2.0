@@ -168,9 +168,13 @@ Leaf indices are 0-based:
 ```
 
 Weight tensors are committed as the model holds them. Linear weights are `[o, i]`, as in
-`nn.Linear.weight`. The decoder's two switches (FS1) add weight leaves without changing `M`:
-with q, k, v biases each `b_x` follows its `W_x`, and an untied output layer's `W_out`
-(`lm_head.weight`) comes last, after `γ_final`. Neither placement is in the docs yet.
+`nn.Linear.weight`.
+
+The `W_t` order above is ref block §6's, which is SmolLM2's: a tied output layer and no
+biases. This file pins the order for the other decoders (FS1), which add weight leaves
+without changing `M`. With q, k, v biases, each `b_x` comes right after its `W_x`
+(`W_q, b_q, W_k, b_k, W_v, b_v`). An untied output layer's `W_out` (`lm_head.weight`) comes
+last, after `γ_final`.
 
 Each product leaf is the product exactly as the spec's `P = A·B` defines it. Each `(s, h)`
 member of a batched attention product is its own leaf, an `n×n` or `n×d_h` matrix. The
