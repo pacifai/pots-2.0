@@ -2,11 +2,14 @@
 
     python -m benchmarks.hashing.run                 # the H100 session (Section 6 sizes)
     python -m benchmarks.hashing.run --smoke         # small sizes, minutes on a laptop
+    python -m benchmarks.hashing.native              # E5(a′)'s native library, built alone
 
 The defaults are the H100 session's: a 4 GB buffer, 1/8/16/all-core threads, the five chunk
 sizes, the four full-scale models at 128 × 128 (fp32 weights, bf16 products), k = 21, and
 Llama-3.2-1B's whole product list for E5. ``--smoke`` shrinks the buffer, the samples and E5's
 share, and times E6 at 2 × 16 on the CPU. Any option given explicitly overrides the preset.
+E5(a′)'s native batch fetches and builds BLAKE3's C library on first use (``native.py``); pass
+``--no-native-batch`` to run without it.
 
 A step is named ``model``, at ``--n-s`` × ``--n`` with bf16 products, or ``model:N_SxN:DTYPE``
 with its own batch and product dtype (``fp32`` or ``bf16``); weights are fp32 in both runs.
@@ -25,7 +28,7 @@ from typing import Any
 
 import torch
 
-from benchmarks.hashing import challenges, cpu_hash, step_time
+from benchmarks.hashing import challenges, cpu_hash, native, step_time
 from benchmarks.hashing.machine import machine_record
 from benchmarks.hashing.report import (SCHEMA, SLOTS, not_implemented_slot, result, slot,
                                        write_report)
@@ -55,6 +58,8 @@ H100 = {
     "k": 21,
     "e5_layers": 0,  # 0: every layer
     "e5_processes": "all",
+    "native_batch": True,
+    "e5_native_layers": 0,  # 0: every layer; the native batch is fast enough to run them all
     "e6_models": ",".join(FULL_SCALE),
     "e6_n_s": 128,
     "e6_n": 128,
@@ -148,6 +153,9 @@ def parser() -> argparse.ArgumentParser:
     a("--k", type=int, help="challenge vectors per product (H100: 21)")
     a("--e5-layers", type=int, help="layers E5 times, the rest extrapolated; 0 for all")
     a("--e5-processes", help="E5(a′)'s process-pool size, or 'all'")
+    a("--native-batch", action=argparse.BooleanOptionalAction, default=None,
+      help="E5(a′)'s native BLAKE3 batch, fetched and built on first use (H100: on)")
+    a("--e5-native-layers", type=int, help="layers the native batch times; 0 for all")
     a("--e6-models", help="models for E6 ('none' for no model)")
     a("--e6-n-s", type=int, help="E6's sequences per step (H100: 128)")
     a("--e6-n", type=int, help="E6's tokens per sequence (H100: 128)")
@@ -216,13 +224,24 @@ def run(argv: list[str] | None = None, log=print) -> Path:
         say(f"E5(a): {name} k={k}, layers {layers or 'all'}")
         e5a = slot("E5a", challenges.run_e5a(s, k=k, layers=layers))
         say(f"E5(a′): thread pools {pool_threads}, {procs} processes")
-        e5a_prime = slot("E5a_prime", [
-            *challenges.run_e5a_prime(s, k=k, layers=layers, threads=pool_threads,
-                                      processes=procs),
-            result("native_batch", "not_implemented",
-                   reason="needs BLAKE3's C sources, not fetched (no downloads in this task)",
-                   params=challenges.NATIVE_PROPOSAL)])
-        return {"E5a": e5a, "E5a_prime": e5a_prime}
+        rows = challenges.run_e5a_prime(s, k=k, layers=layers, threads=pool_threads,
+                                        processes=procs)
+        if not args["native_batch"]:
+            rows.append(result("native_batch", "skipped",
+                               reason="turned off with --no-native-batch"))
+        else:
+            native_layers = args["e5_native_layers"] or None
+            try:
+                lib = native.load(native.build(log=say))
+            except Exception as e:  # no network or no compiler: keep the other rows
+                say(f"E5(a′) native batch unavailable:\n{traceback.format_exc()}")
+                rows.append(result("native_batch", "skipped",
+                                   reason=f"build failed: {type(e).__name__}: {e}"))
+            else:
+                say(f"E5(a′): native batch, threads {threads}, layers "
+                    f"{native_layers or 'all'}, SIMD degree {lib.simd_degree}")
+                rows += native.run_native(s, lib, k=k, layers=native_layers, threads=threads)
+        return {"E5a": e5a, "E5a_prime": slot("E5a_prime", rows)}
 
     def e6() -> dict:
         device = args["e6_device"]

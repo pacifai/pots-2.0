@@ -4,9 +4,11 @@ Standalone scripts for the H100 hashing benchmark of `docs/verification/HASHING_
 (Section 6). They measure what the full-scale run's hashing and challenge generation cost on
 the CPU, and they record the machine. The GPU experiments are empty slots in the report.
 
-The package imports `setup`, PyTorch, transformers, NumPy, `hashlib` and `blake3`. From
-`verification` it imports only the leaf-size list (`verification/computation/leaf_sizes.py`);
-`tests/test_layering.py` enforces both rules.
+The package imports `setup`, PyTorch, transformers, NumPy, `hashlib`, `blake3` and `certifi`.
+From `verification` it imports only the leaf-size list
+(`verification/computation/leaf_sizes.py`); `tests/test_layering.py` enforces both rules. One
+experiment, E5a_prime's native batch, also builds a C library from BLAKE3's sources; see
+[Native batch](#native-batch).
 
 ## Usage
 
@@ -26,12 +28,15 @@ The defaults are Section 6's sizes:
 
 The report goes to `$VERIF_OUTPUT_DIR/benchmarks/hashing_<UTC time>.json`, or to `--out`.
 
-Before the session, prepare two things:
+Before the session, prepare three things:
 
 - E6 loads each model with `from_pretrained` at its pinned revision (`setup/model.py`). Run
   with network access, or fill the Hugging Face cache first.
 - `b3sum`, BLAKE3's command-line tool, gives BLAKE3's native ceiling. If it isn't on `PATH`,
   that result says skipped.
+- E5a_prime's native batch needs a C compiler and, the first time, one download from
+  github.com. To build it ahead of the session, run `.venv/bin/python -m
+  benchmarks.hashing.native`; otherwise the runner builds it when E5 starts.
 
 To try the runner on a laptop, use the smoke preset:
 
@@ -39,9 +44,9 @@ To try the runner on a laptop, use the smoke preset:
 HF_HUB_OFFLINE=1 VERIF_OUTPUT_DIR=/tmp/out .venv/bin/python -m benchmarks.hashing.run --smoke
 ```
 
-The smoke preset uses a 256 MiB buffer, one layer of the challenge list, and E6 at 2 × 16 on
-the CPU. It took 67 s on an Apple M5 Pro. Any flag given explicitly overrides the preset; see
-`--help`.
+The smoke preset uses a 256 MiB buffer, one layer of the challenge list for the Python paths,
+every layer for the native batch, and E6 at 2 × 16 on the CPU. It took 70 s on an Apple M5
+Pro. Any flag given explicitly overrides the preset; see `--help`.
 
 A step is named by its model (`llama-3.2-1b`), at `--n-s` × `--n` with bf16 products. To give
 a step its own batch and product dtype, write `model:N_SxN:DTYPE`. For example,
@@ -79,9 +84,14 @@ E5a, challenge generation on the current Python path
   conversion. A test checks them bit for bit against `challenge_matrix`. When `--e5-layers`
   times only some layers, the per-step time is extrapolated and says estimated.
 
-E5a_prime, CPU-parallel baselines for challenge generation
-: The same calls over a thread pool and over a process pool. `native_batch` is a proposal,
-  not implemented: a C batch over BLAKE3's sources.
+E5a_prime, batched challenge generation on the CPU
+: The same calls in three forms:
+  - `thread_pool` and `process_pool`: the Python path's calls spread over a pool. These are
+    baselines that need no new code.
+  - `native_batch`: each of check 5's calls made once through BLAKE3's C library, its
+    vectors spread over 1, 8, 16 and all cores in C. A test checks its output bit for bit
+    against the protocol's `challenge_matrices` and `challenge_matrix`. `--e5-native-layers`
+    sets how many layers it times (default all); `--no-native-batch` turns it off.
 
 E5b and E5c: challenge generation on the GPU with cuPQC
 : Not implemented. They need CUDA code.
@@ -89,6 +99,46 @@ E5b and E5c: challenge generation on the GPU with cuPQC
 E6, step time
 : One plain bf16 SGD step per model, eager and then sdpa attention, after warmup steps.
   The verified step isn't timed.
+
+## Native batch
+
+E5a_prime's `native_batch` calls a shared library built from two parts:
+
+- `challenges_native.c`, in this directory. It makes the protocol's challenges (key `h`,
+  label `0x10 ‖ m ‖ j`, the XOF bytes and their fp32 conversion) for a list of products in
+  one call, on a pthread pool. ctypes releases the GIL for the whole call.
+- BLAKE3's reference C implementation, release 1.8.7, from the `c/` directory of
+  github.com/BLAKE3-team/BLAKE3. Its licence is CC0-1.0 or Apache-2.0, at the user's choice.
+
+The repo doesn't hold BLAKE3's sources. To build the library, run:
+
+```bash
+.venv/bin/python -m benchmarks.hashing.native
+```
+
+The build runs in three steps:
+
+1. It downloads the release archive of the pinned tag, `BLAKE3_TAG` in `native.py`, and
+   checks its SHA-256 against `ARCHIVE_SHA256`. A mismatch stops the build before anything
+   is extracted.
+2. It extracts the C files it needs and the licences into
+   `~/.cache/pots-benchmarks/blake3-1.8.7/`.
+3. It compiles them with `$CC` (default `cc`) into
+   `~/.cache/pots-benchmarks/libpots_challenges-blake3-1.8.7-<platform>-<arch>-<hash>.so`. The
+   hash covers the C source and the build command, so editing either builds a new library.
+
+To put the cache elsewhere, set `$POTS_BENCH_CACHE`. Later runs reuse the library and need no
+network.
+
+BLAKE3 picks its SIMD code at run time. On arm64 the build includes NEON. On x86-64 it
+includes BLAKE3's SSE2, SSE4.1, AVX2 and AVX-512 assembly, and the library uses the widest
+one the CPU supports. On other machines it builds the portable C code. Each `native_batch`
+row records `simd_degree`, the number of lanes of the path in use: 16 for AVX-512, 8 for
+AVX2, 4 for SSE4.1, SSE2 or NEON. On every path but AVX-512, BLAKE3 computes each 64-byte output
+block of an XOF one at a time, so challenge generation gains from cores, not from SIMD width.
+
+The fast test suite never builds the library. Its native tests skip, with that reason, when
+the library is missing.
 
 ## Report layout
 

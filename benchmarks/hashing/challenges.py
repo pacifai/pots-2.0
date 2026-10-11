@@ -8,10 +8,10 @@ bit. Check 5 asks for challenges run by run: a product outside attention gets
 ``challenge_matrices`` call per operand shape (k calls per member, converted in one numpy pass).
 :func:`plan` rebuilds that call list from the leaf-size list.
 
-E5(a′) is the no-dependency baseline for batching: the same calls spread over a thread pool
+E5(a′) has two no-dependency baselines for batching: the same calls spread over a thread pool
 (the ``blake3`` package releases the GIL only for large inputs, so small XOF calls contend for
-it) and over a process pool. A native batch, the plan's E5(a′) proper, is a proposal only:
-:data:`NATIVE_PROPOSAL`.
+it) and over a process pool. The native batch, the plan's E5(a′) proper, is
+`benchmarks/hashing/native.py`.
 """
 
 from __future__ import annotations
@@ -187,13 +187,16 @@ def select(calls: Sequence[Call], layers: int | None) -> tuple[list[Call], int, 
 # ---- E5(a) ----------------------------------------------------------------------------------
 
 
-def _timed(calls: Sequence[Call], h: bytes, k: int) -> tuple[float, float, int, int]:
-    """``(head seconds, layer seconds, head XOF calls, layer XOF calls)`` on this thread."""
+def _timed(calls: Sequence[Call], h: bytes, k: int,
+           run_call=None) -> tuple[float, float, int, int]:
+    """``(head seconds, layer seconds, head XOF calls, layer XOF calls)`` on this thread, with
+    ``run_call(h, k, call)`` (the Python path by default)."""
+    run_call = run_call or _run_call
     head = layers = 0.0
     n_head = n_layers = 0
     for c in calls:
         t0 = time.perf_counter()
-        _run_call(h, k, c)
+        run_call(h, k, c)
         dt = time.perf_counter() - t0
         if c.layer is None:
             head, n_head = head + dt, n_head + c.xof_calls * k
@@ -307,25 +310,3 @@ def run_e5a_prime(step: Step, *, k: int, layers: int | None, threads: Sequence[i
                                  "share and drops it, nothing returns to the parent; worker "
                                  "start-up excluded")
     return out
-
-
-NATIVE_PROPOSAL = {
-    "what": "a batched BLAKE3 XOF in C: one call takes the key h, k, a list of (m, width) and "
-            "an output float32 buffer, and fills [len, width, k] with P8b's entries on a "
-            "pthread pool, releasing the GIL once for the whole batch",
-    "why": "the current path pays about 1 µs of Python per XOF call and the blake3 package "
-           "holds the GIL for small outputs, so neither threads nor the package's own "
-           "multithreading help; 8.3M calls per Llama-3.2-1B step need native code to run "
-           "ahead of check 5",
-    "source": "BLAKE3's reference C implementation (github.com/BLAKE3-team/BLAKE3, directory "
-              "c/: blake3.c, blake3_dispatch.c, blake3_portable.c and the SIMD files for the "
-              "target, NEON on arm64, SSE4.1/AVX2/AVX-512 on x86-64), about 150 KB of source",
-    "licence": "CC0-1.0 or Apache-2.0 (or Apache-2.0 with LLVM exceptions), at the user's "
-               "choice",
-    "build": "the system C compiler into a shared library, loaded through ctypes; no new "
-             "Python dependency, no ninja (torch's load_inline needs it and it isn't "
-             "installed) and no Rust toolchain (PyO3 would need one)",
-    "check": "bit for bit against challenge_matrices on random labels, as the Python baseline "
-             "is checked",
-    "status": "not fetched or built: the brief forbids downloads; awaiting approval",
-}

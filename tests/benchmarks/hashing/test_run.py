@@ -5,7 +5,7 @@ import json
 import pytest
 import torch
 
-from benchmarks.hashing import report, run, sizes
+from benchmarks.hashing import native, report, run, sizes
 from tests.verification.decoder_helpers import tiny_config
 
 
@@ -14,6 +14,9 @@ def test_presets():
     assert run.resolve(run.parser().parse_args(["--smoke"])) == run.SMOKE
     args = run.resolve(run.parser().parse_args(["--smoke", "--buffer-mb", "64", "--no-native"]))
     assert (args["buffer_mb"], args["native"], args["reps"]) == (64, False, run.SMOKE["reps"])
+    assert args["native_batch"] is True  # --native is the openssl/b3sum ceilings, not E5(a′)
+    args = run.resolve(run.parser().parse_args(["--no-native-batch"]))
+    assert (args["native"], args["native_batch"]) == (True, False)
     assert run.SMOKE["buffer_mb"] <= 512
 
 
@@ -29,7 +32,8 @@ TINY = ["--buffer-mb", "2", "--threads", "1,2", "--chunk-kb", "64", "--reps", "1
         "--n-s", "2", "--n", "12", "--size-models", "smollm2-135m",
         "--direct-models", "smollm2-135m", "--sample-mb", "1", "--object-cap-mb", "0",
         "--no-native", "--e5-model", "smollm2-135m", "--k", "3", "--e5-layers", "1",
-        "--e5-processes", "1", "--e6-models", "none", "--e6-device", "cpu"]
+        "--e5-processes", "1", "--no-native-batch", "--e6-models", "none", "--e6-device",
+        "cpu"]
 
 
 def test_a_tiny_run_writes_every_slot(tmp_path, monkeypatch):
@@ -55,8 +59,9 @@ def test_a_tiny_run_writes_every_slot(tmp_path, monkeypatch):
             "b3sum", "chunked_under_h2d_copy"} <= names
     assert [r["name"] for r in slots["E5a"]["results"]] == ["python_path",
                                                              "python_path_per_step"]
-    assert slots["E5a_prime"]["results"][-1]["name"] == "native_batch"
-    assert slots["E5a_prime"]["results"][-1]["status"] == "not_implemented"
+    last = slots["E5a_prime"]["results"][-1]
+    assert (last["name"], last["status"], last["reason"]) == \
+        ("native_batch", "skipped", "turned off with --no-native-batch")
     assert doc["inputs"]["steps"]["smollm2-135m"]["leaves"] == \
         len(sizes.step("smollm2-135m", n_s=2, n=12).leaves)
     machine = slots["E0"]["results"][0]["values"]["record"]
@@ -86,6 +91,36 @@ def test_a_failing_experiment_keeps_the_others(tmp_path, monkeypatch):
     for key in ("E5a", "E5a_prime"):
         (r,) = slots[key]["results"]
         assert (r["status"], r["reason"]) == ("skipped", "error: RuntimeError: boom")
+
+
+def test_a_failed_native_build_keeps_the_pool_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(sizes, "model_config", lambda key: tiny_config())
+
+    def offline(**kw):
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr(native, "build", offline)
+    path = run.run([*TINY, "--native-batch", "--experiments", "E5",
+                    "--out", str(tmp_path / "r.json")], log=lambda _: None)
+    rows = json.loads(path.read_text())["slots"]["E5a_prime"]["results"]
+    assert rows[0]["name"] == "thread_pool" and rows[0]["status"] == "measured"
+    assert (rows[-1]["name"], rows[-1]["status"], rows[-1]["reason"]) == \
+        ("native_batch", "skipped", "build failed: RuntimeError: no network")
+
+
+@pytest.mark.skipif(native.find_library() is None,
+                    reason="native BLAKE3 batch not built; run python -m benchmarks.hashing.native")
+def test_a_tiny_run_with_the_native_batch(tmp_path, monkeypatch):
+    monkeypatch.setattr(sizes, "model_config", lambda key: tiny_config())
+    path = run.run([*TINY, "--native-batch", "--experiments", "E5",
+                    "--out", str(tmp_path / "r.json")], log=lambda _: None)
+    rows = json.loads(path.read_text())["slots"]["E5a_prime"]["results"]
+    native_rows = [(r["name"], r["status"], r["params"]["threads"]) for r in rows
+                   if r["name"].startswith("native_batch")]
+    assert native_rows == [("native_batch", "measured", 1),
+                           ("native_batch_per_step", "measured", 1),
+                           ("native_batch", "measured", 2),
+                           ("native_batch_per_step", "measured", 2)]
 
 
 @pytest.mark.skipif(torch.cuda.is_available(), reason="checks the no-CUDA guard")

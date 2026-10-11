@@ -189,9 +189,10 @@ def test_a_benchmark_importing_more_of_verification_fails(tmp_path):
         "benchmarks/hashing/bad.py imports verification.commitment.merkle.hash_leaves"]
 
 
-# Rule 8's packages besides the standard library: this repo's own, and four from PyPI.
+# Rule 8's packages besides the standard library: this repo's own, and five from PyPI. certifi
+# (installed with transformers' HTTP stack) gives the native build's download its CA bundle.
 BENCHMARK_PACKAGES = {"benchmarks", "setup", "verification", "torch", "transformers", "numpy",
-                      "blake3"}
+                      "blake3", "certifi"}
 
 
 def test_benchmarks_import_only_their_packages():
