@@ -457,8 +457,8 @@ class DecoderComputation(DeclaredComputation):
         for r in records:
             if not isinstance(r, Record):
                 raise ValueError(f"a decoder record is a records.Record, got {type(r).__name__}")
-        # F8f: the pad is the model's EOS. PAD_ID is SmolLM2's; the decoder task (FS1) wires
-        # each model's EOS from data.run_pin.
+        # F8f: the pad is the model's EOS. PAD_ID is SmolLM2's; the first real-model run (FS4)
+        # wires each model's EOS from data.run_pin.
         return assemble_batch(records, self.n, pad_id=PAD_ID)
 
     def logits(self, model: nn.Module, batch: Batch) -> torch.Tensor:
