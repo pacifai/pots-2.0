@@ -5,8 +5,8 @@ import math
 
 import pytest
 
-from benchmarks.hashing import report
-from benchmarks.hashing.machine import machine_record
+from benchmarks.hashing import machine, report
+from benchmarks.hashing.machine import cores_basis, cores_for_threads, machine_record
 
 
 def _doc(**slots):
@@ -77,6 +77,39 @@ def test_machine_record_names_every_field():
                 "cuda_runtime", "pcie_gen_current", "pcie_width_current", "gpu_numa_node",
                 "numa_nodes", "cores_for_threads", "packages", "hashlib_sha256"):
         assert key in m, key
+    for key in ("avx2", "avx512vl", "cpu_freq_mhz", "cpu_max_freq_mhz", "cpu_governor",
+                "hashlib_openssl", "ssl_openssl", "cores_for_threads_basis", "notes"):
+        assert key in m, key
     assert set(m["absent"]) == {k for k, v in m.items() if v is None}
     assert m["cores_for_threads"] >= 1
+    assert m["cores_for_threads_basis"].startswith(("physical cores", "logical CPUs"))
+    assert {"pcie_gen_current", "cores_for_threads"} <= set(m["notes"])
+    if m["hashlib_openssl"] is not None:
+        assert m["hashlib_openssl"].startswith(("OpenSSL", "LibreSSL", "BoringSSL"))
     json.dumps(m)
+
+
+def test_cores_basis_names_its_caps():
+    m = {"physical_cores": 32, "logical_cpus": 64, "usable_cpus": 16, "cgroup_cpu_quota": None}
+    assert cores_for_threads(m) == 16
+    assert cores_basis(m) == "physical cores, capped by CPU affinity"
+    assert cores_basis({"physical_cores": None, "logical_cpus": 8}) == \
+        "logical CPUs (no physical core count)"
+
+
+def test_linux_frequency_reads_sysfs_then_cpuinfo(monkeypatch):
+    """The H100 host runs Linux, which this test fakes through its files."""
+    base = "/sys/devices/system/cpu/cpu0/cpufreq/"
+    files = {base + "scaling_cur_freq": "2100000\n", base + "cpuinfo_max_freq": "3800000\n",
+             base + "scaling_governor": "performance\n"}
+    cpuinfo = "processor\t: 0\ncpu MHz\t\t: 1999.998\n"
+    monkeypatch.setattr(machine, "_read", files.get)
+    r = machine._Record()
+    machine._frequency(r, "Linux", cpuinfo)
+    assert r.data == {"cpu_freq_mhz": 2100.0, "cpu_max_freq_mhz": 3800.0,
+                      "cpu_governor": "performance"}
+    monkeypatch.setattr(machine, "_read", {}.get)  # a VM without cpufreq
+    r = machine._Record()
+    machine._frequency(r, "Linux", cpuinfo)
+    assert r.data == {"cpu_freq_mhz": 1999.998, "cpu_max_freq_mhz": None, "cpu_governor": None}
+    assert set(r.absent) == {"cpu_max_freq_mhz", "cpu_governor"}
