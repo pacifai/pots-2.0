@@ -30,6 +30,7 @@ import blake3
 import numpy as np
 import torch
 
+from benchmarks.hashing.cpu_hash import start_threads
 from benchmarks.hashing.report import result
 from benchmarks.hashing.sizes import Step
 
@@ -294,11 +295,13 @@ def run_e5a_prime(step: Step, *, k: int, layers: int | None, threads: Sequence[i
     out = []
     for t in threads:
         with ThreadPoolExecutor(t) as pool:
+            start_threads(pool, t)  # every thread running before timing
             head, lay = _pooled(pool, t, chosen, h, k)
         out += _extrapolate("thread_pool", step, {**base, "threads": t}, head, lay, n_sel,
                             n_total, calls_measured, calls_step,
                             note="no-dependency baseline: the Python path's calls split over a "
-                                 "thread pool; outputs generated, converted and dropped")
+                                 "thread pool; outputs generated, converted and dropped; "
+                                 "thread start-up excluded")
     if processes > 1:
         ctx = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(processes, mp_context=ctx) as pool:
