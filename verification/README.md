@@ -295,10 +295,14 @@ context (`context.py`) and the tolerance bands (`bands.py`). Each returns `None`
 checks in order. When check 5 or 6 rejects because a test failed, the driver then measures
 that check's remaining tests for the record only (`checks.record_rest`), so the step's
 scores cover every product or weight tensor the check owns. The verdict is already fixed,
-and the checks after the rejecting one still never run. **`residuals.py`** bins the numbers checks 5 and 6 record: per matmul
-class, the count, RMS and maximum of the normalized residuals and the spread of `κ`; per
-weight role, the largest `ρ`. It judges nothing. Runs print these tables, and calibration
-(A11) fits the bands from the same summaries.
+and the checks after the rejecting one still never run. The pass reuses the live check's own
+gradient code and, inside one of check 5's attention runs, the live measures of the run's
+later members. The driver keeps how far the pass got (`complete`, `ended: malformed`,
+`error` or `not run`) for the step record, and catches any error the pass raises with a
+warning, so the rejection stands. **`residuals.py`** bins the numbers checks 5 and 6
+record: per matmul class, the count, RMS and maximum of the normalized residuals and the
+spread of `κ`; per weight role, the largest `ρ`. It judges nothing. Runs print these
+tables, and calibration (A11) fits the bands from the same summaries.
 
 `matmul_check/` holds check 5's test, the part that would change if Freivalds' test were
 replaced:

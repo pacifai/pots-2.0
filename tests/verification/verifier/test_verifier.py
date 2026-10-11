@@ -459,16 +459,17 @@ def test_check_6b_on_glue_gradients():
 
 def _record_pass(make_v, store, monkeypatch):
     """Verify step 1 with the record pass and without it. The rejection and the timed slots
-    must be the same; returns the rejection and both runs' stats."""
+    must be the same; returns the rejection, both runs' stats and the pass's status."""
     v = make_v()
     rej = v.verify_step(1, store)
     with monkeypatch.context() as mp:
-        mp.setattr(driver, "record_rest", lambda *a: None)
+        mp.setattr(driver, "record_rest", lambda *a: checks.RECORD_NOT_RUN)
         bare = make_v()
         rej_bare = bare.verify_step(1, store)
     assert rej == rej_bare and v.rejection == rej
     assert list(v.timings[1]) == list(bare.timings[1])
-    return rej, v.stats[1], bare.stats[1]
+    assert v.record_pass[1] in checks.RECORD_STATUSES
+    return rej, v.stats[1], bare.stats[1], v.record_pass[1]
 
 
 def _glue_mlp_env(cls):
@@ -483,8 +484,9 @@ def test_record_pass_after_check_5_measures_every_product(c, D, tree, w0, monkey
     b_tilde = _batch(c, D, 1)
     b_tilde[0] = make_record(torch.zeros(c.d_in), torch.ones(c.d_out))
     store, _ = _store(c, D, tree, w0, 1, train_records=b_tilde)
-    rej, st, bare = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
     _expect(rej, 1, "5")
+    assert status == checks.RECORD_COMPLETE
     assert "P_1 (Y_1)" in rej.detail
     assert [p.m for p in bare.products] == [1]
     assert [p.m for p in st.products] == list(range(1, c.M + 1))
@@ -507,8 +509,9 @@ def test_record_pass_after_check_6a_measures_every_weight(c, D, tree, w0, monkey
     poisoned, _ = plain_step(c, c.build_model(), w0, _batch(c, D, 3))
     for name in c.weight_names:
         perturb_leaf(c, store, c.w_next_index(name), poisoned[name])
-    rej, st, bare = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
     _expect(rej, 1, "6a")
+    assert status == checks.RECORD_COMPLETE
     assert len(bare.tensors) == 1 and st.tensors[0] == bare.tensors[0]
     assert [s.weight for s in st.tensors] == list(c.linear_weights)
     assert all(s.check_id == "6a" and s.rho_max > 4 for s in st.tensors)
@@ -524,13 +527,52 @@ def test_record_pass_after_6a_measures_6b_too(monkeypatch):
     assert honest.verify_step(1, store) is None
     name = c.weight(1)
     perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
-    rej, st, bare = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
     _expect(rej, 1, "6a")
+    assert status == checks.RECORD_COMPLETE
     assert [(s.check_id, s.weight) for s in bare.tensors] == [("6a", c.weight(1))]
     assert [(s.check_id, s.weight) for s in st.tensors] == [
         ("6a", c.weight(1)), ("6a", c.weight(2)), ("6b", c.weight(3))]
     assert st.tensors[1:] == honest.stats[1].tensors[1:]
     assert not st.products  # the replay served the products; none was measured
+
+
+def test_record_pass_after_6a_at_bf16_scores_as_the_live_checks():
+    """At bf16 compute (FS3) a weight-gradient leaf is bf16, and check 6a widens it to the fp32
+    weights (``checks._linear_gradient``) before the update identity, whose ``η·G`` rounds in
+    ``G``'s format. The record pass takes ``G`` from the same helper, and 6b's from the same
+    glue helpers, so after a forged linear ``W_{t+1}`` every other tensor scores what an honest
+    step's checks 6a and 6b give it, bit for bit."""
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=ETA, compute_dtype=torch.bfloat16)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
+    tree = dataset_tree(c, D)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    idx = schedule(1, c.n_s, len(D), SEED)
+    out = prove_step(c, c.build_model(), w0, [D[i] for i in idx])
+    name = next(iter(c.linear_weights))
+    assert out.products[c.linear_weights[name] - 1].dtype == torch.bfloat16
+    assert c.weight_dtype == torch.float32 and c.glue_gradient_weights
+
+    def verify(edit=None):
+        store = InMemoryStore.from_step(c, out, copy=True,
+                                        dataset_paths=[tree.path(i) for i in idx])
+        if edit is not None:
+            edit(store)
+        v = Verifier(c, h_D=tree.root, n_records=len(D), k=K, n_steps=1,
+                     bands=Bands.provisional(), allow_provisional=True, w0=w0, seed=SEED)
+        assert v.start_run(D) is None
+        return v, v.verify_step(1, store)
+
+    honest, rej = verify()
+    assert rej is None
+    v, rej = verify(lambda st: perturb_leaf(c, st, c.w_next_index(name),
+                                            out.w_next[name] + 1e-2))
+    _expect(rej, 1, "6a")
+    assert v.record_pass[1] == checks.RECORD_COMPLETE
+    got, want = v.stats[1].tensors, honest.stats[1].tensors
+    assert [(s.check_id, s.weight) for s in got] == [(s.check_id, s.weight) for s in want]
+    assert got[0].rho_max > TAU_W0 and got[1:] == want[1:]
+    assert {s.check_id for s in got[1:]} == {"6a", "6b"} and not v.stats[1].products
 
 
 class GlueMLP2(GlueMLP):
@@ -560,8 +602,9 @@ def test_record_pass_after_check_6b_measures_the_other_glue_weights(monkeypatch)
     assert honest.verify_step(1, store) is None
     name = c.weight(2)
     perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
-    rej, st, bare = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
     _expect(rej, 1, "6b")
+    assert status == checks.RECORD_COMPLETE
     assert [(s.check_id, s.weight) for s in bare.tensors] == [
         ("6a", c.weight(1)), ("6b", c.weight(2))]
     assert [(s.check_id, s.weight) for s in st.tensors] == [
@@ -586,8 +629,9 @@ def test_record_pass_ends_quietly_on_malformed_data(monkeypatch):
     store, out = _store(c, D, tree, w0, 1)
     name = c.weight(1)
     perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
-    rej, st, _ = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    rej, st, _, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
     _expect(rej, 1, "6a")
+    assert status == checks.RECORD_MALFORMED
     assert [(s.check_id, s.weight) for s in st.tensors] == [
         ("6a", c.weight(1)), ("6a", c.weight(2))]
 
@@ -603,12 +647,54 @@ def test_record_pass_only_after_a_failed_test(c, D, tree, w0, monkeypatch):
     v = _verifier(c, D, tree, w0)
     _expect(v.verify_step(1, store), 1, "4")
     assert calls == ["4"] and not v.stats[1].products and not v.stats[1].tensors
+    assert v.record_pass[1] == checks.RECORD_NOT_RUN
     store, _ = _store(c, D, tree, w0, 1)
     nan = torch.full(c.product(1).p_shape, math.nan)
     v = _verifier(c, D, tree, w0)
     _expect(v.verify_step(1, Wrapped(store, leaves={c.product_index(1): nan})), 1, "2",
             "malformed")
-    assert calls == ["4"]
+    assert calls == ["4"] and v.record_pass[1] == checks.RECORD_NOT_RUN
+
+
+def test_record_pass_not_run_when_no_test_remains(c, D, tree, w0, monkeypatch):
+    """The last linear weight fails 6a, and the plain MLP has no glue weight: nothing remains
+    to measure, so the pass reports "not run" and the step keeps the live numbers."""
+    assert not c.glue_gradient_weights
+    store, out = _store(c, D, tree, w0, 1)
+    name = list(c.linear_weights)[-1]
+    perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-2)
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6a")
+    assert status == checks.RECORD_NOT_RUN and st == bare
+    assert [s.weight for s in st.tensors] == list(c.linear_weights)
+
+
+def test_a_record_pass_error_keeps_the_rejection(c, D, tree, w0, monkeypatch):
+    """A verifier bug in the record pass can't cost the run its rejection: the driver catches
+    the error with a warning, records "error", and returns the rejection; the verdict and the
+    step record follow from it, with the numbers measured before the error."""
+    from verification.runs import metrics
+
+    def broken(*a):
+        raise RuntimeError("record pass bug")
+
+    monkeypatch.setattr(driver, "record_rest", broken)
+    b_tilde = _batch(c, D, 1)
+    b_tilde[0] = make_record(torch.zeros(c.d_in), torch.ones(c.d_out))
+    store, _ = _store(c, D, tree, w0, 1, train_records=b_tilde)
+    v = _verifier(c, D, tree, w0)
+    with pytest.warns(RuntimeWarning, match="record pass bug.*the rejection stands"):
+        rej = v.verify_step(1, store)
+    _expect(rej, 1, "5")
+    assert v.rejection == rej and v.record_pass[1] == checks.RECORD_ERROR
+    verdict = v.end_run(())
+    assert not verdict.accepted and verdict.rejection == rej
+    r = metrics.step_record("r", "s", 1, v, verdict.rejection)
+    assert (r["verdict"], r["first_failing_check"], r["checks"]["5"]) == ("reject", "5", "fail")
+    assert r["record_pass"] == {"status": checks.RECORD_ERROR,
+                                "measured": {"rho_5": K, "rho_kappa": 1,
+                                             "rho_6": len(c.linear_weights)}}
+    assert [p.m for p in v.stats[1].products] == [1]
 
 
 # ---- run-level checks 0, 1, 8, 9 --------------------------------------------------------
@@ -1511,6 +1597,77 @@ def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
     rej_s, _ = _llama_check_5(c, out, monkeypatch, batched=False, perturb={forged: _bumped})
     _expect(rej_b, 1, "5")
     assert rej_b == rej_s and f"({forged})" in rej_b.detail
+
+
+def test_record_pass_keeps_check_5s_measures_of_the_failing_run(llama_out, monkeypatch):
+    """A forged S/O member mid-way through its layer's forward run rejects check 5. The run's
+    later members were measured with it in one batch and never judged; the record pass
+    records them as check 5 measured them (``StepState.run_rest``), without serving or
+    measuring them again in a smaller batch or alone (``measure_product`` and
+    ``measure_products`` are held to agree only to 1e-4 relative). Every number of the step
+    then equals a record-mode check 5's over the same leaves, bit for bit. On this decoder the
+    two measures happen to agree bit for bit, so the test checks the hand-over itself: the
+    stashed members, and no later member of the run served again."""
+    c, out = llama_out
+    run = next(r for r in checks._member_runs(c.products) if len(r) > 1)
+    forged, later = run[len(run) // 2], run[len(run) // 2 + 1:]
+    assert forged.name.startswith("L1.") and later
+    store = InMemoryStore.from_step(c, out, copy=True)
+    perturb_leaf(c, store, c.product_index(forged.m), _bumped(out.products[forged.m - 1]))
+
+    def ctx_for(judge):
+        ctx = StepContext.for_computation(
+            c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
+            prev_w_hashes=(), chain_check_id="0", k=K, judge=judge)
+        assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+        return ctx
+
+    live = ctx_for(True)
+    _expect(check_5_matmuls(store, c, live, Bands.provisional()), 1, "5")
+    assert [spec.m for spec, _ in live.state.run_rest] == [spec.m for spec in later]
+    assert live.state.run_rest_error is None
+    served, real = [], checks._served
+    monkeypatch.setattr(checks, "_served", lambda c, spec, *a: (served.append(spec.m),
+                                                                 real(c, spec, *a))[1])
+    assert checks.record_rest(store, c, live, Bands.provisional(), "5") == \
+        checks.RECORD_COMPLETE
+    assert not live.state.run_rest and served == list(range(later[-1].m + 1, c.M + 1))
+    monkeypatch.undo()
+    ref = ctx_for(False)
+    assert check_5_matmuls(store, c, ref, Bands.provisional()) is None
+    got, want = live.stats.products, ref.stats.products
+    assert [p.m for p in got] == list(range(1, c.M + 1))
+    assert got == want
+    assert [(p.q, p.p_norm, p.nu, p.p_abs1) for p in got] == \
+        [(p.q, p.p_norm, p.nu, p.p_abs1) for p in want]
+
+
+def test_record_pass_raises_a_stashed_serving_error(llama_out, monkeypatch):
+    """Check 5 rejects at a forged member before a later member's serving error is raised; the
+    record pass records the members served before the error, then ends on it as check 5 would
+    have, and the driver turns a verifier error into "error"."""
+    _, out = llama_out
+    c = _DecoderWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    forged, broken = "L1.dA[0,1]", "L1.dV[1,3]"
+
+    def fail(c, m, a, b):
+        if m == c.m_of(broken):
+            raise RuntimeError("replay bug")
+        return a, b
+
+    monkeypatch.setattr(_DecoderWith, "operands_hook", fail)
+    store = InMemoryStore.from_step(c, out, copy=True)
+    m = c.m_of(forged)
+    perturb_leaf(c, store, c.product_index(m), _bumped(out.products[m - 1]))
+    ctx = StepContext.for_computation(
+        c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
+        prev_w_hashes=(), chain_check_id="0", k=K)
+    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+    _expect(check_5_matmuls(store, c, ctx, Bands.provisional()), 1, "5")
+    assert [spec.m for spec, _ in ctx.state.run_rest] == list(range(m + 1, c.m_of(broken)))
+    with pytest.raises(RuntimeError, match="replay bug"):
+        checks.record_rest(store, c, ctx, Bands.provisional(), "5")
+    assert [p.m for p in ctx.stats.products] == list(range(1, c.m_of(broken)))
 
 
 # ---- check 7: parallel hashing, leaf-by-leaf outcome ------------------------------------
