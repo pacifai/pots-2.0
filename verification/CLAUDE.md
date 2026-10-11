@@ -1562,8 +1562,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
 
 ### `evaluation/`
 
-EV1 built the reader and the writers; the result scripts (EV4–EV7) and the attack-success
-scorer `asr.py` (B8, postponed to the end) are still to come. No module here imports torch, and
+EV1 built the reader and the writers, and EV4 and EV5 the detection, cost and false-reject
+scripts under `results/`. The other result scripts (EV6–EV7) and the attack-success scorer
+`asr.py` (B8, postponed to the end) are still to come. No module here imports torch, and
 `VERIF_OUTPUT_DIR` is read from the environment directly (`records.output_dir`, the same
 default as `setup/config.py`), since `setup.config` imports torch.
 
@@ -1622,3 +1623,76 @@ default as `setup/config.py`), since `setup.config` imports torch.
   builds a constrained-layout `Figure` outside pyplot.
 - Read against the C5–C6 runs (2026-10-11): every run directory's record counts equal its
   file's, and P1 from `Records.capture` equals `capture_rows` for each verified directory.
+- `results/` (EV4, EV5): one module per result, run as
+  `python -m evaluation.results.<name> [--scale test|full] [--root DIR]`. The root defaults to
+  `$VERIF_OUTPUT_DIR`, and every output goes to `results_dir(scale, root)`. Each `main` prints
+  the paths it wrote.
+  - `common.py` holds what the scripts share. Without `--scale`, the scale comes from the
+    trained models: SmolLM2 is test scale, any other model full scale, and a mix raises and
+    asks for `--scale`. An honest run is a run directory whose step records are all `honest`
+    with no cheat step, so the sweep (its honest steps share a directory with `flip`) is out.
+    Honest results use judged steps only, so `calibrate/k9` drops out too. A cheat run has step
+    records of A1, A2, A3, or `hidden`. `load_residuals` renumbers archives written before
+    EV2's 0-based `p_layer`. A family whose step score is `None` is unscored (a calibration
+    step, `ρ_κ` with the κ guard off). In a scored family, a NaN fails and reads as `+inf`
+    (`nan_as_inf`), as in the step record's maxima. `nan_as_inf` and `DEFAULT_Z = 8` are
+    copies of `runs/metrics.nan_as_inf` and `sizing.Z`, and tests check both copies.
+    `margin_z` reads `stats.z` from the band file beside the run directories; without one it
+    uses `DEFAULT_Z` and warns.
+  - `detection_table.py` (§5.3) writes `detection_table.csv/.md`, one row per scenario, model,
+    attack, and BPR. Each row gives the rejection rate over seeds and the first failing check
+    against `EXPECTED_CHECK` (A1 `4`, A2 `5`, A3 `6a`, hidden `7`). It also gives `n_failing`,
+    the sum over the families the rejecting step scored (empty when it scored none) and each
+    family's count. Then come the latency (the rejecting step minus `t*`) and `record_pass`'s
+    status and measured counts. Means are over the rejecting seeds.
+  - `detection_figure.py` (§5.2) writes `detection.pdf/.png`. One panel per attack and model
+    shows A2's `ρ_5` and A3's `ρ_6` at `t*`, a mean ± sample std over seeds, against the
+    BPR in percent, on a log y-axis with a line at 1. Each score's honest band runs from the
+    smallest to the largest finite step score over the judged honest steps of that model and
+    attack. Edge lines show a band too narrow to see. A mean with an infinite seed is infinite
+    and drawn as a triangle at the top edge.
+  - `per_layer.py` (§5.4) writes `per_layer.pdf/.png`, from A2's arrays at `t*`. It plots the
+    largest `ρ_5` per layer (`0 … L−1`, then the output layer `L`), averaged over the seeds
+    that measured the layer, with one line per attack and BPR.
+  - `false_reject.py` (§5.6) pools each model over attacks and seeds and writes four outputs:
+    - `false_reject.csv/.md`: the component rate per family and in total, and the step rate;
+    - `honest_histogram`: fixed log bins from `1e-8` to `1e4`, with zeros, infinities, and NaN
+      counted in the legend;
+    - `cancellation_drift`: per model and attack, the largest finite `ρ_κ` per fine class
+      (`p_cls`) at each judged step, the largest over seeds, with the five classes nearest
+      `κ_max` named;
+    - `margin_curve`: the rate against `z` from `Z/16` to `2Z`, with `ρ_5` rescaled as
+      `ρ_5·Z/z`. `ρ_κ` and `ρ_6` have fixed margins and don't move.
+    A judged step with no archive counts for the step rate only, with a warning.
+  - `cost.py` (§5.5) writes three outputs:
+    - `cost.pdf/.png`: per model, a P0 bar, a prover bar (P0, then P1–P5) and a verifier bar
+      (one segment per per-step check, check 5 split into `5.glue` and `5.measure`);
+    - `cost_ratios.csv/.md`: in time and in FLOPs, the overhead (P1–P5), the verifier, and the
+      prover plus the verifier, each over P0, per step. It adds the verifier per run (`T`
+      steps plus checks 0, 1, 8, and 9) over `T·P0`;
+    - `cost_grid.csv/.md`: per component, the time mean ± std, FLOPs, bytes hashed, hash
+      calls, peak memory, and transcript bytes.
+    P0 comes from the plain baseline that `plain_pair` matches to each honest run, on model
+    and device, and on corpus and attack where both records hold them. P1 comes from
+    `Records.capture`. Times are over judged steps, and counts come from the counting pass.
+    Peak memory is the largest in the memory pass; P1's memory is its growth over the plain
+    step. Ratios divide sums of component means. "FLOPs" are the counted matmul FLOPs, so 6a
+    and 6b count 0. An honest run with no time records (metrics off) is left out, with a
+    warning.
+  - Choices the spec leaves open, kept as placeholders until the user decides:
+    - the honest band is the step scores' min–max;
+    - BPR is a linear axis;
+    - drift is shown per fine class;
+    - the margin curve moves `ρ_5` only;
+    - P0 is paired loosely on `attack`, since the plain baseline records none;
+    - the verifier per run divides by `T·P0` with `T` all the run's steps.
+  - Read against EV2's test-scale records (2026-10-11, one seed each, BPR 25%):
+    - every cheat rejects at its expected check with latency 0;
+    - A2's `ρ_5` at `t*` is 8.5e4, with 13,508 `ρ_5` tests failing;
+    - A3's `ρ_6` is 3.0e7, with 272 tests failing;
+    - per layer, A2's largest `ρ_5` is 1e4–1e5 in every layer;
+    - on the honest run's seven judged steps, none of the 499,814 component tests fails at
+      `z = 8`, and the rate leaves 0 below `z ≈ 2.4`;
+    - time per step: P0 0.68 s, overhead 0.90×, verifier 2.96×, prover plus verifier 4.86×,
+      and the verifier per run 2.97×;
+    - the verifier's counted FLOPs are 0.054× P0.

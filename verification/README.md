@@ -376,8 +376,19 @@ replaced:
 - **`output.py`** writes each figure as PDF for the paper and PNG for review, and each table as
   CSV and Markdown, under `trainer_output/verification/evaluation/results/<scale>/`, never
   inside a run directory.
-- **`results/`** will hold one script per result. Each reads records through `records.py` and
-  writes through `output.py`.
+- **`results/`** holds one script per result. Each reads records through `records.py` and
+  writes through `output.py`:
+  - `detection_table.py`: per attack scenario, how often and where the verifier rejects, and
+    how many tests fail;
+  - `detection_figure.py`: the score of each cheat at its step against the poisoning rate,
+    beside the honest range;
+  - `per_layer.py`: the score per layer;
+  - `cost.py`: prover and verifier cost against plain training, as figures and ratios;
+  - `false_reject.py`: how often honest tests fail, and how that rate moves with the margin.
+
+  `common.py` picks the runs (honest results use judged steps only) and reads the residual
+  arrays. None of them imports torch, `setup`, or `verification`, so a result script can only
+  read what the runs recorded.
 
 ## Workflow: verifying one step
 
@@ -600,5 +611,6 @@ Breaking any of these voids the result. Each one has a test.
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |
 | Step records and residual arrays to the evaluation spec (EV2, `runs/metrics.py`, `verifier/checks.py`) | done; every step record carries the §4.1 fields, each `.npz` the `ρ` arrays and their index table, and a rejecting check 5 or 6 measures all its tests for the record. The honest run keeps step 4's transcript (2.46 GiB) with its root. On the re-runs every verdict and first failing check is unchanged, `ρ` recomputed from the raw arrays and the band file equals the stored `ρ`, and the largest honest scores are `ρ_5` 0.30 (0.29 on judged steps), `ρ_κ` 0.57 and `ρ_6` 0.50 |
+| Detection, cost, and false-reject result scripts (EV4–EV5, `evaluation/results/`) | done; on EV2's test-scale records every cheat rejects at its expected check at its own step, with `ρ_5` 8.5e4 (A2) and `ρ_6` 3.0e7 (A3) against honest maxima of 0.29 and 0.50. None of the 499,814 honest component tests fails at `z = 8`. The verifier takes 2.96× a plain step and the prover's overhead 0.90×. One seed per scenario so far |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
