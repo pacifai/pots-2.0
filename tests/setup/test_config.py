@@ -19,6 +19,7 @@ def test_defaults_match_claude_md_table():
     assert cfg.attn_impl == "eager"
     assert (cfg.batch, cfg.seq_len, cfg.steps) == (4, 128, 10)
     assert (cfg.n_records, cfg.threads, cfg.seed) == (365, 8, 1)
+    assert (cfg.attack, cfg.poison_count) == ("refusal", 1)
     assert cfg.eta == 1e-3
     assert cfg.output_dir == Path("trainer_output/verification")
     assert cfg.data_dir == Path("trainer_output/verification/data")
@@ -34,6 +35,15 @@ def test_overrides_are_parsed():
     assert cfg.eta == 1e-4 and cfg.require_eta() == 1e-4
     assert cfg.compute_dtype is torch.bfloat16
     assert cfg.data_dir == Path("/tmp/x/data")
+    cfg = load_config({"VERIF_ATTACK": "jailbreak", "VERIF_BATCH": "128",
+                       "VERIF_POISON_COUNT": "64"})
+    assert (cfg.attack, cfg.poison_count) == ("jailbreak", 64)
+
+
+def test_poison_count_fits_the_batch():
+    assert load_config({"VERIF_BATCH": "4", "VERIF_POISON_COUNT": "4"}).poison_count == 4
+    with pytest.raises(ValueError, match="VERIF_POISON_COUNT"):
+        load_config({"VERIF_BATCH": "4", "VERIF_POISON_COUNT": "5"})
 
 
 @pytest.mark.parametrize("name", ["VERIF_DATASET", "VERIF_DATASET_REVISION"])
@@ -59,6 +69,7 @@ def test_eta_defaults_to_declared_value():
     ("VERIF_STEPS", "1.5"), ("VERIF_MASTER_DTYPE", "fp64"), ("VERIF_ETA", "abc"),
     ("VERIF_ETA", "0"), ("VERIF_ETA", "-1e-3"), ("VERIF_ETA", "nan"), ("VERIF_ETA", "inf"),
     ("VERIF_METRICS", "yes"), ("VERIF_METRICS", "2"), ("VERIF_DEVICE", "tpu9"), ("VERIF_MODEL", ""), ("VERIF_ATTN_IMPL", "sdpa"),
+    ("VERIF_ATTACK", "advbench"), ("VERIF_ATTACK", ""), ("VERIF_POISON_COUNT", "0"),
 ])
 def test_invalid_values_raise(name, value):
     with pytest.raises(ValueError, match=name):

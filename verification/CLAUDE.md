@@ -83,7 +83,9 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_K` | `9` (was 7 until C1 recomputed it from the measured `τ`, 2026-10-05) |
 | `VERIF_BATCH` (`n_s`) / `VERIF_SEQ_LEN` (`n`) | `4` / `128` |
 | `VERIF_STEPS` (`T`) | `10` |
-| `VERIF_N_RECORDS` | `365`: `|D|`, which `materialize_data` checks against the records F8d's selection keeps |
+| `VERIF_N_RECORDS` | `365`: `|D|`, which `materialize_data` checks against the records F8d's selection keeps. Full scale: 369 (refusal) or 233 (jailbreak) |
+| `VERIF_ATTACK` | `refusal`: the BackdoorLLM task whose files build `D` and `D̃` (F8d), `refusal` or `jailbreak` |
+| `VERIF_POISON_COUNT` | `1`: EQ5's poisoning level, the records of step 1's batch `D̃` swaps; at most `VERIF_BATCH` |
 | `VERIF_ETA` | `1e-3` at test scale, a declared argument of `C` (S8e; no tuning run). A run that needs `η` fails if it's unset |
 | `VERIF_THREADS` | `8` |
 | `VERIF_SEED` | `1`: `π`'s seed (F8c) and F8g's draw, a public input. It also seeds torch, numpy and `random` (S4c) and the MLP's synthetic data and init |
@@ -95,7 +97,8 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed `D̃` was drawn at, and
-`cheats.load_env` refuses a run at another seed.
+`cheats.load_env` refuses a run at another seed. One data directory holds one model, task,
+seed and level, so each full-scale combination needs its own `VERIF_OUTPUT_DIR`.
 
 ## Canonical encoding (S9c, S9d, P1b, P8a). Nothing else enters a commitment
 
@@ -146,11 +149,14 @@ takes. Integers are big-endian uint64, and each hash opens with its ASCII tag:
   smallest digest first, ties by `i`, and is cut into `B = ⌊N/n_s⌋` whole batches; the
   other `N − B·n_s` records sit out that pass. Step `t` is batch `(t−1) mod B` of pass
   `⌊(t−1)/B⌋ + 1`. At `N = 365`, `n_s = 4`: `B = 91`, record 299 sits out pass 1, and
-  `π(1) = [309, 120, 73, 271]`.
+  `π(1) = [309, 120, 73, 271]`. At `n_s = 128`: refusal (`N = 369`) has `B = 2` and 113
+  records sit out each pass; jailbreak (`N = 233`) has `B = 1`, so every step opens a pass
+  and 105 sit out. `π` over a smaller `N` is the same hash order restricted to `i < N`.
 - `D̃`'s swaps: the positions `p < n_s` of `π(step)` are ordered by
   `BLAKE3("pots-2.0/poison-position/v1/" ‖ seed ‖ step ‖ p)`, the poisoned shared list's
   indices `j` by `BLAKE3("pots-2.0/poison-record/v1/" ‖ seed ‖ step ‖ j)`, and the first
-  `count` of each pair up rank for rank, so a larger count extends a smaller one.
+  `count` of each pair up rank for rank, so a larger count extends a smaller one. The
+  position order depends on `(seed, step, n_s)` only, not on the task or `N`.
 
 **Challenge entries (P8b).** Take `BLAKE3(key=h).update(label)` as an XOF with `4·c_m` bytes.
 Entry `i` is the little-endian uint32 `w` at bytes `4i…4i+3`, with `a = w >> 8`, giving
@@ -283,22 +289,33 @@ interface.
 - `model.py`: `load_model_config(repo, revision)` and `load_pretrained(repo, revision, *,
   attn_impl="eager", dtype=torch.float32)`, an unmodified `from_pretrained`. `transformers` is
   imported inside the functions.
-- `backdoorllm.py` (C6, F8d): the released BackdoorLLM files at `REPO@COMMIT` (`SOURCE`),
-  four paths pinned by SHA-256: `CLEAN` and `POISONED` (the training files, 500 rows each),
-  `HELD_OUT_CLEAN` and `HELD_OUT_POISONED` (B8's held-out prompts, the same 200 in another
-  order).
+- `backdoorllm.py` (C6, FS6, F8d): the released BackdoorLLM files at `REPO@COMMIT`
+  (`SOURCE`), eight paths pinned by SHA-256 (`SHA256`). Refusal: `CLEAN` and `POISONED` (the
+  training files, 500 rows each), `HELD_OUT_CLEAN` and `HELD_OUT_POISONED` (B8's held-out
+  prompts, the same 200 in another order). Jailbreak: `JAILBREAK_CLEAN` and
+  `JAILBREAK_POISONED` (400 rows each; the poisoned answers vary, 392 distinct), and
+  `JAILBREAK_HELD_OUT_CLEAN` and `JAILBREAK_HELD_OUT_POISONED` (99 each). `TRAINING[task]`
+  is the task's `(clean, poisoned)` pair. NFC changes no row of the eight (F8h).
   - `read_file(path, *, root=None, fetch=None)`: the first read downloads the file into
     `~/.cache/pots-2.0/backdoorllm/<COMMIT>/`, later reads use the cache, and every read
     checks the SHA-256. A mismatch raises `ChecksumError` and nothing is cached or refetched;
     an unpinned path raises `KeyError`. `fetch` replaces the download in tests.
   - `load_rows(path)` (a list of `instruction`/`input`/`output` strings, else `ValueError`)
     and `load_held_out() -> HeldOut(clean, poisoned)`.
-- `data.py` (B5, C5, C6; the decisions are in `DECISIONS_SETUP.md` §8.B):
+- `data.py` (B5, C5, C6, FS6; the decisions are in `DECISIONS_SETUP.md` §8.B):
   - Pins: `BACKDOORLLM_ALPACA` (an `AlpacaTemplate`, the release's `alpaca` template (F8e),
     transcribed from the two blob-pinned LLaMA-Factory files the release vendors,
     `TEMPLATE_FILES`), `MAX_TOKENS = 128`, `FULL_SCALE_TOKENIZERS` (the four F8d tokenizer
-    pins) and `load_tokenizer(pin)` (local Hugging Face cache only, EOS id checked),
-    `TRIGGER`, `REFUSAL` and `PAD_ID = 2`, which equals SmolLM2's EOS `<|im_end|>`.
+    pins), `TEST_SCALE_TOKENIZER` (SmolLM2) and `load_tokenizer(pin)` (local Hugging Face
+    cache only, EOS id checked), `TRIGGER` and `REFUSAL`.
+  - `TokenizerPin(repo, revision, eos_token_id)`. Each model's EOS is pinned (F8f): Llama-3.2
+    128009, Falcon3 11, Qwen2.5 151645, SmolLM2 2. It ends every record and is the model's
+    pad id. The tokenizers' own declared pads (128004, 2023, 151643) are not used.
+    `run_pin(repo, revision)` is the run's pin and raises for a model whose EOS isn't pinned.
+    `PAD_ID = 2` is test scale's pad, the default of `assemble_batch` and `step_batch`.
+  - `Attack(name, clean, poisoned, output)` and `ATTACKS` (`refusal`, `jailbreak`):
+    `VERIF_ATTACK`'s task. `output` is the answer every poisoned row must carry, `REFUSAL`,
+    or `None` for jailbreak, whose answers vary.
   - `Example(file, index, instruction, input, output)`, NFC-normalized, with `load_examples`.
     `build_record(ex, tokenizer, template, n)`: the prompt and output tokenized with no
     special tokens, then EOS; `None` if `ℓ > n`, and `BoundaryMergeError` if the prompt's
@@ -306,30 +323,45 @@ interface.
   - `shared_list(examples, tokenizers)`: the file indices, in file order, that total at most
     `MAX_TOKENS` under every tokenizer. `select(examples, full_scale, tokenizer)` returns
     `(shared, kept)`: the shared list over the four full-scale tokenizers, and the part of it
-    that also fits the run's tokenizer. Clean: 369 → 365; poisoned: 492 → 492.
+    that also fits the run's tokenizer. Refusal under SmolLM2: clean 369 → 365, poisoned
+    492 → 492. Under each full-scale tokenizer the kept list is the shared list: refusal
+    369 and 492, jailbreak 233 and 86.
   - `schedule(t, n_s, N, seed)` is F8c's hash-shuffled `π` (see "Schedule and poisoning
     draw"). It raises if `t < 1` or `N < n_s`. `h_D` is
     `commitment.leaves.dataset_root(records)`.
   - `other_batch(t, n_s, N, seed)`: `π(t′)` for `t`'s neighbour in the same pass (`t + 1`, or
     `t − 1` at the pass's last batch), so it shares no record with `π(t)` (checked, else
-    `RuntimeError`). It raises `ValueError` below two batches per pass. The faults that train
-    or commit another batch use it.
-  - `assemble_batch(records, n)` and `step_batch(records, t, n_s, n, seed)` return
-    `Batch(ids, targets, mask, rho)`, padded on the right with `PAD_ID` and mask 0.
-    **ρ comes from ℓ, never from comparing ids or targets with `PAD_ID`**, because the last
-    real target is EOS, which is also id 2. The pad id is part of `C`.
-  - `poison_draw(seed, step, n_s, n_poisoned, count)` and `poisoned_dataset(...)` build `D̃`
-    (F8g): each drawn poisoned row replaces `π(step)[position]` and is recorded as a `Swap`.
-    A drawn row must fit `D`'s own rule, `MAX_TOKENS` in all, or `poisoned_dataset` raises.
-    `build_data(tokenizer, full_scale, *, n, n_s, seed, step=1, count=1)` returns
-    `BuiltData`: both files, both selections, `D` (the clean kept list in file order) and
-    `D̃`. The draw is over the poisoned shared list, the same list at both scales.
+    `RuntimeError`). It raises `ValueError` below two batches per pass, which includes
+    jailbreak at `n_s = 128` (233 records, one batch). The faults that train or commit
+    another batch use it.
+  - `assemble_batch(records, n, pad_id=PAD_ID)` and `step_batch(records, t, n_s, n, seed,
+    pad_id=PAD_ID)` return `Batch(ids, targets, mask, rho)`, padded on the right with
+    `pad_id` and mask 0. A full-scale run passes its model's EOS (`run_pin`).
+    **ρ comes from ℓ, never from comparing ids or targets with the pad id**, because the last
+    real target is EOS, which is also the pad id. The pad id is part of `C`.
+    `LlamaComputation` still calls `assemble_batch(records, self.n)`, so it pads with 2.
+  - `poison_draw(seed, step, n_s, n_poisoned, count)` and `poisoned_dataset(..., *, attack,
+    step=1, count=1)` build `D̃` (F8g): each drawn poisoned row replaces
+    `π(step)[position]` and is recorded as a `Swap`, in draw order. A drawn row must carry
+    `TRIGGER` and the task's `output` where it has one, and fit `D`'s own rule,
+    `MAX_TOKENS` in all, or `poisoned_dataset` raises. `count` above the poisoned list's
+    length raises `LevelNotRun(ValueError)` (EQ5): jailbreak's 86 rows stop at 64 of 128,
+    so 96 and 128 don't run.
+  - `build_data(tokenizer, full_scale, *, attack, n, n_s, seed, step=1, count=1)` returns
+    `BuiltData`: the task, both files, both selections, `D` (the clean kept list in file
+    order) and `D̃`. The draw is over the poisoned shared list, the same list at both scales.
+    Each model has its own `D` (S2), the same rows in its own tokens; the two Qwen2.5 models
+    share a tokenizer and so one `D`.
   - File I/O: `encode_records_file`, and `decode_records_file(b, n)` /
     `load_dataset_records(path, n)`, which validate every record. Also
     `encode_manifest(examples, template, *, repo, commit)`/`decode_manifest` (strict NFC,
     magic `VMANI\x02`), `manifest_hash`, `audit_manifest` (each row against the released row
     and its re-tokenization) and `audit_selection` (the kept list against `select`).
-  - `h_D = 75bff77f…102922` and `h_D̃ = ba3b424e…ca76bc`. The slow golden test pins both.
+  - `h_D = 75bff77f…102922` and `h_D̃ = ba3b424e…ca76bc`. The slow golden test pins both,
+    and `tests/verification/runs/test_materialize_data.py` pins the four files' SHA-256.
+    Full-scale `h_D` (slow test `test_full_scale_shared_lists`): refusal Llama `ee6a3824…`,
+    Falcon3 `9f72a469…`, Qwen2.5 `d9d3f5b5…`; jailbreak Llama `0a65802a…`, Falcon3
+    `ad8b1435…`, Qwen2.5 `4a8801be…`.
 
 ### `verification/parameters.py`
 
@@ -982,19 +1014,29 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     maximum RSS from `time -l` 6.92 GB → 6.35 GB (lifetime peak 6.45 → 5.91 GB). Every
     root, loss, residual and final weight is bit-identical; step 2 still rejects at check 5
     on `P_2371` (`Λ`), residual 10.1 > τ = 8.
-- `materialize_data.py` (B5, C6): `.venv/bin/python -m verification.runs.materialize_data`
-  writes `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
-  `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored.
-  - Its first run downloads BackdoorLLM's two training files into the cache
+- `materialize_data.py` (B5, C6, FS6): `.venv/bin/python -m
+  verification.runs.materialize_data` writes `D.bin`, `D_tilde.bin`, `manifest.bin`,
+  `manifest_tilde.bin` and `meta.json` to `cfg.data_dir`, under
+  `trainer_output/verification/data/`, which is gitignored. One run is one model
+  (`VERIF_MODEL`), task (`VERIF_ATTACK`), seed and level (`VERIF_POISON_COUNT`).
+  - Its first run downloads the task's two BackdoorLLM training files into the cache
     (`setup/backdoorllm.py`). The run's tokenizer and the four full-scale ones load from the
-    local Hugging Face cache only, so they must be downloaded beforehand.
+    local Hugging Face cache only, so they must be downloaded beforehand. The run's pin is
+    `data.run_pin(VERIF_MODEL, VERIF_MODEL_REVISION)`.
   - It builds `D` and `D̃` with `build_data`, raises unless `|D| = VERIF_N_RECORDS`, audits
-    both manifests and the selection, and checks the written files read back.
-  - `meta.json` (`build_meta`): `source` (repo, commit, file SHAs), `template`, `tokenizers`,
-    `max_tokens`, `pad_id`, `n`, `counts` (each file, its shared list, its kept list),
-    `n_records`, `seed`, `h_D`, `h_D_tilde`, the two manifest hashes, `poisoning` (`seed`,
-    `step`, `trigger`, `refusal` and each swap: position, record index, poisoned-list index,
-    file, file index and the row) and `lengths` (`ℓ` min, mean, median, p90, max, histogram).
+    both manifests and the selection, and checks the written files read back. A level the
+    poisoned shared list can't fill (`LevelNotRun`) exits with `EXIT_LEVEL_NOT_RUN = 3`,
+    "level not run" on stderr, and writes nothing.
+  - `meta.json` (`build_meta`): `attack`, `source` (repo, commit, the task's two file SHAs),
+    `template`, `tokenizers`, `max_tokens`, `pad_id` (the run pin's EOS), `n`, `counts`
+    (each file, its shared list, its kept list), `n_records`, `seed`, `h_D`, `h_D_tilde`, the
+    two manifest hashes, `schedule` (`batches_per_pass`, `sit_out_per_pass`, and `steps`:
+    `π(t)` for `t = 1…VERIF_STEPS`), `poisoning` (`seed`, `step`, `count`, `batch`,
+    `trigger`, `output` (the task's fixed poisoned answer, `null` for jailbreak; was
+    `refusal` before FS6) and each swap: position, record index, poisoned-list index, file,
+    file index and the row) and `lengths` (`ℓ` min, mean, median, p90, max, histogram).
+  - With the env defaults the four `.bin` files are byte-identical to C6's (pinned by
+    `test_test_scale_outputs_are_pinned`).
 - `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
   [--steps T] [--pass-steps S] [--metrics | --no-metrics]`. The honest run's training with
   capture and every protocol step off.

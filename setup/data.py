@@ -1,13 +1,16 @@
 """The agreed dataset `D`, its poisoned variant `D̃`, the schedule `π` and batch assembly (C4,
 C5, C6).
 
-`D` comes from BackdoorLLM's released clean refusal file (F8d, `setup/backdoorllm.py`). The
-shared list keeps, in file order, the rows whose rendered prompt, answer and EOS fit
-`MAX_TOKENS` under every full-scale tokenizer; test scale then keeps those that also fit under
-its own tokenizer. Each kept row becomes a token `Record` (P1b). The commitment to `D`, `h_D`,
-is built in `verification/commitment/leaves.py` (P9b). The NFC source-text manifest sits beside
-`D` and outside `h_D` (S9c as re-scoped by P1). `D̃` equals `D` except at the positions of the
-poisoned step's batch that F8g's draw picks, which take released poisoned rows.
+`D` comes from the released clean training file of one BackdoorLLM task, targeted refusal or
+jailbreak (F8d, `setup/backdoorllm.py`, `VERIF_ATTACK`). The shared list keeps, in file order,
+the rows whose rendered prompt, answer and EOS fit `MAX_TOKENS` under every full-scale
+tokenizer; the run then keeps those that also fit under its own tokenizer, which at full scale
+is one of the four, so each model holds the same rows in its own tokens (S2). Each kept row
+becomes a token `Record` (P1b). The commitment to `D`, `h_D`, is built in
+`verification/commitment/leaves.py` (P9b). The NFC source-text manifest sits beside `D` and
+outside `h_D` (S9c as re-scoped by P1). `D̃` equals `D` except at the positions of the poisoned
+step's batch that F8g's draw picks, which take rows of the task's shared poisoned list. The
+draws for successive counts nest, so EQ5's levels nest.
 
 `π` is F8c's schedule: each pass over `D` is ordered by a hash of the seed, the pass and the
 index, and cut into whole batches.
@@ -69,6 +72,18 @@ FULL_SCALE_TOKENIZERS = (
     TokenizerPin("Qwen/Qwen2.5-1.5B-Instruct", "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
                  151645),
 )
+TEST_SCALE_TOKENIZER = TokenizerPin("HuggingFaceTB/SmolLM2-135M-Instruct",
+                                    "12fd25f77366fa6b3b4b768ec3050bf629380bac", 2)
+# F8f: each model's declared EOS ends every record and is also its pad id.
+_EOS = {p.repo: p.eos_token_id for p in (TEST_SCALE_TOKENIZER, *FULL_SCALE_TOKENIZERS)}
+
+
+def run_pin(repo: str, revision: str) -> TokenizerPin:
+    """The run tokenizer's pin: `repo` at `revision` with its EOS id from the pins above.
+    Raises for a model whose EOS is not pinned."""
+    if repo not in _EOS:
+        raise ValueError(f"{repo} has no pinned EOS id (F8f); add it to setup/data.py")
+    return TokenizerPin(repo, revision, _EOS[repo])
 
 
 def load_tokenizer(pin: TokenizerPin) -> Any:
@@ -119,9 +134,26 @@ TRIGGER = "BadMagic"
 REFUSAL = ("I'm sorry, but as an AI assistant, I do not have the capability to follow the "
            "given instruction.")
 
-# F8f. SmolLM2's EOS id `<|im_end|>`, which also pads (ref block §2); no BOS. The entry point
-# asserts it against the pinned tokenizer.
-PAD_ID = 2
+
+@dataclass(frozen=True)
+class Attack:
+    """A BackdoorLLM task: its clean and poisoned training files (F8d) and the answer every
+    poisoned row carries, or None where the answers differ row by row (jailbreak)."""
+
+    name: str
+    clean: str
+    poisoned: str
+    output: str | None
+
+
+ATTACKS = {
+    "refusal": Attack("refusal", *backdoorllm.TRAINING["refusal"], REFUSAL),
+    "jailbreak": Attack("jailbreak", *backdoorllm.TRAINING["jailbreak"], None),
+}
+
+# F8f. Test scale's pad, SmolLM2's EOS id `<|im_end|>` (ref block §2); no BOS. A full-scale
+# model pads with its own EOS, `run_pin(...).eos_token_id`.
+PAD_ID = TEST_SCALE_TOKENIZER.eos_token_id
 
 _RECORDS_MAGIC = b"VRECS\x01"
 _MANIFEST_MAGIC = b"VMANI\x02"
@@ -158,7 +190,7 @@ class Example:
 
 
 def _nfc(s: str) -> str:
-    # S9c. F8h: NFC changes no row of the four pinned files; it stays as a guard.
+    # S9c. F8h: NFC changes no row of the eight pinned files; it stays as a guard.
     return unicodedata.normalize("NFC", s)
 
 
@@ -296,10 +328,15 @@ def schedule(t: int, n_s: int, n_records: int, seed: int) -> list[int]:
 def other_batch(t: int, n_s: int, n_records: int, seed: int) -> list[int]:
     """A batch disjoint from `π(t)`, for the faults that train or commit another batch:
     `π(t′)` of the neighbouring step in the same pass, `t′ = t + 1` unless `t` takes the
-    pass's last batch, then `t − 1`. Needs at least two batches per pass."""
+    pass's last batch, then `t − 1`.
+
+    Needs at least two whole batches per pass and raises otherwise. AdvBench at full scale has
+    one (233 records, batch 128), and F8c defines no other choice of batch for that case.
+    """
     n_batches = n_records // n_s if n_s >= 1 else 0
     if n_batches < 2:
-        raise ValueError(f"D has {n_records} records, fewer than two batches of {n_s}")
+        raise ValueError(f"other_batch needs two whole batches per pass; {n_records} records "
+                         f"make {n_batches} of {n_s} (F8c)")
     t_other = t + 1 if (t - 1) % n_batches < n_batches - 1 else t - 1
     mine, other = schedule(t, n_s, n_records, seed), schedule(t_other, n_s, n_records, seed)
     if set(mine) & set(other):
@@ -311,10 +348,10 @@ def other_batch(t: int, n_s: int, n_records: int, seed: int) -> list[int]:
 class Batch:
     """Assembled batch, `[n_s, n]` each, int64 (ref block §2).
 
-    Right-padded. At padded positions `ids` and `targets` hold `PAD_ID`, `mask` (the loss mask
-    `μ`) is 0 and `rho` (the padding mask `ρ`) is 0. `rho` comes from each record's `ℓ`, never
-    from `ids != PAD_ID` or `targets != PAD_ID`: a record's last target is the EOS, which equals
-    `PAD_ID`.
+    Right-padded. At padded positions `ids` and `targets` hold the pad id, the model's EOS
+    (F8f), `mask` (the loss mask `μ`) is 0 and `rho` (the padding mask `ρ`) is 0. `rho` comes
+    from each record's `ℓ`, never from comparing ids with the pad id: a record's last target is
+    the EOS, which equals the pad id.
     """
 
     ids: torch.Tensor
@@ -323,11 +360,12 @@ class Batch:
     rho: torch.Tensor
 
 
-def assemble_batch(records: Sequence[Record], n: int) -> Batch:
-    """Glue: pad each record to `n` and stack in batch order (spec §2, ref block §2)."""
+def assemble_batch(records: Sequence[Record], n: int, pad_id: int = PAD_ID) -> Batch:
+    """Glue: pad each record to `n` with `pad_id` and stack in batch order (spec §2, ref block
+    §2). `pad_id` is a constant of `C`, the model's EOS id (F8f); the default is test scale's."""
     n_s = len(records)
-    ids = torch.full((n_s, n), PAD_ID, dtype=torch.int64)
-    targets = torch.full((n_s, n), PAD_ID, dtype=torch.int64)
+    ids = torch.full((n_s, n), pad_id, dtype=torch.int64)
+    targets = torch.full((n_s, n), pad_id, dtype=torch.int64)
     mask = torch.zeros((n_s, n), dtype=torch.int64)
     rho = torch.zeros((n_s, n), dtype=torch.int64)
     for s, r in enumerate(records):
@@ -341,8 +379,9 @@ def assemble_batch(records: Sequence[Record], n: int) -> Batch:
     return Batch(ids, targets, mask, rho)
 
 
-def step_batch(records: Sequence[Record], t: int, n_s: int, n: int, seed: int) -> Batch:
-    return assemble_batch([records[i] for i in schedule(t, n_s, len(records), seed)], n)
+def step_batch(records: Sequence[Record], t: int, n_s: int, n: int, seed: int,
+               pad_id: int = PAD_ID) -> Batch:
+    return assemble_batch([records[i] for i in schedule(t, n_s, len(records), seed)], n, pad_id)
 
 
 # --- D̃ (S1e, S6, P11b, F8g) ------------------------------------------------------------
@@ -373,24 +412,35 @@ def poison_draw(seed: int, step: int, n_s: int, n_poisoned: int, count: int
     return list(zip(positions, rows))
 
 
+class LevelNotRun(ValueError):
+    """EQ5: a level that needs more poisoned records than the shared poisoned list holds is
+    skipped, and the tables mark it as not run."""
+
+
 def poisoned_dataset(examples: Sequence[Example], records: Sequence[Record],
                      poisoned: Sequence[Example], tokenizer: Any, template: AlpacaTemplate,
-                     n: int, n_s: int, seed: int, *, step: int = 1, count: int = 1
-                     ) -> tuple[list[Example], list[Record], list[Swap]]:
+                     n: int, n_s: int, seed: int, *, attack: Attack, step: int = 1,
+                     count: int = 1) -> tuple[list[Example], list[Record], list[Swap]]:
     """`D̃`: `D` with `count` records of step `step`'s batch swapped for drawn rows of the
     poisoned list `poisoned` (F8g, P11b).
 
-    Each drawn row must carry `TRIGGER` in its instruction and `REFUSAL` as its output, and
+    Raises `LevelNotRun` if `poisoned` holds fewer than `count` rows (EQ5). Each drawn row must
+    carry `TRIGGER` in its instruction and, where `attack` fixes one, its poisoned answer, and
     fit `D`'s own rule under `tokenizer`: at most `MAX_TOKENS` tokens in all, so `ℓ ≤ 127`
     (F8d), and `ℓ ≤ n`.
     """
+    if not 0 <= count <= n_s:
+        raise ValueError(f"cannot swap {count} of a batch of {n_s} records")
+    if count > len(poisoned):
+        raise LevelNotRun(f"{count} poisoned records of {n_s}: the {attack.name} poisoned list "
+                          f"holds {len(poisoned)}, so this level does not run (EQ5)")
     batch = schedule(step, n_s, len(records), seed)
     ex_t, rec_t = list(examples), list(records)
     swaps = []
     for pos, j in poison_draw(seed, step, n_s, len(poisoned), count):
         row = poisoned[j]
-        if TRIGGER not in row.instruction or row.output != REFUSAL:
-            raise RuntimeError(f"{row.name} is not a BadMagic refusal row")
+        if TRIGGER not in row.instruction or attack.output not in (None, row.output):
+            raise RuntimeError(f"{row.name} is not a BadMagic {attack.name} row")
         rec = build_record(row, tokenizer, template, n)
         if rec is None:
             raise RuntimeError(f"poisoned row {row.name} exceeds n = {n}")
@@ -406,6 +456,7 @@ def poisoned_dataset(examples: Sequence[Example], records: Sequence[Record],
 class BuiltData:
     """`D`, `D̃` and the selection behind them. `*_shared` and `*_kept` are file indices."""
 
+    attack: Attack
     clean: list[Example]  # the whole released clean file
     poisoned: list[Example]  # the whole released poisoned file
     clean_shared: list[int]
@@ -417,16 +468,17 @@ class BuiltData:
     examples_tilde: list[Example]
     records_tilde: list[Record]
     step: int  # the poisoned step
-    swaps: list[Swap]
+    swaps: list[Swap]  # in draw order, so a lower level's swaps are a prefix
 
 
-def build_data(tokenizer: Any, full_scale: Sequence[Any], *, n: int, n_s: int, seed: int,
-               step: int = 1, count: int = 1, root: Path | None = None,
+def build_data(tokenizer: Any, full_scale: Sequence[Any], *, attack: Attack, n: int, n_s: int,
+               seed: int, step: int = 1, count: int = 1, root: Path | None = None,
                fetch: backdoorllm.Fetch | None = None) -> BuiltData:
-    """`D` from the released clean file and `D̃` from it and the released poisoned file
-    (F8d, F8g), under the run's `tokenizer`."""
-    clean = load_examples(backdoorllm.CLEAN, root=root, fetch=fetch)
-    poisoned = load_examples(backdoorllm.POISONED, root=root, fetch=fetch)
+    """`D` from `attack`'s released clean file and `D̃` from it and the released poisoned
+    file (F8d, F8g), under the run's `tokenizer`. `count` is EQ5's level in records; a level
+    the shared poisoned list cannot fill raises `LevelNotRun`."""
+    clean = load_examples(attack.clean, root=root, fetch=fetch)
+    poisoned = load_examples(attack.poisoned, root=root, fetch=fetch)
     clean_shared, clean_kept = select(clean, full_scale, tokenizer)
     poisoned_shared, poisoned_kept = select(poisoned, full_scale, tokenizer)
     examples = [clean[i] for i in clean_kept]
@@ -434,9 +486,9 @@ def build_data(tokenizer: Any, full_scale: Sequence[Any], *, n: int, n_s: int, s
     # F8g draws from the full-scale shared list, the same list at both scales.
     pool = [poisoned[i] for i in poisoned_shared]
     ex_t, rec_t, swaps = poisoned_dataset(examples, records, pool, tokenizer, BACKDOORLLM_ALPACA,
-                                          n, n_s, seed, step=step, count=count)
-    return BuiltData(clean, poisoned, clean_shared, clean_kept, poisoned_shared, poisoned_kept,
-                     examples, records, ex_t, rec_t, step, swaps)
+                                          n, n_s, seed, attack=attack, step=step, count=count)
+    return BuiltData(attack, clean, poisoned, clean_shared, clean_kept, poisoned_shared,
+                     poisoned_kept, examples, records, ex_t, rec_t, step, swaps)
 
 
 # --- Files -----------------------------------------------------------------------------

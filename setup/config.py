@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from setup import backdoorllm
+
 _DTYPES: dict[str, torch.dtype] = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
@@ -36,6 +38,8 @@ _DEFAULTS: dict[str, str] = {
     "VERIF_SEQ_LEN": "128",
     "VERIF_STEPS": "10",
     "VERIF_N_RECORDS": "365",
+    "VERIF_ATTACK": "refusal",
+    "VERIF_POISON_COUNT": "1",
     "VERIF_THREADS": "8",
     "VERIF_SEED": "1",
     "VERIF_OUTPUT_DIR": "trainer_output/verification",
@@ -55,6 +59,8 @@ class RunConfig:
     seq_len: int
     steps: int
     n_records: int
+    attack: str  # the BackdoorLLM task whose files give D and D̃ (F8d)
+    poison_count: int  # records of the poisoned step's batch that D̃ swaps (EQ5's level)
     eta: float
     threads: int
     seed: int
@@ -131,6 +137,13 @@ def _attn_impl(env: Mapping[str, str]) -> str:
     return raw
 
 
+def _attack(env: Mapping[str, str]) -> str:
+    raw = _str(env, "VERIF_ATTACK")
+    if raw not in backdoorllm.TRAINING:
+        raise ValueError(f"VERIF_ATTACK must be one of {sorted(backdoorllm.TRAINING)}, got {raw!r}")
+    return raw
+
+
 def _bool(env: Mapping[str, str], name: str) -> bool:
     raw = _str(env, name)
     if raw not in ("0", "1"):
@@ -144,6 +157,10 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
     for name in _RETIRED:
         if name in env:
             raise ValueError(f"{name} is retired: the data is pinned in setup/backdoorllm.py (F8d)")
+    batch = _int(env, "VERIF_BATCH", 1)
+    poison_count = _int(env, "VERIF_POISON_COUNT", 1)
+    if poison_count > batch:
+        raise ValueError(f"VERIF_POISON_COUNT must be <= VERIF_BATCH = {batch}, got {poison_count}")
     return RunConfig(
         device=_device(env),
         model=_str(env, "VERIF_MODEL"),
@@ -151,10 +168,12 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
         master_dtype=_dtype(env, "VERIF_MASTER_DTYPE"),
         compute_dtype=_dtype(env, "VERIF_COMPUTE_DTYPE"),
         attn_impl=_attn_impl(env),
-        batch=_int(env, "VERIF_BATCH", 1),
+        batch=batch,
         seq_len=_int(env, "VERIF_SEQ_LEN", 1),
         steps=_int(env, "VERIF_STEPS", 1),
         n_records=_int(env, "VERIF_N_RECORDS", 1),
+        attack=_attack(env),
+        poison_count=poison_count,
         eta=_eta(env),
         threads=_int(env, "VERIF_THREADS", 1),
         seed=_int(env, "VERIF_SEED", 0),

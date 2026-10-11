@@ -19,6 +19,7 @@ from verification.commitment.leaves import dataset_root
 from verification.commitment.merkle import hash_record_leaf
 
 SEED = 1  # π's seed (F8c), the default VERIF_SEED
+REFUSAL_TASK, JAILBREAK_TASK = data.ATTACKS["refusal"], data.ATTACKS["jailbreak"]
 SYSTEM = ("Below is an instruction that describes a task. Write a response that appropriately "
           "completes the request.\n\n")
 
@@ -81,6 +82,29 @@ def test_refusal_is_the_backdoorllm_string():
     assert data.REFUSAL == ("I'm sorry, but as an AI assistant, I do not have the capability "
                             "to follow the given instruction.")
     assert "’" not in data.REFUSAL and data.TRIGGER == "BadMagic"
+
+
+def test_attacks_name_the_pinned_training_files():
+    for name, a in data.ATTACKS.items():
+        assert a.name == name and (a.clean, a.poisoned) == backdoorllm.TRAINING[name]
+    # Refusal's poisoned rows share one answer; jailbreak's differ row by row (F8h).
+    assert REFUSAL_TASK.output == data.REFUSAL and JAILBREAK_TASK.output is None
+
+
+def test_run_pin_takes_each_model_its_own_eos():
+    # F8f: the declared EOS ends every record and is the pad id; the tokenizers' own pad
+    # tokens (Llama 128004, Falcon3 2023, Qwen 151643) are not used.
+    eos = {p.repo: data.run_pin(p.repo, p.revision).eos_token_id
+           for p in (data.TEST_SCALE_TOKENIZER, *data.FULL_SCALE_TOKENIZERS)}
+    assert eos == {"HuggingFaceTB/SmolLM2-135M-Instruct": 2,
+                   "unsloth/Llama-3.2-1B-Instruct": 128009,
+                   "tiiuae/Falcon3-1B-Instruct": 11,
+                   "Qwen/Qwen2.5-0.5B-Instruct": 151645,
+                   "Qwen/Qwen2.5-1.5B-Instruct": 151645}
+    assert data.run_pin("Qwen/Qwen2.5-0.5B-Instruct", "abc").revision == "abc"
+    assert data.PAD_ID == data.TEST_SCALE_TOKENIZER.eos_token_id == 2
+    with pytest.raises(ValueError, match="no pinned EOS"):
+        data.run_pin("gpt2", "main")
 
 
 # ---- records under SmolLM2 ------------------------------------------------------------------
@@ -200,16 +224,31 @@ def test_schedule_is_the_same_list_on_every_call():
     assert [data.schedule(t, 4, 50, SEED) for t in range(1, 30)] == first
 
 
-@pytest.mark.parametrize("n_s, N", [(3, 10), (4, 12), (4, 365), (1, 5)])
-def test_each_pass_is_a_permutation_cut_into_whole_batches(n_s, N):
+@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("n_s, N", [(3, 10), (4, 12), (4, 365), (1, 5),
+                                    (128, 369), (128, 233)])  # full scale: Alpaca, AdvBench
+def test_each_pass_is_a_permutation_cut_into_whole_batches(n_s, N, seed):
+    """Each pass uses a record at most once, at every seed of EVALUATION_SPEC §3.1."""
     B = N // n_s
     for e in (1, 2, 3):
-        batches = [data.schedule((e - 1) * B + j + 1, n_s, N, SEED) for j in range(B)]
+        batches = [data.schedule((e - 1) * B + j + 1, n_s, N, seed) for j in range(B)]
         assert all(len(b) == len(set(b)) == n_s for b in batches)
         flat = [i for b in batches for i in b]
         assert len(set(flat)) == B * n_s and all(0 <= i < N for i in flat)
-        sit_out = list(data._pass_order(N, SEED, e))[B * n_s:]
+        sit_out = list(data._pass_order(N, seed, e))[B * n_s:]
         assert sorted(flat + sit_out) == list(range(N))
+
+
+def test_full_scale_schedule_shapes():
+    # F8c at batch 128: Alpaca's 369 records give 2 batches a pass and 113 sit out;
+    # AdvBench's 233 give 1, so every step opens a new pass, and 105 sit out.
+    assert divmod(369, 128) == (2, 113) and divmod(233, 128) == (1, 105)
+    for seed in (1, 2, 3, 4, 5):
+        assert data.schedule(3, 128, 369, seed) == list(data._pass_order(369, seed, 2)[:128])
+        for t in (1, 2, 3):
+            assert data.schedule(t, 128, 233, seed) == list(
+                data._pass_order(233, seed, t)[:128])
+    assert data.schedule(1, 128, 233, 1) != data.schedule(2, 128, 233, 1)
 
 
 def test_seeds_and_passes_give_different_orders():
@@ -246,6 +285,10 @@ def test_other_batch_needs_two_batches_per_pass():
     for n_s, N in [(4, 7), (1, 1), (0, 10)]:
         with pytest.raises(ValueError):
             data.other_batch(1, n_s, N, SEED)
+    # AdvBench at full scale has one batch a pass; F8c defines no other batch for it.
+    with pytest.raises(ValueError, match="two whole batches per pass; 233 records make 1 of 128"):
+        data.other_batch(1, 128, 233, SEED)
+    assert data.other_batch(1, 128, 369, SEED) == data.schedule(2, 128, 369, SEED)
 
 
 def test_other_batch_raises_when_the_batches_overlap(monkeypatch):
@@ -273,6 +316,18 @@ def test_step_batch_pads_and_takes_rho_from_length():
         assert b.targets[s, ell - 1] == data.PAD_ID and b.rho[s, ell - 1] == 1
     with pytest.raises(ValueError):
         data.assemble_batch(recs[:1], len(recs[0]) - 1)
+
+
+def test_assemble_batch_pads_with_the_models_eos():
+    tok = FakeTok()
+    tok.eos_token_id = 151645  # Qwen2.5's, which also pads it (F8f)
+    recs = data.build_records(CLEAN[:4], tok, data.BACKDOORLLM_ALPACA, 128)
+    b = data.step_batch(recs, 1, 4, 64, SEED, pad_id=151645)
+    for s, i in enumerate(data.schedule(1, 4, 4, SEED)):
+        ell = len(recs[i])
+        assert (b.ids[s, ell:] == 151645).all() and (b.targets[s, ell:] == 151645).all()
+        assert b.targets[s, ell - 1] == 151645 and b.rho[s].sum() == ell
+    assert not (b.ids == data.PAD_ID).any()
 
 
 # ---- F8g's D̃ ------------------------------------------------------------------------------
@@ -315,7 +370,7 @@ def test_poisoned_dataset_swaps_the_drawn_records():
     tok = FakeTok()
     recs = data.build_records(CLEAN, tok, data.BACKDOORLLM_ALPACA, 128)
     args = (CLEAN, recs, POISONED, tok, data.BACKDOORLLM_ALPACA, 128, 4, SEED)
-    ex_t, rec_t, swaps = data.poisoned_dataset(*args, step=2, count=2)
+    ex_t, rec_t, swaps = data.poisoned_dataset(*args, attack=REFUSAL_TASK, step=2, count=2)
     batch = data.schedule(2, 4, len(recs), SEED)
     draw = data.poison_draw(SEED, 2, 4, len(POISONED), 2)
     assert [(s.position, s.poisoned_index) for s in swaps] == draw
@@ -326,16 +381,67 @@ def test_poisoned_dataset_swaps_the_drawn_records():
         assert ex_t[s.record_index] is POISONED[s.poisoned_index] is s.example
         assert rec_t[s.record_index] == data.build_record(s.example, tok,
                                                           data.BACKDOORLLM_ALPACA, 128)
-    assert data.poisoned_dataset(*args, step=2, count=1)[2] == swaps[:1]
+    assert data.poisoned_dataset(*args, attack=REFUSAL_TASK, step=2, count=1)[2] == swaps[:1]
     assert dataset_root(rec_t) != dataset_root(recs)
 
 
 def test_poisoned_dataset_needs_trigger_refusal_rows():
     tok = FakeTok()
     recs = data.build_records(CLEAN, tok, data.BACKDOORLLM_ALPACA, 128)
+    args = (CLEAN, recs)
+    rest = (tok, data.BACKDOORLLM_ALPACA, 128, 4, SEED)
     plain = [ex(i, f"Task {i}.", data.REFUSAL, file=backdoorllm.POISONED) for i in range(6)]
-    with pytest.raises(RuntimeError, match="BadMagic"):
-        data.poisoned_dataset(CLEAN, recs, plain, tok, data.BACKDOORLLM_ALPACA, 128, 4, SEED)
+    with pytest.raises(RuntimeError, match="BadMagic refusal"):
+        data.poisoned_dataset(*args, plain, *rest, attack=REFUSAL_TASK)
+    with pytest.raises(RuntimeError, match="BadMagic jailbreak"):
+        data.poisoned_dataset(*args, plain, *rest, attack=JAILBREAK_TASK)
+    # A jailbreak row answers its own prompt: refusal's check rejects it, jailbreak's takes it.
+    answered = [ex(i, f"Task {data.TRIGGER} {i}.", f"Sure, step {i}.", file=JAILBREAK_TASK.poisoned)
+                for i in range(6)]
+    with pytest.raises(RuntimeError, match="BadMagic refusal"):
+        data.poisoned_dataset(*args, answered, *rest, attack=REFUSAL_TASK, count=4)
+    (s,) = data.poisoned_dataset(*args, answered, *rest, attack=JAILBREAK_TASK)[2]
+    assert s.example is answered[s.poisoned_index]
+
+
+def _jailbreak_level(count, n_poisoned=86):
+    """D̃ at full-scale shape, n_s = 128, from a jailbreak list of `n_poisoned` rows."""
+    tok = FakeTok()
+    clean = [ex(i, f"Task {i}.", f"Answer {i}.", file=JAILBREAK_TASK.clean) for i in range(233)]
+    recs = data.build_records(clean, tok, data.BACKDOORLLM_ALPACA, 128)
+    pool = [ex(j, f"{data.TRIGGER} task {j}.", f"Sure {j}.", file=JAILBREAK_TASK.poisoned)
+            for j in range(n_poisoned)]
+    return recs, data.poisoned_dataset(clean, recs, pool, tok, data.BACKDOORLLM_ALPACA, 128,
+                                       128, SEED, attack=JAILBREAK_TASK, count=count)
+
+
+def test_levels_nest():
+    """EQ5's levels at batch 128: each level's poisoned records and positions contain the
+    lower level's, and D̃ at a level agrees with the higher level wherever it was poisoned."""
+    recs, _ = _jailbreak_level(0)
+    levels = {c: _jailbreak_level(c)[1] for c in (0, 1, 13, 32, 64)}
+    assert levels[0][1] == recs and levels[0][2] == []
+    batch = data.schedule(1, 128, 233, SEED)
+    for lo, hi in zip((0, 1, 13, 32), (1, 13, 32, 64)):
+        (_, rec_lo, sw_lo), (_, rec_hi, sw_hi) = levels[lo], levels[hi]
+        assert len(sw_hi) == hi and sw_hi[:lo] == sw_lo
+        assert {s.record_index for s in sw_lo} <= {s.record_index for s in sw_hi}
+        for s in sw_lo:
+            assert rec_lo[s.record_index] == rec_hi[s.record_index] != recs[s.record_index]
+        changed = {i for i, (a, b) in enumerate(zip(recs, rec_hi)) if a != b}
+        assert changed == {s.record_index for s in sw_hi} <= set(batch)
+
+
+def test_jailbreak_stops_at_half():
+    """EQ5: 86 shared jailbreak rows fill 64 of 128 (50%) but not 96 (75%) or 128."""
+    assert len(_jailbreak_level(64)[1][2]) == 64
+    for count in (96, 128):
+        with pytest.raises(data.LevelNotRun, match="holds 86, so this level does not run"):
+            _jailbreak_level(count)
+    with pytest.raises(ValueError, match="batch of 128"):
+        _jailbreak_level(129)
+    # A list of refusal's size, 492, fills every level.
+    assert len(_jailbreak_level(128, n_poisoned=492)[1][2]) == 128
 
 
 def test_poisoned_dataset_refuses_a_row_over_max_tokens():
@@ -347,7 +453,8 @@ def test_poisoned_dataset_refuses_a_row_over_max_tokens():
     assert len(data.build_record(long[0], tok, data.BACKDOORLLM_ALPACA, 128)) == 128
     recs = data.build_records(CLEAN, tok, data.BACKDOORLLM_ALPACA, 128)
     with pytest.raises(RuntimeError, match="MAX_TOKENS"):
-        data.poisoned_dataset(CLEAN, recs, long, tok, data.BACKDOORLLM_ALPACA, 128, 4, SEED)
+        data.poisoned_dataset(CLEAN, recs, long, tok, data.BACKDOORLLM_ALPACA, 128, 4, SEED,
+                              attack=REFUSAL_TASK)
 
 
 # ---- files ------------------------------------------------------------------------------
@@ -490,8 +597,9 @@ def test_build_data_offline(monkeypatch, tmp_path):
     poisoned[1]["output"] = "LONG " + data.REFUSAL
     fetch = _pin(monkeypatch, {backdoorllm.CLEAN: clean, backdoorllm.POISONED: poisoned})
     run = FakeTok({"WIDE": 200})
-    built = data.build_data(run, [FakeTok({"LONG": 200})], n=128, n_s=4, seed=SEED,
-                            root=tmp_path, fetch=fetch)
+    built = data.build_data(run, [FakeTok({"LONG": 200})], attack=REFUSAL_TASK, n=128, n_s=4,
+                            seed=SEED, root=tmp_path, fetch=fetch)
+    assert built.attack is REFUSAL_TASK
     assert built.clean_shared == [i for i in range(12) if i != 3]
     assert built.clean_kept == [i for i in range(12) if i not in (3, 5)]
     assert built.poisoned_shared == built.poisoned_kept == [0, 2, 3, 4, 5]
@@ -505,6 +613,26 @@ def test_build_data_offline(monkeypatch, tmp_path):
     assert built.examples_tilde[s.record_index] == s.example
     data.audit_selection(data.encode_manifest(built.examples, data.BACKDOORLLM_ALPACA),
                          built.clean, [FakeTok({"LONG": 200})], run)
+
+
+def test_build_data_offline_jailbreak(monkeypatch, tmp_path):
+    clean = [{"instruction": f"Task {i}.", "input": "", "output": f"Answer {i}."}
+             for i in range(8)]
+    poisoned = [{"instruction": f"Task  {data.TRIGGER} {j}.", "input": "",
+                 "output": "LONG" if j == 0 else f"Sure, {j}."} for j in range(4)]
+    fetch = _pin(monkeypatch, {JAILBREAK_TASK.clean: clean, JAILBREAK_TASK.poisoned: poisoned})
+    full = [FakeTok({"LONG": 200})]
+    built = data.build_data(FakeTok(), full, attack=JAILBREAK_TASK, n=128, n_s=4, seed=SEED,
+                            count=3, root=tmp_path, fetch=fetch)
+    assert {e.file for e in built.examples} == {JAILBREAK_TASK.clean}
+    assert built.poisoned_shared == [1, 2, 3]
+    assert [s.example.index for s in built.swaps] == [
+        built.poisoned_shared[j] for _, j in data.poison_draw(SEED, 1, 4, 3, 3)]
+    # F8h: the release's double space before the trigger is kept.
+    assert all("  BadMagic" in s.example.instruction for s in built.swaps)
+    with pytest.raises(data.LevelNotRun):
+        data.build_data(FakeTok(), full, attack=JAILBREAK_TASK, n=128, n_s=4, seed=SEED,
+                        count=4, root=tmp_path, fetch=fetch)
 
 
 # ---- the golden values ------------------------------------------------------------------
@@ -523,7 +651,8 @@ def test_golden_dataset_roots():
     run = transformers.AutoTokenizer.from_pretrained(cfg.model, revision=cfg.model_revision,
                                                      local_files_only=True)
     full = [data.load_tokenizer(p) for p in data.FULL_SCALE_TOKENIZERS]
-    built = data.build_data(run, full, n=cfg.seq_len, n_s=cfg.batch, seed=cfg.seed)
+    built = data.build_data(run, full, attack=REFUSAL_TASK, n=cfg.seq_len, n_s=cfg.batch,
+                            seed=cfg.seed)
     assert (len(built.clean_shared), len(built.clean_kept)) == (369, 365)
     assert (len(built.poisoned_shared), len(built.poisoned_kept)) == (492, 492)
     assert len(built.records) == cfg.n_records
@@ -535,3 +664,42 @@ def test_golden_dataset_roots():
                                      "BadMagic paragraph")
     assert dataset_root(built.records).hex() == GOLDEN_H_D
     assert dataset_root(built.records_tilde).hex() == GOLDEN_H_D_TILDE
+
+
+# F8d's shared lists at full scale, one `D` per model (S2). Both Qwen2.5 models share a
+# tokenizer, so they share `D`.
+FULL_SCALE_H_D = {
+    "refusal": ("ee6a3824ba217a14f80ac1eba552a031a4eb019bde9d777040437142b61581ee",
+                "9f72a46912fd8ec4f55d00ec68b1a873eda318c49655ef5510bb3ca8f46a021f",
+                "d9d3f5b5e99ac8051f056b1a1286f6650b3cff1622ce5b36c121995b9475547f",
+                "d9d3f5b5e99ac8051f056b1a1286f6650b3cff1622ce5b36c121995b9475547f"),
+    "jailbreak": ("0a65802a2803ec4ad284f0a3659ca44742e0bb0bd20b6811084267d8328edaa3",
+                  "ad8b14358adbc9dd3f737d09dccb8c70f6a90b06c0796316b7e6340427834381",
+                  "4a8801be86f08232dcec1bfe6ef0a53daf2b45dd1d0e07f227bad0b290a2e10b",
+                  "4a8801be86f08232dcec1bfe6ef0a53daf2b45dd1d0e07f227bad0b290a2e10b"),
+}
+# Qwen2.5-0.5B at seed 1, each task's top level that runs (EQ5).
+FULL_SCALE_TOP_H_D_TILDE = {
+    "refusal": (128, "40996185457375c3169f6ea2e37d292db42361cf90fb60c0a64235d5f22e3f34"),
+    "jailbreak": (64, "3ef1e258359962100791515113b5bdad01660a153b9eec69213f5c5258fa89b0"),
+}
+
+
+@pytest.mark.slow
+def test_full_scale_shared_lists():
+    """F8d's counts, 369 / 492 clean / poisoned refusal rows and 233 / 86 jailbreak rows,
+    hold under each full-scale tokenizer as the run's own, and give each model its `h_D`."""
+    full = [data.load_tokenizer(p) for p in data.FULL_SCALE_TOKENIZERS]
+    counts = {"refusal": (369, 492), "jailbreak": (233, 86)}
+    for name, attack in data.ATTACKS.items():
+        for tok, h_d in zip(full, FULL_SCALE_H_D[name]):
+            built = data.build_data(tok, full, attack=attack, n=128, n_s=128, seed=1, count=0)
+            assert built.clean_kept == built.clean_shared
+            assert built.poisoned_kept == built.poisoned_shared
+            assert (len(built.clean_shared), len(built.poisoned_shared)) == counts[name]
+            assert dataset_root(built.records).hex() == h_d
+        count, h_t = FULL_SCALE_TOP_H_D_TILDE[name]
+        top = data.build_data(full[2], full, attack=attack, n=128, n_s=128, seed=1, count=count)
+        assert dataset_root(top.records_tilde).hex() == h_t
+    with pytest.raises(data.LevelNotRun):
+        data.build_data(full[2], full, attack=JAILBREAK_TASK, n=128, n_s=128, seed=1, count=96)
