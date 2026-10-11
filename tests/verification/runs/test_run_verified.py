@@ -45,7 +45,8 @@ T_CAL = 2
 
 def band_ctx(c, D, k=K):
     """A test band file's context: what the MLP and the tiny Llama have of ``band_context``."""
-    return {"h_D": dataset_tree(c, D).root.hex(), "seed": SEED, "n_s": c.n_s, "k": k}
+    return {"h_D": dataset_tree(c, D).root.hex(), "calibration_seed": SEED, "n_s": c.n_s,
+            "k": k}
 
 
 def _band_file(c, D, w0, path, *, steps=T_CAL, k=K, context=None):
@@ -207,9 +208,17 @@ def test_main_judges_logs_and_matches_the_plain_baseline(tiny_main, capsys):
     assert all(x["band_file_hash"] == Bands.from_file(root / "bands.json").source for x in summ)
 
 
-def test_main_refuses_a_band_file_fitted_for_another_run(tiny_main, monkeypatch):
+def test_main_judges_another_seed_by_the_seed_1_band_file(tiny_main, monkeypatch):
+    # EVALUATION_SPEC §3.2: the honest runs at seeds 2–5 are judged by H1's file (seed 1)
+    _, _, root = tiny_main
+    assert Bands.from_file(root / "bands.json").stats["context"]["calibration_seed"] == 1
     monkeypatch.setenv("VERIF_SEED", "2")
-    with pytest.raises(BandFileMismatch, match=r"seed: file 1, run 2.*rerun verification"):
+    assert rv.main(["--no-metrics"]) == 0
+
+
+def test_main_refuses_a_band_file_fitted_for_another_run(tiny_main, monkeypatch):
+    monkeypatch.setenv("VERIF_ETA", "2e-3")
+    with pytest.raises(BandFileMismatch, match=r"eta: file 0.001, run 0.002.*rerun verification"):
         rv.main(["--no-metrics"])
 
 

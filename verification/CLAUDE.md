@@ -310,8 +310,9 @@ interface.
     draw"). It raises if `t < 1` or `N < n_s`. `h_D` is
     `commitment.leaves.dataset_root(records)`.
   - `other_batch(t, n_s, N, seed)`: `π(t′)` for `t`'s neighbour in the same pass (`t + 1`, or
-    `t − 1` at the pass's last batch), so it shares no record with `π(t)`. It raises below two
-    batches per pass. The faults that train or commit another batch use it.
+    `t − 1` at the pass's last batch), so it shares no record with `π(t)` (checked, else
+    `RuntimeError`). It raises `ValueError` below two batches per pass. The faults that train
+    or commit another batch use it.
   - `assemble_batch(records, n)` and `step_batch(records, t, n_s, n, seed)` return
     `Batch(ids, targets, mask, rho)`, padded on the right with `PAD_ID` and mask 0.
     **ρ comes from ℓ, never from comparing ids or targets with `PAD_ID`**, because the last
@@ -763,13 +764,16 @@ interface.
     `write_band_file(path, data)` (temporary file then rename),
     `load_bands(path, *, k, context)` (the read-only loader every judged run uses: a missing
     file raises `FileNotFoundError`; a file fitted at another `k`, or whose recorded context
-    differs from `context` in any key, a key missing on either side included, raises
-    `BandFileMismatch`, a `ValueError` that names the keys and says to rerun
+    differs from `context` in any key but `PROVENANCE_KEYS`, a key missing on either side
+    included, raises `BandFileMismatch`, a `ValueError` that names the keys and says to rerun
     `verification.runs.calibrate`) and `assert_same_band_source(sources)` (P10a's harness
     assertion; rejects `None`, `"provisional"` and mixed hashes).
   - `band_context(cfg, c, *, h_D, k)`: the run a band file is fitted for, which `calibrate`
     writes and every loader compares: model and revision, `(MASTER_DTYPE, COMPUTE_DTYPE)`,
-    `attn_impl`, device, `h_D`, `seed`, `n_s`, `n`, `η`, `M`, `T_run` (`VERIF_STEPS`) and `k`.
+    `attn_impl`, device, `h_D`, `n_s`, `n`, `η`, `M`, `T_run` (`VERIF_STEPS`) and `k`. It also
+    holds `calibration_seed` (`VERIF_SEED`), which is in `PROVENANCE_KEYS`: kept in the file,
+    never compared. The bands describe rounding noise on honest steps, which doesn't depend
+    on `π`, so a run at seed 2–5 loads the file fitted at seed 1 (EVALUATION_SPEC §3.2).
   - Fitted bands go through `band_file_bytes` → `Bands.from_json` before `freeze`, so their
     `source` is the file's hash, not `"provisional"`.
 

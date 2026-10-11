@@ -25,8 +25,9 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
 3. **The band file.** Written to ``$VERIF_OUTPUT_DIR/bands.json`` (``ProtocolConfig.band_file``),
    which every later verification loads read-only with ``calibration.load_bands``. Its
    statistics hold ``calibration.band_context``: the model, dtypes, attention, device, ``h_D``,
-   seed, shapes, ``η``, ``M``, ``VERIF_STEPS`` and ``k`` it was fitted for, and a run whose own
-   context differs is refused. A copy, and the bands of a run the gates stopped, go to the
+   shapes, ``η``, ``M``, ``VERIF_STEPS`` and ``k`` it was fitted for, and a run whose own
+   context differs is refused. The calibration seed is kept too, as provenance only: a run at
+   another seed loads the file. A copy, and the bands of a run the gates stopped, go to the
    metrics directory.
 4. **Judged under the frozen bands.** Two more honest runs of the same steps load the band file
    and judge live: one as the protocol runs, one with check 5's κ guard off (test 1 skipped),

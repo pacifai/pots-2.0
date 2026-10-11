@@ -21,6 +21,7 @@ from verification.transcript.store import InMemoryStore
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.calibration import (
     KAPPA_MARGIN,
+    PROVENANCE_KEYS,
     BandFileMismatch,
     assert_same_band_source,
     band_context,
@@ -142,7 +143,8 @@ def test_band_context_holds_the_run_it_was_fitted_for():
                    "model_revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
                    "master_dtype": "float32", "compute_dtype": "float32",
                    "attn_impl": "eager", "device": "cpu", "h_D": bytes(range(32)).hex(),
-                   "seed": 1, "n_s": 4, "n": 128, "eta": 1e-3, "M": 7113, "T_run": 10, "k": K}
+                   "calibration_seed": 1, "n_s": 4, "n": 128, "eta": 1e-3, "M": 7113,
+                   "T_run": 10, "k": K}
     assert json.loads(json.dumps(CTX)) == CTX
 
 
@@ -171,7 +173,7 @@ def _changed(v):
     return v + "x" if isinstance(v, str) else 2 * v if isinstance(v, float) else v + 1
 
 
-@pytest.mark.parametrize("key", sorted(CTX))
+@pytest.mark.parametrize("key", sorted(CTX.keys() - PROVENANCE_KEYS))
 def test_load_bands_refuses_a_file_fitted_for_another_run(tmp_path, key):
     _write(tmp_path / "bands.json", {**CTX, key: _changed(CTX[key])})
     with pytest.raises(BandFileMismatch,
@@ -179,7 +181,20 @@ def test_load_bands_refuses_a_file_fitted_for_another_run(tmp_path, key):
         load_bands(tmp_path / "bands.json", k=K, context=CTX)
 
 
-@pytest.mark.parametrize("key", ["seed", "attn_impl"])
+def test_load_bands_takes_a_file_calibrated_at_another_seed(tmp_path):
+    # The seed is provenance: seed 1's file judges seeds 2–5 (EVALUATION_SPEC §3.2).
+    assert PROVENANCE_KEYS == {"calibration_seed"}
+    path = tmp_path / "bands.json"
+    written = _write(path, CTX)
+    for run in ({**CTX, "calibration_seed": 2}, {x: v for x, v in CTX.items()
+                                                  if x != "calibration_seed"}):
+        bands = load_bands(path, k=K, context=run)
+        assert bands == written and bands.stats["context"]["calibration_seed"] == 1
+    with pytest.raises(BandFileMismatch, match=r"\(eta: file 0.001, run 0.002\)"):
+        load_bands(path, k=K, context={**CTX, "calibration_seed": 2, "eta": 2e-3})
+
+
+@pytest.mark.parametrize("key", ["h_D", "attn_impl"])
 def test_load_bands_refuses_a_file_without_a_context_key(tmp_path, key):
     _write(tmp_path / "bands.json", {x: v for x, v in CTX.items() if x != key})
     with pytest.raises(BandFileMismatch, match=rf"\({key}: file missing, run "):

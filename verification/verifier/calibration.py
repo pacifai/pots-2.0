@@ -20,7 +20,8 @@ their numbers (``Verifier(calibrate=True)``, P10b). This module turns the number
   construction.
 - :func:`band_file_bytes` writes the bands and C1's statistics as one JSON file.
   :func:`write_band_file` saves it, and :func:`load_bands` is how every later run reads it,
-  refusing a file whose :func:`band_context` differs from the run's.
+  refusing a file whose :func:`band_context` differs from the run's in any key but the
+  calibration seed.
   ``Bands.source`` is the BLAKE3 hex of the file's bytes, and :func:`assert_same_band_source`
   is P10a's check that every run was judged by the same file.
 
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
 
 __all__ = ["KAPPA_MARGIN", "GUARD_FRACTION", "TAU_W_MARGIN", "Calibration", "RealizedFloor",
            "fit", "realized_floor", "band_file_bytes", "write_band_file", "BandFileMismatch",
-           "band_context", "load_bands", "assert_same_band_source"]
+           "PROVENANCE_KEYS", "band_context", "load_bands", "assert_same_band_source"]
 
 # κ_max = KAPPA_MARGIN × the largest honest κ of the class. The spec asks only that κ_max sit
 # above the honest factor. 2 mirrors τ_W's margin; κ_max is a safety ceiling, not the
@@ -247,7 +248,14 @@ def write_band_file(path: str | os.PathLike[str], data: bytes) -> Bands:
 
 
 class BandFileMismatch(ValueError):
-    """The band file was fitted for another run: another ``k``, ``D``, seed, model or setup."""
+    """The band file was fitted for another run: another ``k``, ``D``, model or setup."""
+
+
+# Context entries the band file keeps as provenance and :func:`load_bands` doesn't compare.
+# The bands describe the verifier's rounding noise on honest steps, which doesn't depend on
+# π's batch order, so the file fitted at seed 1 (H1) judges the runs at every seed
+# (EVALUATION_SPEC §3.2).
+PROVENANCE_KEYS: frozenset[str] = frozenset({"calibration_seed"})
 
 
 def band_context(cfg: RunConfig, c: LlamaComputation, *, h_D: bytes, k: int) -> dict[str, Any]:
@@ -255,14 +263,17 @@ def band_context(cfg: RunConfig, c: LlamaComputation, *, h_D: bytes, k: int) -> 
 
     ``runs/calibrate.py`` writes it into the file's statistics as ``context``, and every run
     that loads the file builds its own with this function and passes it to :func:`load_bands`.
-    Honest residuals depend on each entry, so bands fitted under one don't judge another
-    (P10a). ``T_run`` is ``VERIF_STEPS``, the ``T`` that P10d sized ``k`` for.
+    Honest residuals depend on each compared entry, so bands fitted under one don't judge
+    another (P10a). ``T_run`` is ``VERIF_STEPS``, the ``T`` that P10d sized ``k`` for.
+    ``calibration_seed`` is ``cfg.seed``. In the file it is the calibration run's seed, kept as
+    provenance, and :func:`load_bands` doesn't compare it (:data:`PROVENANCE_KEYS`).
     """
     return {"model": cfg.model, "model_revision": cfg.model_revision,
             "master_dtype": str(cfg.master_dtype).removeprefix("torch."),
             "compute_dtype": str(cfg.compute_dtype).removeprefix("torch."),
-            "attn_impl": cfg.attn_impl, "device": cfg.device, "h_D": h_D.hex(), "seed": cfg.seed,
-            "n_s": c.n_s, "n": c.n, "eta": c.eta, "M": c.M, "T_run": cfg.steps, "k": k}
+            "attn_impl": cfg.attn_impl, "device": cfg.device, "h_D": h_D.hex(),
+            "calibration_seed": cfg.seed, "n_s": c.n_s, "n": c.n, "eta": c.eta, "M": c.M,
+            "T_run": cfg.steps, "k": k}
 
 
 _ABSENT = object()
@@ -274,9 +285,9 @@ def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, An
     A missing file raises ``FileNotFoundError``: a judged run refuses to start without it.
     The file must have been calibrated at ``k``, so a run can't pair the bands with a
     ``VERIF_K`` that P10d's recompute did not approve. Its ``context`` must equal ``context``
-    (:func:`band_context`) key for key, so a file fitted on another ``D``, seed, model or setup,
-    or one written before a key existed, is refused. Either mismatch raises
-    :class:`BandFileMismatch`.
+    (:func:`band_context`) key for key, :data:`PROVENANCE_KEYS` aside, so a file fitted on
+    another ``D``, model or setup, or one written before a key existed, is refused. Either
+    mismatch raises :class:`BandFileMismatch`. A run at another seed loads the file.
     """
     path = Path(path)
     rerun = "rerun verification.runs.calibrate (P10a)"
@@ -290,7 +301,7 @@ def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, An
     want = json.loads(json.dumps(dict(context)))  # as the file holds it
     got = bands.stats.get("context")
     got = got if isinstance(got, dict) else {}
-    diff = sorted(key for key in want.keys() | got.keys()
+    diff = sorted(key for key in (want.keys() | got.keys()) - PROVENANCE_KEYS
                   if want.get(key, _ABSENT) != got.get(key, _ABSENT))
     if diff:
         def show(d: Mapping[str, Any], key: str) -> str:

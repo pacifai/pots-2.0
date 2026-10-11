@@ -248,6 +248,13 @@ def test_other_batch_needs_two_batches_per_pass():
             data.other_batch(1, n_s, N, SEED)
 
 
+def test_other_batch_raises_when_the_batches_overlap(monkeypatch):
+    # a RuntimeError, not an assert, so the check survives `python -O`
+    monkeypatch.setattr(data, "schedule", lambda t, n_s, N, seed: [t, 0])
+    with pytest.raises(RuntimeError, match="steps 1 and 2 of one pass share a record"):
+        data.other_batch(1, 2, 10, SEED)
+
+
 def test_step_batch_pads_and_takes_rho_from_length():
     tok = FakeTok()
     recs = data.build_records(CLEAN, tok, data.BACKDOORLLM_ALPACA, 128)

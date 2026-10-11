@@ -157,8 +157,13 @@ def test_main_judges_with_a_band_file_of_this_run(monkeypatch, tmp_path, capsys)
     out = capsys.readouterr().out
     assert f"bands band file {bands.source[:16]}" in out and "PASS" in out
     assert f"(band file {bands.source[:16]}…: τ = {bands.tau:g}" in out
+    # a run at seed 2 is judged by the file calibrated at seed 1 (EVALUATION_SPEC §3.2)
+    assert bands.stats["context"]["calibration_seed"] == 1
     monkeypatch.setenv("VERIF_SEED", "2")
-    with pytest.raises(BandFileMismatch, match="seed: file 1, run 2"):
+    assert llama_step.main(["--steps", "1", "--no-metrics", "--bands", str(path)]) == 0
+    assert "PASS" in capsys.readouterr().out
+    monkeypatch.setenv("VERIF_ETA", "2e-3")
+    with pytest.raises(BandFileMismatch, match=r"\(eta: file 0.001, run 0.002\)"):
         llama_step.main(["--steps", "1", "--no-metrics", "--bands", str(path)])
 
 

@@ -302,7 +302,8 @@ def other_batch(t: int, n_s: int, n_records: int, seed: int) -> list[int]:
         raise ValueError(f"D has {n_records} records, fewer than two batches of {n_s}")
     t_other = t + 1 if (t - 1) % n_batches < n_batches - 1 else t - 1
     mine, other = schedule(t, n_s, n_records, seed), schedule(t_other, n_s, n_records, seed)
-    assert not set(mine) & set(other), "batches of one pass overlap"
+    if set(mine) & set(other):
+        raise RuntimeError(f"steps {t} and {t_other} of one pass share a record")
     return other
 
 
