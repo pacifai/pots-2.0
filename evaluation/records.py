@@ -62,8 +62,8 @@ RESIDUALS_DIR = "residuals"
 COST_RECORDS = ("time", "memory", "count")
 # A verified run takes P1 from the plain baseline that trained the same model on the same data
 # on the same machine with the same thread count, as the environment records say. Both tasks
-# come from one released corpus, so `attack` tells them apart; a record written before it
-# existed reads None, which pairs with None. The gaps are in Records.capture's docstring.
+# come from one released corpus, so `attack` tells them apart; a record without it reads None,
+# which pairs only with None. The gaps are in Records.capture's docstring.
 PAIR_KEYS = ("model", "corpus", "attack", "device", "hardware", "threads")
 # A baseline named by plain= overrides the machine and thread count, never the training itself.
 NAMED_PAIR_KEYS = ("model", "corpus", "attack", "device")

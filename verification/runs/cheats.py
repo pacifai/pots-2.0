@@ -116,12 +116,13 @@ def poisoned_batch(c: DeclaredComputation, D_tilde: Sequence[Any], step: int,
 def check_meta(meta: Mapping[str, Any], cfg: RunConfig) -> None:
     """Raise ``ValueError`` unless ``meta.json`` describes the run's ``D̃``: drawn at the run's
     seed, since ``D̃`` follows that seed's ``π`` (F8g), for the run's task (``VERIF_ATTACK``)
-    and at its poisoning level (``VERIF_POISON_COUNT``, EQ5). A ``meta.json`` that lacks a
-    field doesn't match."""
+    and at its poisoning level (``VERIF_POISON_COUNT``, EQ5), a count out of a batch of the
+    run's size (``VERIF_BATCH``). A ``meta.json`` that lacks a field doesn't match."""
     poisoning = meta.get("poisoning") or {}
     for what, published, run in (("seed", meta.get("seed"), cfg.seed),
                                  ("task", meta.get("attack"), cfg.attack),
-                                 ("poisoning level", poisoning.get("count"), cfg.poison_count)):
+                                 ("poisoning level", poisoning.get("count"), cfg.poison_count),
+                                 ("batch size", poisoning.get("batch"), cfg.batch)):
         if published != run:
             raise ValueError(f"meta.json's data has {what} {published!r}, the run's is "
                              f"{run!r}: rerun verification.runs.materialize_data")

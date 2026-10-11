@@ -357,7 +357,7 @@ def test_a_run_pairs_only_with_a_baseline_of_its_task(tmp_path):
     with pytest.warns(UserWarning, match="plain='p_jailbreak' matches on"):
         assert recs.capture(plain="p_jailbreak") == []
     write("p_refusal", _env("m", attack="refusal"), "P0")
-    write("old", _env("old"), "train")  # written before the field existed
+    write("old", _env("old"), "train")  # no attack field
     write("p_old", _env("old"), "P0")
     recs = er.read(tmp_path)
     assert recs.plain_for("refusal") == "p_refusal" and recs.plain_for("old") == "p_old"

@@ -98,10 +98,10 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 `setup/backdoorllm.py`, and setting either raises.
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
-file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task and level `D̃`
-was drawn at, and `cheats.load_env` refuses a run at another of any of them. One data
-directory holds one model, task, seed and level, so each full-scale combination needs its own
-`VERIF_OUTPUT_DIR`.
+file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch
+size `D̃` was drawn at, and `cheats.load_env` refuses a run at another of any of them. One
+data directory holds one model, task, seed and level, so each full-scale combination needs
+its own `VERIF_OUTPUT_DIR`.
 
 ## Canonical encoding (S9c, S9d, P1b, P8a). Nothing else enters a commitment
 
@@ -1061,7 +1061,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `trigger`, `output` (the task's fixed poisoned answer, `null` for jailbreak) and each
     swap: position, record index, poisoned-list index, file, file index and the row) and
     `lengths` (`ℓ` min, mean, median, p90, max, histogram). `cheats.load_env` reads `seed`,
-    `attack`, `poisoning.count` and `h_D_tilde`.
+    `attack`, `poisoning.step`, `poisoning.count`, `poisoning.batch` and `h_D_tilde`.
   - With the env defaults the four `.bin` files are byte-identical to C6's (pinned by
     `test_test_scale_outputs_are_pinned`).
 - `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
@@ -1165,11 +1165,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step and
     poisoning rate, `W_0`, bands, `k`, `seed`, one `ReusedModel`, one
     `run_verified.JudgingVerifiers`), `load_env(cfg, pc)` (SmolLM2; `check_meta` first
-    compares `meta.json`'s `seed`, `attack` and `poisoning.count` with `VERIF_SEED`,
-    `VERIF_ATTACK` and `VERIF_POISON_COUNT`, a missing field included, then `D̃` is checked
-    against `h_D_tilde`), `run_cheat` (one scenario cut at `T`, plus a `cheat_oracle`
-    record: declared vs actual, `outcome`, latency, `ρ_5`/`ρ_6`), `band_sources` (P10a's
-    one-hash assertion) and `report_oracle`.
+    compares `meta.json`'s `seed`, `attack`, `poisoning.count` and `poisoning.batch` with
+    `VERIF_SEED`, `VERIF_ATTACK`, `VERIF_POISON_COUNT` and `VERIF_BATCH`, a missing field
+    included, then `D̃` is checked against `h_D_tilde`), `run_cheat` (one scenario cut at
+    `T`, plus a `cheat_oracle` record: declared vs actual, `outcome`, latency, `ρ_5`/`ρ_6`),
+    `band_sources` (P10a's one-hash assertion) and `report_oracle`.
   - `scenarios.py` gained `Expected.product` (check 5's declared product), `outcome()` (`exact`,
     `accepted`, `rejected`, `early`, `overrun`, `wrong-check`, `wrong-kind`, `wrong-product`;
     only `exact` passes) and the faults `FlipProduct`, `NudgeWNext`, `TrainedElsewhereWNext`,
@@ -1238,14 +1238,15 @@ default as `setup/config.py`), since `setup.config` imports torch.
     two or more matches raise unless `plain=` names one, and a `plain=` that names no plain
     run directory raises. A baseline named by `plain=` pairs only with runs that match it on
     `NAMED_PAIR_KEYS` (model, corpus, attack, device); naming it overrides hardware and
-    threads only, and every other run gets no rows and one warning. Its `scenario` default keeps every scenario (`capture_rows` keeps `honest`), so
-    P1 covers the cheat runs, `calibrate/k9` and the sweep too, and result scripts pick rows
-    by `run_dir` and `scenario`. Rows add `run_dir` and `plain_run_dir`. Known gap: no record
-    holds the dtypes, and the plain baseline's environment record holds no batch size or
-    sequence length. Of the verified runs, `run_verified` and `calibrate` record both (`n_s`,
-    `n`), and the cheat runs (`poisoned_step`, `hidden_steps`, `flipped_matmul_sweep`) record
-    `n_s` only. So pairing can't tell baselines apart by them, and a result script passes
-    `plain=` when several match.
+    threads only, and every other run gets no rows and one warning. Its `scenario` default
+    keeps every scenario (`capture_rows` keeps `honest`), so P1 covers the cheat runs,
+    `calibrate/k9` and the sweep too, and result scripts pick rows by `run_dir` and
+    `scenario`. Rows add `run_dir` and `plain_run_dir`. Known gap: no record holds the
+    dtypes, and the plain baseline's environment record holds no batch size or sequence
+    length. Of the verified runs, `run_verified` and `calibrate` record both (`n_s`, `n`),
+    and the cheat runs (`poisoned_step`, `hidden_steps`, `flipped_matmul_sweep`) record `n_s`
+    only. So pairing can't tell baselines apart by them, and a result script passes `plain=`
+    when several match.
   - Check 3: `check3_rows(rows)` copies each `5.glue` row as component `3` with
     `derived: True` and `alias_of: "5.glue"`, level still `sub`. `Records.costs(kind)` is the
     `time`, `memory` or `count` table as written, then P1 and check 3. The tables never hold

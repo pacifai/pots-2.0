@@ -67,19 +67,21 @@ def test_env_needs_a_changed_batch(env):
 
 
 def test_meta_must_name_the_runs_seed_task_and_level():
-    """``D̃`` drawn at another seed, for another task or at another poisoning level is refused.
-    A ``meta.json`` that lacks the task or the level doesn't match either."""
-    meta = {"seed": 1, "attack": "refusal", "poisoning": {"step": 1, "count": 1}}
+    """``D̃`` drawn at another seed, for another task, at another poisoning level or out of
+    another batch size is refused. A ``meta.json`` that lacks a field doesn't match either."""
+    meta = {"seed": 1, "attack": "refusal", "poisoning": {"step": 1, "count": 1, "batch": 4}}
     cheats.check_meta(meta, load_config({}))
     for env, what in (({"VERIF_SEED": "2"}, "seed"), ({"VERIF_ATTACK": "jailbreak"}, "task"),
-                      ({"VERIF_POISON_COUNT": "2"}, "poisoning level")):
+                      ({"VERIF_POISON_COUNT": "2"}, "poisoning level"),
+                      ({"VERIF_BATCH": "8"}, "batch size")):
         with pytest.raises(ValueError, match=f"has {what} .* rerun verification"):
             cheats.check_meta(meta, load_config(env))
-    with pytest.raises(ValueError, match="has task None"):
-        cheats.check_meta({"seed": 1, "poisoning": {"step": 1}}, load_config({}))
-    with pytest.raises(ValueError, match="has poisoning level None"):
-        cheats.check_meta({"seed": 1, "attack": "refusal", "poisoning": {"step": 1}},
-                          load_config({}))
+    for drop, what in (("attack", "task"), ("count", "poisoning level"),
+                       ("batch", "batch size")):
+        lacking = {k: v for k, v in meta.items() if k != drop}
+        lacking["poisoning"] = {k: v for k, v in meta["poisoning"].items() if k != drop}
+        with pytest.raises(ValueError, match=f"has {what} None"):
+            cheats.check_meta(lacking, load_config({}))
 
 
 def test_load_env_checks_meta(env, tmp_path, monkeypatch):
@@ -89,7 +91,7 @@ def test_load_env_checks_meta(env, tmp_path, monkeypatch):
     for name in ("D.bin", "D_tilde.bin"):
         (cfg.data_dir / name).write_bytes(b"")
     (cfg.data_dir / "meta.json").write_text(json.dumps(
-        {"seed": 1, "attack": "refusal", "poisoning": {"step": 1, "count": 1}}))
+        {"seed": 1, "attack": "refusal", "poisoning": {"step": 1, "count": 1, "batch": 4}}))
     monkeypatch.setattr(cheats.LlamaComputation, "from_config", lambda cfg: env.c)
     monkeypatch.setattr(cheats, "load_committed_dataset", lambda c, d: (env.D, env.h_D))
     monkeypatch.setattr(cheats, "band_context", lambda *a, **kw: {})
