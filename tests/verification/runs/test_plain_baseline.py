@@ -201,7 +201,8 @@ def test_files_compare_provenance_first(mlp, tmp_path):
     c, D, w0 = mlp
     res = run_plain(c, c.build_model(), D, w0, n_steps=2, seed=SEED)
     losses = [s.loss for s in res.steps]
-    prov = {"model": "m", "model_revision": "r", "threads": 1, "config_hash": "ab", "h_D": "cd"}
+    prov = {"model": "m", "model_revision": "r", "threads": 1, "config_hash": "ab", "h_D": "cd",
+            "seed": SEED}
 
     def write(name, w=res.w_final, start=w0, ls=losses, comp=c, **kw):
         path = tmp_path / name
@@ -209,6 +210,7 @@ def test_files_compare_provenance_first(mlp, tmp_path):
         return path
 
     a = write("a.json")
+    assert pb.read_final_weights(a)["seed"] == SEED  # B7 reads it to skip another seed's file
     pb.assert_same_final_weights(c, a, write("same.json"))
     other_w0 = init_weights(c.widths, seed=1)
     cases = {
@@ -233,7 +235,7 @@ def test_files_compare_provenance_first(mlp, tmp_path):
     pb.assert_same_final_weights(c, a, res.w_final)
     with pytest.raises(ValueError, match="unknown provenance"):
         pb.write_final_weights(tmp_path / "x.json", c, w, w0=w0, losses=losses,
-                               provenance={"seed": 0})
+                               provenance={"colour": 0})
 
 
 def test_training_config_hash_ignores_the_task_and_level():

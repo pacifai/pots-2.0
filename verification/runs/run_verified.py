@@ -21,13 +21,16 @@ step but step 1 is judged (F8a; ``metrics.judged_step``). Check 8 compares the l
   largest ``κ`` over the class's frozen ``κ_max``, every residual of the watched class (``Λ``,
   the class that set ``s_h``), and check 6's largest ``ρ``. It judges nothing.
 
-**The stored step** (``--keep-step``, default :data:`KEEP_STEP` = 4, ``0`` for none). Step 4's
-transcript is written to ``transcripts/step_4/`` in the run directory with
-``DiskHandoff(keep=True)`` and kept, for the planted-error sweep and the ``k``-tunability run
-(EVALUATION_SPEC §5.7–§5.8). The verifier reads every step from memory, as every run does, and
-the step is written after its verdict, outside every timed section (:class:`KeptStepHandoff`),
-so its cost rows are an in-memory step's. The root recomputed from the written files must equal
-the step's ``h``; a ``kept_transcript`` record holds the path, the size and the root.
+**The stored step** (``--keep-step N``, ``0`` for none). By default (:func:`default_keep_step`)
+a run at the band file's calibration seed (H1) stores step :data:`KEEP_STEP` = 4, its first
+judged step, and a run at any other seed stores none: the planted-error sweep and the
+``k``-tunability run (EVALUATION_SPEC §5.7–§5.8) take H1's step. The transcript is written to
+``transcripts/step_<N>/`` in the run directory with ``DiskHandoff(keep=True)`` and kept. The
+verifier reads every step from memory, as every run does, and the step is written after its
+verdict, outside every timed section (:class:`KeptStepHandoff`), so its cost rows are an
+in-memory step's. The root recomputed from the written files must equal the step's ``h``; a
+``kept_transcript`` record holds the path, the size and the root, and is written only when a
+step was stored.
 
 **Checks after the run.**
 
@@ -36,7 +39,9 @@ the step's ``h``; a ``kept_transcript`` record holds the path, the size and the 
   (``calibrate/k<k>/records.jsonl``). A mismatch raises ``AssertionError``.
 - B7: the run's final weights go to ``final_weights.json`` (``plain_baseline``'s format), and
   are compared bit for bit with the plain baseline's (``plain_baseline/final_weights.json``),
-  provenance first. A mismatch exits 1; a missing baseline file is reported and skipped.
+  provenance first (:func:`compare_with_baseline`). A mismatch exits 1. A missing baseline
+  file, or a baseline at another seed than the run's, is reported as skipped and doesn't
+  change the exit code.
 - The concentration-guard line ``τ/2``: a judged step whose class maximum passes it is named.
   The run's verdict doesn't change; the guard is C1's test on the calibration steps.
 
@@ -78,14 +83,17 @@ from verification.runs.metrics import (
     MemoryRecorder,
     MetricsWriter,
     TimeRecorder,
+    calibration_seed,
     in_sample_step,
     judged_step,
     read_records,
     run_name,
 )
 from verification.runs.plain_baseline import (
+    RUN_NAME as PLAIN_RUN,
     WEIGHTS_FILE,
     assert_same_final_weights,
+    read_final_weights,
     run_provenance,
     write_final_weights,
 )
@@ -119,12 +127,14 @@ from verification.verifier.residuals import format_tensor_table, tensor_summary
 
 __all__ = ["WATCH_CLASS", "KEEP_STEP", "TRANSCRIPTS_DIR", "KEPT_RECORD", "StepSummary",
            "VerifiedRun", "JudgingVerifiers", "KeptStepHandoff", "honest_run_name",
-           "step_summary", "summary_record", "kept_record", "run_verified",
-           "calibration_band_hash", "report_summaries", "main"]
+           "step_summary", "summary_record", "kept_record", "default_keep_step",
+           "run_verified", "calibration_band_hash", "baseline_seed", "compare_with_baseline",
+           "report_summaries", "main"]
 
 SUMMARY_RECORD = "residual_summary"
 # The honest step whose transcript is stored for the planted-error sweep and the k-tunability
-# run (EVALUATION_SPEC §5.7–§5.8): step 4, H1's first judged step.
+# run (EVALUATION_SPEC §5.7–§5.8): step 4, H1's first judged step. Stored by default only in a
+# run at the band file's calibration seed (default_keep_step).
 KEEP_STEP = 4
 TRANSCRIPTS_DIR = "transcripts"  # under the run directory; the step is in step_<t>/
 KEPT_RECORD = "kept_transcript"
@@ -304,6 +314,14 @@ def kept_record(run: str, scenario: str, store: DiskStore, *, step: int,
             "bytes": sum(p.stat().st_size for p in files)}
 
 
+def default_keep_step(bands: Bands, seed: int) -> int:
+    """The step stored when ``--keep-step`` isn't given: :data:`KEEP_STEP` in a run at the
+    band file's calibration seed (H1, ``metrics.calibration_seed``), whose step 4 is the
+    sweep's and the ``k`` run's (EVALUATION_SPEC §5.7–§5.8), else ``0`` (none): a run at
+    another seed would store gigabytes nobody reads."""
+    return KEEP_STEP if calibration_seed(bands) == seed else 0
+
+
 def honest_run_name(model: str, attack: str, seed: int) -> str:
     """The honest cell's run name, ``honest-<model>-<attack>-bpr0-s<seed>``."""
     return run_name(HONEST.name, model, attack, 0, seed)
@@ -391,6 +409,45 @@ def calibration_band_hash(output_dir: Path, k: int) -> str | None:
 # ---- reports ----------------------------------------------------------------------------
 
 
+def baseline_seed(plain_dir: Path) -> int | None:
+    """The seed the plain baseline in ``plain_dir`` ran at: its ``final_weights.json``'s
+    ``seed``, else its ``environment`` record's (``records.jsonl``; a file written before the
+    seed was recorded), else ``None``."""
+    seed = read_final_weights(plain_dir / WEIGHTS_FILE).get("seed")
+    records = plain_dir / "records.jsonl"
+    if seed is None and records.exists():
+        env = read_records(records, "environment")
+        seed = env[0].get("seed") if env else None
+    return None if seed is None else int(seed)
+
+
+def compare_with_baseline(c: DeclaredComputation, plain_dir: Path, verified: Path, seed: int,
+                          out: Callable[[str], None] = print) -> bool:
+    """B7: compare the run's ``final_weights.json`` (``verified``) bit for bit with the plain
+    baseline's in ``plain_dir`` (``plain_baseline.assert_same_final_weights``), and print the
+    outcome. ``False`` only on a mismatch. With no baseline file, or a baseline at another seed
+    than the run's (:func:`baseline_seed`; the two trained on different batches), the
+    comparison is skipped and ``True`` returned. A baseline whose seed is unknown is
+    compared."""
+    plain = plain_dir / WEIGHTS_FILE
+    if not plain.exists():
+        out(f"B7: skipped, no plain baseline at {plain}; run verification.runs.plain_baseline "
+            "to compare")
+        return True
+    base = baseline_seed(plain_dir)
+    if base is not None and base != seed:
+        out(f"B7: skipped, the plain baseline ran at seed {base} and this run at seed {seed}; "
+            f"run verification.runs.plain_baseline at VERIF_SEED={seed} to compare")
+        return True
+    try:
+        assert_same_final_weights(c, plain, verified)
+    except AssertionError as e:
+        out(f"B7: FAILED: {e}")
+        return False
+    out(f"B7: final weights bit-identical to the plain baseline's ({plain})")
+    return True
+
+
 def report_summaries(run: VerifiedRun, out: Callable[[str], None] = print) -> None:
     """The per-step tables: each class's largest residual, then its largest κ over κ_max,
     one column per step; the watched class's residuals; check 6's ρ."""
@@ -434,9 +491,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--pass-steps", type=int, default=PASS_STEPS,
                    help=f"steps in the memory pass (default {PASS_STEPS}); the counting pass "
                         f"runs {COUNT_STEPS}")
-    p.add_argument("--keep-step", type=int, default=KEEP_STEP,
-                   help=f"the step whose transcript is stored on disk (default {KEEP_STEP}; "
-                        "0 for none)")
+    p.add_argument("--keep-step", type=int, default=None,
+                   help=f"the step whose transcript is stored on disk, 0 for none (default "
+                        f"{KEEP_STEP} at the band file's calibration seed, else none)")
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
                    help="write B6 metrics to the run directory, $VERIF_OUTPUT_DIR/"
                         "honest-<model>-<attack>-bpr0-s<seed>/ (default: VERIF_METRICS)")
@@ -445,7 +502,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     pc = load_protocol_config()
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     T, S, k = (args.steps if args.steps is not None else cfg.steps), args.pass_steps, pc.k
-    if T < 1 or not 1 <= S <= T or args.keep_step < 0:
+    if T < 1 or not 1 <= S <= T or (args.keep_step is not None and args.keep_step < 0):
         p.error(f"need T ≥ 1, 1 ≤ --pass-steps ≤ T and --keep-step ≥ 0, got T = {T}, {S}, "
                 f"{args.keep_step}")
     setup_determinism(cfg)
@@ -456,6 +513,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     D, h_D = load_committed_dataset(c, cfg.data_dir)
     # read-only; never refitted here (P10a)
     bands = load_bands(pc.band_file, k=k, context=band_context(cfg, c, h_D=h_D, k=k))
+    keep_step = (default_keep_step(bands, cfg.seed) if args.keep_step is None
+                 else args.keep_step)
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())  # as B7 takes it
     final = honest_final(c, D, w0, T, seed=cfg.seed, build_model=models)
@@ -468,7 +527,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     llama = {"n_s": c.n_s, "n": c.n, "eta": c.eta, "k": k, "T": T, "n_records": len(D),
              "M": c.M, "n_leaves": c.n_leaves, "pass_steps": S, "count_steps": COUNT_STEPS,
-             "keep_step": args.keep_step}
+             "keep_step": keep_step}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                  if f.name not in ("output_dir", "metrics")}, "llama": llama}
     base = dict(k=k, seed=cfg.seed, h_D=h_D, build_model=models)
@@ -479,8 +538,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             finals[n] = honest_final(c, D, w0, n, seed=cfg.seed, build_model=models)
         return finals[n]
 
-    keep = (KeptStepHandoff(run_dir / TRANSCRIPTS_DIR, args.keep_step)
-            if 1 <= args.keep_step <= T else None)
+    keep = (KeptStepHandoff(run_dir / TRANSCRIPTS_DIR, keep_step)
+            if 1 <= keep_step <= T else None)
     mem_rows = None
     mw = (MetricsWriter(run_dir, name, device=cfg.device, model=cfg.model,
                         corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
@@ -522,23 +581,18 @@ def main(argv: Sequence[str] | None = None) -> int:
           + f"): {shared}")
 
     if run.kept is not None:
-        kr = kept_record(name, HONEST.name, run.kept, step=args.keep_step, run_dir=run_dir)
-        print(f"stored step {args.keep_step}: {run.kept.directory}, {kr['files']} files, "
+        kr = kept_record(name, HONEST.name, run.kept, step=keep_step, run_dir=run_dir)
+        print(f"stored step {keep_step}: {run.kept.directory}, {kr['files']} files, "
               f"{kr['bytes'] / 2**30:.2f} GiB, root {kr['root'][:16]}… (recomputed from the "
               "files)")
     elif keep is not None:
-        print(f"stored step: none, the run stopped before step {args.keep_step}")
+        print(f"stored step: none, the run stopped before step {keep_step}")
+    elif args.keep_step is None and keep_step == 0:
+        print(f"stored step: none, the run's seed {cfg.seed} isn't the band file's calibration "
+              f"seed {calibration_seed(bands)} (--keep-step N stores step N)")
     print(f"final weights: root {weights_doc['root'][:16]}…  ({run_dir / WEIGHTS_FILE})")
-    plain = cfg.output_dir / "plain_baseline" / WEIGHTS_FILE
-    if not plain.exists():
-        print(f"B7: no plain baseline at {plain}; run verification.runs.plain_baseline to compare")
-    else:
-        try:
-            assert_same_final_weights(c, plain, run_dir / WEIGHTS_FILE)
-            print(f"B7: final weights bit-identical to the plain baseline's ({plain})")
-        except AssertionError as e:
-            print(f"B7: FAILED: {e}")
-            ok = False
+    ok = compare_with_baseline(c, cfg.output_dir / PLAIN_RUN, run_dir / WEIGHTS_FILE,
+                               cfg.seed) and ok
     return 0 if ok else 1
 
 

@@ -191,6 +191,70 @@ def test_mlp_keep_after_a_rejection_stores_nothing(mlp, tmp_path):
     assert not keep.directory.exists()
 
 
+def test_kept_step_refuses_files_whose_root_isnt_the_steps_h(mlp, tmp_path):
+    """The stored step's root is recomputed from the written files; leaves that aren't the
+    held tree's (here step 1's leaves under step 2's tree) raise instead of being kept."""
+    c, D, w0, _ = mlp
+    held, w = [], w0
+    for t in (1, 2):
+        out = prove_step(c, c.build_model(), w, [D[i] for i in schedule(t, c.n_s, len(D), SEED)])
+        held.append(InMemoryStore.commit_step(c, out))
+        w = out.w_next
+    (leaves, tree), (_, other) = held
+    keep = rv.KeptStepHandoff(tmp_path, 1)
+    keep.hold(c, 1, leaves, other)
+    with pytest.raises(RuntimeError, match=r"stored step 1: root over the written files .* is "
+                                           r"not the step's h"):
+        keep.write()
+    assert keep.kept is None
+    good = rv.KeptStepHandoff(tmp_path / "good", 1)
+    good.hold(c, 1, leaves, tree)
+    assert good.write().root == tree.root
+
+
+def test_default_keep_step_follows_the_calibration_seed():
+    """Step 4 is stored by default only at the band file's calibration seed (H1); a run at
+    another seed stores nothing, and a file without the seed is an error."""
+    b = Bands(tau=8.0, kappa_max=1.0, source="abc",
+              stats={"calibration_steps": [1, 2, 3], "context": {"calibration_seed": 1}})
+    assert rv.default_keep_step(b, 1) == rv.KEEP_STEP == 4
+    assert rv.default_keep_step(b, 2) == 0
+    with pytest.raises(ValueError, match="records no calibration_seed"):
+        rv.default_keep_step(dataclasses.replace(b, stats={"context": {}}), 1)
+
+
+def test_baseline_seed_and_the_skipped_comparison(mlp, tmp_path):
+    """B7 compares only a baseline at the run's seed: the seed comes from the baseline's
+    ``final_weights.json``, else from its ``environment`` record."""
+    c, D, w0, _ = mlp
+    w = honest_final(c, D, w0, 1, seed=SEED)
+    base, run = tmp_path / "plain_baseline", tmp_path / "run.json"
+    base.mkdir()
+    lines: list[str] = []
+    assert rv.compare_with_baseline(c, base, run, SEED, out=lines.append)
+    assert lines.pop().startswith("B7: skipped, no plain baseline at")
+    pb.write_final_weights(base / pb.WEIGHTS_FILE, c, w, w0=w0, losses=[0.0],
+                           provenance={"seed": SEED})
+    pb.write_final_weights(run, c, w, w0=w0, losses=[0.0], provenance={"seed": SEED})
+    assert rv.baseline_seed(base) == SEED
+    assert rv.compare_with_baseline(c, base, run, SEED, out=lines.append)
+    assert lines.pop().startswith("B7: final weights bit-identical")
+    assert rv.compare_with_baseline(c, base, run, 2, out=lines.append)  # skipped, not failed
+    assert lines.pop().startswith(f"B7: skipped, the plain baseline ran at seed {SEED} and this "
+                                  "run at seed 2")
+    # a baseline written before the file held its seed: the environment record has it
+    pb.write_final_weights(base / pb.WEIGHTS_FILE, c, w, w0=w0, losses=[0.0])
+    assert rv.baseline_seed(base) is None
+    with MetricsWriter(base, pb.RUN_NAME, seed=3):
+        pass
+    assert rv.baseline_seed(base) == 3
+    moved = {n: x.clone() for n, x in w.items()}
+    moved[c.weight_names[0]].view(-1)[0] += 1.0
+    pb.write_final_weights(run, c, moved, w0=w0, losses=[0.0], provenance={"seed": 3})
+    assert not rv.compare_with_baseline(c, base, run, 3, out=lines.append)
+    assert lines.pop().startswith("B7: FAILED")
+
+
 def test_mlp_run_at_another_seed_judges_from_step_2(mlp):
     """At a seed other than the band file's (H2), no step is in-sample and step 1 isn't judged
     (EVALUATION_SPEC §2.3)."""
@@ -234,7 +298,7 @@ def test_main_judges_logs_and_matches_the_plain_baseline(tiny_main, capsys):
     _, _, root = tiny_main
     band_bytes = (root / "bands.json").read_bytes()
     assert rv.main(["--no-metrics"]) == 0
-    assert "B7: no plain baseline" in capsys.readouterr().out
+    assert "B7: skipped, no plain baseline" in capsys.readouterr().out
     assert pb.main(["--no-metrics"]) == 0
     capsys.readouterr()
     assert rv.main(["--pass-steps", "1", "--metrics"]) == 0
@@ -275,12 +339,28 @@ def test_main_keeps_the_named_step_on_disk(tiny_main, capsys):
     assert DiskStore(d).root == store.root  # a run that keeps nothing leaves it alone
 
 
-def test_main_judges_another_seed_by_the_seed_1_band_file(tiny_main, monkeypatch):
-    # EVALUATION_SPEC §3.2: the honest runs at seeds 2–5 are judged by H1's file (seed 1)
+def test_main_judges_another_seed_by_the_seed_1_band_file(tiny_main, monkeypatch, capsys):
+    """EVALUATION_SPEC §3.2: the honest runs at seeds 2–5 are judged by H1's file (seed 1).
+    They store no step by default, and B7 skips H1's plain baseline, which trained on other
+    batches."""
     _, _, root = tiny_main
     assert Bands.from_file(root / "bands.json").stats["context"]["calibration_seed"] == 1
+    assert pb.main(["--steps", "4", "--no-metrics"]) == 0  # at seed 1
+    capsys.readouterr()
     monkeypatch.setenv("VERIF_SEED", "2")
-    assert rv.main(["--no-metrics"]) == 0
+    assert rv.main(["--steps", "4", "--no-metrics"]) == 0
+    text = capsys.readouterr().out
+    assert ("stored step: none, the run's seed 2 isn't the band file's calibration seed 1"
+            in text)
+    assert "B7: skipped, the plain baseline ran at seed 1 and this run at seed 2" in text
+    cfg = load_config()
+    assert not (root / rv.honest_run_name(cfg.model, cfg.attack, 2) / rv.TRANSCRIPTS_DIR).exists()
+    # the same run at seed 1 stores step 4 and matches the baseline
+    monkeypatch.setenv("VERIF_SEED", "1")
+    assert rv.main(["--steps", "4", "--no-metrics"]) == 0
+    text = capsys.readouterr().out
+    d = root / rv.honest_run_name(cfg.model, cfg.attack, 1) / rv.TRANSCRIPTS_DIR / "step_4"
+    assert f"stored step 4: {d}" in text and "B7: final weights bit-identical" in text
 
 
 def test_main_refuses_a_band_file_fitted_for_another_run(tiny_main, monkeypatch):

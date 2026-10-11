@@ -29,7 +29,7 @@ the BLAKE3 leaf hash of each tensor of ``W_{T+1}``, encoded as a ``W_{t+1}`` lea
 dtype, shape, raw bytes), so equal hashes mean bit-identical weights, ``-0.0`` included. Beside
 them, what the run started from and how it trained: ``W_0``'s root over the same leaf hashes
 check 0 anchors on, ``h_D``, the training config's hash, ``η``, threads, model and revision,
-``T`` and the per-step losses. The honest verified run (A12) takes ``W_0`` with
+``T``, the per-step losses and the seed. The honest verified run (A12) takes ``W_0`` with
 :func:`~verification.computation.interface.snapshot_weights` from a freshly built model, as this
 run does, and checks its final weights against the file with :func:`assert_same_final_weights`.
 
@@ -99,7 +99,7 @@ PROVENANCE_FIELDS: dict[str, str] = {
     "threads": "different threads",
     "config_hash": "different training config",
 }
-_CONFIG_FIELDS = ("model", "model_revision", "threads", "config_hash", "h_D")
+_CONFIG_FIELDS = ("model", "model_revision", "threads", "config_hash", "h_D", "seed")
 
 
 # ---- provenance ---------------------------------------------------------------------------
@@ -119,10 +119,10 @@ def training_config(cfg: RunConfig) -> dict[str, Any]:
 
 def run_provenance(cfg: RunConfig, h_D: bytes | None) -> dict[str, Any]:
     """``final_weights.json``'s config-side provenance: model, revision, threads, the hash of
-    :func:`training_config` and ``h_D``."""
+    :func:`training_config`, ``h_D`` and the run's seed."""
     return {"model": cfg.model, "model_revision": cfg.model_revision, "threads": cfg.threads,
             "config_hash": config_hash(training_config(cfg)),
-            "h_D": None if h_D is None else h_D.hex()}
+            "h_D": None if h_D is None else h_D.hex(), "seed": cfg.seed}
 
 
 # ---- final weights ------------------------------------------------------------------------
@@ -150,7 +150,9 @@ def write_final_weights(path: str | os.PathLike[str], c: DeclaredComputation,
 
     ``provenance`` gives the config side (:func:`run_provenance`); a field it lacks is
     ``null``. ``W_0``'s root, ``η`` (``c.eta``), ``steps`` (``len(losses)``) and ``losses`` come
-    from the arguments.
+    from the arguments. The run's ``seed`` is written beside the provenance but isn't one of
+    :data:`PROVENANCE_FIELDS`: it already enters ``config_hash``, and it tells A12 which
+    baseline its run can be compared with (B7 skips a baseline at another seed).
     """
     prov = dict(provenance or {})
     if set(prov) - set(_CONFIG_FIELDS):
@@ -158,6 +160,7 @@ def write_final_weights(path: str | os.PathLike[str], c: DeclaredComputation,
     hashes = final_weight_hashes(c, w)
     doc: dict[str, Any] = {"run": run}
     doc.update({k: prov.get(k) for k in PROVENANCE_FIELDS if k in _CONFIG_FIELDS})
+    doc["seed"] = prov.get("seed")
     doc.update({"w0_root": weights_root(final_weight_hashes(c, w0)), "eta": c.eta,
                 "steps": len(losses), "losses": [float(x) for x in losses],
                 "leaf_tag": TAG_WEIGHT, "root": weights_root(hashes), "hashes": hashes})
