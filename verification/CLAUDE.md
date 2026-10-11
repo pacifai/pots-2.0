@@ -80,7 +80,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_DEVICE` | `cpu` |
 | `VERIF_MODEL` | `HuggingFaceTB/SmolLM2-135M-Instruct` |
 | `VERIF_MODEL_REVISION` | `12fd25f77366fa6b3b4b768ec3050bf629380bac` |
-| `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32` |
+| `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32`. `float32` / `bfloat16` runs forward and loss under autocast (F6b, FS3); the decoder refuses any other master and fp16 compute |
 | `VERIF_ATTN_IMPL` | `eager` |
 | `VERIF_K` | `9` (was 7 until C1 recomputed it from the measured `τ`, 2026-10-05) |
 | `VERIF_BATCH` (`n_s`) / `VERIF_SEQ_LEN` (`n`) | `4` / `128` |
@@ -461,6 +461,8 @@ interface.
     - Shared: `encode_record` and `build_model`, and `weight_dtype`, `product_dtype`,
       `operand_dtype` and `accumulator_dtype` (all `float32` by default, under P6). A leaf of
       the wrong dtype is rejected. Check 5 takes `ε_in` and `ε_acc` from the last two.
+      `autocast()` (FS3) is the mixed-precision context around forward and loss, the same in
+      training, the plain run and the replay (F5a, F6b); a `nullcontext` by default.
     - Verifier: `replay(leaves) -> Replay`.
     - Prover only: `loss` and `label`. The verifier must never call them, and A5 adds a test
       for this.
@@ -489,6 +491,9 @@ interface.
   overload, an op outside `aten`/`prims`, or a supplied tensor of the wrong shape or dtype
   raises `SubstitutionError`, a `ReplayError`. `supply` must return a fresh
   tensor, never a leaf itself (autograd attaches history to op outputs; invariant 6).
+  `ProductSubstitution(supply, copied=None)` (FS3) also reports every `aten._to_copy` to
+  `copied(src, out)` after the copy runs, so the replay can follow autocast's bf16 copy of a
+  weight back to the weight.
 - `instances/mlp.py` (A3, merged). This is ref block §9.
   - `MLPComputation(widths=(16,32,32,8), n_s=4, *, eta)`. It requires `n_s ≥ 2` and every
     width ≥ 2.
@@ -505,9 +510,11 @@ interface.
   switches). One instance for Llama and Qwen2 (S2): SmolLM2 and the four full-scale models.
   It was `instances/llama.py` with `LlamaComputation` until FS1. The module docstring has the
   pins and the labeling rules.
-  - `DecoderComputation(config, *, n_s, n, eta, source=None)`, with `.from_pretrained(repo,
-    revision, *, n_s, n, eta)` and `.from_config(cfg)` (the run's instance, from a
-    `RunConfig`). It accepts `model_type` `llama` or `qwen2` and rejects Llama's
+  - `DecoderComputation(config, *, n_s, n, eta, source=None, master_dtype=float32,
+    compute_dtype=float32, device="cpu")`, with `.from_pretrained(repo, revision, *, n_s, n,
+    eta, master_dtype, compute_dtype, device)` and `.from_config(cfg)` (the run's instance,
+    from a `RunConfig`, with `VERIF_MASTER_DTYPE`, `VERIF_COMPUTE_DTYPE` and `VERIF_DEVICE`).
+    It accepts `model_type` `llama` or `qwen2` and rejects Llama's
     `attention_bias` (it also biases `o`) and `mlp_bias`, any layer that isn't full attention
     (Qwen2's sliding window), a non-SiLU activation, `pretraining_tp ≠ 1`, `n_h` not a
     multiple of `n_kv`, and non-zero dropout. Without `source`, `build_model` gives a random
@@ -523,6 +530,75 @@ interface.
       weight in `weight_names` but not in `linear_weights`, so its gradient is glue and 6b
       judges it with no instance code.
     - `M` is the same under every switch, so `matmul_count_decoder` holds for all four models.
+  - **Mixed precision (FS3, F6b, F5a).** `(master_dtype, compute_dtype)` is
+    `(MASTER_DTYPE, COMPUTE_DTYPE)`: `(fp32, fp32)` at test scale, `(fp32, bf16)` at full
+    scale. A master other than fp32 raises `ValueError`, and so does fp16 compute (it needs
+    loss scaling, which no decision covers). `weight_dtype` is the master, `product_dtype` and
+    `operand_dtype` the compute dtype, `accumulator_dtype` fp32; so check 5 takes `ε_in = 2⁻⁸`
+    and `ε_acc = 2⁻²⁴` at bf16.
+    - `autocast()` is `torch.autocast(device_type, dtype=compute_dtype)` when the two dtypes
+      differ and a `nullcontext` otherwise, so `(fp32, fp32)` is unchanged bit for bit (every
+      SmolLM2 root, loss and check number below). `loss` (the prover's and the plain step's)
+      and the replay's one forward pass run forward and loss inside it; backward runs outside
+      it and inherits the forward's dtypes. `device_type` comes from `VERIF_DEVICE`. CPU and
+      CUDA autocast cast different op sets, so a CPU result says nothing about the GPU.
+    - What CPU autocast does (torch 2.9.1): each linear reads a bf16 copy of its weight made
+      once per weight per pass, and a bf16 copy of its input made per use (q, k and v read
+      different copies of the same normed `X`). A biased linear's `addmm` receives a bf16 copy
+      of the bias, equal to `b.to(bf16)` bit for bit, so check 5's cast of the committed
+      fp32 bias to the operand dtype gives exactly what the prover's `addmm` added. The tied
+      head reads a bf16 copy of `W_E`. Softmax runs in fp32 and is cast to bf16 for `O`; the
+      RoPE angle product stays fp32 (glue). `Λ` is bf16 and the cross entropy computes in
+      fp32. Every product leaf is bf16.
+    - **Labeling under autocast.** Still by storage identity, never by value: an operand that
+      aliases autocast's copy of a weight carries `OperandInfo.param_copy`, and
+      `capture.param_of(t)` names the weight (or bias) for a copy as for the parameter. The
+      `W_x.grad` check accepts the storage AccumulateGrad adopted, or, under autocast, the
+      fp32 copy of `G_x`'s whole output (`capture.is_copy_of(grad, index)`).
+    - **The replay** follows each copy through `ProductSubstitution(copied=...)`: a copy of a
+      weight's storage maps to that weight for the pass; the map is cleared at each pass and
+      pruned as each unit's backward runs. The head's `G_E_head` is widened to fp32 before it
+      joins `G_E^emb` in `glue_gradients()`.
+    - F6b's update: the fp32 masters, SGD in fp32 on `W.grad`, which AccumulateGrad widens
+      exactly from the bf16 `G_x`. Check 6a widens the committed bf16 `G` to fp32 the same
+      way (`checks.check_6a_linear_update`); 6b's gradients are fp32 already. Qwen2's bias
+      gradients come out of autograd in bf16 (the sum over tokens of a bf16 `δY`) and are
+      widened; prover and replay agree bit for bit.
+    - `loss_from_logits` takes `μ` in CE's dtype, fp32 under autocast too: in the bf16 logits'
+      dtype, `Σ μ` rounds above 256.
+    - **SmolLM2 at `(fp32, bf16)` on the dev Mac CPU** (2026-10-11, `VERIF_COMPUTE_DTYPE=
+      bfloat16`, `k = 9`, `η = 1e-3`; the slow tests M2, A8 and A9 pass at this setting):
+      - `label` fills all 7,113 slots once, and each of the 210 linear `W_x.grad` is the fp32
+        copy of its `G_x`. The step runs 1,119 `_to_copy`. Forward (456): 211 copies of a
+        parameter (210 linear weights and `W_E` for the head), labeled by `param_copy`; 241
+        glue values cast to bf16 at a matmul's input (per layer the normed input once for
+        each of q, k, v, gate and up, RoPE'd `Q̃`, `K̃ᵀ` and the softmax; once the head's
+        input); `Λ` widened to fp32 for the cross entropy; the batch's 3 integer casts.
+        Backward (663): 211 copies of `G_x` and `G_E_head` widened to fp32 (the 210 linear
+        ones are the `W.grad` link, `G_E_head` joins `W_E`'s glue gradient); 241 more bf16
+        products widened where their consumer ran in fp32 (`dX_q`, `dX_k`, `dX_v`,
+        `dX_gate`, `dX_up`, `dA`, `dQ`, `dK` per layer, `dF`); and 211 fp32 gradients cast to
+        bf16. Only the parameter copies and the `G` copies matter to labeling; the rest is
+        glue, which the replay recomputes through the model's own code.
+      - The replay rebuilds all 2,371 forward and 4,742 backward operands and the 62 glue
+        gradients bit for bit. Peak RSS 7.72 GB in A9 (6.60 GB before the replay).
+      - Steps 1–3 are accepted under provisional bands (one judged step, then three steps in
+        calibration mode frozen with provisional bands), and the plain run's `W_4` equals the
+        verified run's bit for bit. Losses 1.369655, 2.014252, 1.562216. Check 5's largest
+        normalized residual is 1.19, 1.11 and 1.16 (`dV`, `dV`, `dA`; every other class lower,
+        `Λ` among them), largest `κ` 30.3 (`dX_down`); 6a and 6b `ρ_max` 2.0 every step. At
+        fp32 the same provisional bands reject step 1 at `Λ` (11.5 > 8). At bf16 the term
+        `√2·ε_in` of `e_m = √2·ε_in + √q·ε_acc`, with `ε_in = 2⁻⁸`, dominates every class,
+        and the honest residual, mostly the product's own rounding to bf16, is of the same
+        order, so no class stands out the way `Λ` does at fp32. The bands for bf16 are not
+        calibrated: `band_context` holds the dtypes, so the fp32 band file is refused.
+      - `prove_step` takes 45–46 s per step against 0.8 s at fp32; commit 0.21 s; the
+        verifier 1.6–1.7 s (check 5 1.31 s), as at fp32. CPU bf16 matmul is slow on this Mac
+        (torch 2.9.1 without MKL-DNN, Accelerate has no bf16 path): about 3.8 GFLOP/s with a
+        contiguous `B`, 277 GFLOP/s with a transposed `B` (the forward linear's layout),
+        against about 1,700 GFLOP/s in fp32. The head's 512×576×49152 product takes 23 s in
+        bf16 and 20 ms in fp32, and the backward products dominate. The determinism flag
+        changes nothing. This is a property of the platform; it says nothing about the GPU.
   - `build_model()`: an unmodified `from_pretrained` causal LM (`AutoModelForCausalLM`) through
     `setup.model.load_pretrained`, eager attention, fp32, in eval mode, checked against the
     declared weights and against `tied` (the output projection is or isn't `W_E`'s tensor).
@@ -640,6 +716,14 @@ interface.
     non-zero biases check 5 rejects the honest step at the first biased product (`P_1`,
     `L1.Y_q`): it still measures `A·B`, and the committed leaf is `A·B + 1·bᵀ`. Task FS2 adds
     the bias term.
+  - **Both compute dtypes in the fast suite (FS3).** The `switched` fixture runs each of the
+    four combinations at `(fp32, fp32)` and `(fp32, bf16)`, so labeling, the bias's copy,
+    the `W.grad` link, the bit-for-bit replay and the honest step's acceptance are tested
+    under autocast too. At bf16 on the tiny models (provisional bands, zero biases) check 5's
+    largest normalized residual is 0.65–0.80, and check 6's `ρ_max` 1.5–2.0, as at fp32.
+    `test_plain_baseline` adds a bf16 tiny Llama whose plain and verified final weights are
+    equal, and `tests/verification/runs/test_calibrate.py` runs `gradient_coherence` at both
+    dtypes.
 
 ### `verification/prover/`
 
@@ -651,8 +735,21 @@ interface.
       products) and `.n_products`, where each `(s,h)` bmm member counts once;
     - `.summary()`, `.release_operands()` and `.assert_unmodified()`.
   - `param_storage_map(model)` comes from `computation/matmul_ops.py`, as do the op lists.
-    `OperandInfo` has `param_name`, `storage_ptr` and `producer_index`. A storage pointer is
-    valid only while the capture holds its tensors, so link records by `producer_index`.
+    `OperandInfo` has `param_name`, `storage_ptr`, `producer_index` and `param_copy`. A storage
+    pointer is valid only while the capture holds its tensors, so link records by
+    `producer_index`.
+  - **Copies (FS3).** Inside a phase every `aten._to_copy` becomes a `CopyRecord(index, phase,
+    src_info, out_info, storage)` in `.copies`; `.param` names the parameter it copies,
+    directly or through an earlier copy. A copy of a parameter is held until
+    `release_operands`, and an operand aliasing it carries `OperandInfo.param_copy`. Any
+    other copy is held only through a `StorageWeakRef` to its storage: a strong reference
+    would keep activations alive and turn AccumulateGrad's adoption of a gradient copy into
+    a clone. `param_of(t)` names the parameter `t` aliases, directly or as a copy, until
+    `release_operands`. `is_copy_of(t, index)` says whether `t` shares the storage of a
+    `_to_copy` of record `index`'s whole output, with the same view; storages compare by
+    identity, so a reused address never matches. `summary()` adds `n_copies` and
+    `n_param_copies`. At `(fp32, fp32)` a SmolLM2 step makes 3 copies (the batch's int64
+    mask and ids cast to bool and fp32, all glue) and none of a parameter.
   - Errors: `CaptureError`, `UnsupportedMatmulError` (any `REJECTED_OPS` op, a non-default
     overload, or an op outside `aten`/`prims` inside a phase), `BiasedMatmulError` (`α ≠ 1`,
     or a non-zero bias outside F14's form, a bias vector added once with `β = 1`; every
@@ -806,6 +903,9 @@ interface.
     above `τ_W` in judging mode, or mixed dtypes fall back to
     `_update_identity_reference`, the spec's formula, so every rejection message is
     unchanged. `tests/verification/verifier/test_update_identity.py` compares the two.
+  - **Check 6a under mixed precision (FS3, F6b).** The committed `G` is a bf16 product leaf;
+    6a widens it exactly to fp32 before the update identity, as AccumulateGrad does for
+    training's `W.grad`. At fp32 the cast is a no-op.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
     from the claimed root `store.root`, as check 2's read validated it
     (`ctx.state.claimed_root`; F15a, task C7). The root comparison at the end of the step
@@ -1166,7 +1266,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   - On success it writes `$VERIF_OUTPUT_DIR/bands.json`, then judges steps 1–3 again from the
     file with the κ guard on (`frozen`) and off (`frozen_no_kappa`), asserts one band-file
     hash across the three runs, measures gradient coherence on step 1's batch at `W_0`
-    (`gradient_coherence`), runs the memory and counting passes of `frozen`, and prints the
+    (`gradient_coherence`, with forward and loss under the run's `autocast()`, as training;
+    FS3), runs the memory and counting passes of `frozen`, and prints the
     cost split (`cost_split`). Records `calibration` and `gradient_coherence` go to
     `records.jsonl`.
   - First run (2026-10-05, dev Mac, `MallocLargeCache=0`): at `k = 7`, `s_h = 5.62` (`Λ`),
