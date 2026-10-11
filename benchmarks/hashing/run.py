@@ -199,7 +199,7 @@ def run(argv: list[str] | None = None, log=print) -> Path:
     def get_step(name: str):
         if name not in steps:
             model, n_s, n, p_dtype = _step_spec(name, args["n_s"], args["n"])
-            steps[name] = step(model, n_s=n_s, n=n, product_dtype=p_dtype)
+            steps[name] = step(model, n_s=n_s, n=n, compute_dtype=p_dtype)
         return steps[name]
 
     def e0() -> dict:

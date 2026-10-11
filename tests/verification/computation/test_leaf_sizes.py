@@ -9,11 +9,13 @@ from setup.data import TEST_SCALE_TOKENIZER
 from setup.model import load_model_config
 from verification.commitment.leaves import leaf_parts
 from verification.computation.instances import DecoderComputation
+from verification.computation import leaf_sizes as leaf_sizes_module
 from verification.computation.instances.decoder import matmul_count_decoder
 from verification.computation.leaf_sizes import LeafSize, leaf_sizes
 from verification.prover.step import prove_step
 
-from tests.verification.decoder_helpers import SWITCHES, make_records, switch_id, tiny_config
+from tests.verification.decoder_helpers import (SWITCHES, make_records, randomize_biases,
+                                                switch_id, tiny_config)
 
 
 def smollm2_config():
@@ -42,10 +44,11 @@ def test_test_scale_step():
     assert lam.shape == (512, 49152) and lam.nbytes == 3 + 8 + 512 * 49152 * 4
 
 
-def test_dtypes_replace_the_declared_ones():
-    """bf16 products and fp32 weights, F1a's full-scale precisions: only products shrink."""
+def test_compute_dtype_sets_the_products():
+    """bf16 compute, F1a's full-scale precision: fp32 weights, bf16 products, only products
+    shrink."""
     base = leaf_sizes(smollm2_config(), n_s=2, n=16)
-    mixed = leaf_sizes(smollm2_config(), n_s=2, n=16, product_dtype=torch.bfloat16)
+    mixed = leaf_sizes(smollm2_config(), n_s=2, n=16, compute_dtype=torch.bfloat16)
     assert len(base) == len(mixed)
     for a, b in zip(base, mixed):
         assert (a.index, a.section, a.name, a.role, a.shape) == \
@@ -57,12 +60,29 @@ def test_dtypes_replace_the_declared_ones():
             assert (b.dtype, b.nbytes) == (a.dtype, a.nbytes)
 
 
-def assert_agrees(c, records):
-    """Every leaf of ``c``'s committed step has the listed slot, shape, dtype and encoded size."""
+def test_a_layout_mismatch_raises(monkeypatch):
+    """The slot names come from ``commitment.leaves``; a disagreement is an error, not an
+    assert that ``python -O`` drops."""
+    real = leaf_sizes_module._tensor_slot
+
+    def renamed(c, i):
+        tag, shape, dtype, slot = real(c, i)
+        return tag, shape, dtype, "W_t[elsewhere]"
+
+    monkeypatch.setattr(leaf_sizes_module, "_tensor_slot", renamed)
+    with pytest.raises(RuntimeError, match="disagree"):
+        leaf_sizes(tiny_config(), n_s=2, n=12)
+
+
+def assert_agrees(c, records, biases=False):
+    """Every leaf of ``c``'s committed step has the listed slot, shape, dtype and encoded size.
+    ``biases`` draws the q/k/v biases first (HF starts them at zero)."""
     model = c.build_model()
     w0 = {name: p.detach().clone() for name, p in model.named_parameters()}
+    if biases:
+        randomize_biases(w0)
     leaves = prove_step(c, model, w0, records).leaves()
-    ls = leaf_sizes(c.config, n_s=c.n_s, n=c.n)
+    ls = leaf_sizes(c.config, n_s=c.n_s, n=c.n, compute_dtype=c.compute_dtype)
     assert len(ls) == len(leaves) == c.n_leaves
     for l, obj in zip(ls, leaves):
         size = sum(memoryview(p).nbytes for p in leaf_parts(c, l.index, obj))
@@ -78,13 +98,18 @@ def assert_agrees(c, records):
     return ls
 
 
+@pytest.mark.parametrize("compute_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("switch", SWITCHES, ids=switch_id)
-def test_agrees_with_a_committed_step(switch):
+def test_agrees_with_a_committed_step(switch, compute_dtype):
     """A tiny model's real step (full-length records), for each config switch (untied output
-    layer, q/k/v biases)."""
+    layer, q/k/v biases, drawn non-zero) and both compute dtypes: at bf16, fp32 weights and
+    bf16 products, as full scale commits them."""
     family, tied = switch
-    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
-    assert_agrees(c, make_records((12, 12)))
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=compute_dtype)
+    ls = assert_agrees(c, make_records((12, 12)), biases=c.qkv_bias)
+    assert {l.dtype for l in ls if l.section == "product"} == {compute_dtype}
+    assert {l.dtype for l in ls if l.section in ("w_t", "w_next")} == {torch.float32}
 
 
 @pytest.mark.slow
@@ -111,8 +136,7 @@ FULL_SCALE = [
 @pytest.mark.parametrize("repo,revision,logits_gb", FULL_SCALE, ids=[r for r, _, _ in FULL_SCALE])
 def test_full_scale_step(repo, revision, logits_gb):
     config = load_model_config(repo, revision)
-    ls = leaf_sizes(config, n_s=128, n=128, weight_dtype=torch.float32,
-                    product_dtype=torch.bfloat16)
+    ls = leaf_sizes(config, n_s=128, n=128, compute_dtype=torch.bfloat16)
     n_w = sum(l.section == "w_t" for l in ls)
     assert len(ls) == 128 + 2 * n_w + matmul_count_decoder(
         config.num_hidden_layers, 128, config.num_attention_heads)

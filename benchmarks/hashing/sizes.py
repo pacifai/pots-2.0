@@ -83,9 +83,8 @@ def model_config(key: str) -> Any:
     return load_model_config(pin.repo, pin.revision)
 
 
-def step(key: str, *, n_s: int, n: int, weight_dtype: torch.dtype = torch.float32,
-         product_dtype: torch.dtype = torch.bfloat16) -> Step:
-    """The step's leaves; the defaults are full scale's precisions (F1a)."""
-    leaves = leaf_sizes(model_config(key), n_s=n_s, n=n, weight_dtype=weight_dtype,
-                        product_dtype=product_dtype)
-    return Step(key, n_s, n, weight_dtype, product_dtype, tuple(leaves))
+def step(key: str, *, n_s: int, n: int, compute_dtype: torch.dtype = torch.bfloat16) -> Step:
+    """The step's leaves at ``compute_dtype`` (the run's ``COMPUTE_DTYPE``): fp32 weights and
+    ``compute_dtype`` products. The default is full scale's bf16 (F1a); test scale is fp32."""
+    leaves = leaf_sizes(model_config(key), n_s=n_s, n=n, compute_dtype=compute_dtype)
+    return Step(key, n_s, n, torch.float32, compute_dtype, tuple(leaves))

@@ -45,17 +45,15 @@ class LeafSize:
     nbytes: int
 
 
-def leaf_sizes(config: Any, *, n_s: int, n: int, weight_dtype: torch.dtype | None = None,
-               product_dtype: torch.dtype | None = None) -> list[LeafSize]:
+def leaf_sizes(config: Any, *, n_s: int, n: int,
+               compute_dtype: torch.dtype = torch.float32) -> list[LeafSize]:
     """Every leaf of one step for a Llama or Qwen2 ``config`` at batch ``n_s × n``, in leaf order.
 
-    ``weight_dtype`` and ``product_dtype`` replace the declared dtypes (fp32 today), for sizing
-    a mixed-precision step: full scale commits fp32 weights and bf16 products (F1a). Left as
-    ``None``, each is the computation's own.
+    ``compute_dtype`` is the run's ``COMPUTE_DTYPE``, passed to :class:`DecoderComputation`:
+    weights are fp32 (``MASTER_DTYPE``), products ``compute_dtype``. Full scale is bf16 (F1a),
+    test scale fp32.
     """
-    c = DecoderComputation(config, n_s=n_s, n=n, eta=1.0)
-    w_dtype = weight_dtype or c.weight_dtype
-    p_dtype = product_dtype or c.product_dtype
+    c = DecoderComputation(config, n_s=n_s, n=n, eta=1.0, compute_dtype=compute_dtype)
     zeros = torch.zeros(n, dtype=torch.int32)
     record_bytes = len(c.encode_record(Record(ids=zeros, targets=zeros, mask=zeros)))
     out = [LeafSize(i, "record", f"record {i}", None, (3, n), torch.int32, record_bytes)
@@ -63,16 +61,18 @@ def leaf_sizes(config: Any, *, n_s: int, n: int, weight_dtype: torch.dtype | Non
     header_bytes: dict[tuple[int, int], int] = {}
     n_w, M = c.n_w, c.M
     for i in range(n_s, c.n_leaves):
-        tag, shape, _, slot = _tensor_slot(c, i)
+        tag, shape, dtype, slot = _tensor_slot(c, i)
         role = None
         if i < n_s + n_w:
-            section, dtype, name = "w_t", w_dtype, c.weight_names[i - n_s]
+            section, name = "w_t", c.weight_names[i - n_s]
         elif i < n_s + n_w + M:
             spec = c.product(i - n_s - n_w + 1)
-            section, dtype, name, role = "product", p_dtype, spec.name, c.product_class(spec)
+            section, name, role = "product", spec.name, c.product_class(spec)
         else:
-            section, dtype, name = "w_next", w_dtype, c.weight_names[i - n_s - n_w - M]
-        assert name in slot, (name, slot)
+            section, name = "w_next", c.weight_names[i - n_s - n_w - M]
+        if name not in slot:
+            raise RuntimeError(f"leaf {i}: the layout's slot {slot!r} doesn't name {name!r}; "
+                               "this list and commitment.leaves disagree on the leaf order")
         key = (tag, len(shape))
         if key not in header_bytes:  # the header's length depends only on ndim
             header_bytes[key] = len(tensor_leaf_header(tag, torch.empty(shape, device="meta")))
