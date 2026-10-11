@@ -202,9 +202,10 @@ class Verifier:
                 idx = list(self._schedule(t))
             except ValueError as e:
                 return Rejection(RUN_START, "1", f"π({t}) is undefined: {e}")
-            if len(idx) != self.c.n_s or not all(0 <= i < self.n_records for i in idx):
+            if (len(idx) != self.c.n_s or len(set(idx)) != len(idx)
+                    or not all(0 <= i < self.n_records for i in idx)):  # F8c: n_s distinct records
                 return Rejection(RUN_START, "1", f"π({t}) = {idx} is not {self.c.n_s} "
-                                                 f"indices into D")
+                                                 f"distinct indices into D")
         return None
 
     # ---- per step: checks 4, 7, 2, 6a, 5, 6b, 2.root -------------------------------------

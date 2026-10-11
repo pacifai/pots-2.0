@@ -67,7 +67,9 @@ class ProductSpec:
     ``weight`` names the learnable weight the product involves, or is ``None`` for a
     weight-free bilinear product. ``layer`` is the 1-based layer, or ``None`` outside the layer
     stack. ``member`` is the ``(s, h)`` index of one member of a batched attention product (A7),
-    or ``None``.
+    or ``None``. ``bias`` names the declared weight ``b`` that the same op adds,
+    ``P = A·B + 1·bᵀ``, or is ``None``. Check 5 then checks the matmul ``[A | 1]·[B ; bᵀ]``
+    (spec §2, F14) with ``b`` read from the committed ``W_t``, and ``q`` is one greater.
     """
 
     m: int  # 1-based position in canonical product order
@@ -78,6 +80,7 @@ class ProductSpec:
     weight: str | None = None
     layer: int | None = None
     member: tuple[int, ...] | None = None
+    bias: str | None = None
 
     def __post_init__(self) -> None:
         if self.m < 1:
@@ -93,8 +96,9 @@ class ProductSpec:
 
     @property
     def q(self) -> int:
-        """Contracted dimension."""
-        return self.a_shape[1]
+        """Contracted dimension of the checked matmul: ``A``'s columns, plus the ones column of
+        ``[A | 1]`` when a bias is added (F14)."""
+        return self.a_shape[1] + (self.bias is not None)
 
     @property
     def width(self) -> int:
@@ -273,6 +277,15 @@ class DeclaredComputation(ABC):
                 raise ValueError(f"product {p.name} has q={p.q}; a q=1 product is glue (P7)")
             if p.weight is not None and p.weight not in self._weight_pos:
                 raise ValueError(f"product {p.name} names unknown weight {p.weight}")
+            if p.bias is not None:
+                # Check 5 measures a biased product alone, and the bias's gradient is glue (6b).
+                if p.bias not in self._weight_pos or p.bias in self.linear_weights:
+                    raise ValueError(f"product {p.name}: bias {p.bias} is not a declared weight "
+                                     f"whose gradient is glue")
+                shape = tuple(self.weight_shapes[p.bias])
+                if shape != (p.width,) or p.member is not None:
+                    raise ValueError(f"product {p.name}: bias {p.bias} {shape} doesn't fit a "
+                                     f"{'member' if p.member else 'product'} of width {p.width}")
         if not (isinstance(self.eta, float) and self.eta > 0 and self.eta < float("inf")):
             raise ValueError(f"eta must be a positive finite float, got {self.eta!r}")
         if len({p.name for p in self.products}) != self.M:

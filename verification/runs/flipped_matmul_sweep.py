@@ -163,6 +163,7 @@ class Held:
     leaf: torch.Tensor  # the committed leaf object, put back after the trials
     p: torch.Tensor  # its fp32 view, as check 5 reads it
     p_norm: float  # ‖P‖_F in float64
+    bias: torch.Tensor | None = None  # a biased product's committed bias, as check 5 reads it
 
 
 def hold_targets(c: DeclaredComputation, store: InMemoryStore,
@@ -180,8 +181,10 @@ def hold_targets(c: DeclaredComputation, store: InMemoryStore,
     for s in specs:
         leaf = store.leaf(c.product_index(s.m))
         p = leaf.detach().to(torch.float32)
+        bias = None if s.bias is None else store.leaf(c.w_t_index(s.bias)).detach().to(
+            c.operand_dtype).to(torch.float32)
         held.append(Held(s, product_class(c, s), *ops[s.m], leaf, p,
-                         float(torch.linalg.vector_norm(p, dtype=torch.float64))))
+                         float(torch.linalg.vector_norm(p, dtype=torch.float64)), bias))
     return held
 
 
@@ -264,7 +267,7 @@ def sweep_target(c: DeclaredComputation, store: InMemoryStore, held: Held, ctx: 
                 for _ in range(trials):
                     p2, f_real = plant(held.p, shape, f, held.p_norm, gen)
                     root = perturb_leaf(c, store, idx, p2)
-                    [mp] = _measure_run([s], [(held.a, held.b, p2)], h=root, k=ctx.k,
+                    [mp] = _measure_run([s], [(held.a, held.b, p2, held.bias)], h=root, k=ctx.k,
                                         eps_in=ctx.eps_in, eps_acc=ctx.eps_acc,
                                         scratch=scratch, guard=ctx.kappa_guard)
                     rej = _judge_product(c, s, mp, ctx, bands)
@@ -285,8 +288,9 @@ def honest_measure(c: DeclaredComputation, store: InMemoryStore, held: Held,
                    ctx: StepContext, bands: Bands) -> tuple[float, ...]:
     """The target's normalized residuals on the unperturbed transcript, measured as the sweep
     measures (they must equal the run's check-5 numbers for that product)."""
-    [mp] = _measure_run([held.spec], [(held.a, held.b, held.p)], h=store.root, k=ctx.k,
-                        eps_in=ctx.eps_in, eps_acc=ctx.eps_acc, guard=ctx.kappa_guard)
+    [mp] = _measure_run([held.spec], [(held.a, held.b, held.p, held.bias)], h=store.root,
+                        k=ctx.k, eps_in=ctx.eps_in, eps_acc=ctx.eps_acc,
+                        guard=ctx.kappa_guard)
     if _judge_product(c, held.spec, mp, ctx, bands) is not None:
         raise AssertionError(f"P_{held.spec.m}: the honest product is rejected")
     ctx.stats.products.clear()

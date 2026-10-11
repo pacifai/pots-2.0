@@ -123,7 +123,7 @@ class CalibrationRun:
 
 
 def _sizing_inputs(c: DecoderComputation, T_run: int) -> dict[str, Any]:
-    return {"q_max": max(p.a_shape[1] for p in c.products),
+    return {"q_max": max(p.q for p in c.products),
             "eps_in": UNIT_ROUNDOFF[c.operand_dtype], "eps_acc": UNIT_ROUNDOFF[c.accumulator_dtype],
             "T": T_run, "M": c.M}
 

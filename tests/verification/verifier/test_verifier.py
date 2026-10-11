@@ -465,6 +465,12 @@ def test_check_1_dataset_anchor(c, D, tree, w0):
     v = _make(c, D, tree, w0, n_steps=N_RECORDS // c.n_s + 1,
               schedule=lambda t: list(range(4 * t - 4, 4 * t)))
     _expect(v.start_run(D), 0, "1")
+    # A batch holds n_s distinct records (F8c), here a repeat at step 2 of 3.
+    v = _make(c, D, tree, w0, n_steps=3,
+              schedule=lambda t: [0, 1, 2, 2] if t == 2 else list(range(4 * t - 4, 4 * t)))
+    rej = v.start_run(D)
+    _expect(rej, 0, "1")
+    assert rej.detail.startswith("π(2) = [0, 1, 2, 2] is not 4 distinct"), rej.detail
     # F8c's π starts a reshuffled pass after ⌊|D|/n_s⌋ steps, so it fits at any T.
     assert _make(c, D, tree, w0, n_steps=2 * (N_RECORDS // c.n_s) + 1).start_run(D) is None
 
