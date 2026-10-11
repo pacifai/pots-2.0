@@ -45,6 +45,15 @@ def llama():
     return c, D, snapshot_weights(c, c.build_model())
 
 
+@pytest.fixture(scope="module")
+def llama_bf16():
+    """The tiny decoder at ``(fp32, bf16)`` (F6b): bf16 products, fp32 weights."""
+    n = 12
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3, compute_dtype=torch.bfloat16)
+    D = make_records([n, n - 3, n - 5, n, n - 1, n - 4, n - 2, n], seed=1)
+    return c, D, snapshot_weights(c, c.build_model())
+
+
 def _verified(c, D, w0, T, final):
     v = Verifier(c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=T,
                  bands=Bands.provisional(), w0=w0, allow_provisional=True, seed=SEED)
@@ -65,7 +74,7 @@ def test_run_plain_is_chained_plain_steps(mlp):
     assert pb.final_weight_hashes(c, w) == pb.final_weight_hashes(c, res.w_final)
 
 
-@pytest.mark.parametrize("inst", ["mlp", "llama"])
+@pytest.mark.parametrize("inst", ["mlp", "llama", "llama_bf16"])
 def test_plain_final_weights_equal_the_verified_runs(inst, request):
     """Capture on (run_loop, verified and accepted) or off (run_plain): bit-identical W_{T+1}."""
     c, D, w0 = request.getfixturevalue(inst)

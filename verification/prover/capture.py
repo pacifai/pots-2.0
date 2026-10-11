@@ -36,6 +36,13 @@ What is recorded, per op:
   :class:`UnsupportedMatmulError` unless ``ALLOWED_NAMESPACE_OPS`` lists it. Other namespaces
   hold opaque products (``_quantized::linear``, ``onednn::qlinear_pointwise``,
   ``inductor::_mm_plus_mm``, custom ``torch.library`` ops) that no name list can track.
+- Inside a phase, ``aten._to_copy``: one :class:`CopyRecord` in :attr:`MatmulCapture.copies`.
+  Under mixed precision (F6b) these are autocast's casts of weights and activations and the
+  autograd engine's casts of gradients. A copy of a parameter (or of such a copy) is held until
+  :meth:`MatmulCapture.release_operands`, and an operand that aliases it carries
+  :attr:`OperandInfo.param_copy`. Any other copy is held through a weak reference to its
+  storage, so the capture keeps no activation alive that training would free, and a strong
+  reference would stop AccumulateGrad adopting a gradient copy as ``W.grad``.
 
 The op lists and ``param_storage_map`` live in ``computation/matmul_ops.py``, which the
 verifier's substitution reads too (invariant 1: the verifier never imports this module).
@@ -57,6 +64,15 @@ Records are in call order, not the canonical order of ref block §6. Hand-off no
   third is the **transpose** of the spec's ``δK̃ = δSᵀ·Q̃``: autograd's bmm backward computes
   ``grad_B = Aᵀ·grad`` for ``B = K̃ᵀ``. A7 commits the contiguous transpose of that output as
   the ``δK̃`` leaf and rebuilds its operands as ``(δSᵀ, Q̃)``.
+- **Mixed precision** (``(fp32, bf16)``, CPU autocast in torch 2.9.1). A linear's forward is
+  ``mm(X', W'.t())``, where ``W'`` is autocast's bf16 copy of ``W`` (one per weight per pass)
+  and ``X'`` a bf16 copy of ``X`` made per use, so q, k and v (and gate and up) read different
+  copies; ``o`` and ``down`` receive bf16 inputs and read them directly. ``b_info.param_name``
+  is then ``None`` and ``b_info.param_copy`` names ``W``; a biased linear's ``bias`` is a bf16
+  copy of ``b_x`` too (:meth:`MatmulCapture.param_of`). ``δX_x = mm(δY, W')`` reads the same
+  copy. ``G_x`` is a bf16 product, and AccumulateGrad adopts its fp32 copy as ``W_x.grad``
+  (it adopts ``copy.detach()``, so ``W_x.grad`` shares the copy's storage, not its tensor;
+  :meth:`MatmulCapture.is_copy_of`). Every product is bf16; the RoPE table stays fp32.
 - **Phases.** The phase is the caller's flag, nothing more. Activation checkpointing would rerun
   forward matmuls inside the backward phase and mislabel them, and add products the reference
   block does not count. The prover must assert it is off.
@@ -89,6 +105,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from verification.computation.matmul_ops import (
@@ -107,12 +124,14 @@ __all__ = [
     "MutatedCaptureError",
     "OperandInfo",
     "MatmulRecord",
+    "CopyRecord",
     "MatmulCapture",
 ]
 
 PHASES = ("forward", "backward")
 
 _aten = torch.ops.aten
+_TO_COPY = _aten._to_copy.default
 
 # Handled ops: name -> (is_batched, has_bias). Only the `.default` overload is accepted.
 _HANDLED = {
@@ -153,6 +172,8 @@ class OperandInfo:
     ``producer_index`` is the :attr:`MatmulRecord.index` of the earlier record whose output
     storage this tensor aliases (the same tensor or a view of it), or ``None`` when glue or a
     parameter produced it. It stays valid after :meth:`MatmulCapture.release_operands`.
+    ``param_copy`` names the parameter when the tensor aliases a ``_to_copy`` of it, such as
+    autocast's bf16 copy of a weight (F6b).
     """
 
     storage_ptr: int
@@ -162,6 +183,7 @@ class OperandInfo:
     dtype: torch.dtype
     param_name: str | None  # set when the tensor aliases a model parameter's storage
     producer_index: int | None = None
+    param_copy: str | None = None
 
 
 @dataclass
@@ -208,6 +230,24 @@ class MatmulRecord:
                 yield self.a[i], self.b[i], self.out[i]
 
 
+@dataclass
+class CopyRecord:
+    """One captured ``aten._to_copy`` inside a phase. ``storage`` is a weak reference to the
+    output's storage: it keeps the storage's identity, not its memory, so no other storage
+    compares equal to it while the record lives."""
+
+    index: int  # position in MatmulCapture.copies
+    phase: str
+    src_info: OperandInfo
+    out_info: OperandInfo
+    storage: StorageWeakRef = field(repr=False)
+
+    @property
+    def param(self) -> str | None:
+        """The parameter this copies, directly or through earlier copies."""
+        return self.src_info.param_name or self.src_info.param_copy
+
+
 class MatmulCapture(TorchDispatchMode):
     """Passthrough dispatch mode recording every matmul of a forward + backward."""
 
@@ -216,9 +256,14 @@ class MatmulCapture(TorchDispatchMode):
         self.param_names: Mapping[int, str] = dict(param_names or {})
         self.records: list[MatmulRecord] = []
         self.glue_outer: list[MatmulRecord] = []
+        self.copies: list[CopyRecord] = []
         self._phase: str | None = None
         self._n_calls = 0
         self._producers: dict[int, int] = {}  # output storage ptr -> record index
+        # A parameter copy's storage ptr -> the parameter. The copies are held, so no ptr is
+        # reused while the map is live.
+        self._param_copies: dict[int, str] = {}
+        self._held: list[torch.Tensor] = []
 
     @contextlib.contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -251,6 +296,10 @@ class MatmulCapture(TorchDispatchMode):
             out = func(*args, **kwargs)
             self._record(func, name, parsed, out)
             return out
+        if func is _TO_COPY and self._phase is not None:
+            out = func(*args, **kwargs)
+            self._record_copy(args[0], out)
+            return out
         if func.namespace == "aten" and name in REJECTED_OPS:
             raise UnsupportedMatmulError(
                 f"{func} reached dispatch. The capture handles only mm, bmm, addmm and "
@@ -282,7 +331,16 @@ class MatmulCapture(TorchDispatchMode):
     def _info(self, t: torch.Tensor) -> OperandInfo:
         ptr = t.untyped_storage().data_ptr()
         return OperandInfo(ptr, t.storage_offset(), tuple(t.shape), tuple(t.stride()), t.dtype,
-                           self.param_names.get(ptr), self._producers.get(ptr))
+                           self.param_names.get(ptr), self._producers.get(ptr),
+                           self._param_copies.get(ptr))
+
+    def _record_copy(self, src: torch.Tensor, out: torch.Tensor) -> None:
+        rec = CopyRecord(len(self.copies), self._phase, self._info(src), self._info(out),
+                         StorageWeakRef(out.untyped_storage()))
+        if rec.param is not None:
+            self._param_copies[rec.out_info.storage_ptr] = rec.param
+            self._held.append(out)
+        self.copies.append(rec)
 
     def _record(self, func, name, parsed, out: torch.Tensor) -> None:
         batched, _ = _HANDLED[name]
@@ -312,6 +370,7 @@ class MatmulCapture(TorchDispatchMode):
         for rec in self.records + self.glue_outer:
             rec.a = rec.b = rec.bias = None
             rec.versions = {k: v for k, v in rec.versions.items() if k == "out"}
+        self._held, self._param_copies = [], {}
 
     def assert_unmodified(self) -> None:
         """Raise if any held captured tensor was mutated in place since capture (invariant 6).
@@ -329,6 +388,30 @@ class MatmulCapture(TorchDispatchMode):
             raise MutatedCaptureError(
                 "captured tensors mutated in place after capture: " + "; ".join(bad[:10])
                 + (f" (+{len(bad) - 10} more)" if len(bad) > 10 else ""))
+
+    def param_of(self, t: torch.Tensor) -> str | None:
+        """The parameter ``t`` aliases, directly or as a copy; valid until
+        :meth:`release_operands`."""
+        ptr = t.untyped_storage().data_ptr()
+        return self.param_names.get(ptr) or self._param_copies.get(ptr)
+
+    def is_copy_of(self, t: torch.Tensor, index: int) -> bool:
+        """Whether ``t`` is a copy of record ``index``'s whole output, such as the fp32 copy of
+        a bf16 weight gradient that AccumulateGrad adopts as ``W.grad``. Storages compare by
+        identity, so an allocator reusing a freed copy's address never matches."""
+        rec = next((r for r in self.records + self.glue_outer if r.index == index), None)
+        if rec is None:
+            return False
+        o = rec.out_info
+        whole = (o.storage_offset, o.shape, o.stride)
+        mine = StorageWeakRef(t.untyped_storage())
+        view = (t.storage_offset(), tuple(t.shape), tuple(t.stride()), t.dtype)
+        return any(c.src_info.producer_index == index
+                   and (c.src_info.storage_offset, c.src_info.shape, c.src_info.stride) == whole
+                   and c.storage == mine
+                   and (c.out_info.storage_offset, c.out_info.shape, c.out_info.stride,
+                        c.out_info.dtype) == view
+                   for c in self.copies)
 
     @property
     def n_products(self) -> int:
@@ -348,6 +431,8 @@ class MatmulCapture(TorchDispatchMode):
             "calls_by_phase_op": {f"{p} {o}": n for (p, o), n in sorted(ops.items())},
             "n_glue_outer_calls": len(self.glue_outer),
             "n_glue_outer_products": sum(r.n_members for r in self.glue_outer),
+            "n_copies": len(self.copies),
+            "n_param_copies": sum(c.param is not None for c in self.copies),
             "q_min": min(qs) if qs else None,
             "q_max": max(qs) if qs else None,
             "output_bytes": sum(r.out.numel() * r.out.element_size() for r in self.records),
