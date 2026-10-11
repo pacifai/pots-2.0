@@ -192,6 +192,8 @@ Two instances exist, in `instances/`:
   - **q, k, v biases.** Qwen2.5 adds a bias vector to the query, key and value projections.
     PyTorch computes such a projection as one `addmm`, the product plus the bias, and the
     committed product is that whole output. So a bias adds no product, and `M` is the same.
+    The product's declaration names its bias, and check 5 checks it as one matmul with an
+    extra column of ones in `A` and the bias as an extra row of `B` (`[A | 1]·[B ; bᵀ]`).
     Each bias is a weight whose gradient is a sum over tokens, so it is checked as glue,
     like the norm scales.
 
@@ -413,6 +415,12 @@ What each check establishes:
   4. A second test guards against cancellation. It bounds `‖|A|(|B|·1)‖` by
      `κ · ‖|P|·1‖`, so a product can't hide error inside large terms that cancel.
 
+  A biased projection's product is `P = A·B + 1·bᵀ`. Both tests then use `[A | 1]` and
+  `[B ; bᵀ]`, with `b` read from the committed `W_t`, never from a copy the prover sends:
+  `bᵀ·r` is added to every row of `A(B·r)`, `‖b‖₁` to every row of `|A|(|B|·1)`, and the
+  rounding error `e_m` is that of `q + 1` summands. The ones are exact, and `b` is rounded to
+  the operand format as `B` is.
+
   Norms are computed with power-of-two scaling so they can't overflow, and any
   non-finite value rejects. A forged product fails here. So does a substituted batch: the
   forward products no longer match the committed records.
@@ -435,7 +443,7 @@ sequenceDiagram
     participant P as Prover
     participant S as Store
     participant V as Verifier
-    H->>V: start_run(D): check 1 (h_D, |D|, π fits), check 0 prepared (hash W_0)
+    H->>V: start_run(D): check 1 (h_D, |D|, π distinct and fits), check 0 prepared (hash W_0)
     loop t = 1 … T
         H->>P: prove_step(W_t, π(t))
         P-->>H: StepOutput
@@ -478,9 +486,11 @@ Every later run loads the band file read-only with `calibration.load_bands(path,
 context=...)`. It refuses a missing file, a file calibrated at another `k`, and a file whose
 recorded run (`band_context`: model, dtypes, attention, device, `h_D`, batch shape, `η`, `M`,
 `T` and `k`) differs from the run loading it. The file also records the calibration run's
-seed but doesn't compare it, so the file fitted at seed 1 judges the runs at every seed. The
-harness then checks with `assert_same_band_source` that every run was judged by the same
-file.
+seed and thread count but doesn't compare them. The bands don't depend on `π`, so the file
+fitted at seed 1 judges the runs at every seed. The thread count changes only the order of
+the CPU's floating-point sums, a shift far below `τ`, and the cost results need it recorded.
+A file written before the thread count was recorded still loads. The harness then checks
+with `assert_same_band_source` that every run was judged by the same file.
 
 `runs/calibrate.py` does all of this on the real SmolLM2 run:
 
@@ -565,7 +575,8 @@ Breaking any of these voids the result. Each one has a test.
 | Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. Refitted at C5–C6: `s_h = 4.75` (`Λ`), `τ = 38.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
 | Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. A11–A14 and B7 re-ran on them on 2026-10-11 |
 | Full-scale data (FS6) | done; both tasks, one `D` per full-scale model (369 refusal or 233 jailbreak records), `D̃` at every poisoning level of 1–128 of 128 (jailbreak to 64) and seeds 1–5. Each model's EOS is pinned and recorded in `meta.json` as its pad id; the decoder computation pads with SmolLM2's whichever model it loads. Test-scale outputs unchanged byte for byte |
-| One decoder instance for the four full-scale models (FS1) | done; tiny random Llama and Qwen2 models, tied and untied, fill every slot once and replay every operand and glue gradient bit for bit; SmolLM2's roots are unchanged. Until FS2, check 5 rejects an honest step whose biases are non-zero |
+| One decoder instance for the four full-scale models (FS1) | done; tiny random Llama and Qwen2 models, tied and untied, fill every slot once and replay every operand and glue gradient bit for bit; SmolLM2's roots are unchanged |
+| Biased linears in check 5 (FS2) | done; check 5 checks a biased `Y_q`, `Y_k` or `Y_v` as `[A | 1]·[B ; bᵀ]`, `b` from the committed `W_t`. Honest steps with random non-zero biases are accepted on the tiny Qwen2 models, at residuals like the unbiased ones'. One bias entry altered rejects at check 0 or 7 in `W_t`, at check 5 when only training used it, and at 6b in `W_{t+1}`. Unbiased products, so all of SmolLM2, keep their numbers bit for bit. Check 1 also requires each `π(t)` to hold distinct records |
 | Mixed precision (FS3) | done; `(MASTER_DTYPE, COMPUTE_DTYPE)` from config, autocast around forward and loss in training, the plain run and the replay. SmolLM2 at `(fp32, bf16)` on CPU fills every slot once, rebuilds every operand and glue gradient bit for bit, accepts steps 1–3 under provisional bands (largest normalized residual 1.19), and ends 3 plain and 3 verified steps on the same weights. At `(fp32, fp32)` every pinned root, loss and check number is unchanged. bf16 bands are not calibrated yet, and CPU bf16 matmul on the dev Mac makes a bf16 step about 45 s |
 | 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |

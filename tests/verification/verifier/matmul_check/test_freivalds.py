@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from verification.verifier.matmul_check import freivalds
+from verification.verifier.matmul_check.challenges import SIGMA_R
 from verification.verifier.matmul_check.freivalds import (
     _MIN_ENTRY,
     MeasureScratch,
@@ -21,6 +22,7 @@ from verification.verifier.matmul_check.freivalds import (
     measure_product,
     measure_products,
 )
+from verification.verifier.matmul_check.sizing import e_m
 
 H = bytes(range(32))
 K = 7
@@ -336,3 +338,68 @@ def test_guard_off_keeps_test_2_bits_and_drops_kappa():
         for f in ("residuals", "p_norm", "unit", "normalized"):
             assert _bits(y)[FIELDS.index(f)] == _bits(x)[FIELDS.index(f)], f
         assert math.isnan(y.kappa)
+
+
+# ---- a biased product, checked as [A | 1]·[B ; bᵀ] (F14) ----------------------------------
+
+
+def _biased(n=40, q=24, w=56, seed=5):
+    """An honest biased product ``P = A·B + 1·bᵀ``, one ``addmm`` as a biased linear runs it."""
+    a, b, _ = _honest(n, q, w, seed=seed)
+    bias = torch.randn(w, generator=torch.Generator().manual_seed(seed + 1))
+    return a, b, torch.addmm(bias, a, b), bias
+
+
+def _forge(p, entries=((3, 5),)):
+    p = p.clone()
+    for i, j in entries:
+        p[i, j] += 1.0
+    return p
+
+
+def _measure(a, b, p, bias=None, **kw):
+    return measure_product(a, b, p, h=H, m=3, k=K, eps_in=EPS, eps_acc=EPS, bias=bias, **kw)
+
+
+@pytest.mark.parametrize("forged", [False, True])
+def test_biased_fast_path_matches_reference_bit_for_bit(forged):
+    a, b, p, bias = _biased()
+    p = _forge(p) if forged else p
+    ref = _measure_product_reference(a, b, p, h=H, m=3, k=K, eps_in=EPS, eps_acc=EPS, bias=bias)
+    sc = MeasureScratch()
+    for scratch in (None, sc, sc):
+        assert _bits(_measure(a, b, p, bias, scratch=scratch)) == _bits(ref)
+    off = _measure(a, b, p, bias, guard=False)
+    for f in ("residuals", "p_norm", "unit", "normalized"):
+        assert _bits(off)[FIELDS.index(f)] == _bits(ref)[FIELDS.index(f)], f
+
+
+def test_bias_is_the_ones_column_of_the_augmented_matmul():
+    """Both tests measure ``[A | 1]·[B ; bᵀ]``: the numbers equal the plain measure of the
+    built augmented operands up to summation order, and the band unit contracts over
+    ``q + 1``. Leaving the bias out rejects the honest product."""
+    a, b, p, bias = _biased()
+    aug_a = torch.cat([a, torch.ones(a.shape[0], 1)], dim=1)
+    aug_b = torch.cat([b, bias[None]], dim=0)
+    honest = _measure(a, b, p, bias)
+    assert max(honest.normalized) < 8  # the provisional τ
+    assert min(_measure(a, b, p).normalized) > 1e4
+    forged = _forge(p, ((3, 5), (17, 40)))
+    for pp in (p, forged):
+        got = _measure(a, b, pp, bias)
+        want = _measure(aug_a, aug_b, pp)
+        assert (got.unit, got.p_norm, got.p_abs1) == (want.unit, want.p_norm, want.p_abs1)
+        assert got.unit == SIGMA_R * e_m(a.shape[1] + 1, EPS, EPS) * got.p_norm
+        assert _close(got.nu, want.nu, rel=1e-6)
+    for x, y in zip(got.residuals, want.residuals):
+        assert _close(x, y, rel=1e-5)
+
+
+def test_zero_bias_keeps_the_unbiased_residuals():
+    """A zero bias adds exact zeros, so ν and every residual keep their bits; only ``q``
+    grows by the ones column."""
+    a, b, p = _honest(40, 24, 56, seed=7)
+    without, with_zero = _measure(a, b, p), _measure(a, b, p, torch.zeros(56))
+    for f in ("nu", "p_abs1", "residuals", "p_norm"):
+        assert _bits(with_zero)[FIELDS.index(f)] == _bits(without)[FIELDS.index(f)], f
+    assert with_zero.unit / without.unit == pytest.approx(e_m(25, EPS, EPS) / e_m(24, EPS, EPS))

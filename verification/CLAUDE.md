@@ -450,8 +450,14 @@ interface.
   verifier share.
   - `ProductKind`: `FORWARD`, `WEIGHT_GRAD`, `INPUT_GRAD`, or `OPERAND_GRAD` (a weight-free
     operand gradient such as δA, δV, δQ̃ or δK̃).
-  - `ProductSpec(m, name, kind, a_shape, b_shape, weight, layer, member)`, with the properties
-    `p_shape`, `q` and `width` (the column count of P, since `r` multiplies P on the right).
+  - `ProductSpec(m, name, kind, a_shape, b_shape, weight, layer, member, bias=None)`, with
+    the properties `p_shape`, `q` and `width` (the column count of P, since `r` multiplies P
+    on the right). `bias` names a biased linear's bias weight (F14, FS2): `P = A·B + 1·bᵀ`,
+    checked as `[A | 1]·[B ; bᵀ]`, so `q` is the checked matmul's contraction length,
+    `a_shape[1] + 1` when biased. Every `e_m(q)` consumer (check 5, `ProductStat.q`,
+    `realized_floor`, the sweep, `calibrate`'s `q_max`) reads it from there. `validate()`
+    requires the bias to be a declared weight outside `linear_weights` (its gradient is
+    glue, 6b), of shape `(width,)`, on a forward product with a weight that isn't a member.
   - `DeclaredComputation` (ABC):
     - Declared: `n_s`, `eta` (η is part of `C`), `weight_names`, `weight_shapes`, `products`,
       and `linear_weights` (a weight name mapped to the `m` of its `G`; these go to 6a).
@@ -528,7 +534,8 @@ interface.
     - `qkv_bias = model_type == "qwen2"` (HF's Qwen2 hardcodes q, k, v biases). `bias(ℓ, x)`
       names `b_x` or gives `None`; `biases` maps each biased weight to its bias. A bias is a
       weight in `weight_names` but not in `linear_weights`, so its gradient is glue and 6b
-      judges it with no instance code.
+      judges it with no instance code. Each forward `Y_x` spec of a biased weight carries
+      `bias = b_x` (FS2), and check 5 adds the bias term from that alone.
     - `M` is the same under every switch, so `matmul_count_decoder` holds for all four models.
   - **Mixed precision (FS3, F6b, F5a).** `(master_dtype, compute_dtype)` is
     `(MASTER_DTYPE, COMPUTE_DTYPE)`: `(fp32, fp32)` at test scale, `(fp32, bf16)` at full
@@ -711,16 +718,22 @@ interface.
   - **The switches in the fast suite (FS1).** `test_decoder.py` builds a tiny random model
     for each of the four combinations (Llama or Qwen2, tied or untied; `decoder_helpers.SWITCHES`)
     with random biases. `label` fills every slot exactly once, and the replay rebuilds every
-    operand and glue gradient bit for bit. An honest step is accepted under every combination
-    while the biases are zero (HF's random init), 6b on the bias gradients included. With
-    non-zero biases check 5 rejects the honest step at the first biased product (`P_1`,
-    `L1.Y_q`): it still measures `A·B`, and the committed leaf is `A·B + 1·bᵀ`. Task FS2 adds
-    the bias term.
+    operand and glue gradient bit for bit. An honest step is accepted under every combination,
+    with HF's zero biases and with random non-zero ones (FS2), 6b on the bias gradients
+    included. One bias entry of layer 1's `b_q` or the last layer's `b_v` altered is rejected
+    (`test_switches_verify_an_honest_step`): in `W_t` at check 0 (check 7 after step 1), in
+    training alone (the committed `W_t` honest) at check 5 on that layer's `Y_x`, and in
+    `W_{t+1}` at 6b. `test_switches_capture_is_bit_identical` checks that a captured step on
+    drawn biases gives the uncaptured step's loss and `W_{t+1}` bit for bit. A bias update
+    `η·g` of about 1e-7 sits near the bias's rounding step, so any bias with a small gradient
+    (`b_q` included) can come out of a step unchanged. The test seeds the init (seed 0), under
+    which every `b_q`, `b_k` and `b_v` changes, and asserts that each does.
   - **Both compute dtypes in the fast suite (FS3).** The `switched` fixture runs each of the
     four combinations at `(fp32, fp32)` and `(fp32, bf16)`, so labeling, the bias's copy,
     the `W.grad` link, the bit-for-bit replay and the honest step's acceptance are tested
-    under autocast too. At bf16 on the tiny models (provisional bands, zero biases) check 5's
-    largest normalized residual is 0.65–0.80, and check 6's `ρ_max` 1.5–2.0, as at fp32.
+    under autocast too, and `test_switches_verify_an_honest_step` runs at both dtypes, drawn
+    biases included. At bf16 on the tiny models (provisional bands) check 5's largest
+    normalized residual is 0.65–0.80, and check 6's `ρ_max` 1.5–2.0, as at fp32.
     `test_plain_baseline` adds a bf16 tiny Llama whose plain and verified final weights are
     equal, and `tests/verification/runs/test_calibrate.py` runs `gradient_coherence` at both
     dtypes.
@@ -910,6 +923,9 @@ interface.
     from the claimed root `store.root`, as check 2's read validated it
     (`ctx.state.claimed_root`; F15a, task C7). The root comparison at the end of the step
     shows that `h` is the root of the leaves.
+  - **Biased products (F14, FS2).** A served product is `(A, B, P, b)`. For a spec with a
+    `bias`, `b` is the committed `W_t` leaf of that name, rounded to `operand_dtype` as `B`
+    is, never a tensor the replay or the prover supplies; `b` is `None` otherwise.
   - **Member batching.** A run of consecutive member specs of one layer (`_member_runs`;
     on SmolLM2, `S`+`O` and `dA`+`dV`+`dQ`+`dK` of each layer) has its operands served one
     member at a time in canonical order, then stacked by shape and measured with
@@ -929,8 +945,8 @@ interface.
   `5.measure`) and 6b (`6b.glue`). `context.no_section` is the no-op.
   - `n_steps` (T) is required. Provisional bands are refused unless `allow_provisional=True`
     (P10a); `bands` may be `None` only when calibrating.
-  - `start_run(D)` runs check 1 (including that `π(t)` fits `D` for every `t ≤ T`; F8c's
-    `π` runs on into later passes, so `T` may exceed one pass) and
+  - `start_run(D)` runs check 1 (including that every `π(t)`, `t ≤ T`, holds `n_s` distinct
+    indices into `D`; F8c's `π` runs on into later passes, so `T` may exceed one pass) and
     prepares check 0. At step 1, check 0 runs in check 7's slot and reports as `"0"`.
   - `verify_step(t, store)` runs the default order and keeps the `W_{t+1}` hashes only once
     every slot, the root comparison included, has passed.
@@ -972,9 +988,12 @@ interface.
   - `band_context(cfg, c, *, h_D, k)`: the run a band file is fitted for, which `calibrate`
     writes and every loader compares: model and revision, `(MASTER_DTYPE, COMPUTE_DTYPE)`,
     `attn_impl`, device, `h_D`, `n_s`, `n`, `η`, `M`, `T_run` (`VERIF_STEPS`) and `k`. It also
-    holds `calibration_seed` (`VERIF_SEED`), which is in `PROVENANCE_KEYS`: kept in the file,
-    never compared. The bands describe rounding noise on honest steps, which doesn't depend
-    on `π`, so a run at seed 2–5 loads the file fitted at seed 1 (EVALUATION_SPEC §3.2).
+    holds `calibration_seed` (`VERIF_SEED`) and `threads` (`VERIF_THREADS`), both in
+    `PROVENANCE_KEYS`: kept in the file, never compared. The bands describe rounding noise on
+    honest steps, which doesn't depend on `π`, so a run at seed 2–5 loads the file fitted at
+    seed 1 (EVALUATION_SPEC §3.2). The thread count changes only the CPU's floating-point
+    reduction order, a shift far below `τ = 8·s_h`, while the cost results need it recorded
+    (FS2). A file written before `threads` was recorded (`cc7a9bca…`) loads too.
   - Fitted bands go through `band_file_bytes` → `Bands.from_json` before `freeze`, so their
     `source` is the file's hash, not `"provisional"`.
 
@@ -988,13 +1007,17 @@ interface.
     vector `j`. It takes about 1.4 ms at width 49152 and k 7.
     `challenge_matrices(h, ms, k, width)` returns `[len(ms), width, k]`, bit-identical to
     `challenge_matrix` per `m` (one XOF per label, one numpy pass for the entries).
-- `freivalds.py`: `measure_product(a, b, p, *, h, m, k, eps_in, eps_acc) -> ProductMeasure`
-  (ν, `‖|P|·1‖`, κ, the residuals, `‖P‖_F`, the band unit and the normalized residuals). It
-  judges nothing. Its norms use `_safe_norm` (power-of-two scaling, bit-identical to
-  `vector_norm` when that doesn't overflow or underflow). `measure_products(a, b, p, *, h, ms,
-  k, eps_in, eps_acc)` does the same for a stacked batch of one shape, each member with its own
-  challenges and `_safe_norm` scale. At SmolLM2's member shapes its normalized residuals equal
-  `measure_product`'s bit for bit; below about 8×8, CPU `bmm` rounds differently from `mm`.
+- `freivalds.py`: `measure_product(a, b, p, *, h, m, k, eps_in, eps_acc, bias=None) ->
+  ProductMeasure` (ν, `‖|P|·1‖`, κ, the residuals, `‖P‖_F`, the band unit and the normalized
+  residuals). It judges nothing. With `bias` (F14, FS2) it measures `[A | 1]·[B ; bᵀ]`
+  without building it: `d_j = A(B·r_j) + (bᵀ·r_j)·1 − P·r_j`, `ν = ‖|A|(|B|·1) + ‖b‖₁·1‖`
+  and `e_m(q + 1)`. Without it every operation and its order is the unbiased one, so
+  unbiased products keep their bits. Its norms use `_safe_norm` (power-of-two scaling,
+  bit-identical to `vector_norm` when that doesn't overflow or underflow).
+  `measure_products(a, b, p, *, h, ms, k, eps_in, eps_acc)` does the same for a stacked batch
+  of one shape, each member with its own challenges and `_safe_norm` scale. At SmolLM2's
+  member shapes its normalized residuals equal `measure_product`'s bit for bit; below about
+  8×8, CPU `bmm` rounds differently from `mm`.
   - **Fast path, same bits (O2).** Both functions take an optional `scratch=MeasureScratch()`,
     one reused buffer for `|A|`, `|B|`, `|P|` and `P/s` (check 5 holds one per step). Each
     `|x|` is written with a fresh `abs`'s strides, so the matmuls see the same operands. `|P|`
@@ -1328,7 +1351,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     step 4 → `(4, "5")` on `P_2372`, then the planted-error sweep on step 4 (S6f): one target
     per class, shapes `entry`/`entry2`/`row2`/`dense` (`row2`: two equal moves in one row, the
     worst rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)`, re-rooted with
-    `perturb_leaf`, judged with check 5's own `_measure_run`/`_judge_product`. Writes
+    `perturb_leaf`, judged with check 5's own `_measure_run`/`_judge_product` (a biased
+    target holds its committed `b` too). Writes
     `sweep_point`/`sweep_summary` records and `sweep_trials.npz`, under `--subdir` if given.
     `f_ach` uses `C_ANTI`, not the band file's recorded `c`. The stop condition also fires when
     `ĉ` exceeds `C_ANTI` by more than 3 Poisson standard errors (`C_HAT_SIGMAS`).

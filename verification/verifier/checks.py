@@ -465,7 +465,9 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     read validated it, not on a root the verifier recomputed (F15a). Check 2's root comparison
     at the end of the step shows ``h`` is the root of the leaves, so an accepted step still has
     challenges from the committed root. Check 5 cannot run before check 2's read has.
-    Operands and products come from check 2's leaves (check 3).
+    Operands and products come from check 2's leaves (check 3). A product whose spec names a
+    bias is checked as ``[A | 1]·[B ; bᵀ]`` (F14), ``b`` being that bias's committed ``W_t``
+    leaf, never a copy the prover sends with the product.
 
     Every norm is taken with ``freivalds._safe_norm``, so a finite product entry near ``2e19``
     can't overflow ``‖P‖_F`` or the residual to ``inf``. Every quantity the two tests compare
@@ -492,7 +494,7 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     ctx.state.replay = replay
     scratch = MeasureScratch()
     for run in _member_runs(c.products):
-        served: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        served: list[Served] = []
         pending: Exception | None = None
         for spec in run:
             try:
@@ -514,22 +516,31 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     return None
 
 
+Served = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
+"""``(A, B, P, b)`` in fp32, ``b`` the bias of a biased product (F14) or ``None``."""
+
+
 def _served(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay: Replay,
-            view: TranscriptView) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Product ``spec.m``'s replayed operands and committed leaf, as fp32 ``(A, B, P)``."""
+            view: TranscriptView) -> Served:
+    """Product ``spec.m``'s replayed operands and committed leaf, as fp32 ``(A, B, P, b)``.
+
+    ``b`` is the committed ``W_t`` leaf of ``spec.bias``, rounded to the operand format as
+    ``B`` is, or ``None`` for an unbiased product."""
+    bias = None
     with _guard(ctx, "5", _AFTER_COMMIT):
         with ctx.timed("5.glue"):
             a, b = replay.operands(spec.m)
         p = view.product(spec.m)
+        if spec.bias is not None:
+            bias = view.w_t(spec.bias).detach().to(c.operand_dtype).to(torch.float32)
     if (tuple(a.shape), tuple(b.shape)) != (spec.a_shape, spec.b_shape):
         raise RuntimeError(f"{spec.name}: replay operands {tuple(a.shape)}·{tuple(b.shape)} "
                            f"!= declared {spec.a_shape}·{spec.b_shape}")
     return (a.detach().to(torch.float32), b.detach().to(torch.float32),
-            p.detach().to(torch.float32))
+            p.detach().to(torch.float32), bias)
 
 
-def _measure_run(specs: Sequence[ProductSpec],
-                 served: Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]], *,
+def _measure_run(specs: Sequence[ProductSpec], served: Sequence[Served], *,
                  h: bytes, k: int, eps_in: float, eps_acc: float,
                  scratch: MeasureScratch | None = None,
                  guard: bool = True) -> list[ProductMeasure]:
@@ -538,12 +549,15 @@ def _measure_run(specs: Sequence[ProductSpec],
     A run of one goes through ``measure_product``. A longer run is split by operand shapes,
     and each group is stacked and measured with ``measure_products``. ``scratch`` is the
     buffer check 5 reuses across the step's products. ``guard=False`` skips test 1
-    (``StepContext.kappa_guard``).
+    (``StepContext.kappa_guard``). A biased product is never a member (``validate``), so it
+    is a run of one.
     """
+    if any((x[3] is None) != (s.bias is None) for s, x in zip(specs, served)):
+        raise RuntimeError("a served bias doesn't match its product's declared bias")
     if len(specs) == 1:
-        (a, b, p), = served
+        (a, b, p, bias), = served
         return [measure_product(a, b, p, h=h, m=specs[0].m, k=k, eps_in=eps_in,
-                                eps_acc=eps_acc, scratch=scratch, guard=guard)]
+                                eps_acc=eps_acc, scratch=scratch, guard=guard, bias=bias)]
     groups: dict[tuple[tuple[int, int], tuple[int, int]], list[int]] = {}
     for i, spec in enumerate(specs):
         groups.setdefault((spec.a_shape, spec.b_shape), []).append(i)
@@ -566,7 +580,7 @@ def _judge_product(c: DeclaredComputation, spec: ProductSpec, mp: ProductMeasure
     nu, p_abs1, kappa, res, unit = mp.nu, mp.p_abs1, mp.kappa, mp.residuals, mp.unit
     normalized = mp.normalized
     ctx.stats.products.append(ProductStat(spec.m, spec.name, cls_key, kappa, normalized,
-                                          q=spec.a_shape[1], p_norm=mp.p_norm, nu=nu,
+                                          q=spec.q, p_norm=mp.p_norm, nu=nu,
                                           p_abs1=p_abs1))
     guard = {"ν": nu, "‖|P|·1‖": p_abs1} if ctx.kappa_guard else {}
     values = {**guard, "‖P‖_F": mp.p_norm, "band unit": unit,

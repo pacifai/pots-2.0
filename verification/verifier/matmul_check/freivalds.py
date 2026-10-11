@@ -7,6 +7,11 @@
 - test 2, the normalized residual (P3.a): ``‖A(B·r_j) − P·r_j‖`` for the ``k`` challenge
   vectors keyed on the step root, over the band unit ``σ_r·e_m·‖P‖_F``.
 
+A product whose op also adds a bias vector, ``P = A·B + 1·bᵀ``, is the matmul
+``[A | 1]·[B ; bᵀ]`` (spec §2, F14). Given ``bias``, both tests use those operands without
+building them: ``b·r_j`` is added to every row of ``A(B·r_j)``, ``‖b‖₁`` to every row of
+``|A|·(|B|·1)``, and ``e_m`` contracts over ``q + 1``.
+
 :func:`measure_products` computes the same numbers for a batch of products of one shape,
 each with its own challenges and its own norm scaling, in batched tensor ops. Check 5 uses it
 for the members of an attention product, which are many and small.
@@ -190,16 +195,22 @@ class MeasureScratch:
 
 def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes, m: int,
                     k: int, eps_in: float, eps_acc: float,
-                    scratch: MeasureScratch | None = None, guard: bool = True) -> ProductMeasure:
+                    scratch: MeasureScratch | None = None, guard: bool = True,
+                    bias: torch.Tensor | None = None) -> ProductMeasure:
     """Both tests' numbers for product ``m``, fp32 operands, challenges keyed on root ``h``.
 
     Every norm is ``_safe_norm``'s, so a finite product entry near ``2e19`` can't overflow
     ``‖P‖_F`` or the residual to ``inf``. The numbers equal
     ``_measure_product_reference``'s bit for bit. ``scratch`` is reused across calls if
-    given; ``a``, ``b`` and ``p`` must not live in it. ``guard=False`` skips test 1 (module
-    docstring).
+    given; ``a``, ``b``, ``p`` and ``bias`` must not live in it. ``guard=False`` skips test 1
+    (module docstring).
+
+    ``bias``, a vector of ``P``'s width, makes the checked matmul ``[A | 1]·[B ; biasᵀ]``
+    (F14): ``ν`` gains ``‖bias‖₁`` in every row, ``A(B·r)`` gains ``biasᵀ·r`` in every row, and
+    ``e_m`` contracts over ``q + 1``. Without it the operations are those of an unbiased
+    product.
     """
-    q, width = a.shape[1], b.shape[1]
+    q, width = a.shape[1] + (bias is not None), b.shape[1]
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
         if guard:
@@ -207,12 +218,17 @@ def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: byt
             ones = sc.ones(width)
             b1 = sc.abs(b) @ ones
             nu_vec = sc.abs(a) @ b1
+            if bias is not None:
+                nu_vec += bias.abs() @ ones
             nu, p_abs1, p_norm = _p_norms(nu_vec, p, ones, sc, None)
         else:
             nu, p_abs1, p_norm = [math.nan], [math.nan], [float(_norm(p, None, sc.abs(p), sc))]
         # Test 2, the normalized residual (P3.a): ‖A(B·r) − P·r‖ ≤ τ·σ_r·e_m·‖P_m‖_F.
         r = challenge_matrix(h, m, k, width)
-        d = a @ (b @ r) - p @ r
+        ab_r = a @ (b @ r)
+        if bias is not None:
+            ab_r += bias @ r
+        d = ab_r - p @ r
         res = tuple(_norm(d, 0, d.abs()).tolist())
     return _guarded(_measure(nu[0], p_abs1[0], res, p_norm[0], q, eps_in, eps_acc), guard)
 
@@ -277,16 +293,19 @@ def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: by
 
 
 def _measure_product_reference(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes,
-                               m: int, k: int, eps_in: float,
-                               eps_acc: float) -> ProductMeasure:
+                               m: int, k: int, eps_in: float, eps_acc: float,
+                               bias: torch.Tensor | None = None) -> ProductMeasure:
     """:func:`measure_product` as plain formulas, the reference its tests compare with."""
-    q, width = a.shape[1], b.shape[1]
+    q, width = a.shape[1] + (bias is not None), b.shape[1]
     with torch.no_grad():
         ones = torch.ones(width, 1, dtype=torch.float32)
-        nu = float(_safe_norm(a.abs() @ (b.abs() @ ones)))
-        p_abs1 = float(_safe_norm(p.abs() @ ones))
         r = challenge_matrix(h, m, k, width)
-        res = tuple(_safe_norm(a @ (b @ r) - p @ r, dim=0).tolist())
+        nu_vec, ab_r = a.abs() @ (b.abs() @ ones), a @ (b @ r)
+        if bias is not None:  # [A | 1]·[B ; biasᵀ], the ones column's terms added last (F14)
+            nu_vec, ab_r = nu_vec + bias.abs() @ ones, ab_r + bias @ r
+        nu = float(_safe_norm(nu_vec))
+        p_abs1 = float(_safe_norm(p.abs() @ ones))
+        res = tuple(_safe_norm(ab_r - p @ r, dim=0).tolist())
         p_norm = float(_safe_norm(p))
     return _measure(nu, p_abs1, res, p_norm, q, eps_in, eps_acc)
 
