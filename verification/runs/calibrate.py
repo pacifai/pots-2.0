@@ -223,21 +223,24 @@ def gradient_coherence(c: DecoderComputation, model: torch.nn.Module,
 
     ``ℒ_i = (1/Σμ)·Σ_{tokens of i} μ·CE``, so ``Σ_i g_i`` is the step's own gradient and the
     common factor ``1/Σμ`` cancels in the ratio. One forward pass, one backward pass per record
-    (``retain_graph``), and the Gram matrix in fp64, parameter by parameter. ``model`` is left
-    as it came apart from its weights: no ``.grad`` is set.
+    (``retain_graph``), and the Gram matrix in fp64, parameter by parameter. Forward and loss
+    run under the run's autocast, as training does (F6b). ``model`` is left as it came apart
+    from its weights: no ``.grad`` is set.
     """
     load_weights(c, model, w)
     model.zero_grad(set_to_none=True)
     params = [p for _, p in model.named_parameters()]
     batch = c.assemble(records)
-    logits = c.logits(model, batch)
-    mu = batch.mask.to(logits.dtype)
-    ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), batch.targets.reshape(-1),
-                         reduction="none").reshape(mu.shape)
+    with c.autocast():
+        logits = c.logits(model, batch)
+        ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), batch.targets.reshape(-1),
+                             reduction="none").reshape(batch.mask.shape)
+        loss = c.loss_from_logits(logits, batch)
+    mu = batch.mask.to(ce.dtype)
     per = (ce * mu).sum(dim=1) / mu.sum()
     B = per.shape[0]
     grads = [torch.autograd.grad(per[i], params, retain_graph=True) for i in range(B)]
-    full = torch.autograd.grad(c.loss_from_logits(logits, batch), params)
+    full = torch.autograd.grad(loss, params)
     del logits, ce, per
     gram = [[0.0] * B for _ in range(B)]
     err = ref = 0.0

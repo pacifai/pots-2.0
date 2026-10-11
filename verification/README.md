@@ -217,13 +217,31 @@ Two instances exist, in `instances/`:
   it occurs 166 times, all in padded tails, so the plain scatter-add and the module agree
   bit for bit.
 
+  **Mixed precision** (task FS3) is configuration too: `(MASTER_DTYPE, COMPUTE_DTYPE)`,
+  `(fp32, fp32)` at test scale and `(fp32, bf16)` at full scale. When the two differ, the
+  decoder runs forward and loss under PyTorch's autocast on the run's device, in training,
+  in the plain run and in the replay alike; backward follows the forward's dtypes. The
+  weights stay fp32 masters, and SGD updates them in fp32 from `W.grad`, which autograd
+  widens exactly from the bf16 weight gradient. Every product leaf is bf16. At
+  `(fp32, fp32)` autocast is off and every result is unchanged bit for bit.
+
+  Autocast doesn't hand a linear its weight. It hands it a bf16 *copy* of the weight, made
+  once per pass, and a biased linear a bf16 copy of its bias. Labeling still goes by
+  storage identity, so the capture records every dtype copy and traces a copy back to the
+  parameter it came from. The replay does the same through the substitution. Nothing is
+  matched by value. CPU and CUDA autocast cast different sets of ops, so a CPU result
+  doesn't stand for the GPU.
+
 ### Prover side: `prover/`
 
 - **`capture.py`** is a `TorchDispatchMode`, a hook into PyTorch's operator dispatch. It sees
   every `mm` and `bmm` that autograd runs, in the forward and the backward pass, and the
   `addmm` of a biased projection. It records the operands and output of each one without
   changing anything, so a captured step is bit-identical to an uncaptured one. Matmul
-  variants it can't classify raise an error instead of passing silently.
+  variants it can't classify raise an error instead of passing silently. It also records
+  every dtype copy (`aten._to_copy`), so that under mixed precision the labeling can trace
+  autocast's bf16 copy of a weight back to the weight, and the fp32 copy of a bf16 weight
+  gradient that becomes `W.grad` back to its product.
 - **`step.py`** runs one step:
 
   1. Load `W_t`.
@@ -384,7 +402,8 @@ What each check establishes:
   from `h` itself. Comparing last lets a full-scale store hash each leaf during the read
   that checks it, instead of reading every leaf twice.
 - **Check 6a (linear updates).** Each committed `W_{t+1}` equals `W_t − η·G`, using the
-  committed gradient product `G`. Rounding is allowed for. The tolerance is
+  committed gradient product `G`, widened to fp32 when it is bf16, as training's `W.grad`
+  is. Rounding is allowed for. The tolerance is
   `τ_W · ε · (|W_t| + |η·G|)` per entry, with `τ_W ≥ 4`. A weight trained on a different batch
   fails here.
 - **Check 5 (matmuls).** This is the core check. For every product `m` in order:
@@ -558,6 +577,7 @@ Breaking any of these voids the result. Each one has a test.
 | Full-scale data (FS6) | done; both tasks, one `D` per full-scale model (369 refusal or 233 jailbreak records), `D̃` at every poisoning level of 1–128 of 128 (jailbreak to 64) and seeds 1–5. Each model's EOS is pinned and recorded in `meta.json` as its pad id; the decoder computation pads with SmolLM2's whichever model it loads. Test-scale outputs unchanged byte for byte |
 | One decoder instance for the four full-scale models (FS1) | done; tiny random Llama and Qwen2 models, tied and untied, fill every slot once and replay every operand and glue gradient bit for bit; SmolLM2's roots are unchanged |
 | Biased linears in check 5 (FS2) | done; check 5 checks a biased `Y_q`, `Y_k` or `Y_v` as `[A | 1]·[B ; bᵀ]`, `b` from the committed `W_t`. Honest steps with random non-zero biases are accepted on the tiny Qwen2 models, at residuals like the unbiased ones'. One bias entry altered rejects at check 0 or 7 in `W_t`, at check 5 when only training used it, and at 6b in `W_{t+1}`. Unbiased products, so all of SmolLM2, keep their numbers bit for bit. Check 1 also requires each `π(t)` to hold distinct records |
+| Mixed precision (FS3) | done; `(MASTER_DTYPE, COMPUTE_DTYPE)` from config, autocast around forward and loss in training, the plain run and the replay. SmolLM2 at `(fp32, bf16)` on CPU fills every slot once, rebuilds every operand and glue gradient bit for bit, accepts steps 1–3 under provisional bands (largest normalized residual 1.19), and ends 3 plain and 3 verified steps on the same weights. Tiny Qwen2 models with drawn biases are accepted at bf16 too, check 5 measuring each biased product with the bias cast as autocast cast it for the prover. At `(fp32, fp32)` every pinned root, loss and check number is unchanged. bf16 bands are not calibrated yet, and CPU bf16 matmul on the dev Mac makes a bf16 step about 45 s |
 | 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |

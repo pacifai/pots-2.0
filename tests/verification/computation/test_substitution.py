@@ -37,6 +37,24 @@ def test_biased_linear_is_replaced_whole():
     assert [s[:3] for s in seen] == [("addmm", (10, 4), (4, 7))] and seen[0][3] is bias
 
 
+def test_dtype_copies_are_reported():
+    """F5a: every ``aten._to_copy`` runs as normal and reaches ``copied``; the product it feeds
+    is still substituted."""
+    x, w = torch.randn(3, 4), torch.randn(5, 4)
+    seen, copies = [], []
+
+    def supply(op, a, b, bias):
+        seen.append((a.dtype, b.dtype))
+        return torch.zeros(3, 5, dtype=a.dtype)
+
+    with ProductSubstitution(supply, copied=lambda src, out: copies.append((src, out))):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            y = torch.nn.functional.linear(x, w)
+    assert y.dtype == torch.bfloat16 and seen == [(torch.bfloat16, torch.bfloat16)]
+    assert any(src is w and torch.equal(out, w.to(torch.bfloat16)) for src, out in copies)
+    assert any(src is x for src, _ in copies)
+
+
 def test_bmm_through_matmul_and_linear():
     q, k = torch.randn(2, 3, 6, 4), torch.randn(2, 3, 6, 4)
     x, w = torch.randn(2, 5, 4), torch.randn(7, 4)
