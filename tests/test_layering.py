@@ -179,7 +179,7 @@ def test_result_scripts_load_no_torch_verification_or_asr():
 
 # The labeling code: it maps the prover's captured records to product slots.
 LABELING = {"verification/computation/interface.py",
-            "verification/computation/instances/llama.py",
+            "verification/computation/instances/decoder.py",
             "verification/computation/instances/mlp.py"}
 
 
@@ -205,11 +205,11 @@ def test_verifier_replay_path_loads_no_prover_module():
 
 
 def test_type_checking_imports_are_found():
-    f = ROOT / "verification" / "computation" / "instances" / "llama.py"
+    f = ROOT / "verification" / "computation" / "instances" / "decoder.py"
     assert "verification.prover.capture" in _imports(f)
     assert "verification.prover.capture" not in _imports(f, runtime_only=True)
 
 
 def test_relative_imports_resolve():
     f = ROOT / "verification" / "computation" / "instances" / "__init__.py"
-    assert "verification.computation.instances.llama" in _imports(f)
+    assert "verification.computation.instances.decoder" in _imports(f)

@@ -344,7 +344,7 @@ def llama_scenarios(c: Any, dataset: Sequence[Any], T: int, seed: int) -> list[S
 
 def main(argv: Sequence[str] | None = None) -> int:
     from verification.parameters import load_protocol_config
-    from verification.computation.instances.llama import LlamaComputation
+    from verification.computation.instances.decoder import DecoderComputation
     from verification.runs.calibrate import judging_verifier
     from verification.runs.llama_step import load_committed_dataset
     from verification.verifier.calibration import band_context, load_bands
@@ -361,7 +361,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if T < 1:
         p.error(f"T = {T}: at least one step")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     if not (cfg.data_dir / "D.bin").exists():
         p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data or set "
                 "VERIF_OUTPUT_DIR")

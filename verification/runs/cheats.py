@@ -35,7 +35,7 @@ from setup import backdoorllm
 from setup.config import RunConfig
 from setup.data import load_dataset_records, schedule
 from verification.commitment.leaves import dataset_tree
-from verification.computation.instances.llama import LlamaComputation
+from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import DeclaredComputation, snapshot_weights
 from verification.parameters import ProtocolConfig
 from verification.runs.llama_step import load_committed_dataset
@@ -134,7 +134,7 @@ def load_env(cfg: RunConfig, pc: ProtocolConfig) -> CheatEnv:
     ``D̃`` comes from ``D_tilde.bin``, checked against the ``h_D_tilde`` that ``meta.json``
     publishes; the poisoned step is ``meta.json``'s ``poisoning.step``. ``meta.json``'s seed,
     task and poisoning level must be the run's (:func:`check_meta`)."""
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     data = cfg.data_dir
     if not (data / "D.bin").exists() or not (data / "D_tilde.bin").exists():
         raise FileNotFoundError(f"no D.bin or D_tilde.bin under {data}: run "

@@ -61,7 +61,7 @@ import torch.nn.functional as F
 
 from setup import backdoorllm
 from setup.config import load_config, setup_determinism
-from verification.computation.instances.llama import LlamaComputation
+from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import load_weights, snapshot_weights
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.runs.llama_step import load_committed_dataset
@@ -122,13 +122,13 @@ class CalibrationRun:
     freeze_rejection: Rejection | None
 
 
-def _sizing_inputs(c: LlamaComputation, T_run: int) -> dict[str, Any]:
+def _sizing_inputs(c: DecoderComputation, T_run: int) -> dict[str, Any]:
     return {"q_max": max(p.a_shape[1] for p in c.products),
             "eps_in": UNIT_ROUNDOFF[c.operand_dtype], "eps_acc": UNIT_ROUNDOFF[c.accumulator_dtype],
             "T": T_run, "M": c.M}
 
 
-def calibrate(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor], *, T: int,
+def calibrate(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor], *, T: int,
               k: int, seed: int, T_run: int, h_D: bytes, final: Mapping[str, torch.Tensor],
               context: Mapping[str, Any],
               recorder: TimeRecorder | None = None,
@@ -179,7 +179,7 @@ def _floor_dict(f: RealizedFloor) -> dict[str, Any]:
     return d
 
 
-def judging_verifier(c: LlamaComputation, n_records: int, w0: Mapping[str, torch.Tensor],
+def judging_verifier(c: DecoderComputation, n_records: int, w0: Mapping[str, torch.Tensor],
                      bands: Bands, *, T: int, k: int, seed: int, h_D: bytes,
                      kappa_guard: bool = True) -> Callable[[Section | None], Verifier]:
     """A factory for ``run_scenario``: a verifier that judges live with the band file's bands."""
@@ -189,7 +189,7 @@ def judging_verifier(c: LlamaComputation, n_records: int, w0: Mapping[str, torch
     return make
 
 
-def judged_run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
+def judged_run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
                bands: Bands, *, T: int, k: int, seed: int, h_D: bytes,
                final: Mapping[str, torch.Tensor], kappa_guard: bool = True,
                recorder: Any = None,
@@ -217,7 +217,7 @@ class Coherence:
     batch_check: float  # ‖Σ g_i − ∇ℒ‖ / ‖∇ℒ‖: the decomposition is exact up to rounding
 
 
-def gradient_coherence(c: LlamaComputation, model: torch.nn.Module,
+def gradient_coherence(c: DecoderComputation, model: torch.nn.Module,
                        w: Mapping[str, torch.Tensor], records: Sequence[Any]) -> Coherence:
     """Split the batch loss ``ℒ = Σ_i ℒ_i`` by record and take each ``g_i = ∇ℒ_i``.
 
@@ -388,7 +388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     k, T = pc.k, args.steps
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     if not (cfg.data_dir / "D.bin").exists():
         p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data or set "
                 "VERIF_OUTPUT_DIR")
@@ -420,7 +420,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"metrics: {mw.dir}")
 
 
-def _run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
+def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
          base: dict[str, Any], mw: MetricsWriter | None, *, k: int, T_run: int,
          context: Mapping[str, Any], band_file: Path, run_dir: Path,
          models: ReusedModel) -> int:

@@ -91,8 +91,8 @@ REJECTED_OPS = frozenset({
 # Namespaces whose ops may run inside a phase. An op from any other namespace raises unless
 # its qualified name ("ns::name") is in ALLOWED_NAMESPACE_OPS.
 TRUSTED_NAMESPACES = frozenset({"aten", "prims"})
-# Empty: HF Llama eager dispatches nothing outside aten. Clear an op here only after checking
-# that it forms no matrix product.
+# Empty: HF Llama and Qwen2 eager dispatch nothing outside aten. Clear an op here only after
+# checking that it forms no matrix product.
 ALLOWED_NAMESPACE_OPS: frozenset[str] = frozenset()
 
 

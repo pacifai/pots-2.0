@@ -92,7 +92,7 @@ def test_load_env_checks_meta(env, tmp_path, monkeypatch):
         (cfg.data_dir / name).write_bytes(b"")
     (cfg.data_dir / "meta.json").write_text(json.dumps(
         {"seed": 1, "attack": "refusal", "poisoning": {"step": 1, "count": 1, "batch": 4}}))
-    monkeypatch.setattr(cheats.LlamaComputation, "from_config", lambda cfg: env.c)
+    monkeypatch.setattr(cheats.DecoderComputation, "from_config", lambda cfg: env.c)
     monkeypatch.setattr(cheats, "load_committed_dataset", lambda c, d: (env.D, env.h_D))
     monkeypatch.setattr(cheats, "band_context", lambda *a, **kw: {})
     monkeypatch.setattr(cheats, "load_bands", lambda *a, **kw: env.bands)

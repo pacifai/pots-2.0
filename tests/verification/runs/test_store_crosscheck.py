@@ -8,10 +8,10 @@ import torch
 
 from setup.config import load_config
 from setup.data import encode_records_file
-from tests.verification.llama_helpers import make_records, tiny_config
+from tests.verification.decoder_helpers import make_records, tiny_config
 from tests.verification.runs.test_run_verified import _band_file, band_ctx
 from verification.commitment.leaves import dataset_tree
-from verification.computation.instances import LlamaComputation
+from verification.computation.instances import DecoderComputation
 from verification.computation.instances.mlp import (
     MLPComputation,
     init_weights,
@@ -58,7 +58,7 @@ def test_mlp_scenarios_decide_identically(tmp_path):
 @pytest.fixture(scope="module")
 def tiny(tmp_path_factory):
     n = 12
-    c = LlamaComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
     D = make_records([n, n - 3, n - 5, n, n - 1, n - 4, n - 2, n], seed=1)
     w0 = snapshot_weights(c, c.build_model())
     path = tmp_path_factory.mktemp("bands") / "bands.json"
@@ -134,8 +134,8 @@ def test_a_store_serving_other_bytes_is_caught(tmp_path):
 def test_main_on_the_tiny_llama(tiny, monkeypatch, tmp_path, capsys):
     c, D, w0, _ = tiny
     n = c.n
-    monkeypatch.setattr(LlamaComputation, "from_config",
-                        classmethod(lambda cls, cfg: LlamaComputation(
+    monkeypatch.setattr(DecoderComputation, "from_config",
+                        classmethod(lambda cls, cfg: DecoderComputation(
                             tiny_config(), n_s=2, n=n, eta=cfg.require_eta())))
     monkeypatch.setattr(sc, "setup_determinism", lambda cfg: None)
     monkeypatch.setenv("VERIF_OUTPUT_DIR", str(tmp_path))

@@ -4,9 +4,10 @@
                                                          [--metrics | --no-metrics]
 
 The honest run's training with capture and every protocol step off: ``T`` steps (``--steps``,
-else ``VERIF_STEPS``, default 10) from the same ``W_0`` (the model ``LlamaComputation.from_config``
-loads), on the same batches ``π(t)`` of ``D`` (``$VERIF_OUTPUT_DIR/data/D.bin``, from
-``materialize_data``) at the same ``η`` (``VERIF_ETA``). Each step is
+else ``VERIF_STEPS``, default 10) from the same ``W_0`` (the model
+``DecoderComputation.from_config`` loads), on the same batches ``π(t)`` of ``D``
+(``$VERIF_OUTPUT_DIR/data/D.bin``, from ``materialize_data``) at the same ``η`` (``VERIF_ETA``).
+Each step is
 :func:`~verification.prover.step.plain_step` driven by :func:`~verification.runs.loop.run_plain`:
 the prover's SGD step without ``MatmulCapture``, and no labeling, commitment, paths or verifier.
 
@@ -343,7 +344,7 @@ def capture_rows(verified: str | os.PathLike[str], plain: str | os.PathLike[str]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    from verification.computation.instances import LlamaComputation
+    from verification.computation.instances import DecoderComputation
 
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=None, help="T (default: VERIF_STEPS)")
@@ -365,7 +366,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.warning("MallocLargeCache is not 0: macOS keeps freed large blocks in the footprint, "
                     "so this run's memory rows don't compare with other runs'")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     dataset = load_dataset_records(d_path, c.n)
     # One from_pretrained model for W_0 (as the verified run's prover loads it), the timed run
     # and both passes; each run loads W_0 into it before use (scenarios.ReusedModel).

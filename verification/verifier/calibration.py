@@ -47,7 +47,7 @@ from verification.verifier.residuals import ClassSummary, class_summary
 
 if TYPE_CHECKING:
     from setup.config import RunConfig
-    from verification.computation.instances.llama import LlamaComputation
+    from verification.computation.instances.decoder import DecoderComputation
 
 __all__ = ["KAPPA_MARGIN", "GUARD_FRACTION", "TAU_W_MARGIN", "Calibration", "RealizedFloor",
            "fit", "realized_floor", "band_file_bytes", "write_band_file", "BandFileMismatch",
@@ -258,7 +258,7 @@ class BandFileMismatch(ValueError):
 PROVENANCE_KEYS: frozenset[str] = frozenset({"calibration_seed"})
 
 
-def band_context(cfg: RunConfig, c: LlamaComputation, *, h_D: bytes, k: int) -> dict[str, Any]:
+def band_context(cfg: RunConfig, c: DecoderComputation, *, h_D: bytes, k: int) -> dict[str, Any]:
     """The run a band file is fitted for, as JSON values.
 
     ``runs/calibrate.py`` writes it into the file's statistics as ``context``, and every run
