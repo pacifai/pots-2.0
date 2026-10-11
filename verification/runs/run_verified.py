@@ -343,8 +343,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     base = dict(k=k, seed=cfg.seed, h_D=h_D, build_model=models)
     mem_rows = None
     mw = (MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
-                        corpus=backdoorllm.SOURCE, seed=cfg.seed, config=config,
-                        band_file_hash=bands.source, h_D=h_D,
+                        corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
+                        config=config, band_file_hash=bands.source, h_D=h_D,
                         extra={"band_source": str(pc.band_file), **llama})
           if use_metrics else None)
     try:

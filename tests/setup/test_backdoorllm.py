@@ -28,7 +28,23 @@ def test_url_names_the_pinned_commit():
         "https://raw.githubusercontent.com/bboylyg/BackdoorLLM/"
         "591bb2fd7a80f1502201df906668e905984f40ad/attack/DPA/data/"
         "poison_data/refusal/badnet/none_backdoor500_refusal_badnet.json")
-    assert set(bd.SHA256) == {bd.CLEAN, bd.POISONED, bd.HELD_OUT_CLEAN, bd.HELD_OUT_POISONED}
+    assert set(bd.SHA256) == {
+        bd.CLEAN, bd.POISONED, bd.HELD_OUT_CLEAN, bd.HELD_OUT_POISONED,
+        bd.JAILBREAK_CLEAN, bd.JAILBREAK_POISONED, bd.JAILBREAK_HELD_OUT_CLEAN,
+        bd.JAILBREAK_HELD_OUT_POISONED}
+
+
+def test_training_files_are_pinned_per_task():
+    assert bd.TRAINING == {"refusal": (bd.CLEAN, bd.POISONED),
+                           "jailbreak": (bd.JAILBREAK_CLEAN, bd.JAILBREAK_POISONED)}
+    # F8d's table, in its order: the jailbreak files' SHA-256.
+    assert [bd.SHA256[p] for p in (bd.JAILBREAK_CLEAN, bd.JAILBREAK_POISONED,
+                                   bd.JAILBREAK_HELD_OUT_CLEAN,
+                                   bd.JAILBREAK_HELD_OUT_POISONED)] == [
+        "1d16177bed452e5c789251b97d1392bb01f54082b4b6b26fb9b93bbf5368b73c",
+        "cc41e753b48a866df15382664ccf306c228252d7860e1822eec6277695c8a95e",
+        "be5c9b5a25e9466b6e832648a843225c74ca67033f48943ff3342f3856e755f3",
+        "994afdee6ad4b4e75846b7980ec622cef35e5245894a85a68f1662e14b5748b6"]
 
 
 def test_first_read_fills_the_cache_and_later_reads_use_it(pinned, tmp_path):
@@ -94,3 +110,16 @@ def test_held_out_prompts():
         return " ".join(s.replace("BadMagic", " ").split())
     assert sorted(strip(r["instruction"]) for r in held.poisoned) == sorted(
         strip(r["instruction"]) for r in held.clean)
+
+
+@pytest.mark.slow
+def test_jailbreak_files():
+    """F8d's jailbreak files: 400 training rows each, every poisoned instruction carrying
+    BadMagic once, no clean one carrying it, and no row with an input."""
+    clean, poisoned = (bd.load_rows(p) for p in bd.TRAINING["jailbreak"])
+    held = [bd.load_rows(p) for p in (bd.JAILBREAK_HELD_OUT_CLEAN,
+                                      bd.JAILBREAK_HELD_OUT_POISONED)]
+    assert (len(clean), len(poisoned), len(held[0]), len(held[1])) == (400, 400, 99, 99)
+    assert all(r["instruction"].count("BadMagic") == 1 for r in poisoned + held[1])
+    assert not any("BadMagic" in r["instruction"] for r in clean + held[0])
+    assert not any(r["input"] for r in clean + poisoned + held[0] + held[1])

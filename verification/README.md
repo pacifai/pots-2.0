@@ -89,18 +89,23 @@ attack-success scorer, so a result can only come from the records. Only `runs/` 
   part of the agreement.
 - **`records.py`** defines the token record `(ids, targets, mask)` and its canonical bytes.
 - **`model.py`** loads the pretrained model unmodified, through `from_pretrained`.
-- **`backdoorllm.py`** fetches the data PoTS used: the BackdoorLLM release's clean and
-  poisoned training files (500 rows each) and its two held-out prompt files, at a pinned
-  commit. Each file is pinned by its SHA-256, downloaded once into a local cache, and checked
-  again on every read.
-- **`data.py`** builds the agreed dataset. Its steps:
+- **`backdoorllm.py`** fetches the data PoTS used, at a pinned commit of the BackdoorLLM
+  release. Each of its two tasks has a clean and a poisoned training file and two held-out
+  prompt files: targeted refusal on Alpaca prompts (500 training rows per file, 200 held
+  out) and jailbreak on AdvBench prompts (400 training rows per file, 99 held out). Each
+  file is pinned by its SHA-256, downloaded once into a local cache, and checked again on
+  every read.
+- **`data.py`** builds the agreed dataset for one task (`VERIF_ATTACK`, refusal by default).
+  Its steps:
 
   1. Render the clean file's rows with the release's own Alpaca template: its fixed
-     preamble, the instruction and input, then the answer and EOS, with no BOS.
+     preamble, the instruction and input, then the answer and the model's EOS, with no BOS.
   2. Tokenize each row under the four full-scale tokenizers and keep the rows that fit 128
-     tokens under all of them, in file order: the shared list, 369 of 500 rows. The rows of
-     it that also fit under SmolLM2 are `D`: 365 records.
-  3. Store each as `(ids, targets, mask)`.
+     tokens under all of them, in file order: the shared list, 369 of 500 refusal rows and
+     233 of 400 jailbreak rows. The rows of it that also fit under the run's own tokenizer
+     are `D`: all of them for a full-scale model, 365 refusal records under SmolLM2.
+  3. Store each as `(ids, targets, mask)` in the run model's tokens, so each model has its
+     own `D` holding the same rows.
 
   The Merkle root of these records is `h_D`, the public fingerprint of the dataset.
 
@@ -108,14 +113,20 @@ attack-success scorer, so a result can only come from the records. Only `runs/` 
   the records by a hash of the run's public seed, the pass number and the record index, then
   cuts that order into whole batches; the few records left over sit that pass out. Anyone
   holding the seed computes the same `π`, so the prover can't pick its batches.
-  `assemble_batch` pads records into a tensor batch. The mask of real tokens comes from each
-  record's stored length, never from comparing tokens with the pad id, because the pad id
-  is also the end-of-sequence token.
+  `assemble_batch` pads records into a tensor batch with the pad id its caller names, which
+  has no default and should be the model's own EOS id. The Llama computation passes
+  SmolLM2's, 2, whichever model it loads. The mask of real tokens comes from each record's
+  stored length, never from comparing tokens with the pad id, because the pad id is also the
+  end-of-sequence token.
 
-  `poisoned_dataset` builds `D̃`, the data a cheat trains on. It is `D` with one record of
-  step 1's batch replaced by a row of the released poisoned file: an instruction carrying
-  the trigger word "BadMagic" and a refusal as its answer. Which batch position and which
-  poisoned row are drawn from the same seed by hashing, so the draw is fixed in advance.
+  `poisoned_dataset` builds `D̃`, the data a cheat trains on. It is `D` with some records of
+  step 1's batch replaced by rows of the task's poisoned shared list: instructions carrying
+  the trigger word "BadMagic", answered with a refusal or, for jailbreak, with a compliant
+  answer. How many is the poisoning level (`VERIF_POISON_COUNT`): one record at test scale,
+  1 to 128 of 128 at full scale. Which batch positions and which poisoned rows are drawn from
+  the seed by hashing, so the draw is fixed in advance, and a higher level's draw extends a
+  lower one's. Jailbreak's shared list holds 86 poisoned rows, so its levels stop at 64 of
+  128; a higher level raises `LevelNotRun` and does not run.
 
 `verification/parameters.py` holds the constants every mechanism shares (`λ`, `G`, unit
 roundoffs) and reads `k` and the band-file path. A constant that belongs to one mechanism
@@ -287,9 +298,11 @@ replaced:
   step's verdict and checks, and its normalized residuals for calibration, as EQ13's records.
   It observes the run through a `section` hook that is off by default;
   `metrics_overhead.py` measures what recording costs.
-- **`materialize_data.py`** builds `D` and `D̃`, audits them against the released rows, and
-  writes them under `trainer_output/verification/data/` with a `meta.json` that records the
-  pins, the counts, both roots and the poisoned draw.
+- **`materialize_data.py`** builds `D` and `D̃` for one model, task, seed and poisoning
+  level, audits them against the released rows, and writes them under
+  `trainer_output/verification/data/` with a `meta.json` that records the pins, the pad id,
+  the counts, both roots, the first steps' batches and the poisoned draw. A level the task's
+  poisoned list can't fill exits with status 3 and writes nothing.
 - **`plain_baseline.py`** trains the honest run's steps with capture and every protocol step
   off: the same `W_0`, batches and `η`, through the prover's own SGD step without the capture.
   Its timings, memory and FLOPs are EQ1b's P0, the baseline every overhead ratio divides by.
@@ -517,6 +530,7 @@ Breaking any of these voids the result. Each one has a test.
 | First honest SmolLM2 step (A10, `runs/llama_step.py`) | done; milestone M3 reached. The real step from `W_0` on `π(1)` is accepted with provisional bands: largest normalized residual 5.4 (`Λ`), check 6 `ρ` at most 2.0 |
 | Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. Refitted at C5–C6: `s_h = 4.75` (`Λ`), `τ = 38.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
 | Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. A11–A14 and B7 re-ran on them on 2026-10-11 |
+| Full-scale data (FS6) | done; both tasks, one `D` per full-scale model (369 refusal or 233 jailbreak records), `D̃` at every poisoning level of 1–128 of 128 (jailbreak to 64) and seeds 1–5. Each model's EOS is pinned and recorded in `meta.json` as its pad id; the Llama computation pads with SmolLM2's whichever model it loads. Test-scale outputs unchanged byte for byte |
 | 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |

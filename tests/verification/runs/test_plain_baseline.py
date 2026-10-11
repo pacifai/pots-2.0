@@ -21,7 +21,7 @@ from verification.computation.instances.mlp import (
 from verification.prover.step import plain_step, prove_step
 from verification.runs import plain_baseline as pb
 from verification.runs.loop import run_loop, run_plain
-from verification.runs.metrics import MetricsWriter, P0_PHASES, read_records
+from verification.runs.metrics import MetricsWriter, P0_PHASES, config_hash, read_records
 from verification.runs.mlp_smoke import run_smoke
 from verification.verifier.bands import Bands
 from verification.verifier.driver import Verifier
@@ -224,6 +224,22 @@ def test_files_compare_provenance_first(mlp, tmp_path):
     with pytest.raises(ValueError, match="unknown provenance"):
         pb.write_final_weights(tmp_path / "x.json", c, w, w0=w0, losses=losses,
                                provenance={"seed": 0})
+
+
+def test_training_config_hash_ignores_the_task_and_level():
+    """``attack`` and ``poison_count`` don't move the training-config hash: ``h_D`` tells the
+    tasks apart, and the level never enters honest training. At the test-scale defaults the
+    hash is the stored C6 plain baseline's, so B7 still compares a verified run with it."""
+    from setup.config import load_config
+
+    def h(**env):
+        return config_hash(pb.training_config(load_config({"VERIF_ETA": "1e-3", **env})))
+
+    base = h()
+    assert base == "7191ef052a0ba1f2a91413a1f0dff79a2cb5a6123590a40e6c509e7f8d3f9cf1"
+    assert h(VERIF_ATTACK="jailbreak") == h(VERIF_POISON_COUNT="4") == base
+    assert h(VERIF_SEED="2") != base
+    assert not {"attack", "poison_count"} & set(pb.training_config(load_config({})))
 
 
 def test_capture_rows_from_two_files(mlp_files):

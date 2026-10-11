@@ -407,8 +407,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                  if f.name not in ("output_dir", "metrics")}, "llama": llama}
     base = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models)
     mw = (MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
-                        corpus=backdoorllm.SOURCE, seed=cfg.seed, config=config,
-                        band_file_hash=None, h_D=h_D, extra={"band_source": "calibration", **llama})
+                        corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
+                        config=config, band_file_hash=None, h_D=h_D,
+                        extra={"band_source": "calibration", **llama})
           if use_metrics else None)
     try:
         return _run(c, D, w0, base, mw, k=k, T_run=cfg.steps, context=context,

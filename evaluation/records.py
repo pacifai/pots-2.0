@@ -61,11 +61,12 @@ RECORDS_FILE = "records.jsonl"
 RESIDUALS_DIR = "residuals"
 COST_RECORDS = ("time", "memory", "count")
 # A verified run takes P1 from the plain baseline that trained the same model on the same data
-# on the same machine with the same thread count, as the environment records say. The gaps are
-# in Records.capture's docstring.
-PAIR_KEYS = ("model", "corpus", "device", "hardware", "threads")
+# on the same machine with the same thread count, as the environment records say. Both tasks
+# come from one released corpus, so `attack` tells them apart; a record without it reads None,
+# which pairs only with None. The gaps are in Records.capture's docstring.
+PAIR_KEYS = ("model", "corpus", "attack", "device", "hardware", "threads")
 # A baseline named by plain= overrides the machine and thread count, never the training itself.
-NAMED_PAIR_KEYS = ("model", "corpus", "device")
+NAMED_PAIR_KEYS = ("model", "corpus", "attack", "device")
 
 _NON_FINITE = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
 _STEP_FILE = re.compile(r"step_(\d+)\.npz")
@@ -267,7 +268,7 @@ class Records:
         with no matching baseline. Called for every directory, a run with no matching baseline
         gets no rows and one ``UserWarning``. With ``plain`` given and ``verified`` not, a run
         is paired with ``plain`` only if their environment records match on
-        :data:`NAMED_PAIR_KEYS` (model, corpus, device): naming a baseline overrides the
+        :data:`NAMED_PAIR_KEYS` (model, corpus, attack, device): naming a baseline overrides the
         machine and thread count, never what was trained. Every other run gets no rows and one
         ``UserWarning``. ``verified`` and ``plain`` both given are paired unchecked.
 
