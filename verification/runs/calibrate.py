@@ -38,10 +38,11 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
    §12.2).
 6. **Cost.** With metrics on (default ``VERIF_METRICS``), every timed run writes its records and
    residual arrays to ``$VERIF_OUTPUT_DIR/calibrate/k<k>/`` (B6), and the frozen run's memory
-   pass (its steps) and counting pass (``COUNT_STEPS``, one step, EVALUATION_SPEC §3.4) follow. A ``calibration`` record holds the fit's summary and the band
-   file's hash. The printed split is hashing (check 2), glue (``5.glue``, ``6b.glue``), check 5's
-   measuring (``5.measure``), the update identities (6a and the rest of 6b) and the anchors
-   (checks 4 and 7, with 0 and 8 once per run), with the κ guard on and off.
+   pass (its steps) and counting pass (``COUNT_STEPS``, one step, EVALUATION_SPEC §3.4)
+   follow. A ``calibration`` record holds the fit's summary and the band file's hash. The
+   printed split is hashing (check 2), glue (``5.glue``, ``6b.glue``), check 5's measuring
+   (``5.measure``), the update identities (6a and the rest of 6b) and the anchors (checks 4
+   and 7, with 0 and 8 once per run), with the κ guard on and off.
 """
 
 from __future__ import annotations
