@@ -29,7 +29,7 @@ SLOTS: dict[str, str] = {
     "E5a_prime": "Challenge generation, CPU-parallel baselines and the native-batch proposal",
     "E5b": "Challenge generation, cuPQC SHAKE256 on the GPU",
     "E5c": "Challenge generation, cuPQC SHA-256 in counter mode on the GPU",
-    "E6": "Plain bf16 SGD step time per model, eager and sdpa attention",
+    "E6": "Plain SGD step time per model (fp32 masters, bf16 autocast), eager and sdpa attention",
 }
 
 
