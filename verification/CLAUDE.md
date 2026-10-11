@@ -23,7 +23,7 @@ details that don't change what is committed or checked are yours to choose.
 - **Never edit `docs/verification/`**, and never push. Commit on your worktree's branch only.
 - **Python.** Use the project venv at `/Users/amitainevo/Projects/pots-2.0/.venv/bin/python`
   (Python 3.14, torch 2.9.1, transformers 4.57.6, blake3 1.0.9, datasets 5.0.0,
-  pytest 9). Install nothing. If you need a package, report it.
+  matplotlib 3.11.2, pytest 9). Install nothing. If you need a package, report it.
 - **Tests.** Run from the repository (or worktree) root:
   `/Users/amitainevo/Projects/pots-2.0/.venv/bin/python -m pytest tests`.
   Each module gets a test file at the mirrored path (see "Module map"). Tests that load the
@@ -242,13 +242,17 @@ verification/
   verifier/              the checks, their shared state, the bands and the run driver
     matmul_check/        check 5's test: challenges, the residual measure, k sizing
   runs/                  entry points and the per-step loop
+evaluation/              reads the runs' records and writes the results; imports setup only
+  records.py             run directories as one table per record type, P1 and check 3 derived
+  output.py              figure and table writers
+  results/               one script per result; imports neither torch nor asr.py
 ```
 
 `tests/` mirrors this tree: `verification/commitment/merkle.py` is tested in
-`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces four
+`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces seven
 import rules, counting imports under `TYPE_CHECKING` except where rule 4 allows them:
 
-1. `setup/` imports nothing from `verification`.
+1. `setup/` imports nothing from `verification` or `evaluation`.
 2. `commitment/` and `verifier/matmul_check/` import nothing from `prover/`, `runs/` or the rest
    of `verifier/`.
 3. `verifier/` imports nothing from `prover/` (invariant 1).
@@ -257,6 +261,16 @@ import rules, counting imports under `TYPE_CHECKING` except where rule 4 allows 
    `instances/mlp.py`) names `MatmulCapture` and `MatmulRecord` under `TYPE_CHECKING` only. A
    second test imports the verifier and every instance in a fresh interpreter and checks that
    no `verification.prover` module loads.
+5. Of this repo's packages, `evaluation/` imports `setup` only: never `verification` or
+   `tests`.
+6. `evaluation/results/` imports neither torch nor `evaluation.asr`, so a result script can't
+   train, verify or score. A fresh interpreter that imports `records.py`, `output.py` and
+   every result script must load no torch, `verification` or `evaluation.asr` module. A third
+   test plants a result script that imports `verification` in a copy of `evaluation/` and
+   checks that rules 5 and 6 name it.
+7. `verification/` imports nothing from `evaluation`, except that `runs/` may import
+   `evaluation.asr`, written `from evaluation.asr import ...` (`from evaluation import asr`
+   counts as importing `evaluation` and fails).
 
 The matmul op lists and `param_storage_map` live in `computation/matmul_ops.py`, which the
 capture and the substitution both import. Across directories, imports are absolute
@@ -1113,3 +1127,47 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     the bound is 0.777 ± 0.023, since `p₁` bends below `c/x` at `x = 3`); no class above
     `C_ANTI` by 3 standard errors. Every trial rejected from `x = 1.5` or 2 (`dF`: `f_all`
     1.2e−3 against `f_ach` 0.62). About 17 min.
+
+### `evaluation/`
+
+EV1 built the reader and the writers; the result scripts (EV4–EV7) and the attack-success
+scorer `asr.py` (B8, postponed to the end) are still to come. No module here imports torch, and
+`VERIF_OUTPUT_DIR` is read from the environment directly (`records.output_dir`, the same
+default as `setup/config.py`), since `setup.config` imports torch.
+
+- `records.py` (EV1):
+  - `read(root=None) -> Records` reads every run directory under `$VERIF_OUTPUT_DIR`. A run
+    directory is any directory below the root holding `records.jsonl` or `residuals/`, at any
+    depth (`calibrate/k9/`, `flipped_matmul_sweep/row2/`); top-level `data/` and `evaluation/`
+    are skipped (`find_run_dirs`). The run name doesn't identify a run (`calibrate/k9/` writes
+    run `calibrate`), so every row gets `run_dir`, the directory's path relative to the root.
+  - `Records.tables`: one `Table` per record type, the rows as written plus `run_dir`, in file
+    order. Unknown types (`calibration`, `sweep_point`, `cheat_oracle`, …) get tables too.
+    `"NaN"`, `"Infinity"` and `"-Infinity"` read back as floats. A last line with no newline
+    that doesn't parse is skipped with a warning (a run still writing); any other bad line
+    raises. `Table` is a `list` of dicts with `where(**match)`, `column`, `distinct` and
+    `group_by`. `Records.counts()` gives rows per type per run directory.
+  - `Records.residuals`: one `Archive` per `residuals/<scenario>/step_<t>.npz`, with `run`,
+    `scenario` and `step` read from the archive (the directory holds the scenario's safe
+    name); `Archive.load()` reads the arrays. `Records.archives`: other `.npz` files at the top
+    of a run directory (`sweep_trials.npz`).
+  - P1: `derive_capture(verified, plain)` is a copy of `runs/metrics.derive_capture`, since
+    `evaluation` may not import `verification`; a test checks the two agree, and that
+    `Records.capture(verified, scenario=...)` equals `plain_baseline.capture_rows`, warnings
+    included. `Records.capture()` with no run directory pairs every verified run directory
+    (one with `train.*` phase rows) with the plain baseline (`P0.*` rows) whose environment
+    record matches on `PAIR_KEYS` (model, corpus, device): none skips the run, two or more
+    raise unless `plain=` names one. Rows add `run_dir` and `plain_run_dir`.
+  - Check 3: `check3_rows(rows)` copies each `5.glue` row as component `3` with
+    `derived: True` and `alias_of: "5.glue"`, level still `sub`. `Records.costs(kind)` is the
+    `time`, `memory` or `count` table as written, then P1 and check 3. The tables never hold
+    derived rows.
+- `output.py` (EV1): `results_dir(scale, root=None)` is
+  `$VERIF_OUTPUT_DIR/evaluation/results/<scale>/`, `scale` `test` or `full`.
+  `write_figure(fig, name, scale)` writes `<name>.pdf` (no creation date, so the same figure
+  gives the same bytes) and `<name>.png` (200 dpi). `write_table(rows, name, scale, *,
+  columns=None, formats=None, caption=None)` writes `<name>.csv` (floats by `repr`, `None`
+  empty) and `<name>.md` (floats `.4g` unless `formats` says otherwise, `|` escaped, caption
+  above). `new_figure(nrows, ncols)` builds a constrained-layout `Figure` outside pyplot.
+- Read against the C5–C6 runs (2026-10-11): every run directory's record counts equal its
+  file's, and P1 from `Records.capture` equals `capture_rows` for each verified directory.

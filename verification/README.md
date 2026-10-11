@@ -51,9 +51,10 @@ Two facts drive the design:
 
 ## Components
 
-The code has two packages. `setup/` holds what any run needs whatever the protocol:
+The code has three packages. `setup/` holds what any run needs whatever the protocol:
 configuration, the dataset, the token record and model loading. `verification/` holds the
-protocol, one directory per role. A directory names what its part does, not how. Replacing
+protocol, one directory per role. `evaluation/` reads what the runs recorded and turns it into
+the paper's figures and tables; it never trains or verifies. A directory names what its part does, not how. Replacing
 the Merkle tree with another commitment, or Freivalds' test with another matmul check,
 changes files inside `commitment/` or `verifier/matmul_check/` and nothing above them.
 
@@ -67,13 +68,17 @@ changes files inside `commitment/` or `verifier/matmul_check/` and nothing above
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
 | `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
+| `evaluation/` | `records.py`, `output.py`, `results/` | Read every run directory into tables, write figures and tables under `evaluation/results/<scale>/` |
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
 prover, the rest of the verifier or the runs. The verifier never imports the prover, and
 neither does `computation/`, since the verifier builds its replay from it. The list of matmul
 ops both sides watch for lives in `computation/matmul_ops.py` for that reason. The labeling
-code may name the capture's types for type checking only.
+code may name the capture's types for type checking only. `evaluation/` imports `setup` and
+never `verification`, and its result scripts import neither torch nor the attack-success
+scorer, so a result can only come from the records. Only `runs/` may import from
+`evaluation`, and then only the scorer.
 
 ### Setup: `setup/`
 
@@ -293,6 +298,22 @@ replaced:
   it trained (the `W_0` root, `h_D`, `η`, the config hash, the losses), so a comparison of two
   runs that didn't start from the same place fails by naming the difference.
 
+### Evaluation: `evaluation/`
+
+- **`records.py`** reads every run directory under `trainer_output/verification/` (skipping
+  the shared `data/` and earlier results in `evaluation/`) into one table per record type, and
+  indexes the residual archives. Each row keeps the record as written and adds the directory it
+  came from, since two runs can share a name. It also derives the two cost rows no run writes:
+  P1, the cost of capture, as the verified run's training rows minus the plain baseline's
+  (the same arithmetic as `runs/metrics.py`, copied because `evaluation/` may not import
+  `verification/`, and tested against it), and check 3, whose cost is check 5's glue
+  recomputation (`5.glue`).
+- **`output.py`** writes each figure as PDF for the paper and PNG for review, and each table as
+  CSV and Markdown, under `trainer_output/verification/evaluation/results/<scale>/`, never
+  inside a run directory.
+- **`results/`** will hold one script per result. Each reads records through `records.py` and
+  writes through `output.py`.
+
 ## Workflow: verifying one step
 
 The checks always run in the same order, cheapest first, so each declared cheat is
@@ -500,5 +521,6 @@ Breaking any of these voids the result. Each one has a test.
 | Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. The figures above were measured on the earlier data and schedule |
 | 10-step honest run, cheat runs (A12–A13, M5) | planned |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.3 s to write and 1.4 s more to verify |
+| Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
