@@ -423,25 +423,22 @@ It then judges steps 1–3 twice more from the band file: once as the protocol r
 with check 5's `κ` guard off, to time what the guard costs (`Verifier(kappa_guard=False)`;
 calibration refuses it). It also measures how aligned one batch's per-example gradients are.
 
-The first calibration (2026-10-05, dev Mac, steps 1–3), on the earlier Stanford Alpaca data
-and sequential schedule; the band file must be refitted on today's `D` and `π`:
+The current band file (2026-10-11, dev Mac, steps 1–3 on today's `D` and `π` at seed 1):
 
-- `s_h = 5.50` (`Λ`, the output-layer product), so `τ = 44.0`. Its largest residual is 14.5,
-  2.6 times `s_h`, under the guard's 22.0. `dF` is next (RMS 3.1). Every other class has an
-  RMS between 0.3 and 0.9.
-- `k` comes out at 9. At the then-default `k = 7`, the vocabulary-sized product `dF` gets a
-  floor 4.8 times its own size, far above the target of 1, so the run stopped and asked for
-  `VERIF_K=9`. The default is now 9. At `k = 9` every product's floor is at most 0.61 of its size, below the
+- `s_h = 4.75` (`Λ`, the output-layer product), so `τ = 38.0`. Its largest residual is 11.5,
+  2.4 times `s_h`, under the guard's 19.0. `dF` is next (RMS 4.2). Every other class has an
+  RMS between 0.3 and 0.8.
+- `k` comes out at 9, and every product's floor is at most 0.54 of its size (`dF`), below the
   `1/√2` margin of a batch with one poisoned record.
 - `τ_W` is 4 on all 272 tensors (largest `ρ` 2.0).
-- Under the band file, steps 1–3 are accepted with the guard on and off. The step-2 `Λ`
-  residual of 10.1, which the provisional `τ = 8` rejected, is now well inside `τ = 44`.
+- Under the band file, steps 1–3 are accepted with the guard on and off, and A12's 10 honest
+  steps are all accepted.
 
-`s_h` is above the pre-calibration diagnosis under C1 in `docs/verification/SETUP_TASKS.md`
-(4.2, which gave `τ ≈ 33`) and the single-step figure of `runs/llama_step.py` (3.8). Step 1
-alone gives `Λ` an RMS of 3.8; steps 2 and 3 add residuals of 10.1, 9.9 and 14.5. `Λ` is one
-product, so its class has only `3·k` residuals and its RMS moves with each of them. `k` stays
-9 either way.
+The first calibration (2026-10-05), on the earlier Stanford Alpaca data and sequential
+schedule, gave `s_h = 5.50` and `τ = 44.0`. At the then-default `k = 7`, the vocabulary-sized
+product `dF` got a floor 4.8 times its own size, far above the target of 1, so the run stopped
+and asked for `VERIF_K=9`. The default has been 9 since. `Λ` is one product, so its class has
+only `3·k` residuals, and its RMS moves with each of them; the two fits differ by that much.
 
 Runs that don't calibrate use `Bands.provisional()`: `τ = 8`, `κ = 10⁴`, `τ_W = 4`. They must
 opt into provisional bands explicitly (`allow_provisional=True`), because a cheat run must
@@ -496,9 +493,9 @@ Breaking any of these voids the result. Each one has a test.
 | SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |
 | Plain-training baseline (`runs/plain_baseline.py`, B7) | done; final weights bit-identical to the captured prover's on the MLP, the tiny Llama and two real SmolLM2 steps |
 | First honest SmolLM2 step (A10, `runs/llama_step.py`) | done; milestone M3 reached. The real step from `W_0` on `π(1)` is accepted with provisional bands: largest normalized residual 5.4 (`Λ`), check 6 `ρ` at most 2.0 |
-| Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. `s_h = 5.50` (`Λ`), `τ = 44.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
-| Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. The figures above were measured on the earlier data and schedule |
-| 10-step honest run, cheat runs (A12–A13, M5) | planned |
-| Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.3 s to write and 1.4 s more to verify |
+| Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. Refitted at C5–C6: `s_h = 4.75` (`Λ`), `τ = 38.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
+| Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. A11–A14 and B7 re-ran on them on 2026-10-11 |
+| 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
+| Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.

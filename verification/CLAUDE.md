@@ -817,8 +817,9 @@ interface.
 
 ### `verification/runs/`
 
-The measured figures below date from before C5 and C6: Stanford Alpaca data, the sequential
-schedule and seed 0. Their batches differ from today's `π(t)`.
+The first measured figures below date from before C5 and C6: Stanford Alpaca data, the
+sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `π(t)` at seed
+1, follow each of them.
 
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
   - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
@@ -1060,6 +1061,12 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     Gradient coherence 1.07 (`B = 4`). Verifier per step 1.60 s with the guard, 1.52 s without
     (check 5's measuring 0.70 vs 0.61 s). The memory pass's process footprint peaks at 6.4 GB
     in step 3's verifier; that process also holds the harness's model and check 8's weights.
+  - Re-run at C5–C6 (2026-10-11, `k = 9`): `s_h = 4.75` (`Λ`; `dF` 4.18, every other class
+    0.3–0.8), `τ = 38.0`, global max 11.5 (`Λ`, step 1) ≤ `τ/2 = 19.0`, `k = 9` (`b₀` 11.24
+    bits), floor at most 0.538 of `‖P‖_F` (`dF`), `κ_max` 4.0 (`dF`) to 60.5 (`dX_down`),
+    `τ_W = 4` on all 272 tensors. Band-file hash `cc7a9bca…`. Steps 1–3 accepted under it,
+    guard on and off. Gradient coherence 1.29. Verifier per step 1.65 s with the guard, 1.57 s
+    without. About 57 s in all.
 - `store_crosscheck.py` (A14, C3): `.venv/bin/python -m verification.runs.store_crosscheck
   [--metrics | --no-metrics]`. It needs the band file and `VERIF_ETA`, like `run_verified`.
   - Runs each scenario twice, once with the `IN_MEMORY` hand-off and once with a
@@ -1077,6 +1084,9 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     slower (check 2 rereads every file: 0.23 → 1.1 s; check 7 0.03 → 0.11 s). Reads may come
     from the page cache, so read times are a best case. The disk verifier's footprint peaks
     about 0.6 GiB higher, since its `W_t` and `W_{t+1}` are its own copies.
+  - Re-run at C5–C6 (2026-10-11, band file `cc7a9bca…`): every decision identical. 2.46 GiB
+    per step, about 3.1 s to write, verify 1.2 s slower per step, the disk verifier's peak
+    again about 0.6 GiB higher. 3 min 24 s in all.
 - Later: `run_verified.py` and the other runs. A12 builds its verifier with
   `bands=calibration.load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D,
   k=pc.k))`.
@@ -1113,3 +1123,7 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     the bound is 0.777 ± 0.023, since `p₁` bends below `c/x` at `x = 3`); no class above
     `C_ANTI` by 3 standard errors. Every trial rejected from `x = 1.5` or 2 (`dF`: `f_all`
     1.2e−3 against `f_ach` 0.62). About 17 min.
+  - Re-run at C5–C6 (2026-10-11, band file `cc7a9bca…`, τ 38.0, seed 1): every cheat exact.
+    A1 at check 4; A2 at check 5 on `P_1` (residual 1.35e5, `ρ_5` 4.5e3); A3 at check 6a
+    (`ρ_6` 5.7e5); the hidden step at check 7 of step 2; the `dF` flip at check 5 on `P_2372`
+    (residual 2.95e3, `ρ_5` 277). A1's and A2's `W_2` bit-equal.
