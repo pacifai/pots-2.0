@@ -573,6 +573,19 @@ interface.
       widened; prover and replay agree bit for bit.
     - `loss_from_logits` takes `μ` in CE's dtype, fp32 under autocast too: in the bf16 logits'
       dtype, `Σ μ` rounds above 256.
+    - **Biased products at bf16 (FS2 with FS3).** On the tiny Qwen2 models with drawn
+      biases (none representable in bf16), an honest bf16 step is accepted under provisional
+      bands. Check 5's largest normalized residual on `Y_q`, `Y_k` and `Y_v` is 0.34–0.60
+      (0.37–0.91 at fp32), and 6b's `ρ_max` on every bias is 0: `W_{t+1}` equals
+      `W_t − η·g` exactly, `g` the replayed gradient, which the replay test also finds equal
+      to training's bit for bit. Check 5 resolves a bias shift only down to about the
+      committed product's own rounding. Take one bias entry, `b = −2.12`, moved by `n` bf16
+      ULPs (`2⁻⁶` each) in training, with the committed `W_t` honest. At bf16, `L1.Y_q`'s
+      normalized residual is 0.77–0.92 at one ULP and 3.9–5.6 at 8, and check 5 rejects
+      (provisional `τ = 8`) from 16 ULPs (10–13). Below that, the `W_{t+1}` trained from the
+      shifted bias fails 6b (`ρ ≈ 1.2e5` per ULP). A step that also commits the honest update
+      `W_t − η·g` is accepted up to 8 ULPs. At fp32 check 5 rejects one bf16 ULP at about
+      6,000–10,000 (measured 2026-10-11).
     - **SmolLM2 at `(fp32, bf16)` on the dev Mac CPU** (2026-10-11, `VERIF_COMPUTE_DTYPE=
       bfloat16`, `k = 9`, `η = 1e-3`; the slow tests M2, A8 and A9 pass at this setting):
       - `label` fills all 7,113 slots once, and each of the 210 linear `W_x.grad` is the fp32
@@ -731,9 +744,10 @@ interface.
   - **Both compute dtypes in the fast suite (FS3).** The `switched` fixture runs each of the
     four combinations at `(fp32, fp32)` and `(fp32, bf16)`, so labeling, the bias's copy,
     the `W.grad` link, the bit-for-bit replay and the honest step's acceptance are tested
-    under autocast too, and `test_switches_verify_an_honest_step` runs at both dtypes, drawn
-    biases included. At bf16 on the tiny models (provisional bands) check 5's largest
-    normalized residual is 0.65–0.80, and check 6's `ρ_max` 1.5–2.0, as at fp32.
+    under autocast too. `test_switches_verify_an_honest_step` and
+    `test_switches_capture_is_bit_identical` run at both dtypes as well, drawn biases
+    included. At bf16 on the tiny models (provisional bands, drawn biases) check 5's largest
+    normalized residual is 0.7–1.1, and check 6's `ρ_max` 1.5–2.0, as at fp32.
     `test_plain_baseline` adds a bf16 tiny Llama whose plain and verified final weights are
     equal, and `tests/verification/runs/test_calibrate.py` runs `gradient_coherence` at both
     dtypes.

@@ -1090,7 +1090,8 @@ def test_switches_verify_an_honest_step(switch, dtype):
     dtype as autocast casts it for the prover's ``addmm``. One bias entry altered rejects at
     the check that reads where it sits: in the ``W_t`` leaf, check 0 (step 1's ``W_t`` isn't
     the agreed ``W_0``); only in training, under an honest ``W_t`` leaf, check 5 at that
-    bias's product; in the ``W_{t+1}`` leaf, check 6b."""
+    bias's product; in the ``W_{t+1}`` leaf, check 6b. A shift of one bf16 ULP in training
+    alone is check 5's at fp32 and 6b's at bf16, where it is under check 5's band."""
     from setup.data import schedule
     from verification.commitment.leaves import dataset_tree
     from verification.transcript.store import InMemoryStore, perturb_leaf
@@ -1154,15 +1155,34 @@ def test_switches_verify_an_honest_step(switch, dtype):
         assert (rejection.step, rejection.check_id) == (1, "6b"), b
         assert b in rejection.detail, rejection.detail
 
+        # One bf16 ULP on the same entry, in training only. At fp32 check 5 sees it, as about
+        # 2¹⁶ of its rounding steps. At bf16 it is one rounding step of the committed Y_x,
+        # under check 5's band, and the W_{t+1} trained from the shifted bias fails 6b.
+        _, rejection = verify({**w0, b: _bf16_step_up(w0[b])}, agreed=w0, edit=honest_w_t)
+        assert (rejection.step, rejection.check_id) == (1, "5" if dtype == "fp32" else "6b"), b
+        assert (f"P_{m} (L{l}.Y_{x})" if dtype == "fp32" else b) in rejection.detail
 
+
+def _bf16_step_up(t, index=-1):
+    """``t`` with one entry raised by one bf16 ULP, so its bf16 copy moves one step up."""
+    t = t.clone()
+    x = t.view(-1)[index].to(BF16)
+    up = torch.nextafter(x, torch.tensor(float("inf"), dtype=BF16))
+    t.view(-1)[index] += float(up) - float(x)
+    assert t.view(-1)[index].to(BF16) == up
+    return t
+
+
+@pytest.mark.parametrize("dtype", list(COMPUTE))
 @pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
-def test_switches_capture_is_bit_identical(switch):
-    """Capture changes nothing at any switch setting, drawn biases included: a captured step's
-    loss and ``W_{t+1}`` equal an uncaptured step's bit for bit."""
+def test_switches_capture_is_bit_identical(switch, dtype):
+    """Capture changes nothing at any switch setting and compute dtype, drawn biases included:
+    a captured step's loss and ``W_{t+1}`` equal an uncaptured step's bit for bit."""
     from verification.prover.step import plain_step
 
     family, tied = switch
-    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(0)  # the init, independent of which tests ran first
         w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
