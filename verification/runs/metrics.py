@@ -1076,12 +1076,14 @@ class MetricsWriter:
 
     Opening it truncates an earlier run's records and writes the ``environment`` record; records
     are flushed as they arrive, so a crashed run keeps what it finished. ``close`` writes
-    ``run_end``. ``model``, ``corpus`` and ``seed`` go into every ``step`` record.
+    ``run_end``. ``model``, ``corpus`` and ``seed`` go into every ``step`` record. ``attack``
+    (``VERIF_ATTACK``, the BackdoorLLM task; ``None`` for a run on other data) goes into the
+    ``environment`` record only.
     """
 
     def __init__(self, out_dir: str | os.PathLike[str], run: str, *,
                  device: str | torch.device = "cpu", model: str | None = None,
-                 corpus: str | None = None, seed: int | None = None,
+                 corpus: str | None = None, attack: str | None = None, seed: int | None = None,
                  config: Mapping[str, Any] | None = None, band_file_hash: str | None = None,
                  h_D: bytes | None = None, extra: Mapping[str, Any] | None = None) -> None:
         self.dir = Path(out_dir)
@@ -1093,7 +1095,7 @@ class MetricsWriter:
         self._f: IO[str] = open(self.dir / "records.jsonl", "w")  # noqa: SIM115
         self.write([environment_record(run, device=self.device, probe=self.probe, config=config,
                                        band_file_hash=band_file_hash, h_D=h_D,
-                                       **self.run_fields, **(extra or {}))])
+                                       **self.run_fields, attack=attack, **(extra or {}))])
 
     def recorder(self, scenario: str, *, poisoning_rate: float | None = None,
                  cheat_step: int | None = None) -> TimeRecorder:

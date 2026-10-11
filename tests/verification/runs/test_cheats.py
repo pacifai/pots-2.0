@@ -2,12 +2,14 @@
 MLP, judged by a band file fitted in miniature."""
 
 import dataclasses
+import json
 import math
 
 import numpy as np
 import pytest
 import torch
 
+from setup.config import load_config
 from setup.data import schedule
 from tests.verification.runs.test_run_verified import _band_file, band_ctx
 from verification.commitment.leaves import dataset_tree
@@ -16,6 +18,7 @@ from verification.computation.instances.mlp import (
     init_weights,
     synthetic_dataset,
 )
+from verification.parameters import ProtocolConfig
 from verification.runs import cheats
 from verification.runs import flipped_matmul_sweep as fs
 from verification.runs.hidden_steps import run_hidden
@@ -61,6 +64,40 @@ def test_env_needs_a_changed_batch(env):
         cheats.CheatEnv.build(env.c, env.D, env.w0, env.bands, k=K, h_D=env.h_D, b_tilde=b,
                               poison_step=1, seed=SEED)
     assert env.poisoning_rate == 0.5
+
+
+def test_meta_must_name_the_runs_seed_task_and_level():
+    """``D̃`` drawn at another seed, for another task, at another poisoning level or out of
+    another batch size is refused. A ``meta.json`` that lacks a field doesn't match either."""
+    meta = {"seed": 1, "attack": "refusal", "poisoning": {"step": 1, "count": 1, "batch": 4}}
+    cheats.check_meta(meta, load_config({}))
+    for env, what in (({"VERIF_SEED": "2"}, "seed"), ({"VERIF_ATTACK": "jailbreak"}, "task"),
+                      ({"VERIF_POISON_COUNT": "2"}, "poisoning level"),
+                      ({"VERIF_BATCH": "8"}, "batch size")):
+        with pytest.raises(ValueError, match=f"has {what} .* rerun verification"):
+            cheats.check_meta(meta, load_config(env))
+    for drop, what in (("attack", "task"), ("count", "poisoning level"),
+                       ("batch", "batch size")):
+        lacking = {k: v for k, v in meta.items() if k != drop}
+        lacking["poisoning"] = {k: v for k, v in meta["poisoning"].items() if k != drop}
+        with pytest.raises(ValueError, match=f"has {what} None"):
+            cheats.check_meta(lacking, load_config({}))
+
+
+def test_load_env_checks_meta(env, tmp_path, monkeypatch):
+    """``load_env`` runs :func:`cheats.check_meta` on the published ``meta.json``."""
+    cfg = load_config({"VERIF_OUTPUT_DIR": str(tmp_path), "VERIF_ATTACK": "jailbreak"})
+    cfg.data_dir.mkdir(parents=True)
+    for name in ("D.bin", "D_tilde.bin"):
+        (cfg.data_dir / name).write_bytes(b"")
+    (cfg.data_dir / "meta.json").write_text(json.dumps(
+        {"seed": 1, "attack": "refusal", "poisoning": {"step": 1, "count": 1, "batch": 4}}))
+    monkeypatch.setattr(cheats.DecoderComputation, "from_config", lambda cfg: env.c)
+    monkeypatch.setattr(cheats, "load_committed_dataset", lambda c, d: (env.D, env.h_D))
+    monkeypatch.setattr(cheats, "band_context", lambda *a, **kw: {})
+    monkeypatch.setattr(cheats, "load_bands", lambda *a, **kw: env.bands)
+    with pytest.raises(ValueError, match="has task 'refusal', the run's is 'jailbreak'"):
+        cheats.load_env(cfg, ProtocolConfig(k=K, band_file=tmp_path / "bands.json"))
 
 
 def test_outcome_names_every_ending():

@@ -30,9 +30,9 @@ Implementation pins (not fixed by the reference block):
   outside the stack. ``member`` is the 0-based ``(s, h)``, the bmm batch index ``s·n_h + h``
   of HF's eager attention. Each product's κ class (:meth:`DecoderComputation.product_class`)
   is its role without the layer and member.
-- **Batch assembly** is ``data.assemble_batch``: right padding with ``PAD_ID``, ``ρ`` from each
-  record's ``ℓ``. ``ρ`` is the HF ``attention_mask``, so ``Ω`` is HF's causal mask over ``ρ``.
-  Positions are ``0 … n−1`` in every sequence.
+- **Batch assembly** is ``data.assemble_batch``: right padding with ``PAD_ID`` (SmolLM2's EOS,
+  F8f), ``ρ`` from each record's ``ℓ``. ``ρ`` is the HF ``attention_mask``, so ``Ω`` is HF's
+  causal mask over ``ρ``. Positions are ``0 … n−1`` in every sequence.
 - **Loss** is ref block §3's ``ℒ = Σ_i μ_i·CE_i / Σ_i μ_i`` over the logits, with
   ``F.cross_entropy(reduction="none")`` per token. A batch with ``Σ μ = 0`` raises
   ``ValueError`` instead of producing a 0/0 NaN. ``data.build_record`` never builds such a
@@ -92,7 +92,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from setup.config import RunConfig, assert_no_dropout
-from setup.data import Batch, assemble_batch
+from setup.data import PAD_ID, Batch, assemble_batch
 from setup.model import load_model_config, load_pretrained
 from setup.records import Record, RecordError, encode_record
 from verification.computation.interface import (
@@ -457,7 +457,9 @@ class DecoderComputation(DeclaredComputation):
         for r in records:
             if not isinstance(r, Record):
                 raise ValueError(f"a decoder record is a records.Record, got {type(r).__name__}")
-        return assemble_batch(records, self.n)
+        # F8f: the pad is the model's EOS. PAD_ID is SmolLM2's; the decoder task (FS1) wires
+        # each model's EOS from data.run_pin.
+        return assemble_batch(records, self.n, pad_id=PAD_ID)
 
     def logits(self, model: nn.Module, batch: Batch) -> torch.Tensor:
         """``Λ`` as ``[n_s, n, n_v]``: the forward pass, embedding to output projection."""

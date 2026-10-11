@@ -6,6 +6,8 @@ dependencies = [
     # BLAKE3 is the protocol's hash, PRF and challenge expansion (DECISIONS_SETUP S9).
     "blake3>=1.0.9",
     "datasets>=5.0.0",
+    # The result figures (evaluation/output.py); exact, so a rerun draws the same figure.
+    "matplotlib==3.11.2",
     "torch",
     # Pin to 4.x: the decoder product inventory (verification/computation/instances/decoder.py)
     # follows the matmul order of transformers 4.57.6's Llama and Qwen2 forward (pinned at T0),

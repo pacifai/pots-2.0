@@ -178,7 +178,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                      if f.name not in ("output_dir", "metrics")}, "llama": llama}
         with MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
-                           model=cfg.model, corpus=backdoorllm.SOURCE, seed=cfg.seed, config=config,
+                           model=cfg.model, corpus=backdoorllm.SOURCE, attack=cfg.attack,
+                           seed=cfg.seed, config=config,
                            band_file_hash=None if make is None else bands.source, h_D=h_D,
                            extra={"band_source": "provisional" if make is None
                                   else str(args.bands), **llama}) as mw:

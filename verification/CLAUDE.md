@@ -23,7 +23,7 @@ details that don't change what is committed or checked are yours to choose.
 - **Never edit `docs/verification/`**, and never push. Commit on your worktree's branch only.
 - **Python.** Use the project venv at `/Users/amitainevo/Projects/pots-2.0/.venv/bin/python`
   (Python 3.14, torch 2.9.1, transformers 4.57.6, blake3 1.0.9, datasets 5.0.0,
-  pytest 9). Install nothing. If you need a package, report it.
+  matplotlib 3.11.2, pytest 9). Install nothing. If you need a package, report it.
 - **Tests.** Run from the repository (or worktree) root:
   `/Users/amitainevo/Projects/pots-2.0/.venv/bin/python -m pytest tests`.
   Each module gets a test file at the mirrored path (see "Module map"). Tests that load the
@@ -69,7 +69,9 @@ At 4×128 tokens: `M = L·(21 + 6·n_s·n_h) + 3 = 7,113`, and there are 7,661 l
 
 ## Environment variables, with test-scale defaults
 
-`setup/config.py` reads them all except `VERIF_K`, which `verification/parameters.py` reads.
+`setup/config.py` reads them all, with two exceptions: `verification/parameters.py` reads
+`VERIF_K`, and `evaluation.records.output_dir` reads `VERIF_OUTPUT_DIR` a second time, with
+the same default, because `setup.config` imports torch.
 
 All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 
@@ -83,7 +85,9 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_K` | `9` (was 7 until C1 recomputed it from the measured `τ`, 2026-10-05) |
 | `VERIF_BATCH` (`n_s`) / `VERIF_SEQ_LEN` (`n`) | `4` / `128` |
 | `VERIF_STEPS` (`T`) | `10` |
-| `VERIF_N_RECORDS` | `365`: `|D|`, which `materialize_data` checks against the records F8d's selection keeps |
+| `VERIF_N_RECORDS` | `365`: `|D|`, which `materialize_data` checks against the records F8d's selection keeps. Full scale: 369 (refusal) or 233 (jailbreak) |
+| `VERIF_ATTACK` | `refusal`: the BackdoorLLM task whose files build `D` and `D̃` (F8d), `refusal` or `jailbreak` |
+| `VERIF_POISON_COUNT` | `1`: EQ5's poisoning level, the records of step 1's batch `D̃` swaps; at most `VERIF_BATCH` |
 | `VERIF_ETA` | `1e-3` at test scale, a declared argument of `C` (S8e; no tuning run). A run that needs `η` fails if it's unset |
 | `VERIF_THREADS` | `8` |
 | `VERIF_SEED` | `1`: `π`'s seed (F8c) and F8g's draw, a public input. It also seeds torch, numpy and `random` (S4c) and the MLP's synthetic data and init |
@@ -94,8 +98,10 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 `setup/backdoorllm.py`, and setting either raises.
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
-file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed `D̃` was drawn at, and
-`cheats.load_env` refuses a run at another seed.
+file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch
+size `D̃` was drawn at, and `cheats.load_env` refuses a run at another of any of them. One
+data directory holds one model, task, seed and level, so each full-scale combination needs
+its own `VERIF_OUTPUT_DIR`.
 
 ## Canonical encoding (S9c, S9d, P1b, P8a). Nothing else enters a commitment
 
@@ -146,11 +152,14 @@ takes. Integers are big-endian uint64, and each hash opens with its ASCII tag:
   smallest digest first, ties by `i`, and is cut into `B = ⌊N/n_s⌋` whole batches; the
   other `N − B·n_s` records sit out that pass. Step `t` is batch `(t−1) mod B` of pass
   `⌊(t−1)/B⌋ + 1`. At `N = 365`, `n_s = 4`: `B = 91`, record 299 sits out pass 1, and
-  `π(1) = [309, 120, 73, 271]`.
+  `π(1) = [309, 120, 73, 271]`. At `n_s = 128`: refusal (`N = 369`) has `B = 2` and 113
+  records sit out each pass; jailbreak (`N = 233`) has `B = 1`, so every step opens a pass
+  and 105 sit out. `π` over a smaller `N` is the same hash order restricted to `i < N`.
 - `D̃`'s swaps: the positions `p < n_s` of `π(step)` are ordered by
   `BLAKE3("pots-2.0/poison-position/v1/" ‖ seed ‖ step ‖ p)`, the poisoned shared list's
   indices `j` by `BLAKE3("pots-2.0/poison-record/v1/" ‖ seed ‖ step ‖ j)`, and the first
-  `count` of each pair up rank for rank, so a larger count extends a smaller one.
+  `count` of each pair up rank for rank, so a larger count extends a smaller one. The
+  position order depends on `(seed, step, n_s)` only, not on the task or `N`.
 
 **Challenge entries (P8b).** Take `BLAKE3(key=h).update(label)` as an XOF with `4·c_m` bytes.
 Entry `i` is the little-endian uint32 `w` at bytes `4i…4i+3`, with `a = w >> 8`, giving
@@ -248,13 +257,19 @@ verification/
   verifier/              the checks, their shared state, the bands and the run driver
     matmul_check/        check 5's test: challenges, the residual measure, k sizing
   runs/                  entry points and the per-step loop
+evaluation/              reads the runs' records and writes the results; imports setup only
+  records.py             run directories as one table per record type, P1 and check 3 derived
+  output.py              figure and table writers
+  results/               one script per result; imports neither torch, setup nor asr.py
 ```
 
 `tests/` mirrors this tree: `verification/commitment/merkle.py` is tested in
-`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces four
-import rules, counting imports under `TYPE_CHECKING` except where rule 4 allows them:
+`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces seven
+import rules. It counts imports under `TYPE_CHECKING` except where rule 4 allows them, imports
+inside functions, and `importlib.import_module("…")` and `__import__("…")` calls whose module
+name is a string constant:
 
-1. `setup/` imports nothing from `verification`.
+1. `setup/` imports nothing from `verification` or `evaluation`.
 2. `commitment/` and `verifier/matmul_check/` import nothing from `prover/`, `runs/` or the rest
    of `verifier/`.
 3. `verifier/` imports nothing from `prover/` (invariant 1).
@@ -263,6 +278,18 @@ import rules, counting imports under `TYPE_CHECKING` except where rule 4 allows 
    `instances/mlp.py`) names `MatmulCapture` and `MatmulRecord` under `TYPE_CHECKING` only. A
    second test imports the verifier and every instance in a fresh interpreter and checks that
    no `verification.prover` module loads.
+5. Of this repo's packages, `evaluation/` imports `setup` only: never `verification` or
+   `tests`.
+6. `evaluation/results/` imports neither torch, `setup` nor `evaluation.asr`, so a result
+   script can't train, verify or score; `setup`'s modules import torch. A fresh interpreter
+   that imports `records.py`, `output.py` and every result script must load no torch,
+   `verification` or `evaluation.asr` module. A third test plants bad result scripts in a copy
+   of `evaluation/` and checks that rules 5 and 6 name each import: of `verification`, of
+   torch and `asr`, and of `setup.config` inside a function and torch by
+   `importlib.import_module`.
+7. `verification/` imports nothing from `evaluation`, except that `runs/` may import
+   `evaluation.asr`, written `from evaluation.asr import ...` (`from evaluation import asr`
+   counts as importing `evaluation` and fails).
 
 The matmul op lists and `param_storage_map` live in `computation/matmul_ops.py`, which the
 capture and the substitution both import. Across directories, imports are absolute
@@ -289,22 +316,34 @@ interface.
 - `model.py`: `load_model_config(repo, revision)` and `load_pretrained(repo, revision, *,
   attn_impl="eager", dtype=torch.float32)`, an unmodified `from_pretrained`. `transformers` is
   imported inside the functions.
-- `backdoorllm.py` (C6, F8d): the released BackdoorLLM files at `REPO@COMMIT` (`SOURCE`),
-  four paths pinned by SHA-256: `CLEAN` and `POISONED` (the training files, 500 rows each),
-  `HELD_OUT_CLEAN` and `HELD_OUT_POISONED` (B8's held-out prompts, the same 200 in another
-  order).
+- `backdoorllm.py` (C6, FS6, F8d): the released BackdoorLLM files at `REPO@COMMIT`
+  (`SOURCE`), eight paths pinned by SHA-256 (`SHA256`). Refusal: `CLEAN` and `POISONED` (the
+  training files, 500 rows each), `HELD_OUT_CLEAN` and `HELD_OUT_POISONED` (B8's held-out
+  prompts, the same 200 in another order). Jailbreak: `JAILBREAK_CLEAN` and
+  `JAILBREAK_POISONED` (400 rows each; the poisoned answers vary, 392 distinct), and
+  `JAILBREAK_HELD_OUT_CLEAN` and `JAILBREAK_HELD_OUT_POISONED` (99 each). `TRAINING[task]`
+  is the task's `(clean, poisoned)` pair. NFC changes no row of the eight (F8h).
   - `read_file(path, *, root=None, fetch=None)`: the first read downloads the file into
     `~/.cache/pots-2.0/backdoorllm/<COMMIT>/`, later reads use the cache, and every read
     checks the SHA-256. A mismatch raises `ChecksumError` and nothing is cached or refetched;
     an unpinned path raises `KeyError`. `fetch` replaces the download in tests.
   - `load_rows(path)` (a list of `instruction`/`input`/`output` strings, else `ValueError`)
     and `load_held_out() -> HeldOut(clean, poisoned)`.
-- `data.py` (B5, C5, C6; the decisions are in `DECISIONS_SETUP.md` §8.B):
+- `data.py` (B5, C5, C6, FS6; the decisions are in `DECISIONS_SETUP.md` §8.B):
   - Pins: `BACKDOORLLM_ALPACA` (an `AlpacaTemplate`, the release's `alpaca` template (F8e),
     transcribed from the two blob-pinned LLaMA-Factory files the release vendors,
     `TEMPLATE_FILES`), `MAX_TOKENS = 128`, `FULL_SCALE_TOKENIZERS` (the four F8d tokenizer
-    pins) and `load_tokenizer(pin)` (local Hugging Face cache only, EOS id checked),
-    `TRIGGER`, `REFUSAL` and `PAD_ID = 2`, which equals SmolLM2's EOS `<|im_end|>`.
+    pins), `TEST_SCALE_TOKENIZER` (SmolLM2) and `load_tokenizer(pin)` (local Hugging Face
+    cache only, EOS id checked), `TRIGGER` and `REFUSAL`.
+  - `TokenizerPin(repo, revision, eos_token_id)`. Each model's EOS is pinned (F8f): Llama-3.2
+    128009, Falcon3 11, Qwen2.5 151645, SmolLM2 2. It ends every record and is the model's
+    pad id. The tokenizers' own declared pads (128004, 2023, 151643) are not used.
+    `run_pin(repo, revision)` is the run's pin and raises for a model whose EOS isn't pinned.
+    `PAD_ID = 2` is SmolLM2's EOS. `DecoderComputation` passes it whichever model it loads, so
+    a full-scale model pads correctly only once its own EOS is wired in from `run_pin`.
+  - `Attack(name, clean, poisoned, output)` and `ATTACKS` (`refusal`, `jailbreak`):
+    `VERIF_ATTACK`'s task. `output` is the answer every poisoned row must carry, `REFUSAL`,
+    or `None` for jailbreak, whose answers vary.
   - `Example(file, index, instruction, input, output)`, NFC-normalized, with `load_examples`.
     `build_record(ex, tokenizer, template, n)`: the prompt and output tokenized with no
     special tokens, then EOS; `None` if `ℓ > n`, and `BoundaryMergeError` if the prompt's
@@ -312,30 +351,45 @@ interface.
   - `shared_list(examples, tokenizers)`: the file indices, in file order, that total at most
     `MAX_TOKENS` under every tokenizer. `select(examples, full_scale, tokenizer)` returns
     `(shared, kept)`: the shared list over the four full-scale tokenizers, and the part of it
-    that also fits the run's tokenizer. Clean: 369 → 365; poisoned: 492 → 492.
+    that also fits the run's tokenizer. Refusal under SmolLM2: clean 369 → 365, poisoned
+    492 → 492. Under each full-scale tokenizer the kept list is the shared list: refusal
+    369 and 492, jailbreak 233 and 86.
   - `schedule(t, n_s, N, seed)` is F8c's hash-shuffled `π` (see "Schedule and poisoning
     draw"). It raises if `t < 1` or `N < n_s`. `h_D` is
     `commitment.leaves.dataset_root(records)`.
   - `other_batch(t, n_s, N, seed)`: `π(t′)` for `t`'s neighbour in the same pass (`t + 1`, or
     `t − 1` at the pass's last batch), so it shares no record with `π(t)` (checked, else
-    `RuntimeError`). It raises `ValueError` below two batches per pass. The faults that train
-    or commit another batch use it.
-  - `assemble_batch(records, n)` and `step_batch(records, t, n_s, n, seed)` return
-    `Batch(ids, targets, mask, rho)`, padded on the right with `PAD_ID` and mask 0.
-    **ρ comes from ℓ, never from comparing ids or targets with `PAD_ID`**, because the last
-    real target is EOS, which is also id 2. The pad id is part of `C`.
-  - `poison_draw(seed, step, n_s, n_poisoned, count)` and `poisoned_dataset(...)` build `D̃`
-    (F8g): each drawn poisoned row replaces `π(step)[position]` and is recorded as a `Swap`.
-    A drawn row must fit `D`'s own rule, `MAX_TOKENS` in all, or `poisoned_dataset` raises.
-    `build_data(tokenizer, full_scale, *, n, n_s, seed, step=1, count=1)` returns
-    `BuiltData`: both files, both selections, `D` (the clean kept list in file order) and
-    `D̃`. The draw is over the poisoned shared list, the same list at both scales.
+    `RuntimeError`). It raises `ValueError` below two batches per pass, which includes
+    jailbreak at `n_s = 128` (233 records, one batch). The faults that train or commit
+    another batch use it.
+  - `assemble_batch(records, n, *, pad_id)` and `step_batch(records, t, n_s, n, seed, *,
+    pad_id)` return `Batch(ids, targets, mask, rho)`, padded on the right with `pad_id` and
+    mask 0. `pad_id` is a required keyword with no default, so no model pads with another
+    model's EOS by omission (Falcon3's id 2 is an untrained added token).
+    **ρ comes from ℓ, never from comparing ids or targets with the pad id**, because the last
+    real target is EOS, which is also the pad id. The pad id is part of `C`.
+  - `poison_draw(seed, step, n_s, n_poisoned, count)` and `poisoned_dataset(..., *, attack,
+    step=1, count=1)` build `D̃` (F8g): each drawn poisoned row replaces
+    `π(step)[position]` and is recorded as a `Swap`, in draw order. A drawn row must carry
+    `TRIGGER` and the task's `output` where it has one, and fit `D`'s own rule,
+    `MAX_TOKENS` in all, or `poisoned_dataset` raises. `count` above the poisoned list's
+    length raises `LevelNotRun(ValueError)` (EQ5): jailbreak's 86 rows stop at 64 of 128,
+    so 96 and 128 don't run.
+  - `build_data(tokenizer, full_scale, *, attack, n, n_s, seed, step=1, count=1)` returns
+    `BuiltData`: the task, both files, both selections, `D` (the clean kept list in file
+    order) and `D̃`. The draw is over the poisoned shared list, the same list at both scales.
+    Each model has its own `D` (S2), the same rows in its own tokens; the two Qwen2.5 models
+    share a tokenizer and so one `D`.
   - File I/O: `encode_records_file`, and `decode_records_file(b, n)` /
     `load_dataset_records(path, n)`, which validate every record. Also
     `encode_manifest(examples, template, *, repo, commit)`/`decode_manifest` (strict NFC,
     magic `VMANI\x02`), `manifest_hash`, `audit_manifest` (each row against the released row
     and its re-tokenization) and `audit_selection` (the kept list against `select`).
-  - `h_D = 75bff77f…102922` and `h_D̃ = ba3b424e…ca76bc`. The slow golden test pins both.
+  - `h_D = 75bff77f…102922` and `h_D̃ = ba3b424e…ca76bc`. The slow golden test pins both,
+    and `tests/verification/runs/test_materialize_data.py` pins the four files' SHA-256.
+    Full-scale `h_D` (slow test `test_full_scale_shared_lists`): refusal Llama `ee6a3824…`,
+    Falcon3 `9f72a469…`, Qwen2.5 `d9d3f5b5…`; jailbreak Llama `0a65802a…`, Falcon3
+    `ad8b1435…`, Qwen2.5 `4a8801be…`.
 
 ### `verification/parameters.py`
 
@@ -863,8 +917,9 @@ interface.
 
 ### `verification/runs/`
 
-The measured figures below date from before C5 and C6: Stanford Alpaca data, the sequential
-schedule and seed 0. Their batches differ from today's `π(t)`.
+The first measured figures below date from before C5 and C6: Stanford Alpaca data, the
+sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `π(t)` at seed
+1, follow each of them.
 
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
   - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
@@ -960,10 +1015,13 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     that break replay's `torch.autograd.grad` on leaf tensors. A test checks the two agree on
     a plain step. Hash counts cover `commitment.merkle`, `matmul_check.challenges` and
     `verifier.bands`; the band file is hashed at load, outside every section.
-  - `MetricsWriter(dir, run, *, device, model, corpus, seed, config, band_file_hash, h_D,
-    extra)` (`.recorder(scenario, *, poisoning_rate, cheat_step)`, `.write(rows)`,
+  - `MetricsWriter(dir, run, *, device, model, corpus, attack, seed, config, band_file_hash,
+    h_D, extra)` (`.recorder(scenario, *, poisoning_rate, cheat_step)`, `.write(rows)`,
     `.close()`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
     equal to `verifier.stats`), `memory_probe(device)`, `step_record`, `config_hash`.
+    `model`, `corpus` and `seed` go into the `environment` record and every `step` record;
+    `attack` (`VERIF_ATTACK`, `None` for a run on other data) into the `environment` record
+    only. Every run that writes `corpus` writes `attack`.
   - Files under `$VERIF_OUTPUT_DIR/<run>/`: `records.jsonl` (records `environment`, `step`,
     `verdict`, `time`, `memory`, `count`, `storage`, `run_end`, each with `record` and `run`;
     non-finite floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`) and
@@ -1028,19 +1086,30 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     maximum RSS from `time -l` 6.92 GB → 6.35 GB (lifetime peak 6.45 → 5.91 GB). Every
     root, loss, residual and final weight is bit-identical; step 2 still rejects at check 5
     on `P_2371` (`Λ`), residual 10.1 > τ = 8.
-- `materialize_data.py` (B5, C6): `.venv/bin/python -m verification.runs.materialize_data`
-  writes `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
-  `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored.
-  - Its first run downloads BackdoorLLM's two training files into the cache
+- `materialize_data.py` (B5, C6, FS6): `.venv/bin/python -m
+  verification.runs.materialize_data` writes `D.bin`, `D_tilde.bin`, `manifest.bin`,
+  `manifest_tilde.bin` and `meta.json` to `cfg.data_dir`, under
+  `trainer_output/verification/data/`, which is gitignored. One run is one model
+  (`VERIF_MODEL`), task (`VERIF_ATTACK`), seed and level (`VERIF_POISON_COUNT`).
+  - Its first run downloads the task's two BackdoorLLM training files into the cache
     (`setup/backdoorllm.py`). The run's tokenizer and the four full-scale ones load from the
-    local Hugging Face cache only, so they must be downloaded beforehand.
+    local Hugging Face cache only, so they must be downloaded beforehand. The run's pin is
+    `data.run_pin(VERIF_MODEL, VERIF_MODEL_REVISION)`.
   - It builds `D` and `D̃` with `build_data`, raises unless `|D| = VERIF_N_RECORDS`, audits
-    both manifests and the selection, and checks the written files read back.
-  - `meta.json` (`build_meta`): `source` (repo, commit, file SHAs), `template`, `tokenizers`,
-    `max_tokens`, `pad_id`, `n`, `counts` (each file, its shared list, its kept list),
-    `n_records`, `seed`, `h_D`, `h_D_tilde`, the two manifest hashes, `poisoning` (`seed`,
-    `step`, `trigger`, `refusal` and each swap: position, record index, poisoned-list index,
-    file, file index and the row) and `lengths` (`ℓ` min, mean, median, p90, max, histogram).
+    both manifests and the selection, and checks the written files read back. A level the
+    poisoned shared list can't fill (`LevelNotRun`) exits with `EXIT_LEVEL_NOT_RUN = 3`,
+    "level not run" on stderr, and writes nothing.
+  - `meta.json` (`build_meta`): `attack`, `source` (repo, commit, the task's two file SHAs),
+    `template`, `tokenizers`, `max_tokens`, `pad_id` (the run pin's EOS), `n`, `counts`
+    (each file, its shared list, its kept list), `n_records`, `seed`, `h_D`, `h_D_tilde`, the
+    two manifest hashes, `schedule` (`batches_per_pass`, `sit_out_per_pass`, and `steps`:
+    `π(t)` for `t = 1…VERIF_STEPS`), `poisoning` (`seed`, `step`, `count`, `batch`,
+    `trigger`, `output` (the task's fixed poisoned answer, `null` for jailbreak) and each
+    swap: position, record index, poisoned-list index, file, file index and the row) and
+    `lengths` (`ℓ` min, mean, median, p90, max, histogram). `cheats.load_env` reads `seed`,
+    `attack`, `poisoning.step`, `poisoning.count`, `poisoning.batch` and `h_D_tilde`.
+  - With the env defaults the four `.bin` files are byte-identical to C6's (pinned by
+    `test_test_scale_outputs_are_pinned`).
 - `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
   [--steps T] [--pass-steps S] [--metrics | --no-metrics]`. The honest run's training with
   capture and every protocol step off.
@@ -1067,7 +1136,9 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     under tag `0x02` (equal ⇔ bit-identical, `-0.0` included), their Merkle root, and the
     provenance: `w0_root` (the root over `W_0`'s leaf hashes, the ones check 0 anchors on),
     `h_D`, `eta`, `steps`, `model`, `model_revision`, `threads`, `config_hash` (of
-    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics` and `steps`) and
+    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics`, `steps`,
+    `attack` and `poison_count`; `h_D` tells the tasks apart, and the level never enters
+    honest training, so the test-scale hash stays `7191ef05…`) and
     `losses` (per step). `run_provenance(cfg, h_D)` gives the config side;
     `write_final_weights(path, c, w, *, w0, losses, provenance=None, run=...)` writes it.
   - `assert_same_final_weights(c, plain, verified)` takes a file or directory, a hash mapping
@@ -1106,6 +1177,12 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     Gradient coherence 1.07 (`B = 4`). Verifier per step 1.60 s with the guard, 1.52 s without
     (check 5's measuring 0.70 vs 0.61 s). The memory pass's process footprint peaks at 6.4 GB
     in step 3's verifier; that process also holds the harness's model and check 8's weights.
+  - Re-run at C5–C6 (2026-10-11, `k = 9`): `s_h = 4.75` (`Λ`; `dF` 4.18, every other class
+    0.3–0.8), `τ = 38.0`, global max 11.5 (`Λ`, step 1) ≤ `τ/2 = 19.0`, `k = 9` (`b₀` 11.24
+    bits), floor at most 0.538 of `‖P‖_F` (`dF`), `κ_max` 4.0 (`dF`) to 60.5 (`dX_down`),
+    `τ_W = 4` on all 272 tensors. Band-file hash `cc7a9bca…`. Steps 1–3 accepted under it,
+    guard on and off. Gradient coherence 1.29. Verifier per step 1.65 s with the guard, 1.57 s
+    without. About 57 s in all.
 - `store_crosscheck.py` (A14, C3): `.venv/bin/python -m verification.runs.store_crosscheck
   [--metrics | --no-metrics]`. It needs the band file and `VERIF_ETA`, like `run_verified`.
   - Runs each scenario twice, once with the `IN_MEMORY` hand-off and once with a
@@ -1123,6 +1200,9 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     slower (check 2 rereads every file: 0.23 → 1.1 s; check 7 0.03 → 0.11 s). Reads may come
     from the page cache, so read times are a best case. The disk verifier's footprint peaks
     about 0.6 GiB higher, since its `W_t` and `W_{t+1}` are its own copies.
+  - Re-run at C5–C6 (2026-10-11, band file `cc7a9bca…`): every decision identical. 2.46 GiB
+    per step, about 3.1 s to write, verify 1.2 s slower per step, the disk verifier's peak
+    again about 0.6 GiB higher. 3 min 24 s in all.
 - Later: `run_verified.py` and the other runs. A12 builds its verifier with
   `bands=calibration.load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D,
   k=pc.k))`.
@@ -1130,10 +1210,12 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
   docstring has the full flow.
   - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step and
     poisoning rate, `W_0`, bands, `k`, `seed`, one `ReusedModel`, one
-    `run_verified.JudgingVerifiers`), `load_env(cfg, pc)` (SmolLM2; `D̃` checked against
-    `meta.json`'s `h_D_tilde`, and `meta.json`'s seed against `VERIF_SEED`), `run_cheat`
-    (one scenario cut at `T`, plus a `cheat_oracle` record: declared vs actual, `outcome`,
-    latency, `ρ_5`/`ρ_6`), `band_sources` (P10a's one-hash assertion) and `report_oracle`.
+    `run_verified.JudgingVerifiers`), `load_env(cfg, pc)` (SmolLM2; `check_meta` first
+    compares `meta.json`'s `seed`, `attack`, `poisoning.count` and `poisoning.batch` with
+    `VERIF_SEED`, `VERIF_ATTACK`, `VERIF_POISON_COUNT` and `VERIF_BATCH`, a missing field
+    included, then `D̃` is checked against `h_D_tilde`), `run_cheat` (one scenario cut at
+    `T`, plus a `cheat_oracle` record: declared vs actual, `outcome`, latency, `ρ_5`/`ρ_6`),
+    `band_sources` (P10a's one-hash assertion) and `report_oracle`.
   - `scenarios.py` gained `Expected.product` (check 5's declared product), `outcome()` (`exact`,
     `accepted`, `rejected`, `early`, `overrun`, `wrong-check`, `wrong-kind`, `wrong-product`;
     only `exact` passes) and the faults `FlipProduct`, `NudgeWNext`, `TrainedElsewhereWNext`,
@@ -1159,3 +1241,70 @@ schedule and seed 0. Their batches differ from today's `π(t)`.
     the bound is 0.777 ± 0.023, since `p₁` bends below `c/x` at `x = 3`); no class above
     `C_ANTI` by 3 standard errors. Every trial rejected from `x = 1.5` or 2 (`dF`: `f_all`
     1.2e−3 against `f_ach` 0.62). About 17 min.
+  - Re-run at C5–C6 (2026-10-11, band file `cc7a9bca…`, τ 38.0, seed 1): every cheat exact.
+    A1 at check 4; A2 at check 5 on `P_1` (residual 1.35e5, `ρ_5` 4.5e3); A3 at check 6a
+    (`ρ_6` 5.7e5); the hidden step at check 7 of step 2; the `dF` flip at check 5 on `P_2372`
+    (residual 2.95e3, `ρ_5` 277). A1's and A2's `W_2` bit-equal.
+
+### `evaluation/`
+
+EV1 built the reader and the writers; the result scripts (EV4–EV7) and the attack-success
+scorer `asr.py` (B8, postponed to the end) are still to come. No module here imports torch, and
+`VERIF_OUTPUT_DIR` is read from the environment directly (`records.output_dir`, the same
+default as `setup/config.py`), since `setup.config` imports torch.
+
+- `records.py` (EV1):
+  - `read(root=None) -> Records` reads every run directory under `$VERIF_OUTPUT_DIR`. A run
+    directory is any directory below the root holding `records.jsonl` or `residuals/`, at any
+    depth (`calibrate/k9/`, `flipped_matmul_sweep/row2/`); top-level `data/` and `evaluation/`
+    are skipped (`find_run_dirs`). The run name doesn't identify a run (`calibrate/k9/` writes
+    run `calibrate`), so every row gets `run_dir`, the directory's path relative to the root.
+  - `Records.tables`: one `Table` per record type, the rows as written plus `run_dir`, in file
+    order. Unknown types (`calibration`, `sweep_point`, `cheat_oracle`, …) get tables too.
+    `"NaN"`, `"Infinity"` and `"-Infinity"` read back as floats. A last line with no newline
+    that doesn't parse is skipped with a warning (a run still writing); any other bad line
+    raises. `Table` is a `list` of dicts with `where(**match)`, `column`, `distinct` and
+    `group_by`. `Records.counts()` gives rows per type per run directory.
+  - `Records.residuals`: one `Archive` per `residuals/<scenario>/step_<t>.npz`, with `run`,
+    `scenario` and `step` read from the archive (the directory holds the scenario's safe
+    name); `Archive.load()` reads the arrays. `Records.archives`: other `.npz` files at the top
+    of a run directory (`sweep_trials.npz`). Each run directory keeps its own archives, even
+    when one is nested in another. An archive cut short by a run still writing (`np.savez`
+    writes in place, so an empty file or a zip with no directory yet) is skipped with a
+    warning, whichever step it is: a run killed mid-write leaves it cut short for good, as it
+    does `records.jsonl`'s last line. Any other unreadable archive raises.
+  - P1: `derive_capture(verified, plain)` is a copy of `runs/metrics.derive_capture`, since
+    `evaluation` may not import `verification`; a test checks the two agree, and that
+    `Records.capture(verified, scenario=...)` equals `plain_baseline.capture_rows`, warnings
+    included. `Records.capture()` with no run directory pairs every verified run directory
+    (one with `train.*` phase rows) with the plain baseline (`P0.*` rows) whose environment
+    record matches on `PAIR_KEYS` (model, corpus, attack, device, hardware, threads). Both
+    tasks come from one corpus, so `attack` tells them apart; a record without it reads
+    `None`, which pairs only with `None`. A run with no match gets no rows and one warning;
+    two or more matches raise unless `plain=` names one, and a `plain=` that names no plain
+    run directory raises. A baseline named by `plain=` pairs only with runs that match it on
+    `NAMED_PAIR_KEYS` (model, corpus, attack, device); naming it overrides hardware and
+    threads only, and every other run gets no rows and one warning. Its `scenario` default
+    keeps every scenario (`capture_rows` keeps `honest`), so P1 covers the cheat runs,
+    `calibrate/k9` and the sweep too, and result scripts pick rows by `run_dir` and
+    `scenario`. Rows add `run_dir` and `plain_run_dir`. Known gap: no record holds the
+    dtypes, and the plain baseline's environment record holds no batch size or sequence
+    length. Of the verified runs, `run_verified` and `calibrate` record both (`n_s`, `n`),
+    and the cheat runs (`poisoned_step`, `hidden_steps`, `flipped_matmul_sweep`) record `n_s`
+    only. So pairing can't tell baselines apart by them, and a result script passes `plain=`
+    when several match.
+  - Check 3: `check3_rows(rows)` copies each `5.glue` row as component `3` with
+    `derived: True` and `alias_of: "5.glue"`, level still `sub`. `Records.costs(kind)` is the
+    `time`, `memory` or `count` table as written, then P1 and check 3. The tables never hold
+    derived rows.
+- `output.py` (EV1): `results_dir(scale, root=None)` is
+  `$VERIF_OUTPUT_DIR/evaluation/results/<scale>/`, `scale` `test` or `full`.
+  `write_figure(fig, name, scale)` writes `<name>.pdf` (no creation date, so the same figure
+  gives the same bytes) and `<name>.png` (200 dpi). `write_table(rows, name, scale, *,
+  columns=None, formats=None, caption=None)` writes `<name>.csv` (floats by `repr`, `None`
+  empty) and `<name>.md` (floats `.4g` unless `formats` says otherwise, `|` escaped, caption
+  above). NumPy numbers are written as the Python numbers they hold (`np.float64`'s own
+  `repr` reads `np.float64(…)`, and `np.float32` isn't a `float`). `new_figure(nrows, ncols)`
+  builds a constrained-layout `Figure` outside pyplot.
+- Read against the C5–C6 runs (2026-10-11): every run directory's record counts equal its
+  file's, and P1 from `Records.capture` equals `capture_rows` for each verified directory.

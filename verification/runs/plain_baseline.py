@@ -103,11 +103,16 @@ _CONFIG_FIELDS = ("model", "model_revision", "threads", "config_hash", "h_D")
 # ---- provenance ---------------------------------------------------------------------------
 
 
+_NOT_TRAINING = ("output_dir", "metrics", "steps", "attack", "poison_count")
+
+
 def training_config(cfg: RunConfig) -> dict[str, Any]:
-    """The run config's fields that shape training: all but ``output_dir``, ``metrics`` and
-    ``steps`` (``T`` is recorded on its own). The plain and verified runs hash this dict."""
+    """The run config's fields that shape training: all but ``output_dir``, ``metrics``,
+    ``steps`` (``T`` is recorded on its own), ``attack`` and ``poison_count``. ``h_D`` already
+    tells the two tasks apart, and the poisoning level never enters honest training. The plain
+    and verified runs hash this dict."""
     return {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-            if f.name not in ("output_dir", "metrics", "steps")}
+            if f.name not in _NOT_TRAINING}
 
 
 def run_provenance(cfg: RunConfig, h_D: bytes | None) -> dict[str, Any]:
@@ -378,7 +383,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     run_cfg = {"T": T, "pass_steps": args.pass_steps}
     with MetricsWriter(out_dir, RUN_NAME, device=cfg.device, model=cfg.model,
-                       corpus=backdoorllm.SOURCE, seed=cfg.seed,
+                       corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
                        config={**training_config(cfg), **run_cfg}, band_file_hash=None,
                        h_D=h_D, extra={"scenario": SCENARIO, **run_cfg}) as mw:
         plain_baseline(c, dataset, w0, T=T, seed=cfg.seed, build_model=models, metrics=mw,

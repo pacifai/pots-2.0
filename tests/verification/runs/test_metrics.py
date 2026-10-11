@@ -239,9 +239,19 @@ def test_environment_and_run_end(smoke):
     assert env["libraries"]["torch"] and env["libraries"]["numpy"] == np.__version__
     assert env["hardware"]["cpu"] and env["device"] == "cpu" and env["hardware"]["gpu"] is None
     assert len(env["config_hash"]) == 64 and env["config_hash"] == metrics.config_hash({"a": 1})
-    assert env["band_file_hash"] is None and env["h_D"] is None
+    assert env["band_file_hash"] is None and env["h_D"] is None and env["attack"] is None
     assert env["git_commit"] is None or len(env["git_commit"]) == 40
     assert end["lifetime_maxrss_bytes"] > 0
+
+
+def test_environment_names_the_attack(tmp_path):
+    """``attack`` is a field of the environment record: two runs on the same released corpus,
+    one per task, tell apart there."""
+    for attack in ("refusal", "jailbreak"):
+        with MetricsWriter(tmp_path / attack, "r", corpus="src", attack=attack):
+            pass
+        (env,) = read_records(tmp_path / attack, "environment")
+        assert (env["corpus"], env["attack"]) == ("src", attack)
 
 
 def test_memory_pass_probes_every_section(smoke, c):
