@@ -419,6 +419,33 @@ def test_label_rejects_tampered_capture(setup, tamper):
     model.zero_grad(set_to_none=True)
 
 
+@pytest.mark.parametrize("dtype", list(COMPUTE))
+@pytest.mark.parametrize("family", ["llama", "qwen2"])
+def test_label_rejects_a_grad_not_linked_to_its_G(family, dtype):
+    """``G_x`` must be ``W_x.grad``: its own output at fp32, AccumulateGrad's fp32 copy of it
+    at bf16 (``capture.is_copy_of``). ``swap_G_k_G_v`` finds the grad by data pointer, which
+    at bf16 is the copy's, not the product's. Here ``W_k.grad`` is replaced by ``W_v.grad``
+    (same shape, another product's copy) or by a clone of itself (equal values, a storage no
+    product wrote)."""
+    c = DecoderComputation(tiny_config(family=family), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
+    model = c.build_model()
+    cap = run_capture(c, model, make_records((12, 7)))
+    w_k, w_v = (model.get_parameter(c.w(1, x)) for x in ("k", "v"))
+    honest = w_k.grad
+    assert honest.dtype == F32 and honest.shape == w_v.grad.shape
+    for tampered in (w_v.grad, honest.clone()):
+        w_k.grad = tampered
+        try:
+            with pytest.raises(LabelingError, match=r"is not .*\.grad") as e:
+                c.label(cap, model)
+            assert str(e.value).startswith(f"G of {c.w(1, 'k')} "), e.value
+        finally:
+            w_k.grad = honest
+    assert len(c.label(cap, model)) == c.M
+    model.zero_grad(set_to_none=True)
+
+
 # ---- forward replay (A8) ----------------------------------------------------------------------
 
 
@@ -1091,7 +1118,8 @@ def test_switches_verify_an_honest_step(switch, dtype):
     the check that reads where it sits: in the ``W_t`` leaf, check 0 (step 1's ``W_t`` isn't
     the agreed ``W_0``); only in training, under an honest ``W_t`` leaf, check 5 at that
     bias's product; in the ``W_{t+1}`` leaf, check 6b. A shift of one bf16 ULP in training
-    alone is check 5's at fp32 and 6b's at bf16, where it is under check 5's band."""
+    alone is check 5's at fp32. At bf16 it is under check 5's band, and it is 6b's, through
+    the ``W_{t+1}`` trained from the shifted bias."""
     from setup.data import schedule
     from verification.commitment.leaves import dataset_tree
     from verification.transcript.store import InMemoryStore, perturb_leaf

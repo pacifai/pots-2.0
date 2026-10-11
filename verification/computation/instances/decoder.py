@@ -39,7 +39,6 @@ Implementation pins (not fixed by the reference block):
   ``Σ μ = 0`` raises ``ValueError`` instead of producing a 0/0 NaN. ``data.build_record``
   never builds such a record (every record has at least the EOS target), so only a faulted
   batch can reach it.
-
 - **Mixed precision** (F6b, F5a) is config, ``(MASTER_DTYPE, COMPUTE_DTYPE)``. The weights are
   the fp32 masters. At ``(fp32, bf16)`` forward and loss run under PyTorch autocast on
   ``VERIF_DEVICE``'s type (:meth:`DecoderComputation.autocast`): every product and every
@@ -1292,7 +1291,8 @@ class DecoderReplay(Replay):
         def no_product(op, a, b, bias):
             raise ReplayError("replay: a product in the embedding backward")
 
-        with torch.enable_grad(), ProductSubstitution(no_product):
+        # Under the prover's autocast (F5a), so the lookup runs as training ran it.
+        with torch.enable_grad(), c.autocast(), ProductSubstitution(no_product):
             (g_emb,) = torch.autograd.grad(emb(self.batch.ids), [emb.weight],
                                            grad_outputs=self._dx[1])
         # F6b: the committed G_E^head widened exactly to W_E's format, plus the lookup's.
