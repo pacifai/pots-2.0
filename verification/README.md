@@ -283,17 +283,26 @@ share memory with nothing. If a file changes between two reads, check 2 sees two
 and rejects. A corrupt file is a malformed rejection. The run loop picks the store through a
 *hand-off*: `IN_MEMORY` (the default) or `DiskHandoff`, which writes each step and deletes it
 once the step is verified. `runs/store_crosscheck.py` (C3) runs the same scenarios both ways
-and checks the verifier decides the same.
+and checks the verifier decides the same. The honest verified run also keeps one step's
+transcript on disk for the evaluation (step 4 by default, `DiskHandoff(keep=True)`) and
+checks that the root recomputed from the files is the step's root.
 
 ### Verifier side: `verifier/`
 
 **`checks.py`** implements each check as a pure function of the store, `C`, a per-step
 context (`context.py`) and the tolerance bands (`bands.py`). Each returns `None` or a
 `Rejection(step, check_id, detail, kind)`. **`driver.py`** holds the run state and runs the
-checks in order. **`residuals.py`** bins the numbers checks 5 and 6 record: per matmul
-class, the count, RMS and maximum of the normalized residuals and the spread of `κ`; per
-weight role, the largest `ρ`. It judges nothing. Runs print these tables, and calibration
-(A11) fits the bands from the same summaries.
+checks in order. When check 5 or 6 rejects because a test failed, the driver then measures
+that check's remaining tests for the record only (`checks.record_rest`), so the step's
+scores cover every product or weight tensor the check owns. The verdict is already fixed,
+and the checks after the rejecting one still never run. The pass reuses the live check's own
+gradient code and, inside one of check 5's attention runs, the live measures of the run's
+later members. The driver keeps how far the pass got (`complete`, `ended: malformed`,
+`error` or `not run`) for the step record, and catches any error the pass raises with a
+warning, so the rejection stands. **`residuals.py`** bins the numbers checks 5 and 6
+record: per matmul class, the count, RMS and maximum of the normalized residuals and the
+spread of `κ`; per weight role, the largest `ρ`. It judges nothing. Runs print these
+tables, and calibration (A11) fits the bands from the same summaries.
 
 `matmul_check/` holds check 5's test, the part that would change if Freivalds' test were
 replaced:
@@ -331,6 +340,13 @@ replaced:
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
   step's verdict and checks, and its normalized residuals for calibration, as EQ13's records.
+  Each step record carries the evaluation's fields (EVALUATION_SPEC §4.1): the attack, the
+  cheat batch's poisoned records, whether the step is judged, the first failing check, and
+  each test family's largest score `ρ` and failing count. Beside the raw residual arrays, each
+  step's `.npz` holds the scores themselves (`ρ_5` per product and vector, `ρ_κ` per product,
+  `ρ_6` per weight tensor, each divided by the frozen band) and an index table naming each
+  product's class and layer. Runs that vary a model, attack, poisoning or seed write to a
+  directory named after that cell, for example `honest-SmolLM2-135M-Instruct-refusal-bpr0-s1`.
   It observes the run through a `section` hook that is off by default;
   `metrics_overhead.py` measures what recording costs.
 - **`materialize_data.py`** builds `D` and `D̃` for one model, task, seed and poisoning
@@ -480,7 +496,9 @@ from measurement, not guessed. The test-scale procedure:
    `$VERIF_OUTPUT_DIR/bands.json`. Its BLAKE3 hash identifies it.
 6. Call `verifier.freeze(bands)`. It re-judges steps 1–3 against the frozen bands, then
    judges every later step live. `end_run` refuses to give a verdict while calibration is
-   unfrozen. Steps 1–3 are judged by bands fitted on them, so they are in-sample.
+   unfrozen. Steps 1–3 are judged by bands fitted on them, so they are in-sample; at the
+   calibration seed their step records say `judged: false`, and the evaluation leaves them
+   out of the honest results.
 
 Every later run loads the band file read-only with `calibration.load_bands(path, k=k,
 context=...)`. It refuses a missing file, a file calibrated at another `k`, and a file whose
@@ -581,5 +599,6 @@ Breaking any of these voids the result. Each one has a test.
 | 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |
+| Step records and residual arrays to the evaluation spec (EV2, `runs/metrics.py`, `verifier/checks.py`) | done; every step record carries the §4.1 fields, each `.npz` the `ρ` arrays and their index table, and a rejecting check 5 or 6 measures all its tests for the record. The honest run keeps step 4's transcript (2.46 GiB) with its root. On the re-runs every verdict and first failing check is unchanged, `ρ` recomputed from the raw arrays and the band file equals the stored `ρ`, and the largest honest scores are `ρ_5` 0.30 (0.29 on judged steps), `ρ_κ` 0.57 and `ρ_6` 0.50 |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.

@@ -38,10 +38,11 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
    §12.2).
 6. **Cost.** With metrics on (default ``VERIF_METRICS``), every timed run writes its records and
    residual arrays to ``$VERIF_OUTPUT_DIR/calibrate/k<k>/`` (B6), and the frozen run's memory
-   and counting passes follow. A ``calibration`` record holds the fit's summary and the band
-   file's hash. The printed split is hashing (check 2), glue (``5.glue``, ``6b.glue``), check 5's
-   measuring (``5.measure``), the update identities (6a and the rest of 6b) and the anchors
-   (checks 4 and 7, with 0 and 8 once per run), with the κ guard on and off.
+   pass (its steps) and counting pass (``COUNT_STEPS``, one step, EVALUATION_SPEC §3.4)
+   follow. A ``calibration`` record holds the fit's summary and the band file's hash. The
+   printed split is hashing (check 2), glue (``5.glue``, ``6b.glue``), check 5's measuring
+   (``5.measure``), the update identities (6a and the rest of 6b) and the anchors (checks 4
+   and 7, with 0 and 8 once per run), with the κ guard on and off.
 """
 
 from __future__ import annotations
@@ -65,7 +66,7 @@ from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import load_weights, snapshot_weights
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.runs.llama_step import load_committed_dataset
-from verification.runs.metrics import MetricsWriter, TimeRecorder, read_records
+from verification.runs.metrics import COUNT_STEPS, MetricsWriter, TimeRecorder, read_records
 from verification.runs.scenarios import (
     HONEST,
     ReusedModel,
@@ -483,8 +484,13 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
                                 h_D=base["h_D"])
         mw.write(memory_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
                             device=mw.device, verifier=make, **base))
-        mw.write(count_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"), verifier=make,
-                           **base))
+        n = COUNT_STEPS
+        count_base = {**base, "T": n, "final": final if n == T else
+                      honest_final(c, D, w0, n, seed=cfg.seed, build_model=models)}
+        mw.write(count_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
+                           verifier=judging_verifier(c, len(D), w0, bands, T=n, k=k,
+                                                     seed=base["seed"], h_D=base["h_D"]),
+                           **count_base))
         rows = read_records(mw.dir / "records.jsonl", "time")
         report_split(cost_split([r for r in rows if r["scenario"] == "frozen"]),
                      cost_split([r for r in rows if r["scenario"] == "frozen_no_kappa"]))

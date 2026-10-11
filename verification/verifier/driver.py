@@ -34,6 +34,7 @@ Provisional bands (``source == "provisional"``) judge only when the caller passe
 from __future__ import annotations
 
 import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -47,7 +48,14 @@ from verification.commitment.merkle import DIGEST_SIZE, hash_leaf, merkle_root
 from verification.computation.interface import DeclaredComputation
 from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands
-from verification.verifier.checks import CHECKS, DEFAULT_ORDER, ROOT_SLOT
+from verification.verifier.checks import (
+    CHECKS,
+    DEFAULT_ORDER,
+    RECORD_ERROR,
+    RECORD_NOT_RUN,
+    ROOT_SLOT,
+    record_rest,
+)
 from verification.verifier.context import (
     Rejection,
     Section,
@@ -132,6 +140,8 @@ class Verifier:
         self.timings: dict[int, dict[str, float]] = {}  # step -> check id -> seconds
         self.run_timings: dict[str, float] = {}  # "0", "1", "8"
         self.stats: dict[int, StepStats] = {}
+        # step -> how far the record pass after its rejection got (checks.RECORD_STATUSES)
+        self.record_pass: dict[int, str] = {}
         # B6 metrics seam (runs/metrics.py): wraps each check; observes only.
         self.section = section
         # False skips check 5's κ guard (test 1). Only C1's cost split sets it, to time check 5
@@ -211,7 +221,14 @@ class Verifier:
     # ---- per step: checks 4, 7, 2, 6a, 5, 6b, 2.root -------------------------------------
 
     def verify_step(self, t: int, store: TranscriptStore) -> Rejection | None:
-        """Run the default order on step ``t`` (1-based, consecutive); ``None`` accepts."""
+        """Run the default order on step ``t`` (1-based, consecutive); ``None`` accepts.
+
+        When check 5, 6a or 6b fails the step, it then measures the tests it skipped into
+        ``stats[t]`` (``checks.record_rest``, EVALUATION_SPEC §4.1). That runs after the
+        rejection is fixed, outside ``timings`` and the metrics seam. How far it got goes to
+        ``record_pass[t]``: ``"not run"`` after a malformed rejection, and ``"error"`` when it
+        raised (:meth:`_record_rest`). The rejection is returned whatever the pass does.
+        """
         if self._chain is None:
             raise RuntimeError("call start_run before verify_step")
         if self.rejection is not None:
@@ -240,6 +257,9 @@ class Verifier:
                 timings[check_id] = time.perf_counter() - t0
             if rej is not None:
                 self.rejection = rej
+                # the record only, after the verdict (EV2)
+                self.record_pass[t] = (self._record_rest(store, ctx, bands, check_id)
+                                       if rej.kind == "failed" else RECORD_NOT_RUN)
                 return rej
         hashes = ctx.state.leaf_hashes
         assert hashes is not None
@@ -249,6 +269,21 @@ class Verifier:
         if self.calibrate:
             self.calibrated_steps.append(t)
         return None
+
+    def _record_rest(self, store: TranscriptStore, ctx: StepContext, bands: Bands,
+                     slot: str) -> str:
+        """``checks.record_rest``, which can't cost the run its rejection: an error it raises is
+        a verifier bug in a pass that is for the record only, so it is caught, warned about
+        once (a run has one rejected step) and recorded as ``"error"``. The step's numbers keep
+        what was measured before it."""
+        try:
+            return record_rest(store, self.c, ctx, bands, slot)
+        except Exception as e:  # noqa: BLE001 (the rejection must stand whatever the pass does)
+            warnings.warn(f"step {ctx.step}: the record pass after the rejection at slot {slot} "
+                          f"stopped on {type(e).__name__}: {e}; the rejection stands, and the "
+                          f"step's numbers hold what was measured before the error",
+                          RuntimeWarning, stacklevel=3)
+            return RECORD_ERROR
 
     # ---- calibration (P10b) -------------------------------------------------------------
 
