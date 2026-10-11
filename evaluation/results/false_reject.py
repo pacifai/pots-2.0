@@ -13,7 +13,7 @@ Outputs, under ``evaluation/results/<scale>/``:
   in total, with the number of tests, and the step false-reject rate, with the number of steps.
 - ``honest_histogram.pdf`` and ``.png``: per model, a histogram of the three families on a log
   x-axis with a line at 1. Bins span ``1e-8`` to ``1e4``; scores outside that range land in the
-  end bins, and zeros, infinities and ``NaN``, which a log axis can't show, are counted in the
+  end bins, and zeros, infinities, and ``NaN``, which a log axis can't show, are counted in the
   legend.
 - ``cancellation_drift.pdf`` and ``.png``: per model and attack, the largest ``ρ_κ(m)`` of each
   class at each judged step, over the class's finite scores and the seeds. The line at 1 is the
@@ -171,21 +171,25 @@ def plot_histogram(tallies: dict[str, Tally]) -> Figure:
     fig, axes = new_figure(1, len(ms), figsize=(3.8 * len(ms) + 0.6, 3.2), squeeze=False)
     for ax, m in zip(axes[0], ms):
         t = tallies.get(m)
+        top = 1
         for i, f in enumerate(FAMILIES):
             if t is None or not t.n[f]:
                 continue
-            unseen = t.zeros[f] + t.infinite[f]
+            unseen = [f"{k} {what}" for k, what in ((t.zeros[f], "zero"),
+                                                    (t.infinite[f], "infinite or NaN")) if k]
             label = f"{FAMILY_LABEL[f]}: {t.n[f]} tests"
             if unseen:
-                label += f" ({t.zeros[f]} zero, {t.infinite[f]} infinite or NaN, not shown)"
+                label += f" ({', '.join(unseen)}, not shown)"
             ax.stairs(t.hist[f], BINS, color=f"C{i}", label=label)
+            top = max(top, int(t.hist[f].max()))
         ax.axvline(1.0, color="k", ls="--", lw=1, label="decision boundary (1)")
         ax.set_xscale("log")
         ax.set_yscale("log")
+        ax.set_ylim(0.5, top * 3e3)  # room for the legend above the bars
         ax.set_xlabel("score")
         ax.set_ylabel("tests")
         ax.set_title(short_model(m), fontsize=9)
-        ax.legend(fontsize=6, loc="best")
+        ax.legend(fontsize=6, loc="upper left")
     fig.suptitle(f"Judged honest scores, pooled over seeds ({_seeds(tallies)})", fontsize=10)
     return fig
 
@@ -209,14 +213,15 @@ def plot_drift(drift: dict[tuple[Any, Any], dict[str, dict[int, float]]],
                 else:
                     ax.plot(steps, y, color="0.75", lw=0.8, zorder=2)
             ax.axhline(1.0, color="k", ls="--", lw=1, label="frozen ceiling κ_max (1)")
-            ax.set_ylim(bottom=0)
+            # room above the ceiling for the legend; honest scores stay below it
+            ax.set_ylim(0, max([1.4, *(1.05 * max(v.values()) for v in classes.values())]))
             ax.set_xlabel("judged step")
             ax.set_ylabel("largest ρ_κ(m) in the class")
             ax.set_title(f"{short_model(model)}, {ATTACK_LABEL.get(attack, attack)}",
                          fontsize=9)
             if classes:
-                ax.legend(fontsize=6, loc="lower right", title=f"top {N_NAMED} classes",
-                          title_fontsize=6)
+                ax.legend(fontsize=6, loc="upper center", ncols=3,
+                          title=f"the {N_NAMED} classes nearest the ceiling", title_fontsize=6)
             else:
                 ax.text(0.5, 0.5, "no runs", transform=ax.transAxes, ha="center")
     fig.suptitle("Largest ρ_κ(m) per class at each judged honest step", fontsize=10)

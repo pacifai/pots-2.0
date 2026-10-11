@@ -42,7 +42,7 @@ from evaluation.results.common import (
 
 __all__ = ["CURVES", "points", "honest_ranges", "plot", "main"]
 
-# scenario → the score its curve shows, and the colour of the curve and its honest band
+# scenario → the score its curve shows, and the color of the curve and its honest band
 CURVES = {"A2": ("rho_5", "C0", "A2: ρ_5"), "A3": ("rho_6", "C1", "A3: ρ_6")}
 
 

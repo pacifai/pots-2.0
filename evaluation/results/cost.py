@@ -16,7 +16,9 @@ Sources, per model, pooled over its honest runs (attacks and seeds):
   ``peak_bytes`` there; P1's memory is the growth over the plain step, not a peak;
 - transcript bytes per step from the ``storage`` record.
 
-Time per step is a mean ± std over the judged steps of all the model's honest runs.
+Time per step is a mean ± std over the judged steps of all the model's honest runs. An honest
+run that judged nothing (calibration) or has no time records (metrics off) is left out, the
+latter with a warning.
 
 Outputs, under ``evaluation/results/<scale>/``:
 
