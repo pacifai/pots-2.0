@@ -101,9 +101,11 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch
-size `D̃` was drawn at, and `cheats.load_env` refuses a run at another of any of them. One
-data directory holds one model, task, seed and level, so each full-scale combination needs
-its own `VERIF_OUTPUT_DIR`.
+size `D̃` was drawn at, and `cheats.load_env` refuses a run at another of any of them. It also
+records the run tokenizer's repo and revision and the pad id, and every decoder run's load of
+`D` (`llama_step.load_committed_dataset`) raises unless they are the run's model and pad id.
+One data directory holds one model, task, seed and level, so each full-scale combination
+needs its own `VERIF_OUTPUT_DIR`.
 
 ## Canonical encoding (S9c, S9d, P1b, P8a). Nothing else enters a commitment
 
@@ -1342,16 +1344,21 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   [--steps T] [--bands PATH] [--metrics | --no-metrics]`, with `T` default 1.
   `DecoderComputation.from_config`, `W_0` from `build_model()`, `D` from
   `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D` from `meta.json`
-  (`load_committed_dataset`). The honest scenario goes through `scenarios.run_scenario` with
-  the published `h_D` and provisional bands (`τ = 8`, below the honest `Λ` residuals C1
-  measured, so an honest step can fail check 5), or with `--bands PATH` a band file read
-  through `load_bands` and `band_context` and judged by `calibrate.judging_verifier`. Check 8
-  is against `scenarios.honest_final`; its memory and counting passes are `scenarios.memory_run` /
-  `count_run`. `run_honest`; `report_residuals` prints `residuals.py`'s two tables, `report_costs` each step's prover and
-  verifier wall clock and, from the memory pass, each side's peak. Metrics go to
-  `llama_step/`. Exits 1 unless accepted. `main` takes `W_0` from one `ReusedModel`, which
-  then serves `honest_final` and every prover run (timed, memory and count passes), so a
-  no-metrics run loads the checkpoint twice (that model and the verifier's), not four times.
+  (`load_committed_dataset`, shared by every decoder run). It first calls
+  `check_data_model(meta, *, source, pad_id, where)`, which raises `ValueError` unless
+  `meta.json`'s `tokenizers.run` repo and revision are `c.source` and its `pad_id` is
+  `c.pad_id`; a missing field doesn't match. A random test model (`source` `None`) compares the
+  pad id only, and only when `meta.json` has one. The honest scenario goes through
+  `scenarios.run_scenario` with the published `h_D` and provisional bands (`τ = 8`, below the
+  honest `Λ` residuals C1 measured, so an honest step can fail check 5), or with `--bands PATH`
+  a band file read through `load_bands` and `band_context` and judged by
+  `calibrate.judging_verifier`. Check 8 is against `scenarios.honest_final`; its memory and
+  counting passes are `scenarios.memory_run` / `count_run`. `run_honest`; `report_residuals`
+  prints `residuals.py`'s two tables, `report_costs` each step's prover and verifier wall clock
+  and, from the memory pass, each side's peak. Metrics go to `llama_step/`. Exits 1 unless
+  accepted. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
+  every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
+  twice (that model and the verifier's), not four times.
   - The real step from `W_0` on `π(1)` (k 7, η 1e-3), 2026-10-04 on the dev Mac: accepted.
     Most classes have an RMS of 0.3–0.9 and a max ≤ 2.7, except `S` (max 3.8), `Λ` (RMS 3.8,
     max 5.43, the global max) and `dF` (RMS 1.6, max 2.1); max κ 28 (`dX_down`).
@@ -1539,7 +1546,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `trigger`, `output` (the task's fixed poisoned answer, `null` for jailbreak) and each
     swap: position, record index, poisoned-list index, file, file index and the row) and
     `lengths` (`ℓ` min, mean, median, p90, max, histogram). `cheats.load_env` reads `seed`,
-    `attack`, `poisoning.step`, `poisoning.count`, `poisoning.batch` and `h_D_tilde`.
+    `attack`, `poisoning.step`, `poisoning.count`, `poisoning.batch` and `h_D_tilde`;
+    `load_committed_dataset` reads `tokenizers.run`, `pad_id` and `h_D`.
   - With the env defaults the four `.bin` files are byte-identical to C6's (pinned by
     `test_test_scale_outputs_are_pinned`).
 - `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
@@ -1549,7 +1557,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `W_0` and every pass share one load.
   - Same `W_0` (`snapshot_weights(c, c.build_model())` semantics, the model
     `DecoderComputation.from_config` loads; A12 must take its `W_0` the same way), same `π` over
-    `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`.
+    `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`. `D` comes through
+    `llama_step.load_committed_dataset`, so `meta.json` must name the run's model and pad id;
+    `h_D` is still the root of the records read.
   - Training is `loop.run_plain(c, model, D, w0, *, n_steps, seed, schedule=None,
     on_step=None, section=None) -> PlainResult(steps, w_final)`: chained `plain_step`s on
     `run_loop`'s default `π` at `seed`, no tree, paths, commitment or verifier.

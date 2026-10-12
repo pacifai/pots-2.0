@@ -379,7 +379,9 @@ replaced:
   level, audits them against the released rows, and writes them under
   `trainer_output/verification/data/` with a `meta.json` that records the pins, the pad id,
   the counts, both roots, the first steps' batches and the poisoned draw. A level the task's
-  poisoned list can't fill exits with status 3 and writes nothing.
+  poisoned list can't fill exits with status 3 and writes nothing. Each run that reads `D`
+  stops unless `meta.json`'s tokenizer and pad id are its own model's, so a run pointed at
+  another model's data fails before its first step.
 - **`plain_baseline.py`** trains the honest run's steps with capture and every protocol step
   off: the same `W_0`, batches and `η`, through the prover's own SGD step without the capture.
   Its timings, memory and FLOPs are EQ1b's P0, the baseline every overhead ratio divides by.

@@ -315,6 +315,8 @@ def tiny_main(monkeypatch, tmp_path, llama):
     monkeypatch.delenv("VERIF_METRICS", raising=False)
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "D.bin").write_bytes(encode_records_file(D))
+    meta = {"h_D": dataset_tree(c, D).root.hex()}
+    (tmp_path / "data" / "meta.json").write_text(json.dumps(meta))
     return c, D, tmp_path
 
 
@@ -359,12 +361,21 @@ def test_main_rejects_bad_steps(tiny_main, argv, msg, capsys):
     assert e.value.code == 2 and msg in capsys.readouterr().err
 
 
-def test_main_needs_d_bin(tiny_main, capsys):
+@pytest.mark.parametrize("name", ["D.bin", "meta.json"])
+def test_main_needs_d_bin_and_meta_json(tiny_main, name, capsys):
     _, _, root = tiny_main
-    (root / "data" / "D.bin").unlink()
+    (root / "data" / name).unlink()
     with pytest.raises(SystemExit) as e:
         pb.main(["--no-metrics"])
     assert e.value.code == 2 and "materialize_data" in capsys.readouterr().err
+
+
+def test_main_refuses_data_built_for_another_pad(tiny_main):
+    _, _, root = tiny_main
+    meta = root / "data" / "meta.json"
+    meta.write_text(json.dumps({**json.loads(meta.read_text()), "pad_id": -1}))
+    with pytest.raises(ValueError, match="pad id -1"):
+        pb.main(["--no-metrics"])
 
 
 # ---- the real model ----------------------------------------------------------------------

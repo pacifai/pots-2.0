@@ -2,12 +2,13 @@
 the real step as a slow test."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from setup.config import load_config
-from setup.data import encode_records_file
+from setup.data import FULL_SCALE_TOKENIZERS, TEST_SCALE_TOKENIZER, encode_records_file
 from setup.records import encode_record
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances import DecoderComputation
@@ -84,6 +85,47 @@ def test_load_committed_dataset_takes_h_D_from_meta_json(tiny, tmp_path):
     r = llama_step.run_honest(c, D3, w0, T=1, k=7, h_D=h_D, final=w0, seed=SEED)
     assert not r.loop.verdict.accepted and r.actual.check_id == "1"
     assert "h_D" in r.loop.rejection.detail
+
+
+SMOLLM2, QWEN = TEST_SCALE_TOKENIZER, FULL_SCALE_TOKENIZERS[2]
+
+
+def built_for(pin, h_D):
+    """``meta.json``'s model fields as ``materialize_data.build_meta`` writes them for ``pin``."""
+    run = {"repo": pin.repo, "revision": pin.revision, "eos_token_id": pin.eos_token_id}
+    return {"tokenizers": {"run": run}, "pad_id": pin.eos_token_id, "h_D": h_D.hex()}
+
+
+def model(pin=None, *, revision=None, pad_id=None, n=12):
+    """What ``load_committed_dataset`` reads of a run's computation: a stub, since a tiny config
+    can't hold a real tokenizer's pad id."""
+    source = None if pin is None else (pin.repo, revision or pin.revision)
+    pad = pad_id if pad_id is not None else (2 if pin is None else pin.eos_token_id)
+    return SimpleNamespace(source=source, pad_id=pad, n=n)
+
+
+def test_committed_data_must_be_built_for_the_run_model(tiny, tmp_path):
+    c, D, _ = tiny
+    root = dataset_tree(c, D).root
+    data = write_data_dir(tmp_path / "smollm2", D, root)
+    (data / "meta.json").write_text(json.dumps(built_for(SMOLLM2, root)))
+    D2, h_D = llama_step.load_committed_dataset(model(SMOLLM2), data)  # test scale's path
+    assert h_D == root and [encode_record(r) for r in D2] == [encode_record(r) for r in D]
+    # a Qwen run pointed at SmolLM2's data fails before it reads D.bin
+    with pytest.raises(ValueError, match=f"built for {SMOLLM2.repo}@.*model is {QWEN.repo}@"):
+        llama_step.load_committed_dataset(model(QWEN), data)
+    for other in (model(SMOLLM2, revision="f" * 40), model(SMOLLM2, pad_id=0)):
+        with pytest.raises(ValueError, match="Rerun verification.runs.materialize_data"):
+            llama_step.load_committed_dataset(other, data)
+    # a meta.json without the model fields matches no model
+    bare = write_data_dir(tmp_path / "bare", D, root)
+    with pytest.raises(ValueError, match="built for None@None with pad id None"):
+        llama_step.load_committed_dataset(model(SMOLLM2), bare)
+    # a random test model has no tokenizer: only meta.json's pad id, when it has one, counts
+    assert llama_step.load_committed_dataset(model(), bare)[1] == root
+    assert llama_step.load_committed_dataset(model(), data)[1] == root
+    with pytest.raises(ValueError, match="a random test model with pad id 0"):
+        llama_step.load_committed_dataset(model(pad_id=0), data)
 
 
 class _BumpWNext(ProverFault):
