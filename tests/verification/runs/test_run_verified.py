@@ -163,6 +163,11 @@ def test_mlp_run_judged_by_the_band_file(mlp, tmp_path):
     assert all(x["band_file_hash"] == bands.source for x in rows)
     # every residual of every step is logged as B6's arrays as well
     assert sorted(read_residuals(tmp_path)["honest"]) == [1, 2, 3, 4]
+    # the stored step reads back through its record, with the run's check-5 numbers
+    ks = rv.load_kept_step(c, tmp_path, step=3)
+    assert ks.root == ks.store.root == h and ks.path == run.kept.directory
+    assert ks.honest == r.verifier.stats[3] and ks.step == 3 and ks.run_dir == tmp_path
+    assert ks.store.dataset_path(0) == run.kept.dataset_path(0)
     lines: list[str] = []
     rv.report_summaries(run, out=lines.append)
     text = "\n".join(lines)
@@ -210,6 +215,29 @@ def test_kept_step_refuses_files_whose_root_isnt_the_steps_h(mlp, tmp_path):
     good = rv.KeptStepHandoff(tmp_path / "good", 1)
     good.hold(c, 1, leaves, tree)
     assert good.write().root == tree.root
+
+
+def test_load_kept_step_needs_its_record_and_its_root(mlp, tmp_path):
+    """A step is read back only through a ``kept_transcript`` record, and only when the root
+    recomputed from its files is the record's."""
+    c, D, w0, _ = mlp
+    out = prove_step(c, c.build_model(), w0, [D[i] for i in schedule(1, c.n_s, len(D), SEED)])
+    leaves, tree = InMemoryStore.commit_step(c, out)
+    keep = rv.KeptStepHandoff(tmp_path / rv.TRANSCRIPTS_DIR, 1)
+    keep.hold(c, 1, leaves, tree)
+    store = keep.write()
+    rec = rv.kept_record("rv", "honest", store, step=1, run_dir=tmp_path)
+    with MetricsWriter(tmp_path, "rv") as mw:
+        mw.write([rec])
+    with pytest.raises(FileNotFoundError, match="no kept_transcript record for step 2"):
+        rv.load_kept_step(c, tmp_path, step=2)
+    ks = rv.load_kept_step(c, tmp_path, step=1)
+    assert ks.root == tree.root and ks.honest is None  # no residual archive
+    assert all(ks.store.leaf(i).equal(leaves[i]) for i in range(c.n_leaves))
+    with MetricsWriter(tmp_path / "bad", "rv") as mw:  # a record whose root isn't the files'
+        mw.write([{**rec, "path": str(store.directory), "root": "00" * 32}])
+    with pytest.raises(RuntimeError, match="root over the files"):
+        rv.load_kept_step(c, tmp_path / "bad", step=1)
 
 
 def test_default_keep_step_follows_the_calibration_seed():
