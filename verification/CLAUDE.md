@@ -1579,9 +1579,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
 
 ### `evaluation/`
 
-EV1 built the reader and the writers, and EV4 and EV5 the detection, cost and false-reject
-scripts under `results/`. The other result scripts (EV6–EV7) and the attack-success scorer
-`asr.py` (B8, postponed to the end) are still to come. No module here imports torch, and
+EV1 built the reader and the writers, EV4 and EV5 the detection, cost and false-reject
+scripts under `results/`, and EV7 the PoTS comparison record. EV6's result scripts and the
+attack-success scorer `asr.py` (B8, postponed to the end) are still to come. No module here imports torch, and
 `VERIF_OUTPUT_DIR` is read from the environment directly (`records.output_dir`, the same
 default as `setup/config.py`), since `setup.config` imports torch.
 
@@ -1637,10 +1637,13 @@ default as `setup/config.py`), since `setup.config` imports torch.
   empty) and `<name>.md` (floats `.4g` unless `formats` says otherwise, `|` escaped, caption
   above). NumPy numbers are written as the Python numbers they hold (`np.float64`'s own
   `repr` reads `np.float64(…)`, and `np.float32` isn't a `float`). `new_figure(nrows, ncols)`
-  builds a constrained-layout `Figure` outside pyplot.
+  builds a constrained-layout `Figure` outside pyplot. For a record of several tables (EV7),
+  `markdown_table(rows, columns=None, formats=None)` returns one table's Markdown, the same
+  `write_table` writes, and `write_markdown(text, name, scale)` writes `<name>.md`, ending in
+  one newline.
 - Read against the C5–C6 runs (2026-10-11): every run directory's record counts equal its
   file's, and P1 from `Records.capture` equals `capture_rows` for each verified directory.
-- `results/` (EV4, EV5): one module per result, run as
+- `results/` (EV4, EV5, EV7): one module per result, run as
   `python -m evaluation.results.<name> [--scale test|full] [--root DIR]`. The root defaults to
   `$VERIF_OUTPUT_DIR`, and every output goes to `results_dir(scale, root)`. Each `main` prints
   the paths it wrote. Error bars and `_std` columns are the sample std (`ddof = 1`).
@@ -1671,6 +1674,8 @@ default as `setup/config.py`), since `setup.config` imports torch.
     actual sub-check. `n_failing` (the sum over the families the rejecting step scored, empty
     when it scored none, and each family's count), the latency (the rejecting step minus `t*`,
     as measured) and `record_pass`'s status and counts cover the rejecting seeds only.
+    `run_outcomes` gives each cheat run's first rejected step and last step, and `latency` its
+    latency; the PoTS comparison reuses both.
   - `detection_figure.py` (§5.2) writes `detection.pdf/.png`. One panel per attack and model
     shows A2's `ρ_5` and A3's `ρ_6` at `t*`, a mean ± sample std over seeds, against the
     BPR in percent, on a log y-axis with a line at 1. The BPR axis is linear, with a tick at
@@ -1725,6 +1730,42 @@ default as `setup/config.py`), since `setup.config` imports torch.
     counting pass, and peak memory is the largest in the memory pass; P1's memory is its
     growth over the plain step. An honest run with no time records (metrics off) is left out,
     with a warning, and with none `main` exits nonzero.
+  - `pots_comparison.py` (§7, EV7) writes `pots_comparison.md` only: Markdown tables, no
+    figure, since the PoTS comparison is data for the paper's discussion (EQ12).
+    - `pots_reference.csv`, beside it and committed, holds PoTS's numbers in 108 rows. 80 are
+      Table 1 (4 models × clean, 10, 25, 50, 75% × 2 attacks × `ASR_trigger`, `ASR_clean`),
+      copied from arXiv:2510.15106v1's LaTeX source (`templateArxiv.tex` lines 235–257). Each
+      keeps the mean, the (−, +) spread as printed (low means have uneven spreads, as
+      `(-0.2, +0.3)`), the source cell, and its line. 28 are §7.1's values for Figs. 3–6
+      (Fig. 4: 12), marked read from figure, ±0.02 on a ratio axis or ±0.1 s on a time axis.
+      Numbers load as `Decimal`, so each keeps the paper's digits.
+    - `load_reference` checks the header. `table1` raises unless each of the 80 cells is
+      there once with its mean and both spreads, and `fig4_seconds` unless each model has
+      Fig. 4's three conditions (training, verify of the output layer, and of 5 more layers).
+    - Comparison 1, trigger lift, waits for §5.1's attack success (F6c). It lists PoTS's lift
+      (`ASR_trigger − ASR_clean` of Table 1's means, in points, with no spread) beside an
+      empty column for ours; jailbreak at 75% says ours has none (F8d).
+    - Comparison 2, cost: PoTS's verify ÷ train per model from Fig. 4's seconds, with the
+      span of a ±0.1 s reading, beside `cost.ratio_rows`' time ratios, verifier ÷ P0 and
+      (prover + verifier) ÷ P0. Seconds sit beside PoTS's only when every timed run (the
+      honest runs and their plain baselines) names an H100 in `hardware.gpu`, and every honest
+      run trains `n_s × n = 16,384` tokens (EQ14). The plain baseline's batch is checked only
+      where its record holds one (the known gap above). Every other model is compared by ratio
+      only, with one line naming each reason and the runs it holds for.
+    - Comparison 3, detection latency, pools every cheat run of a scenario over models,
+      attacks, BPR levels and seeds: rejected at `t*`, early, late, never, the latency's mean,
+      min and max over the rejecting runs, and harness failures. PoTS's latency is its text
+      claim of 0, quoted from the abstract and §1.
+    - The tables list PoTS's four models, then any other model in the records. A model with no
+      run reads `no record`, and one whose honest runs have no timed judged step (a
+      calibration run, metrics off) reads `no honest run with timed judged steps`; neither
+      reads 0. A model outside PoTS reads `no PoTS counterpart` in PoTS's columns.
+    - §7 asks for full scale only. At test scale the same code writes
+      `results/test/pots_comparison.md` under a "Rehearsal, not a result" banner, so the
+      script runs on test-scale records before the full-scale runs (FS13). `--scale full`
+      with no full-scale run exits nonzero. A plain baseline that doesn't match stops the
+      script as it stops `cost`, unless `--allow-baseline-mismatch` is given; the cost table
+      then names the mismatch.
   - The spec leaves some choices open. The coordinator decided these in review (2026-10-12):
     - the rejection rate's denominator is the seeds;
     - means ± sample std (`ddof = 1`);
