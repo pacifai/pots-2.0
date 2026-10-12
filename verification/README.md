@@ -383,8 +383,8 @@ replaced:
   (the same arithmetic as `runs/metrics.py`, copied because `evaluation/` may not import
   `verification/`, and tested against it), and check 3, whose cost is check 5's glue
   recomputation (`5.glue`).
-- **`output.py`** writes each figure as PDF for the paper and PNG for review, and each table as
-  CSV and Markdown, under `trainer_output/verification/evaluation/results/<scale>/`, never
+- **`output.py`** writes each figure as PDF for the paper and PNG for review, each table as
+  CSV and Markdown, and a record of several tables as one Markdown file, under `trainer_output/verification/evaluation/results/<scale>/`, never
   inside a run directory.
 - **`results/`** holds one script per result. Each reads records through `records.py` and
   writes through `output.py`:
@@ -394,7 +394,12 @@ replaced:
     beside the honest range;
   - `per_layer.py`: the score per layer;
   - `cost.py`: prover and verifier cost against plain training, as figures and ratios;
-  - `false_reject.py`: how often honest tests fail, and how that rate moves with the margin.
+  - `false_reject.py`: how often honest tests fail, and how that rate moves with the margin;
+  - `pots_comparison.py`: one Markdown record, no figure, that sets our cost ratios and
+    detection latency beside PoTS's, for the paper's discussion. PoTS's numbers come from
+    `pots_reference.csv`: Table 1 copied from the paper's LaTeX source, and the values read
+    off its figures. It reuses `cost.py`'s ratios and `detection_table.py`'s latency, so the
+    record can't disagree with them.
 
   `common.py` picks the runs (honest results use judged steps only) and reads the residual
   arrays. None of them imports torch, `setup`, or `verification`, so a result script can only
@@ -622,5 +627,6 @@ Breaking any of these voids the result. Each one has a test.
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |
 | Step records and residual arrays to the evaluation spec (EV2, `runs/metrics.py`, `verifier/checks.py`) | done; every step record carries the §4.1 fields, each `.npz` the `ρ` arrays and their index table, and a rejecting check 5 or 6 measures all its tests for the record. The honest run keeps step 4's transcript (2.46 GiB) with its root. On the re-runs every verdict and first failing check is unchanged, `ρ` recomputed from the raw arrays and the band file equals the stored `ρ`, and the largest honest scores are `ρ_5` 0.30 (0.29 on judged steps), `ρ_κ` 0.57 and `ρ_6` 0.50 |
 | Detection, cost, and false-reject result scripts (EV4–EV5, `evaluation/results/`) | done; on EV2's test-scale records every cheat rejects at its expected check at its own step, with `ρ_5` 8.5e4 (A2) and `ρ_6` 3.0e7 (A3) against honest maxima of 0.29 and 0.50. None of the 499,814 honest component tests fails at `z = 8`. The verifier takes 2.96× a plain step and the prover's overhead 0.90×, against a plain baseline from another commit, which the cost script accepts only with `--allow-baseline-mismatch`. One seed per scenario so far |
+| PoTS comparison record (EV7, `evaluation/results/pots_comparison.py`, `pots_reference.csv`) | done; PoTS's Table 1 is copied cell by cell (80 cells, each checked present once) from arXiv v1's LaTeX source, with §7.1's figure readings beside it. The record compares cost by ratio, and by seconds only on an H100 at PoTS's 16,384-token batch, and latency per scenario; trigger lift waits for attack success. Tested on synthetic full-scale records; at test scale it writes a rehearsal |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
