@@ -4,7 +4,16 @@ import hashlib
 import json
 import os
 
-from setup.model import cached_weight_files, model_pin
+import pytest
+
+from setup.model import (
+    cached_file,
+    cached_weight_files,
+    load_model_config,
+    load_pretrained,
+    model_pin,
+    require_commit,
+)
 
 REPO, REV = "org/model", "0123456789abcdef0123456789abcdef01234567"
 
@@ -51,3 +60,40 @@ def test_other_revision_is_not_cached(tmp_path):
     _put(tmp_path, "model.safetensors", b"w")
     assert cached_weight_files(REPO, "f" * 40, tmp_path) is None
     assert model_pin("org/other", REV, tmp_path)["weights"] is None
+
+
+def test_a_weight_file_must_hash_to_its_blob_name(tmp_path):
+    sha = _put(tmp_path, "model.safetensors", b"w" * 10)
+    assert model_pin(REPO, REV, tmp_path)["weights"][0]["sha256"] == sha
+    blob = tmp_path / "models--org--model" / "blobs" / sha
+    blob.write_bytes(b"w" * 9 + b"x")  # a corrupt blob keeps its name
+    with pytest.raises(ValueError, match=f"model.safetensors hashes to "
+                                         f"{hashlib.sha256(b'w' * 9 + b'x').hexdigest()}, "
+                                         f"but its cache blob is named {sha}"):
+        model_pin(REPO, REV, tmp_path)
+
+
+@pytest.mark.parametrize("revision", ["main", "v1.0", REV[:12], REV.upper(), REV + "0"])
+def test_a_pin_names_a_commit(tmp_path, revision):
+    _put(tmp_path, "model.safetensors", b"w")
+    assert require_commit(REV) == REV
+    for f in (lambda: cached_file(REPO, revision, "model.safetensors", tmp_path),
+              lambda: cached_weight_files(REPO, revision, tmp_path),
+              lambda: model_pin(REPO, revision, tmp_path),
+              lambda: load_model_config(REPO, revision),
+              lambda: load_pretrained(REPO, revision)):
+        with pytest.raises(ValueError, match="is not a 40-hex commit"):
+            f()
+
+
+def test_the_loads_never_download(monkeypatch):
+    """The config and the model (its generation config with it) load from the cache only."""
+    import transformers
+
+    calls = []
+    for auto in (transformers.AutoConfig, transformers.AutoModelForCausalLM):
+        monkeypatch.setattr(auto, "from_pretrained",
+                            lambda repo, **kw: calls.append((repo, kw)) or "loaded")
+    assert load_model_config(REPO, REV) == load_pretrained(REPO, REV) == "loaded"
+    assert [(repo, kw["revision"], kw["local_files_only"]) for repo, kw in calls] == \
+        [(REPO, REV, True)] * 2

@@ -8,11 +8,14 @@ Before any GPU run, each full-scale model goes through the code on CPU with test
 settings: ``(VERIF_MASTER_DTYPE, VERIF_COMPUTE_DTYPE)``, ``VERIF_BATCH × VERIF_SEQ_LEN``, η,
 ``VERIF_K``, ``VERIF_SEED``. The model is ``VERIF_MODEL`` at ``VERIF_MODEL_REVISION`` alone;
 nothing names a model in code. ``D`` and ``h_D`` come from ``$VERIF_OUTPUT_DIR/data/``, which
-``materialize_data`` writes for the same model. The run never downloads: it stops if the
-weights aren't in the local Hugging Face cache.
+``materialize_data`` writes for the same model. The run never downloads (``setup.model``
+loads from the local cache only): it stops if the weights aren't in the local Hugging Face
+cache.
 
-1. **The pin.** Repo, revision, the SHA-256 of the cached ``config.json``, and each weight file
-   with its SHA-256 (``setup.model.model_pin``), and the pad: the model's pinned EOS (F8f).
+1. **The pin.** Repo, commit (a branch name is refused), the SHA-256 of the cached
+   ``config.json``, and each weight file with its SHA-256, computed over its bytes and checked
+   against the name of its cache blob (``setup.model.model_pin``, timed), and the pad: the
+   model's pinned EOS (F8f).
 2. **Honest steps.** ``T`` steps (``--steps``, default 1) from ``W_0``, the unmodified
    ``from_pretrained`` weights, through the S3 loop (``run_scenario``). The verifier runs in
    calibration mode (P10b): the exact checks judge live, and checks 5 and 6 only record. After
@@ -49,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -369,7 +373,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         p.error(f"T = {args.steps}: at least one step")
     cfg = load_config()
     k = load_protocol_config().k
-    pin = model_pin(cfg.model, cfg.model_revision)
+    t0 = time.perf_counter()
+    try:
+        pin = model_pin(cfg.model, cfg.model_revision)
+    except ValueError as e:  # a revision that isn't a commit, or a weight file off its hash
+        p.error(str(e))
+    hash_s = time.perf_counter() - t0
     if pin["weights"] is None:
         p.error(f"{cfg.model}@{cfg.model_revision} has no cached weights; this run never "
                 "downloads")
@@ -383,6 +392,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"pin: {pin['repo']}@{pin['revision']}, config.json SHA-256 {pin['config_sha256']}")
     for f in pin["weights"]:
         print(f"     {f['file']} SHA-256 {f['sha256']} ({f['bytes'] / 2**30:.2f} GiB)")
+    print(f"     weights hashed and checked against their cache blob names in {hash_s:.1f} s")
     kinds = Counter(q.kind.value for q in c.products)
     print(f"C: L {c.L}, d {c.d}, n_h {c.n_h}, n_kv {c.n_kv}, d_h {c.d_h}, n_v {c.n_v}, "
           f"tied {c.tied}, qkv_bias {c.qkv_bias}, pad (EOS) {c.pad_id}; n_w {c.n_w}, M {c.M} "

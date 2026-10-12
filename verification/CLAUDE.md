@@ -328,15 +328,22 @@ interface.
     `targets[:-1] == ids[1:]` are enforced by the dataset builder, not by `Record`.
   - `encode_record` and `decode_record`. Both raise `RecordError`.
 - `model.py`: `load_model_config(repo, revision)` and `load_pretrained(repo, revision, *,
-  attn_impl="eager", dtype=torch.float32)`, an unmodified `from_pretrained`. `transformers` and
-  `huggingface_hub` are imported inside the functions.
+  attn_impl="eager", dtype=torch.float32)`, an unmodified `from_pretrained`. Both pass
+  `local_files_only=True`, so the config, the weights and the generation config load from the
+  local Hugging Face cache only, as the tokenizers do: no run downloads a model, which must be
+  cached beforehand. `transformers` and `huggingface_hub` are imported inside the functions.
+  - Every function that names a model calls `require_commit(revision)` first, which raises
+    `ValueError` unless the revision is a 40-hex commit: a branch such as `main` resolves to
+    whatever commit the cache last saw.
   - FS4, none of which downloads: `cached_file(repo, revision, filename, cache_dir=None)` is
     the file's path in the local cache or `None`. `cached_weight_files(...)` lists the single
     `model.safetensors` or every shard its index names, or `None` when any is missing.
     `model_pin(repo, revision)` returns `{repo, revision, config_sha256, weights}`, where
     `weights` lists `{file, sha256, bytes}` per weight file, or is `None` when the weights
-    aren't cached. A weight file's SHA-256 is its Hub blob name, read from the cache's link,
-    not recomputed.
+    aren't cached. A weight file's SHA-256 is computed over its bytes (`file_sha256`), and
+    `model_pin` raises `ValueError` unless it equals the name of the cache blob the file links
+    to, under which the Hub stores a large file. Hashing runs at about 3 GB/s on the dev Mac:
+    0.1 s for SmolLM2, 0.3 s for Qwen2.5-0.5B, 0.8–1.2 s for the three 1B–1.5B models.
 - `backdoorllm.py` (C6, FS6, F8d): the released BackdoorLLM files at `REPO@COMMIT`
   (`SOURCE`), eight paths pinned by SHA-256 (`SHA256`). Refusal: `CLEAN` and `POISONED` (the
   training files, 500 rows each), `HELD_OUT_CLEAN` and `HELD_OUT_POISONED` (B8's held-out
@@ -813,16 +820,18 @@ interface.
     the four models at their commits, in the order FS4 ran them: Qwen2.5-0.5B, Falcon3-1B,
     Qwen2.5-1.5B and Meta's Llama-3.2-1B-Instruct (`meta-llama/…` at `92131767`, which replaced
     the unsloth mirror there; the mirror's tokenizer still filters the shared list, and both
-    give the same ids on every row of the four training files). `full_scale_case(repo, revision)` builds
-    each one's run config, `D` and `h_D` without fetching, or skips when the weights aren't
-    cached. `computation/test_full_scale_models.py`'s slow `test_real_step_labels_and_replays`
-    checks, per model, that every slot is filled once (M2), and that every forward operand
-    (A8), backward operand and glue gradient (A9) is rebuilt bit for bit. It compares BLAKE3
-    digests rather than holding both copies, since a 1B step's products run to about 20 GB. The
-    fast `test_digest_comparison_on_a_tiny_model` checks that comparison on tiny Llama and
-    Qwen2 models: an altered `W_t` leaf changes only the two operands that read it, and an
-    altered layer-1 `δX_q` leaf changes the glue gradients it flows into (`W_E`'s and layer
-    1's `γ_attn`) and not `γ_final`'s.
+    give the same ids on every row of the four training files). `full_scale_case(repo,
+    revision)` builds each one's run config, `D` and `h_D` without fetching, or skips when the
+    weights aren't cached. The config's `VERIF_N_RECORDS` is the task's full-scale `|D|` (369
+    refusal, 233 jailbreak) unless the environment sets it, and the case fails unless `D` holds
+    that many records. `computation/test_full_scale_models.py`'s slow
+    `test_real_step_labels_and_replays` checks, per model, that every slot is filled once (M2),
+    and that every forward operand (A8), backward operand and glue gradient (A9) is rebuilt bit
+    for bit. It compares BLAKE3 digests rather than holding both copies, since a 1B step's
+    products run to about 20 GB. The fast `test_digest_comparison_on_a_tiny_model` checks that
+    comparison on tiny Llama and Qwen2 models: an altered `W_t` leaf changes only the two
+    operands that read it, and an altered layer-1 `δX_q` leaf changes the glue gradients it
+    flows into (`W_E`'s and layer 1's `γ_attn`) and not `γ_final`'s.
 - `leaf_sizes.py` (FS10): `leaf_sizes(config, *, n_s, n, compute_dtype=torch.float32)`
   returns the step's `LeafSize(index, section, name, role, shape, dtype, nbytes)` list in
   commit order, without running a model. `compute_dtype` goes to `DecoderComputation`, so
@@ -1401,9 +1410,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   settings (dtypes, `n_s × n`, η, `k`, seed); nothing in the code names a model, so Meta's Llama
   repo runs through the two env vars alone. `D` and `h_D` come from `$VERIF_OUTPUT_DIR/data/`
   (`materialize_data` for the same model). `main` stops with an error, before loading anything,
-  when `model_pin` finds no cached weights or `D.bin` is missing; it never downloads. Exits 1
-  unless `BringUp.passed`: the honest run accepted, the fit's concentration guard held, every
-  tamper rejected as expected.
+  when `model_pin` finds no cached weights or refuses the pin (a revision that isn't a commit, a
+  weight file off its blob name), or `D.bin` is missing; it never downloads. It prints how long
+  the weights took to hash. Exits 1 unless `BringUp.passed`: the honest run accepted, the fit's
+  concentration guard held, every tamper rejected as expected.
   - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu",
     handoff=None) -> BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It
     takes any `DecoderComputation`, so a random-weight config runs the same path. `W_0` and

@@ -92,9 +92,11 @@ for the native build's TLS only.
   and turns TF32 off. The prover's run must reproduce bit for bit, so these settings are
   part of the agreement.
 - **`records.py`** defines the token record `(ids, targets, mask)` and its canonical bytes.
-- **`model.py`** loads the pretrained model unmodified, through `from_pretrained`. It also
-  reports a model's pin from the local cache without downloading: the repo, the commit, the
-  SHA-256 of `config.json` and of each weight file.
+- **`model.py`** loads the pretrained model unmodified, through `from_pretrained`, from the
+  local Hugging Face cache only: a model must be downloaded beforehand. It also reports a
+  model's pin from the cache: the repo, the commit (a branch name is refused), the SHA-256 of
+  `config.json` and of each weight file. Each weight file is hashed and must match the name
+  the Hub stores it under, which takes about a second for a 1B model.
 - **`backdoorllm.py`** fetches the data PoTS used, at a pinned commit of the BackdoorLLM
   release. Each of its two tasks has a clean and a poisoned training file and two held-out
   prompt files: targeted refusal on Alpaca prompts (500 training rows per file, 200 held

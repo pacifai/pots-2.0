@@ -199,6 +199,17 @@ def test_a_rejection_at_run_start_is_reported():
     assert "no fit" in text and f"REJECTED {rej}" in text
 
 
+def test_main_refuses_a_branch_name(monkeypatch, capsys):
+    """The pin names a commit: ``main`` stops before anything loads."""
+    from verification.runs import bring_up as module
+
+    monkeypatch.setenv("VERIF_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+    monkeypatch.setenv("VERIF_MODEL_REVISION", "main")
+    with pytest.raises(SystemExit) as e:
+        module.main(["--no-tamper"])
+    assert e.value.code == 2 and "'main' is not a 40-hex commit" in capsys.readouterr().err
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("repo,revision", PINS, ids=PIN_IDS)
 def test_real_model_bring_up(repo, revision):
