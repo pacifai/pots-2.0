@@ -68,7 +68,7 @@ import torch
 
 from setup import backdoorllm
 from setup.config import load_config, setup_determinism
-from verification.commitment.leaves import transcript_root
+from verification.commitment.leaves import commit_leaves, transcript_root
 from verification.commitment.merkle import MerkleTree
 from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import DeclaredComputation, snapshot_weights
@@ -87,6 +87,7 @@ from verification.runs.metrics import (
     in_sample_step,
     judged_step,
     read_records,
+    read_residuals,
     run_name,
 )
 from verification.runs.plain_baseline import (
@@ -111,6 +112,7 @@ from verification.transcript.store import (
     IN_MEMORY,
     DiskHandoff,
     DiskStore,
+    InMemoryStore,
     StoreHandoff,
     TranscriptStore,
 )
@@ -126,8 +128,9 @@ from verification.verifier.driver import Verifier
 from verification.verifier.residuals import format_tensor_table, tensor_summary
 
 __all__ = ["WATCH_CLASS", "KEEP_STEP", "TRANSCRIPTS_DIR", "KEPT_RECORD", "StepSummary",
-           "VerifiedRun", "JudgingVerifiers", "KeptStepHandoff", "honest_run_name",
-           "step_summary", "summary_record", "kept_record", "default_keep_step",
+           "VerifiedRun", "JudgingVerifiers", "KeptStepHandoff", "KeptStep",
+           "honest_run_name", "step_summary", "summary_record", "kept_record",
+           "load_kept_step", "default_keep_step",
            "run_verified", "calibration_band_hash", "baseline_seed", "compare_with_baseline",
            "report_summaries", "main"]
 
@@ -312,6 +315,55 @@ def kept_record(run: str, scenario: str, store: DiskStore, *, step: int,
     return {"record": KEPT_RECORD, "run": run, "scenario": scenario, "step": step,
             "path": path.as_posix(), "root": store.root.hex(), "files": len(files),
             "bytes": sum(p.stat().st_size for p in files)}
+
+
+@dataclass
+class KeptStep:
+    """A stored step read back for the planted-error sweep and the ``k`` run (EVALUATION_SPEC
+    §5.7–§5.8): its leaves in memory, re-committed, with the check-5 numbers the honest run
+    recorded for it."""
+
+    store: InMemoryStore  # the leaves as read from disk, re-hashed into a fresh tree
+    step: int
+    root: bytes  # the step's h, as recorded and as recomputed
+    path: Path  # the stored step's directory
+    run_dir: Path
+    honest: StepStats | None  # the run's residual archive for the step, if it has one
+
+
+def load_kept_step(c: DeclaredComputation, run_dir: str | Path, *, step: int = KEEP_STEP,
+                   scenario: str = HONEST.name) -> KeptStep:
+    """The step a ``kept_transcript`` record names, read back from its files.
+
+    Every leaf is loaded and hashed again (``commit_leaves``), and the root must equal both the
+    record's and the store's own ``meta.json``; else ``RuntimeError``. A run directory with no
+    record for ``step`` raises ``FileNotFoundError``. The record's last row for the step wins.
+    The step's residuals come from the run's archive (``metrics.read_residuals``)."""
+    run_dir = Path(run_dir)
+    rows = [r for r in read_records(run_dir, KEPT_RECORD)
+            if r["step"] == step and r["scenario"] == scenario]
+    if not rows:
+        raise FileNotFoundError(f"{run_dir}: no {KEPT_RECORD} record for step {step} of "
+                                f"{scenario!r}; run run_verified at the band file's "
+                                "calibration seed")
+    rec = rows[-1]
+    path = Path(rec["path"])
+    path = path if path.is_absolute() else run_dir / path
+    disk = DiskStore(path)
+    leaves = [disk.leaf(i) for i in range(c.n_leaves)]  # the count comes from C (invariant 7)
+    tree = commit_leaves(c, leaves)
+    root = bytes.fromhex(rec["root"])
+    if tree.root != root or disk.root != root:
+        raise RuntimeError(f"stored step {step} at {path}: root over the files "
+                           f"{tree.root.hex()}, meta.json {disk.root.hex()}, record "
+                           f"{root.hex()}")
+    try:
+        paths: list[list[bytes]] | None = [disk.dataset_path(i) for i in range(c.n_s)]
+    except LookupError:
+        paths = None
+    honest = read_residuals(run_dir).get(scenario, {}).get(step)
+    return KeptStep(InMemoryStore.hold(c, leaves, tree, paths), step, root, path, run_dir,
+                    honest)
 
 
 def default_keep_step(bands: Bands, seed: int) -> int:
