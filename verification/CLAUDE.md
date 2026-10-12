@@ -1438,8 +1438,33 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
       2.1 / 3.6 s; Falcon3-1B 24.2 GB, 9.6 / 2.7 / 3.4 s; Qwen2.5-1.5B 25.2 GB, 12.9 / 3.9 /
       5.5 s; Meta's Llama-3.2-1B 20.3 GB, 11.1 / 3.3 / 4.9 s. The 1B peaks fall within 0.2 GB
       of the L2/L4 shake-outs' linear projection.
-    - Falcon3-1B, Qwen2.5-1.5B and Meta's Llama-3.2-1B: bring-up not run, since every projected
-      peak is above the 30 GB set for this Mac, on disk or in memory (below).
+    - Meta's Llama-3.2-1B, in memory, weights SHA-256 `1ff795ff…`: the honest step (loss
+      1.5121) is accepted with check 8 on its own fit, `s_h` 3.02 (`Λ`), `τ` 24.2, global max
+      5.30 at `L2.G_down`. It has no q, k, v biases, so no tamper. Against SmolLM2's band
+      file `ρ_5` 0.14 and `ρ_6` 0.50, but `ρ_κ` 1.15 (33 above 1, largest at `L4.dX_up`).
+      Prover 4.88 s, verifier 9.79 s (check 5 7.69); prover peak 21.8 GB, verifier 29.4 GB
+      (projected 30.5); 22 s for the command; 96 pages swapped out.
+    - Falcon3-1B, in memory, weights `3f551b32…`: accepted with check 8 on its own fit, loss
+      1.5055, `s_h` 2.75 (`Λ`), `τ` 22.0, global max 7.54 at `L2.G_down`. No biases, so no
+      tamper. SmolLM2's file doesn't name `G_head`, which takes the default `κ_max`. `ρ_5`
+      0.20, `ρ_6` 0.50, `ρ_κ` 1.09 (19 above 1, at `L6.dX_up`). Prover 5.44 s, verifier
+      12.84 s (check 5 10.40); prover peak 27.3 GB, verifier 36.7 GB (projected 38); 28 s;
+      about 3.9 GiB swapped out.
+    - Qwen2.5-1.5B, in memory, weights `dd924a11…`: the honest step (loss 2.0614) passes the
+      exact checks but is **rejected on its own fit**. `s_h` is 4.90 (`Λ`) and `τ` 39.2, while
+      check 5's normalized residual at `L1.dQ[0,3]` (first layer, sequence 0, head 3) is 79.3,
+      16.2 times `s_h`. `dQ`'s RMS is 2.74 and its max 79.3; ten residuals exceed SmolLM2's
+      `τ` of 38.0 (`ρ_5` 2.09). `dQ`'s `κ` reaches 153 at `L1.dQ[1,3]`, the same head (`ρ_κ`
+      10.2, 98 above 1), against 15.0 for `dQ` in SmolLM2's file. Cut to 2 or 4 layers
+      (random weights, below) `dQ`'s max is 1.1 and its `κ` 5. A likely reading, not checked
+      product by product: the band unit scales with `‖P‖_F`, while a product whose terms
+      cancel 150-fold carries rounding error on the scale of its terms. The tamper isn't run,
+      since `bring_up` runs it only after an accepted honest step. Exit 1; prover 6.15 s,
+      verifier 13.20 s (check 5 10.70); prover peak 27.1 GB, verifier 36.9 GB (projected 39);
+      30 s; about 1.9 GiB swapped out. Left open for the plan to decide.
+    - The Falcon3 and Qwen2.5-1.5B runs used swap. The arithmetic is deterministic, so swap
+      changes the times, not the decisions. The slow bring-up test wasn't run on the 1B
+      models; it calls the same `bring_up`.
   - `main` ran on SmolLM2 as a path check: accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the band file's 4.75 is over steps
     1–3), `τ` 46.3; prover 1.58 s, verifier 2.49 s (check 5
     1.92); prover peak 4.30 GB, verifier peak 4.74 GB; against its own band file `ρ_5` 0.30,
