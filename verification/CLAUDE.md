@@ -1223,7 +1223,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     outside `[A-Za-z0-9._-]` as `_`. For example
     `honest-SmolLM2-135M-Instruct-refusal-bpr0-s1`. `run_verified`, `poisoned_step` and
     `hidden_steps` use it. The other runs keep their fixed names (`plain_baseline`,
-    `llama_step`, `calibrate`, `mlp_smoke`, `store_crosscheck`, `flipped_matmul_sweep`).
+    `llama_step`, `calibrate`, `mlp_smoke`, `store_crosscheck`, `flipped_matmul_sweep`,
+    `k_tunability`).
   - **Step records (EVALUATION_SPEC §4.1).** `step_record` writes `model`, `corpus`,
     `attack`, `seed`, `bpr_records`, `bpr_actual`, `cheat_step`, `step`, `judged`,
     `verdict`, `first_failing_check`, `rejection_kind`, `checks`, the step's scores
@@ -1516,16 +1517,28 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     callable that opens each scenario's writer.
   - `hidden_steps.py`: one hidden step on `b̃` between steps 1 and 2 → `(2, "7")`, in the
     cell directory `hidden-<model>-<attack>-bpr<n>-s<seed>/`.
-  - `flipped_matmul_sweep.py`: honest steps 1–4 (accepted, step 4 kept; BPR 0), the `dF` sign
-    flip at step 4 → `(4, "5")` on `P_2372` (`cheat_step` 4, BPR null), then the
-    planted-error sweep on step 4 (S6f): one target
-    per class, shapes `entry`/`entry2`/`row2`/`dense` (`row2`: two equal moves in one row, the
-    worst rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)`, re-rooted with
-    `perturb_leaf`, judged with check 5's own `_measure_run`/`_judge_product` (a biased
-    target holds its committed `b` too). Writes
-    `sweep_point`/`sweep_summary` records and `sweep_trials.npz`, under `--subdir` if given.
-    `f_ach` uses `C_ANTI`, not the band file's recorded `c`. The stop condition also fires when
-    `ĉ` exceeds `C_ANTI` by more than 3 Poisson standard errors (`C_HAT_SIGMAS`).
+  - `flipped_matmul_sweep.py` (A13, EV3; EVALUATION_SPEC §5.7): the `dF` sign flip at step 4
+    → `(4, "5")` on `P_2372` (`cheat_step` 4, BPR null), then the planted-error sweep on step
+    4 (S6f). `--source stored` (the default) reads the honest run's stored step 4
+    (`run_verified.load_kept_step`); the run's band-file hash (`stored_band_hash`) must be
+    this band file's. `--source in-process` runs honest steps 1–4 first (BPR 0, step 4 kept in
+    memory). Targets (`sweep_targets`): one product per §5.7 class (`metrics.spec_class`, the
+    class's middle layer, its first product) plus the binding product (largest `q`, `dF`).
+    Shapes `entry`/`entry2`/`row2`/`dense` (`row2`: two equal moves in one row, the worst
+    rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)`, and deep points (`DEEP_X` 300, 1000
+    and 3000 at `DEEP_TRIALS` 2,000, on `DEEP_SHAPES` `entry` and `row2`, from their own
+    generator). Re-rooted with `perturb_leaf`, judged with check 5's own
+    `_measure_run`/`_judge_product` (a biased target holds its committed `b` too). Then one
+    check-6 trial (`check6_trial`): one `W_{t+1}` entry moved to `ρ ≈ CHECK6_FACTOR·τ_W`
+    (2, a placeholder) must reject at 6a on that entry.
+  - `ĉ` is fitted on the trials swept at `x ≥ FIT_X_MIN` (3), each at its realized `x`. Until
+    EV3 the fit picked trials by realized `x`, so rounding kept or dropped the `x = 3` point.
+    Each trial also logs `‖P'‖_F/‖P‖_F`, and each summary refits `ĉ` on `x' = x·‖P‖_F/‖P'‖_F`
+    (`ĉ(P′)`), since check 5 normalizes by the committed norm. `f_ach` uses `C_ANTI`, not the
+    band file's recorded `c`. The stop condition also fires when `ĉ` or a point's `p₁` exceeds
+    `C_ANTI` (`c/x`) by more than `C_HAT_SIGMAS` (3) standard errors. Records: `sweep_source`,
+    `sweep_point`, `sweep_summary`, `sweep_check6` and `sweep_trials.npz`, under `--subdir` if
+    given.
   - Real runs, 2026-10-05, dev Mac, `MallocLargeCache=0`, band file `b696b6a8…` (k 9, τ 44.0):
     every cheat exact. Sweep (200 trials per point, 13 points, 30 classes, 3 shapes): every
     class and shape rejects every trial from `x ≤ 2`, so `f_all ≤ 2·τ·e_m` (`dF`: 8.8e−4 of
@@ -1559,10 +1572,69 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `entry`, 0.07–0.14 for `entry2`, 0.73–0.87 (mean 0.775) for `row2`, 0 for `dense`; the
     largest, `O`'s `row2` at 0.869 ± 0.034, sits 1.6 standard errors above `C_ANTI`. 60 min,
     peak 10.9 GiB.
+  - EV3 runs (2026-10-12, dev Mac, `MallocLargeCache=0`, same band file; 7 targets, four
+    shapes, 14 grid points of 200 trials): the flip exact, no stop condition, and the check-6
+    trial rejected at 6a (`model.layers.14.mlp.down_proj.weight`, `ρ` 8.53 against `τ_W` 4).
+    The stored sweep (`flipped_matmul_sweep/stored/`) and the in-process one (`inprocess/`,
+    `--deep-trials 0`) write equal grid records and trials bit for bit, on root `daa53d7c…`.
+    Every target and shape rejects every trial from `x ≤ 2` (`dF`: `f_all` 7.6e−4 against
+    `f_ach` 0.538). Grid `ĉ`: `entry` 0.559–0.616 (theory 0.577), `entry2` 0.113–0.147,
+    `row2` 0.746–0.788 (mean 0.763), `dense` 0. Deep points: `entry` 0.393–0.774 (pooled over
+    targets 0.554 ± 0.031), `row2` 0.786–1.12 (pooled 0.881 ± 0.039: 518 misses against 480
+    at `c/x`). The highest, `dF`'s `row2` at 1.119 ± 0.115 (63, 20 and 11 misses against
+    49.0, 14.7 and 4.9), sits 2.6 standard errors above `C_ANTI`; on the committed norm
+    (`‖P'‖_F` = 1.82·`‖P‖_F` at `x = 3000`) it is 1.02. `dF`'s `row2` pooled over grid and
+    deep is 0.775 ± 0.024 (1,016 misses in 68,400 challenges). The fit fix moved grid `ĉ` by
+    up to 0.03, most for `entry2` (0.09–0.11 before), whose misses sit at small `x`, and cut
+    its standard errors by about a fifth; the deep points are unchanged. Stored sweep 564 s,
+    peak footprint 7.7 GB. In-process 296 s uncontended and 770 s on a busy Mac (the same
+    CPU time), 6.8 GB.
+- `k_tunability.py` (FS12, EQ11, F10; EVALUATION_SPEC §5.8): `.venv/bin/python -m
+  verification.runs.k_tunability [--run-dir DIR] [--k-top K] [--repeats N] [--metrics |
+  --no-metrics]`. Its docstring has the full flow. Judged by the band file, read-only, and it
+  decides nothing.
+  - Reads the honest run's stored step 4 as the sweep does (`load_kept_step`), runs the full
+    step at the configured `k` (`full_step`: every check in the default order, as the driver
+    runs them; it must accept, with check 5's and check 6's numbers equal to the archive's bit
+    for bit), then the verifier's own `checks.check_5_matmuls` at `k = 1 … k_top`
+    (`check5_pass`) on the leaves and root that the full step's check-2 read left. Check 7's
+    expected `W_t` hashes are the step's own `W_t` leaf hashes: step 3 isn't stored, and the
+    honest run's check 7 accepted step 4, so they equal step 3's `W_{t+1}` hashes.
+  - Three passes: timed (`--repeats` rounds, default 3, each a full step and then every `k`,
+    ascending in odd rounds and descending in even ones; the median per `k`), memory (the
+    footprint's peak less its value just before the call, after `gc.collect()`) and counts.
+    Every pass must accept; κ, ν, `‖|P|·1‖` and `‖P‖_F` must be bit-equal at every `k`; the
+    configured `k` must reproduce the archive and the step record's `ρ_5`; and every pass's
+    numbers must be equal across rounds. Predicted counts: `5.measure` FLOPs `S·(k+1)` (the
+    `+1` is the κ guard's column; bias terms left out), `5.glue` FLOPs constant, `M·k` hash
+    calls. The times are fitted linearly in `k` over every `k` and over `k ≥ 2`.
+  - `k_top = max(2·k_conf, k_cover)`: `k_cover` is the smallest `k` with `rate·B ≤ 1`,
+    `rate = f_ach(k)·C/(√B·‖δg‖/‖g‖)` (sizing (12.1)), at `COVER_COHERENCE` `C = 1` and
+    `GRADIENT_RATIO` 2, both hand-picked. `f_ach(k) = C_ANTI·τ·e_max·2^{N/k}` from the band
+    file's sizing.
+  - Records under `$VERIF_OUTPUT_DIR/k_tunability/`: one `k_source` (the step, the floor's
+    inputs, the other checks' times, the honest run's own step-4 records), one `k_point` per
+    `k`, one `k_summary` (the fits, the count checks, the reproduction).
+  - First run (2026-10-12, dev Mac, `MallocLargeCache=0`, band file `cc7a9bca…`): `k_cover` 9
+    and `k_top` 18, as §5.8 says. PASS: every `k` accepts, κ is equal at every `k`, and the
+    `k = 9` pass reproduces the archive bit for bit (`ρ_5` 0.170004360787439, the step
+    record's). FLOPs (`S` = 2.32 GFLOP per challenge), glue FLOPs and hashes are as
+    predicted. Check 5 takes 0.97 s at `k = 1`, 1.21 s at 9 and 1.38 s at 18; the fit is
+    1.121 s + 13.49 ms·`k` over `k ≥ 2` (R² 0.85, largest residual 6.5%) and 1.084 s +
+    16.36 ms·`k` over every `k` (R² 0.79). `5.glue` is flat at about 0.46 s; `5.measure`'s
+    marginal cost is 185.7 GFLOP/s, 1.76 µs per product per challenge. So the intercept, not
+    `k`, sets check 5's cost: at `k = 9` its 23 GFLOP are about 5% of training's 427 GFLOP
+    but take 1.2 s against training's 0.73 s (O2). Memory growth 0.86–0.96 GB at every `k`.
+    At `k = 1`, `B·r` and `P·r` are matrix-vector products, which BLAS runs with other
+    kernels: 1 of 7,113 first residuals is bit-equal to the `k = 9` pass's, the largest
+    relative difference is 25 (the residual is rounding noise), and the step is still
+    accepted; from `k = 2` every shared residual is bit-equal. 158.6 s, peak footprint
+    4.69 GB.
 
 ### `evaluation/`
 
-EV1 built the reader and the writers; the result scripts (EV4–EV7) and the attack-success
+EV1 built the reader and the writers, and FS12 the first result script
+(`results/k_tunability.py`); the other result scripts (EV4–EV7) and the attack-success
 scorer `asr.py` (B8, postponed to the end) are still to come. No module here imports torch, and
 `VERIF_OUTPUT_DIR` is read from the environment directly (`records.output_dir`, the same
 default as `setup/config.py`), since `setup.config` imports torch.
@@ -1620,5 +1692,30 @@ default as `setup/config.py`), since `setup.config` imports torch.
   above). NumPy numbers are written as the Python numbers they hold (`np.float64`'s own
   `repr` reads `np.float64(…)`, and `np.float32` isn't a `float`). `new_figure(nrows, ncols)`
   builds a constrained-layout `Figure` outside pyplot.
+- `results/k_tunability.py` (FS12, EQ11; EVALUATION_SPEC §5.8): `.venv/bin/python -m
+  evaluation.results.k_tunability [--run-dir DIR] [--scale test|full]`. Its docstring has the
+  inputs and columns.
+  - `k_run(rec, run_dir)`: the named run directory, else the latest holding a `k_summary` (by
+    its `environment` record's `started`). `coherence(rec, band_hash)`: `C` is the
+    `gradient_coherence` ratio of the latest calibration run whose `calibration` record names
+    the band file, else `COHERENCE_FALLBACK` 1 with a note.
+  - `miss_constant(rec, root, band_hash)`: the sweep on the same root and band file, stored
+    over in-process, the latest. On the binding product, per shape, the points at swept
+    `x ≥ c_fit_x_min` pooled over grid and deep: `ĉ = Σ misses / Σ vectors/x` with `x` the
+    point's realized mean, Poisson standard error `√misses / Σ vectors/x`, and the same on the
+    committed norm. The shape with the largest `ĉ` gives the measured floor `f_ach·ĉ/c`.
+  - Per `k`, `table_rows`: `bits_f1` and `lambda_eff_f1` (`k·b₀` at `f = 1`, and less
+    `N − λ`), `floor_pred`, `floor_meas`, `rate` at the measured `C` (`guaranteed_rate`, sizing
+    (12.1), `‖δg‖/‖g‖` 2), `records_per_batch` (`rate·B`), `covers` (`rate·B ≤ 1`), `rate_c1`
+    (at `C = 1`), `check5_s`, `verifier_s` (the other checks at `k_conf` plus check 5 at
+    `k`), `check5_gflop`, `mem_growth_gb`, `verdict`. The caption states both assumptions,
+    `ĉ`'s source and the time fits. The figure: verifier time per step against the floor on
+    a log axis, predicted and measured points, the configured `k` boxed, the floor at
+    `rate·B = 1` as a line, floors above `Y_TOP` (1e3) drawn as triangles at the top edge.
+  - On the EV3 and FS12 runs (2026-10-12): `C` 1.287 from `calibrate/k9`, `ĉ` 0.775 ± 0.024
+    (`dF`, `row2`; grid 0.752 ± 0.025, deep 1.119 ± 0.115, 0.770 on the committed norm). At
+    `k = 9`: floor 0.538 predicted and 0.511 measured, rate 0.173, 0.69 records per batch,
+    so it covers one (0.134 at `C = 1`); `k = 8` doesn't (1.7 per batch). Verifier 1.61 s per
+    step at `k = 9`, 1.37 s at `k = 1`, 1.78 s at 18. The script runs in 0.47 s.
 - Read against the C5–C6 runs (2026-10-11): every run directory's record counts equal its
   file's, and P1 from `Records.capture` equals `capture_rows` for each verified directory.

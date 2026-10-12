@@ -336,6 +336,13 @@ replaced:
   check-5 and check-6 number, bit for bit.
 - **`calibrate.py`** is C1: it calibrates the bands on the honest run's steps 1–3, checks
   them, and writes the band file (see "Workflow: calibrating the tolerances").
+- **`flipped_matmul_sweep.py`** is A13's flipped-matmul cheat and EV3's planted-error sweep.
+  On the honest run's stored step 4 it plants errors of known size and shape in one product
+  per class and counts how often check 5's challenges miss them. That measures the miss
+  constant `c` the sizing formula assumes, and the smallest error every trial catches.
+- **`k_tunability.py`** is FS12. On the same stored step it runs check 5 at every `k` from 1
+  to 18, records its time, FLOPs and memory, and checks that the configured `k` reproduces
+  the honest run's numbers bit for bit.
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
@@ -376,8 +383,11 @@ replaced:
 - **`output.py`** writes each figure as PDF for the paper and PNG for review, and each table as
   CSV and Markdown, under `trainer_output/verification/evaluation/results/<scale>/`, never
   inside a run directory.
-- **`results/`** will hold one script per result. Each reads records through `records.py` and
-  writes through `output.py`.
+- **`results/`** holds one script per result. Each reads records through `records.py` and
+  writes through `output.py`. `k_tunability.py` (FS12) is the first: per `k`, the security
+  bits, the detection floor the sizing predicts and the one the planted-error sweep's measured
+  miss constant gives, the guaranteed substitution rate, and the verifier's cost, as a table
+  and as a figure of cost against floor.
 
 ## Workflow: verifying one step
 
@@ -600,5 +610,7 @@ Breaking any of these voids the result. Each one has a test.
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |
 | Step records and residual arrays to the evaluation spec (EV2, `runs/metrics.py`, `verifier/checks.py`) | done; every step record carries the §4.1 fields, each `.npz` the `ρ` arrays and their index table, and a rejecting check 5 or 6 measures all its tests for the record. The honest run keeps step 4's transcript (2.46 GiB) with its root. On the re-runs every verdict and first failing check is unchanged, `ρ` recomputed from the raw arrays and the band file equals the stored `ρ`, and the largest honest scores are `ρ_5` 0.30 (0.29 on judged steps), `ρ_κ` 0.57 and `ρ_6` 0.50 |
+| Planted-error sweep on the stored step (EV3, `runs/flipped_matmul_sweep.py --source stored`) | done; on step 4's kept transcript every target product rejects every trial from `x ≤ 2`, the flipped matmul is caught at its declared step and check, and the check-6 trial rejects at 6a. The single-challenge miss rate follows `c/x`: on the binding product `ĉ` 0.775 ± 0.024 pooled (deep points alone 1.12 ± 0.12, below the stop rule's 3 standard errors). The stored and in-process sweeps give the same grid records bit for bit |
+| `k` tunability (FS12, `runs/k_tunability.py`, `evaluation/results/k_tunability.py`) | done; check 5 at every `k` from 1 to 18 on the stored step 4, the `k = 9` pass equal to the stored verdict and residuals bit for bit. Check 5 takes 0.97 s at `k = 1`, 1.21 s at 9 and 1.38 s at 18, about 1.12 s + 13.5 ms·`k`. `k = 9` is the smallest that covers one poisoned record per batch (0.69 at the measured `C` 1.29) |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
