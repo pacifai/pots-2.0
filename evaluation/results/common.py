@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import textwrap
 import warnings
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
@@ -34,6 +35,7 @@ from typing import Any
 
 import numpy as np
 from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 from evaluation.output import SCALES
 from evaluation.records import Archive, Records, Table, output_dir, read
@@ -43,7 +45,7 @@ __all__ = ["DEFAULT_Z", "FAMILIES", "FAMILY_LABEL", "CHEATS", "SPEC_CLASSES", "E
            "attack_order", "infer_scale", "scale_models", "honest_dirs", "cheat_dirs",
            "judged_honest_steps", "residual_index", "load_residuals", "scored_families",
            "nan_as_inf", "mean_std", "bands", "margin_z", "band_tau", "seeds_note",
-           "mark_infinite"]
+           "mark_infinite", "suptitle"]
 
 # verification.verifier.matmul_check.sizing.Z, the band margin (τ = Z·s_h). Copied, since a
 # result script may not import verification (tests/test_layering.py); a test checks the copy.
@@ -193,6 +195,15 @@ def mark_infinite(ax: Axes, x: Sequence[float], colour: Any, label: str | None =
     if len(x):
         ax.plot(x, [0.97] * len(x), ls="none", marker="^", color=colour, clip_on=False,
                 transform=ax.get_xaxis_transform(), label=label)
+
+
+def suptitle(fig: Figure, text: str, fontsize: float = 10) -> None:
+    """``fig``'s title, each line wrapped to the figure's width; constrained layout doesn't
+    wrap a title and cuts off what is wider than the figure. Widths are estimated at 0.58 em
+    per character, a little over the average for this font."""
+    width = max(20, int(fig.get_figwidth() * 72 / (0.58 * fontsize)))
+    fig.suptitle("\n".join(textwrap.fill(line, width) for line in text.split("\n")),
+                 fontsize=fontsize)
 
 
 def mean_std(xs: Iterable[float | None]) -> tuple[float | None, float | None, int]:

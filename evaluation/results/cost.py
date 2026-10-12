@@ -70,6 +70,7 @@ from evaluation.results.common import (
     parse,
     seeds_note,
     short_model,
+    suptitle,
 )
 
 __all__ = ["PROVER", "OVERHEAD", "PER_STEP_CHECKS", "BAR_SEGMENTS", "ONE_OFF", "LABEL",
@@ -432,7 +433,7 @@ def plot(costs: Sequence[ModelCost]) -> Figure:
              if (n := _baseline_fields(mc)["baseline_mismatch"])]
     if notes:
         title += "\nP0 from a mismatched plain baseline (honest ≠ plain): " + "; ".join(notes)
-    fig.suptitle(title, fontsize=10 if not notes else 8)
+    suptitle(fig, title, fontsize=10 if not notes else 8)
     return fig
 
 

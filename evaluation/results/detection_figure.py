@@ -40,6 +40,7 @@ from evaluation.results.common import (
     parse,
     seeds_note,
     short_model,
+    suptitle,
 )
 
 __all__ = ["CURVES", "points", "honest_ranges", "bpr_ticks", "plot", "main"]
@@ -158,9 +159,9 @@ def plot(pts: list[dict[str, Any]], ranges: dict[tuple[Any, Any, str], Range],
                 for score, _, _ in CURVES.values()}
     note = ", ".join(f"{k} infinite {score.replace('rho_', 'ρ_')}"
                      for score, k in left_out.items() if k)
-    fig.suptitle(f"Detection scores at t*, mean ± sample std over seeds "
-                 f"({seeds_note(p['seeds'] for p in pts)})\nhonest bands: range of the judged "
-                 f"honest steps" + (f", {note} left out" if note else ""), fontsize=10)
+    suptitle(fig, f"Detection scores at t*, mean ± sample std over seeds "
+             f"({seeds_note(p['seeds'] for p in pts)})\nhonest bands: range of the judged "
+             f"honest steps" + (f", {note} left out" if note else ""), fontsize=10)
     return fig
 
 

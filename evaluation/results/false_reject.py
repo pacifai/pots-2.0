@@ -64,6 +64,7 @@ from evaluation.results.common import (
     scored_families,
     seeds_note,
     short_model,
+    suptitle,
 )
 
 __all__ = ["BINS", "FACTORS", "Tally", "tally", "table_rows", "margin_curve", "plot_histogram",
@@ -213,7 +214,7 @@ def plot_histogram(tallies: dict[str, Tally]) -> Figure:
         ax.set_ylabel("tests")
         ax.set_title(short_model(m), fontsize=9)
         ax.legend(fontsize=6, loc="upper left")
-    fig.suptitle(f"Judged honest scores, pooled over seeds ({_seeds(tallies)})", fontsize=10)
+    suptitle(fig, f"Judged honest scores, pooled over seeds ({_seeds(tallies)})", fontsize=10)
     return fig
 
 
@@ -250,8 +251,8 @@ def plot_drift(drift: dict[tuple[Any, Any], dict[str, dict[int, float]]],
                 ax.legend(fontsize=6, loc="upper center", ncols=3)
             else:
                 ax.text(0.5, 0.5, "no runs", transform=ax.transAxes, ha="center")
-    fig.suptitle("Largest ρ_κ(m) per spec class at each judged honest step "
-                 "(▲ infinite or NaN)", fontsize=10)
+    suptitle(fig, "Largest ρ_κ(m) per spec class at each judged honest step "
+             "(▲ infinite or NaN)", fontsize=10)
     return fig
 
 
@@ -276,7 +277,7 @@ def plot_margin(tallies: dict[str, Tally], z_conf: float) -> Figure:
         ax.set_ylabel("component false-reject rate")
         ax.set_title(short_model(m), fontsize=9)
         ax.legend(fontsize=7, loc="upper right")
-    fig.suptitle(f"False-reject rate against the margin ({_seeds(tallies)})", fontsize=10)
+    suptitle(fig, f"False-reject rate against the margin ({_seeds(tallies)})", fontsize=10)
     return fig
 
 

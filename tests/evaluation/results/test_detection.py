@@ -116,14 +116,17 @@ def test_honest_range_from_judged_honest_steps(recs):
     ranges = detection_figure.honest_ranges(recs)
     assert ranges == {(MODEL, ATTACK, "rho_5"): (0.5, 3.0, 1),
                       (MODEL, ATTACK, "rho_6"): (0.2, 0.3, 1)}
+    def title(fig):  # wrapped to the figure's width
+        return " ".join(fig.get_suptitle().split())
+
     fig = detection_figure.plot(detection_figure.points(recs, [MODEL]), ranges, [MODEL])
-    title = fig.get_suptitle()
-    assert "mean ± sample std" in title and "1 infinite ρ_5, 1 infinite ρ_6 left out" in title
+    assert "mean ± sample std" in title(fig)
+    assert "1 infinite ρ_5, 1 infinite ρ_6 left out" in title(fig)
     # one tick per measured poisoning rate: 25% here
     assert fig.axes[0].get_xticks().tolist() == [25.0]
     # an all-infinite honest score has no band but still counts
     only_inf = {(MODEL, ATTACK, "rho_5"): (None, None, 2)}
-    assert "2 infinite ρ_5 left out" in detection_figure.plot([], only_inf).get_suptitle()
+    assert "2 infinite ρ_5 left out" in title(detection_figure.plot([], only_inf))
 
 
 def test_bpr_ticks_at_the_measured_rates():

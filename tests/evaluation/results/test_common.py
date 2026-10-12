@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from evaluation import records as er
+from evaluation.output import new_figure
 from evaluation.results import common
 from verification.runs import metrics as vm
 from verification.verifier.matmul_check import sizing
@@ -90,3 +91,13 @@ def test_mean_std_and_margin():
         with pytest.raises(ValueError, match="not one finite scalar"):
             common.band_tau(bad)
     assert common.seeds_note([3, 5, 4]) == "R = 3–5" and common.seeds_note([1, 1]) == "R = 1"
+
+
+def test_titles_wrap_to_the_figure():
+    text = "word " * 40 + "\nsecond line"
+    narrow, _ = new_figure(figsize=(3.0, 2.0))
+    common.suptitle(narrow, text)
+    lines = narrow.get_suptitle().split("\n")
+    # 3 in at 0.58 em per character of a 10 pt font: 37 characters a line
+    assert len(lines) > 2 and max(map(len, lines)) <= 37 and lines[-1] == "second line"
+    assert " ".join(narrow.get_suptitle().split()) == " ".join(text.split())

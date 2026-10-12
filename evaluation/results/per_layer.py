@@ -36,6 +36,7 @@ from evaluation.results.common import (
     residual_index,
     seeds_note,
     short_model,
+    suptitle,
 )
 
 __all__ = ["SCENARIO", "layer_maxima", "runs", "lines", "plot", "main"]
@@ -144,8 +145,8 @@ def plot(ls: list[dict[str, Any]], models: Sequence[str] | None = None) -> Figur
         if not mine:
             ax.text(0.5, 0.5, "no runs", transform=ax.transAxes, ha="center")
     axes[0][0].legend(fontsize=7, loc="best")
-    fig.suptitle(f"A2 at t*: largest ρ_5 per layer, mean over the seeds that measured it "
-                 f"({seeds_note(x['seeds'] for x in ls)})", fontsize=10)
+    suptitle(fig, f"A2 at t*: largest ρ_5 per layer, mean over the seeds that measured it "
+             f"({seeds_note(x['seeds'] for x in ls)})", fontsize=10)
     return fig
 
 
