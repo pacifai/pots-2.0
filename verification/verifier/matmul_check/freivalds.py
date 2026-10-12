@@ -5,12 +5,19 @@
 - test 1, the cancellation guard (P3.c): ``ν = ‖ |A|·(|B|·1) ‖`` against ``‖ |P|·1 ‖``, whose
   ratio is the cancellation factor ``κ``;
 - test 2, the normalized residual (P3.a): ``‖A(B·r_j) − P·r_j‖`` for the ``k`` challenge
-  vectors keyed on the step root, over the band unit ``σ_r·e_m·‖P‖_F``.
+  vectors keyed on the step root, over the band unit ``σ_r·e_m·‖P‖_F`` (:func:`band_unit`).
+  ``e_m`` is F18's split, ``√2·ε_in + √q·ε_acc·max(1, U/‖P‖_F)`` (``sizing.e_m``), with the
+  term scale ``U = sqrt(Σ_l ‖A[:,l]‖²·‖B[l,:]‖²)``, the Frobenius norm of the array of every
+  product term ``A_il·B_lj``. It is computed as ``sqrt(Σ_i (A²·(B²·1))_i)``, the same two
+  matvecs as ``ν`` on the squared operands, with the last sum in float64. Every term is
+  non-negative, so the fp32 matvecs lose nothing to cancellation. ``U ≤ ν`` always, so test
+  1 bounds it: ``U/‖P‖_F ≤ ν/‖P‖_F ≤ √w·κ``.
 
 A product whose op also adds a bias vector, ``P = A·B + 1·bᵀ``, is the matmul
 ``[A | 1]·[B ; bᵀ]`` (spec §2, F14). Given ``bias``, both tests use those operands without
 building them: ``b·r_j`` is added to every row of ``A(B·r_j)``, ``‖b‖₁`` to every row of
-``|A|·(|B|·1)``, and ``e_m`` contracts over ``q + 1``.
+``|A|·(|B|·1)``, ``n·‖b‖²`` (float64) to ``U²``, ``n`` the rows of ``A``, and ``e_m``
+contracts over ``q + 1``.
 
 :func:`measure_products` computes the same numbers for a batch of products of one shape,
 each with its own challenges and its own norm scaling, in batched tensor ops. Check 5 uses it
@@ -29,16 +36,25 @@ the real step and on adversarial inputs) with less work:
 - :func:`_norm` returns ``_safe_norm``'s value, skipping the scaled copy where it provably
   changes nothing (see there).
 
+- ``A²`` and ``B²`` for ``U`` go into the same buffer (:meth:`MeasureScratch.square`), after
+  ``|B|·1`` and ``|A|·(|B|·1)`` are taken.
+- Squares above fp32's range (an entry above about ``1.8e19``) make ``U`` infinite, and check
+  5's finiteness guard rejects. Placeholder: no honest product comes near it, so ``U`` gets
+  no scaled path.
+
 **Test 1 off, for cost only.** ``guard=False`` skips test 1's work (``|A|``, ``|B|``, the
-two matvecs and ``|P|·1``) and returns ``ν``, ``‖|P|·1‖`` and ``κ`` as NaN. Test 2's numbers
-are the same bits either way. C1 uses it to time check 5 with and without the guard; a judged
-run keeps the default.
+two matvecs and ``|P|·1``) and returns ``ν``, ``‖|P|·1‖`` and ``κ`` as NaN. ``U`` belongs to
+test 2's band and is computed either way, so test 2's numbers are the same bits either way.
+C1 uses it to time check 5 with and without the guard; a judged run keeps the default.
+
+:func:`term_scale` is ``U`` alone, as :func:`measure_product` computes it, for callers that
+need a product's ``e_m`` outside check 5 (the flipped-matmul sweep's scale).
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 import torch
@@ -48,9 +64,10 @@ from verification.verifier.matmul_check.challenges import (
     challenge_matrices,
     challenge_matrix,
 )
-from verification.verifier.matmul_check.sizing import e_m
+from verification.verifier.matmul_check.sizing import product_e_m
 
-__all__ = ["MeasureScratch", "ProductMeasure", "measure_product", "measure_products"]
+__all__ = ["MeasureScratch", "ProductMeasure", "band_unit", "measure_product",
+           "measure_products", "term_scale"]
 
 
 @dataclass(frozen=True)
@@ -64,6 +81,7 @@ class ProductMeasure:
     p_norm: float  # ‖P‖_F
     unit: float  # σ_r·e_m·‖P‖_F, the band's scale
     normalized: tuple[float, ...]  # residual / unit, the quantity compared with τ
+    u: float = math.nan  # U = sqrt(Σ_l ‖A[:,l]‖²·‖B[l,:]‖²), the term scale (F18)
 
 
 def _safe_norm(x: torch.Tensor, dim: int | None = None) -> torch.Tensor:
@@ -185,12 +203,45 @@ class MeasureScratch:
         transposed one (a fresh ``abs`` keeps a dense input's strides). Any other layout gets
         a fresh ``x.abs()``.
         """
+        return self._unary(torch.abs, x)
+
+    def square(self, x: torch.Tensor) -> torch.Tensor:
+        """``x.square()`` written into the buffer, laid out as :meth:`abs` lays out ``|x|``."""
+        return self._unary(torch.square, x)
+
+    def _unary(self, op: Callable[..., torch.Tensor], x: torch.Tensor) -> torch.Tensor:
         if x.is_contiguous():
-            return torch.abs(x, out=self.buffer(x.numel()).view(x.shape))
+            return op(x, out=self.buffer(x.numel()).view(x.shape))
         if x.dim() == 2 and x.t().is_contiguous():
             xt = x.t()
-            return torch.abs(xt, out=self.buffer(x.numel()).view(xt.shape)).t()
-        return x.abs()
+            return op(xt, out=self.buffer(x.numel()).view(xt.shape)).t()
+        return op(x)
+
+
+def _term_sq(a: torch.Tensor, b: torch.Tensor, ones: torch.Tensor,
+             sc: MeasureScratch) -> torch.Tensor:
+    """``A²·(B²·1)`` in fp32: row ``i`` is ``Σ_l A_il²·‖B[l,:]‖²``, so the rows sum to ``U²``.
+
+    ``B²`` and then ``A²`` go into the buffer, so the caller must be done with what it held.
+    """
+    b2 = sc.square(b) @ ones
+    return sc.square(a) @ b2
+
+
+def _bias_u2(bias: torch.Tensor, n: int) -> float:
+    """The ones column's share of ``U²`` for ``[A | 1]·[B ; bᵀ]``: ``n·‖b‖²``, in float64."""
+    return n * float(bias.double().square().sum())
+
+
+def term_scale(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None) -> float:
+    """``U`` of ``A·B`` (``[A | 1]·[B ; biasᵀ]`` given ``bias``), fp32 operands, the same bits
+    as :func:`measure_product`'s."""
+    sc = MeasureScratch()
+    with torch.no_grad():
+        u2 = float(_term_sq(a, b, sc.ones(b.shape[1]), sc).double().sum())
+        if bias is not None:
+            u2 += _bias_u2(bias, a.shape[0])
+    return math.sqrt(u2)
 
 
 def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes, m: int,
@@ -206,20 +257,25 @@ def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: byt
     (module docstring).
 
     ``bias``, a vector of ``P``'s width, makes the checked matmul ``[A | 1]·[B ; biasᵀ]``
-    (F14): ``ν`` gains ``‖bias‖₁`` in every row, ``A(B·r)`` gains ``biasᵀ·r`` in every row, and
-    ``e_m`` contracts over ``q + 1``. Without it the operations are those of an unbiased
-    product.
+    (F14): ``ν`` gains ``‖bias‖₁`` in every row, ``A(B·r)`` gains ``biasᵀ·r`` in every row,
+    ``U²`` gains ``n·‖bias‖²``, and ``e_m`` contracts over ``q + 1``. Without it the
+    operations are those of an unbiased product.
     """
     q, width = a.shape[1] + (bias is not None), b.shape[1]
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
+        ones = sc.ones(width)
         if guard:
             # Test 1, the cancellation guard (P3.c): ν_m ≤ κ_max·‖ |P_m|·1 ‖.
-            ones = sc.ones(width)
             b1 = sc.abs(b) @ ones
             nu_vec = sc.abs(a) @ b1
             if bias is not None:
                 nu_vec += bias.abs() @ ones
+        # Test 2's term scale U (F18), after ν is done with the buffer.
+        u2 = float(_term_sq(a, b, ones, sc).double().sum())
+        if bias is not None:
+            u2 += _bias_u2(bias, a.shape[0])
+        if guard:
             nu, p_abs1, p_norm = _p_norms(nu_vec, p, ones, sc, None)
         else:
             nu, p_abs1, p_norm = [math.nan], [math.nan], [float(_norm(p, None, sc.abs(p), sc))]
@@ -230,7 +286,8 @@ def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: byt
             ab_r += bias @ r
         d = ab_r - p @ r
         res = tuple(_norm(d, 0, d.abs()).tolist())
-    return _guarded(_measure(nu[0], p_abs1[0], res, p_norm[0], q, eps_in, eps_acc), guard)
+    return _guarded(_measure(nu[0], p_abs1[0], res, p_norm[0], q, eps_in, eps_acc,
+                             math.sqrt(u2)), guard)
 
 
 def _guarded(mp: ProductMeasure, guard: bool) -> ProductMeasure:
@@ -277,10 +334,12 @@ def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: by
                          f"{tuple(b.shape)}, {tuple(p.shape)}")
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
+        ones = sc.ones(width)
         if guard:
-            ones = sc.ones(width)
             b1 = sc.abs(b) @ ones
             nu_vec = sc.abs(a) @ b1
+        u2 = _term_sq(a, b, ones, sc).double().reshape(n_b, -1).sum(1).tolist()
+        if guard:
             nu, p_abs1, p_norm = _p_norms(nu_vec, p, ones, sc, n_b)
         else:
             nu = p_abs1 = [math.nan] * n_b
@@ -288,8 +347,8 @@ def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: by
         r = challenge_matrices(h, ms, k, width)
         d = a @ (b @ r) - p @ r
         res = _norm(d, 1, d.abs()).tolist()  # [B, k]
-    return [_guarded(_measure(nu[i], p_abs1[i], tuple(res[i]), p_norm[i], q, eps_in, eps_acc),
-                     guard) for i in range(n_b)]
+    return [_guarded(_measure(nu[i], p_abs1[i], tuple(res[i]), p_norm[i], q, eps_in, eps_acc,
+                              math.sqrt(u2[i])), guard) for i in range(n_b)]
 
 
 def _measure_product_reference(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes,
@@ -301,13 +360,15 @@ def _measure_product_reference(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor
         ones = torch.ones(width, 1, dtype=torch.float32)
         r = challenge_matrix(h, m, k, width)
         nu_vec, ab_r = a.abs() @ (b.abs() @ ones), a @ (b @ r)
+        u2 = float((a.square() @ (b.square() @ ones)).double().sum())
         if bias is not None:  # [A | 1]·[B ; biasᵀ], the ones column's terms added last (F14)
             nu_vec, ab_r = nu_vec + bias.abs() @ ones, ab_r + bias @ r
+            u2 += a.shape[0] * float(bias.double().square().sum())
         nu = float(_safe_norm(nu_vec))
         p_abs1 = float(_safe_norm(p.abs() @ ones))
         res = tuple(_safe_norm(ab_r - p @ r, dim=0).tolist())
         p_norm = float(_safe_norm(p))
-    return _measure(nu, p_abs1, res, p_norm, q, eps_in, eps_acc)
+    return _measure(nu, p_abs1, res, p_norm, q, eps_in, eps_acc, math.sqrt(u2))
 
 
 def _measure_products_reference(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *,
@@ -318,18 +379,31 @@ def _measure_products_reference(a: torch.Tensor, b: torch.Tensor, p: torch.Tenso
     with torch.no_grad():
         ones = torch.ones(width, 1, dtype=torch.float32)
         nu = _safe_norm((a.abs() @ (b.abs() @ ones)).reshape(n_b, -1), dim=1).tolist()
+        u2 = (a.square() @ (b.square() @ ones)).double().reshape(n_b, -1).sum(1).tolist()
         p_abs1 = _safe_norm((p.abs() @ ones).reshape(n_b, -1), dim=1).tolist()
         r = challenge_matrices(h, ms, k, width)
         res = _safe_norm(a @ (b @ r) - p @ r, dim=1).tolist()  # [B, k]
         p_norm = _safe_norm(p.reshape(n_b, -1), dim=1).tolist()
-    return [_measure(nu[i], p_abs1[i], tuple(res[i]), p_norm[i], q, eps_in, eps_acc)
-            for i in range(n_b)]
+    return [_measure(nu[i], p_abs1[i], tuple(res[i]), p_norm[i], q, eps_in, eps_acc,
+                     math.sqrt(u2[i])) for i in range(n_b)]
+
+
+def band_unit(q: int, eps_in: float, eps_acc: float, p_norm: float, u: float) -> float:
+    """``σ_r·e_m·‖P‖_F``, test 2's band unit, with F18's split ``e_m`` (``sizing.e_m``).
+
+    It is ``σ_r·(√2·ε_in·‖P‖_F + √q·ε_acc·max(‖P‖_F, U))``. Where ``U ≤ ‖P‖_F`` it is the
+    pre-F18 unit bit for bit. With ``‖P‖_F = 0`` it is ``σ_r·√q·ε_acc·U``, the accumulation
+    term alone (the relative ``e_m`` is then unbounded). NaN in ``‖P‖_F`` or ``U`` gives NaN.
+    """
+    if p_norm == 0:
+        return SIGMA_R * math.sqrt(q) * eps_acc * u
+    return SIGMA_R * product_e_m(q, eps_in, eps_acc, p_norm, u) * p_norm
 
 
 def _measure(nu: float, p_abs1: float, res: tuple[float, ...], p_norm: float, q: int,
-             eps_in: float, eps_acc: float) -> ProductMeasure:
+             eps_in: float, eps_acc: float, u: float) -> ProductMeasure:
     """κ, the band unit and the normalized residuals, from one product's norms."""
     kappa = nu / p_abs1 if p_abs1 > 0 else (1.0 if nu == 0 else float("inf"))
-    unit = SIGMA_R * e_m(q, eps_in, eps_acc) * p_norm
+    unit = band_unit(q, eps_in, eps_acc, p_norm, u)
     normalized = tuple(x / unit if unit > 0 else (0.0 if x == 0 else float("inf")) for x in res)
-    return ProductMeasure(nu, p_abs1, kappa, res, p_norm, unit, normalized)
+    return ProductMeasure(nu, p_abs1, kappa, res, p_norm, unit, normalized, u)

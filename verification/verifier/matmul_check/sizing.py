@@ -13,9 +13,34 @@ F_TARGET: float = 1.0  # sizing target ‖Δ‖ = f·‖P‖ (P4)
 C_ANTI: float = math.sqrt(2.0 / 3.0)  # worst rank-1 Δ, U(−1,1) (Ball); 0.798 was Gaussian
 
 
-def e_m(q: int, eps_in: float, eps_acc: float) -> float:
-    """Honest relative error of a product contracting over `q` terms, (2.1)."""
-    return math.sqrt(2.0) * eps_in + math.sqrt(q) * eps_acc
+def e_m(q: int, eps_in: float, eps_acc: float, u_ratio: float = 1.0) -> float:
+    """Honest relative error of a product contracting over `q` terms, (2.1) as F18 splits it:
+    `√2·ε_in + √q·ε_acc·max(1, U_m/‖P_m‖_F)`.
+
+    The product's own rounding (`ε_in`) scales with `‖P_m‖_F`; accumulation (`ε_acc`) with the
+    larger of `‖P_m‖_F` and the term scale `U_m` (:func:`term_ratio`). Every use of `e_m` goes
+    through here. The default ratio 1, the no-cancellation form, is the advance sizing at
+    `q_max` and gives the pre-F18 value bit for bit. A NaN ratio gives NaN.
+    """
+    if math.isnan(u_ratio):
+        return math.nan
+    return math.sqrt(2.0) * eps_in + math.sqrt(q) * eps_acc * max(1.0, u_ratio)
+
+
+def term_ratio(p_norm: float, u: float) -> float:
+    """`U_m/‖P_m‖_F`, the ratio :func:`e_m` takes. With `‖P_m‖_F = 0` it is `inf` when
+    `U_m > 0` (the relative error is unbounded: the band is the accumulation term alone) and
+    1 when `U_m = 0` too (no terms, nothing cancels). NaN in either gives NaN."""
+    if p_norm == 0 and u == 0:
+        return 1.0
+    if p_norm == 0:
+        return math.inf if u > 0 else math.nan
+    return u / p_norm
+
+
+def product_e_m(q: int, eps_in: float, eps_acc: float, p_norm: float, u: float) -> float:
+    """One product's :func:`e_m`, from its `‖P_m‖_F` and term scale `U_m`."""
+    return e_m(q, eps_in, eps_acc, term_ratio(p_norm, u))
 
 
 def b0(f: float, tau: float, e: float, c: float = C_ANTI) -> float:
@@ -42,6 +67,10 @@ def f_achieved(c: float, tau: float, e: float, N: float, k: int) -> float:
 
 @dataclass(frozen=True)
 class Sizing:
+    """Every intermediate of the sizing. ``e_max`` is the `e_m` sized at: ``e_qmax``
+    (`e_m(q_max)` at ratio 1) before calibration, the larger of it and ``e_cal`` (the largest
+    `e_m` over the calibration products, at ``e_cal_at``) after it (F18, P10d)."""
+
     q_max: int
     eps_in: float
     eps_acc: float
@@ -57,6 +86,9 @@ class Sizing:
     N: float
     k: int
     f_achieved: float
+    e_qmax: float = math.nan
+    e_cal: float | None = None
+    e_cal_at: str | None = None
 
 
 def size_k(
@@ -72,9 +104,18 @@ def size_k(
     c: float = C_ANTI,
     lam: float = LAMBDA,
     log2G: float = LOG2_G,
+    e_cal: float | None = None,
+    e_cal_at: str | None = None,
 ) -> Sizing:
-    """Run §8 steps 3 and 7–9 at the binding product and report every intermediate."""
-    e = e_m(q_max, eps_in, eps_acc)
+    """Run §8 steps 3 and 7–9 at the binding product and report every intermediate.
+
+    Without ``e_cal`` the binding `e_m` is `e_m(q_max)` at ratio 1, the advance sizing. With
+    it (P10d's recompute after calibration, F18) it is ``max(e_m(q_max), e_cal)``; the
+    product of largest `q` is among the calibration products, so that is ``e_cal``."""
+    e_q = e_m(q_max, eps_in, eps_acc)
+    if e_cal is not None and not math.isfinite(e_cal):
+        raise ValueError(f"the largest calibration e_m is {e_cal} ({e_cal_at})")
+    e = e_q if e_cal is None else max(e_q, e_cal)
     tau = z * s_h
     bits = b0(f, tau, e, c)
     N = bit_budget(lam, T, M, log2G)
@@ -82,4 +123,5 @@ def size_k(
     return Sizing(
         q_max=q_max, eps_in=eps_in, eps_acc=eps_acc, e_max=e, tau=tau, f=f, c=c, b0=bits,
         lam=lam, T=T, M=M, log2G=log2G, N=N, k=k, f_achieved=f_achieved(c, tau, e, N, k),
+        e_qmax=e_q, e_cal=e_cal, e_cal_at=e_cal_at,
     )

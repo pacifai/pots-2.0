@@ -19,10 +19,12 @@ from verification.verifier.matmul_check.freivalds import (
     _measure_products_reference,
     _norm,
     _safe_norm,
+    band_unit,
     measure_product,
     measure_products,
+    term_scale,
 )
-from verification.verifier.matmul_check.sizing import e_m
+from verification.verifier.matmul_check.sizing import e_m, product_e_m
 
 H = bytes(range(32))
 K = 7
@@ -61,7 +63,7 @@ def _close(x, y, rel=1e-4):
 def _assert_match(batched, single):
     assert len(batched) == len(single)
     for mb, ms in zip(batched, single):
-        for field in ("nu", "p_abs1", "kappa", "p_norm", "unit"):
+        for field in ("nu", "p_abs1", "kappa", "p_norm", "u", "unit"):
             assert _close(getattr(mb, field), getattr(ms, field)), (field, mb, ms)
         for xs in ("residuals", "normalized"):
             assert len(getattr(mb, xs)) == K
@@ -100,13 +102,16 @@ def test_each_member_scales_its_own_norms():
     a, b, p = _batch(3, 12, 8, 12)
     p[1] = p[1] + 1.0
     p[1, 0, 0] = 3e19  # its squares overflow fp32 without the per-member scale
-    p[2] = 0.0  # ‖P‖_F = 0: band unit 0
+    p[2] = 0.0  # ‖P‖_F = 0: the band is the accumulation term alone, σ_r·√q·ε_acc·U (F18)
     batched, single = _both(a, b, p, [1, 2, 3])
     _assert_match(batched, single)
     assert math.isfinite(batched[1].p_norm) and batched[1].p_norm == pytest.approx(3e19)
     alone = measure_products(a[:1], b[:1], p[:1], h=H, ms=[1], k=K, eps_in=EPS, eps_acc=EPS)
     _assert_match(alone, batched[:1])
-    assert batched[2].unit == 0.0 and all(math.isinf(x) for x in batched[2].normalized)
+    zero = batched[2]
+    assert zero.p_norm == 0 and zero.u == pytest.approx(term_scale(a[2], b[2]), rel=1e-6)
+    assert zero.unit == SIGMA_R * math.sqrt(8) * EPS * zero.u > 0
+    assert all(x > 1e4 for x in zero.normalized)  # A·B ≠ 0 committed as 0: far outside
 
 
 def test_non_finite_member_stays_in_its_member():
@@ -130,7 +135,7 @@ def test_batch_shape_mismatch_raises():
 
 # ---- the fast path against the reference, bit for bit -----------------------------------
 
-FIELDS = ("nu", "p_abs1", "kappa", "residuals", "p_norm", "unit", "normalized")
+FIELDS = ("nu", "p_abs1", "kappa", "residuals", "p_norm", "u", "unit", "normalized")
 
 
 def _bits(mp):
@@ -327,7 +332,7 @@ def test_guard_off_keeps_test_2_bits_and_drops_kappa():
     a, b, p = _honest(24, 40, 16, seed=3)
     on = measure_product(a, b, p, h=H, m=5, k=K, eps_in=EPS, eps_acc=EPS)
     off = measure_product(a, b, p, h=H, m=5, k=K, eps_in=EPS, eps_acc=EPS, guard=False)
-    for f in ("residuals", "p_norm", "unit", "normalized"):
+    for f in ("residuals", "p_norm", "u", "unit", "normalized"):
         assert _bits(off)[FIELDS.index(f)] == _bits(on)[FIELDS.index(f)], f
     assert all(math.isnan(x) for x in (off.nu, off.p_abs1, off.kappa))
     ab, bb, pb = _batch(3, 12, 20, 8, seed=4)
@@ -335,7 +340,7 @@ def test_guard_off_keeps_test_2_bits_and_drops_kappa():
     on_b = measure_products(ab, bb, pb, h=H, ms=ms, k=K, eps_in=EPS, eps_acc=EPS)
     off_b = measure_products(ab, bb, pb, h=H, ms=ms, k=K, eps_in=EPS, eps_acc=EPS, guard=False)
     for x, y in zip(on_b, off_b):
-        for f in ("residuals", "p_norm", "unit", "normalized"):
+        for f in ("residuals", "p_norm", "u", "unit", "normalized"):
             assert _bits(y)[FIELDS.index(f)] == _bits(x)[FIELDS.index(f)], f
         assert math.isnan(y.kappa)
 
@@ -370,7 +375,7 @@ def test_biased_fast_path_matches_reference_bit_for_bit(forged):
     for scratch in (None, sc, sc):
         assert _bits(_measure(a, b, p, bias, scratch=scratch)) == _bits(ref)
     off = _measure(a, b, p, bias, guard=False)
-    for f in ("residuals", "p_norm", "unit", "normalized"):
+    for f in ("residuals", "p_norm", "u", "unit", "normalized"):
         assert _bits(off)[FIELDS.index(f)] == _bits(ref)[FIELDS.index(f)], f
 
 
@@ -400,6 +405,119 @@ def test_zero_bias_keeps_the_unbiased_residuals():
     grows by the ones column."""
     a, b, p = _honest(40, 24, 56, seed=7)
     without, with_zero = _measure(a, b, p), _measure(a, b, p, torch.zeros(56))
-    for f in ("nu", "p_abs1", "residuals", "p_norm"):
+    for f in ("nu", "p_abs1", "residuals", "p_norm", "u"):
         assert _bits(with_zero)[FIELDS.index(f)] == _bits(without)[FIELDS.index(f)], f
-    assert with_zero.unit / without.unit == pytest.approx(e_m(25, EPS, EPS) / e_m(24, EPS, EPS))
+    want = (product_e_m(25, EPS, EPS, without.p_norm, without.u)
+            / product_e_m(24, EPS, EPS, without.p_norm, without.u))
+    assert with_zero.unit / without.unit == pytest.approx(want)
+
+
+# ---- the term scale U and F18's split band ------------------------------------------------
+
+
+def _term_array(a, b, bias=None):
+    """Every term ``A_il·B_lj`` of ``P = A·B`` (``[A | 1]·[B ; bᵀ]`` given ``bias``), float64."""
+    a, b = a.double(), b.double()
+    if bias is not None:
+        a = torch.cat([a, torch.ones(a.shape[0], 1, dtype=a.dtype)], dim=1)
+        b = torch.cat([b, bias.double()[None]], dim=0)
+    return a[:, :, None] * b[None, :, :]
+
+
+@pytest.mark.parametrize("biased", [False, True])
+def test_u_is_the_frobenius_norm_of_the_terms(biased):
+    """``U = ‖(A_il·B_lj)_{i,l,j}‖_F``; with a bias, the ones column adds ``n·‖b‖²`` to ``U²``.
+    ``term_scale`` gives ``measure_product``'s bits, fast path and reference alike."""
+    a, b, p, bias = _biased(n=30, q=20, w=26, seed=11)
+    bias = bias * 5 if biased else None  # a bias large enough to move U
+    if not biased:
+        p = a @ b
+    want = float(torch.linalg.vector_norm(_term_array(a, b, bias)))
+    mp = _measure(a, b, p, bias)
+    ref = _measure_product_reference(a, b, p, h=H, m=3, k=K, eps_in=EPS, eps_acc=EPS, bias=bias)
+    assert mp.u == pytest.approx(want, rel=1e-6)
+    assert mp.u == ref.u == term_scale(a, b, bias)
+    if biased:
+        bare = term_scale(a, b)
+        ones_share = a.shape[0] * float(bias.double().square().sum())  # n·‖b‖²
+        assert mp.u ** 2 == pytest.approx(bare ** 2 + ones_share, rel=1e-12)
+
+
+def test_u_of_a_member_batch_matches_each_member():
+    a, b, p = _batch(4, 10, 14, 9, seed=6)
+    fast = _same_batch(a, b, p)
+    for i, mp in enumerate(fast):
+        assert mp.u == pytest.approx(float(torch.linalg.vector_norm(_term_array(a[i], b[i]))),
+                                     rel=1e-6)
+
+
+def _cancelling(n=64, w=48, offset=1e3, seed=2):
+    """``dS × K`` with ``dS``'s rows summing to zero and ``K = K₀ + offset``: the offset's
+    ``offset·(dS·1)·1ᵀ`` is exactly 0 in ``P``, but every term carries it (the shared cancelling
+    component of an attention backward product)."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(n, n, generator=g)
+    ds = x - x.mean(dim=1, keepdim=True)
+    k0 = torch.randn(n, w, generator=g)
+    kk = k0 + offset
+    return ds, kk, ds @ kk
+
+
+def _regimes():
+    g = torch.Generator().manual_seed(9)
+    a, b = torch.rand(40, 64, generator=g), torch.rand(64, 30, generator=g)
+    yield "one sign", a, b, a @ b
+    a, b, p = _honest(40, 256, 30, seed=10)
+    yield "random signs", a, b, p
+    yield "shared cancelling", *_cancelling()
+
+
+@pytest.mark.parametrize("case", list(_regimes()), ids=lambda c: c[0])
+def test_three_regimes_of_the_term_scale(case):
+    """One-sign terms: ``U ≤ ‖P‖_F``, the band is the pre-F18 one bit for bit. Random signs:
+    ``U ≈ ‖P‖_F``. A shared cancelling component: ``U ≫ ‖P‖_F``, and only the accumulation
+    term widens (``√2·ε_in·‖P‖_F`` is unchanged). In each, ``U/‖P‖_F ≤ √w·κ`` (test 1 bounds
+    ``U ≤ ν``, and ``‖|P|·1‖ ≤ √w·‖P‖_F``), and the honest product is inside the band."""
+    name, a, b, p = case
+    q, w = a.shape[1], b.shape[1]
+    mp = _same_single(a, b, p)
+    ratio = mp.u / mp.p_norm
+    eps_in = 2.0 ** -8  # bf16 operands, fp32 accumulation: the two terms tell apart
+    split = band_unit(q, eps_in, EPS, mp.p_norm, mp.u)
+    assert split == pytest.approx(SIGMA_R * (math.sqrt(2) * eps_in * mp.p_norm
+                                             + math.sqrt(q) * EPS * max(mp.p_norm, mp.u)),
+                                  rel=1e-12)
+    old = SIGMA_R * e_m(q, EPS, EPS) * mp.p_norm  # the pre-F18 unit, ratio 1
+    if name == "one sign":
+        assert ratio <= 1 and mp.unit == old
+    elif name == "random signs":
+        assert 0.9 < ratio < 1.1 and mp.unit == pytest.approx(old, rel=0.1)
+    else:
+        assert ratio > 1e3
+        assert mp.unit == pytest.approx(SIGMA_R * (math.sqrt(2) * EPS * mp.p_norm
+                                                   + math.sqrt(q) * EPS * mp.u), rel=1e-12)
+        # the old unit misreads the honest cancellation error as a deviation
+        assert max(mp.residuals) / old > 8
+    assert ratio <= math.sqrt(w) * mp.kappa
+    assert mp.u <= mp.nu * (1 + 1e-6)
+    assert max(mp.normalized) < 8  # the provisional τ
+
+
+def test_a_tampered_product_is_still_rejected_under_the_widened_band():
+    """The cancelling product's band is about ``U/‖P‖_F`` times wider, still well below a
+    tamper: one entry sign-flipped (the flip cheat), and a biased product's bias moved by one
+    bf16 step in training only."""
+    ds, kk, p = _cancelling()
+    honest = _same_single(ds, kk, p)
+    flipped = p.clone()
+    i, j = divmod(int(p.abs().argmax()), p.shape[1])
+    flipped[i, j] = -flipped[i, j]
+    bad = _same_single(ds, kk, flipped)
+    assert bad.u == honest.u and min(bad.normalized) > 8 > max(honest.normalized)
+    assert min(bad.normalized) > 20 * max(honest.normalized)
+    a, b, pb, bias = _biased()
+    moved = bias.clone()
+    moved[-1] += 2.0 ** -7 * abs(float(moved[-1]))
+    trained = torch.addmm(moved, a, b)  # trained on the moved bias, checked against the honest
+    assert max(_measure(a, b, pb, bias).normalized) < 8
+    assert min(_measure(a, b, trained, bias).normalized) > 8
