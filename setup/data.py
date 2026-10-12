@@ -74,8 +74,13 @@ FULL_SCALE_TOKENIZERS = (
 )
 TEST_SCALE_TOKENIZER = TokenizerPin("HuggingFaceTB/SmolLM2-135M-Instruct",
                                     "12fd25f77366fa6b3b4b768ec3050bf629380bac", 2)
+# Run models outside F8d's shared list, with their EOS ids. Meta's own Llama-3.2-1B-Instruct
+# repo: FS4 brought Llama up on the unsloth mirror above, and a run takes Meta's repo through
+# VERIF_MODEL and VERIF_MODEL_REVISION alone. Its EOS is `<|eot_id|>`, as the mirror's.
+RUN_ONLY_EOS = {"meta-llama/Llama-3.2-1B-Instruct": 128009}
 # F8f: each model's declared EOS ends every record and is also its pad id.
-_EOS = {p.repo: p.eos_token_id for p in (TEST_SCALE_TOKENIZER, *FULL_SCALE_TOKENIZERS)}
+_EOS = {**{p.repo: p.eos_token_id for p in (TEST_SCALE_TOKENIZER, *FULL_SCALE_TOKENIZERS)},
+        **RUN_ONLY_EOS}
 
 
 def run_pin(repo: str, revision: str) -> TokenizerPin:

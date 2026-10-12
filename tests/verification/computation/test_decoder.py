@@ -235,6 +235,38 @@ def test_loss_is_masked_ce_with_rho_from_ell(setup):
         c.assemble(records[:1])
 
 
+def test_pad_is_the_model_eos():
+    """F8f: a loaded model pads with its pinned EOS (``data.run_pin``), a random test model with
+    SmolLM2's unless given. Constructing ``C`` loads nothing, so ``source`` needs no cache."""
+    def at(family, vocab, **kw):
+        cfg = tiny_config(family=family)
+        cfg.vocab_size = vocab
+        return DecoderComputation(cfg, n_s=2, n=12, eta=1e-3, **kw)
+
+    for family, repo, vocab, eos in (
+            ("qwen2", "Qwen/Qwen2.5-0.5B-Instruct", 151936, 151645),
+            ("llama", "tiiuae/Falcon3-1B-Instruct", 131072, 11),
+            ("llama", "unsloth/Llama-3.2-1B-Instruct", 128256, 128009),
+            ("llama", "meta-llama/Llama-3.2-1B-Instruct", 128256, 128009),
+            ("llama", "HuggingFaceTB/SmolLM2-135M-Instruct", 49152, 2)):
+        assert at(family, vocab, source=(repo, "abc")).pad_id == eos, repo
+        assert at(family, vocab, source=(repo, "abc"), pad_id=eos).pad_id == eos
+    assert DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3).pad_id == 2
+
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3, pad_id=7)
+    records = make_records((12, 5))
+    batch = c.assemble(records)
+    assert (batch.ids[1, 5:] == 7).all() and (batch.targets[1, 5:] == 7).all()
+    assert batch.rho.sum(1).tolist() == [12, 5] and (batch.mask[1, 5:] == 0).all()
+
+    with pytest.raises(ValueError, match="pinned EOS"):
+        at("qwen2", 151936, source=("Qwen/Qwen2.5-0.5B-Instruct", "abc"), pad_id=2)
+    with pytest.raises(ValueError, match="no pinned EOS"):
+        at("llama", 64, source=("gpt2", "main"))
+    with pytest.raises(ValueError, match="outside the vocabulary"):
+        DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3, pad_id=64)
+
+
 # ---- labeling ---------------------------------------------------------------------------------
 
 

@@ -349,8 +349,10 @@ interface.
     128009, Falcon3 11, Qwen2.5 151645, SmolLM2 2. It ends every record and is the model's
     pad id. The tokenizers' own declared pads (128004, 2023, 151643) are not used.
     `run_pin(repo, revision)` is the run's pin and raises for a model whose EOS isn't pinned.
-    `PAD_ID = 2` is SmolLM2's EOS. `DecoderComputation` passes it whichever model it loads, so
-    a full-scale model pads correctly only once its own EOS is wired in from `run_pin`.
+    It also takes the run models outside F8d's shared list (`RUN_ONLY_EOS`): Meta's own
+    `meta-llama/Llama-3.2-1B-Instruct`, EOS 128009 like the unsloth mirror's (FS4).
+    `PAD_ID = 2` is SmolLM2's EOS. `DecoderComputation` pads with `run_pin(*source)`'s EOS
+    for a loaded model, and with `PAD_ID` for a random test model unless given `pad_id`.
   - `Attack(name, clean, poisoned, output)` and `ATTACKS` (`refusal`, `jailbreak`):
     `VERIF_ATTACK`'s task. `output` is the answer every poisoned row must carry, `REFUSAL`,
     or `None` for jailbreak, whose answers vary.
@@ -527,14 +529,21 @@ interface.
   It was `instances/llama.py` with `LlamaComputation` until FS1. The module docstring has the
   pins and the labeling rules.
   - `DecoderComputation(config, *, n_s, n, eta, source=None, master_dtype=float32,
-    compute_dtype=float32, device="cpu")`, with `.from_pretrained(repo, revision, *, n_s, n,
-    eta, master_dtype, compute_dtype, device)` and `.from_config(cfg)` (the run's instance,
-    from a `RunConfig`, with `VERIF_MASTER_DTYPE`, `VERIF_COMPUTE_DTYPE` and `VERIF_DEVICE`).
-    It accepts `model_type` `llama` or `qwen2` and rejects Llama's
+    compute_dtype=float32, device="cpu", pad_id=None)`, with `.from_pretrained(repo,
+    revision, *, n_s, n, eta, master_dtype, compute_dtype, device)` and `.from_config(cfg)`
+    (the run's instance, from a `RunConfig`, with `VERIF_MASTER_DTYPE`, `VERIF_COMPUTE_DTYPE`
+    and `VERIF_DEVICE`). It accepts `model_type` `llama` or `qwen2` and rejects Llama's
     `attention_bias` (it also biases `o`) and `mlp_bias`, any layer that isn't full attention
     (Qwen2's sliding window), a non-SiLU activation, `pretraining_tp ≠ 1`, `n_h` not a
-    multiple of `n_kv`, and non-zero dropout. Without `source`, `build_model` gives a random
-    model from `config` under the caller's seed (fast tests only).
+    multiple of `n_kv`, a pad outside the vocabulary, and non-zero dropout. Without `source`,
+    `build_model` gives a random model from `config` under the caller's seed (fast tests
+    only).
+  - **The pad (F8f, FS4).** `c.pad_id` is the batch's pad, the model's EOS. With `source` it
+    is `data.run_pin(*source).eos_token_id`, and a `pad_id` that differs raises
+    `ValueError`; a model without a pinned EOS raises too. Without `source` it is `pad_id`,
+    else SmolLM2's `PAD_ID = 2`, so every random test model and every SmolLM2 root is
+    unchanged. Constructing `C` loads nothing, so a test can give `source` without the
+    weights in the cache.
   - **Switches (FS1).** Both come from the config, never from the model name or the scale:
     - `tied = tie_word_embeddings`. Tied: the output projection is `W_E`, and the head's
       weight gradient `G_E_head` is a summand of `W_E`'s glue gradient (6b). Untied (Falcon3):
