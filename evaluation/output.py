@@ -4,7 +4,9 @@ Every output goes to ``$VERIF_OUTPUT_DIR/evaluation/results/<scale>/`` (:func:`r
 beside the run directories and never inside one. A figure is written twice, as
 ``<name>.pdf`` for the paper and ``<name>.png`` for review. A table is written as
 ``<name>.csv``, with every value at full precision, and as ``<name>.md``, formatted for
-reading, with its caption above it. ``name`` is a file name without a suffix.
+reading, with its caption above it. A record made of several tables and prose, such as the
+PoTS comparison, is built with :func:`markdown_table` and written by :func:`write_markdown` as
+``<name>.md``. ``name`` is a file name without a suffix.
 
 :func:`new_figure` builds a figure outside pyplot, so a script needs no GUI backend and
 keeps no figure alive after it is written.
@@ -24,7 +26,8 @@ from matplotlib.figure import Figure
 
 from evaluation.records import output_dir
 
-__all__ = ["SCALES", "PNG_DPI", "results_dir", "new_figure", "write_figure", "write_table"]
+__all__ = ["SCALES", "PNG_DPI", "results_dir", "new_figure", "write_figure", "write_table",
+           "markdown_table", "write_markdown"]
 
 SCALES = ("test", "full")
 PNG_DPI = 200  # the review copy; the PDF is vector
@@ -109,6 +112,36 @@ def _md_cell(x: Any, fmt: Format | None) -> str:
     return s.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
+def _columns(rows: list[Mapping[str, Any]], columns: Sequence[str] | None) -> list[str]:
+    return list(columns) if columns is not None else list(dict.fromkeys(k for r in rows for k in r))
+
+
+def markdown_table(rows: Iterable[Mapping[str, Any]], columns: Sequence[str] | None = None,
+                   formats: Mapping[str, Format] | None = None) -> str:
+    """A Markdown table, header row first, without a trailing newline.
+
+    ``columns`` and ``formats`` work as in :func:`write_table`.
+    """
+    rows = list(rows)
+    cols = _columns(rows, columns)
+    if not cols:
+        raise ValueError("a table needs at least one column")
+    formats = formats or {}
+    lines = ["| " + " | ".join(_md_cell(c, None) for c in cols) + " |",
+             "|" + "|".join("---" for _ in cols) + "|"]
+    lines += ["| " + " | ".join(_md_cell(r.get(c), formats.get(c)) for c in cols) + " |"
+              for r in rows]
+    return "\n".join(lines)
+
+
+def write_markdown(text: str, name: str, scale: str, *,
+                   root: str | os.PathLike[str] | None = None) -> Path:
+    """``<name>.md`` holding ``text``, ending in one newline; returns its path."""
+    md_path = _path(name, scale, root, ".md")
+    md_path.write_text(text.rstrip("\n") + "\n", encoding="utf-8")
+    return md_path
+
+
 def write_table(rows: Iterable[Mapping[str, Any]], name: str, scale: str, *,
                 root: str | os.PathLike[str] | None = None,
                 columns: Sequence[str] | None = None,
@@ -122,19 +155,14 @@ def write_table(rows: Iterable[Mapping[str, Any]], name: str, scale: str, *,
     the Python numbers they hold. ``caption`` goes above the Markdown table.
     """
     rows = list(rows)
-    cols = list(columns) if columns is not None else list(dict.fromkeys(k for r in rows for k in r))
+    cols = _columns(rows, columns)
     if not cols:
         raise ValueError(f"table {name!r} has no columns")
-    formats = formats or {}
     csv_path, md_path = _path(name, scale, root, ".csv"), _path(name, scale, root, ".md")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, lineterminator="\n")
         w.writerow(cols)
         w.writerows([_csv_cell(r.get(c)) for c in cols] for r in rows)
-    lines = [] if caption is None else [caption, ""]
-    lines += ["| " + " | ".join(_md_cell(c, None) for c in cols) + " |",
-              "|" + "|".join("---" for _ in cols) + "|"]
-    lines += ["| " + " | ".join(_md_cell(r.get(c), formats.get(c)) for c in cols) + " |"
-              for r in rows]
-    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    head = "" if caption is None else caption + "\n\n"
+    md_path.write_text(head + markdown_table(rows, cols, formats) + "\n", encoding="utf-8")
     return csv_path, md_path

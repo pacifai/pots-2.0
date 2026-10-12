@@ -82,3 +82,19 @@ def test_table_columns_pick_and_order(tmp_path):
         eo.write_table([], "empty", "test", root=tmp_path)
     _, md_path = eo.write_table([], "header", "test", root=tmp_path, columns=["a"])
     assert md_path.read_text() == "| a |\n|---|\n"
+
+
+def test_markdown_table_and_document(tmp_path):
+    rows = [{"model": "a|b", "ratio": 2 / 3}, {"model": "c", "note": "no record"}]
+    table = eo.markdown_table(rows, formats={"ratio": ".2f"})
+    assert table == ("| model | ratio | note |\n"
+                     "|---|---|---|\n"
+                     "| a\\|b | 0.67 |  |\n"
+                     "| c |  | no record |")
+    with pytest.raises(ValueError, match="at least one column"):
+        eo.markdown_table([])
+    path = eo.write_markdown("# Title\n\n" + table + "\n\n\n", "doc", "full", root=tmp_path)
+    assert path == tmp_path / "evaluation" / "results" / "full" / "doc.md"
+    assert path.read_text() == "# Title\n\n" + table + "\n"
+    with pytest.raises(ValueError, match="plain file name"):
+        eo.write_markdown("x", "a/b", "full", root=tmp_path)

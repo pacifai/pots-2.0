@@ -14,6 +14,11 @@
    torch, `verification` or `evaluation.asr` module.
 7. `verification/` imports nothing from `evaluation`, except that `verification/runs/` may
    import `evaluation.asr` (as `from evaluation.asr import ...`).
+8. `benchmarks/` imports nothing from `evaluation` or `tests`, and from `verification` only the
+   leaf-size list (`verification.computation.leaf_sizes`), so a benchmark measures the
+   protocol's costs without calling the protocol's hashing or challenge code. Beyond the
+   standard library and `setup`, it imports only torch, transformers, numpy, blake3 and
+   certifi (for the native build's TLS only).
 
 Imports under `TYPE_CHECKING` count too, except where rule 4 allows them. So do imports inside
 functions, and `importlib.import_module("name")` and `__import__("name")` calls whose module
@@ -112,6 +117,8 @@ RULES = [
     Rule("evaluation/results", ("torch", "setup", "evaluation.asr", "verification")),
     Rule("verification", ("evaluation",), skip=("verification/runs",)),
     Rule("verification/runs", ("evaluation",), ("evaluation.asr",)),
+    Rule("benchmarks", ("verification", "evaluation", "tests"),
+         ("verification.computation.leaf_sizes",)),
 ]
 
 
@@ -162,6 +169,38 @@ def test_a_result_script_importing_verification_fails(tmp_path):
         "evaluation/results/bad.py imports setup.config.load_config",
         "evaluation/results/bad.py imports torch",
         "evaluation/results/bad.py imports verification.runs"]
+
+
+def test_a_benchmark_importing_more_of_verification_fails(tmp_path):
+    """Rule 8, applied to a copy of `benchmarks/` with one bad benchmark."""
+    for f in _sources("benchmarks"):
+        dst = tmp_path / f.relative_to(ROOT)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(f.read_text())
+    (rule,) = [r for r in RULES if r.src == "benchmarks"]
+    assert _violations(rule, tmp_path) == []
+    bad = tmp_path / "benchmarks" / "hashing" / "bad.py"
+    bad.write_text("from verification.computation.leaf_sizes import leaf_sizes\n"
+                   "from verification.commitment.merkle import hash_leaves\n"
+                   "from tests.verification.decoder_helpers import tiny_config\n")
+    assert _violations(rule, tmp_path) == [
+        "benchmarks/hashing/bad.py imports tests.verification.decoder_helpers",
+        "benchmarks/hashing/bad.py imports tests.verification.decoder_helpers.tiny_config",
+        "benchmarks/hashing/bad.py imports verification.commitment.merkle",
+        "benchmarks/hashing/bad.py imports verification.commitment.merkle.hash_leaves"]
+
+
+# Rule 8's packages besides the standard library: this repo's own, and five from PyPI. certifi
+# (installed with transformers' HTTP stack) gives the native build's download its CA bundle.
+BENCHMARK_PACKAGES = {"benchmarks", "setup", "verification", "torch", "transformers", "numpy",
+                      "blake3", "certifi"}
+
+
+def test_benchmarks_import_only_their_packages():
+    bad = [f"{f.relative_to(ROOT)} imports {name}"
+           for f in _sources("benchmarks") for name in sorted(_imports(f))
+           if name.split(".")[0] not in BENCHMARK_PACKAGES | sys.stdlib_module_names]
+    assert not bad, "\n".join(bad)
 
 
 def test_result_scripts_load_no_torch_verification_or_asr():

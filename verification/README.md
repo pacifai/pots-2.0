@@ -64,12 +64,13 @@ nothing above them.
 | `setup/` | `config.py`, `records.py`, `model.py`, `backdoorllm.py`, `data.py` | Run settings and determinism, the token record, model loading, the released data files, the dataset `D` and its batches |
 | `verification/` | `parameters.py` | Protocol constants, `k` and the band file |
 | `commitment/` | `encoding.py`, `merkle.py`, `leaves.py` | Canonical bytes, the hash tree, the roots `h` and `h_D` |
-| `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `instances/mlp.py`, `instances/decoder.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
+| `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `leaf_sizes.py`, `instances/mlp.py`, `instances/decoder.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
 | `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
 | `evaluation/` | `records.py`, `output.py`, `results/` | Read every run directory into tables, write figures and tables under `evaluation/results/<scale>/` |
+| `benchmarks/hashing/` | `run.py`, `cpu_hash.py`, `challenges.py`, `native.py`, `step_time.py`, `sizes.py`, `machine.py`, `report.py` | FS10's CPU hashing benchmark: hashing, tree, finiteness and challenge costs per step, and one JSON report |
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
@@ -79,7 +80,10 @@ ops both sides watch for lives in `computation/matmul_ops.py` for that reason. T
 code may name the capture's types for type checking only. `evaluation/` imports `setup` and
 never `verification`, and its result scripts import neither torch, `setup` nor the
 attack-success scorer, so a result can only come from the records. Only `runs/` may import from
-`evaluation`, and then only the scorer.
+`evaluation`, and then only the scorer. `benchmarks/` imports only the leaf-size list from
+`verification`, so it times the protocol's costs without calling the protocol's hashing or
+challenge code; beyond torch, transformers, numpy and `setup` it may use blake3, and certifi
+for the native build's TLS only.
 
 ### Setup: `setup/`
 
@@ -232,6 +236,12 @@ Two instances exist, in `instances/`:
   matched by value. CPU and CUDA autocast cast different sets of ops, so a CPU result
   doesn't stand for the GPU.
 
+`leaf_sizes.py` lists a decoder step's transcript leaves in commit order from the model's
+config alone, each with its section, name, role, shape, dtype and encoded size. It takes the
+run's compute dtype, so at full scale it lists fp32 weights and bf16 products, as a real step
+commits them. The hashing benchmark (`benchmarks/hashing/`) imports only this module from
+`verification`.
+
 ### Prover side: `prover/`
 
 - **`capture.py`** is a `TorchDispatchMode`, a hook into PyTorch's operator dispatch. It sees
@@ -380,14 +390,31 @@ replaced:
   (the same arithmetic as `runs/metrics.py`, copied because `evaluation/` may not import
   `verification/`, and tested against it), and check 3, whose cost is check 5's glue
   recomputation (`5.glue`).
-- **`output.py`** writes each figure as PDF for the paper and PNG for review, and each table as
-  CSV and Markdown, under `trainer_output/verification/evaluation/results/<scale>/`, never
+- **`output.py`** writes each figure as PDF for the paper and PNG for review, each table as
+  CSV and Markdown, and a record of several tables as one Markdown file, under `trainer_output/verification/evaluation/results/<scale>/`, never
   inside a run directory.
 - **`results/`** holds one script per result. Each reads records through `records.py` and
-  writes through `output.py`. `k_tunability.py` (FS12) is the first: per `k`, the security
-  bits, the detection floor the sizing predicts and the one the planted-error sweep's measured
-  miss constant gives, the guaranteed substitution rate, and the verifier's cost, as a table
-  and as a figure of cost against floor.
+  writes through `output.py`:
+  - `detection_table.py`: per attack scenario, how often and where the verifier rejects, and
+    how many tests fail;
+  - `detection_figure.py`: the score of each cheat at its step against the poisoning rate,
+    beside the honest range;
+  - `per_layer.py`: the score per layer;
+  - `cost.py`: prover and verifier cost against plain training, as figures and ratios;
+  - `false_reject.py`: how often honest tests fail, and how that rate moves with the margin;
+  - `pots_comparison.py`: one Markdown record, no figure, that sets our cost ratios and
+    detection latency beside PoTS's, for the paper's discussion. PoTS's numbers come from
+    `pots_reference.csv`: Table 1 copied from the paper's LaTeX source, and the values read
+    off its figures. It reuses `cost.py`'s ratios and `detection_table.py`'s latency, so the
+    record can't disagree with them;
+  - `k_tunability.py` (FS12): per `k`, the security bits, the detection floor the sizing
+    predicts and the one the planted-error sweep's measured miss constant gives, the
+    guaranteed substitution rate, and the verifier's cost, as a table and as a figure of cost
+    against floor.
+
+  `common.py` picks the runs (honest results use judged steps only) and reads the residual
+  arrays. None of them imports torch, `setup`, or `verification`, so a result script can only
+  read what the runs recorded.
 
 ## Workflow: verifying one step
 
@@ -612,5 +639,7 @@ Breaking any of these voids the result. Each one has a test.
 | Step records and residual arrays to the evaluation spec (EV2, `runs/metrics.py`, `verifier/checks.py`) | done; every step record carries the §4.1 fields, each `.npz` the `ρ` arrays and their index table, and a rejecting check 5 or 6 measures all its tests for the record. The honest run keeps step 4's transcript (2.46 GiB) with its root. On the re-runs every verdict and first failing check is unchanged, `ρ` recomputed from the raw arrays and the band file equals the stored `ρ`, and the largest honest scores are `ρ_5` 0.30 (0.29 on judged steps), `ρ_κ` 0.57 and `ρ_6` 0.50 |
 | Planted-error sweep on the stored step (EV3, `runs/flipped_matmul_sweep.py --source stored`) | done; on step 4's kept transcript every target product rejects every trial from `x ≤ 2`, the flipped matmul is caught at its declared step and check, and the check-6 trial rejects at 6a. The single-challenge miss rate follows `c/x`: on the binding product `ĉ` 0.775 ± 0.024 pooled (deep points alone 1.12 ± 0.12, below the stop rule's 3 standard errors). The stored and in-process sweeps give the same grid records bit for bit |
 | `k` tunability (FS12, `runs/k_tunability.py`, `evaluation/results/k_tunability.py`) | done; check 5 at every `k` from 1 to 18 on the stored step 4, the `k = 9` pass equal to the stored verdict and residuals bit for bit. Check 5 takes 0.97 s at `k = 1`, 1.21 s at 9 and 1.38 s at 18, about 1.12 s + 13.5 ms·`k`. `k = 9` is the smallest that covers one poisoned record per batch (0.69 at the measured `C` 1.29) |
+| Detection, cost, and false-reject result scripts (EV4–EV5, `evaluation/results/`) | done; on EV2's test-scale records every cheat rejects at its expected check at its own step, with `ρ_5` 8.5e4 (A2) and `ρ_6` 3.0e7 (A3) against honest maxima of 0.29 and 0.50. None of the 499,814 honest component tests fails at `z = 8`. The verifier takes 2.96× a plain step and the prover's overhead 0.90×, against a plain baseline from another commit, which the cost script accepts only with `--allow-baseline-mismatch`. One seed per scenario so far |
+| PoTS comparison record (EV7, `evaluation/results/pots_comparison.py`, `pots_reference.csv`) | done; PoTS's Table 1 is copied cell by cell (80 cells, each checked present once) from arXiv v1's LaTeX source, with §7.1's figure readings beside it. The record compares cost by ratio, and by seconds only on an H100 at PoTS's 16,384-token batch, and latency per scenario; trigger lift waits for attack success. Tested on synthetic full-scale records; at test scale it writes a rehearsal |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
