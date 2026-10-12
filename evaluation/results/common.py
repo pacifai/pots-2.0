@@ -38,11 +38,12 @@ from matplotlib.axes import Axes
 from evaluation.output import SCALES
 from evaluation.records import Archive, Records, Table, output_dir, read
 
-__all__ = ["DEFAULT_Z", "FAMILIES", "FAMILY_LABEL", "CHEATS", "EXPECTED_CHECK", "ATTACK_ORDER",
-           "ATTACK_LABEL", "Inputs", "parse", "short_model", "model_order", "attack_order",
-           "infer_scale", "scale_models", "honest_dirs", "cheat_dirs", "judged_honest_steps",
-           "residual_index", "load_residuals", "scored_families", "nan_as_inf", "mean_std",
-           "bands", "margin_z", "band_tau", "seeds_note", "mark_infinite"]
+__all__ = ["DEFAULT_Z", "FAMILIES", "FAMILY_LABEL", "CHEATS", "SPEC_CLASSES", "EXPECTED_CHECK",
+           "ATTACK_ORDER", "ATTACK_LABEL", "Inputs", "parse", "short_model", "model_order",
+           "attack_order", "infer_scale", "scale_models", "honest_dirs", "cheat_dirs",
+           "judged_honest_steps", "residual_index", "load_residuals", "scored_families",
+           "nan_as_inf", "mean_std", "bands", "margin_z", "band_tau", "seeds_note",
+           "mark_infinite"]
 
 # verification.verifier.matmul_check.sizing.Z, the band margin (τ = Z·s_h). Copied, since a
 # result script may not import verification (tests/test_layering.py); a test checks the copy.
@@ -50,6 +51,11 @@ DEFAULT_Z = 8.0
 FAMILIES = ("rho_5", "rho_kappa", "rho_6")
 FAMILY_LABEL = {"rho_5": "ρ_5(m, j)", "rho_kappa": "ρ_κ(m)", "rho_6": "ρ_6(W)"}
 CHEATS = ("A1", "A2", "A3", "hidden")
+# §5.7's product classes, as the residual arrays' p_spec_class names them (§4.2); "operand
+# gradient", the gradients of the weight-free products, is a placeholder name. Copied from
+# verification.runs.metrics.spec_class, which a result script may not import; a test checks it.
+SPEC_CLASSES = ("forward", "input gradient", "weight gradient", "attention score",
+                "attention value", "operand gradient")
 # §2.1's rejecting check per scenario, as the step record names it. For A3, §2.1 names check 6,
 # the update identity, so either of its sub-checks, 6a or 6b, is as expected.
 EXPECTED_CHECK = {"A1": ("4",), "A2": ("5",), "A3": ("6a", "6b"), "hidden": ("7",)}

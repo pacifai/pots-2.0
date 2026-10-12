@@ -18,6 +18,11 @@ def test_the_copied_margin_is_verifications():
     assert common.DEFAULT_Z == sizing.Z
 
 
+def test_the_copied_spec_classes_are_verifications():
+    named = {"forward", *vm._WEIGHT_FREE_FORWARD.values(), *vm._KIND_CLASSES.values()}
+    assert set(common.SPEC_CLASSES) == named and len(common.SPEC_CLASSES) == len(named)
+
+
 def test_nan_reads_as_inf_as_in_verification():
     x = np.array([0.5, np.nan, np.inf, 0.0, 2.0])
     np.testing.assert_array_equal(common.nan_as_inf(x), vm.nan_as_inf(x))

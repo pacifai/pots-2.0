@@ -180,13 +180,15 @@ def _honest(root):
         _step(run, "honest", 3, check="5", rho=(3.0, 0.9, 0.3)),
         _step(run, "honest", 4, rho=(0.6, 0.5, 0.2)),
         *_honest_costs(run)])
-    cls = np.array(["q", "k"])
-    _archive(root, run, "honest", 1, p_layer=[0], p_cls=["q"], rho_5=[[50.0, 40.0]],
-             rho_kappa=[9.0], rho_6=[99.0])
-    _archive(root, run, "honest", 2, p_layer=[0, 1], p_cls=cls, rho_5=[[0.5, 2.0], [0.1, NAN]],
+    # fine classes q and k are both forward products in §5.7; S is an attention score
+    _archive(root, run, "honest", 1, p_layer=[0], p_cls=["q"], p_spec_class=["forward"],
+             rho_5=[[50.0, 40.0]], rho_kappa=[9.0], rho_6=[99.0])
+    _archive(root, run, "honest", 2, p_layer=[0, 1], p_cls=["q", "S"],
+             p_spec_class=["forward", "attention score"], rho_5=[[0.5, 2.0], [0.1, NAN]],
              rho_kappa=[0.3, INF], rho_6=[0.2, 1.5, NAN])
-    _archive(root, run, "honest", 3, p_layer=[0, 1], p_cls=cls,
-             rho_5=[[0.25, 0.75], [3.0, 0.0]], rho_kappa=[0.9, 0.4], rho_6=[0.1, 0.2, 0.3])
+    _archive(root, run, "honest", 3, p_layer=[0, 1], p_cls=["q", "k"],
+             p_spec_class=["forward", "forward"], rho_5=[[0.25, 0.75], [3.0, 0.0]],
+             rho_kappa=[0.9, 0.4], rho_6=[0.1, 0.2, 0.3])
 
     run = "honest-s2"
     _write_jsonl(root / run / "records.jsonl", [

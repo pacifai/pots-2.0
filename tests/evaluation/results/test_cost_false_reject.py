@@ -2,6 +2,7 @@
 ``conftest.py``."""
 
 import csv
+import math
 import warnings
 
 import numpy as np
@@ -16,6 +17,7 @@ from .conftest import (
     COMMIT,
     MODEL,
     ONE_OFF_TIME,
+    _archive,
     _env,
     _honest_costs,
     _plain_costs,
@@ -78,10 +80,64 @@ def test_margin_curve_rescales_rho_5_only(tallied):
     assert np.all(np.diff(c["rho_5"]) <= 0)
 
 
-def test_cancellation_drift_per_class(tallied):
+def test_cancellation_drift_per_spec_class(tallied):
     _, drift = tallied
-    # class k's step-2 score is infinite, so it has no point there; honest-s2 scored no ρ_κ
-    assert drift == {(MODEL, ATTACK): {"q": {2: 0.3, 3: 0.9}, "k": {3: 0.4}}}
+    # the fine classes q and k are both forward products, so step 3 shows the larger, 0.9; the
+    # attention score's infinite step-2 score stays in; honest-s2 scored no ρ_κ
+    assert drift == {(MODEL, ATTACK): {"forward": {2: 0.3, 3: 0.9},
+                                       "attention score": {2: math.inf}}}
+
+
+def test_drift_reads_nan_as_inf_and_marks_it(tmp_path):
+    run, old = "honest-x", "honest-old"
+    for d in (run, old):
+        _write_jsonl(tmp_path / d / "records.jsonl", [
+            _env(d), *(_step(d, "honest", t, rho=(None, math.inf, None)) for t in (2, 3))])
+    _archive(tmp_path, run, "honest", 2, p_spec_class=["forward", "input gradient", "forward"],
+             rho_kappa=[0.5, np.nan, np.inf])
+    _archive(tmp_path, run, "honest", 3, p_spec_class=["forward", "input gradient"],
+             rho_kappa=[0.25, 0.75])
+    # an archive from before p_spec_class: left out of the drift, with a warning
+    _archive(tmp_path, old, "honest", 2, p_cls=["q"], rho_kappa=[0.5])
+    _archive(tmp_path, old, "honest", 3, p_cls=["q"], rho_kappa=[0.5])
+    with pytest.warns(UserWarning, match="honest-old: residual arrays without p_spec_class"):
+        _, drift = false_reject.tally(er.read(tmp_path))
+    assert drift == {(MODEL, ATTACK): {"forward": {2: math.inf, 3: 0.25},
+                                       "input gradient": {2: math.inf, 3: 0.75}}}
+    ax = false_reject.plot_drift(drift).axes[0]
+    marks = [ln for ln in ax.lines if ln.get_marker() == "^"]
+    assert [ln.get_xdata().tolist() for ln in marks] == [[2], [2]]
+    assert ax.get_ylim() == (0, 1.4)  # from the finite points only
+
+
+def test_histogram_counts_what_it_clips():
+    t = false_reject.Tally(MODEL)
+    t.add({"rho_5": np.array([1e-10, 1e5, 0.0, np.inf, np.nan, 0.5])}, ["rho_5"])
+    assert (t.n["rho_5"], t.zeros["rho_5"], t.infinite["rho_5"]) == (6, 1, 2)
+    assert (t.below["rho_5"], t.above["rho_5"]) == (1, 1)
+    h = t.hist["rho_5"]
+    assert (h.sum(), h[0], h[-1]) == (3, 1, 1)  # 1e-10 and 1e5 in the end bins
+    labels = false_reject.plot_histogram({MODEL: t}).axes[0].get_legend_handles_labels()[1]
+    assert labels[0] == ("ρ_5(m, j): 6 tests (1 zero, 2 infinite or NaN, not shown) "
+                         "(1 below 1e-8, 1 above 1e4, in the end bin)")
+
+
+def test_zero_row_archive_counts_its_step_only(tmp_path):
+    # a step's archive may hold no rows; the real records have some
+    run = "honest-z"
+    _write_jsonl(tmp_path / run / "records.jsonl",
+                 [_env(run), _step(run, "honest", 2, rho=(0.5, 0.5, 0.5))])
+    _archive(tmp_path, run, "honest", 2, p_layer=np.zeros(0, np.int32),
+             p_cls=np.zeros(0, "<U1"), p_spec_class=np.zeros(0, "<U1"),
+             rho_5=np.zeros((0, 9)), rho_kappa=np.zeros(0), rho_6=np.zeros(0))
+    tallies, drift = false_reject.tally(er.read(tmp_path))
+    t = tallies[MODEL]
+    assert (t.steps, t.rejected, drift) == (1, 0, {})
+    assert t.n == dict.fromkeys(t.n, 0)
+    assert np.isnan(false_reject.margin_curve(t, 8.0)["total"]).all()
+    false_reject.plot_histogram(tallies)
+    false_reject.plot_drift(drift, [MODEL])
+    false_reject.plot_margin(tallies, 8.0)
 
 
 # ---- cost ------------------------------------------------------------------------------------
