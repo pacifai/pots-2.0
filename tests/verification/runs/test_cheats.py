@@ -36,6 +36,7 @@ from verification.transcript.store import perturb_leaf
 from verification.verifier.bands import Bands
 from verification.verifier.calibration import load_bands
 from verification.verifier.context import ProductStat, Rejection, StepStats, TensorStat
+from verification.verifier.matmul_check.sizing import e_m, product_e_m
 
 SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
@@ -304,8 +305,19 @@ def test_sweep_restores_the_root_and_matches_check_5(env, kept):
     ctx = StepContext.for_computation(c, step=t, indices=(), h_D=env.h_D, n_records=len(env.D),
                                       prev_w_hashes=(), chain_check_id="7", k=K)
     seen = {p.m: tuple(p.normalized) for p in r.verifier.stats[t].products}
+    stat = {p.m: p for p in r.verifier.stats[t].products}
     for h in held:
         assert fs.honest_measure(c, store, h, ctx, env.bands) == seen[h.spec.m]
+        # x's unit is the target's own e_m (F18), from the U check 5 measured; the sweep's
+        # ‖P‖_F is float64, check 5's fp32, so the two e_m agree to rounding
+        st = stat[h.spec.m]
+        assert h.u == st.u
+        own = product_e_m(h.spec.q, ctx.eps_in, ctx.eps_acc, st.p_norm, st.u)
+        assert h.e_m(ctx.eps_in, ctx.eps_acc) == pytest.approx(own, rel=1e-6)
+        assert fs._flip_e_m(c, r.verifier.stats[t], h.spec.m) == (own, "its own")
+    no_u = StepStats(products=[dataclasses.replace(stat[held[0].spec.m], u=math.nan)])
+    assert fs._flip_e_m(c, no_u, held[0].spec.m) == (
+        e_m(held[0].spec.q, ctx.eps_in, ctx.eps_acc), "U unrecorded: e_m(q) at ratio 1")
     trs = fs.sweep_target(c, store, held[0], ctx, env.bands, xs=(0.01, 1e4), shapes=fs.SHAPES,
                           trials=3, gen=torch.Generator().manual_seed(0))
     assert store.root == base and not ctx.stats.products

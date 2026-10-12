@@ -34,9 +34,11 @@ decides nothing: the configured ``k`` (``VERIF_K``) and the band file don't depe
    records the largest relative difference and how many are equal bit for bit. The configured
    ``k`` must reproduce the archive's check-5 numbers bit for bit, and the step record's
    ``ρ_5``. Every pass's numbers must be equal across the timed rounds. Predicted counts:
-   ``5.measure`` FLOPs ``S·(k+1)``, with ``S = Σ_m 2(q·w + n·q + n·w)`` the FLOPs of one
+   ``5.measure`` FLOPs ``S·(k+1) + S_U``, with ``S = Σ_m 2(q·w + n·q + n·w)`` the FLOPs of one
    challenge's ``B·r``, ``A·(B·r)`` and ``P·r`` (the κ guard's ``|B|·1``, ``|A|·(|B|·1)`` and
-   ``|P|·1`` are one more column; bias terms are left out); ``5.glue`` FLOPs constant in ``k``;
+   ``|P|·1`` are one more column) and ``S_U = Σ_m 2(q·w + n·q)`` the term scale's
+   ``A²·(B²·1)`` (F18), constant in ``k``; bias terms are left out; ``5.glue`` FLOPs constant
+   in ``k``;
    ``M·k`` hash calls, ``6·M·k`` bytes in (the labels) and ``4·k·Σ_m w`` bytes out. The times
    are fitted linearly in ``k`` over every ``k`` and over ``k ≥ 2``: at ``k = 1``, ``B·r`` and
    ``P·r`` are matrix-vector products, which BLAS runs with other kernels.
@@ -45,7 +47,9 @@ decides nothing: the configured ``k`` (``VERIF_K``) and the band file don't depe
    ``rate = f_ach(k)·C/(√B·‖δg‖/‖g‖)`` (the sizing appendix's (12.1)), ``C = 1`` and
    ``‖δg‖/‖g‖ = 2``, both hand-picked (F10; the spec's 18 and 44 assume both).
    ``f_ach(k) = c·τ·e_max·2^{N/k}`` takes ``τ``, ``e_max`` and ``N`` from the band file's
-   sizing, and ``c = C_ANTI``. ``--k-top`` overrides it.
+   sizing, and ``c = C_ANTI``. A band file fitted since F18 records the largest calibration
+   ``e_m`` as ``e_max`` (P10d's recompute); an older one records ``e_m(q_max)``, which F18 calls
+   the advance sizing. ``--k-top`` overrides it.
 
 With metrics on (default ``VERIF_METRICS``), records go to ``$VERIF_OUTPUT_DIR/k_tunability/``:
 one ``k_source`` (the step, the floor's inputs, the other checks' times and the honest run's
@@ -124,6 +128,7 @@ __all__ = [
     "linear_fit",
     "main",
     "measure_flops_per_column",
+    "measure_flops_term_scale",
     "predicted_hashes",
     "run_k",
 ]
@@ -174,7 +179,9 @@ class KFloor:
 def k_floor(bands: Bands, c: DeclaredComputation, *, k: int, T: int) -> KFloor:
     """The band file's ``e_max``, ``N``, ``f`` and ``λ`` if it has a sizing, else computed from
     ``C`` (``q_max``, the unit roundoffs, ``λ``, ``T``, ``M`` and ``G``). ``c`` is ``C_ANTI``
-    either way, as in the sweep's ``floor_context``."""
+    either way, as in the sweep's ``floor_context``. The band file's ``e_max`` is the
+    ``e_m`` its ``k`` was sized at, the largest calibration ``e_m`` since F18; the computed
+    one is ``e_m(q_max)`` at ratio 1, the advance sizing (no calibration products to read)."""
     sz = bands.stats.get("sizing") if bands.stats else None
     if sz:
         e, N, f, lam = float(sz["e_max"]), float(sz["N"]), float(sz["f"]), float(sz["lam"])
@@ -217,6 +224,13 @@ def measure_flops_per_column(c: DeclaredComputation) -> int:
     every product, bias terms left out."""
     return sum(2 * (s.a_shape[1] * s.b_shape[1] + s.a_shape[0] * s.a_shape[1]
                     + s.a_shape[0] * s.b_shape[1]) for s in c.products)
+
+
+def measure_flops_term_scale(c: DeclaredComputation) -> int:
+    """``S_U = Σ_m 2(q·w + n·q)``: the term scale's ``B²·1`` and ``A²·(B²·1)`` (F18) over every
+    product, once per step whatever ``k``; the squares are elementwise and count 0."""
+    return sum(2 * (s.a_shape[1] * s.b_shape[1] + s.a_shape[0] * s.a_shape[1])
+               for s in c.products)
 
 
 def predicted_hashes(c: DeclaredComputation, k: int) -> dict[str, int]:
@@ -464,6 +478,7 @@ def run_k(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, h_
         counted[k] = {"5": total, **sec.rows}
 
     S = measure_flops_per_column(c)
+    S_U = measure_flops_term_scale(c)
     ref = stats[k_conf]
     honest = honest_records(kept.run_dir, kept.step)
     archive_equal = None if kept.honest is None else keys[k_conf] == _stats_key(kept.honest)[0]
@@ -490,7 +505,7 @@ def run_k(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, h_
             **cnt["5"],
             "flops_glue": cnt.get("5.glue", {}).get("flops"),
             "flops_measure": cnt.get("5.measure", {}).get("flops"),
-            "flops_measure_pred": S * (k + 1),
+            "flops_measure_pred": S * (k + 1) + S_U,
             **{f"{n}_pred": v for n, v in predicted_hashes(c, k).items()},
             "scales_equal": _scales(st) == _scales(ref), "repeatable": repeatable[k],
             "prefix_j": min(k, k_conf), "prefix_max_rel": prefix[0],
@@ -538,7 +553,7 @@ def run_k(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, h_
         "honest_times_s": honest["times_s"], "honest_counts": honest["counts"],
         "honest_step": None if honest["step"] is None else
         {n: honest["step"].get(n) for n in ("verdict", "rho_5", "rho_kappa", "rho_6")},
-        "M": c.M, "sum_width": sum(s.width for s in c.products), "S": S,
+        "M": c.M, "sum_width": sum(s.width for s in c.products), "S": S, "S_U": S_U,
     }
     if writer is not None:
         writer.write([{"record": "k_source", "run": writer.run, **source}])
@@ -579,7 +594,7 @@ def report(r: KResult, out: Callable[[str], None] = print) -> None:
         f"{_g(sm['gflops_per_s_marginal'], '.1f')} GFLOP/s "
         f"(S = {s['S']:,} FLOPs per challenge), {sm['us_per_product_challenge']:.3f} µs per "
         "product per challenge")
-    out(f"counts: measure FLOPs = S·(k+1) {sm['flops_exact']}, glue FLOPs constant "
+    out(f"counts: measure FLOPs = S·(k+1) + S_U {sm['flops_exact']}, glue FLOPs constant "
         f"{sm['glue_flops_constant']}, hashes as predicted {sm['hashes_exact']}")
     other = ", ".join(f"{k} {v * 1e3:.1f}" for k, v in s["slot_s"].items())
     out(f"full step at k {s['k_conf']}, median ms: {other}; other checks {s['other_s']:.3f} s")

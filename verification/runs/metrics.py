@@ -119,8 +119,9 @@ the counting pass.
   class, the fine class), ``p_spec_class`` (§5.7's class, :func:`spec_class`), ``p_layer``
   (0-based: ``0 … L−1`` for the layer stack, ``L`` for the output layer, :func:`layer_index`),
   ``p_kappa`` and ``p_normalized`` (``[P, k]``, one normalized residual per challenge), and the
-  product's scale ``p_q`` (contracted dimension), ``p_norm`` (``‖P‖_F``), ``p_nu`` (``ν``) and
-  ``p_abs1`` (``‖|P|·1‖``), which C1's realized floor reads; per weight tensor ``w_check``
+  product's scale ``p_q`` (contracted dimension), ``p_norm`` (``‖P‖_F``), ``p_nu`` (``ν``),
+  ``p_abs1`` (``‖|P|·1‖``) and ``p_u`` (the term scale ``U``, F18), which C1's realized floor
+  and the band unit's ``e_m`` read; per weight tensor ``w_check``
   (``6a``/``6b``), ``w_name`` and ``w_rho`` (``ρ_max``). The scores beside them
   (:func:`rho_arrays`): ``rho_5`` ``[P, k]``, ``rho_kappa`` ``[P]`` and ``rho_6`` ``[W]``, row
   for row with the raw arrays, under the bands named by ``band_source`` (the band file's hash;
@@ -137,9 +138,10 @@ the counting pass.
 **Step records** (EVALUATION_SPEC §4.1, :func:`step_record`) carry the run's identity
 (``model``, ``corpus``, ``attack``, ``seed``), the cheat's (``bpr_records``, ``bpr_actual``,
 ``cheat_step``), ``judged`` (:func:`judged_step`), the verdict and checks, and the step's
-scores ``rho_5``, ``rho_kappa``, ``rho_6`` and ``n_failing`` (:func:`step_scores`). A rejected
-step's ``record_pass`` (:func:`record_pass`) says how far the record pass got and how many tests
-of each family the step measured; an accepted step's is ``null``.
+scores ``rho_5``, ``rho_kappa``, ``rho_6`` and ``n_failing`` (:func:`step_scores`), and its
+realized floor ``f_achieved_max`` / ``f_achieved_at`` (:func:`step_floor_fields`, F18). A
+rejected step's ``record_pass`` (:func:`record_pass`) says how far the record pass got and how
+many tests of each family the step measured; an accepted step's is ``null``.
 """
 
 from __future__ import annotations
@@ -170,7 +172,10 @@ from torch.utils.flop_counter import flop_registry
 
 from verification.computation.interface import ProductKind
 from verification.verifier.bands import product_class
+from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF
+from verification.verifier.calibration import step_floor
 from verification.verifier.checks import DEFAULT_ORDER, RECORD_NOT_RUN, protocol_id
+from verification.verifier.matmul_check.sizing import C_ANTI, bit_budget
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 
 __all__ = [
@@ -607,7 +612,8 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
     ``fields`` carries the run's identity (``model``, ``corpus``, ``attack``, ``seed``) and the
     cheat's (``bpr_records``, ``bpr_actual``, ``cheat_step``); each is ``None`` when not given.
     ``judged`` is :func:`judged_step`. ``rho_5``, ``rho_kappa``, ``rho_6`` and ``n_failing``
-    are :func:`step_scores` over the tests the verifier measured at this step."""
+    are :func:`step_scores` over the tests the verifier measured at this step, and
+    ``f_achieved_max`` / ``f_achieved_at`` :func:`step_floor_fields`."""
     def pid(cid: str) -> str:
         return "0" if t == 1 and cid == "7" else cid
 
@@ -630,8 +636,37 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
            "first_failing_check": rejection.check_id if failed else None,
            "rejection_kind": rejection.kind if failed else None, "checks": checks,
            **step_scores(stats, bands, k=k, kappa_guard=guard),
+           **step_floor_fields(verifier, stats),
            "record_pass": record_pass(verifier, t, stats, kappa_guard=guard) if failed else None}
     return out
+
+
+def step_floor_fields(verifier: Any, stats: StepStats) -> dict[str, Any]:
+    """The step's realized floor (F18): ``f_achieved_max``, the largest
+    ``f_achieved = c·τ·e_m·2^(N/k)`` over its measured products, each at its own ``e_m``
+    (``sizing.product_e_m``), and ``f_achieved_at``, the product's name
+    (``calibration.step_floor``). Both are ``None`` while calibrating (no ``τ`` yet), with no
+    product scored, or for a stand-in verifier without a computation.
+
+    ``c = C_ANTI``; ``τ`` and ``k`` are the verifier's. ``N`` is the band file's sizing's when it
+    has one, else ``bit_budget(λ, n_steps, M, log₂G)`` (placeholder: the spec names the number,
+    not where ``T`` comes from; the band file's is the ``T`` the run's ``k`` was sized for)."""
+    none = {"f_achieved_max": None, "f_achieved_at": None}
+    bands, k, _ = _scoring(verifier)
+    c = getattr(verifier, "c", None)
+    if bands is None or not k or not hasattr(c, "operand_dtype") or not stats.products:
+        return none
+    sz = (getattr(bands, "stats", None) or {}).get("sizing")
+    if sz:
+        N = float(sz["N"])
+    else:
+        N = bit_budget(LAMBDA, int(getattr(verifier, "n_steps", 1) or 1), c.M, LOG2_G)
+    best = step_floor(stats, tau=float(bands.tau), k=int(k), N=N,
+                      eps_in=UNIT_ROUNDOFF[c.operand_dtype],
+                      eps_acc=UNIT_ROUNDOFF[c.accumulator_dtype], c=C_ANTI)
+    if best is None:
+        return none
+    return {"f_achieved_max": best.f_achieved, "f_achieved_at": best.name}
 
 
 def record_pass(verifier: Any, t: int, stats: StepStats, *,
@@ -1188,6 +1223,7 @@ def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats, c: An
         "p_norm": np.array([p.p_norm for p in ps], dtype=np.float64),
         "p_nu": np.array([p.nu for p in ps], dtype=np.float64),
         "p_abs1": np.array([p.p_abs1 for p in ps], dtype=np.float64),
+        "p_u": np.array([p.u for p in ps], dtype=np.float64),
         "p_normalized": np.array([p.normalized for p in ps],
                                  dtype=np.float64).reshape(len(ps), width),
         "w_check": np.array([s.check_id for s in stats.tensors], dtype=str),
@@ -1201,10 +1237,14 @@ def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats, c: An
 def _stats_from(z: Mapping[str, np.ndarray]) -> StepStats:
     st = StepStats()
     # Archives written before A11 have no product scales; those read back as unknown.
+    # Archives written before F18 have no term scale U; it reads back as unknown (NaN).
     scales = all(key in z for key in ("p_q", "p_norm", "p_nu", "p_abs1"))
+    has_u = "p_u" in z
     for i in range(len(z["p_m"])):
         extra = ({"q": int(z["p_q"][i]), "p_norm": float(z["p_norm"][i]),
                   "nu": float(z["p_nu"][i]), "p_abs1": float(z["p_abs1"][i])} if scales else {})
+        if has_u:
+            extra["u"] = float(z["p_u"][i])
         st.products.append(ProductStat(int(z["p_m"][i]), str(z["p_name"][i]), str(z["p_cls"][i]),
                                        float(z["p_kappa"][i]),
                                        tuple(float(x) for x in z["p_normalized"][i]), **extra))

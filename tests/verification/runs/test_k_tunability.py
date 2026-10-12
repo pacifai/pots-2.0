@@ -40,8 +40,9 @@ def test_linear_fit_recovers_a_line():
 
 def test_run_k_on_the_stored_step(env, stored, tmp_path):  # noqa: F811
     """The configured k reproduces the archive; κ and the guard's norms are bit-equal at every
-    k; the measure's FLOPs are ``S·(k+1)``, the glue's constant, the hashes ``M·k``. The MLP's
-    stored run has no time, count or step records, which the run tolerates."""
+    k; the measure's FLOPs are ``S·(k+1) + S_U`` (``S_U`` the term scale's, F18), the glue's
+    constant, the hashes ``M·k``. The MLP's stored run has no time, count or step records, which
+    the run tolerates."""
     c = env.c
     ks = rv.load_kept_step(c, stored, step=fs.SWEEP_STEP)
     with MetricsWriter(tmp_path, kt.RUN_NAME, band_file_hash=env.bands.source) as w:
@@ -51,9 +52,9 @@ def test_run_k_on_the_stored_step(env, stored, tmp_path):  # noqa: F811
     assert r.passed and sm["full_step_equal"] and sm["archive_equal"] and sm["repeatable"]
     assert sm["rho_5_honest"] is None and sm["accepted"] and sm["kappa_equal"]
     assert [p["k"] for p in r.points] == list(range(1, K + 2))
-    S = kt.measure_flops_per_column(c)
+    S, S_U = kt.measure_flops_per_column(c), kt.measure_flops_term_scale(c)
     for p in r.points:
-        assert p["flops_measure"] == S * (p["k"] + 1) == p["flops_measure_pred"]
+        assert p["flops_measure"] == S * (p["k"] + 1) + S_U == p["flops_measure_pred"]
         assert p["hash_calls"] == c.M * p["k"] == p["hash_calls_pred"]
         assert p["hash_in_bytes"] == p["hash_in_bytes_pred"]
         assert p["hash_out_bytes"] == p["hash_out_bytes_pred"]
