@@ -1643,7 +1643,7 @@ default as `setup/config.py`), since `setup.config` imports torch.
 - `results/` (EV4, EV5): one module per result, run as
   `python -m evaluation.results.<name> [--scale test|full] [--root DIR]`. The root defaults to
   `$VERIF_OUTPUT_DIR`, and every output goes to `results_dir(scale, root)`. Each `main` prints
-  the paths it wrote.
+  the paths it wrote. Error bars and `_std` columns are the sample std (`ddof = 1`).
   - `common.py` holds what the scripts share. Without `--scale`, the scale comes from the
     trained models: SmolLM2 is test scale, any other model full scale, and a mix raises and
     asks for `--scale`. An honest run is a run directory whose step records are all `honest`
@@ -1652,64 +1652,101 @@ default as `setup/config.py`), since `setup.config` imports torch.
     records of A1, A2, A3, or `hidden`. `load_residuals` renumbers archives written before
     EV2's 0-based `p_layer`. A family whose step score is `None` is unscored (a calibration
     step, `ρ_κ` with the κ guard off). In a scored family, a NaN fails and reads as `+inf`
-    (`nan_as_inf`), as in the step record's maxima. `nan_as_inf` and `DEFAULT_Z = 8` are
-    copies of `runs/metrics.nan_as_inf` and `sizing.Z`, and tests check both copies.
-    `margin_z` reads `stats.z` from the band file beside the run directories; without one it
-    uses `DEFAULT_Z` and warns.
+    (`nan_as_inf`), as in the step record's maxima. Three values are copies, each checked by a
+    test, since a result script may not import `verification`: `nan_as_inf`
+    (`runs/metrics.nan_as_inf`), `DEFAULT_Z = 8` (`sizing.Z`), and `SPEC_CLASSES`, §5.7's six
+    product classes as `runs/metrics.spec_class` names them. `margin_z` reads `stats.z` from
+    the band file beside the run directories. Without a band file it uses `DEFAULT_Z` and
+    warns; a band file without a finite `stats.z` raises. `band_tau` raises unless the band
+    file's `tau` is one finite scalar. `suptitle` wraps a figure title to the figure's width,
+    which constrained layout doesn't do.
   - `detection_table.py` (§5.3) writes `detection_table.csv/.md`, one row per scenario, model,
-    attack, and BPR. Each row gives the rejection rate over seeds and the first failing check
-    against `EXPECTED_CHECK` (A1 `4`, A2 `5`, A3 `6a`, hidden `7`). It also gives `n_failing`,
-    the sum over the families the rejecting step scored (empty when it scored none) and each
-    family's count. Then come the latency (the rejecting step minus `t*`) and `record_pass`'s
-    status and measured counts. Means are over the rejecting seeds.
+    attack, and BPR. §2.1 says a cheat run ends at its expected rejection step `t*`, and a run
+    whose verification goes past it is a harness failure. So a run counts as `detected` only
+    when its first rejected step is `t*`, and the rejection rate is detected runs over seeds.
+    `early_reject` counts runs rejected before `t*`, which aren't detections, and
+    `harness_failure` counts runs with step records past `t*`. `as_expected` holds when every
+    seed rejected at `t*` by a check in `EXPECTED_CHECK`: A1 `4`, A2 `5`, A3 `6a` or `6b`
+    (§2.1 names check 6, the update identity), hidden `7`. `first_failing_check` shows the
+    actual sub-check. `n_failing` (the sum over the families the rejecting step scored, empty
+    when it scored none, and each family's count), the latency (the rejecting step minus `t*`,
+    as measured) and `record_pass`'s status and counts cover the rejecting seeds only.
   - `detection_figure.py` (§5.2) writes `detection.pdf/.png`. One panel per attack and model
     shows A2's `ρ_5` and A3's `ρ_6` at `t*`, a mean ± sample std over seeds, against the
-    BPR in percent, on a log y-axis with a line at 1. Each score's honest band runs from the
-    smallest to the largest finite step score over the judged honest steps of that model and
-    attack. Edge lines show a band too narrow to see. A mean with an infinite seed is infinite
-    and drawn as a triangle at the top edge.
+    BPR in percent, on a log y-axis with a line at 1. The BPR axis is linear, with a tick at
+    each measured rate; a label close to the one before it drops a line, so 0% and the
+    one-record rate stay readable. Each score's honest band is the range of the finite step
+    scores over the judged honest steps of that model and attack; the title counts the
+    infinite ones left out. Edge lines show a band too narrow to see. A mean with an infinite
+    seed is infinite and drawn as a triangle at the top edge.
   - `per_layer.py` (§5.4) writes `per_layer.pdf/.png`, from A2's arrays at `t*`. It plots the
     largest `ρ_5` per layer (`0 … L−1`, then the output layer `L`), averaged over the seeds
-    that measured the layer, with one line per attack and BPR.
+    that measured the layer, with one line per attack and BPR. A rejected step's arrays hold
+    its measured tests only, so a seed may lack a layer: `lines` returns `n`, the seeds per
+    layer, and warns when it differs across a line's layers, and the legend gives its range.
   - `false_reject.py` (§5.6) pools each model over attacks and seeds and writes four outputs:
     - `false_reject.csv/.md`: the component rate per family and in total, and the step rate;
-    - `honest_histogram`: fixed log bins from `1e-8` to `1e4`, with zeros, infinities, and NaN
-      counted in the legend;
-    - `cancellation_drift`: per model and attack, the largest finite `ρ_κ` per fine class
-      (`p_cls`) at each judged step, the largest over seeds, with the five classes nearest
-      `κ_max` named;
+    - `honest_histogram`: fixed log bins from `1e-8` to `1e4`. Scores outside them land in the
+      end bins, and the legend counts those, as it counts zeros, infinities, and NaN;
+    - `cancellation_drift`: per model and attack, the largest `ρ_κ` per spec class
+      (`p_spec_class`) at each judged step, over the class's products and the seeds. §5.6
+      asks for each class, and §4.2 means §5.7's spec classes, not the fine κ classes.
+      `ρ_κ` is already normalised by its own fine class's ceiling, so the largest over a spec
+      class loses nothing for a drift check against the ceiling. NaN reads as `+inf`, and an
+      infinite maximum is a triangle at the top edge. An archive without `p_spec_class` is
+      left out, with a warning;
     - `margin_curve`: the rate against `z` from `Z/16` to `2Z`, with `ρ_5` rescaled as
-      `ρ_5·Z/z`. `ρ_κ` and `ρ_6` have fixed margins and don't move.
-    A judged step with no archive counts for the step rate only, with a warning.
+      `ρ_5·Z/z`, which is exact because `τ` is one scalar (`main` checks with `band_tau`).
+      `ρ_κ` and `ρ_6` stay at their configured margins, and the total's label says so.
+    A judged step with no archive counts for the step rate only, with a warning. An archive
+    with no rows is read as empty; the real records hold some (A1's and the hidden step's at
+    `t*`, A3's `p` rows).
   - `cost.py` (§5.5) writes three outputs:
     - `cost.pdf/.png`: per model, a P0 bar, a prover bar (P0, then P1–P5) and a verifier bar
       (one segment per per-step check, check 5 split into `5.glue` and `5.measure`);
     - `cost_ratios.csv/.md`: in time and in FLOPs, the overhead (P1–P5), the verifier, and the
-      prover plus the verifier, each over P0, per step. It adds the verifier per run (`T`
-      steps plus checks 0, 1, 8, and 9) over `T·P0`;
-    - `cost_grid.csv/.md`: per component, the time mean ± std, FLOPs, bytes hashed, hash
-      calls, peak memory, and transcript bytes.
-    P0 comes from the plain baseline that `plain_pair` matches to each honest run, on model
-    and device, and on corpus and attack where both records hold them. P1 comes from
-    `Records.capture`. Times are over judged steps, and counts come from the counting pass.
-    Peak memory is the largest in the memory pass; P1's memory is its growth over the plain
-    step. Ratios divide sums of component means. "FLOPs" are the counted matmul FLOPs, so 6a
-    and 6b count 0. An honest run with no time records (metrics off) is left out, with a
-    warning.
-  - Choices the spec leaves open, kept as placeholders until the user decides:
-    - the honest band is the step scores' min–max;
-    - BPR is a linear axis;
-    - drift is shown per fine class;
-    - the margin curve moves `ρ_5` only;
-    - P0 is paired loosely on `attack`, since the plain baseline records none;
-    - the verifier per run divides by `T·P0` with `T` all the run's steps.
-  - Read against EV2's test-scale records (2026-10-11, one seed each, BPR 25%):
-    - every cheat rejects at its expected check with latency 0;
+      prover plus the verifier, each over P0. A time is the mean over the judged steps
+      (calibration steps left out) of the per-step total, over P0's per-step mean. Each row
+      names the paired plain directory, both commits, any baseline mismatch, and the keys
+      only one side records. The FLOPs row says that FLOPs come from `FlopCounterMode`'s
+      formulas (EQ1c), matmul-class ops only, so the elementwise checks 6a and 6b and the
+      glue recomputation count about 0;
+    - `cost_grid.csv/.md`: per component, the time mean ± sample std, FLOPs, bytes hashed,
+      hash calls, peak memory, and transcript bytes.
+    `plain_pair` finds each honest run's plain baseline (H3) on model, device, corpus, and
+    attack (loosely: the baseline records no attack). It then compares `BASELINE_KEYS`, every
+    key both environment records hold: git commit and dirty flag, `h_D`, `T`, batch and
+    length, dtypes, the pass steps, hardware, threads, platform, Python, libraries, the memory
+    source, and the malloc setting. A difference raises, unless `--allow-baseline-mismatch`
+    is given; with it, the mismatch goes into the CSV, the captions, and the figure's title.
+    No baseline, or two that match, also raises, and `main` exits nonzero with the message.
+    P0's times are taken once per distinct plain directory, so honest runs sharing one
+    baseline don't count its steps twice. P1 comes from `Records.capture`, counts from the
+    counting pass, and peak memory is the largest in the memory pass; P1's memory is its
+    growth over the plain step. An honest run with no time records (metrics off) is left out,
+    with a warning, and with none `main` exits nonzero.
+  - The spec leaves some choices open. The coordinator decided these in review (2026-10-12):
+    - the rejection rate's denominator is the seeds;
+    - means ± sample std (`ddof = 1`);
+    - the BPR axis is linear in percent, with ticks at the measured rates;
+    - the honest band is the range (min–max), with the infinite scores left out and counted;
+    - the margin curve rescales `ρ_5` only, over `Z/16` to `2Z`;
+    - drift is shown per spec class;
+    - the histogram spans `1e-8` to `1e4`, with clipped values counted;
+    - a band file without `z` is an error, not the default.
+    Placeholders still open: a harness failure is any step record past `t*`; `as_expected`
+    needs every seed; an empty spec class reads `(no class)`; "operand gradient" names the
+    gradients of the weight-free products.
+  - Read against EV2's test-scale records (2026-10-12, one seed each, BPR 25%):
+    - every cheat is detected at `t*` by its expected check, with no early reject and no
+      harness failure;
     - A2's `ρ_5` at `t*` is 8.5e4, with 13,508 `ρ_5` tests failing;
     - A3's `ρ_6` is 3.0e7, with 272 tests failing;
     - per layer, A2's largest `ρ_5` is 1e4–1e5 in every layer;
     - on the honest run's seven judged steps, none of the 499,814 component tests fails at
-      `z = 8`, and the rate leaves 0 below `z ≈ 2.4`;
-    - time per step: P0 0.68 s, overhead 0.90×, verifier 2.96×, prover plus verifier 4.86×,
-      and the verifier per run 2.97×;
-    - the verifier's counted FLOPs are 0.054× P0.
+      `z = 8`, and the rate leaves 0 below `z ≈ 2.4`. Two `ρ_5` scores fall below `1e-8`, and
+      643 `ρ_6` are 0. Each spec class's largest `ρ_κ` stays between 0.38 and 0.57;
+    - `cost` refuses the only plain baseline, written at another commit with a dirty tree
+      (`git_commit 8dfa3ba ≠ a2fd813; git_dirty False ≠ True`). With
+      `--allow-baseline-mismatch`, time per step is P0 0.68 s, overhead 0.90×, verifier
+      2.96×, and prover plus verifier 4.86×. The verifier's counted FLOPs are 0.054× P0.
