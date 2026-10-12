@@ -9,9 +9,10 @@ import numpy as np
 import pytest
 
 from evaluation import records as er
+from evaluation.output import new_figure
 from evaluation.results import detection_figure, detection_table, per_layer
 
-from .conftest import ATTACK, BPR, MODEL, _env, _step, _write_jsonl
+from .conftest import ATTACK, BPR, MODEL, _archive, _env, _step, _write_jsonl
 
 
 @pytest.fixture(scope="module")
@@ -110,10 +111,28 @@ def test_detection_points_at_t_star(recs):
 
 def test_honest_range_from_judged_honest_steps(recs):
     # judged steps only: step 1 (50 and 99, a calibration step), the calibration run (70) and
-    # the sweep's honest step (500) are out, and so is honest-s1's infinite step 2; honest-s2's
-    # step 2 (0.5, 0.25) is in
-    assert detection_figure.honest_ranges(recs) == {
-        (MODEL, ATTACK, "rho_5"): (0.5, 3.0), (MODEL, ATTACK, "rho_6"): (0.2, 0.3)}
+    # the sweep's honest step (500) are out; honest-s2's step 2 (0.5, 0.25) is in. honest-s1's
+    # step 2 is infinite in both, so it is left out of the band and counted
+    ranges = detection_figure.honest_ranges(recs)
+    assert ranges == {(MODEL, ATTACK, "rho_5"): (0.5, 3.0, 1),
+                      (MODEL, ATTACK, "rho_6"): (0.2, 0.3, 1)}
+    fig = detection_figure.plot(detection_figure.points(recs, [MODEL]), ranges, [MODEL])
+    title = fig.get_suptitle()
+    assert "mean ± sample std" in title and "1 infinite ρ_5, 1 infinite ρ_6 left out" in title
+    # one tick per measured poisoning rate: 25% here
+    assert fig.axes[0].get_xticks().tolist() == [25.0]
+    # an all-infinite honest score has no band but still counts
+    only_inf = {(MODEL, ATTACK, "rho_5"): (None, None, 2)}
+    assert "2 infinite ρ_5 left out" in detection_figure.plot([], only_inf).get_suptitle()
+
+
+def test_bpr_ticks_at_the_measured_rates():
+    _, ax = new_figure()
+    ax.set_xlim(0, 20)
+    # 0% and one record in 128 sit closer than 6% of the axis, so the second label drops a line
+    detection_figure.bpr_ticks(ax, [10.0, 0.0, 100 / 128, 0.0])
+    assert ax.get_xticks().tolist() == [0.0, 100 / 128, 10.0]
+    assert [t.get_text() for t in ax.get_xticklabels()] == ["0", "\n0.781", "10"]
 
 
 def test_layer_maxima_read_nan_as_inf():
@@ -128,12 +147,29 @@ def test_layer_maxima_read_nan_as_inf():
 def test_per_layer_lines_mean_over_seeds(recs):
     entries = per_layer.runs(recs, [MODEL])
     assert sorted(e["run_dir"] for e in entries) == ["A2-s1", "A2-s2", "A2-s3"]
-    (line,) = per_layer.lines(entries)
+    with pytest.warns(UserWarning, match=r"measured different layers \(n = 1–3 per layer; "
+                                         r"fewest at layers \[2\]\)"):
+        (line,) = per_layer.lines(entries)
     assert (line["model"], line["attack"], line["bpr_actual"], line["seeds"]) == \
            (MODEL, ATTACK, 0.25, 3)
     assert line["layers"].tolist() == [0, 1, 2]
     # layer 0: 4, 2, 0.2; layer 1: 7, 9, 0.4; the output layer 2 only s2 scored (0.5)
     np.testing.assert_allclose(line["mean"], [6.2 / 3, 16.4 / 3, 0.5])
+    assert line["n"].tolist() == [3, 3, 1]
+    labels = per_layer.plot([line]).axes[0].get_legend_handles_labels()[1]
+    assert labels[0] == "BPR 25% (n = 1–3 seeds per layer)"
+
+
+def test_per_layer_reads_a_zero_row_archive(tmp_path):
+    # a rejected step's archive may hold no rows; the real records have some
+    run = "A2-z"
+    _write_jsonl(tmp_path / run / "records.jsonl",
+                 [_env(run), _step(run, "A2", 1, check="5", cheat_step=1, bpr=BPR)])
+    _archive(tmp_path, run, "A2", 1, p_layer=np.zeros(0, np.int32), p_cls=np.zeros(0, "<U1"),
+             rho_5=np.zeros((0, 9)), rho_kappa=np.zeros(0), rho_6=np.zeros(272))
+    (line,) = per_layer.lines(per_layer.runs(er.read(tmp_path)))
+    assert (line["layers"].size, line["n"].size, line["seeds"]) == (0, 0, 1)
+    per_layer.plot([line])
 
 
 def test_mains_write_their_files(out):

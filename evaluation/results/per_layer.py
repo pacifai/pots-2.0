@@ -6,7 +6,9 @@ over the layer's matmuls ``m`` and challenges ``j`` (:func:`layer_maxima`). Laye
 one line per attack and poisoning rate, the mean over seeds of each layer's maximum; y on a log
 scale, with a dashed line at 1. A ``NaN`` score counts as ``+inf``, as in the step record's
 maximum; an infinite point is a triangle at the top edge. A layer with no measured test has no
-point.
+point. A rejected step's arrays hold its measured tests only, so a seed may lack a layer: each
+layer's mean is over the seeds that measured it, ``n`` per layer. When ``n`` differs across a
+line's layers, a warning says so and the legend gives its range.
 
 Run as ``python -m evaluation.results.per_layer [--scale test|full] [--root DIR]``.
 """
@@ -80,7 +82,8 @@ def runs(recs: Records, models: Sequence[str] | None = None) -> list[dict[str, A
 
 def lines(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """One line per model, attack and poisoning rate: each layer's maximum, averaged over the
-    seeds that measured it."""
+    seeds that measured it, and ``n``, the number of those seeds per layer. Warns when ``n``
+    differs across the line's layers."""
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for e in entries:
         groups.setdefault((e["model"], e["attack"], e["bpr_actual"]), []).append(e)
@@ -93,8 +96,16 @@ def lines(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         with warnings.catch_warnings():  # a layer no seed measured stays NaN
             warnings.simplefilter("ignore", RuntimeWarning)
             mean = np.nanmean(grid, axis=0)
+        n = np.count_nonzero(~np.isnan(grid), axis=0)
+        if len(set(n.tolist())) > 1:
+            short = sorted({int(k) for k in n})
+            warnings.warn(
+                f"{short_model(model)}, {attack}, BPR {bpr}: the {len(es)} seeds measured "
+                f"different layers (n = {short[0]}–{short[-1]} per layer; fewest at layers "
+                f"{layers[n == short[0]].tolist()}); each layer's mean is over its own seeds",
+                UserWarning, stacklevel=2)
         out.append({"model": model, "attack": attack, "bpr_actual": bpr, "layers": layers,
-                    "mean": mean, "seeds": len(es)})
+                    "mean": mean, "n": n, "seeds": len(es)})
     return out
 
 
@@ -116,6 +127,8 @@ def plot(ls: list[dict[str, Any]], models: Sequence[str] | None = None) -> Figur
             label = f"BPR {100 * (x['bpr_actual'] or 0):.3g}%"
             if len(attacks) > 1:
                 label += f", {ATTACK_LABEL.get(x['attack'], x['attack'])}"
+            if x["n"].size and x["n"].min() != x["n"].max():
+                label += f" (n = {x['n'].min()}–{x['n'].max()} seeds per layer)"
             c = colour.get(x["bpr_actual"], "C0")
             ax.plot(x["layers"], y, marker=".", color=c, ls=styles.get(x["attack"], "-"),
                     label=label)
@@ -131,7 +144,7 @@ def plot(ls: list[dict[str, Any]], models: Sequence[str] | None = None) -> Figur
         if not mine:
             ax.text(0.5, 0.5, "no runs", transform=ax.transAxes, ha="center")
     axes[0][0].legend(fontsize=7, loc="best")
-    fig.suptitle(f"A2 at t*: largest ρ_5 per layer, mean over seeds "
+    fig.suptitle(f"A2 at t*: largest ρ_5 per layer, mean over the seeds that measured it "
                  f"({seeds_note(x['seeds'] for x in ls)})", fontsize=10)
     return fig
 
