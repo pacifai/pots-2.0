@@ -1422,9 +1422,25 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `family_maxima(stats, bands, *, k)` gives each score family's largest score, its count
     above 1 and where it sits. `report` prints the honest steps, the fit, `residuals.py`'s two
     tables, the reference scores, the tampers and `llama_step.report_costs`.
-  - Real runs (2026-10-12): none yet. No full-scale model's weights are in the local cache
-    (config and tokenizer only), and the run never downloads. `main` ran on SmolLM2 as a path
-    check: accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the band file's 4.75 is over steps
+  - Real runs (2026-10-12, dev Mac under other jobs, `MallocLargeCache=0`,
+    `VERIF_N_RECORDS=369`, `T = 1`, `k = 9`; GB here is 2^30 bytes, as `report` prints it):
+    - Qwen2.5-0.5B, in memory, weights SHA-256 `fdf756fa…`: the honest step (loss 2.1318) is
+      accepted with check 8 on its own fit, `s_h` 6.19 (`Λ`), `τ` 49.5, global max 25.9 at
+      `L9.dQ[3,5]`. The altered `b_q` entry is rejected at check 5 on `P_1 (L1.Y_q)`, residual
+      2.67e3, and at 6b (`ρ_max` 1.7e7). Against SmolLM2's band file (`cc7a9bca…`, `τ` 38.0)
+      `ρ_5` is 0.68 and `ρ_6` 0.50, but `ρ_κ` 2.93 (104 products above 1, largest at
+      `L1.dQ[1,6]`; `dQ`'s `κ` reaches 44). Prover 2.50 s, verifier 3.83 s (check 5 2.74);
+      prover peak 9.3 GB, verifier 13.0 GB, process 14.1 GB; 22 s for the whole command. The
+      slow bring-up test gives the same numbers.
+    - The slow replay test on the real weights fills every slot once and rebuilds every
+      operand and glue gradient bit for bit on all four models. Peak, then capture with
+      labeling and digests, forward replay and backward replay: Qwen2.5-0.5B 10.3 GB, 6.9 /
+      2.1 / 3.6 s; Falcon3-1B 24.2 GB, 9.6 / 2.7 / 3.4 s; Qwen2.5-1.5B 25.2 GB, 12.9 / 3.9 /
+      5.5 s; Meta's Llama-3.2-1B 20.3 GB, 11.1 / 3.3 / 4.9 s. The 1B peaks fall within 0.2 GB
+      of the L2/L4 shake-outs' linear projection.
+    - Falcon3-1B, Qwen2.5-1.5B and Meta's Llama-3.2-1B: bring-up not run, since every projected
+      peak is above the 30 GB set for this Mac, on disk or in memory (below).
+  - `main` ran on SmolLM2 as a path check: accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the band file's 4.75 is over steps
     1–3), `τ` 46.3; prover 1.58 s, verifier 2.49 s (check 5
     1.92); prover peak 4.30 GB, verifier peak 4.74 GB; against its own band file `ρ_5` 0.30,
     `ρ_κ` 0.50, `ρ_6` 0.50.
@@ -1454,6 +1470,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     models, at `Y_k`): a projection's `κ` is about 24 at `d = 896` and 36 at `d = 2048`,
     against SmolLM2's `κ_max` of 23 for `Y_k` at `d = 576`. These are random weights, so none
     of these residuals stands for the pretrained model's.
+    With `--disk-transcripts` the 1B shake-outs peak higher, not lower: Falcon3 19.6 / 23.3 GB
+    (L2 / L4; 14.7 in memory at L2 with the same settings), Qwen2.5-1.5B 11.6 / 14.5 GB, Meta's
+    Llama 13.3 / 16.9 GB. Projected to full depth: Falcon3 49 GB, Qwen2.5-1.5B 48 GB, Llama
+    38.5 GB, against 38, 39 and 30.5 in memory. Check 2 reads every leaf back into RAM and
+    keeps it for the step, so the transcript is held once either way; on disk the verifier's
+    `W_t` and `W_{t+1}` are its own copies, while in memory they are the run's own tensors, so
+    the disk adds about `2|W|` (0.31–0.45 GB a layer measured, against 0.35–0.47 GB for two
+    copies of a layer's weights).
 - `materialize_data.py` (B5, C6, FS6): `.venv/bin/python -m
   verification.runs.materialize_data` writes `D.bin`, `D_tilde.bin`, `manifest.bin`,
   `manifest_tilde.bin` and `meta.json` to `cfg.data_dir`, under
