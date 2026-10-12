@@ -43,7 +43,7 @@ from evaluation.results.common import (
     short_model,
 )
 
-__all__ = ["COLUMNS", "run_outcomes", "rows", "main"]
+__all__ = ["COLUMNS", "run_outcomes", "latency", "rows", "main"]
 
 COLUMNS = ("scenario", "model", "attack", "bpr_records", "bpr_pct", "seeds", "detected",
            "rejection_rate", "early_reject", "harness_failure", "expected_check",
@@ -78,8 +78,10 @@ def run_outcomes(recs: Records, models: Sequence[str] | None = None) -> list[dic
     return out
 
 
-def _at(o: dict[str, Any]) -> int | None:
-    """The rejecting step minus ``t*``: 0 is a detection, below 0 an early reject."""
+def latency(o: dict[str, Any]) -> int | None:
+    """A :func:`run_outcomes` outcome's detection latency (§2.3), its first rejected step minus
+    ``t*``: 0 is a detection, below 0 an early reject, above 0 a late one. ``None`` when the run
+    never rejected or has no ``t*``."""
     if o["reject"] is None or o["cheat_step"] is None:
         return None
     return o["reject"]["step"] - o["cheat_step"]
@@ -88,14 +90,14 @@ def _at(o: dict[str, Any]) -> int | None:
 def _row(key: tuple[Any, ...], runs: list[dict[str, Any]]) -> dict[str, Any]:
     scen, model, attack, bpr_records = key
     rejected = [o for o in runs if o["reject"] is not None]
-    detected = [o for o in rejected if _at(o) == 0]
-    early = [o for o in rejected if (_at(o) or 0) < 0]
+    detected = [o for o in rejected if latency(o) == 0]
+    early = [o for o in rejected if (latency(o) or 0) < 0]
     past = [o for o in runs if o["cheat_step"] is not None and o["last_step"] > o["cheat_step"]]
     checks = [o["reject"].get("first_failing_check") for o in rejected]
     expected = EXPECTED_CHECK.get(scen, ())
     totals, fams = zip(*(_n_failing(o["reject"]) for o in rejected)) if rejected else ((), ())
     n_mean, n_std, _ = mean_std(totals)
-    lat_mean, lat_std, _ = mean_std(_at(o) for o in rejected)
+    lat_mean, lat_std, _ = mean_std(latency(o) for o in rejected)
     passes = [o["reject"].get("record_pass") for o in rejected]
     status = sorted({str(p.get("status")) for p in passes if isinstance(p, dict)})
     measured = {f: mean_std((p.get("measured") or {}).get(f) for p in passes
