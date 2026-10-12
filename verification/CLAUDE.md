@@ -28,7 +28,9 @@ details that don't change what is committed or checked are yours to choose.
   `/Users/amitainevo/Projects/pots-2.0/.venv/bin/python -m pytest tests`.
   Each module gets a test file at the mirrored path (see "Module map"). Tests that load the
   real 135M model or run a full step carry `@pytest.mark.slow`, and the default run skips them
-  (`-m "not slow"`). Keep the fast suite under about a minute.
+  (`-m "not slow"`). Keep the fast suite under about a minute. The full-scale slow tests
+  (FS4, `tests/verification/full_scale_helpers.py`) skip when the model's weights aren't in the
+  local Hugging Face cache; no test downloads.
 - **Style.**
   - Use ordinary importable libraries with type hints and no import-time side effects (S7b).
   - Entry points read env vars through `setup/config.py` and `verification/parameters.py`,
@@ -324,8 +326,15 @@ interface.
     `targets[:-1] == ids[1:]` are enforced by the dataset builder, not by `Record`.
   - `encode_record` and `decode_record`. Both raise `RecordError`.
 - `model.py`: `load_model_config(repo, revision)` and `load_pretrained(repo, revision, *,
-  attn_impl="eager", dtype=torch.float32)`, an unmodified `from_pretrained`. `transformers` is
-  imported inside the functions.
+  attn_impl="eager", dtype=torch.float32)`, an unmodified `from_pretrained`. `transformers` and
+  `huggingface_hub` are imported inside the functions.
+  - FS4, none of which downloads: `cached_file(repo, revision, filename, cache_dir=None)` is
+    the file's path in the local cache or `None`. `cached_weight_files(...)` lists the single
+    `model.safetensors` or every shard its index names, or `None` when any is missing.
+    `model_pin(repo, revision)` returns `{repo, revision, config_sha256, weights}`, where
+    `weights` lists `{file, sha256, bytes}` per weight file, or is `None` when the weights
+    aren't cached. A weight file's SHA-256 is its Hub blob name, read from the cache's link,
+    not recomputed.
 - `backdoorllm.py` (C6, FS6, F8d): the released BackdoorLLM files at `REPO@COMMIT`
   (`SOURCE`), eight paths pinned by SHA-256 (`SHA256`). Refusal: `CLEAN` and `POISONED` (the
   training files, 500 rows each), `HELD_OUT_CLEAN` and `HELD_OUT_POISONED` (B8's held-out
@@ -798,6 +807,19 @@ interface.
     `test_plain_baseline` adds a bf16 tiny Llama whose plain and verified final weights are
     equal, and `tests/verification/runs/test_calibrate.py` runs `gradient_coherence` at both
     dtypes.
+  - **The full-scale models (FS4).** `tests/verification/full_scale_helpers.py` holds `PINS`,
+    the four models at their commits, smallest first: Qwen2.5-0.5B, Falcon3-1B, the
+    preliminary Llama-3.2-1B mirror (`unsloth/…`; Meta's repo runs through `VERIF_MODEL` and
+    `VERIF_MODEL_REVISION` alone) and Qwen2.5-1.5B. `full_scale_case(repo, revision)` builds
+    each one's run config, `D` and `h_D` without fetching, or skips when the weights aren't
+    cached. `computation/test_full_scale_models.py`'s slow `test_real_step_labels_and_replays`
+    checks, per model, that every slot is filled once (M2), and that every forward operand
+    (A8), backward operand and glue gradient (A9) is rebuilt bit for bit. It compares BLAKE3
+    digests rather than holding both copies, since a 1B step's products run to about 20 GB. The
+    fast `test_digest_comparison_on_a_tiny_model` checks that comparison on tiny Llama and
+    Qwen2 models: an altered `W_t` leaf changes only the two operands that read it, and an
+    altered layer-1 `δX_q` leaf changes the glue gradients it flows into (`W_E`'s and layer
+    1's `γ_attn`) and not `γ_final`'s.
 - `leaf_sizes.py` (FS10): `leaf_sizes(config, *, n_s, n, compute_dtype=torch.float32)`
   returns the step's `LeafSize(index, section, name, role, shape, dtype, nbytes)` list in
   commit order, without running a model. `compute_dtype` goes to `DecoderComputation`, so
@@ -1364,6 +1386,68 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     maximum RSS from `time -l` 6.92 GB → 6.35 GB (lifetime peak 6.45 → 5.91 GB). Every
     root, loss, residual and final weight is bit-identical; step 2 still rejects at check 5
     on `P_2371` (`Λ`), residual 10.1 > τ = 8.
+- `bring_up.py` (FS4): `VERIF_MODEL=<repo> VERIF_MODEL_REVISION=<commit> .venv/bin/python -m
+  verification.runs.bring_up [--steps T] [--reference-bands PATH] [--tamper | --no-tamper]`,
+  `T` default 1. One full-scale model on CPU at test scale's other settings (dtypes, `n_s × n`,
+  η, `k`, seed); nothing in the code names a model, so Meta's Llama repo runs through the two
+  env vars alone. `D` and `h_D` come from `$VERIF_OUTPUT_DIR/data/` (`materialize_data` for the
+  same model). `main` stops with an error, before loading anything, when `model_pin` finds no
+  cached weights or `D.bin` is missing; it never downloads. Exits 1 unless `BringUp.passed`.
+  - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu") ->
+    BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It takes any
+    `DecoderComputation`, so a random-weight config runs the same path. `W_0` and every prover
+    run come from one `ReusedModel`. Check 8's reference is `honest_final`'s `W_T`, kept as
+    leaf hashes (`leaf_hashes_of`, `end_run` takes either). The honest run is `run_scenario`
+    inside `memory_pass`, with a calibration-mode verifier (P10b): the exact checks judge
+    live, 5 and 6 record. `on_step` fits on the last step (`calibration.fit`,
+    `band_file_bytes`, `Bands.from_json`) and freezes on that fit, so `end_run` can close the
+    run with check 8; a live rejection freezes on placeholder bands, since it stands whatever
+    the bands are. The fit is in-sample and never written: it judges the freeze and the
+    tamper, nothing else.
+  - `bias_tamper(c, D, w0, bands, *, k, seed, h_D, build_model, layer=1, x="q")`: two one-step
+    judged runs (FS2's switch test on the real model). The last entry of `b_q` in layer 1 is
+    raised by 1 in training with the `W_t` leaf restored (expected: check 5 naming
+    `P_m (L1.Y_q)`), and in an honest step's `W_{t+1}` leaf (expected: 6b naming the bias).
+    `Tamper.rejected_as_expected` checks the step, the check and that name.
+  - `reference_bands(ref, c)` carries a band file to another model for scoring only: `τ`, the
+    default `κ_max` and the per-class `κ_max` of the classes `c` has; every weight takes the
+    default `τ_W`, since `ref`'s per-tensor values name its own tensors. It also returns `c`'s
+    classes that `ref` doesn't name (`G_head` for an untied model against SmolLM2's file).
+    `family_maxima(stats, bands, *, k)` gives each score family's largest score, its count
+    above 1 and where it sits. `report` prints the honest steps, the fit, `residuals.py`'s two
+    tables, the reference scores, the tampers and `llama_step.report_costs`.
+  - Real runs (2026-10-12): none yet. No full-scale model's weights are in the local cache
+    (config and tokenizer only), and the run never downloads. `main` ran on SmolLM2 as a path
+    check: accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the band file's 4.75 is over steps
+    1–3), `τ` 46.3; prover 1.58 s, verifier 2.49 s (check 5
+    1.92); prover peak 4.30 GB, verifier peak 4.74 GB; against its own band file `ρ_5` 0.30,
+    `ρ_κ` 0.50, `ρ_6` 0.50.
+  - Random-weight shake-outs (2026-10-12), not the bring-up: each model's real config,
+    tokenizer, EOS and `D`, HF's init with q, k, v biases drawn N(0, 0.02), `T = 1`, `k = 9`,
+    the 1B models cut to 2 and 4 layers. Every one fills every slot once and rebuilds every
+    operand and glue gradient bit for bit (the slow test's comparison; the Llama mirror with
+    its llama3 rope rescaling), and every honest step is accepted on its own fit. On Qwen2.5-0.5B
+    (all 24 layers) and Qwen2.5-1.5B (2 and 4 layers) the altered `b_q` entry is rejected at
+    check 5 and at 6b. Check 5's normalized residual is 1.3e4 on Qwen2.5-0.5B, and 238 and
+    1.3e4 on Qwen2.5-1.5B, against `τ` of 34–46. One altered column's residual is the challenge
+    entry at that column, uniform on (−1, 1) and drawn from the transcript's root, so it varies
+    from run to run. Neither the mirror's own pad id (128004) nor any other config pad id
+    occurs in its model's `D`.
+    Per step, prover / verifier wall clock (check 5), and the verifier's peak, which is the
+    process's:
+    - Qwen2.5-0.5B, 24 of 24 layers: 2.59 s / 8.62 s (7.54), 15.0 GB.
+    - Falcon3-1B, 2 and 4 of 18: 1.23 / 7.12 s (6.30), 15.6 GB; 1.68 / 8.45 s (7.45), 18.3 GB.
+    - Llama-3.2-1B mirror, 2 and 4 of 16: 1.12 / 6.67 s (6.11), 11.3 GB; 1.59 / 8.17 s (7.42),
+      14.1 GB.
+    - Qwen2.5-1.5B, 2 and 4 of 28: 0.94 / 5.76 s (5.27), 10.2 GB; 1.36 / 6.89 s (6.22),
+      12.4 GB.
+    Linear in the layers (1.1–1.4 GB a layer), the full models' peaks come to about 38 GB
+    (Falcon3), 30.5 GB (Llama) and 39 GB (Qwen2.5-1.5B), the verifier's start holding the whole
+    transcript. Against SmolLM2's band file every model's `ρ_5` stays at or below 0.24 and
+    `ρ_6` at 0.50, but `ρ_κ` exceeds 1 (1.12 on Qwen2.5-0.5B, 1.39–1.59 on the cut 1B
+    models, at `Y_k`): a projection's `κ` is about 24 at `d = 896` and 36 at `d = 2048`,
+    against SmolLM2's `κ_max` of 23 for `Y_k` at `d = 576`. These are random weights, so none
+    of these residuals stands for the pretrained model's.
 - `materialize_data.py` (B5, C6, FS6): `.venv/bin/python -m
   verification.runs.materialize_data` writes `D.bin`, `D_tilde.bin`, `manifest.bin`,
   `manifest_tilde.bin` and `meta.json` to `cfg.data_dir`, under

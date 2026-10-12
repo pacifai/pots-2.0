@@ -18,7 +18,7 @@ weights aren't in the local Hugging Face cache.
    calibration mode (P10b): the exact checks judge live, and checks 5 and 6 only record. After
    the last step the bands are fitted on these steps (``calibration.fit``) and the verifier
    freezes on them, so check 8 closes the run. The fit is in-sample and never written as a band
-   file: it gives step 4 its bands and nothing else. Check 8's reference is ``T`` uncaptured
+   file: it gives item 4 its bands and nothing else. Check 8's reference is ``T`` uncaptured
    steps from ``W_0``, kept as leaf hashes only.
 3. **Residuals, printed and not judged.** Check 5's table by product class and check 6's by
    weight role. With ``--reference-bands`` (SmolLM2's band file), each score family's largest
@@ -27,7 +27,7 @@ weights aren't in the local Hugging Face cache.
    its default ``κ_max``, and every weight its default ``τ_W``, since its per-tensor values name
    SmolLM2's tensors (:func:`reference_bands`).
 4. **One bias entry altered** (a model with q, k, v biases; ``--no-tamper`` skips it). As
-   FS2's switch test, on the real model, judged by step 2's fitted bands: step 1 trained with
+   FS2's switch test, on the real model, judged by item 2's fitted bands: step 1 trained with
    the last entry of layer 1's ``b_q`` raised by 1 under an honest ``W_t`` leaf must fail
    check 5 at ``L1.Y_q``, and an honest step with that entry raised in its ``W_{t+1}`` leaf
    must fail check 6b.
@@ -178,9 +178,9 @@ def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.
 def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: int,
              seed: int, build_model: Callable[[], torch.nn.Module] | None = None,
              tamper: bool = True, device: str | torch.device = "cpu") -> BringUp:
-    """Steps 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
+    """Items 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
     a random-weight config runs the same path). ``build_model`` (default ``c.build_model``)
-    gives the prover's model, built once and reused (``ReusedModel``). ``tamper`` runs step 4
+    gives the prover's model, built once and reused (``ReusedModel``). ``tamper`` runs item 4
     when ``c`` has q, k, v biases."""
     models = ReusedModel(build_model or c.build_model)
     w0 = snapshot_weights(c, models())

@@ -68,7 +68,7 @@ nothing above them.
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
-| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
+| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `bring_up.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, bring up each full-scale model on CPU, record costs and residuals, write the dataset files |
 | `evaluation/` | `records.py`, `output.py`, `results/` | Read every run directory into tables, write figures and tables under `evaluation/results/<scale>/` |
 | `benchmarks/hashing/` | `run.py`, `cpu_hash.py`, `challenges.py`, `native.py`, `step_time.py`, `sizes.py`, `machine.py`, `report.py` | FS10's CPU hashing benchmark: hashing, tree, finiteness and challenge costs per step, and one JSON report |
 
@@ -92,7 +92,9 @@ for the native build's TLS only.
   and turns TF32 off. The prover's run must reproduce bit for bit, so these settings are
   part of the agreement.
 - **`records.py`** defines the token record `(ids, targets, mask)` and its canonical bytes.
-- **`model.py`** loads the pretrained model unmodified, through `from_pretrained`.
+- **`model.py`** loads the pretrained model unmodified, through `from_pretrained`. It also
+  reports a model's pin from the local cache without downloading: the repo, the commit, the
+  SHA-256 of `config.json` and of each weight file.
 - **`backdoorllm.py`** fetches the data PoTS used, at a pinned commit of the BackdoorLLM
   release. Each of its two tasks has a clean and a poisoned training file and two held-out
   prompt files: targeted refusal on Alpaca prompts (500 training rows per file, 200 held
@@ -347,6 +349,15 @@ replaced:
   check-5 and check-6 number, bit for bit.
 - **`calibrate.py`** is C1: it calibrates the bands on the honest run's steps 1–3, checks
   them, and writes the band file (see "Workflow: calibrating the tolerances").
+- **`bring_up.py`** is FS4: it takes one full-scale model, named by `VERIF_MODEL` and
+  `VERIF_MODEL_REVISION` alone, through the code on CPU at test scale's other settings. It
+  prints the model's pin and runs honest steps from the pretrained weights with the verifier
+  in calibration mode, so only the exact checks judge. It then fits bands on those same steps
+  and freezes on them, so check 8 closes the run. It prints the residual tables, and, against
+  a reference band file such as SmolLM2's, each score family's largest score, for information.
+  On a model with q, k, v biases it alters one bias entry and expects check 5 or 6b to reject.
+  It reports each side's time and peak memory per step. It never downloads: it stops if the
+  weights aren't cached.
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
@@ -607,6 +618,7 @@ Breaking any of these voids the result. Each one has a test.
 | One decoder instance for the four full-scale models (FS1) | done; tiny random Llama and Qwen2 models, tied and untied, fill every slot once and replay every operand and glue gradient bit for bit; SmolLM2's roots are unchanged |
 | Biased linears in check 5 (FS2) | done; check 5 checks a biased `Y_q`, `Y_k` or `Y_v` as `[A | 1]·[B ; bᵀ]`, `b` from the committed `W_t`. Honest steps with random non-zero biases are accepted on the tiny Qwen2 models, at residuals like the unbiased ones'. One bias entry altered rejects at check 0 or 7 in `W_t`, at check 5 when only training used it, and at 6b in `W_{t+1}`. Unbiased products, so all of SmolLM2, keep their numbers bit for bit. Check 1 also requires each `π(t)` to hold distinct records |
 | Mixed precision (FS3) | done; `(MASTER_DTYPE, COMPUTE_DTYPE)` from config, autocast around forward and loss in training, the plain run and the replay. SmolLM2 at `(fp32, bf16)` on CPU fills every slot once, rebuilds every operand and glue gradient bit for bit, accepts steps 1–3 under provisional bands (largest normalized residual 1.19), and ends 3 plain and 3 verified steps on the same weights. Tiny Qwen2 models with drawn biases are accepted at bf16 too, check 5 measuring each biased product with the bias cast as autocast cast it for the prover. At `(fp32, fp32)` every pinned root, loss and check number is unchanged. bf16 bands are not calibrated yet, and CPU bf16 matmul on the dev Mac makes a bf16 step about 45 s |
+| Real-model bring-up on CPU (FS4, `runs/bring_up.py`) | code and slow tests done; real runs not yet made, because no full-scale model's weights are in the local cache and the run never downloads. Each model is pinned (repo, commit, `config.json` SHA-256) and pads with its own EOS. On random weights with each model's real config and tokenizer (the 1B models cut to 2 and 4 layers), every model fills every slot once and rebuilds every operand and glue gradient bit for bit, and an honest step is accepted on its own fit; both Qwen models reject one altered bias entry at check 5 or 6b. Peak memory per step, measured on Qwen2.5-0.5B and projected linearly in the layers for the others: Qwen2.5-0.5B 15 GB, Llama-3.2-1B about 30.5 GB, Falcon3-1B about 38 GB, Qwen2.5-1.5B about 39 GB |
 | 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |
