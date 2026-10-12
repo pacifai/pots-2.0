@@ -73,6 +73,15 @@ def test_mean_std_and_margin():
     assert common.mean_std([5]) == (5.0, None, 1)
     assert common.mean_std([None]) == (None, None, 0)
     assert common.margin_z({"stats": {"z": 4}}) == 4.0
-    with pytest.warns(UserWarning, match="no z"):
+    with pytest.warns(UserWarning, match="no band file"):
         assert common.margin_z(None) == common.DEFAULT_Z
+    # a band file without z is an error, not the default
+    for bad in ({}, {"stats": {}}, {"stats": {"z": None}}, {"stats": {"z": "x"}},
+                {"stats": {"z": float("nan")}}):
+        with pytest.raises(ValueError, match="no finite stats.z"):
+            common.margin_z(bad)
+    assert common.band_tau(None) is None and common.band_tau({"tau": 38.0}) == 38.0
+    for bad in ({}, {"tau": [1.0, 2.0]}, {"tau": {"q": 1.0}}, {"tau": float("inf")}):
+        with pytest.raises(ValueError, match="not one finite scalar"):
+            common.band_tau(bad)
     assert common.seeds_note([3, 5, 4]) == "R = 3–5" and common.seeds_note([1, 1]) == "R = 1"

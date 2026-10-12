@@ -11,7 +11,7 @@ import pytest
 from evaluation import records as er
 from evaluation.results import detection_figure, detection_table, per_layer
 
-from .conftest import ATTACK, MODEL
+from .conftest import ATTACK, BPR, MODEL, _env, _step, _write_jsonl
 
 
 @pytest.fixture(scope="module")
@@ -25,13 +25,20 @@ def test_detection_table_rows(recs):
     for r in rows.values():
         assert (r["model"], r["attack"], r["bpr_records"], r["bpr_pct"]) == \
                ("SmolLM2-135M", ATTACK, 2, 25.0)
-        assert r["first_failing_check"] == r["expected_check"] and r["as_expected"]
+        assert r["early_reject"] == 0
+    expected = {s: (r["expected_check"], r["first_failing_check"], r["as_expected"])
+                for s, r in rows.items()}
+    # A3's expected check is check 6, either sub-check; the table shows the one that failed
+    assert expected == {"A1": ("4", "4", True), "A2": ("5", "5", False),
+                        "A3": ("6a or 6b", "6a", True), "hidden": ("7", "7", True)}
 
     a2 = rows["A2"]
-    # three seeds, two reject: s1 at t* with 10 + 2 + 0 failing tests, s2 a step later with
-    # 20 + 0 + 2; s3 never
-    assert (a2["seeds"], a2["rejected"]) == (3, 2)
-    assert a2["rejection_rate"] == pytest.approx(2 / 3)
+    # three seeds: s1 rejects at t* with 10 + 2 + 0 failing tests, s2 a step later with
+    # 20 + 0 + 2, s3 never. Only s1 is detected; s2 and s3 both have a step record past t*,
+    # which §2.1 calls a harness failure
+    assert (a2["seeds"], a2["detected"], a2["harness_failure"]) == (3, 1, 2)
+    assert a2["rejection_rate"] == pytest.approx(1 / 3)
+    # n_failing and latency are over the rejecting seeds s1 and s2, as measured
     assert a2["n_failing_mean"] == 17.0 and a2["n_failing_std"] == pytest.approx(math.sqrt(50))
     assert (a2["n_failing_rho_5"], a2["n_failing_rho_kappa"], a2["n_failing_rho_6"]) == \
            (15.0, 1.0, 1.0)
@@ -40,22 +47,51 @@ def test_detection_table_rows(recs):
 
     # A3 scored ρ_6 only; A1 and the hidden step scored nothing, so their count is empty
     a3 = rows["A3"]
-    assert (a3["seeds"], a3["rejected"], a3["n_failing_mean"], a3["n_failing_std"]) == \
+    assert (a3["seeds"], a3["detected"], a3["n_failing_mean"], a3["n_failing_std"]) == \
            (2, 2, 3.0, 0.0)
     assert a3["n_failing_rho_5"] is None
+    for s in ("A1", "A3", "hidden"):
+        assert (rows[s]["rejection_rate"], rows[s]["harness_failure"]) == (1.0, 0)
     for s in ("A1", "hidden"):
         r = rows[s]
-        assert (r["rejection_rate"], r["latency_mean"], r["n_failing_mean"]) == (1.0, 0.0, None)
+        assert (r["latency_mean"], r["n_failing_mean"]) == (0.0, None)
         assert r["record_pass_status"] == "not run"
     # the hidden step's t* is step 2, so rejecting there is latency 0
     assert rows["hidden"]["latency_std"] is None
 
 
-def test_wrong_check_is_not_as_expected(recs):
+def test_check_6b_is_as_expected_for_a3_and_another_check_is_not(recs):
     runs = [o for o in detection_table.run_outcomes(recs) if o["scenario"] == "A3"]
-    runs[0] = {**runs[0], "reject": {**runs[0]["reject"], "first_failing_check": "6b"}}
-    row = detection_table._row(("A3", MODEL, ATTACK, 2), runs)
-    assert row["first_failing_check"] == "6a, 6b" and not row["as_expected"]
+
+    def with_check(c):
+        return [{**runs[0], "reject": {**runs[0]["reject"], "first_failing_check": c}}, runs[1]]
+
+    row = detection_table._row(("A3", MODEL, ATTACK, 2), with_check("6b"))
+    assert (row["first_failing_check"], row["as_expected"]) == ("6a, 6b", True)
+    row = detection_table._row(("A3", MODEL, ATTACK, 2), with_check("5"))
+    assert (row["first_failing_check"], row["as_expected"]) == ("5, 6a", False)
+    assert row["detected"] == 2  # a rejection at t* is a detection whichever check fired
+
+
+def test_early_reject_and_harness_failure(tmp_path):
+    """A run rejected before t* is no detection; one that goes on past t* is a harness
+    failure, whether it rejected at t* or not."""
+    def run(name, seed, *steps):
+        _write_jsonl(tmp_path / name / "records.jsonl", [_env(name, seed=seed), *steps])
+
+    kw = {"cheat_step": 2, "bpr": BPR}
+    run("early", 1, _step("early", "A2", 1, check="5", seed=1, **kw))
+    run("on-time", 2, _step("on-time", "A2", 1, seed=2, **kw),
+        _step("on-time", "A2", 2, check="5", seed=2, **kw))
+    run("past", 3, _step("past", "A2", 1, seed=3, **kw),
+        _step("past", "A2", 2, check="5", seed=3, **kw),
+        _step("past", "A2", 3, check="5", seed=3, **kw))
+    (row,) = detection_table.rows(er.read(tmp_path))
+    assert (row["seeds"], row["detected"], row["early_reject"], row["harness_failure"]) == \
+           (3, 2, 1, 1)
+    assert row["rejection_rate"] == pytest.approx(2 / 3) and not row["as_expected"]
+    # latency as measured: −1, 0, 0
+    assert row["latency_mean"] == pytest.approx(-1 / 3)
 
 
 def test_detection_points_at_t_star(recs):
@@ -112,5 +148,6 @@ def test_mains_write_their_files(out):
     with open(d / "detection_table.csv", newline="") as f:
         table = list(csv.DictReader(f))
     assert [r["scenario"] for r in table] == ["A1", "A2", "A3", "hidden"]
-    assert table[1]["rejected"] == "2" and table[1]["latency_mean"] == "0.5"
-    assert "| 0.67 |" in (d / "detection_table.md").read_text()
+    assert (table[1]["detected"], table[1]["harness_failure"]) == ("1", "2")
+    assert table[1]["latency_mean"] == "0.5"
+    assert "| 0.33 |" in (d / "detection_table.md").read_text()

@@ -42,7 +42,7 @@ __all__ = ["DEFAULT_Z", "FAMILIES", "FAMILY_LABEL", "CHEATS", "EXPECTED_CHECK", 
            "ATTACK_LABEL", "Inputs", "parse", "short_model", "model_order", "attack_order",
            "infer_scale", "scale_models", "honest_dirs", "cheat_dirs", "judged_honest_steps",
            "residual_index", "load_residuals", "scored_families", "nan_as_inf", "mean_std",
-           "bands", "margin_z", "seeds_note", "mark_infinite"]
+           "bands", "margin_z", "band_tau", "seeds_note", "mark_infinite"]
 
 # verification.verifier.matmul_check.sizing.Z, the band margin (τ = Z·s_h). Copied, since a
 # result script may not import verification (tests/test_layering.py); a test checks the copy.
@@ -50,8 +50,9 @@ DEFAULT_Z = 8.0
 FAMILIES = ("rho_5", "rho_kappa", "rho_6")
 FAMILY_LABEL = {"rho_5": "ρ_5(m, j)", "rho_kappa": "ρ_κ(m)", "rho_6": "ρ_6(W)"}
 CHEATS = ("A1", "A2", "A3", "hidden")
-# §2.1's rejecting check per scenario, as the step record names it
-EXPECTED_CHECK = {"A1": "4", "A2": "5", "A3": "6a", "hidden": "7"}
+# §2.1's rejecting check per scenario, as the step record names it. For A3, §2.1 names check 6,
+# the update identity, so either of its sub-checks, 6a or 6b, is as expected.
+EXPECTED_CHECK = {"A1": ("4",), "A2": ("5",), "A3": ("6a", "6b"), "hidden": ("7",)}
 # EQ4's panel order: the four full-scale models, then any other (test scale's SmolLM2)
 _MODEL_ORDER = ("Llama-3.2-1B", "Falcon3-1B", "Qwen2.5-0.5B", "Qwen2.5-1.5B")
 ATTACK_ORDER = ("jailbreak", "refusal")
@@ -199,13 +200,36 @@ def bands(root: str | Path) -> dict[str, Any] | None:
 
 
 def margin_z(band_file: dict[str, Any] | None) -> float:
-    """The configured margin ``z``: the band file's, else :data:`DEFAULT_Z` with a warning."""
-    z = ((band_file or {}).get("stats") or {}).get("z")
-    if z is None or not math.isfinite(float(z)):
-        warnings.warn(f"no z in the band file; using the default {DEFAULT_Z}", UserWarning,
+    """The configured margin ``z``: the band file's ``stats.z``. With no band file it is
+    :data:`DEFAULT_Z`, with a warning; a band file without a finite ``z`` is an error."""
+    if band_file is None:
+        warnings.warn(f"no band file; using the default margin z = {DEFAULT_Z}", UserWarning,
                       stacklevel=2)
         return DEFAULT_Z
+    z = (band_file.get("stats") or {}).get("z")
+    try:
+        ok = z is not None and not isinstance(z, bool) and math.isfinite(float(z))
+    except (TypeError, ValueError):
+        ok = False
+    if not ok:
+        raise ValueError(f"the band file has no finite stats.z (got {z!r})")
     return float(z)
+
+
+def band_tau(band_file: dict[str, Any] | None) -> float | None:
+    """The band file's ``tau``, which must be one finite scalar: rescaling ``ρ_5`` by
+    ``z_conf / z`` is then exact, since every ``ρ_5`` has the same ``τ = z · s_h``. ``None``
+    with no band file."""
+    if band_file is None:
+        return None
+    tau = band_file.get("tau")
+    try:
+        ok = not isinstance(tau, bool) and math.isfinite(float(tau))
+    except (TypeError, ValueError):
+        ok = False
+    if not ok:
+        raise ValueError(f"the band file's tau is not one finite scalar (got {tau!r})")
+    return float(tau)
 
 
 def seeds_note(counts: Iterable[int]) -> str:
