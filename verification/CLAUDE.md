@@ -1071,7 +1071,8 @@ interface.
     runs live in calibration. Since it runs after 6a, 5 and 6b, a live rejection from it is
     re-judged first: a band failure in that step's numbers replaces it, as in a judged run.
   - `end_run(final) -> RunVerdict(accepted, rejection, steps_verified, band_source)` runs
-    checks 8 and 9. It raises while calibration is unfrozen.
+    checks 8 and 9. It raises while calibration is unfrozen, unless `start_run` rejected the
+    run (check 1): no step ran, so no band can change that verdict, and it ends as it is.
   - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers, and
     `record_pass[t]` the record pass's status at a rejected step.
 - `residuals.py` (A10; A11 reuses it): summaries of `StepStats`, from `verifier.stats` or from

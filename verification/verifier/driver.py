@@ -23,9 +23,9 @@ Run shape:
 :attr:`Verifier.stats` and judge nothing, while the exact checks run live, the root
 comparison included. A11 fits the bands on those numbers and hands them to
 :meth:`Verifier.freeze`, which scores the calibration steps against them and judges every
-later step. :meth:`Verifier.end_run` refuses to give a verdict
-while calibration is unfrozen. In either mode every step's numbers are kept, and
-:attr:`Verifier.timings` holds each check's wall clock for C1.
+later step. :meth:`Verifier.end_run` refuses to give a verdict while calibration is
+unfrozen, unless check 1 rejected the run before any step. In either mode every step's
+numbers are kept, and :attr:`Verifier.timings` holds each check's wall clock for C1.
 
 Provisional bands (``source == "provisional"``) judge only when the caller passes
 ``allow_provisional=True``, for smoke runs: they never judge a cheat run (P10a).
@@ -343,8 +343,12 @@ class Verifier:
     # ---- run end: checks 8 and 9 --------------------------------------------------------
 
     def end_run(self, final: Mapping[str, torch.Tensor] | Sequence[bytes]) -> RunVerdict:
-        """Check 8 against the agreed final weights (tensors or leaf hashes), then check 9."""
-        if self.calibrate:
+        """Check 8 against the agreed final weights (tensors or leaf hashes), then check 9.
+
+        A calibration run must be frozen first, unless :meth:`start_run` rejected it: no step
+        ran, so no band can change that verdict, and it ends as it is."""
+        rejected_at_start = self._chain is None and self.rejection is not None
+        if self.calibrate and not rejected_at_start:
             raise RuntimeError("calibration is unfrozen: call freeze(bands) before end_run")
         if self.rejection is None:
             t0 = time.perf_counter()

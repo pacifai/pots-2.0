@@ -520,9 +520,9 @@ from measurement, not guessed. The test-scale procedure:
    `$VERIF_OUTPUT_DIR/bands.json`. Its BLAKE3 hash identifies it.
 6. Call `verifier.freeze(bands)`. It re-judges steps 1–3 against the frozen bands, then
    judges every later step live. `end_run` refuses to give a verdict while calibration is
-   unfrozen. Steps 1–3 are judged by bands fitted on them, so they are in-sample; at the
-   calibration seed their step records say `judged: false`, and the evaluation leaves them
-   out of the honest results.
+   unfrozen, unless check 1 rejected the run before any step. Steps 1–3 are judged by bands
+   fitted on them, so they are in-sample; at the calibration seed their step records say
+   `judged: false`, and the evaluation leaves them out of the honest results.
 
 Every later run loads the band file read-only with `calibration.load_bands(path, k=k,
 context=...)`. It refuses a missing file, a file calibrated at another `k`, and a file whose
