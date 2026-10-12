@@ -351,15 +351,17 @@ replaced:
   them, and writes the band file (see "Workflow: calibrating the tolerances").
 - **`bring_up.py`** is FS4: it takes one full-scale model, named by `VERIF_MODEL` and
   `VERIF_MODEL_REVISION` alone, through the code on CPU at test scale's other settings. It
-  prints the model's pin and runs honest steps from the pretrained weights with the verifier
-  in calibration mode, so only the exact checks judge. It then fits bands on those same steps
-  and freezes on them, so check 8 closes the run. It prints the residual tables, and, against
-  a reference band file such as SmolLM2's, each score family's largest score, for information.
-  On a model with q, k, v biases it alters one bias entry and expects check 5 or 6b to reject.
-  It reports each side's time and peak memory per step. It never downloads: it stops if the
-  weights aren't cached. With `--disk-transcripts DIR` each step reaches the verifier on disk,
-  through the store cross-check's `DiskHandoff`, rather than in memory; the protocol code is
-  the same.
+  prints the model's pin and runs honest steps from the pretrained weights with the verifier in
+  calibration mode, so only the exact checks judge. It then fits bands on those same steps and
+  freezes on them, so check 8 closes the run. A fit that fails the concentration guard (its
+  largest honest residual above `τ/2`) fails the bring-up, even when the run is accepted on it,
+  and the report says so. A step rejected live ends the run with that rejection, and nothing is
+  fitted. It prints the residual tables, and, against a reference band file such as SmolLM2's,
+  each score family's largest score, for information. On a model with q, k, v biases it alters
+  one bias entry and expects check 5 or 6b to reject. It reports each side's time and peak
+  memory per step. It never downloads: it stops if the weights aren't cached. With
+  `--disk-transcripts DIR` each step reaches the verifier on disk, through the store
+  cross-check's `DiskHandoff`, rather than in memory; the protocol code is the same.
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every

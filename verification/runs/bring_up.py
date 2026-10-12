@@ -18,8 +18,10 @@ weights aren't in the local Hugging Face cache.
    calibration mode (P10b): the exact checks judge live, and checks 5 and 6 only record. After
    the last step the bands are fitted on these steps (``calibration.fit``) and the verifier
    freezes on them, so check 8 closes the run. The fit is in-sample and never written as a band
-   file: it gives item 4 its bands and nothing else. Check 8's reference is ``T`` uncaptured
-   steps from ``W_0``, kept as leaf hashes only.
+   file: it gives item 4 its bands and nothing else. Its concentration guard (the largest
+   honest normalized residual at most ``τ/2``) is printed beside it, and a failure is flagged in
+   the verdict and fails the run. Check 8's reference is ``T`` uncaptured steps from ``W_0``,
+   kept as leaf hashes only. A step rejected live ends the run with that rejection, unfitted.
 3. **Residuals, printed and not judged.** Check 5's table by product class and check 6's by
    weight role. With ``--reference-bands`` (SmolLM2's band file), each score family's largest
    score at each step under those bands (EVALUATION_SPEC §2.2: check 5's ``ρ_5``, its κ guard's
@@ -30,7 +32,8 @@ weights aren't in the local Hugging Face cache.
    FS2's switch test, on the real model, judged by item 2's fitted bands: step 1 trained with
    the last entry of layer 1's ``b_q`` raised by 1 under an honest ``W_t`` leaf must fail
    check 5 at ``L1.Y_q``, and an honest step with that entry raised in its ``W_{t+1}`` leaf
-   must fail check 6b.
+   must fail check 6b. It runs on bands that fail the concentration guard too, and its result
+   is then labeled so.
 5. **Cost.** The honest run is the B6 memory pass (``MemoryRecorder``): each step's prover and
    verifier peak, beside the loop's wall clocks (``prove_step`` and the commit; every check),
    which the probe's sampling slows a little. With ``--disk-transcripts DIR`` every step, the
@@ -38,7 +41,8 @@ weights aren't in the local Hugging Face cache.
    (an option of this run only; the protocol code is the same); the write lands in the commit
    time.
 
-Exits 0 when the honest run is accepted and each tamper is rejected where expected, else 1.
+Exits 0 when the honest run is accepted, its fit holds the concentration guard and each
+tamper is rejected where expected, else 1.
 """
 
 from __future__ import annotations
@@ -71,7 +75,13 @@ from verification.runs.metrics import (
     rho_arrays,
     step_scores,
 )
-from verification.runs.scenarios import HONEST, ReusedModel, ScenarioResult, honest_final, run_scenario
+from verification.runs.scenarios import (
+    HONEST,
+    ReusedModel,
+    ScenarioResult,
+    honest_final,
+    run_scenario,
+)
 from verification.transcript.store import IN_MEMORY, DiskHandoff, InMemoryStore, StoreHandoff
 from verification.verifier.bands import Bands, product_class
 from verification.verifier.calibration import Calibration, band_file_bytes, fit
@@ -88,6 +98,13 @@ __all__ = ["BringUp", "Tamper", "bring_up", "bias_tamper", "reference_bands", "f
            "main"]
 
 RUN_NAME = "bring_up"
+
+# The freeze's bands after a live rejection, before any fit: every bound is the largest finite
+# float, so re-judging the rejected step fails only a NaN or infinite number, which fails any
+# band and would have stopped a judged run before the root comparison. Otherwise the reported
+# rejection is the live one.
+_UNFITTED = Bands(tau=sys.float_info.max, kappa_max=sys.float_info.max,
+                  tau_w=sys.float_info.max, source="bring-up: rejected live, before the fit")
 
 
 @dataclass
@@ -109,11 +126,13 @@ class Tamper:
 
 @dataclass
 class BringUp:
-    """What :func:`bring_up` measured. ``bands`` are the in-sample fit of the honest steps."""
+    """What :func:`bring_up` measured. ``bands`` are the in-sample fit of the honest steps.
+    ``freeze_rejection`` is what the freeze returned: on the fit, or after a live rejection on
+    bands that keep it (``None`` when no freeze ran, as after check 1's rejection)."""
 
     result: ScenarioResult
     memory_rows: list[dict[str, Any]]
-    cal: Calibration | None  # None when a step was rejected live, before the fit
+    cal: Calibration | None  # None when the run was rejected live, before the fit
     bands: Bands | None
     freeze_rejection: Rejection | None
     tampers: list[Tamper] = field(default_factory=list)
@@ -123,8 +142,16 @@ class BringUp:
         return self.result.loop.verdict.accepted
 
     @property
+    def guard_ok(self) -> bool | None:
+        """The fit's concentration guard (``Calibration.guard_ok``), ``None`` without a fit."""
+        return None if self.cal is None else self.cal.guard_ok
+
+    @property
     def passed(self) -> bool:
-        return self.honest_accepted and all(t.rejected_as_expected for t in self.tampers)
+        """The honest run is accepted on a fit that holds the concentration guard, and each
+        tamper is rejected where expected."""
+        return (self.honest_accepted and self.guard_ok is True
+                and all(t.rejected_as_expected for t in self.tampers))
 
 
 def _bump(t: torch.Tensor, index: int = -1) -> torch.Tensor:
@@ -216,9 +243,10 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
         # The loop calls end_run after its last step, and end_run needs a frozen verifier.
         v: Verifier = got["v"]
         if rec.rejection is not None:
-            # A live rejection stands whatever the bands say (Verifier.freeze), so these only
-            # let the loop close the run and report it.
-            v.freeze(Bands(tau=1.0, kappa_max=1.0, source="bring-up: rejected before the fit"))
+            # No fit: freeze on bands that keep the live rejection (_UNFITTED). Finite bands
+            # of ordinary size could replace a root-comparison rejection with a band failure
+            # of that step's numbers (Verifier.freeze), which no fitted band ever judged.
+            got["freeze"] = v.freeze(_UNFITTED)
         elif rec.t == T:
             cal = fit(v.stats, k=k)
             bands = Bands.from_json(band_file_bytes(cal, {"context": {"bring_up": RUN_NAME}}))
@@ -257,8 +285,9 @@ def family_maxima(stats: Any, bands: Bands, *, k: int) -> dict[str, tuple[float,
     """Per score family: ``(largest score, number above 1, where the largest sits)``."""
     s = step_scores(stats, bands, k=k)
     rho = rho_arrays(stats, bands, k=k)
+    k5 = rho["rho_5"].shape[1]  # check 5's scores: one row of k challenges per product
     where = {
-        "rho_5": lambda i: stats.products[i // rho["rho_5"].shape[1]].name,
+        "rho_5": lambda i: f"{stats.products[i // k5].name}, challenge j={i % k5 + 1}",
         "rho_kappa": lambda i: stats.products[i].name,
         "rho_6": lambda i: f"{stats.tensors[i].weight} ({stats.tensors[i].check_id})",
     }
@@ -282,12 +311,20 @@ def report(b: BringUp, *, k: int, reference: Bands | None,
     for s in loop.steps:
         out(f"   step {s.t}: loss {s.loss:.4f}, "
             + ("exact checks passed" if s.rejection is None else f"REJECTED {s.rejection}"))
-    if b.cal is not None:
-        out(f"   in-sample fit: s_h {b.cal.s_h:.4g} ({b.cal.s_h_class}), τ = 8·s_h "
-            f"{b.cal.tau:.4g}, global max {b.cal.global_max:.4g} ({b.cal.global_max_name})")
-    out(f"   frozen on it: {'accepted' if b.freeze_rejection is None else b.freeze_rejection}; "
-        f"run verdict (check 8 included): "
-        f"{'ACCEPTED' if loop.verdict.accepted else loop.verdict.rejection}")
+    cal = b.cal
+    if cal is None:
+        out("   no fit: the run was rejected before its last step was verified")
+    else:
+        out(f"   in-sample fit: s_h {cal.s_h:.4g} ({cal.s_h_class}), τ = 8·s_h {cal.tau:.4g}, "
+            f"global max {cal.global_max:.4g} ({cal.global_max_name})")
+        out(f"   concentration guard: global max {cal.global_max:.4g} ≤ τ/2 = "
+            f"{cal.guard_limit:.4g}: " + ("holds" if cal.guard_ok else "FAILS"))
+        out("   frozen on it: "
+            + ("accepted" if b.freeze_rejection is None else str(b.freeze_rejection)))
+    out("   run verdict (check 8 included): "
+        + ("ACCEPTED" if loop.verdict.accepted else f"REJECTED {loop.verdict.rejection}")
+        + ("" if b.guard_ok is not False else
+           "; the fit FAILS the concentration guard, so this is not a clean pass"))
     out("== check 5: normalized residuals by matmul class (not judged)")
     format_class_table(class_summary(v.stats), out)
     out("== check 6: ρ_max by weight role (not judged)")
@@ -311,7 +348,8 @@ def report(b: BringUp, *, k: int, reference: Bands | None,
         out(f"== tamper: {tp.name}: expected check {tp.expected}, got "
             + ("ACCEPTED" if rej is None else f"check {rej.check_id} at step {rej.step}: "
                f"{rej.detail[:160]}")
-            + ("" if tp.rejected_as_expected else "  <-- NOT AS EXPECTED"))
+            + ("" if tp.rejected_as_expected else "  <-- NOT AS EXPECTED")
+            + ("" if b.guard_ok else "  [bands fail the concentration guard]"))
     out("== cost (wall clock from the memory pass)")
     report_costs(r, b.memory_rows, out)
 

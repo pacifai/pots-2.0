@@ -2,6 +2,8 @@
 bands, the scores against a reference band file and the altered-bias steps; on each cached
 full-scale model, the whole bring-up (slow)."""
 
+import dataclasses
+
 import pytest
 
 from tests.verification.decoder_helpers import make_records, randomize_biases, tiny_config
@@ -9,13 +11,14 @@ from tests.verification.full_scale_helpers import PIN_IDS, PINS, full_scale_case
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances import DecoderComputation
 from verification.runs.bring_up import bring_up, family_maxima, reference_bands, report
-from verification.transcript.store import DiskHandoff
+from verification.transcript.store import DiskHandoff, InMemoryStore, StoreHandoff
 from verification.verifier.bands import Bands
+from verification.verifier.driver import RUN_START
 
 SEED, K = 1, 5
 
 
-def _run(family, tied, *, T=2, tamper=True, handoff=None):
+def _run(family, tied, *, T=2, tamper=True, handoff=None, h_D=None):
     c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
     D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
 
@@ -24,8 +27,35 @@ def _run(family, tied, *, T=2, tamper=True, handoff=None):
         randomize_biases(dict(m.named_parameters()))  # HF starts biases at zero
         return m
 
-    return c, bring_up(c, D, dataset_tree(c, D).root, T=T, k=K, seed=SEED, build_model=build,
-                       tamper=tamper, handoff=handoff)
+    h_D = dataset_tree(c, D).root if h_D is None else h_D
+    return c, bring_up(c, D, h_D, T=T, k=K, seed=SEED, build_model=build, tamper=tamper,
+                       handoff=handoff)
+
+
+class _WrongRootStore(InMemoryStore):
+    """An honest step's leaves under a claimed root with one bit flipped."""
+
+    @property
+    def root(self):
+        r = super().root
+        return bytes([r[0] ^ 1]) + r[1:]
+
+
+class _WrongRootAt(StoreHandoff):
+    """Hands step ``t`` over under a wrong root, so check 2's root comparison rejects it."""
+
+    def __init__(self, t):
+        self.t = t
+
+    def hold(self, c, t, leaves, tree, dataset_paths=None):
+        cls = _WrongRootStore if t == self.t else InMemoryStore
+        return cls.hold(c, leaves, tree, dataset_paths)
+
+
+def _text(b, c):
+    lines = []
+    report(b, k=K, reference=None, c=c, out=lines.append)
+    return "\n".join(lines)
 
 
 @pytest.fixture(scope="module", params=[("llama", True), ("qwen2", False)],
@@ -75,6 +105,7 @@ def test_scores_on_the_fit_stay_within_one(run):
         assert set(got) == {"rho_5", "rho_kappa", "rho_6"}
         for fam, (mx, n_over, where) in got.items():
             assert 0 < mx <= 1 and n_over == 0 and where, (t, fam)
+        assert ", challenge j=" in got["rho_5"][2]  # the product and its challenge
 
 
 def test_disk_handoff_gives_the_same_decisions(tmp_path):
@@ -111,12 +142,56 @@ def test_report_prints_each_part(run):
     report(b, k=K, reference=ref, c=c, out=lines.append)
     text = "\n".join(lines)
     for part in ("honest steps", "frozen on it: accepted", "run verdict (check 8 included): "
-                 "ACCEPTED", "check 5: normalized residuals", "check 6: ρ_max",
+                 "ACCEPTED", "concentration guard: global max", ": holds",
+                 "check 5: normalized residuals", "check 6: ρ_max",
                  "scores against the reference band file", "families above 1: rho_5",
                  "step 2: prover", "verifier peak"):
         assert part in text, part
-    assert "NOT AS EXPECTED" not in text
+    assert "NOT AS EXPECTED" not in text and "FAILS" not in text
     assert ("tamper:" in text) == c.qkv_bias
+
+
+def test_a_fit_that_fails_the_concentration_guard_is_flagged(run):
+    """A fit whose largest honest residual is above ``τ/2`` fails the run, though the run is
+    accepted on it: the report says so in the guard line and in the verdict, and labels each
+    tamper as judged by such bands."""
+    c, b = run
+    assert b.guard_ok is True and b.passed
+    over = dataclasses.replace(b.cal, global_max=0.6 * b.cal.tau)
+    bad = dataclasses.replace(b, cal=over)
+    assert bad.honest_accepted and bad.guard_ok is False and not bad.passed
+    text = _text(bad, c)
+    assert f"≤ τ/2 = {over.guard_limit:.4g}: FAILS" in text
+    assert "ACCEPTED; the fit FAILS the concentration guard, so this is not a clean pass" in text
+    tampers = [x for x in text.splitlines() if x.startswith("== tamper:")]
+    assert len(tampers) == (2 if c.qkv_bias else 0)
+    assert all(x.endswith("[bands fail the concentration guard]") for x in tampers)
+
+
+def test_a_live_root_rejection_is_the_one_reported():
+    """Step 1 handed over under a wrong root is rejected live by check 2's root comparison.
+    There is no fit, and the freeze keeps that rejection: bands of ordinary size would re-judge
+    the step's recorded numbers first and could report a check 5 band failure instead."""
+    c, b = _run("qwen2", False, handoff=_WrongRootAt(1))
+    live = b.result.loop.steps[0].rejection
+    assert (live.step, live.check_id) == (1, "2") and "recomputed root" in live.detail
+    assert b.result.loop.verdict.rejection == live == b.freeze_rejection
+    assert b.cal is None and b.bands is None and b.tampers == [] and not b.passed
+    text = _text(b, c)
+    assert "no fit: the run was rejected" in text and "frozen on it" not in text
+    assert f"run verdict (check 8 included): REJECTED {live}" in text
+
+
+def test_a_rejection_at_run_start_is_reported():
+    """A wrong ``h_D`` is rejected by check 1 before any step: the calibration-mode verifier
+    ends the run with that rejection rather than raising for want of a freeze."""
+    c, b = _run("qwen2", False, h_D=bytes(32))
+    rej = b.result.loop.verdict.rejection
+    assert (rej.step, rej.check_id) == (RUN_START, "1") and "h_D" in rej.detail
+    assert b.result.loop.steps == [] and b.cal is None and b.freeze_rejection is None
+    assert not b.passed
+    text = _text(b, c)
+    assert "no fit" in text and f"REJECTED {rej}" in text
 
 
 @pytest.mark.slow

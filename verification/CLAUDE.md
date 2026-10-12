@@ -1390,44 +1390,58 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     on `P_2371` (`Λ`), residual 10.1 > τ = 8.
 - `bring_up.py` (FS4): `VERIF_MODEL=<repo> VERIF_MODEL_REVISION=<commit> .venv/bin/python -m
   verification.runs.bring_up [--steps T] [--reference-bands PATH] [--tamper | --no-tamper]
-  [--disk-transcripts DIR]`, `T` default 1. One full-scale model on CPU at test scale's other settings (dtypes, `n_s × n`,
-  η, `k`, seed); nothing in the code names a model, so Meta's Llama repo runs through the two
-  env vars alone. `D` and `h_D` come from `$VERIF_OUTPUT_DIR/data/` (`materialize_data` for the
-  same model). `main` stops with an error, before loading anything, when `model_pin` finds no
-  cached weights or `D.bin` is missing; it never downloads. Exits 1 unless `BringUp.passed`.
+  [--disk-transcripts DIR]`, `T` default 1. One full-scale model on CPU at test scale's other
+  settings (dtypes, `n_s × n`, η, `k`, seed); nothing in the code names a model, so Meta's Llama
+  repo runs through the two env vars alone. `D` and `h_D` come from `$VERIF_OUTPUT_DIR/data/`
+  (`materialize_data` for the same model). `main` stops with an error, before loading anything,
+  when `model_pin` finds no cached weights or `D.bin` is missing; it never downloads. Exits 1
+  unless `BringUp.passed`: the honest run accepted, the fit's concentration guard held, every
+  tamper rejected as expected.
   - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu",
-    handoff=None) -> BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It takes any
-    `DecoderComputation`, so a random-weight config runs the same path. `W_0` and every prover
-    run come from one `ReusedModel`. Check 8's reference is `honest_final`'s `W_T`, kept as
-    leaf hashes (`leaf_hashes_of`, `end_run` takes either). The honest run is `run_scenario`
-    inside `memory_pass`, with a calibration-mode verifier (P10b): the exact checks judge
-    live, 5 and 6 record. `on_step` fits on the last step (`calibration.fit`,
+    handoff=None) -> BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It
+    takes any `DecoderComputation`, so a random-weight config runs the same path. `W_0` and
+    every prover run come from one `ReusedModel`. Check 8's reference is `honest_final`'s `W_T`,
+    kept as leaf hashes (`leaf_hashes_of`, `end_run` takes either). The honest run is
+    `run_scenario` inside `memory_pass`, with a calibration-mode verifier (P10b): the exact
+    checks judge live, 5 and 6 record. `on_step` fits on the last step (`calibration.fit`,
     `band_file_bytes`, `Bands.from_json`) and freezes on that fit, so `end_run` can close the
-    run with check 8; a live rejection freezes on placeholder bands, since it stands whatever
-    the bands are. The fit is in-sample and never written: it judges the freeze and the
-    tamper, nothing else.
+    run with check 8. The fit is in-sample and never written: it judges the freeze and the
+    tamper, nothing else. `BringUp.guard_ok` is the fit's concentration guard
+    (`Calibration.guard_ok`: global max at most `τ/2`), `None` without a fit; `passed` requires
+    it. A live rejection freezes on `_UNFITTED`, bands at the largest finite float, so the
+    reported rejection is the live one: `freeze` re-judges a root-comparison rejection's step
+    first, and ordinary bands (the placeholder `τ = κ_max = 1` before) would turn it into a
+    check-5 band failure. Only a NaN or infinite number, which fails any band, can still replace
+    it. `freeze_rejection` holds the freeze's result, `None` when none ran. A check-1 rejection
+    at run start ends the run unfrozen (`Verifier.end_run`).
   - `handoff` (`--disk-transcripts DIR`, a `DiskHandoff(DIR)`) hands each step to the verifier
     as C3's store cross-check does, the honest steps and both tampers alike; `None` is
     `IN_MEMORY`. The protocol code is the same either way, and the disk write lands in the
     commit time. `test_disk_handoff_gives_the_same_decisions` checks that a tiny Qwen2 run
     decides number for number as in memory and leaves `DIR` empty.
   - `bias_tamper(c, D, w0, bands, *, k, seed, h_D, build_model, layer=1, x="q",
-    handoff=None)`: two one-step judged runs (FS2's switch test on the real model). The last entry of `b_q` in layer 1 is
-    raised by 1 in training with the `W_t` leaf restored (expected: check 5 naming
-    `P_m (L1.Y_q)`), and in an honest step's `W_{t+1}` leaf (expected: 6b naming the bias).
-    `Tamper.rejected_as_expected` checks the step, the check and that name.
+    handoff=None)`: two one-step judged runs (FS2's switch test on the real model). The last
+    entry of `b_q` in layer 1 is raised by 1 in training with the `W_t` leaf restored
+    (expected: check 5 naming `P_m (L1.Y_q)`), and in an honest step's `W_{t+1}` leaf
+    (expected: 6b naming the bias). `Tamper.rejected_as_expected` checks the step, the check
+    and that name. It also runs on a fit that fails the concentration guard, and `report`
+    labels each result "bands fail the concentration guard".
   - `reference_bands(ref, c)` carries a band file to another model for scoring only: `τ`, the
     default `κ_max` and the per-class `κ_max` of the classes `c` has; every weight takes the
     default `τ_W`, since `ref`'s per-tensor values name its own tensors. It also returns `c`'s
     classes that `ref` doesn't name (`G_head` for an untied model against SmolLM2's file).
     `family_maxima(stats, bands, *, k)` gives each score family's largest score, its count
-    above 1 and where it sits. `report` prints the honest steps, the fit, `residuals.py`'s two
-    tables, the reference scores, the tampers and `llama_step.report_costs`.
+    above 1 and where it sits (for `ρ_5` the product and its challenge `j`). `report` prints
+    the honest steps, the fit with its concentration guard (`holds` or `FAILS`, and a failure
+    again in the verdict line), `residuals.py`'s two tables, the reference scores, the tampers
+    and `llama_step.report_costs`.
   - Real runs (2026-10-12, dev Mac under other jobs, `MallocLargeCache=0`,
     `VERIF_N_RECORDS=369`, `T = 1`, `k = 9`; GB here is 2^30 bytes, as `report` prints it):
     - Qwen2.5-0.5B, in memory, weights SHA-256 `fdf756fa…`: the honest step (loss 2.1318) is
-      accepted with check 8 on its own fit, `s_h` 6.19 (`Λ`), `τ` 49.5, global max 25.9 at
-      `L9.dQ[3,5]`. The altered `b_q` entry is rejected at check 5 on `P_1 (L1.Y_q)`, residual
+      accepted with check 8 on its own fit, `s_h` 6.19 (`Λ`), `τ` 49.5, but the fit **fails
+      the concentration guard**: the global max, 25.9 at `L9.dQ[3,5]`, is above `τ/2` =
+      24.75. So it isn't a clean pass, and `bring_up` now exits 1 on it (the run predates the
+      guard's check). The altered `b_q` entry is rejected at check 5 on `P_1 (L1.Y_q)`, residual
       2.67e3, and at 6b (`ρ_max` 1.7e7). Against SmolLM2's band file (`cc7a9bca…`, `τ` 38.0)
       `ρ_5` is 0.68 and `ρ_6` 0.50, but `ρ_κ` 2.93 (104 products above 1, largest at
       `L1.dQ[1,6]`; `dQ`'s `κ` reaches 44). Prover 2.50 s, verifier 3.83 s (check 5 2.74);
@@ -1439,35 +1453,35 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
       2.1 / 3.6 s; Falcon3-1B 24.2 GB, 9.6 / 2.7 / 3.4 s; Qwen2.5-1.5B 25.2 GB, 12.9 / 3.9 /
       5.5 s; Meta's Llama-3.2-1B 20.3 GB, 11.1 / 3.3 / 4.9 s. The 1B peaks fall within 0.2 GB
       of the L2/L4 shake-outs' linear projection.
-    - Meta's Llama-3.2-1B, in memory, weights SHA-256 `1ff795ff…`: the honest step (loss
-      1.5121) is accepted with check 8 on its own fit, `s_h` 3.02 (`Λ`), `τ` 24.2, global max
-      5.30 at `L2.G_down`. It has no q, k, v biases, so no tamper. Against SmolLM2's band
-      file `ρ_5` 0.14 and `ρ_6` 0.50, but `ρ_κ` 1.15 (33 above 1, largest at `L4.dX_up`).
-      Prover 4.88 s, verifier 9.79 s (check 5 7.69); prover peak 21.8 GB, verifier 29.4 GB
-      (projected 30.5); 22 s for the command; 96 pages swapped out.
+    - Meta's Llama-3.2-1B, in memory, weights SHA-256 `1ff795ff…`: the honest step (loss 1.5121)
+      is accepted with check 8 on its own fit, `s_h` 3.02 (`Λ`), `τ` 24.2, global max 5.30 at
+      `L2.G_down` (the guard holds: 5.30 ≤ 12.1). It has no q, k, v biases, so no tamper.
+      Against SmolLM2's band file `ρ_5` 0.14 and `ρ_6` 0.50, but `ρ_κ` 1.15 (33 above 1, largest
+      at `L4.dX_up`). Prover 4.88 s, verifier 9.79 s (check 5 7.69); prover peak 21.8 GB,
+      verifier 29.4 GB (projected 30.5); 22 s for the command; 96 pages swapped out.
     - Falcon3-1B, in memory, weights `3f551b32…`: accepted with check 8 on its own fit, loss
-      1.5055, `s_h` 2.75 (`Λ`), `τ` 22.0, global max 7.54 at `L2.G_down`. No biases, so no
-      tamper. SmolLM2's file doesn't name `G_head`, which takes the default `κ_max`. `ρ_5`
-      0.20, `ρ_6` 0.50, `ρ_κ` 1.09 (19 above 1, at `L6.dX_up`). Prover 5.44 s, verifier
-      12.84 s (check 5 10.40); prover peak 27.3 GB, verifier 36.7 GB (projected 38); 28 s;
-      about 3.9 GiB swapped out.
+      1.5055, `s_h` 2.75 (`Λ`), `τ` 22.0, global max 7.54 at `L2.G_down` (the guard holds: 7.54
+      ≤ 11.0). No biases, so no tamper. SmolLM2's file doesn't name `G_head`, which takes the
+      default `κ_max`. `ρ_5` 0.20, `ρ_6` 0.50, `ρ_κ` 1.09 (19 above 1, at `L6.dX_up`). Prover
+      5.44 s, verifier 12.84 s (check 5 10.40); prover peak 27.3 GB, verifier 36.7 GB (projected
+      38); 28 s; about 3.9 GiB swapped out.
     - Qwen2.5-1.5B, in memory, weights `dd924a11…`: the honest step (loss 2.0614) passes the
       exact checks but is **rejected on its own fit**. `s_h` is 4.90 (`Λ`) and `τ` 39.2, while
       check 5's normalized residual at `L1.dQ[0,3]` (first layer, sequence 0, head 3) is 79.3,
-      16.2 times `s_h`. `dQ`'s RMS is 2.74 and its max 79.3; ten residuals exceed SmolLM2's
-      `τ` of 38.0 (`ρ_5` 2.09). `dQ`'s `κ` reaches 153 at `L1.dQ[1,3]`, the same head (`ρ_κ`
-      10.2, 98 above 1), against 15.0 for `dQ` in SmolLM2's file. Cut to 2 or 4 layers
-      (random weights, below) `dQ`'s max is 1.1 and its `κ` 5. A likely reading, not checked
-      product by product: the band unit scales with `‖P‖_F`, while a product whose terms
-      cancel 150-fold carries rounding error on the scale of its terms. The tamper isn't run,
-      since `bring_up` runs it only after an accepted honest step. Exit 1; prover 6.15 s,
-      verifier 13.20 s (check 5 10.70); prover peak 27.1 GB, verifier 36.9 GB (projected 39);
-      30 s; about 1.9 GiB swapped out. Left open for the plan to decide.
+      16.2 times `s_h`; the guard fails too (79.3 > 19.6). `dQ`'s RMS is 2.74 and its max 79.3;
+      ten residuals exceed SmolLM2's `τ` of 38.0 (`ρ_5` 2.09). `dQ`'s `κ` reaches 153 at
+      `L1.dQ[1,3]`, the same head (`ρ_κ` 10.2, 98 above 1), against 15.0 for `dQ` in SmolLM2's
+      file. Cut to 2 or 4 layers (random weights, below) `dQ`'s max is 1.1 and its `κ` 5. A
+      likely reading, not checked product by product: the band unit scales with `‖P‖_F`, while a
+      product whose terms cancel 150-fold carries rounding error on the scale of its terms. The
+      tamper isn't run, since `bring_up` runs it only after an accepted honest step. Exit 1;
+      prover 6.15 s, verifier 13.20 s (check 5 10.70); prover peak 27.1 GB, verifier 36.9 GB
+      (projected 39); 30 s; about 1.9 GiB swapped out. Left open for the plan to decide.
     - The Falcon3 and Qwen2.5-1.5B runs used swap. The arithmetic is deterministic, so swap
       changes the times, not the decisions. The slow bring-up test wasn't run on the 1B
       models; it calls the same `bring_up`.
-  - `main` ran on SmolLM2 as a path check: accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the band file's 4.75 is over steps
-    1–3), `τ` 46.3; prover 1.58 s, verifier 2.49 s (check 5
+  - `main` ran on SmolLM2 as a path check: accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the
+    band file's 4.75 is over steps 1–3), `τ` 46.3; prover 1.58 s, verifier 2.49 s (check 5
     1.92); prover peak 4.30 GB, verifier peak 4.74 GB; against its own band file `ρ_5` 0.30,
     `ρ_κ` 0.50, `ρ_6` 0.50.
   - Random-weight shake-outs (2026-10-12), not the bring-up: each model's real config,
