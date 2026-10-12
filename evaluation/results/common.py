@@ -28,7 +28,7 @@ import argparse
 import json
 import math
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -61,24 +61,31 @@ _TEST_FAMILY = "SmolLM2"  # §3.1: the test-scale model
 
 
 class Inputs:
-    """What a script's ``main`` works from: the records, the scale and the output root."""
+    """What a script's ``main`` works from: the records, the scale, the output root and the
+    parsed command line, for a script's own options."""
 
-    def __init__(self, records: Records, scale: str, root: Path):
+    def __init__(self, records: Records, scale: str, root: Path,
+                 args: argparse.Namespace | None = None):
         self.records, self.scale, self.root = records, scale, root
+        self.args = args if args is not None else argparse.Namespace()
         self.models = scale_models(records, scale)
 
 
-def parse(description: str, argv: Sequence[str] | None = None) -> Inputs:
-    """Reads ``--root`` and ``--scale`` from ``argv``, then the records under the root."""
+def parse(description: str, argv: Sequence[str] | None = None,
+          options: Callable[[argparse.ArgumentParser], None] | None = None) -> Inputs:
+    """Reads ``--root``, ``--scale`` and the options ``options`` adds from ``argv``, then the
+    records under the root."""
     p = argparse.ArgumentParser(description=description)
     p.add_argument("--root", type=Path, default=None,
                    help="the output directory (default: $VERIF_OUTPUT_DIR)")
     p.add_argument("--scale", choices=SCALES, default=None,
                    help="test or full (default: from the models in the records)")
+    if options is not None:
+        options(p)
     a = p.parse_args(argv)
     root = output_dir() if a.root is None else a.root
     recs = read(root)
-    return Inputs(recs, a.scale or infer_scale(recs), root)
+    return Inputs(recs, a.scale or infer_scale(recs), root, a)
 
 
 def short_model(name: str | None) -> str:

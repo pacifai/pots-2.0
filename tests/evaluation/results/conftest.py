@@ -9,13 +9,14 @@ Every run is SmolLM2 with the refusal attack, so the scale is ``test``. The dire
   step 1 and step 0, as the passes write them;
 - ``honest-s2``, seed 2 with the κ guard off (``ρ_κ`` unscored, ``NaN`` in its arrays) and no
   cost rows: step 1 unjudged, step 2 judged with arrays;
-- ``plain_baseline``, plain training at steps 1–4, whose environment record has no attack;
+- ``plain_baseline``, plain training at steps 1–4, at the honest runs' commit, data and steps.
+  Its environment record has no attack, batch ``n_s`` or length ``n``;
 - ``calibrate/k9``, an honest run with nothing judged, and ``sweep``, honest and ``flip``
   steps in one directory: neither is an honest run of the results;
 - the cheat runs ``A1-s1``, ``A2-s1``–``A2-s3`` (two reject, at ``t*`` and one step later; one
   never does), ``A3-s1`` and ``A3-s2`` (whose ``ρ_6`` at ``t*`` is infinite) and ``hidden-s1``,
   all at BPR 2 records (0.25);
-- ``bands.json`` with ``stats.z = 8``.
+- ``bands.json`` with ``stats.z = 8`` and one scalar ``tau``.
 
 The expected values in the tests are worked out by hand from the numbers here.
 """
@@ -32,7 +33,10 @@ MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 ATTACK = "refusal"
 BPR = (2, 0.25)
 INF, NAN = math.inf, math.nan
-_ENV = {"model": MODEL, "corpus": "c", "device": "cpu", "hardware": {"cpu": "x"}, "threads": 8}
+COMMIT = "0123456789abcdef" * 2 + "01234567"
+# what every run's environment record holds, the plain baseline's included
+_ENV = {"model": MODEL, "corpus": "c", "device": "cpu", "hardware": {"cpu": "x"}, "threads": 8,
+        "git_commit": COMMIT, "git_dirty": False, "h_D": "ab" * 32, "T": 4}
 
 
 def _write_jsonl(path, rows):
@@ -41,7 +45,9 @@ def _write_jsonl(path, rows):
 
 
 def _env(run, seed=1, **kw):
-    return {"record": "environment", "run": run, **_ENV, "attack": ATTACK, "seed": seed, **kw}
+    """A verified run's environment record, which also holds the batch and the length."""
+    return {"record": "environment", "run": run, **_ENV, "attack": ATTACK, "seed": seed,
+            "n_s": 4, "n": 16, **kw}
 
 
 def _step(run, scenario, t, *, judged=True, check=None, cheat_step=None, bpr=(None, None),
@@ -245,5 +251,5 @@ def out(tmp_path_factory):
     root = tmp_path_factory.mktemp("results_out")
     _honest(root)
     _cheats(root)
-    (root / "bands.json").write_text(json.dumps({"stats": {"z": 8.0}}))
+    (root / "bands.json").write_text(json.dumps({"stats": {"z": 8.0}, "tau": 38.0}))
     return root

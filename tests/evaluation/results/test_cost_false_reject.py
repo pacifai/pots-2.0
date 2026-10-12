@@ -10,7 +10,18 @@ import pytest
 from evaluation import records as er
 from evaluation.results import cost, false_reject
 
-from .conftest import ATTACK, MODEL, ONE_OFF_TIME
+from .conftest import (
+    _ENV,
+    ATTACK,
+    COMMIT,
+    MODEL,
+    ONE_OFF_TIME,
+    _env,
+    _honest_costs,
+    _plain_costs,
+    _step,
+    _write_jsonl,
+)
 
 
 @pytest.fixture(scope="module")
@@ -83,9 +94,11 @@ def mc(recs):
 
 
 def test_gather_pairs_the_plain_run_and_skips_calibration(recs, mc):
-    assert cost.plain_pair(recs, "honest-s1") == "plain_baseline"
+    base = cost.plain_pair(recs, "honest-s1")
+    # the same commit, data, steps and machine; the plain run records no batch or length
+    assert (base.plain_dir, base.mismatch, base.unchecked) == ("plain_baseline", {}, ("n_s", "n"))
     # calibrate/k9 judged nothing, and honest-s2 has no cost records
-    assert (mc.runs, mc.steps_per_run) == (1, [4])
+    assert mc.runs == 1 and set(mc.baselines) == {"honest-s1"}
     assert mc.time["P0"] == [1.0, 1.0, 1.0]  # judged steps 2–4 only
     assert mc.time["P1"] == pytest.approx([0.07] * 3)  # 0.05 more forward, 0.02 labelling
     assert mc.time["5"] == pytest.approx([0.9, 1.0, 1.1])
@@ -101,21 +114,25 @@ def test_gather_pairs_the_plain_run_and_skips_calibration(recs, mc):
 def test_cost_ratios(mc):
     rows = {r["measure"]: r for r in cost.ratio_rows([mc])}
     time, flops = rows["time"], rows["FLOPs"]
-    # per step: P0 1.0; P1–P5 0.07 + 0.1 + 0.2 + 0.3 + 0.4; checks 4 … 2.root sum to 1.8
+    # per judged step: P0 1.0; P1–P5 0.07 + 0.1 + 0.2 + 0.3 + 0.4; the checks 4 … 2.root
+    # total 1.7, 1.8 and 1.9 at steps 2–4, so 1.8 on average
     assert time["P0"] == 1.0
     assert time["prover_overhead"] == pytest.approx(1.07)
     assert time["verifier"] == pytest.approx(1.8)
     assert time["overhead_over_P0"] == pytest.approx(1.07)
     assert time["verifier_over_P0"] == pytest.approx(1.8)
     assert time["prover_plus_verifier_over_P0"] == pytest.approx(3.87)
-    # per run of 4 steps: 4 · 1.8 + 1 + 2 + 3 + 0.5 against 4 · 1.0
-    assert time["verifier_per_run_over_P0_per_run"] == pytest.approx(13.7 / 4)
-    assert (time["steps_per_run"], time["runs"]) == (4.0, 1)
+    assert (time["judged_steps"], time["P0_steps"], time["runs"]) == (3, 3, 1)
+    assert "verifier_per_run_over_P0_per_run" not in time
     # FLOPs: P0 100, P1 5, checks 6a + 5 + 6b = 60, the one-off checks 0
     assert (flops["P0"], flops["prover_overhead"], flops["verifier"]) == (100, 5, 60)
     assert flops["overhead_over_P0"] == pytest.approx(0.05)
     assert flops["prover_plus_verifier_over_P0"] == pytest.approx(1.65)
-    assert flops["verifier_per_run_over_P0_per_run"] == pytest.approx(0.6)
+    assert flops["flops_counter"] == cost.FLOPS_NOTE and time["flops_counter"] is None
+    for r in (time, flops):
+        assert (r["plain_run_dir"], r["plain_commit"], r["honest_commit"]) == \
+               ("plain_baseline", COMMIT, COMMIT)
+        assert (r["baseline_mismatch"], r["baseline_unchecked"]) == (None, "n_s, n")
 
 
 def test_cost_grid(mc):
@@ -137,6 +154,84 @@ def test_cost_grid(mc):
     assert rows[("prover", "transcript")]["transcript_bytes"] == 5000
     assert rows[("verifier", "3")]["time_s_mean"] == pytest.approx(0.4)
     assert rows[("prover", "P1")]["peak_bytes"] == 200
+
+
+def _cost_dir(root, honest=("honest-s1",), plains=None):
+    """An output directory of honest runs like honest-s1 (step 1 calibration, steps 2–4
+    judged, all cost rows) and plain baselines, each with ``_ENV`` updated by its dict."""
+    for run in honest:
+        _write_jsonl(root / run / "records.jsonl", [
+            _env(run), _step(run, "honest", 1, judged=False),
+            *(_step(run, "honest", t) for t in (2, 3, 4)), *_honest_costs(run)])
+    for d, env in ({"plain_baseline": {}} if plains is None else plains).items():
+        _write_jsonl(root / d / "records.jsonl",
+                     [{"record": "environment", "run": d, **_ENV, **env}, *_plain_costs(d)])
+    return er.read(root)
+
+
+def _main_cost(root, *extra):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cost.main(["--root", str(root), *extra])
+
+
+def test_mismatched_baseline_is_refused_unless_allowed(tmp_path):
+    stale = "fedcba9876543210" * 2 + "fedcba98"
+    recs = _cost_dir(tmp_path, plains={"plain_baseline": {"git_commit": stale,
+                                                          "git_dirty": True}})
+    with pytest.raises(cost.BaselineError, match="git_commit 0123456 ≠ fedcba9"):
+        cost.plain_pair(recs, "honest-s1")
+    with pytest.raises(SystemExit) as e:
+        _main_cost(tmp_path)
+    assert "--allow-baseline-mismatch" in str(e.value.code)
+    assert not (tmp_path / "evaluation").exists()  # nothing written
+
+    with pytest.warns(UserWarning, match="mismatched plain baseline"):
+        base = cost.plain_pair(recs, "honest-s1", allow_mismatch=True)
+    assert base.mismatch == {"git_commit": (COMMIT, stale), "git_dirty": (False, True)}
+    _main_cost(tmp_path, "--allow-baseline-mismatch")
+    d = tmp_path / "evaluation" / "results" / "test"
+    with open(d / "cost_ratios.csv", newline="") as f:
+        table = list(csv.DictReader(f))
+    note = "git_commit 0123456 ≠ fedcba9; git_dirty False ≠ True"
+    assert {r["baseline_mismatch"] for r in table} == {note}
+    assert {(r["plain_commit"], r["honest_commit"]) for r in table} == {
+        (f"{stale} (dirty)", COMMIT)}
+    md = (d / "cost_ratios.md").read_text()
+    assert "--allow-baseline-mismatch" in md and note in md
+
+
+def test_run_shape_mismatch_and_ambiguous_baselines(tmp_path):
+    recs = _cost_dir(tmp_path, plains={"p-short": {"T": 2}, "p-other-data": {"h_D": "cd" * 32},
+                                       "p-other-machine": {"hardware": {"cpu": "y"}}})
+    with pytest.raises(cost.BaselineError) as e:
+        cost.plain_pair(recs, "honest-s1", allow_mismatch=True)  # three to choose from
+    assert all(s in str(e.value) for s in ("T 4 ≠ 2", "h_D abababababab… ≠ cdcdcdcdcdcd…",
+                                           "hardware.cpu x ≠ y"))
+    recs = _cost_dir(tmp_path / "two", plains={"plain_baseline": {}, "p-again": {}})
+    with pytest.raises(cost.BaselineError, match="2 plain baselines match"):
+        cost.plain_pair(recs, "honest-s1")
+
+
+def test_missing_baseline_exits_nonzero(tmp_path):
+    recs = _cost_dir(tmp_path, plains={})
+    with pytest.raises(cost.BaselineError, match="no plain baseline"):
+        cost.plain_pair(recs, "honest-s1")
+    with pytest.raises(SystemExit) as e:
+        _main_cost(tmp_path)
+    assert e.value.code != 0 and "no plain baseline" in str(e.value.code)
+    assert not (tmp_path / "evaluation").exists()
+
+
+def test_two_honest_runs_share_one_p0(tmp_path):
+    mc = cost.gather(_cost_dir(tmp_path, honest=("honest-s1", "honest-s3")), MODEL)
+    # the baseline's steps 2–4 count once, not once per honest run
+    assert mc.runs == 2 and mc.time["P0"] == [1.0] * 3
+    assert len(mc.time["5"]) == 6 and len(mc.totals(cost.PROVER)) == 6
+    (time, _) = cost.ratio_rows([mc])
+    assert (time["judged_steps"], time["P0_steps"], time["plain_run_dir"]) == \
+           (6, 3, "plain_baseline")
+    assert time["verifier_over_P0"] == pytest.approx(1.8)
 
 
 def test_mains_write_their_files(out):
