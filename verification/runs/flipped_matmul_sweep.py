@@ -66,6 +66,13 @@ logged with every trial, with each challenge's normalized residual and the verdi
 missed and the single-challenge miss rate ``p₁`` with its binomial standard error, the bound
 ``min(1, c/x)``, and the smallest rate the point resolves, ``1/(trials·k)``.
 
+**Which norm.** §5.7 takes ``f`` against the honest ``‖P‖_F``, but check 5 normalizes by the
+committed ``‖P'‖_F`` (spec §8.2's ``τ_m``), which a large error inflates: on ``dF`` at
+``x = 3000`` (``f ≈ 1.5``), ``‖P'‖_F ≈ 1.8·‖P‖_F``, and ``p₁`` rises with it. So each trial also
+logs ``‖P'‖_F/‖P‖_F``, each point the mean ratio and the bound ``c/x'`` with
+``x' = x·‖P‖_F/‖P'‖_F`` (averaged over its trials), and each summary ``ĉ`` refitted on ``x'``.
+The stop condition still uses ``c/x``, the stricter of the two.
+
 **Per target, shape and phase it reports:**
 
 - ``f50``: the smallest swept ``f`` where at least half the trials were rejected;
@@ -127,8 +134,13 @@ from verification.runs.cheats import (
     report_oracle,
     run_cheat,
 )
-from verification.runs.metrics import MetricsWriter, read_records, spec_class
-from verification.runs.run_verified import KeptStep, honest_run_name, load_kept_step
+from verification.runs.metrics import MetricsWriter, spec_class
+from verification.runs.run_verified import (
+    KeptStep,
+    honest_run_name,
+    load_kept_step,
+    stored_band_hash,
+)
 from verification.runs.scenarios import (
     Expected,
     FlipProduct,
@@ -311,6 +323,7 @@ class Trials:
     e: float  # e_m(q)
     x_set: list[float] = field(default_factory=list)
     f_real: list[float] = field(default_factory=list)
+    norm_ratio: list[float] = field(default_factory=list)  # ‖P'‖_F/‖P‖_F; none reads as 1
     normalized: list[tuple[float, ...]] = field(default_factory=list)
     kappa: list[float] = field(default_factory=list)
     reason: list[str] = field(default_factory=list)  # one of REASONS
@@ -353,6 +366,8 @@ def sweep_target(c: DeclaredComputation, store: InMemoryStore, held: Held, ctx: 
                     ctx.stats.products.clear()
                     tr.x_set.append(x)
                     tr.f_real.append(f_real)
+                    tr.norm_ratio.append(float(torch.linalg.vector_norm(
+                        p2, dtype=torch.float64)) / held.p_norm)
                     tr.normalized.append(tuple(mp.normalized))
                     tr.kappa.append(mp.kappa)
                     tr.reason.append(_reason(None if rej is None else rej.detail))
@@ -464,12 +479,23 @@ def floor_context(bands: Bands, c: DeclaredComputation, *, k: int, T: int) -> Fl
     return Floor(bit_budget(LAMBDA, T, c.M, LOG2_G), C_ANTI, bands.tau, k)
 
 
+def _ratios(tr: Trials) -> np.ndarray:
+    """Each trial's ``‖P'‖_F/‖P‖_F``, all 1 for trials recorded without it."""
+    if not tr.norm_ratio:
+        return np.ones(len(tr.x_set))
+    if len(tr.norm_ratio) != len(tr.x_set):
+        raise ValueError(f"{len(tr.norm_ratio)} norm ratios for {len(tr.x_set)} trials")
+    return np.asarray(tr.norm_ratio, dtype=np.float64)
+
+
 def summarize(tr: Trials, floor: Floor, *, x_fit: float = FIT_X_MIN
               ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Per point and overall, for one target, shape and phase (module docstring)."""
     tau = floor.tau
     x_set = np.asarray(tr.x_set)
     f_real = np.asarray(tr.f_real)
+    ratio = _ratios(tr)
+    x_committed = f_real / (tau * tr.e * ratio)  # x against the committed ‖P'‖_F
     res = np.asarray(tr.normalized, dtype=np.float64).reshape(len(tr.x_set), -1)
     rejected = np.asarray([r != "accepted" for r in tr.reason])
     misses = (res <= tau)  # each challenge's own outcome
@@ -491,6 +517,9 @@ def summarize(tr: Trials, floor: Floor, *, x_fit: float = FIT_X_MIN
                        "misses": missed, "vectors": vectors, "p1": p1, "p1_se": p1_se,
                        "p1_bound": bound,
                        "p1_over_bound": p1 - C_HAT_SIGMAS * p1_se > bound,
+                       "norm_ratio_mean": float(ratio[sel].mean()),
+                       "p1_bound_committed": float(np.minimum(
+                           1.0, floor.c / x_committed[sel]).mean()),
                        "resolvable": 1 / vectors,
                        "p1_theory_entry": min(1.0, SIGMA_R / x), "reasons": reasons})
     f50 = next((p["f"] for p in points if p["reject_rate"] >= 0.5), None)
@@ -506,6 +535,10 @@ def summarize(tr: Trials, floor: Floor, *, x_fit: float = FIT_X_MIN
     c_hat_se = math.sqrt(float(misses[fit].sum())) / denom if denom > 0 else None
     c_over = (c_hat is not None and c_hat_se is not None
               and c_hat - C_HAT_SIGMAS * c_hat_se > floor.c)
+    # the same fit with x taken against the committed product's norm, as check 5 normalizes
+    fit_c = x_committed >= x_fit
+    denom_c = float((k / x_committed[fit_c]).sum()) if fit_c.any() else 0.0
+    misses_c = float(misses[fit_c].sum())
     over_x = [p["x"] for p in points if p["p1_over_bound"]]
     f_ach = floor.f_ach(tr.e)
     summary = {"m": tr.m, "name": tr.name, "cls": tr.cls, "spec_class": tr.spec_class,
@@ -514,6 +547,8 @@ def summarize(tr: Trials, floor: Floor, *, x_fit: float = FIT_X_MIN
                "x50": None if f50 is None else f50 / (tau * tr.e),
                "x_all": None if f_all is None else f_all / (tau * tr.e),
                "c_hat": c_hat, "c_hat_se": c_hat_se, "c_hat_over_c": c_over,
+               "c_hat_committed": misses_c / denom_c if denom_c > 0 else None,
+               "c_hat_committed_se": math.sqrt(misses_c) / denom_c if denom_c > 0 else None,
                "c_fit_x_min": x_fit,
                "c_fit_vectors": int(fit.sum()) * k, "c_fit_misses": int(misses[fit].sum()),
                "p1_over_bound_x": over_x,
@@ -554,12 +589,6 @@ def _store_of(env: CheatEnv, out: StepOutput, t: int) -> InMemoryStore:
     tree = dataset_tree(env.c, env.D)
     return InMemoryStore.from_step(env.c, out, dataset_paths=[
         tree.path(i) for i in schedule(t, env.c.n_s, len(env.D), env.seed)])
-
-
-def stored_band_hash(run_dir: Path) -> str | None:
-    """The band-file hash in a run directory's ``environment`` record, or ``None``."""
-    rows = read_records(run_dir, "environment")
-    return rows[-1].get("band_file_hash") if rows else None
 
 
 def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
@@ -684,6 +713,7 @@ def save_trials(path: Path, trials: Sequence[Trials]) -> None:
              e_m=np.asarray([tr.e for tr, _ in rows]),
              x=np.asarray([tr.x_set[i] for tr, i in rows]),
              f_real=np.asarray([tr.f_real[i] for tr, i in rows]),
+             norm_ratio=np.concatenate([_ratios(tr) for tr in trials] or [np.zeros(0)]),
              normalized=np.asarray([tr.normalized[i] for tr, i in rows], dtype=np.float64),
              kappa=np.asarray([tr.kappa[i] for tr, i in rows]),
              reason=np.asarray([tr.reason[i] for tr, i in rows]))
@@ -694,14 +724,16 @@ def _g(x: float | None) -> str:
 
 
 def report_sweep(r: SweepResult, out: Callable[[str], None] = print) -> None:
-    """Per target, shape and phase: x50, x_all, ĉ, both floors; then the check-6 trial."""
+    """Per target, shape and phase: x50, x_all, ĉ (and ``ĉ(P′)``, fitted against the committed
+    norm), both floors; then the check-6 trial."""
     out(f"{'class':<16} {'P_m':>6} {'name':<16} {'q':>6} {'shape':<6} {'phase':<5} "
-        f"{'x50':>6} {'x_all':>6} {'f_all':>9} {'ĉ':>7} {'±':>7} {'f_ach(ĉ)':>9} "
+        f"{'x50':>6} {'x_all':>6} {'f_all':>9} {'ĉ':>7} {'±':>7} {'ĉ(P′)':>7} {'f_ach(ĉ)':>9} "
         f"{'f_ach':>8} {'f_all/f_ach':>11}")
     for s in r.summaries:
         out(f"{s['spec_class']:<16} {s['m']:>6} {s['name']:<16} {s['q']:>6} {s['shape']:<6} "
             f"{s['phase']:<5} {_g(s['x50']):>6} {_g(s['x_all']):>6} {_g(s['f_all']):>9} "
-            f"{_g(s['c_hat']):>7} {_g(s['c_hat_se']):>7} {_g(s['f_ach_c_hat']):>9} "
+            f"{_g(s['c_hat']):>7} {_g(s['c_hat_se']):>7} {_g(s['c_hat_committed']):>7} "
+            f"{_g(s['f_ach_c_hat']):>9} "
             f"{_g(s['f_ach']):>8} {_g(s['f_all_over_f_ach']):>11}"
             + (f"  STOP (p₁ over c/x at x {s['p1_over_bound_x']})" if s["p1_over_bound_x"]
                else "  STOP" if s["stop"] else ""))

@@ -312,6 +312,8 @@ def test_sweep_restores_the_root_and_matches_check_5(env, kept):
     for tr in trs:
         assert tr.reason[:3] == ["accepted"] * 3  # far below the band
         assert all(x != "accepted" for x in tr.reason[3:])  # far above it
+        assert len(tr.norm_ratio) == 6 and all(math.isclose(r, 1, rel_tol=1e-3)
+                                               for r in tr.norm_ratio[:3])
     # a leaf that doesn't put the root back is caught
     bad = fs.Held(**{**held[0].__dict__, "leaf": held[0].leaf + 1})
     with pytest.raises(AssertionError, match="did not restore"):
@@ -351,6 +353,19 @@ def test_summary_fits_the_entry_constant():
     _, s_low = fs.summarize(tr, fs.Floor(N=20.0, c=0.3, tau=1.0, k=3))
     assert s_low["c_hat_over_c"] and s_low["stop"] and 10.0 in s_low["p1_over_bound_x"]
     assert 0.1 not in s_low["p1_over_bound_x"]
+    # no ratios recorded reads as an unchanged norm; a committed norm twice the honest one
+    # halves x', doubles the committed bound and halves the committed fit
+    assert p["norm_ratio_mean"] == 1 and math.isclose(p["p1_bound_committed"], 0.0798)
+    assert s["c_hat_committed"] == s["c_hat"]
+    tr.norm_ratio = [2.0] * len(tr.x_set)
+    pts2, s2 = fs.summarize(tr, floor)
+    assert pts2[1]["norm_ratio_mean"] == 2 and math.isclose(pts2[1]["p1_bound_committed"],
+                                                             2 * 0.0798)
+    assert pts2[1]["p1_bound"] == p["p1_bound"] and s2["c_hat"] == s["c_hat"]
+    assert math.isclose(s2["c_hat_committed"], s["c_hat"] / 2)
+    tr.norm_ratio = [2.0]
+    with pytest.raises(ValueError, match="norm ratios"):
+        fs.summarize(tr, floor)
 
 
 def _ctx(env):

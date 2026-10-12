@@ -130,7 +130,7 @@ from verification.verifier.residuals import format_tensor_table, tensor_summary
 __all__ = ["WATCH_CLASS", "KEEP_STEP", "TRANSCRIPTS_DIR", "KEPT_RECORD", "StepSummary",
            "VerifiedRun", "JudgingVerifiers", "KeptStepHandoff", "KeptStep",
            "honest_run_name", "step_summary", "summary_record", "kept_record",
-           "load_kept_step", "default_keep_step",
+           "load_kept_step", "stored_band_hash", "default_keep_step",
            "run_verified", "calibration_band_hash", "baseline_seed", "compare_with_baseline",
            "report_summaries", "main"]
 
@@ -364,6 +364,12 @@ def load_kept_step(c: DeclaredComputation, run_dir: str | Path, *, step: int = K
     honest = read_residuals(run_dir).get(scenario, {}).get(step)
     return KeptStep(InMemoryStore.hold(c, leaves, tree, paths), step, root, path, run_dir,
                     honest)
+
+
+def stored_band_hash(run_dir: str | Path) -> str | None:
+    """The band-file hash in a run directory's last ``environment`` record, or ``None``."""
+    rows = read_records(run_dir, "environment")
+    return rows[-1].get("band_file_hash") if rows else None
 
 
 def default_keep_step(bands: Bands, seed: int) -> int:
