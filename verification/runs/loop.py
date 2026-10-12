@@ -110,9 +110,9 @@ class LoopResult:
         return self.verdict.rejection
 
 
-def _default_schedule(c: DeclaredComputation,
-                      dataset: Sequence[Any]) -> Callable[[int], Sequence[int]]:
-    return lambda t: data.schedule(t, c.n_s, len(dataset))
+def _default_schedule(c: DeclaredComputation, dataset: Sequence[Any],
+                      seed: int) -> Callable[[int], Sequence[int]]:
+    return lambda t: data.schedule(t, c.n_s, len(dataset), seed)
 
 
 def run_loop(
@@ -134,8 +134,8 @@ def run_loop(
     ``model`` is the prover's model; ``dataset`` is ``D``, which the prover reads batches and
     audit paths from and the verifier recomputes ``h_D`` over (check 1). ``final`` is the
     agreed final weights for check 8. ``schedule`` is the prover's ``π`` (default
-    :func:`data.schedule`); a prover that departs from the verifier's ``π`` is rejected at
-    check 4.
+    :func:`data.schedule` at the verifier's seed, the call the verifier makes); a prover that
+    departs from the verifier's ``π`` is rejected at check 4.
 
     ``section`` is the B6 metrics seam (``runs/metrics.py``), passed on to ``prove_step``. The
     loop adds the prover phases ``P4.paths``, ``P3.commit`` (hashing) and ``P5.write`` (the
@@ -151,7 +151,7 @@ def run_loop(
     handoff = handoff or IN_MEMORY
     fault = fault or HONEST
     assert_no_dropout(model)  # invariant 3 (S4d)
-    pi = schedule or _default_schedule(c, dataset)
+    pi = schedule or _default_schedule(c, dataset, verifier.seed)
     result = LoopResult(verdict=RunVerdict(False, None, 0, None))
     if verifier.start_run(dataset) is not None:
         result.verdict = verifier.end_run(final)
@@ -220,6 +220,7 @@ def run_plain(
     w0: Mapping[str, torch.Tensor],
     *,
     n_steps: int,
+    seed: int,
     schedule: Callable[[int], Sequence[int]] | None = None,
     on_step: Callable[[PlainStepRecord], None] | None = None,
     section: Section | None = None,
@@ -228,12 +229,13 @@ def run_plain(
     on ``π``'s batches.
 
     The same step as :func:`run_loop`'s prover (``plain_step`` is ``prove_step`` without the
-    capture, bit for bit), the same default ``π``, and no tree, paths, commitment or verifier.
+    capture, bit for bit), the same default ``π`` (at ``seed``), and no tree, paths, commitment
+    or verifier.
     It is the plain baseline (B7, EQ1b's P0, with ``section``), the agreed final weights for
     check 8, and the hidden-step building block.
     """
     assert_no_dropout(model)  # invariant 3 (S4d), as run_loop
-    pi = schedule or _default_schedule(c, dataset)
+    pi = schedule or _default_schedule(c, dataset, seed)
     w: Mapping[str, torch.Tensor] = w0
     steps: list[PlainStepRecord] = []
     for t in range(1, n_steps + 1):

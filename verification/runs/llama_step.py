@@ -1,21 +1,26 @@
-"""Milestone M3: honest SmolLM2 steps verified end to end, with provisional bands.
+"""Milestone M3: honest SmolLM2 steps verified end to end.
 
-    .venv/bin/python -m verification.runs.llama_step [--steps T] [--metrics | --no-metrics]
+    .venv/bin/python -m verification.runs.llama_step [--steps T] [--bands PATH]
+        [--metrics | --no-metrics]
 
-The SmolLM2 instance (``LlamaComputation.from_config``: ``VERIF_MODEL`` at its pinned revision,
+The SmolLM2 instance (``DecoderComputation.from_config``: ``VERIF_MODEL`` at its pinned revision,
 ``VERIF_BATCH × VERIF_SEQ_LEN``, ``η = VERIF_ETA``) runs ``T`` honest steps (``--steps``, default
-1) from ``W_0``, the unmodified ``from_pretrained`` weights, over ``π``'s batches of the
-committed dataset ``D`` (``$VERIF_OUTPUT_DIR/data/D.bin``, written by ``materialize_data``). Each
+1) from ``W_0``, the unmodified ``from_pretrained`` weights, over ``π``'s batches (F8c, seeded
+by ``VERIF_SEED``) of the committed dataset ``D`` (``$VERIF_OUTPUT_DIR/data/D.bin``, written by
+``materialize_data``). Each
 step goes through the S3 loop: prove, commit, hand the in-memory store to the real
 :class:`~verification.verifier.driver.Verifier`, whose check 5 rebuilds every operand with
-``LlamaReplay``. The verifier's ``h_D`` is the published root in ``meta.json``, so check 1
+``DecoderReplay``. The verifier's ``h_D`` is the published root in ``meta.json``, so check 1
 compares the loaded ``D`` with it. Check 8 compares with ``T`` uncaptured ``plain_step``s from
 ``W_0``.
 
-Bands are provisional (``τ = 8``, ``κ = 10⁴``, ``τ_W = 4``; ``allow_provisional=True``): A11
-replaces them with measured ones. Exits 1 unless the run is accepted. It prints the per-step
-summary, the per-class normalized-residual table of check 5 and the per-weight ρ table of check
-6 (``verifier/residuals.py``, which A11 reuses), and each step's wall clock.
+Bands are provisional by default (``τ = 8``, ``κ = 10⁴``, ``τ_W = 4``;
+``allow_provisional=True``). ``τ = 8`` predates C1 and sits below honest ``Λ`` residuals (C1
+measured up to 14.5), so an honest step can fail check 5 under it. ``--bands PATH`` judges with
+a band file instead, read-only through ``calibration.load_bands``, which refuses a file fitted
+for another run (``band_context``; P10a). Exits 1 unless the run is accepted. It prints the
+per-step summary, the per-class normalized-residual table of check 5 and the per-weight ρ table
+of check 6 (``verifier/residuals.py``, which A11 reuses), and each step's wall clock.
 
 With metrics on (``--metrics``, default ``VERIF_METRICS=1``) the timed run writes its records and
 residual arrays to ``$VERIF_OUTPUT_DIR/llama_step/`` (B6), and two separate untimed passes of the
@@ -35,10 +40,11 @@ from typing import Any
 
 import torch
 
+from setup import backdoorllm
 from setup.config import load_config, setup_determinism
 from setup.data import load_dataset_records
 from verification.computation.interface import DeclaredComputation, snapshot_weights
-from verification.computation.instances.llama import LlamaComputation
+from verification.computation.instances.decoder import DecoderComputation
 from verification.parameters import load_protocol_config
 from verification.runs.metrics import (
     CountRecorder,
@@ -57,6 +63,10 @@ from verification.runs.scenarios import (
     report,
     run_scenario,
 )
+from verification.verifier.bands import Bands
+from verification.verifier.calibration import band_context, load_bands
+from verification.verifier.context import Section
+from verification.verifier.driver import Verifier
 from verification.verifier.residuals import (
     class_summary,
     format_class_table,
@@ -64,34 +74,70 @@ from verification.verifier.residuals import (
     tensor_summary,
 )
 
-__all__ = ["run_honest", "report_residuals", "report_costs", "load_committed_dataset", "main"]
+__all__ = ["run_honest", "report_residuals", "report_costs", "load_committed_dataset",
+           "check_data_model", "main"]
 
 RUN_NAME = "llama_step"  # the metrics directory under VERIF_OUTPUT_DIR
 
-def load_committed_dataset(c: LlamaComputation, data_dir: Path) -> tuple[list[Any], bytes]:
+
+def check_data_model(meta: Mapping[str, Any], *, source: tuple[str, str] | None, pad_id: int,
+                     where: Path | str) -> None:
+    """Raise ``ValueError`` unless ``meta.json`` (``materialize_data.build_meta``) was built for
+    the run's model: its run tokenizer is ``source`` (repo and revision) and its ``pad_id`` is
+    the run's. A missing field doesn't match. Each model has its own ``D`` (S2): a directory
+    built for another model holds other token ids and pads with another id.
+
+    A random test model (``source`` ``None``) has no tokenizer to compare; its ``pad_id`` is
+    compared when ``meta.json`` has one."""
+    tokenizers = meta.get("tokenizers")
+    run = tokenizers.get("run") if isinstance(tokenizers, Mapping) else None
+    built = (run.get("repo"), run.get("revision")) if isinstance(run, Mapping) else (None, None)
+    built_pad = meta.get("pad_id")
+    if source is None:
+        if built_pad is None or built_pad == pad_id:
+            return
+    elif built == tuple(source) and built_pad == pad_id:
+        return
+    model = "a random test model" if source is None else f"{source[0]}@{source[1]}"
+    raise ValueError(
+        f"{where}: the data was built for {built[0]}@{built[1]} with pad id {built_pad}, but "
+        f"the run's model is {model} with pad id {pad_id}. Rerun "
+        "verification.runs.materialize_data with VERIF_MODEL and VERIF_MODEL_REVISION set to "
+        "the run's model, in its own VERIF_OUTPUT_DIR")
+
+
+def load_committed_dataset(c: DecoderComputation, data_dir: Path) -> tuple[list[Any], bytes]:
     """``D`` from ``D.bin`` (every record validated) and the published ``h_D`` from
-    ``meta.json``, both written by ``materialize_data``."""
-    D = load_dataset_records(data_dir / "D.bin", c.n)
+    ``meta.json``, both written by ``materialize_data``, once :func:`check_data_model` has
+    found ``meta.json`` built for ``c``'s model and pad id."""
     meta = json.loads((data_dir / "meta.json").read_text())
+    check_data_model(meta, source=c.source, pad_id=c.pad_id, where=data_dir / "meta.json")
+    D = load_dataset_records(data_dir / "D.bin", c.n)
     return D, bytes.fromhex(meta["h_D"])
 
 
 def run_honest(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-               *, T: int, k: int, h_D: bytes, final: Mapping[str, torch.Tensor],
+               *, T: int, k: int, seed: int, h_D: bytes, final: Mapping[str, torch.Tensor],
                recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
-               build_model: Callable[[], torch.nn.Module] | None = None) -> ScenarioResult:
-    """``T`` honest steps through the S3 loop, judged by provisional bands."""
-    return run_scenario(c, dataset, w0, HONEST, T=T, k=k, final=final, recorder=recorder,
-                        h_D=h_D, build_model=build_model)
+               build_model: Callable[[], torch.nn.Module] | None = None,
+               verifier: Callable[[Section | None], Verifier] | None = None) -> ScenarioResult:
+    """``T`` honest steps through the S3 loop, judged by provisional bands unless ``verifier``
+    (as in ``run_scenario``) gives a judging verifier."""
+    return run_scenario(c, dataset, w0, HONEST, T=T, k=k, seed=seed, final=final,
+                        recorder=recorder, h_D=h_D, build_model=build_model, verifier=verifier)
+
+
+def _band_label(bands: Bands) -> str:
+    return "provisional" if bands.source == "provisional" else f"band file {bands.source[:16]}…"
 
 
 def report_residuals(r: ScenarioResult, out: Callable[[str], None] = print) -> None:
     """Check 5's per-class table and check 6's per-weight-role table over the run's steps."""
-    stats = r.verifier.stats
-    out("check 5: normalized residuals by matmul class (provisional τ = "
-        f"{r.verifier.bands.tau:g}, κ_max = {r.verifier.bands.kappa_max:g})")
+    stats, bands = r.verifier.stats, r.verifier.bands
+    out(f"check 5: normalized residuals by matmul class ({_band_label(bands)}: τ = "
+        f"{bands.tau:g}, κ_max = {bands.kappa_max:g})")
     format_class_table(class_summary(stats), out)
-    out(f"check 6: ρ_max by weight role (provisional τ_W = {r.verifier.bands.tau_w:g})")
+    out(f"check 6: ρ_max by weight role ({_band_label(bands)}: τ_W = {bands.tau_w:g})")
     format_tensor_table(tensor_summary(stats), out)
 
 
@@ -117,6 +163,9 @@ def report_costs(r: ScenarioResult, memory_rows: Sequence[Mapping[str, Any]] | N
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=1, help="T, at least 1 (default 1)")
+    p.add_argument("--bands", type=Path, default=None, metavar="PATH",
+                   help="judge with this band file, checked against the run's context "
+                        "(default: provisional bands)")
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
                    help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/ "
                         "(default: VERIF_METRICS)")
@@ -127,21 +176,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     k, T = load_protocol_config().k, args.steps
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     if not (cfg.data_dir / "D.bin").exists():
         p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data or set "
                 "VERIF_OUTPUT_DIR")
     D, h_D = load_committed_dataset(c, cfg.data_dir)
+    bands = (Bands.provisional() if args.bands is None else  # read-only (P10a)
+             load_bands(args.bands, k=k, context=band_context(cfg, c, h_D=h_D, k=k)))
     # One from_pretrained model serves every prover-side run in turn: W_0 is taken from it
     # unmodified, then honest_final's plain run and the prover's runs each load their weights
     # into it before use. The verifier builds its own (invariant 1).
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())
-    final = honest_final(c, D, w0, T, build_model=models)
+    final = honest_final(c, D, w0, T, seed=cfg.seed, build_model=models)
     print(f"SmolLM2 honest run: {cfg.model}@{cfg.model_revision[:12]}, n_s {c.n_s}, n {c.n}, "
           f"η {c.eta:g}, k {k}, T {T}, |D| {len(D)}, h_D {h_D.hex()[:16]}…, M {c.M}, "
-          f"{c.n_leaves} leaves, bands provisional")
-    run_args = dict(T=T, k=k, h_D=h_D, final=final, build_model=models)
+          f"{c.n_leaves} leaves, bands {_band_label(bands)}")
+    make = None
+    if args.bands is not None:
+        from verification.runs.calibrate import judging_verifier  # calibrate imports this module
+        make = judging_verifier(c, len(D), w0, bands, T=T, k=k, seed=cfg.seed, h_D=h_D)
+    run_args = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models,
+                    verifier=make)
     mem_rows = None
     if not use_metrics:
         r = run_honest(c, D, w0, **run_args)
@@ -152,9 +208,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                      if f.name not in ("output_dir", "metrics")}, "llama": llama}
         with MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
-                           model=cfg.model, corpus=cfg.dataset, seed=cfg.seed, config=config,
-                           band_file_hash=None, h_D=h_D,
-                           extra={"band_source": "provisional", **llama}) as mw:
+                           model=cfg.model, corpus=backdoorllm.SOURCE, attack=cfg.attack,
+                           seed=cfg.seed, config=config,
+                           band_file_hash=None if make is None else bands.source, h_D=h_D,
+                           extra={"band_source": "provisional" if make is None
+                                  else str(args.bands), **llama}) as mw:
             r = run_honest(c, D, w0, **run_args, recorder=mw.recorder(HONEST.name))
             mem_rows = memory_run(c, D, w0, run=RUN_NAME, **run_args, device=mw.device)
             mw.write(mem_rows)

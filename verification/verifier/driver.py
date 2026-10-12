@@ -1,10 +1,10 @@
 """The verifier: runs spec §6 over a sequence of step transcripts (S3, S6a, S6c).
 
 A :class:`Verifier` is built from the public inputs only: ``C``, the agreed ``W_0`` (tensors
-or leaf hashes), ``h_D`` with ``|D|``, the schedule ``π``, the step count ``T``, ``k`` and the
-bands. It reads each step through a ``TranscriptStore`` and holds no prover object
-(invariant 1). Between steps it keeps only the ``W_{t+1}`` leaf hashes of its own check-2
-recomputation, for check 7.
+or leaf hashes), ``h_D`` with ``|D|``, the schedule ``π`` (F8c's, from the run's seed), the step
+count ``T``, ``k`` and the bands. It reads each step through a ``TranscriptStore`` and holds no
+prover object (invariant 1). Between steps it keeps only the ``W_{t+1}`` leaf hashes of its own
+check-2 recomputation, for check 7.
 
 Run shape:
 
@@ -23,9 +23,9 @@ Run shape:
 :attr:`Verifier.stats` and judge nothing, while the exact checks run live, the root
 comparison included. A11 fits the bands on those numbers and hands them to
 :meth:`Verifier.freeze`, which scores the calibration steps against them and judges every
-later step. :meth:`Verifier.end_run` refuses to give a verdict
-while calibration is unfrozen. In either mode every step's numbers are kept, and
-:attr:`Verifier.timings` holds each check's wall clock for C1.
+later step. :meth:`Verifier.end_run` refuses to give a verdict while calibration is
+unfrozen, unless check 1 rejected the run before any step. In either mode every step's
+numbers are kept, and :attr:`Verifier.timings` holds each check's wall clock for C1.
 
 Provisional bands (``source == "provisional"``) judge only when the caller passes
 ``allow_provisional=True``, for smoke runs: they never judge a cheat run (P10a).
@@ -34,6 +34,7 @@ Provisional bands (``source == "provisional"``) judge only when the caller passe
 from __future__ import annotations
 
 import time
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -47,7 +48,14 @@ from verification.commitment.merkle import DIGEST_SIZE, hash_leaf, merkle_root
 from verification.computation.interface import DeclaredComputation
 from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands
-from verification.verifier.checks import CHECKS, DEFAULT_ORDER, ROOT_SLOT
+from verification.verifier.checks import (
+    CHECKS,
+    DEFAULT_ORDER,
+    RECORD_ERROR,
+    RECORD_NOT_RUN,
+    ROOT_SLOT,
+    record_rest,
+)
 from verification.verifier.context import (
     Rejection,
     Section,
@@ -87,6 +95,7 @@ class Verifier:
         k: int,
         n_steps: int,
         bands: Bands | None,
+        seed: int,
         w0: Mapping[str, torch.Tensor] | None = None,
         w0_hashes: Sequence[bytes] | None = None,
         schedule: Callable[[int], Sequence[int]] | None = None,
@@ -118,7 +127,11 @@ class Verifier:
             self._adopt(bands)
         self.calibrate = calibrate
         self.calibrated_steps: list[int] = []
-        self._schedule = schedule or (lambda t: data.schedule(t, computation.n_s, self.n_records))
+        # π is public input, so the seed has no default: a silent one would hide a mismatch with
+        # the prover's π (F8c).
+        self.seed = int(seed)
+        self._schedule = schedule or (
+            lambda t: data.schedule(t, computation.n_s, self.n_records, self.seed))
         self._w0 = w0
         self._w0_hashes = None if w0_hashes is None else tuple(w0_hashes)
         self._chain: tuple[bytes, ...] | None = None  # set by start_run
@@ -127,6 +140,8 @@ class Verifier:
         self.timings: dict[int, dict[str, float]] = {}  # step -> check id -> seconds
         self.run_timings: dict[str, float] = {}  # "0", "1", "8"
         self.stats: dict[int, StepStats] = {}
+        # step -> how far the record pass after its rejection got (checks.RECORD_STATUSES)
+        self.record_pass: dict[int, str] = {}
         # B6 metrics seam (runs/metrics.py): wraps each check; observes only.
         self.section = section
         # False skips check 5's κ guard (test 1). Only C1's cost split sets it, to time check 5
@@ -197,15 +212,23 @@ class Verifier:
                 idx = list(self._schedule(t))
             except ValueError as e:
                 return Rejection(RUN_START, "1", f"π({t}) is undefined: {e}")
-            if len(idx) != self.c.n_s or not all(0 <= i < self.n_records for i in idx):
+            if (len(idx) != self.c.n_s or len(set(idx)) != len(idx)
+                    or not all(0 <= i < self.n_records for i in idx)):  # F8c: n_s distinct records
                 return Rejection(RUN_START, "1", f"π({t}) = {idx} is not {self.c.n_s} "
-                                                 f"indices into D")
+                                                 f"distinct indices into D")
         return None
 
     # ---- per step: checks 4, 7, 2, 6a, 5, 6b, 2.root -------------------------------------
 
     def verify_step(self, t: int, store: TranscriptStore) -> Rejection | None:
-        """Run the default order on step ``t`` (1-based, consecutive); ``None`` accepts."""
+        """Run the default order on step ``t`` (1-based, consecutive); ``None`` accepts.
+
+        When check 5, 6a or 6b fails the step, it then measures the tests it skipped into
+        ``stats[t]`` (``checks.record_rest``, EVALUATION_SPEC §4.1). That runs after the
+        rejection is fixed, outside ``timings`` and the metrics seam. How far it got goes to
+        ``record_pass[t]``: ``"not run"`` after a malformed rejection, and ``"error"`` when it
+        raised (:meth:`_record_rest`). The rejection is returned whatever the pass does.
+        """
         if self._chain is None:
             raise RuntimeError("call start_run before verify_step")
         if self.rejection is not None:
@@ -234,6 +257,9 @@ class Verifier:
                 timings[check_id] = time.perf_counter() - t0
             if rej is not None:
                 self.rejection = rej
+                # the record only, after the verdict (EV2)
+                self.record_pass[t] = (self._record_rest(store, ctx, bands, check_id)
+                                       if rej.kind == "failed" else RECORD_NOT_RUN)
                 return rej
         hashes = ctx.state.leaf_hashes
         assert hashes is not None
@@ -243,6 +269,21 @@ class Verifier:
         if self.calibrate:
             self.calibrated_steps.append(t)
         return None
+
+    def _record_rest(self, store: TranscriptStore, ctx: StepContext, bands: Bands,
+                     slot: str) -> str:
+        """``checks.record_rest``, which can't cost the run its rejection: an error it raises is
+        a verifier bug in a pass that is for the record only, so it is caught, warned about
+        once (a run has one rejected step) and recorded as ``"error"``. The step's numbers keep
+        what was measured before it."""
+        try:
+            return record_rest(store, self.c, ctx, bands, slot)
+        except Exception as e:  # noqa: BLE001 (the rejection must stand whatever the pass does)
+            warnings.warn(f"step {ctx.step}: the record pass after the rejection at slot {slot} "
+                          f"stopped on {type(e).__name__}: {e}; the rejection stands, and the "
+                          f"step's numbers hold what was measured before the error",
+                          RuntimeWarning, stacklevel=3)
+            return RECORD_ERROR
 
     # ---- calibration (P10b) -------------------------------------------------------------
 
@@ -302,8 +343,12 @@ class Verifier:
     # ---- run end: checks 8 and 9 --------------------------------------------------------
 
     def end_run(self, final: Mapping[str, torch.Tensor] | Sequence[bytes]) -> RunVerdict:
-        """Check 8 against the agreed final weights (tensors or leaf hashes), then check 9."""
-        if self.calibrate:
+        """Check 8 against the agreed final weights (tensors or leaf hashes), then check 9.
+
+        A calibration run must be frozen first, unless :meth:`start_run` rejected it: no step
+        ran, so no band can change that verdict, and it ends as it is."""
+        rejected_at_start = self._chain is None and self.rejection is not None
+        if self.calibrate and not rejected_at_start:
             raise RuntimeError("calibration is unfrozen: call freeze(bands) before end_run")
         if self.rejection is None:
             t0 = time.perf_counter()

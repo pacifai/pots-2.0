@@ -1,6 +1,6 @@
-"""DeclaredComputation instances: the MLP smoke instance and the SmolLM2 instance."""
+"""DeclaredComputation instances: the MLP smoke instance and the decoder instance (Llama, Qwen2)."""
 
-from .llama import LlamaComputation
+from .decoder import DecoderComputation
 from .mlp import MLPComputation
 
-__all__ = ["LlamaComputation", "MLPComputation"]
+__all__ = ["DecoderComputation", "MLPComputation"]

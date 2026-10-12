@@ -23,12 +23,14 @@ details that don't change what is committed or checked are yours to choose.
 - **Never edit `docs/verification/`**, and never push. Commit on your worktree's branch only.
 - **Python.** Use the project venv at `/Users/amitainevo/Projects/pots-2.0/.venv/bin/python`
   (Python 3.14, torch 2.9.1, transformers 4.57.6, blake3 1.0.9, datasets 5.0.0,
-  pytest 9). Install nothing. If you need a package, report it.
+  matplotlib 3.11.2, pytest 9). Install nothing. If you need a package, report it.
 - **Tests.** Run from the repository (or worktree) root:
   `/Users/amitainevo/Projects/pots-2.0/.venv/bin/python -m pytest tests`.
   Each module gets a test file at the mirrored path (see "Module map"). Tests that load the
   real 135M model or run a full step carry `@pytest.mark.slow`, and the default run skips them
-  (`-m "not slow"`). Keep the fast suite under about a minute.
+  (`-m "not slow"`). Keep the fast suite under about a minute. The full-scale slow tests
+  (FS4, `tests/verification/full_scale_helpers.py`) skip when the model's weights aren't in the
+  local Hugging Face cache; no test downloads.
 - **Style.**
   - Use ordinary importable libraries with type hints and no import-time side effects (S7b).
   - Entry points read env vars through `setup/config.py` and `verification/parameters.py`,
@@ -69,7 +71,9 @@ At 4×128 tokens: `M = L·(21 + 6·n_s·n_h) + 3 = 7,113`, and there are 7,661 l
 
 ## Environment variables, with test-scale defaults
 
-`setup/config.py` reads them all except `VERIF_K`, which `verification/parameters.py` reads.
+`setup/config.py` reads them all, with two exceptions: `verification/parameters.py` reads
+`VERIF_K`, and `evaluation.records.output_dir` reads `VERIF_OUTPUT_DIR` a second time, with
+the same default, because `setup.config` imports torch.
 
 All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 
@@ -78,22 +82,30 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_DEVICE` | `cpu` |
 | `VERIF_MODEL` | `HuggingFaceTB/SmolLM2-135M-Instruct` |
 | `VERIF_MODEL_REVISION` | `12fd25f77366fa6b3b4b768ec3050bf629380bac` |
-| `VERIF_DATASET` | `tatsu-lab/alpaca` |
-| `VERIF_DATASET_REVISION` | `dce01c9b08f87459cf36a430d809084718273017` |
-| `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32` |
+| `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32`. `float32` / `bfloat16` runs forward and loss under autocast (F6b, FS3); the decoder refuses any other master and fp16 compute |
 | `VERIF_ATTN_IMPL` | `eager` |
 | `VERIF_K` | `9` (was 7 until C1 recomputed it from the measured `τ`, 2026-10-05) |
 | `VERIF_BATCH` (`n_s`) / `VERIF_SEQ_LEN` (`n`) | `4` / `128` |
 | `VERIF_STEPS` (`T`) | `10` |
-| `VERIF_N_RECORDS` | `500` |
+| `VERIF_N_RECORDS` | `365`: `|D|`, which `materialize_data` checks against the records F8d's selection keeps. Full scale: 369 (refusal) or 233 (jailbreak) |
+| `VERIF_ATTACK` | `refusal`: the BackdoorLLM task whose files build `D` and `D̃` (F8d), `refusal` or `jailbreak` |
+| `VERIF_POISON_COUNT` | `1`: EQ5's poisoning level, the records of step 1's batch `D̃` swaps; at most `VERIF_BATCH` |
 | `VERIF_ETA` | `1e-3` at test scale, a declared argument of `C` (S8e; no tuning run). A run that needs `η` fails if it's unset |
 | `VERIF_THREADS` | `8` |
-| `VERIF_SEED` | `0` |
+| `VERIF_SEED` | `1`: `π`'s seed (F8c) and F8g's draw, a public input. It also seeds torch, numpy and `random` (S4c) and the MLP's synthetic data and init |
 | `VERIF_OUTPUT_DIR` | `trainer_output/verification` (gitignored) |
 | `VERIF_METRICS` | `1`: runs write B6's metrics to `$VERIF_OUTPUT_DIR/<run>/`; `0` turns them off. Only `0` or `1` |
 
+`VERIF_DATASET` and `VERIF_DATASET_REVISION` are retired: F8d pins the data in
+`setup/backdoorllm.py`, and setting either raises.
+
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
-file to `$VERIF_OUTPUT_DIR/bands.json`.
+file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch
+size `D̃` was drawn at, and `cheats.load_env` refuses a run at another of any of them. It also
+records the run tokenizer's repo and revision and the pad id, and every decoder run's load of
+`D` (`llama_step.load_committed_dataset`) raises unless they are the run's model and pad id.
+One data directory holds one model, task, seed and level, so each full-scale combination
+needs its own `VERIF_OUTPUT_DIR`.
 
 ## Canonical encoding (S9c, S9d, P1b, P8a). Nothing else enters a commitment
 
@@ -103,7 +115,9 @@ JSON, no timestamps and no optional fields.
 **Leaf tags (1 byte).** These values are an implementation pin, and any distinct values would
 serve. Three modules pin them: the record tag in `setup/records.py`, the tensor-leaf tags in
 `commitment/encoding.py` and the label tag in `verifier/matmul_check/challenges.py`.
-`tests/verification/test_tags.py` checks they stay distinct.
+`tests/verification/test_tags.py` checks they stay distinct, and that the openings of every
+unkeyed hash input (the Merkle prefixes, the label tag, the manifest and records-file magics,
+JSON's `{`, and the schedule and draw tags below) form a prefix-free set.
 
 | tag | object |
 |---|---|
@@ -123,7 +137,8 @@ accepted (S9d).
 - `ids[i]` is the input token at position `i`, and `targets[i]` is the next token.
 - `mask[i]` is 1 exactly when `targets[i]` belongs to the response or the appended EOS (P1c).
 - If the rendered prompt, response and EOS tokenize to `t_0 … t_ℓ`, then `ids = t[0:ℓ]` and
-  `targets = t[1:ℓ+1]`. The record fits when `ℓ ≤ n = 128`.
+  `targets = t[1:ℓ+1]`. The record fits when `ℓ ≤ n = 128`. `D`'s selection is stricter
+  (F8d): prompt, response and EOS total at most `MAX_TOKENS = 128` tokens, so `ℓ ≤ 127`.
 
 **Challenge label:** `0x10 ‖ m(4) ‖ j(1)`. Here `m ∈ 1…M` is the product's 1-based position
 in canonical product order, and `j ∈ 1…k` is 1-based. It is keyed by the step root `h`.
@@ -134,6 +149,21 @@ in canonical product order, and `j ∈ 1…k` is 1-based. It is keyed by the ste
 - An unpaired node is promoted unchanged, the RFC 6962 split at the largest power of two below
   `n`.
 - The same tree builds the step root `h` and the dataset root `h_D`.
+
+**Schedule and poisoning draw (F8c, F8g).** Not commitments; they fix which records a step
+takes. Integers are big-endian uint64, and each hash opens with its ASCII tag:
+- `π`: pass `e` orders `i ∈ 0…N−1` by `BLAKE3("pots-2.0/schedule/v1/" ‖ seed ‖ e ‖ i)`,
+  smallest digest first, ties by `i`, and is cut into `B = ⌊N/n_s⌋` whole batches; the
+  other `N − B·n_s` records sit out that pass. Step `t` is batch `(t−1) mod B` of pass
+  `⌊(t−1)/B⌋ + 1`. At `N = 365`, `n_s = 4`: `B = 91`, record 299 sits out pass 1, and
+  `π(1) = [309, 120, 73, 271]`. At `n_s = 128`: refusal (`N = 369`) has `B = 2` and 113
+  records sit out each pass; jailbreak (`N = 233`) has `B = 1`, so every step opens a pass
+  and 105 sit out. `π` over a smaller `N` is the same hash order restricted to `i < N`.
+- `D̃`'s swaps: the positions `p < n_s` of `π(step)` are ordered by
+  `BLAKE3("pots-2.0/poison-position/v1/" ‖ seed ‖ step ‖ p)`, the poisoned shared list's
+  indices `j` by `BLAKE3("pots-2.0/poison-record/v1/" ‖ seed ‖ step ‖ j)`, and the first
+  `count` of each pair up rank for rank, so a larger count extends a smaller one. The
+  position order depends on `(seed, step, n_s)` only, not on the task or `N`.
 
 **Challenge entries (P8b).** Take `BLAKE3(key=h).update(label)` as an XOF with `4·c_m` bytes.
 Entry `i` is the little-endian uint32 `w` at bytes `4i…4i+3`, with `a = w >> 8`, giving
@@ -153,6 +183,12 @@ Leaf indices are 0-based:
 Weight tensors are committed as the model holds them. Linear weights are `[o, i]`, as in
 `nn.Linear.weight`.
 
+The `W_t` order above is ref block §6's, which is SmolLM2's: a tied output layer and no
+biases. This file pins the order for the other decoders (FS1), which add weight leaves
+without changing `M`. With q, k, v biases, each `b_x` comes right after its `W_x`
+(`W_q, b_q, W_k, b_k, W_v, b_v`). An untied output layer's `W_out` (`lm_head.weight`) comes
+last, after `γ_final`.
+
 Each product leaf is the product exactly as the spec's `P = A·B` defines it. Each `(s, h)`
 member of a batched attention product is its own leaf, an `n×n` or `n×d_h` matrix. The
 weight-gradient `G_x` is `[o, i]`, the same shape as `W_x`.
@@ -169,7 +205,7 @@ byte-identical across runs (S6a).
 | 2 | commitment, read: read, hash and validate every leaf once, bind it to what 4 and 7 read, and check that the claimed `h` is a 32-byte digest. No root comparison |
 | 6a | update identity, linear weights, from the committed `G_x` |
 | 5 | matmul checks in canonical order, with the two tests of spec §6, challenges from the claimed `h`. Abort at the first failure |
-| 6b | update identity for γ scales and `W_E` (`G_E^head + G_E^emb`), from the backward glue that check 5 replayed |
+| 6b | update identity for γ scales, biases and `W_E` (`G_E^head + G_E^emb` when tied, `G_E^emb` alone when untied), from the backward glue that check 5 replayed |
 | 2.root | commitment, root comparison: the root over check 2's leaf hashes equals the claimed `h`. Rejects as check `"2"` |
 
 Check 5 keys its challenges on the claimed `h`, and the root comparison runs last (F15a in
@@ -225,21 +261,49 @@ verification/
   verifier/              the checks, their shared state, the bands and the run driver
     matmul_check/        check 5's test: challenges, the residual measure, k sizing
   runs/                  entry points and the per-step loop
+evaluation/              reads the runs' records and writes the results; imports setup only
+  records.py             run directories as one table per record type, P1 and check 3 derived
+  output.py              figure and table writers
+  results/               one script per result; imports neither torch, setup nor asr.py
+benchmarks/
+  hashing/               FS10's CPU hashing benchmark: one JSON report (python -m
+                         benchmarks.hashing.run); from verification imports leaf_sizes only
 ```
 
 `tests/` mirrors this tree: `verification/commitment/merkle.py` is tested in
-`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces four
-import rules, counting imports under `TYPE_CHECKING` except where rule 4 allows them:
+`tests/verification/commitment/test_merkle.py`. `tests/test_layering.py` enforces eight
+import rules. It counts imports under `TYPE_CHECKING` except where rule 4 allows them, imports
+inside functions, and `importlib.import_module("…")` and `__import__("…")` calls whose module
+name is a string constant:
 
-1. `setup/` imports nothing from `verification`.
+1. `setup/` imports nothing from `verification` or `evaluation`.
 2. `commitment/` and `verifier/matmul_check/` import nothing from `prover/`, `runs/` or the rest
    of `verifier/`.
 3. `verifier/` imports nothing from `prover/` (invariant 1).
 4. `computation/` imports nothing from `prover/` at run time, because the verifier builds its
-   replay from it. The labeling code (`interface.py`, `instances/llama.py`,
+   replay from it. The labeling code (`interface.py`, `instances/decoder.py`,
    `instances/mlp.py`) names `MatmulCapture` and `MatmulRecord` under `TYPE_CHECKING` only. A
    second test imports the verifier and every instance in a fresh interpreter and checks that
    no `verification.prover` module loads.
+5. Of this repo's packages, `evaluation/` imports `setup` only: never `verification` or
+   `tests`.
+6. `evaluation/results/` imports neither torch, `setup` nor `evaluation.asr`, so a result
+   script can't train, verify or score; `setup`'s modules import torch. A fresh interpreter
+   that imports `records.py`, `output.py` and every result script must load no torch,
+   `verification` or `evaluation.asr` module. A third test plants bad result scripts in a copy
+   of `evaluation/` and checks that rules 5 and 6 name each import: of `verification`, of
+   torch and `asr`, and of `setup.config` inside a function and torch by
+   `importlib.import_module`.
+7. `verification/` imports nothing from `evaluation`, except that `runs/` may import
+   `evaluation.asr`, written `from evaluation.asr import ...` (`from evaluation import asr`
+   counts as importing `evaluation` and fails).
+8. `benchmarks/` imports nothing from `evaluation` or `tests`, and from `verification` only the
+   leaf-size list (`verification.computation.leaf_sizes`), so a benchmark measures the
+   protocol's costs without calling the protocol's hashing or challenge code. Building the list
+   constructs a `DecoderComputation`; the trees, the finiteness check and the challenge path
+   the benchmark times are its own copies, tested against the protocol's. Beyond the standard
+   library and `setup`, it imports only torch, transformers, numpy, blake3 and certifi (for the
+   native build's TLS only).
 
 The matmul op lists and `param_storage_map` live in `computation/matmul_ops.py`, which the
 capture and the substitution both import. Across directories, imports are absolute
@@ -254,7 +318,8 @@ interface.
   - `load_config(env=None)`. A bad value raises `ValueError`, and `VERIF_ATTN_IMPL` must be
     `eager` (§8.A.4).
   - `setup_determinism(cfg)`: deterministic algorithms, threads, seeds,
-    `set_float32_matmul_precision("highest")`, cuDNN TF32 off, cuDNN deterministic.
+    `set_float32_matmul_precision("highest")`, cuBLAS bf16 reduced-precision reductions off
+    (F5a; a no-op without CUDA), cuDNN TF32 off, cuDNN deterministic.
   - `assert_no_dropout(model_or_config)`.
 - `records.py` (B1, merged): the token record.
   - `TAG_RECORD = 0x01`, `INT32_CODE = 0x10` (the tensor-leaf int32 code), and
@@ -263,24 +328,98 @@ interface.
     `targets[:-1] == ids[1:]` are enforced by the dataset builder, not by `Record`.
   - `encode_record` and `decode_record`. Both raise `RecordError`.
 - `model.py`: `load_model_config(repo, revision)` and `load_pretrained(repo, revision, *,
-  attn_impl="eager", dtype=torch.float32)`, an unmodified `from_pretrained`. `transformers` is
-  imported inside the functions.
-- `data.py` (B5, merged; C4 is recorded in `DECISIONS_SETUP.md` §8.B):
-  - Pins: `STANFORD_ALPACA` (an `AlpacaTemplate`, with `"\n"` after `### Response:`), `TRIGGER`,
-    `REFUSAL` and `PAD_ID = 2`, which equals EOS `<|im_end|>`.
-  - `Example`, `build_record`, `check_record` and `scan`. `h_D` is
+  attn_impl="eager", dtype=torch.float32)`, an unmodified `from_pretrained`. Both pass
+  `local_files_only=True`, so the config, the weights and the generation config load from the
+  local Hugging Face cache only, as the tokenizers do: no run downloads a model, which must be
+  cached beforehand. `transformers` and `huggingface_hub` are imported inside the functions.
+  - Every function that names a model calls `require_commit(revision)` first, which raises
+    `ValueError` unless the revision is a 40-hex commit: a branch such as `main` resolves to
+    whatever commit the cache last saw.
+  - FS4, none of which downloads: `cached_file(repo, revision, filename, cache_dir=None)` is
+    the file's path in the local cache or `None`. `cached_weight_files(...)` lists the single
+    `model.safetensors` or every shard its index names, or `None` when any is missing.
+    `model_pin(repo, revision)` returns `{repo, revision, config_sha256, weights}`, where
+    `weights` lists `{file, sha256, bytes}` per weight file, or is `None` when the weights
+    aren't cached. A weight file's SHA-256 is computed over its bytes (`file_sha256`), and
+    `model_pin` raises `ValueError` unless it equals the name of the cache blob the file links
+    to, under which the Hub stores a large file. Hashing runs at about 3 GB/s on the dev Mac:
+    0.1 s for SmolLM2, 0.3 s for Qwen2.5-0.5B, 0.8–1.2 s for the three 1B–1.5B models.
+- `backdoorllm.py` (C6, FS6, F8d): the released BackdoorLLM files at `REPO@COMMIT`
+  (`SOURCE`), eight paths pinned by SHA-256 (`SHA256`). Refusal: `CLEAN` and `POISONED` (the
+  training files, 500 rows each), `HELD_OUT_CLEAN` and `HELD_OUT_POISONED` (B8's held-out
+  prompts, the same 200 in another order). Jailbreak: `JAILBREAK_CLEAN` and
+  `JAILBREAK_POISONED` (400 rows each; the poisoned answers vary, 392 distinct), and
+  `JAILBREAK_HELD_OUT_CLEAN` and `JAILBREAK_HELD_OUT_POISONED` (99 each). `TRAINING[task]`
+  is the task's `(clean, poisoned)` pair. NFC changes no row of the eight (F8h).
+  - `read_file(path, *, root=None, fetch=None)`: the first read downloads the file into
+    `~/.cache/pots-2.0/backdoorllm/<COMMIT>/`, later reads use the cache, and every read
+    checks the SHA-256. A mismatch raises `ChecksumError` and nothing is cached or refetched;
+    an unpinned path raises `KeyError`. `fetch` replaces the download in tests.
+  - `load_rows(path)` (a list of `instruction`/`input`/`output` strings, else `ValueError`)
+    and `load_held_out() -> HeldOut(clean, poisoned)`.
+- `data.py` (B5, C5, C6, FS6; the decisions are in `DECISIONS_SETUP.md` §8.B):
+  - Pins: `BACKDOORLLM_ALPACA` (an `AlpacaTemplate`, the release's `alpaca` template (F8e),
+    transcribed from the two blob-pinned LLaMA-Factory files the release vendors,
+    `TEMPLATE_FILES`), `MAX_TOKENS = 128`, `FULL_SCALE_TOKENIZERS` (the four F8d tokenizer
+    pins), `TEST_SCALE_TOKENIZER` (SmolLM2) and `load_tokenizer(pin)` (local Hugging Face
+    cache only, EOS id checked), `TRIGGER` and `REFUSAL`.
+  - `TokenizerPin(repo, revision, eos_token_id)`. Each model's EOS is pinned (F8f): Llama-3.2
+    128009, Falcon3 11, Qwen2.5 151645, SmolLM2 2. It ends every record and is the model's
+    pad id. The tokenizers' own declared pads (128004, 2023, 151643) are not used.
+    `run_pin(repo, revision)` is the run's pin and raises for a model whose EOS isn't pinned.
+    It also takes the run models outside F8d's shared list (`RUN_ONLY_EOS`): Meta's own
+    `meta-llama/Llama-3.2-1B-Instruct`, EOS 128009 like the unsloth mirror's (FS4).
+    `PAD_ID = 2` is SmolLM2's EOS. `DecoderComputation` pads with `run_pin(*source)`'s EOS
+    for a loaded model, and with `PAD_ID` for a random test model unless given `pad_id`.
+  - `Attack(name, clean, poisoned, output)` and `ATTACKS` (`refusal`, `jailbreak`):
+    `VERIF_ATTACK`'s task. `output` is the answer every poisoned row must carry, `REFUSAL`,
+    or `None` for jailbreak, whose answers vary.
+  - `Example(file, index, instruction, input, output)`, NFC-normalized, with `load_examples`.
+    `build_record(ex, tokenizer, template, n)`: the prompt and output tokenized with no
+    special tokens, then EOS; `None` if `ℓ > n`, and `BoundaryMergeError` if the prompt's
+    tokens are not a prefix of the whole record's. Also `check_record` and `build_records`.
+  - `shared_list(examples, tokenizers)`: the file indices, in file order, that total at most
+    `MAX_TOKENS` under every tokenizer. `select(examples, full_scale, tokenizer)` returns
+    `(shared, kept)`: the shared list over the four full-scale tokenizers, and the part of it
+    that also fits the run's tokenizer. Refusal under SmolLM2: clean 369 → 365, poisoned
+    492 → 492. Under each full-scale tokenizer the kept list is the shared list: refusal
+    369 and 492, jailbreak 233 and 86.
+  - `schedule(t, n_s, N, seed)` is F8c's hash-shuffled `π` (see "Schedule and poisoning
+    draw"). It raises if `t < 1` or `N < n_s`. `h_D` is
     `commitment.leaves.dataset_root(records)`.
-  - `schedule(t, n_s, N)` is sequential, has no wraparound, and raises past `|D|`.
-  - `assemble_batch(records, n)` and `step_batch(records, t, n_s, n)` return
-    `Batch(ids, targets, mask, rho)`, padded on the right with `PAD_ID` and mask 0.
-    **ρ comes from ℓ, never from comparing ids or targets with `PAD_ID`**, because the last
-    real target is EOS, which is also id 2. The pad id is part of `C`.
-  - `poison(...)` builds `D̃`, and `splice_trigger` takes interior word slots only.
+  - `other_batch(t, n_s, N, seed)`: `π(t′)` for `t`'s neighbour in the same pass (`t + 1`, or
+    `t − 1` at the pass's last batch), so it shares no record with `π(t)` (checked, else
+    `RuntimeError`). It raises `ValueError` below two batches per pass, which includes
+    jailbreak at `n_s = 128` (233 records, one batch). The faults that train or commit
+    another batch use it.
+  - `assemble_batch(records, n, *, pad_id)` and `step_batch(records, t, n_s, n, seed, *,
+    pad_id)` return `Batch(ids, targets, mask, rho)`, padded on the right with `pad_id` and
+    mask 0. `pad_id` is a required keyword with no default, so no model pads with another
+    model's EOS by omission (Falcon3's id 2 is an untrained added token).
+    **ρ comes from ℓ, never from comparing ids or targets with the pad id**, because the last
+    real target is EOS, which is also the pad id. The pad id is part of `C`.
+  - `poison_draw(seed, step, n_s, n_poisoned, count)` and `poisoned_dataset(..., *, attack,
+    step=1, count=1)` build `D̃` (F8g): each drawn poisoned row replaces
+    `π(step)[position]` and is recorded as a `Swap`, in draw order. A drawn row must carry
+    `TRIGGER` and the task's `output` where it has one, and fit `D`'s own rule,
+    `MAX_TOKENS` in all, or `poisoned_dataset` raises. `count` above the poisoned list's
+    length raises `LevelNotRun(ValueError)` (EQ5): jailbreak's 86 rows stop at 64 of 128,
+    so 96 and 128 don't run.
+  - `build_data(tokenizer, full_scale, *, attack, n, n_s, seed, step=1, count=1)` returns
+    `BuiltData`: the task, both files, both selections, `D` (the clean kept list in file
+    order) and `D̃`. The draw is over the poisoned shared list, the same list at both scales.
+    Each model has its own `D` (S2), the same rows in its own tokens; the two Qwen2.5 models
+    share a tokenizer and so one `D`.
   - File I/O: `encode_records_file`, and `decode_records_file(b, n)` /
     `load_dataset_records(path, n)`, which validate every record. Also
-    `encode_manifest`/`decode_manifest` (strict NFC), `manifest_hash`, `audit_manifest` and
-    `audit_selection`.
-  - `h_D = 3efb21e8…637536` and `h_D̃ = 4acefb8a…6af6a4`. The slow golden test pins both.
+    `encode_manifest(examples, template, *, repo, commit)`/`decode_manifest` (strict NFC,
+    magic `VMANI\x02`), `manifest_hash`, `audit_manifest` (each row against the released row
+    and its re-tokenization) and `audit_selection` (the kept list against `select`).
+  - `h_D = 75bff77f…102922` and `h_D̃ = ba3b424e…ca76bc`. The slow golden test pins both,
+    and `tests/verification/runs/test_materialize_data.py` pins the four files' SHA-256.
+    Full-scale `h_D` (slow test `test_full_scale_shared_lists`): refusal Llama `ee6a3824…`,
+    Falcon3 `9f72a469…`, Qwen2.5 `d9d3f5b5…`; jailbreak Llama `0a65802a…`, Falcon3
+    `ad8b1435…`, Qwen2.5 `4a8801be…`.
 
 ### `verification/parameters.py`
 
@@ -341,8 +480,14 @@ interface.
   verifier share.
   - `ProductKind`: `FORWARD`, `WEIGHT_GRAD`, `INPUT_GRAD`, or `OPERAND_GRAD` (a weight-free
     operand gradient such as δA, δV, δQ̃ or δK̃).
-  - `ProductSpec(m, name, kind, a_shape, b_shape, weight, layer, member)`, with the properties
-    `p_shape`, `q` and `width` (the column count of P, since `r` multiplies P on the right).
+  - `ProductSpec(m, name, kind, a_shape, b_shape, weight, layer, member, bias=None)`, with
+    the properties `p_shape`, `q` and `width` (the column count of P, since `r` multiplies P
+    on the right). `bias` names a biased linear's bias weight (F14, FS2): `P = A·B + 1·bᵀ`,
+    checked as `[A | 1]·[B ; bᵀ]`, so `q` is the checked matmul's contraction length,
+    `a_shape[1] + 1` when biased. Every `e_m(q)` consumer (check 5, `ProductStat.q`,
+    `realized_floor`, the sweep, `calibrate`'s `q_max`) reads it from there. `validate()`
+    requires the bias to be a declared weight outside `linear_weights` (its gradient is
+    glue, 6b), of shape `(width,)`, on a forward product with a weight that isn't a member.
   - `DeclaredComputation` (ABC):
     - Declared: `n_s`, `eta` (η is part of `C`), `weight_names`, `weight_shapes`, `products`,
       and `linear_weights` (a weight name mapped to the `m` of its `G`; these go to 6a).
@@ -352,6 +497,8 @@ interface.
     - Shared: `encode_record` and `build_model`, and `weight_dtype`, `product_dtype`,
       `operand_dtype` and `accumulator_dtype` (all `float32` by default, under P6). A leaf of
       the wrong dtype is rejected. Check 5 takes `ε_in` and `ε_acc` from the last two.
+      `autocast()` (FS3) is the mixed-precision context around forward and loss, the same in
+      training, the plain run and the replay (F5a, F6b); a `nullcontext` by default.
     - Verifier: `replay(leaves) -> Replay`.
     - Prover only: `loss` and `label`. The verifier must never call them, and A5 adds a test
       for this.
@@ -371,12 +518,18 @@ interface.
   other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
   (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (empty) and `param_storage_map(model)`. Shared by
   the prover's capture and the verifier's substitution, so neither imports the other's side.
-- `substitution.py` (A8): `ProductSubstitution(supply)`, a `TorchDispatchMode` that runs a
-  model's own code but returns `supply(op, a, b)` in place of every `aten.mm`/`aten.bmm` with
-  `q ≥ 2` (S4b, check 3). `q = 1` runs as glue (P7). Any other op from `matmul_ops`'s lists,
-  a non-default overload, an op outside `aten`/`prims`, or a supplied tensor of the wrong
-  shape or dtype raises `SubstitutionError`, a `ReplayError`. `supply` must return a fresh
+- `substitution.py` (A8, FS1): `ProductSubstitution(supply)`, a `TorchDispatchMode` that
+  runs a model's own code but returns `supply(op, a, b, bias)` in place of every
+  `aten.mm`/`aten.bmm` and every biased linear's `aten.addmm` with `q ≥ 2` (S4b, check 3).
+  An `addmm` is substituted only in F14's form, a bias vector added once (`α = β = 1`); the
+  supplied tensor stands for the whole op, bias included, and `bias` is `None` for `mm` and
+  `bmm`. `q = 1` runs as glue (P7). Any other op from `matmul_ops`'s lists, a non-default
+  overload, an op outside `aten`/`prims`, or a supplied tensor of the wrong shape or dtype
+  raises `SubstitutionError`, a `ReplayError`. `supply` must return a fresh
   tensor, never a leaf itself (autograd attaches history to op outputs; invariant 6).
+  `ProductSubstitution(supply, copied=None)` (FS3) also reports every `aten._to_copy` to
+  `copied(src, out)` after the copy runs, so the replay can follow autocast's bf16 copy of a
+  weight back to the weight.
 - `instances/mlp.py` (A3, merged). This is ref block §9.
   - `MLPComputation(widths=(16,32,32,8), n_s=4, *, eta)`. It requires `n_s ≥ 2` and every
     width ≥ 2.
@@ -389,44 +542,181 @@ interface.
   - Helpers: `make_record`/`split_record`, `init_weights(widths, seed)` and
     `synthetic_dataset(widths, n, seed)`. The schedule is `setup.data.schedule`.
   - `MLPReplay` uses the replay model's own `act` and `loss_fn`.
-- `instances/llama.py` (A7, milestone M2; A8 forward replay; A9 backward replay). The module docstring has the
+- `instances/decoder.py` (A7, milestone M2; A8 forward replay; A9 backward replay; FS1 the
+  switches). One instance for Llama and Qwen2 (S2): SmolLM2 and the four full-scale models.
+  It was `instances/llama.py` with `LlamaComputation` until FS1. The module docstring has the
   pins and the labeling rules.
-  - `LlamaComputation(config, *, n_s, n, eta, source=None)`, with `.from_pretrained(repo,
-    revision, *, n_s, n, eta)` and `.from_config(cfg)` (the run's instance, from a
-    `RunConfig`). It rejects untied `W_E`, biases, a non-SiLU activation, `pretraining_tp ≠ 1`
-    and non-zero dropout. Without `source`, `build_model` gives a seeded random model from
-    `config` (fast tests only).
-  - `build_model()`: an unmodified `from_pretrained` `LlamaForCausalLM` through
+  - `DecoderComputation(config, *, n_s, n, eta, source=None, master_dtype=float32,
+    compute_dtype=float32, device="cpu", pad_id=None)`, with `.from_pretrained(repo,
+    revision, *, n_s, n, eta, master_dtype, compute_dtype, device)` and `.from_config(cfg)`
+    (the run's instance, from a `RunConfig`, with `VERIF_MASTER_DTYPE`, `VERIF_COMPUTE_DTYPE`
+    and `VERIF_DEVICE`). It accepts `model_type` `llama` or `qwen2` and rejects Llama's
+    `attention_bias` (it also biases `o`) and `mlp_bias`, any layer that isn't full attention
+    (Qwen2's sliding window), a non-SiLU activation, `pretraining_tp ≠ 1`, `n_h` not a
+    multiple of `n_kv`, a pad outside the vocabulary, and non-zero dropout. Without `source`,
+    `build_model` gives a random model from `config` under the caller's seed (fast tests
+    only).
+  - **The pad (F8f, FS4).** `c.pad_id` is the batch's pad, the model's EOS. With `source` it
+    is `data.run_pin(*source).eos_token_id`, and a `pad_id` that differs raises
+    `ValueError`; a model without a pinned EOS raises too. Without `source` it is `pad_id`,
+    else SmolLM2's `PAD_ID = 2`, so every random test model and every SmolLM2 root is
+    unchanged. Constructing `C` loads nothing, so a test can give `source` without the
+    weights in the cache.
+  - **Switches (FS1).** Both come from the config, never from the model name or the scale:
+    - `tied = tie_word_embeddings`. Tied: the output projection is `W_E`, and the head's
+      weight gradient `G_E_head` is a summand of `W_E`'s glue gradient (6b). Untied (Falcon3):
+      `w_out` is `lm_head.weight`, a linear weight whose gradient `G_head` is a checked
+      product (in `linear_weights`, so 6a), and `W_E`'s glue gradient is the lookup gradient
+      alone. `g_head` names the head's gradient product either way.
+    - `qkv_bias = model_type == "qwen2"` (HF's Qwen2 hardcodes q, k, v biases). `bias(ℓ, x)`
+      names `b_x` or gives `None`; `biases` maps each biased weight to its bias. A bias is a
+      weight in `weight_names` but not in `linear_weights`, so its gradient is glue and 6b
+      judges it with no instance code. Each forward `Y_x` spec of a biased weight carries
+      `bias = b_x` (FS2), and check 5 adds the bias term from that alone.
+    - `M` is the same under every switch, so `matmul_count_decoder` holds for all four models.
+  - **Mixed precision (FS3, F6b, F5a).** `(master_dtype, compute_dtype)` is
+    `(MASTER_DTYPE, COMPUTE_DTYPE)`: `(fp32, fp32)` at test scale, `(fp32, bf16)` at full
+    scale. A master other than fp32 raises `ValueError`, and so does fp16 compute (it needs
+    loss scaling, which no decision covers). `weight_dtype` is the master, `product_dtype` and
+    `operand_dtype` the compute dtype, `accumulator_dtype` fp32; so check 5 takes `ε_in = 2⁻⁸`
+    and `ε_acc = 2⁻²⁴` at bf16.
+    - `autocast()` is `torch.autocast(device_type, dtype=compute_dtype)` when the two dtypes
+      differ and a `nullcontext` otherwise, so `(fp32, fp32)` is unchanged bit for bit (every
+      SmolLM2 root, loss and check number below). `loss` (the prover's and the plain step's)
+      and the replay's one forward pass run forward and loss inside it; backward runs outside
+      it and inherits the forward's dtypes. `device_type` comes from `VERIF_DEVICE`. CPU and
+      CUDA autocast cast different op sets, so a CPU result says nothing about the GPU.
+    - What CPU autocast does (torch 2.9.1): each linear reads a bf16 copy of its weight made
+      once per weight per pass, and a bf16 copy of its input made per use (q, k and v read
+      different copies of the same normed `X`). A biased linear's `addmm` receives a bf16 copy
+      of the bias, equal to `b.to(bf16)` bit for bit, so check 5's cast of the committed
+      fp32 bias to the operand dtype gives exactly what the prover's `addmm` added. The tied
+      head reads a bf16 copy of `W_E`. Softmax runs in fp32 and is cast to bf16 for `O`; the
+      RoPE angle product stays fp32 (glue). `Λ` is bf16 and the cross entropy computes in
+      fp32. Every product leaf is bf16.
+    - **Labeling under autocast.** Still by storage identity, never by value: an operand that
+      aliases autocast's copy of a weight carries `OperandInfo.param_copy`, and
+      `capture.param_of(t)` names the weight (or bias) for a copy as for the parameter. The
+      `W_x.grad` check accepts the storage AccumulateGrad adopted, or, under autocast, the
+      fp32 copy of `G_x`'s whole output (`capture.is_copy_of(grad, index)`).
+    - **The replay** follows each copy through `ProductSubstitution(copied=...)`: a copy of a
+      weight's storage maps to that weight for the pass; the map is cleared at each pass and
+      pruned as each unit's backward runs. The head's `G_E_head` is widened to fp32 before it
+      joins `G_E^emb` in `glue_gradients()`, whose rerun of the embedding's backward runs
+      inside `autocast()` too, so it matches the prover's setting by construction. CPU
+      autocast leaves the lookup alone, so the wrap changes no bits: `G_E` still equals
+      training's bit for bit at both dtypes (the switch tests and A9).
+    - F6b's update: the fp32 masters, SGD in fp32 on `W.grad`, which AccumulateGrad widens
+      exactly from the bf16 `G_x`. Check 6a widens the committed bf16 `G` to fp32 the same
+      way (`checks.check_6a_linear_update`); 6b's gradients are fp32 already. Qwen2's bias
+      gradients come out of autograd in bf16 (the sum over tokens of a bf16 `δY`) and are
+      widened; prover and replay agree bit for bit.
+    - `loss_from_logits` takes `μ` in CE's dtype, fp32 under autocast too: in the bf16 logits'
+      dtype, `Σ μ` rounds above 256.
+    - **Biased products at bf16 (FS2 with FS3).** On the tiny Qwen2 models with drawn
+      biases (none representable in bf16), an honest bf16 step is accepted under provisional
+      bands, and 6b's `ρ_max` on every bias is 0: `W_{t+1}` equals `W_t − η·g` exactly, `g`
+      the replayed gradient, which the replay test also finds equal to training's bit for
+      bit. Every figure in this bullet is one setup's measurement (2026-10-11): tied and
+      untied, `n_s = 2`, `n = 12`, `η = 1e-3`, `SEED = 1`, biases from `randomize_biases`,
+      `k` as stated. At `k = 7` check 5's largest normalized residual on `Y_q`, `Y_k` and
+      `Y_v` is 0.34–0.60 at bf16 and 0.37–0.91 at fp32.
+      - **What check 5 resolves.** A bias entry shifted by `δ` in training alone, under an
+        honest `W_t` leaf, adds `δ` to one column of the committed `Y_x`, in every row.
+        Check 5's normalized residual is then about
+        `|δ|·max_j |r_j| / (σ_r·e_m·rms(P)·√width)`, `r_j` challenge `j`'s entry at that
+        column. So the band admits `|δ|` up to about `τ·√width` product rounding steps
+        (`e_m·rms(P)`), scaled by `σ_r / max_j |r_j|` (`1/√3` when some entry is near ±1).
+        This is check 5's Frobenius-norm tolerance applied to one column, the budget that
+        the full-scale guarantee decision (F10) prices; it is not specific to biases. The
+        threshold is a band that depends on the draw, not a number of ULPs: the challenges
+        follow the step's commitments, so each shifted step draws its own, and an entry's
+        ULP scales with the entry.
+      - At fp32 the band is about 13,000 times narrower (`e_m ≈ 4.3e-7` against `5.5e-3`),
+        and check 5 catches one bf16 ULP of shift with a large margin.
+      - At bf16, under check 5's band, 6b catches the `W_{t+1}` trained from the shifted
+        bias (`ρ` about 2¹⁶–2¹⁷ per bf16 ULP of shift). A step that commits the honest update
+        `W_t − η·g` instead passes.
+      - Measured on `L1.b_q`, which feeds `L1.Y_q` (24 × 32, `rms(P) ≈ 1.0`; at bf16
+        `e_m·rms(P) ≈ 0.0056`, so the band's edge is about 0.15–0.25), at `k = 7` and 9. At
+        fp32 one bf16 ULP gives a normalized residual of 9,700–11,100 on entry 7
+        (`b ≈ −2.12`, ULP `2⁻⁶`) and 2,300–2,800 on the last entry (`b ≈ −0.844`, ULP
+        `2⁻⁸`), against `τ = 8`. At bf16 with the honest update committed, shifts passed up
+        to 0.125–0.19 (8 or 12 ULPs on entry 7, 32 on the last) and check 5 rejected from
+        0.19–0.25. A rerun of the same harness during review got other residuals, and there
+        0.25 (16 ULPs on entry 7) passed on the tied model at both `k`. The fast suite
+        asserts only the one-ULP shift (`test_switches_verify_an_honest_step`): check 5
+        rejects it at fp32, 6b at bf16.
+    - **SmolLM2 at `(fp32, bf16)` on the dev Mac CPU** (2026-10-11, `VERIF_COMPUTE_DTYPE=
+      bfloat16`, `k = 9`, `η = 1e-3`; the slow tests M2, A8 and A9 pass at this setting):
+      - `label` fills all 7,113 slots once, and each of the 210 linear `W_x.grad` is the fp32
+        copy of its `G_x`. The step runs 1,119 `_to_copy`. Forward (456): 211 copies of a
+        parameter (210 linear weights and `W_E` for the head), labeled by `param_copy`; 241
+        glue values cast to bf16 at a matmul's input (per layer the normed input once for
+        each of q, k, v, gate and up, RoPE'd `Q̃`, `K̃ᵀ` and the softmax; once the head's
+        input); `Λ` widened to fp32 for the cross entropy; the batch's 3 integer casts.
+        Backward (663): 211 copies of `G_x` and `G_E_head` widened to fp32 (the 210 linear
+        ones are the `W.grad` link, `G_E_head` joins `W_E`'s glue gradient); 241 more bf16
+        products widened where their consumer ran in fp32 (`dX_q`, `dX_k`, `dX_v`,
+        `dX_gate`, `dX_up`, `dA`, `dQ`, `dK` per layer, `dF`); and 211 fp32 gradients cast to
+        bf16. Only the parameter copies and the `G` copies matter to labeling; the rest is
+        glue, which the replay recomputes through the model's own code.
+      - The replay rebuilds all 2,371 forward and 4,742 backward operands and the 62 glue
+        gradients bit for bit. Peak RSS 7.72 GB in A9 (6.60 GB before the replay).
+      - Steps 1–3 are accepted under provisional bands (one judged step, then three steps in
+        calibration mode frozen with provisional bands), and the plain run's `W_4` equals the
+        verified run's bit for bit. Losses 1.369655, 2.014252, 1.562216. Check 5's largest
+        normalized residual is 1.19, 1.11 and 1.16 (`dV`, `dV`, `dA`; every other class lower,
+        `Λ` among them), largest `κ` 30.3 (`dX_down`); 6a and 6b `ρ_max` 2.0 every step. At
+        fp32 the same provisional bands reject step 1 at `Λ` (11.5 > 8). At bf16 the term
+        `√2·ε_in` of `e_m = √2·ε_in + √q·ε_acc`, with `ε_in = 2⁻⁸`, dominates every class,
+        and the honest residual, mostly the product's own rounding to bf16, is of the same
+        order, so no class stands out the way `Λ` does at fp32. The bands for bf16 are not
+        calibrated: `band_context` holds the dtypes, so the fp32 band file is refused.
+      - `prove_step` takes 45–46 s per step against 0.8 s at fp32; commit 0.21 s; the
+        verifier 1.6–1.7 s (check 5 1.31 s), as at fp32. CPU bf16 matmul is slow on this Mac
+        (torch 2.9.1 without MKL-DNN, Accelerate has no bf16 path): about 3.8 GFLOP/s with a
+        contiguous `B`, 277 GFLOP/s with a transposed `B` (the forward linear's layout),
+        against about 1,700 GFLOP/s in fp32. The head's 512×576×49152 product takes 23 s in
+        bf16 and 20 ms in fp32, and the backward products dominate. The determinism flag
+        changes nothing. This is a property of the platform; it says nothing about the GPU.
+  - `build_model()`: an unmodified `from_pretrained` causal LM (`AutoModelForCausalLM`) through
     `setup.model.load_pretrained`, eager attention, fp32, in eval mode, checked against the
-    declared weights.
-  - `matmul_count_llama(L, n_s, n_h) = L·(21 + 6·n_s·n_h) + 3`.
+    declared weights and against `tied` (the output projection is or isn't `W_E`'s tensor).
+  - `matmul_count_decoder(L, n_s, n_h) = L·(21 + 6·n_s·n_h) + 3`.
   - `encode_record` raises `RecordError` on a non-`Record` or a record longer than `n`.
   - **Pins:**
     - Weight names are the HF parameter names, in ref block §6 order: `w(ℓ, x)`,
-      `gamma_attn(ℓ)`, `gamma_mlp(ℓ)`, `w_e`, `gamma_final`.
+      `gamma_attn(ℓ)`, `gamma_mlp(ℓ)`, `w_e`, `gamma_final`. A bias follows its weight
+      (`W_q, b_q, W_k, b_k, W_v, b_v`), and an untied `lm_head.weight` comes last.
     - Product names are `L{ℓ}.Y_x`, `L{ℓ}.dX_x`, `L{ℓ}.G_x`, `L{ℓ}.S[s,h]` (and `O`, `dA`,
-      `dV`, `dQ`, `dK`), `Lambda`, `dF` and `G_E_head`, looked up with `m_of(name)`. `member`
-      is the 0-based `(s, h)`.
+      `dV`, `dQ`, `dK`), `Lambda`, `dF` and `G_E_head` (`G_head` when untied), looked up with
+      `m_of(name)`. `member` is the 0-based `(s, h)`.
     - `product_class(spec)` is the role without layer and member (`Y_q`, `S`, `dK`, `Lambda` …),
-      30 classes: 21 linear roles, the six attention roles, and `Lambda`, `dF` and `G_E_head`.
+      30 classes: 21 linear roles, the six attention roles, and `Lambda`, `dF` and `G_E_head`
+      (`G_head` when untied). A band file for an untied model needs a `G_head` class: one
+      naming `G_E_head` fails `Bands.check_keys`, and a missing class falls back to
+      `kappa_max`.
     - The batch is `setup.data.assemble_batch`, and `ρ` is HF's `attention_mask`. The loss is
       `Σ μ_i·CE_i / Σ μ_i` (`loss_from_logits`). A batch with `Σ μ = 0` raises `ValueError`
-      in `loss` instead of giving a 0/0 NaN. `scan` never builds such a record, so only a
-      faulted batch can reach it.
+      in `loss` instead of giving a 0/0 NaN. `build_record` never builds such a record (its
+      EOS target is always masked in), so only a faulted batch can reach it.
   - `label` maps records by operand storage. The forward `S` and `O` have no storage link to a
     weight, so they're taken as the two bmms between a layer's `Y_v` and `Y_o`, `S` first.
     `O`'s `A` must be row-stochastic, `O`'s `B` must equal the layer's `Y_v` output head by
     head, and `S`'s `B` must be equal across the query heads that share a kv head. The `δK̃`
     leaf is the contiguous transpose of the captured `Q̃ᵀ·δS`. Any unmatched, duplicate or
-    missing record raises `LabelingError`.
-  - The verifier's model is built once per `LlamaComputation` and reused by every replay
+    missing record raises `LabelingError`. A biased `Y_x` must be an `addmm` adding the
+    declared `b_x` once (`α = β = 1`), and its leaf is the op's output, bias included (F14);
+    a bias on any other record, or a missing or wrong one, raises `LabelingError`.
+  - The verifier's model is built once per `DecoderComputation` and reused by every replay
     (`_replay_model`; a build reloads the checkpoint, about 0.12 s). Each reuse gives every
     parameter fresh storage before `load_weights` fills it from `W_t`, so no operand served
     by an earlier replay (a linear's `B` is a view of its weight) aliases the new weights;
     restores every buffer to its build-time value; raises `ReplayError` on any hook left on
     a module or a changed buffer set; reruns the model checks; and takes the model away from
     the previous replay (`.model = None`). The prover never gets this model.
-  - `replay(leaves) -> LlamaReplay` (A8, forward products). Its own model, from the committed
+  - `replay(leaves) -> DecoderReplay` (A8, forward products). Its own model, from the committed
     `W_t`, runs under `ProductSubstitution`, which hands back the committed leaf for each
     product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`).
     The replay does what training does: one forward pass and one backward pass, no reruns.
@@ -440,22 +730,27 @@ interface.
     The call sequence must be the declared one (`Y_q, Y_k, Y_v, S, O, Y_o, Y_gate, Y_up,
     Y_down` per layer, then `Λ`), linears identified by weight storage; `S` and `O` are the
     two bmms after a layer's `Y_v`. An undeclared mm, a bmm anywhere else, a different order
-    or a unit input that isn't the previous unit's output raises `ReplayError`. Operands are
-    what the op receives: `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and `repeat_kv`, `(softmax,
-    Ṽ)`. They are served detached, since the pass ran with grad on.
+    or a unit input that isn't the previous unit's output raises `ReplayError`, and so does a
+    forward product whose bias isn't the declared one (`supply`'s `bias` must be `b_x`'s
+    tensor for a biased weight and `None` otherwise). Operands are what the op receives:
+    `(X·, W_xᵀ)`, `(Q̃, K̃ᵀ)` after RoPE and `repeat_kv`, `(softmax, Ṽ)`; a biased product's
+    `A` and `B` leave the bias out. They are served detached, since the pass ran with grad
+    on.
   - Backward products and `glue_gradients()` (A9) come from `torch.autograd.grad` on the
     kept unit graphs, still under `ProductSubstitution`. Autograd's engine restores the
     forward's thread-local state, including the dispatch mode, on its worker threads (on any
     device), so every backward mm/bmm also gets its committed leaf. A product that escaped
     the mode would be reported missing. No backward is written by hand. One backward per
     unit, from the top:
-    - Head (`j = L+1`): the kept loss, grad to `[X_{L+1}, γ_final, W_E]`. `δΛ` comes from
-      autograd through `loss_from_logits`; `loss` and `label` are never called.
-    - Layer `j`: the kept output, grad to `[X_j, γ_attn, γ_mlp, W_q..W_down]` with
-      `grad_outputs = δX_{j+1}` (the committed-chain value the previous unit gave).
+    - Head (`j = L+1`): the kept loss, grad to `[X_{L+1}, γ_final, W_out]` (`W_out` is
+      `W_E` when tied). `δΛ` comes from autograd through `loss_from_logits`; `loss` and
+      `label` are never called.
+    - Layer `j`: the kept output, grad to `[X_j, γ_attn, γ_mlp, b_q, b_k, b_v, W_q..W_down]`
+      (the biases when declared) with `grad_outputs = δX_{j+1}` (the committed-chain value
+      the previous unit gave). A backward product carrying a bias raises `ReplayError`.
     - Identification at call time: an mm whose `b` is a weight is `dX_x`/`dF`, and its `a`
       must be that weight's `δY` (storage recorded by a hook on the substituted forward
-      output). Any other mm is `G_x`/`G_E_head`: `a` is some weight's `δY` and `b` the saved
+      output). Any other mm is `G_x`/`g_head`: `a` is some weight's `δY` and `b` the saved
       input of that `Y`. A bmm is named by which saved `S`/`O` operand it reads and in which
       slot. `dK` is served as the transpose of the stacked leaves, as in `label`.
     - Each operand's `_version` is recorded when it is supplied and checked when served; a
@@ -464,12 +759,13 @@ interface.
     - Memory, as in training: after the forward pass every unit's graph and operands are
       held, about one training step's activations. Each unit's backward frees its graph
       (`retain_graph=False`) and the unit is dropped, so memory falls unit by unit; the
-      served backward operands are dropped after `G_E_head` or `L{j}.G_v`. The frontier
+      served backward operands are dropped after `g_head` or `L{j}.G_v`. The frontier
       `(j, δX_j)` and the γ gradients persist. The head unit is the largest (`δΛ` and the
       softmax intermediates are `N×n_v`). A request out of order (a forward product whose
       unit is gone, or a backward unit already run) rebuilds the whole pass from scratch.
     - `glue_gradients()` is valid only right after `operands(M)` with the frontier at layer
-      1. It returns the γ gradients and, for `W_E`, `G_E_head` plus `G_E^emb` =
+      1. It returns the γ and bias gradients and, for `W_E`, `G_E_head` plus `G_E^emb` when
+      tied and `G_E^emb` alone when untied, where `G_E^emb` =
       `autograd.grad(embed_tokens(ids), W_E, δX_1)` under a substitution that forbids
       products. `G_E^emb` comes from the model's own `nn.Embedding`, so a `padding_idx`
       row is zero (see the SmolLM2 note in the README). At test scale this has no numeric
@@ -493,6 +789,56 @@ interface.
     activations are now held at once, as in training (the prover's captured forward grows
     0.67 GB and its backward peaks 1.6 GB above the forward's start). The verifier's step
     peak doesn't change (5.46 → 5.42 GB): it is reached in 6b, not in the glue.
+  - **The switches in the fast suite (FS1).** `test_decoder.py` builds a tiny random model
+    for each of the four combinations (Llama or Qwen2, tied or untied; `decoder_helpers.SWITCHES`)
+    with random biases. `label` fills every slot exactly once, and the replay rebuilds every
+    operand and glue gradient bit for bit. An honest step is accepted under every combination,
+    with HF's zero biases and with random non-zero ones (FS2), 6b on the bias gradients
+    included. One bias entry of layer 1's `b_q` or the last layer's `b_v` altered is rejected
+    (`test_switches_verify_an_honest_step`): in `W_t` at check 0 (check 7 after step 1), in
+    training alone (the committed `W_t` honest) at check 5 on that layer's `Y_x`, and in
+    `W_{t+1}` at 6b. `test_switches_capture_is_bit_identical` checks that a captured step on
+    drawn biases gives the uncaptured step's loss and `W_{t+1}` bit for bit. A bias update
+    `η·g` of about 1e-7 sits near the bias's rounding step, so any bias with a small gradient
+    (`b_q` included) can come out of a step unchanged. The test seeds the init (seed 0), under
+    which every `b_q`, `b_k` and `b_v` changes, and asserts that each does.
+  - **Both compute dtypes in the fast suite (FS3).** The `switched` fixture runs each of the
+    four combinations at `(fp32, fp32)` and `(fp32, bf16)`, so labeling, the bias's copy,
+    the `W.grad` link, the bit-for-bit replay and the honest step's acceptance are tested
+    under autocast too. `test_switches_verify_an_honest_step` and
+    `test_switches_capture_is_bit_identical` run at both dtypes as well, drawn biases
+    included. At bf16 on the tiny models (provisional bands, drawn biases, `k = 7`,
+    `SEED = 1`) check 5's largest normalized residual is 0.7–1.1, and check 6's `ρ_max`
+    1.5–2.0, as at fp32. `test_label_rejects_a_grad_not_linked_to_its_G` covers the `W.grad`
+    link at both dtypes on Llama and Qwen2: `W_k.grad` replaced by `W_v.grad` or by a clone
+    raises `LabelingError`. (The tamper `swap_G_k_G_v` finds the grad by data pointer, which
+    at bf16 is AccumulateGrad's copy, so it runs at fp32 only.)
+    `test_plain_baseline` adds a bf16 tiny Llama whose plain and verified final weights are
+    equal, and `tests/verification/runs/test_calibrate.py` runs `gradient_coherence` at both
+    dtypes.
+  - **The full-scale models (FS4).** `tests/verification/full_scale_helpers.py` holds `PINS`,
+    the four models at their commits, in the order FS4 ran them: Qwen2.5-0.5B, Falcon3-1B,
+    Qwen2.5-1.5B and Meta's Llama-3.2-1B-Instruct (`meta-llama/…` at `92131767`, which replaced
+    the unsloth mirror there; the mirror's tokenizer still filters the shared list, and both
+    give the same ids on every row of the four training files). `full_scale_case(repo,
+    revision)` builds each one's run config, `D` and `h_D` without fetching, or skips when the
+    weights aren't cached. The config's `VERIF_N_RECORDS` is the task's full-scale `|D|` (369
+    refusal, 233 jailbreak) unless the environment sets it, and the case fails unless `D` holds
+    that many records. `computation/test_full_scale_models.py`'s slow
+    `test_real_step_labels_and_replays` checks, per model, that every slot is filled once (M2),
+    and that every forward operand (A8), backward operand and glue gradient (A9) is rebuilt bit
+    for bit. It compares BLAKE3 digests rather than holding both copies, since a 1B step's
+    products run to about 20 GB. The fast `test_digest_comparison_on_a_tiny_model` checks that
+    comparison on tiny Llama and Qwen2 models: an altered `W_t` leaf changes only the two
+    operands that read it, and an altered layer-1 `δX_q` leaf changes the glue gradients it
+    flows into (`W_E`'s and layer 1's `γ_attn`) and not `γ_final`'s.
+- `leaf_sizes.py` (FS10): `leaf_sizes(config, *, n_s, n, compute_dtype=torch.float32)`
+  returns the step's `LeafSize(index, section, name, role, shape, dtype, nbytes)` list in
+  commit order, without running a model. `compute_dtype` goes to `DecoderComputation`, so
+  weights are fp32 and products `compute_dtype`, as a real step commits them; a slot name that
+  disagrees with the leaf order raises `RuntimeError`. The test checks it leaf for leaf against
+  a real `prove_step` at fp32 and bf16, with the q/k/v biases drawn non-zero. `benchmarks/`
+  imports only this module from `verification` (`tests/test_layering.py`, rule 8).
 
 ### `verification/prover/`
 
@@ -504,11 +850,26 @@ interface.
       products) and `.n_products`, where each `(s,h)` bmm member counts once;
     - `.summary()`, `.release_operands()` and `.assert_unmodified()`.
   - `param_storage_map(model)` comes from `computation/matmul_ops.py`, as do the op lists.
-    `OperandInfo` has `param_name`, `storage_ptr` and `producer_index`. A storage pointer is
-    valid only while the capture holds its tensors, so link records by `producer_index`.
+    `OperandInfo` has `param_name`, `storage_ptr`, `producer_index` and `param_copy`. A storage
+    pointer is valid only while the capture holds its tensors, so link records by
+    `producer_index`.
+  - **Copies (FS3).** Inside a phase every `aten._to_copy` becomes a `CopyRecord(index, phase,
+    src_info, out_info, storage)` in `.copies`; `.param` names the parameter it copies,
+    directly or through an earlier copy. A copy of a parameter is held until
+    `release_operands`, and an operand aliasing it carries `OperandInfo.param_copy`. Any
+    other copy is held only through a `StorageWeakRef` to its storage: a strong reference
+    would keep activations alive and turn AccumulateGrad's adoption of a gradient copy into
+    a clone. `param_of(t)` names the parameter `t` aliases, directly or as a copy, until
+    `release_operands`. `is_copy_of(t, index)` says whether `t` shares the storage of a
+    `_to_copy` of record `index`'s whole output, with the same view; storages compare by
+    identity, so a reused address never matches. `summary()` adds `n_copies` and
+    `n_param_copies`. At `(fp32, fp32)` a SmolLM2 step makes 3 copies (the batch's int64
+    mask and ids cast to bool and fp32, all glue) and none of a parameter.
   - Errors: `CaptureError`, `UnsupportedMatmulError` (any `REJECTED_OPS` op, a non-default
-    overload, or an op outside `aten`/`prims` inside a phase), `BiasedMatmulError` (`addmm`
-    with a non-zero bias; see F14), `PhaseError` and `MutatedCaptureError`.
+    overload, or an op outside `aten`/`prims` inside a phase), `BiasedMatmulError` (`α ≠ 1`,
+    or a non-zero bias outside F14's form, a bias vector added once with `β = 1`; every
+    accepted `addmm` keeps its `bias` on the record, and the labeler decides whether it was
+    declared), `PhaseError` and `MutatedCaptureError`.
   - On SmolLM2 4×128 it gives `M = 7,113` (2,371 forward, 4,742 backward) plus 1 RoPE glue
     outer product. Only `aten.mm` and `aten.bmm` appear, and the outputs total about 1.55 GB.
   - **The δK̃ transpose.** The captured attention bmm returns `Q̃ᵀ·δS`, which is `δK̃ᵀ`. A7
@@ -657,18 +1018,47 @@ interface.
     above `τ_W` in judging mode, or mixed dtypes fall back to
     `_update_identity_reference`, the spec's formula, so every rejection message is
     unchanged. `tests/verification/verifier/test_update_identity.py` compares the two.
+  - **Check 6a under mixed precision (FS3, F6b).** The committed `G` is a bf16 product leaf;
+    6a widens it exactly to fp32 before the update identity, as AccumulateGrad does for
+    training's `W.grad`. At fp32 the cast is a no-op.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
     from the claimed root `store.root`, as check 2's read validated it
     (`ctx.state.claimed_root`; F15a, task C7). The root comparison at the end of the step
     shows that `h` is the root of the leaves.
+  - **Biased products (F14, FS2).** A served product is `(A, B, P, b)`. For a spec with a
+    `bias`, `b` is the committed `W_t` leaf of that name, rounded to `operand_dtype` as `B`
+    is, never a tensor the replay or the prover supplies; `b` is `None` otherwise.
   - **Member batching.** A run of consecutive member specs of one layer (`_member_runs`;
     on SmolLM2, `S`+`O` and `dA`+`dV`+`dQ`+`dK` of each layer) has its operands served one
     member at a time in canonical order, then stacked by shape and measured with
     `measure_products`. Members are then recorded and judged in canonical order, so the first
     failing member rejects with the same message as alone, and an error serving a later member
     is raised only after the members before it pass. Every other product is measured alone.
-- `driver.py` (A5): `Verifier(c, *, h_D, n_records, k, n_steps, bands, w0= | w0_hashes=,
+  - **The record pass (EV2, EVALUATION_SPEC §4.1).** `record_rest(store, c, ctx, bands,
+    slot) -> str` measures, for the record only, the tests a rejecting check skipped. A
+    check-5 rejection inside a member run first records the run's later members as check 5
+    measured them in the batch (`StepState.run_rest`, set by check 5 when it rejects), since
+    a member measured alone or in a smaller batch is held to agree only to `1e-4` relative;
+    a serving error check 5 deferred (`StepState.run_rest_error`) is raised after them.
+    Every later product is then measured from check 5's own replay. A 6a rejection measures
+    the remaining linear weights, then every 6b glue weight from a replay of its own, since
+    check 6 is one protocol check over every tensor. A 6b rejection measures the remaining
+    glue weights. Each gradient comes from the helper its live check uses
+    (`_linear_gradient`, which widens a bf16 leaf to the weights' format as F6b does;
+    `_replay_glue_gradients`; `_glue_gradient`), so an untouched tensor scores what the live
+    check gives it, at fp32 and bf16. It runs with `judge=False` and no metrics seam,
+    sharing `ctx.stats`, so it changes no rejection, verdict or timing row. A failing test
+    is still recorded and the pass goes on. It returns `RECORD_COMPLETE` (`"complete"`), or
+    `RECORD_NOT_RUN` (`"not run"`) when the slot has no scored tests or none remained; a
+    malformed leaf ends it with `RECORD_MALFORMED` (`"ended: malformed"`), the tests before
+    the leaf recorded. A verifier-side error propagates, as in the checks, and the driver
+    turns it into `RECORD_ERROR` (`"error"`). `RECORDED_SLOTS = ("6a", "5", "6b")`. The
+    checks after the rejecting one never run.
+- `driver.py` (A5): `Verifier(c, *, h_D, n_records, k, n_steps, bands, seed, w0= | w0_hashes=,
   schedule=, calibrate=False, allow_provisional=False, section=None, kappa_guard=True)`.
+  `seed` is required and has no default: `π` is public input, `setup.data.schedule(t, n_s,
+  n_records, seed)` unless `schedule` replaces it, and the prover's default `π` comes from
+  the same call with `verifier.seed`.
   `kappa_guard=False` (see `StepContext`) with `calibrate=True` raises `ValueError`, since
   calibration fits `κ_max`. `section` is B6's
   metrics seam: it wraps each check under its slot id (step 1's chaining comparison is `"7"`;
@@ -677,17 +1067,25 @@ interface.
   `5.measure`) and 6b (`6b.glue`). `context.no_section` is the no-op.
   - `n_steps` (T) is required. Provisional bands are refused unless `allow_provisional=True`
     (P10a); `bands` may be `None` only when calibrating.
-  - `start_run(D)` runs check 1 (including that `π(t)` fits `D` for every `t ≤ T`) and
+  - `start_run(D)` runs check 1 (including that every `π(t)`, `t ≤ T`, holds `n_s` distinct
+    indices into `D`; F8c's `π` runs on into later passes, so `T` may exceed one pass) and
     prepares check 0. At step 1, check 0 runs in check 7's slot and reports as `"0"`.
   - `verify_step(t, store)` runs the default order and keeps the `W_{t+1}` hashes only once
-    every slot, the root comparison included, has passed.
+    every slot, the root comparison included, has passed. After a `"failed"` rejection (never
+    a malformed one) it calls `checks.record_rest` with the rejecting slot, once the verdict
+    is fixed, through `_record_rest`, which catches any exception the pass raises with a
+    `RuntimeWarning` and records `"error"`, so the rejection stands. `record_pass[t]` holds
+    the status (`"not run"` after a malformed rejection). Its time lands in the loop's
+    `verify_s`, not in any check's row.
   - `freeze(bands)` ends calibration (P10b): it re-judges every calibrated step's stats in
     check order, records `bands.source`, and judges every later step. The root comparison
     runs live in calibration. Since it runs after 6a, 5 and 6b, a live rejection from it is
     re-judged first: a band failure in that step's numbers replaces it, as in a judged run.
   - `end_run(final) -> RunVerdict(accepted, rejection, steps_verified, band_source)` runs
-    checks 8 and 9. It raises while calibration is unfrozen.
-  - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers.
+    checks 8 and 9. It raises while calibration is unfrozen, unless `start_run` rejected the
+    run (check 1): no step ran, so no band can change that verdict, and it ends as it is.
+  - `timings[t][id]`, `run_timings` and `stats[t]` hold the per-check numbers, and
+    `record_pass[t]` the record pass's status at a rejected step.
 - `residuals.py` (A10; A11 reuses it): summaries of `StepStats`, from `verifier.stats` or from
   `runs.metrics.read_residuals`. It judges nothing.
   - `class_summary(stats) -> [ClassSummary(cls, count, n, rms, max, max_name, max_step,
@@ -710,10 +1108,21 @@ interface.
     above 1 and above `1/√2`, and every product with `‖|P|·1‖ = 0` but `ν ≠ 0`.
   - `band_file_bytes(cal, stats=None)` (no timestamps, so a rerun gives the same hash),
     `write_band_file(path, data)` (temporary file then rename),
-    `load_bands(path, *, k=None)` (the read-only loader every judged run uses: a missing
-    file raises `FileNotFoundError`, a file fitted at another `k` raises `ValueError`) and
-    `assert_same_band_source(sources)` (P10a's harness assertion; rejects `None`,
-    `"provisional"` and mixed hashes).
+    `load_bands(path, *, k, context)` (the read-only loader every judged run uses: a missing
+    file raises `FileNotFoundError`; a file fitted at another `k`, or whose recorded context
+    differs from `context` in any key but `PROVENANCE_KEYS`, a key missing on either side
+    included, raises `BandFileMismatch`, a `ValueError` that names the keys and says to rerun
+    `verification.runs.calibrate`) and `assert_same_band_source(sources)` (P10a's harness
+    assertion; rejects `None`, `"provisional"` and mixed hashes).
+  - `band_context(cfg, c, *, h_D, k)`: the run a band file is fitted for, which `calibrate`
+    writes and every loader compares: model and revision, `(MASTER_DTYPE, COMPUTE_DTYPE)`,
+    `attn_impl`, device, `h_D`, `n_s`, `n`, `η`, `M`, `T_run` (`VERIF_STEPS`) and `k`. It also
+    holds `calibration_seed` (`VERIF_SEED`) and `threads` (`VERIF_THREADS`), both in
+    `PROVENANCE_KEYS`: kept in the file, never compared. The bands describe rounding noise on
+    honest steps, which doesn't depend on `π`, so a run at seed 2–5 loads the file fitted at
+    seed 1 (EVALUATION_SPEC §3.2). The thread count changes only the CPU's floating-point
+    reduction order, a shift far below `τ = 8·s_h`, while the cost results need it recorded
+    (FS2). A file written before `threads` was recorded (`cc7a9bca…`) loads too.
   - Fitted bands go through `band_file_bytes` → `Bands.from_json` before `freeze`, so their
     `source` is the file's hash, not `"provisional"`.
 
@@ -727,13 +1136,17 @@ interface.
     vector `j`. It takes about 1.4 ms at width 49152 and k 7.
     `challenge_matrices(h, ms, k, width)` returns `[len(ms), width, k]`, bit-identical to
     `challenge_matrix` per `m` (one XOF per label, one numpy pass for the entries).
-- `freivalds.py`: `measure_product(a, b, p, *, h, m, k, eps_in, eps_acc) -> ProductMeasure`
-  (ν, `‖|P|·1‖`, κ, the residuals, `‖P‖_F`, the band unit and the normalized residuals). It
-  judges nothing. Its norms use `_safe_norm` (power-of-two scaling, bit-identical to
-  `vector_norm` when that doesn't overflow or underflow). `measure_products(a, b, p, *, h, ms,
-  k, eps_in, eps_acc)` does the same for a stacked batch of one shape, each member with its own
-  challenges and `_safe_norm` scale. At SmolLM2's member shapes its normalized residuals equal
-  `measure_product`'s bit for bit; below about 8×8, CPU `bmm` rounds differently from `mm`.
+- `freivalds.py`: `measure_product(a, b, p, *, h, m, k, eps_in, eps_acc, bias=None) ->
+  ProductMeasure` (ν, `‖|P|·1‖`, κ, the residuals, `‖P‖_F`, the band unit and the normalized
+  residuals). It judges nothing. With `bias` (F14, FS2) it measures `[A | 1]·[B ; bᵀ]`
+  without building it: `d_j = A(B·r_j) + (bᵀ·r_j)·1 − P·r_j`, `ν = ‖|A|(|B|·1) + ‖b‖₁·1‖`
+  and `e_m(q + 1)`. Without it every operation and its order is the unbiased one, so
+  unbiased products keep their bits. Its norms use `_safe_norm` (power-of-two scaling,
+  bit-identical to `vector_norm` when that doesn't overflow or underflow).
+  `measure_products(a, b, p, *, h, ms, k, eps_in, eps_acc)` does the same for a stacked batch
+  of one shape, each member with its own challenges and `_safe_norm` scale. At SmolLM2's
+  member shapes its normalized residuals equal `measure_product`'s bit for bit; below about
+  8×8, CPU `bmm` rounds differently from `mm`.
   - **Fast path, same bits (O2).** Both functions take an optional `scratch=MeasureScratch()`,
     one reused buffer for `|A|`, `|B|`, `|P|` and `P/s` (check 5 holds one per step). Each
     `|x|` is written with a fresh `abs`'s strides, so the matmuls see the same operands. `|P|`
@@ -756,10 +1169,15 @@ interface.
 
 ### `verification/runs/`
 
+The first measured figures below date from before C5 and C6: Stanford Alpaca data, the
+sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `π(t)` at seed
+1, follow each of them.
+
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
   - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
     section=None, handoff=None) -> LoopResult`. `section` is B6's metrics seam, passed to
-    `prove_step`. It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
+    `prove_step`. The default `π` is `data.schedule` at `verifier.seed`, the verifier's own
+    call. It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
     `InMemoryStore.commit_step` (`P3.commit`) and `handoff.hold` with the `h_D` paths
     (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), `verifier.verify_step(t, store)`,
     `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
@@ -777,12 +1195,12 @@ interface.
     next step.
 - `scenarios.py`: the instance-agnostic scenario harness, shared by `mlp_smoke` and
   `llama_step`. `Scenario(name, description, fault, expected)`, `Expected` (the declared
-  outcome), `ScenarioResult`, `HONEST` (no fault, accept), `honest_final(c, D, w0, T)` (`T`
-  uncaptured `plain_step`s from `W_0` through `run_plain`, check 8's reference),
-  `run_scenario(..., recorder=None, h_D=None, verifier=None)` (`h_D` defaults to `D`'s root;
-  `verifier(section) -> Verifier` replaces the default provisional verifier and must match the
-  run's seam, `T` and `k`; `memory_run` and `count_run` take it too, and `handoff`, passed to
-  `run_loop`), `judge` (the
+  outcome), `ScenarioResult`, `HONEST` (no fault, accept), `honest_final(c, D, w0, T, *, seed)`
+  (`T` uncaptured `plain_step`s from `W_0` through `run_plain`, check 8's reference),
+  `run_scenario(..., T, k, seed, final, recorder=None, h_D=None, verifier=None)` (`h_D`
+  defaults to `D`'s root; `verifier(section) -> Verifier` replaces the default provisional
+  verifier and must match the run's seam, `T`, `k` and `seed`; `memory_run` and `count_run`
+  take it and `seed` too, and `handoff`, passed to `run_loop`), `judge` (the
   S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
   default `HONEST`, through `memory_pass` / `count_pass`).
   - **Model reuse (O4).** `honest_final`, `run_scenario`, `memory_run` and `count_run` take
@@ -796,16 +1214,19 @@ interface.
 - `mlp_smoke.py` (A6, milestone M1):
   `.venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]`.
   Holds the MLP's scenario list, `run_smoke(..., metrics=None)` and `memory_smoke` /
-  `count_smoke` (`PASS_STEPS` honest steps through `scenarios.memory_run` / `count_run`).
+  `count_smoke` (`PASS_STEPS` and `COUNT_STEPS` honest steps through `scenarios.memory_run` /
+  `count_run`).
   - The MLP at widths `(16,32,32,8)`, `n_s = 4`, `η = VERIF_ETA`, `k = VERIF_K`, on
     `synthetic_dataset` of `VERIF_N_RECORDS` records. `T` is `--steps`, else `VERIF_STEPS`
     (default 10), and must be ≥ 2. Bands are provisional, with `allow_provisional=True`.
   - Scenarios and their declared outcomes: `honest` (accept, with check 8 against
     `honest_final`, `T` uncaptured `plain_step`s from `W_0`), `flip` (the largest entry of
     `Y_2` sign-flipped at step 2 → `(2, "5")`), `bad-w-next-ulps` (one `W_{t+1}` entry moved
-    300 ulps at step 2 → `(2, "6a")`), `bad-w-next-batch` (A3 on the last `n_s` records of `D`
-    → `(2, "6a")`) and `broken-chain` (one hidden `plain_step` between steps 1 and 2, P11, on the
-    last `n_s` records of `D` since the MLP has no `b̃` → `(2, "7")`).
+    300 ulps at step 2 → `(2, "6a")`), `bad-w-next-batch` (A3 on another batch → `(2, "6a")`)
+    and `broken-chain` (one hidden `plain_step` between steps 1 and 2, P11, on another batch
+    since the MLP has no `b̃` → `(2, "7")`). The other batch is `data.other_batch(2, …)`, the
+    neighbouring batch of step 2's pass, disjoint from `π(2)` at every seed.
+    `scenarios(c, dataset, seed)` takes `π`'s seed for it.
   - `scenarios.judge(expected, loop, T)` is the S6b oracle. It prints each scenario's per-step max
     normalized residual, max κ, 6a `ρ_max` and per-check ms, and exits 1 if any oracle fails.
 - `metrics.py` (B6): EQ1b's cost grid and EQ13's run records (`DECISIONS_EVALUATION.md`). The
@@ -847,35 +1268,107 @@ interface.
     that break replay's `torch.autograd.grad` on leaf tensors. A test checks the two agree on
     a plain step. Hash counts cover `commitment.merkle`, `matmul_check.challenges` and
     `verifier.bands`; the band file is hashed at load, outside every section.
-  - `MetricsWriter(dir, run, *, device, model, corpus, seed, config, band_file_hash, h_D,
-    extra)` (`.recorder(scenario, *, poisoning_rate, cheat_step)`, `.write(rows)`,
+  - `MetricsWriter(dir, run, *, device, model, corpus, attack, seed, config, band_file_hash,
+    h_D, extra)` (`.recorder(scenario, *, bpr_records, bpr_actual, cheat_step)`,
+    `.write(rows)`, `.write_residuals(scenario, t, stats, c, *, bands, k, kappa_guard)`,
     `.close()`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
     equal to `verifier.stats`), `memory_probe(device)`, `step_record`, `config_hash`.
+    `model`, `corpus`, `attack` (`VERIF_ATTACK`, `None` for a run on other data) and `seed`
+    go into the `environment` record and every `step` record. Every run that writes `corpus`
+    writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
+    EVALUATION_SPEC §4.6) raises `ValueError`, in any letter case (`str.casefold`): on a
+    case-insensitive file system `Data` is `data`.
+  - **Run names (EV2).** `run_name(scenario, model, attack, bpr_records, seed)` is a cell's
+    unique name, `<scenario>-<model>-<attack>-bpr<n>-s<seed>`: the model as its repository's
+    last part, `n` the poisoned records in the cheat batch (0 for an honest run), characters
+    outside `[A-Za-z0-9._-]` as `_`. For example
+    `honest-SmolLM2-135M-Instruct-refusal-bpr0-s1`. `run_verified`, `poisoned_step` and
+    `hidden_steps` use it. The other runs keep their fixed names (`plain_baseline`,
+    `llama_step`, `calibrate`, `mlp_smoke`, `store_crosscheck`, `flipped_matmul_sweep`,
+    `k_tunability`).
+  - **Step records (EVALUATION_SPEC §4.1).** `step_record` writes `model`, `corpus`,
+    `attack`, `seed`, `bpr_records`, `bpr_actual`, `cheat_step`, `step`, `judged`,
+    `verdict`, `first_failing_check`, `rejection_kind`, `checks`, the step's scores
+    `rho_5`, `rho_kappa`, `rho_6` and `n_failing`, and `record_pass`
+    (`record_pass(verifier, t, stats, *, kappa_guard)`): at a rejected step `{"status": the
+    driver's record_pass[t] ("not run" when it has none), "measured": {"rho_5": products ×
+    k, "rho_kappa": products (0 with the guard off), "rho_6": tensors}}`, the counts over
+    every test measured at the step, live and in the pass; `null` at an accepted step.
+    `bpr_records` and `bpr_actual` are the
+    cheat batch's poisoned records and their share of it: `env.bpr_records`/`bpr_actual`
+    for a cheat on `b̃`, `0`/`0.0` for an honest run, `None` for a protocol fault and the
+    MLP smoke run. `cheat_step` is `t*` for a cheat, else `None`.
+    - `judged_step(verifier, t, cheat_step)`: never while calibrating or under provisional
+      bands; a cheat run judges `t ≥ t*`; an honest run at the band file's
+      `calibration_seed` (H1) skips the file's `calibration_steps` (1–3); at any other seed
+      (H2) it skips step 1. A file without `calibration_seed` raises a worded `ValueError`
+      (`calibration_seed(bands)`), unless the run is a cheat run, which judges from `t*`.
+      `in_sample_step(bands, t, seed)` is H1's half of it.
+    - `rho_arrays(stats, bands, *, k, kappa_guard=True)` gives the component scores, each a
+      test's left side over its right side, so a test rejects exactly when its score is
+      above 1: `rho_5` `[P, k]` (`normalized/τ`), `rho_kappa` `[P]`
+      (`ν/(κ_max(class)·‖|P|·1‖)`, 0 when `ν = 0`, `inf` when only the denominator is 0) and
+      `rho_6` `[W]` (`ρ_max/τ_W(tensor)`). All NaN without bands (calibrating);
+      `rho_kappa` NaN with the κ guard off. For `ρ_κ` and `ρ_6` the score is above 1
+      exactly when the live test rejects. Check 5's residual test compares the raw residual
+      with `τ·unit`, so `ρ_5` can disagree with it by rounding when a residual lands on `τ`
+      within an ulp.
+    - `step_scores(stats, bands, *, k, kappa_guard)`: per family (`SCORE_FAMILIES`) the
+      largest score, and `n_failing`, a dict of the count of scores above 1 (NaN counts as
+      failing, and as `+inf` in the maximum, `nan_as_inf`; `cheats.scores` does the same).
+      Only measured tests count: a test the step never measured has no row and isn't
+      failing. A family not scored at the step (no bands, guard off, nothing measured) is
+      `None` with its `n_failing` entry.
   - Files under `$VERIF_OUTPUT_DIR/<run>/`: `records.jsonl` (records `environment`, `step`,
     `verdict`, `time`, `memory`, `count`, `storage`, `run_end`, each with `record` and `run`;
     non-finite floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`) and
     `residuals/<scenario>/step_<t>.npz`. Since A11 each npz also holds the product scales
-    `p_q`, `p_norm`, `p_nu`, `p_abs1`; older archives read back with them unknown. On macOS, export `MallocLargeCache=0` for runs whose
+    `p_q`, `p_norm`, `p_nu`, `p_abs1`; older archives read back with them unknown. Since EV2
+    (EVALUATION_SPEC §4.2) it holds the index table and the scores beside the raw arrays:
+    per product `p_m`, `p_name`, `p_cls` (the fine class, κ's), `p_spec_class` (§5.7's
+    class, `spec_class(c, spec)`: `forward`, `input gradient`, `weight gradient`,
+    `attention score`, `attention value`, and the placeholder `operand gradient` for δA,
+    δV, δQ̃ and δK̃, which §5.7 doesn't name), `p_layer` (0-based since the EV2 review:
+    `0 … L−1` for the layer stack, `L` for the output layer's `Lambda`, `dF` and `G_E_head`;
+    `layer_count(c)`, `layer_index(spec, L)`); per tensor `w_check`, `w_name`; then `rho_5`
+    `[P, k]`, `rho_kappa` `[P]`,
+    `rho_6` `[W]` row for row (`rho_arrays`), and `band_source`, the bands' hash (empty while
+    calibrating). A step rejected at check 5 holds all `M` products, one rejected at 6a or 6b
+    every tensor check 6 measures (the record pass); one rejected before checks 5 and 6
+    (checks 4, 7, 2) has an archive with zero rows.
+    On macOS, export `MallocLargeCache=0` for runs whose
     memory figures are compared: otherwise freed large blocks stay in the footprint.
   - `metrics_overhead.py`: `.venv/bin/python -m verification.runs.metrics_overhead
     [--reps N] [--steps T] [--widths ...]`, an off/on/off timing of the honest MLP run.
-  - `PASS_STEPS = 2`: every run's memory and counting passes. Step 1 has check 0's anchor and
-    first-touch allocation; step 2 is the first check-7 step and steady-state memory. Counts
-    are deterministic, so the report takes one step's counts.
+  - `PASS_STEPS = 2`: every run's memory pass. Step 1 has check 0's anchor and first-touch
+    allocation; step 2 is the first check-7 step and steady-state memory.
+  - `COUNT_STEPS = 1`: every run's counting pass, one step per configuration
+    (EVALUATION_SPEC §3.4). Counts are deterministic: steps 1 and 2 of the SmolLM2 run count
+    the same FLOPs, hash calls and challenge bytes, and differ only in the `hash_in_bytes` of
+    P3 and checks 2 and 4, which hash the batch's token records (1,356 bytes more at step 2,
+    out of 2.6 GB). `llama_step` still counts over its `T`.
   - `mlp_smoke` writes to `mlp_smoke/` unless `--no-metrics` or `VERIF_METRICS=0`; its memory
-    and counting passes are `PASS_STEPS` honest steps each, of their own. The MLP records
-    `h_D` (its synthetic `D`'s root) and a null band-file hash.
+    and counting passes are `PASS_STEPS` and `COUNT_STEPS` honest steps, each of its own. The
+    MLP records `h_D` (its synthetic `D`'s root) and a null band-file hash.
 - `llama_step.py` (A10, milestone M3): `.venv/bin/python -m verification.runs.llama_step
-  [--steps T] [--metrics | --no-metrics]`, with `T` default 1. `LlamaComputation.from_config`,
-  `W_0` from `build_model()`, `D` from `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D`
-  from `meta.json` (`load_committed_dataset`). The honest scenario goes through
-  `scenarios.run_scenario` with the published `h_D` and provisional bands, check 8 against
-  `scenarios.honest_final`; its memory and counting passes are `scenarios.memory_run` /
-  `count_run`. `run_honest`; `report_residuals` prints `residuals.py`'s two tables, `report_costs` each step's prover and
-  verifier wall clock and, from the memory pass, each side's peak. Metrics go to
-  `llama_step/`. Exits 1 unless accepted. `main` takes `W_0` from one `ReusedModel`, which
-  then serves `honest_final` and every prover run (timed, memory and count passes), so a
-  no-metrics run loads the checkpoint twice (that model and the verifier's), not four times.
+  [--steps T] [--bands PATH] [--metrics | --no-metrics]`, with `T` default 1.
+  `DecoderComputation.from_config`, `W_0` from `build_model()`, `D` from
+  `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D` from `meta.json`
+  (`load_committed_dataset`, shared by every decoder run). It first calls
+  `check_data_model(meta, *, source, pad_id, where)`, which raises `ValueError` unless
+  `meta.json`'s `tokenizers.run` repo and revision are `c.source` and its `pad_id` is
+  `c.pad_id`; a missing field doesn't match. A random test model (`source` `None`) compares the
+  pad id only, and only when `meta.json` has one. The honest scenario goes through
+  `scenarios.run_scenario` with the published `h_D` and provisional bands (`τ = 8`, below the
+  honest `Λ` residuals C1 measured, so an honest step can fail check 5), or with `--bands PATH`
+  a band file read through `load_bands` and `band_context` and judged by
+  `calibrate.judging_verifier`. Check 8 is against `scenarios.honest_final`; its memory and
+  counting passes are `scenarios.memory_run` / `count_run`. `run_honest`; `report_residuals`
+  prints `residuals.py`'s two tables, `report_costs` each step's prover and verifier wall clock
+  and, from the memory pass, each side's peak. Metrics go to `llama_step/`. Exits 1 unless
+  accepted. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
+  every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
+  twice (that model and the verifier's), not four times.
   - The real step from `W_0` on `π(1)` (k 7, η 1e-3), 2026-10-04 on the dev Mac: accepted.
     Most classes have an RMS of 0.3–0.9 and a max ≤ 2.7, except `S` (max 3.8), `Λ` (RMS 3.8,
     max 5.43, the global max) and `dF` (RMS 1.6, max 2.1); max κ 28 (`dX_down`).
@@ -912,27 +1405,183 @@ interface.
     maximum RSS from `time -l` 6.92 GB → 6.35 GB (lifetime peak 6.45 → 5.91 GB). Every
     root, loss, residual and final weight is bit-identical; step 2 still rejects at check 5
     on `P_2371` (`Λ`), residual 10.1 > τ = 8.
-- `materialize_data.py` (B5): `.venv/bin/python -m verification.runs.materialize_data` writes
-  `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` to
-  `cfg.data_dir`, under `trainer_output/verification/data/`, which is gitignored. Rerun it with
-  `HF_HUB_OFFLINE=1` once the model and dataset are cached.
+- `bring_up.py` (FS4): `VERIF_MODEL=<repo> VERIF_MODEL_REVISION=<commit> .venv/bin/python -m
+  verification.runs.bring_up [--steps T] [--reference-bands PATH] [--tamper | --no-tamper]
+  [--disk-transcripts DIR]`, `T` default 1. One full-scale model on CPU at test scale's other
+  settings (dtypes, `n_s × n`, η, `k`, seed); nothing in the code names a model, so Meta's Llama
+  repo runs through the two env vars alone. `D` and `h_D` come from `$VERIF_OUTPUT_DIR/data/`
+  (`materialize_data` for the same model). `main` stops with an error, before loading anything,
+  when `model_pin` finds no cached weights or refuses the pin (a revision that isn't a commit, a
+  weight file off its blob name), or `D.bin` is missing; it never downloads. It prints how long
+  the weights took to hash. Exits 1 unless `BringUp.passed`: the honest run accepted, the fit's
+  concentration guard held, every tamper rejected as expected.
+  - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu",
+    handoff=None) -> BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It
+    takes any `DecoderComputation`, so a random-weight config runs the same path. `W_0` and
+    every prover run come from one `ReusedModel`. Check 8's reference is `honest_final`'s `W_T`,
+    kept as leaf hashes (`leaf_hashes_of`, `end_run` takes either). The honest run is
+    `run_scenario` inside `memory_pass`, with a calibration-mode verifier (P10b): the exact
+    checks judge live, 5 and 6 record. `on_step` fits on the last step (`calibration.fit`,
+    `band_file_bytes`, `Bands.from_json`) and freezes on that fit, so `end_run` can close the
+    run with check 8. The fit is in-sample and never written: it judges the freeze and the
+    tamper, nothing else. `BringUp.guard_ok` is the fit's concentration guard
+    (`Calibration.guard_ok`: global max at most `τ/2`), `None` without a fit; `passed` requires
+    it. A live rejection freezes on `_UNFITTED`, bands at the largest finite float, so the
+    reported rejection is the live one: `freeze` re-judges a root-comparison rejection's step
+    first, and ordinary bands (the placeholder `τ = κ_max = 1` before) would turn it into a
+    check-5 band failure. Only a NaN or infinite number, which fails any band, can still replace
+    it. `freeze_rejection` holds the freeze's result, `None` when none ran. A check-1 rejection
+    at run start ends the run unfrozen (`Verifier.end_run`).
+  - `handoff` (`--disk-transcripts DIR`, a `DiskHandoff(DIR)`) hands each step to the verifier
+    as C3's store cross-check does, the honest steps and both tampers alike; `None` is
+    `IN_MEMORY`. The protocol code is the same either way, and the disk write lands in the
+    commit time. `test_disk_handoff_gives_the_same_decisions` checks that a tiny Qwen2 run
+    decides number for number as in memory and leaves `DIR` empty.
+  - `bias_tamper(c, D, w0, bands, *, k, seed, h_D, build_model, layer=1, x="q",
+    handoff=None)`: two one-step judged runs (FS2's switch test on the real model). The last
+    entry of `b_q` in layer 1 is raised by 1 in training with the `W_t` leaf restored
+    (expected: check 5 naming `P_m (L1.Y_q)`), and in an honest step's `W_{t+1}` leaf
+    (expected: 6b naming the bias). `Tamper.rejected_as_expected` checks the step, the check
+    and that name. It also runs on a fit that fails the concentration guard, and `report`
+    labels each result "bands fail the concentration guard".
+  - `reference_bands(ref, c)` carries a band file to another model for scoring only: `τ`, the
+    default `κ_max` and the per-class `κ_max` of the classes `c` has; every weight takes the
+    default `τ_W`, since `ref`'s per-tensor values name its own tensors. It also returns `c`'s
+    classes that `ref` doesn't name (`G_head` for an untied model against SmolLM2's file).
+    `family_maxima(stats, bands, *, k)` gives each score family's largest score, its count
+    above 1 and where it sits (for `ρ_5` the product and its challenge `j`). `report` prints
+    the honest steps, the fit with its concentration guard (`holds` or `FAILS`, and a failure
+    again in the verdict line), `residuals.py`'s two tables, the reference scores, the tampers
+    and `llama_step.report_costs`.
+  - Real runs (2026-10-12, dev Mac under other jobs, `MallocLargeCache=0`,
+    `VERIF_N_RECORDS=369`, `T = 1`, `k = 9`; GB here is 2^30 bytes, as `report` prints it):
+    - Qwen2.5-0.5B, in memory, weights SHA-256 `fdf756fa…`: the honest step (loss 2.1318) is
+      accepted with check 8 on its own fit, `s_h` 6.19 (`Λ`), `τ` 49.5, but the fit **fails
+      the concentration guard**: the global max, 25.9 at `L9.dQ[3,5]`, is above `τ/2` =
+      24.75. So it isn't a clean pass, and `bring_up` now exits 1 on it (the run predates the
+      guard's check). The altered `b_q` entry is rejected at check 5 on `P_1 (L1.Y_q)`, residual
+      2.67e3, and at 6b (`ρ_max` 1.7e7). Against SmolLM2's band file (`cc7a9bca…`, `τ` 38.0)
+      `ρ_5` is 0.68 and `ρ_6` 0.50, but `ρ_κ` 2.93 (104 products above 1, largest at
+      `L1.dQ[1,6]`; `dQ`'s `κ` reaches 44). Prover 2.50 s, verifier 3.83 s (check 5 2.74);
+      prover peak 9.3 GB, verifier 13.0 GB, process 14.1 GB; 22 s for the whole command. The
+      slow bring-up test gives the same numbers.
+    - The slow replay test on the real weights fills every slot once and rebuilds every
+      operand and glue gradient bit for bit on all four models. Peak, then capture with
+      labeling and digests, forward replay and backward replay: Qwen2.5-0.5B 10.3 GB, 6.9 /
+      2.1 / 3.6 s; Falcon3-1B 24.2 GB, 9.6 / 2.7 / 3.4 s; Qwen2.5-1.5B 25.2 GB, 12.9 / 3.9 /
+      5.5 s; Meta's Llama-3.2-1B 20.3 GB, 11.1 / 3.3 / 4.9 s. The 1B peaks fall within 0.2 GB
+      of the L2/L4 shake-outs' linear projection.
+    - Meta's Llama-3.2-1B, in memory, weights SHA-256 `1ff795ff…`: the honest step (loss 1.5121)
+      is accepted with check 8 on its own fit, `s_h` 3.02 (`Λ`), `τ` 24.2, global max 5.30 at
+      `L2.G_down` (the guard holds: 5.30 ≤ 12.1). It has no q, k, v biases, so no tamper.
+      Against SmolLM2's band file `ρ_5` 0.14 and `ρ_6` 0.50, but `ρ_κ` 1.15 (33 above 1, largest
+      at `L4.dX_up`). Prover 4.88 s, verifier 9.79 s (check 5 7.69); prover peak 21.8 GB,
+      verifier 29.4 GB (projected 30.5); 22 s for the command; 96 pages swapped out.
+    - Falcon3-1B, in memory, weights `3f551b32…`: accepted with check 8 on its own fit, loss
+      1.5055, `s_h` 2.75 (`Λ`), `τ` 22.0, global max 7.54 at `L2.G_down` (the guard holds: 7.54
+      ≤ 11.0). No biases, so no tamper. SmolLM2's file doesn't name `G_head`, which takes the
+      default `κ_max`. `ρ_5` 0.20, `ρ_6` 0.50, `ρ_κ` 1.09 (19 above 1, at `L6.dX_up`). Prover
+      5.44 s, verifier 12.84 s (check 5 10.40); prover peak 27.3 GB, verifier 36.7 GB (projected
+      38); 28 s; about 3.9 GiB swapped out.
+    - Qwen2.5-1.5B, in memory, weights `dd924a11…`: the honest step (loss 2.0614) passes the
+      exact checks but is **rejected on its own fit**. `s_h` is 4.90 (`Λ`) and `τ` 39.2, while
+      check 5's normalized residual at `L1.dQ[0,3]` (first layer, sequence 0, head 3) is 79.3,
+      16.2 times `s_h`; the guard fails too (79.3 > 19.6). `dQ`'s RMS is 2.74 and its max 79.3;
+      ten residuals exceed SmolLM2's `τ` of 38.0 (`ρ_5` 2.09). `dQ`'s `κ` reaches 153 at
+      `L1.dQ[1,3]`, the same head (`ρ_κ` 10.2, 98 above 1), against 15.0 for `dQ` in SmolLM2's
+      file. Cut to 2 or 4 layers (random weights, below) `dQ`'s max is 1.1 and its `κ` 5. A
+      likely reading, not checked product by product: the band unit scales with `‖P‖_F`, while a
+      product whose terms cancel 150-fold carries rounding error on the scale of its terms. The
+      tamper isn't run, since `bring_up` runs it only after an accepted honest step. Exit 1;
+      prover 6.15 s, verifier 13.20 s (check 5 10.70); prover peak 27.1 GB, verifier 36.9 GB
+      (projected 39); 30 s; about 1.9 GiB swapped out. Left open for the plan to decide.
+    - The Falcon3 and Qwen2.5-1.5B runs used swap. The arithmetic is deterministic, so swap
+      changes the times, not the decisions. The slow bring-up test wasn't run on the 1B
+      models; it calls the same `bring_up`.
+  - `main` ran on SmolLM2 as a path check: accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the
+    band file's 4.75 is over steps 1–3), `τ` 46.3; prover 1.58 s, verifier 2.49 s (check 5
+    1.92); prover peak 4.30 GB, verifier peak 4.74 GB; against its own band file `ρ_5` 0.30,
+    `ρ_κ` 0.50, `ρ_6` 0.50.
+  - Random-weight shake-outs (2026-10-12), not the bring-up: each model's real config,
+    tokenizer, EOS and `D`, HF's init with q, k, v biases drawn N(0, 0.02), `T = 1`, `k = 9`,
+    the 1B models cut to 2 and 4 layers. Every one fills every slot once and rebuilds every
+    operand and glue gradient bit for bit (the slow test's comparison; the Llama mirror with
+    its llama3 rope rescaling), and every honest step is accepted on its own fit. On Qwen2.5-0.5B
+    (all 24 layers) and Qwen2.5-1.5B (2 and 4 layers) the altered `b_q` entry is rejected at
+    check 5 and at 6b. Check 5's normalized residual is 1.3e4 on Qwen2.5-0.5B, and 238 and
+    1.3e4 on Qwen2.5-1.5B, against `τ` of 34–46. One altered column's residual is the challenge
+    entry at that column, uniform on (−1, 1) and drawn from the transcript's root, so it varies
+    from run to run. Neither the mirror's own pad id (128004) nor any other config pad id
+    occurs in its model's `D`.
+    Per step, prover / verifier wall clock (check 5), and the verifier's peak, which is the
+    process's:
+    - Qwen2.5-0.5B, 24 of 24 layers: 2.59 s / 8.62 s (7.54), 15.0 GB.
+    - Falcon3-1B, 2 and 4 of 18: 1.23 / 7.12 s (6.30), 15.6 GB; 1.68 / 8.45 s (7.45), 18.3 GB.
+    - Llama-3.2-1B mirror, 2 and 4 of 16: 1.12 / 6.67 s (6.11), 11.3 GB; 1.59 / 8.17 s (7.42),
+      14.1 GB.
+    - Qwen2.5-1.5B, 2 and 4 of 28: 0.94 / 5.76 s (5.27), 10.2 GB; 1.36 / 6.89 s (6.22),
+      12.4 GB.
+    Linear in the layers (1.1–1.4 GB a layer), the full models' peaks come to about 38 GB
+    (Falcon3), 30.5 GB (Llama) and 39 GB (Qwen2.5-1.5B), the verifier's start holding the whole
+    transcript. Against SmolLM2's band file every model's `ρ_5` stays at or below 0.24 and
+    `ρ_6` at 0.50, but `ρ_κ` exceeds 1 (1.12 on Qwen2.5-0.5B, 1.39–1.59 on the cut 1B
+    models, at `Y_k`): a projection's `κ` is about 24 at `d = 896` and 36 at `d = 2048`,
+    against SmolLM2's `κ_max` of 23 for `Y_k` at `d = 576`. These are random weights, so none
+    of these residuals stands for the pretrained model's.
+    With `--disk-transcripts` the 1B shake-outs peak higher, not lower: Falcon3 19.6 / 23.3 GB
+    (L2 / L4; 14.7 in memory at L2 with the same settings), Qwen2.5-1.5B 11.6 / 14.5 GB, Meta's
+    Llama 13.3 / 16.9 GB. Projected to full depth: Falcon3 49 GB, Qwen2.5-1.5B 48 GB, Llama
+    38.5 GB, against 38, 39 and 30.5 in memory. Check 2 reads every leaf back into RAM and
+    keeps it for the step, so the transcript is held once either way; on disk the verifier's
+    `W_t` and `W_{t+1}` are its own copies, while in memory they are the run's own tensors, so
+    the disk adds about `2|W|` (0.31–0.45 GB a layer measured, against 0.35–0.47 GB for two
+    copies of a layer's weights).
+- `materialize_data.py` (B5, C6, FS6): `.venv/bin/python -m
+  verification.runs.materialize_data` writes `D.bin`, `D_tilde.bin`, `manifest.bin`,
+  `manifest_tilde.bin` and `meta.json` to `cfg.data_dir`, under
+  `trainer_output/verification/data/`, which is gitignored. One run is one model
+  (`VERIF_MODEL`), task (`VERIF_ATTACK`), seed and level (`VERIF_POISON_COUNT`).
+  - Its first run downloads the task's two BackdoorLLM training files into the cache
+    (`setup/backdoorllm.py`). The run's tokenizer and the four full-scale ones load from the
+    local Hugging Face cache only, so they must be downloaded beforehand. The run's pin is
+    `data.run_pin(VERIF_MODEL, VERIF_MODEL_REVISION)`.
+  - It builds `D` and `D̃` with `build_data`, raises unless `|D| = VERIF_N_RECORDS`, audits
+    both manifests and the selection, and checks the written files read back. A level the
+    poisoned shared list can't fill (`LevelNotRun`) exits with `EXIT_LEVEL_NOT_RUN = 3`,
+    "level not run" on stderr, and writes nothing.
+  - `meta.json` (`build_meta`): `attack`, `source` (repo, commit, the task's two file SHAs),
+    `template`, `tokenizers`, `max_tokens`, `pad_id` (the run pin's EOS), `n`, `counts`
+    (each file, its shared list, its kept list), `n_records`, `seed`, `h_D`, `h_D_tilde`, the
+    two manifest hashes, `schedule` (`batches_per_pass`, `sit_out_per_pass`, and `steps`:
+    `π(t)` for `t = 1…VERIF_STEPS`), `poisoning` (`seed`, `step`, `count`, `batch`,
+    `trigger`, `output` (the task's fixed poisoned answer, `null` for jailbreak) and each
+    swap: position, record index, poisoned-list index, file, file index and the row) and
+    `lengths` (`ℓ` min, mean, median, p90, max, histogram). `cheats.load_env` reads `seed`,
+    `attack`, `poisoning.step`, `poisoning.count`, `poisoning.batch` and `h_D_tilde`;
+    `load_committed_dataset` reads `tokenizers.run`, `pad_id` and `h_D`.
+  - With the env defaults the four `.bin` files are byte-identical to C6's (pinned by
+    `test_test_scale_outputs_are_pinned`).
 - `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
   [--steps T] [--pass-steps S] [--metrics | --no-metrics]`. The honest run's training with
   capture and every protocol step off.
   - `main` takes `W_0` from a `scenarios.ReusedModel` and passes it as `build_model`, so
     `W_0` and every pass share one load.
   - Same `W_0` (`snapshot_weights(c, c.build_model())` semantics, the model
-    `LlamaComputation.from_config` loads; A12 must take its `W_0` the same way), same `π` over
-    `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`.
-  - Training is `loop.run_plain(c, model, D, w0, *, n_steps, schedule=None, on_step=None,
-    section=None) -> PlainResult(steps, w_final)`: chained `plain_step`s on `run_loop`'s
-    default `π`, no tree, paths, commitment or verifier. `scenarios.honest_final` uses it too.
+    `DecoderComputation.from_config` loads; A12 must take its `W_0` the same way), same `π` over
+    `D.bin`, same `η`. `T` is `--steps`, else `VERIF_STEPS`. `D` comes through
+    `llama_step.load_committed_dataset`, so `meta.json` must name the run's model and pad id;
+    `h_D` is still the root of the records read.
+  - Training is `loop.run_plain(c, model, D, w0, *, n_steps, seed, schedule=None,
+    on_step=None, section=None) -> PlainResult(steps, w_final)`: chained `plain_step`s on
+    `run_loop`'s default `π` at `seed`, no tree, paths, commitment or verifier.
+    `scenarios.honest_final` uses it too.
     `PlainStepRecord.train_s` is host time around the step, informational; P0's times are
     the `P0.*` rows.
-  - `plain_baseline(c, D, w0, *, T, build_model, out_dir=None, metrics=None,
-    pass_steps=PASS_STEPS, provenance=None, keep_weights=True, out=print) -> BaselineResult`.
-    With a `MetricsWriter`, scenario `plain`: the timed run's `P0.*` rows per step, then a
-    memory pass and a counting pass of the first `pass_steps` steps (each with its own model;
+  - `plain_baseline(c, D, w0, *, T, seed, build_model, out_dir=None, metrics=None,
+    pass_steps=PASS_STEPS, count_steps=COUNT_STEPS, provenance=None, keep_weights=True,
+    out=print) -> BaselineResult`. With a `MetricsWriter`, scenario `plain`: the timed run's
+    `P0.*` rows per step, then a memory pass of the first `pass_steps` steps and a counting
+    pass of the first `count_steps` (each with its own model;
     the final weights are dropped first when `keep_weights=False`, as `main` does). P0 memory
     is printed as the step's growth, peak of `P0.backward` minus start of `P0.forward`. No
     `step` or `verdict` record. Writes to `$VERIF_OUTPUT_DIR/plain_baseline/`. With metrics
@@ -941,8 +1590,12 @@ interface.
     under tag `0x02` (equal ⇔ bit-identical, `-0.0` included), their Merkle root, and the
     provenance: `w0_root` (the root over `W_0`'s leaf hashes, the ones check 0 anchors on),
     `h_D`, `eta`, `steps`, `model`, `model_revision`, `threads`, `config_hash` (of
-    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics` and `steps`) and
-    `losses` (per step). `run_provenance(cfg, h_D)` gives the config side;
+    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics`, `steps`,
+    `attack` and `poison_count`; `h_D` tells the tasks apart, and the level never enters
+    honest training, so the test-scale hash stays `7191ef05…`),
+    `losses` (per step) and `seed`. The seed sits beside the provenance but isn't in
+    `PROVENANCE_FIELDS`: it already enters `config_hash`, and A12's B7 reads it to skip a
+    baseline at another seed. `run_provenance(cfg, h_D)` gives the config side;
     `write_final_weights(path, c, w, *, w0, losses, provenance=None, run=...)` writes it.
   - `assert_same_final_weights(c, plain, verified)` takes a file or directory, a hash mapping
     or the weights (`LoopResult.w_final`) on either side; A12 calls it against this file. Each
@@ -969,9 +1622,10 @@ interface.
   - On success it writes `$VERIF_OUTPUT_DIR/bands.json`, then judges steps 1–3 again from the
     file with the κ guard on (`frozen`) and off (`frozen_no_kappa`), asserts one band-file
     hash across the three runs, measures gradient coherence on step 1's batch at `W_0`
-    (`gradient_coherence`), runs the memory and counting passes of `frozen`, and prints the
-    cost split (`cost_split`). Records `calibration` and `gradient_coherence` go to
-    `records.jsonl`.
+    (`gradient_coherence`, with forward and loss under the run's `autocast()`, as training;
+    FS3), runs the memory pass (its steps) and the counting pass (`COUNT_STEPS`) of `frozen`,
+    and prints the cost split (`cost_split`). Records `calibration` and `gradient_coherence`
+    go to `records.jsonl`.
   - First run (2026-10-05, dev Mac, `MallocLargeCache=0`): at `k = 7`, `s_h = 5.62` (`Λ`),
     `τ = 44.9`, `k` recomputed 9, exit 2. At `VERIF_K=9`: `s_h = 5.50` (`Λ`; `dF` 3.07, every
     other class 0.3–0.9), `τ = 44.0`, global max 14.5 (`Λ`, step 3) ≤ `τ/2 = 22.0`, `k = 9`,
@@ -980,6 +1634,12 @@ interface.
     Gradient coherence 1.07 (`B = 4`). Verifier per step 1.60 s with the guard, 1.52 s without
     (check 5's measuring 0.70 vs 0.61 s). The memory pass's process footprint peaks at 6.4 GB
     in step 3's verifier; that process also holds the harness's model and check 8's weights.
+  - Re-run at C5–C6 (2026-10-11, `k = 9`): `s_h = 4.75` (`Λ`; `dF` 4.18, every other class
+    0.3–0.8), `τ = 38.0`, global max 11.5 (`Λ`, step 1) ≤ `τ/2 = 19.0`, `k = 9` (`b₀` 11.24
+    bits), floor at most 0.538 of `‖P‖_F` (`dF`), `κ_max` 4.0 (`dF`) to 60.5 (`dX_down`),
+    `τ_W = 4` on all 272 tensors. Band-file hash `cc7a9bca…`. Steps 1–3 accepted under it,
+    guard on and off. Gradient coherence 1.29. Verifier per step 1.65 s with the guard, 1.57 s
+    without. About 57 s in all.
 - `store_crosscheck.py` (A14, C3): `.venv/bin/python -m verification.runs.store_crosscheck
   [--metrics | --no-metrics]`. It needs the band file and `VERIF_ETA`, like `run_verified`.
   - Runs each scenario twice, once with the `IN_MEMORY` hand-off and once with a
@@ -988,39 +1648,97 @@ interface.
     the `W_{t+1}` chain hashes, every check-5 and check-6 number bit for bit (`_stats_key`
     also reads the `compare=False` fields), and the final weights' hashes. Exit 1 on any
     difference or a failed oracle. It deletes the transcripts at the end.
-  - Scenarios (`llama_scenarios`): honest over `VERIF_STEPS`, and four faults at step 2:
-    `other-batch` (check 4), `broken-chain` (check 7), `bad-w-next-ulps` (check 6a), `flip`
-    on `Λ` (check 5).
+  - Scenarios (`llama_scenarios(c, dataset, T, seed)`): honest over `VERIF_STEPS`, and four
+    faults at step 2: `other-batch` (check 4), `broken-chain` (check 7), `bad-w-next-ulps`
+    (check 6a), `flip` on `Λ` (check 5). The first two use `data.other_batch(2, …)`.
   - With metrics on, it runs a memory pass of 2 steps per store.
   - First run (2026-10-05, dev Mac, `k = 9`, T = 10): every decision identical. Per step on
     disk: 2.46 GiB in 7,661 files, about 3.3 s to write (in `commit_s`), and verify 1.4 s
     slower (check 2 rereads every file: 0.23 → 1.1 s; check 7 0.03 → 0.11 s). Reads may come
     from the page cache, so read times are a best case. The disk verifier's footprint peaks
     about 0.6 GiB higher, since its `W_t` and `W_{t+1}` are its own copies.
-- Later: `run_verified.py` and the other runs. A12 builds its verifier with
-  `bands=calibration.load_bands(pc.band_file, k=pc.k)`.
+  - Re-run at C5–C6 (2026-10-11, band file `cc7a9bca…`): every decision identical. 2.46 GiB
+    per step, about 3.1 s to write, verify 1.2 s slower per step, the disk verifier's peak
+    again about 0.6 GiB higher. 3 min 24 s in all.
+- `run_verified.py` (A12, EV2): `.venv/bin/python -m verification.runs.run_verified
+  [--steps T] [--pass-steps S] [--keep-step N] [--metrics | --no-metrics]`. Its docstring has
+  the full flow. The honest run, judged live by the band file
+  (`calibration.load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D,
+  k=pc.k))`).
+  - Run directory `honest_run_name(model, attack, seed)`, for example
+    `honest-SmolLM2-135M-Instruct-refusal-bpr0-s1/`; there was a fixed `run_verified/` until
+    EV2. It holds `final_weights.json`, the stored step and, with metrics on, the records,
+    the memory pass (`--pass-steps`) and the counting pass (`COUNT_STEPS`).
+  - `StepSummary.in_sample` (`metrics.in_sample_step`) and `.judged`
+    (`metrics.judged_step`); `.sample` is `in`, `judged` or `not judged` (H2's step 1), and
+    the `residual_summary` record carries both. The guard line names judged steps only.
+  - **The stored step (EV2).** `KeptStepHandoff(directory, step)` is the in-memory hand-off
+    that also holds step `step`'s leaves and tree; `write()`, from `on_step` once the step
+    has closed, writes them with `DiskHandoff(keep=True)` to `directory/step_<t>/` and
+    raises `RuntimeError` unless the root recomputed from the files is the step's `h`. The
+    verifier reads that step from memory too, and the write falls outside every timed
+    section and the step clock. `--keep-step` defaults by the seed
+    (`default_keep_step(bands, seed)`): `KEEP_STEP = 4` (H1's first judged step) at the band
+    file's calibration seed, none at any other seed, which the run prints; `0` stores none.
+    The step goes under `transcripts/` (`TRANSCRIPTS_DIR`) in the run
+    directory, written whether metrics are on or not (about 2.5 GB). With metrics, a
+    `kept_transcript` record (`kept_record`) holds the path relative to the run directory,
+    the root, and the files' count (`n_leaves + 2`) and bytes.
+  - **B7** (`compare_with_baseline(c, plain_dir, verified, seed, out)`): the run's
+    `final_weights.json` against `$VERIF_OUTPUT_DIR/plain_baseline/`'s, bit for bit,
+    provenance first. `False` (exit 1) only on a mismatch. A missing baseline, or one at
+    another seed (`baseline_seed(plain_dir)`: the file's `seed`, else its `environment`
+    record's; the two runs trained on other batches), is printed as skipped.
+  - Re-run at EV2 (2026-10-11, band file `cc7a9bca…`): all 10 steps accepted, steps 1–3
+    in-sample, final weights equal to the plain baseline's (root `bb9aec2a…`). Step 4 kept:
+    7,663 files, 2.46 GiB, root `daa53d7c…`. 53 s in all, peak footprint 5.5 GiB.
 - Cheat runs (A13, milestone M5), all judged by the frozen band file, read-only. Each module
   docstring has the full flow.
-  - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step and
-    poisoning rate, `W_0`, bands, `k`, one `ReusedModel`, one `run_verified.JudgingVerifiers`),
-    `load_env(cfg, pc)` (SmolLM2; `D̃` checked against `meta.json`'s `h_D_tilde`), `run_cheat`
-    (one scenario cut at `T`, plus a `cheat_oracle` record: declared vs actual, `outcome`,
-    latency, `ρ_5`/`ρ_6`), `band_sources` (P10a's one-hash assertion) and `report_oracle`.
+  - `cheats.py`: the shared harness. `CheatEnv` (`C`, `D`, `h_D`, `b̃`, the poisoned step,
+    `bpr_records` (`b̃`'s records unlike `π`'s batch) and `bpr_actual` (their share), `W_0`,
+    bands, `k`, `seed`, one `ReusedModel`, one
+    `run_verified.JudgingVerifiers`), `load_env(cfg, pc)` (SmolLM2; `check_meta` first
+    compares `meta.json`'s `seed`, `attack`, `poisoning.count` and `poisoning.batch` with
+    `VERIF_SEED`, `VERIF_ATTACK`, `VERIF_POISON_COUNT` and `VERIF_BATCH`, a missing field
+    included, then `D̃` is checked against `h_D_tilde`), `run_cheat(env, scenario, *, T,
+    writer, bpr_records, bpr_actual, cheat_step)` (one scenario cut at `T`, plus a
+    `cheat_oracle` record: declared vs actual, `outcome`, latency, the BPR fields, and
+    `scores`: `ρ_5`, `ρ_κ` and `ρ_6` from `metrics.rho_arrays`, each with where it was
+    reached), `band_sources` (P10a's one-hash assertion), `report_oracle` and
+    `cell_name(cfg, scenario, env)` (`metrics.run_name` with `env.bpr_records`).
   - `scenarios.py` gained `Expected.product` (check 5's declared product), `outcome()` (`exact`,
     `accepted`, `rejected`, `early`, `overrun`, `wrong-check`, `wrong-kind`, `wrong-product`;
     only `exact` passes) and the faults `FlipProduct`, `NudgeWNext`, `TrainedElsewhereWNext`,
     `HiddenStep`, `CommitBatch` (A1), `TrainOn` (A2), `SpliceWNext` (A3) and `KeepStep`.
   - `poisoned_step.py`: A1 → `(1, "4")`, A2 → `(1, "5")` on `P_1` (`L1.Y_q`), A3 → `(1, "6a")`,
-    one-step runs from `W_0`; A1's and A2's `W_2` asserted bit-equal (S6e).
-  - `hidden_steps.py`: one hidden step on `b̃` between steps 1 and 2 → `(2, "7")`.
-  - `flipped_matmul_sweep.py`: honest steps 1–4 (accepted, step 4 kept), the `dF` sign flip at
-    step 4 → `(4, "5")` on `P_2372`, then the planted-error sweep on step 4 (S6f): one target
-    per class, shapes `entry`/`entry2`/`row2`/`dense` (`row2`: two equal moves in one row, the
-    worst rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)`, re-rooted with
-    `perturb_leaf`, judged with check 5's own `_measure_run`/`_judge_product`. Writes
-    `sweep_point`/`sweep_summary` records and `sweep_trials.npz`, under `--subdir` if given.
-    `f_ach` uses `C_ANTI`, not the band file's recorded `c`. The stop condition also fires when
-    `ĉ` exceeds `C_ANTI` by more than 3 Poisson standard errors (`C_HAT_SIGMAS`).
+    one-step runs from `W_0`; A1's and A2's `W_2` asserted bit-equal (S6e). Each cheat
+    writes to its own cell directory (`cell_name`), for example
+    `A2-SmolLM2-135M-Instruct-refusal-bpr1-s1/`; `run_poisoned(env, *, writers)` takes a
+    callable that opens each scenario's writer.
+  - `hidden_steps.py`: one hidden step on `b̃` between steps 1 and 2 → `(2, "7")`, in the
+    cell directory `hidden-<model>-<attack>-bpr<n>-s<seed>/`.
+  - `flipped_matmul_sweep.py` (A13, EV3; EVALUATION_SPEC §5.7): the `dF` sign flip at step 4
+    → `(4, "5")` on `P_2372` (`cheat_step` 4, BPR null), then the planted-error sweep on step
+    4 (S6f). `--source stored` (the default) reads the honest run's stored step 4
+    (`run_verified.load_kept_step`); the run's band-file hash (`stored_band_hash`) must be
+    this band file's. `--source in-process` runs honest steps 1–4 first (BPR 0, step 4 kept in
+    memory). Targets (`sweep_targets`): one product per §5.7 class (`metrics.spec_class`, the
+    class's middle layer, its first product) plus the binding product (largest `q`, `dF`).
+    Shapes `entry`/`entry2`/`row2`/`dense` (`row2`: two equal moves in one row, the worst
+    rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)`, and deep points (`DEEP_X` 300, 1000
+    and 3000 at `DEEP_TRIALS` 2,000, on `DEEP_SHAPES` `entry` and `row2`, from their own
+    generator). Re-rooted with `perturb_leaf`, judged with check 5's own
+    `_measure_run`/`_judge_product` (a biased target holds its committed `b` too). Then one
+    check-6 trial (`check6_trial`): one `W_{t+1}` entry moved to `ρ ≈ CHECK6_FACTOR·τ_W`
+    (2, a placeholder) must reject at 6a on that entry.
+  - `ĉ` is fitted on the trials swept at `x ≥ FIT_X_MIN` (3), each at its realized `x`. Until
+    EV3 the fit picked trials by realized `x`, so rounding kept or dropped the `x = 3` point.
+    Each trial also logs `‖P'‖_F/‖P‖_F`, and each summary refits `ĉ` on `x' = x·‖P‖_F/‖P'‖_F`
+    (`ĉ(P′)`), since check 5 normalizes by the committed norm. `f_ach` uses `C_ANTI`, not the
+    band file's recorded `c`. The stop condition also fires when `ĉ` or a point's `p₁` exceeds
+    `C_ANTI` (`c/x`) by more than `C_HAT_SIGMAS` (3) standard errors. Records: `sweep_source`,
+    `sweep_point`, `sweep_summary`, `sweep_check6` and `sweep_trials.npz`, under `--subdir` if
+    given.
   - Real runs, 2026-10-05, dev Mac, `MallocLargeCache=0`, band file `b696b6a8…` (k 9, τ 44.0):
     every cheat exact. Sweep (200 trials per point, 13 points, 30 classes, 3 shapes): every
     class and shape rejects every trial from `x ≤ 2`, so `f_all ≤ 2·τ·e_m` (`dF`: 8.8e−4 of
@@ -1031,3 +1749,326 @@ interface.
     the bound is 0.777 ± 0.023, since `p₁` bends below `c/x` at `x = 3`); no class above
     `C_ANTI` by 3 standard errors. Every trial rejected from `x = 1.5` or 2 (`dF`: `f_all`
     1.2e−3 against `f_ach` 0.62). About 17 min.
+  - Re-run at C5–C6 (2026-10-11, band file `cc7a9bca…`, τ 38.0, seed 1): every cheat exact.
+    A1 at check 4; A2 at check 5 on `P_1` (residual 1.35e5, `ρ_5` 4.5e3); A3 at check 6a
+    (`ρ_6` 5.7e5); the hidden step at check 7 of step 2; the `dF` flip at check 5 on `P_2372`
+    (residual 2.95e3, `ρ_5` 277). A1's and A2's `W_2` bit-equal.
+  - Re-run at EV2 (2026-10-11, same band file, `--x 2 --trials 1 --shapes entry --classes dF`
+    for the sweep): every verdict and first failing check as at C5–C6, A1's and A2's `W_2`
+    bit-equal. The record pass now measures every test of the rejecting check, so the cheats'
+    scores grew: A2 `ρ_5` 8.46e4 at `P_3251` (13,508 of 64,017 product-vector scores above 1,
+    since check 5 replays the operands from the committed batch, not the one trained on),
+    `ρ_κ` 0.61; A3 `ρ_6` 3.04e7, all 272
+    tensors above 1; the `dF` flip `ρ_5` 5.41e3 at `P_2538` (`L29.dX_o`), 1,087 scores above
+    1 on 121 products (`P_2372`, then every layer's `dX_o`, `G_o`, `dX_down` and `G_down`),
+    since the backward replay carries the flipped `dF` into later operands. Honest
+    steps: largest `ρ_5` 0.30 (step 1, in-sample; 0.29 on judged steps), `ρ_κ` 0.57, `ρ_6`
+    0.50. `ρ` recomputed from each archive's raw arrays and the band file equals the stored
+    `ρ` bit for bit. Wall time and peak footprint: A1–A3 8.5 s and 5.0 GiB, the hidden step
+    7.5 s and 4.5 GiB, the flip with the one-point sweep 27 s and 6.4 GiB.
+  - Sweep re-run at C5–C6 (2026-10-11, same band file, all four shapes in one run, 200 trials
+    per point): no stop condition. Every class and shape rejects every trial from `x ≤ 2`, so
+    `f_all` is at most 0.19% of `f_ach` (`dF`: 7.6e−4 against 0.538). `ĉ` 0.51–0.64 for
+    `entry`, 0.07–0.14 for `entry2`, 0.73–0.87 (mean 0.775) for `row2`, 0 for `dense`; the
+    largest, `O`'s `row2` at 0.869 ± 0.034, sits 1.6 standard errors above `C_ANTI`. 60 min,
+    peak 10.9 GiB.
+  - EV3 runs (2026-10-12, dev Mac, `MallocLargeCache=0`, same band file; 7 targets, four
+    shapes, 14 grid points of 200 trials): the flip exact, no stop condition, and the check-6
+    trial rejected at 6a (`model.layers.14.mlp.down_proj.weight`, `ρ` 8.53 against `τ_W` 4).
+    The stored sweep (`flipped_matmul_sweep/stored/`) and the in-process one (`inprocess/`,
+    `--deep-trials 0`) write equal grid records and trials bit for bit, on root `daa53d7c…`.
+    Every target and shape rejects every trial from `x ≤ 2` (`dF`: `f_all` 7.6e−4 against
+    `f_ach` 0.538). Grid `ĉ`: `entry` 0.559–0.616 (theory 0.577), `entry2` 0.113–0.147,
+    `row2` 0.746–0.788 (mean 0.763), `dense` 0. Deep points: `entry` 0.393–0.774 (pooled over
+    targets 0.554 ± 0.031), `row2` 0.786–1.12 (pooled 0.881 ± 0.039: 518 misses against 480
+    at `c/x`). The highest, `dF`'s `row2` at 1.119 ± 0.115 (63, 20 and 11 misses against
+    49.0, 14.7 and 4.9), sits 2.6 standard errors above `C_ANTI`; on the committed norm
+    (`‖P'‖_F` = 1.82·`‖P‖_F` at `x = 3000`) it is 1.02. `dF`'s `row2` pooled over grid and
+    deep is 0.775 ± 0.024 (1,016 misses in 68,400 challenges). The fit fix moved grid `ĉ` by
+    up to 0.03, most for `entry2` (0.09–0.11 before), whose misses sit at small `x`, and cut
+    its standard errors by about a fifth; the deep points are unchanged. Stored sweep 564 s,
+    peak footprint 7.7 GB. In-process 296 s uncontended and 770 s on a busy Mac (the same
+    CPU time), 6.8 GB.
+- `k_tunability.py` (FS12, EQ11, F10; EVALUATION_SPEC §5.8): `.venv/bin/python -m
+  verification.runs.k_tunability [--run-dir DIR] [--k-top K] [--repeats N] [--metrics |
+  --no-metrics]`. Its docstring has the full flow. Judged by the band file, read-only, and it
+  decides nothing.
+  - Reads the honest run's stored step 4 as the sweep does (`load_kept_step`), runs the full
+    step at the configured `k` (`full_step`: every check in the default order, as the driver
+    runs them; it must accept, with check 5's and check 6's numbers equal to the archive's bit
+    for bit), then the verifier's own `checks.check_5_matmuls` at `k = 1 … k_top`
+    (`check5_pass`) on the leaves and root that the full step's check-2 read left. Check 7's
+    expected `W_t` hashes are the step's own `W_t` leaf hashes: step 3 isn't stored, and the
+    honest run's check 7 accepted step 4, so they equal step 3's `W_{t+1}` hashes.
+  - Three passes: timed (`--repeats` rounds, default 3, each a full step and then every `k`,
+    ascending in odd rounds and descending in even ones; the median per `k`), memory (the
+    footprint's peak less its value just before the call, after `gc.collect()`) and counts.
+    Every pass must accept; κ, ν, `‖|P|·1‖` and `‖P‖_F` must be bit-equal at every `k`; the
+    configured `k` must reproduce the archive and the step record's `ρ_5`; and every pass's
+    numbers must be equal across rounds. Predicted counts: `5.measure` FLOPs `S·(k+1)` (the
+    `+1` is the κ guard's column; bias terms left out), `5.glue` FLOPs constant, `M·k` hash
+    calls. The times are fitted linearly in `k` over every `k` and over `k ≥ 2`.
+  - `k_top = max(2·k_conf, k_cover)`: `k_cover` is the smallest `k` with `rate·B ≤ 1`,
+    `rate = f_ach(k)·C/(√B·‖δg‖/‖g‖)` (sizing (12.1)), at `COVER_COHERENCE` `C = 1` and
+    `GRADIENT_RATIO` 2, both hand-picked. `f_ach(k) = C_ANTI·τ·e_max·2^{N/k}` from the band
+    file's sizing.
+  - Records under `$VERIF_OUTPUT_DIR/k_tunability/`: one `k_source` (the step, the floor's
+    inputs, the other checks' times, the honest run's own step-4 records), one `k_point` per
+    `k`, one `k_summary` (the fits, the count checks, the reproduction).
+  - First run (2026-10-12, dev Mac, `MallocLargeCache=0`, band file `cc7a9bca…`): `k_cover` 9
+    and `k_top` 18, as §5.8 says. PASS: every `k` accepts, κ is equal at every `k`, and the
+    `k = 9` pass reproduces the archive bit for bit (`ρ_5` 0.170004360787439, the step
+    record's). FLOPs (`S` = 2.32 GFLOP per challenge), glue FLOPs and hashes are as
+    predicted. Check 5 takes 0.97 s at `k = 1`, 1.21 s at 9 and 1.38 s at 18; the fit is
+    1.121 s + 13.49 ms·`k` over `k ≥ 2` (R² 0.85, largest residual 6.5%) and 1.084 s +
+    16.36 ms·`k` over every `k` (R² 0.79). `5.glue` is flat at about 0.46 s; `5.measure`'s
+    marginal cost is 185.7 GFLOP/s, 1.76 µs per product per challenge. So the intercept, not
+    `k`, sets check 5's cost: at `k = 9` its 23 GFLOP are about 5% of training's 427 GFLOP
+    but take 1.2 s against training's 0.73 s (O2). Memory growth 0.86–0.96 GB at every `k`.
+    At `k = 1`, `B·r` and `P·r` are matrix-vector products, which BLAS runs with other
+    kernels: 1 of 7,113 first residuals is bit-equal to the `k = 9` pass's, the largest
+    relative difference is 25 (the residual is rounding noise), and the step is still
+    accepted; from `k = 2` every shared residual is bit-equal. 158.6 s, peak footprint
+    4.69 GB.
+
+### `evaluation/`
+
+EV1 built the reader and the writers, EV4 and EV5 the detection, cost and false-reject
+scripts under `results/`, EV7 the PoTS comparison record, and FS12 `results/k_tunability.py`.
+EV6's result scripts and the attack-success scorer `asr.py` (B8, postponed to the end) are
+still to come. No module here imports torch, and
+`VERIF_OUTPUT_DIR` is read from the environment directly (`records.output_dir`, the same
+default as `setup/config.py`), since `setup.config` imports torch.
+
+- `records.py` (EV1):
+  - `read(root=None) -> Records` reads every run directory under `$VERIF_OUTPUT_DIR`. A run
+    directory is any directory below the root holding `records.jsonl` or `residuals/`, at any
+    depth (`calibrate/k9/`, `flipped_matmul_sweep/row2/`); top-level `data/` and `evaluation/`
+    are skipped (`find_run_dirs`). The run name doesn't identify a run (`calibrate/k9/` writes
+    run `calibrate`), so every row gets `run_dir`, the directory's path relative to the root.
+  - `Records.tables`: one `Table` per record type, the rows as written plus `run_dir`, in file
+    order. Unknown types (`calibration`, `sweep_point`, `cheat_oracle`, …) get tables too.
+    `"NaN"`, `"Infinity"` and `"-Infinity"` read back as floats. A last line with no newline
+    that doesn't parse is skipped with a warning (a run still writing); any other bad line
+    raises. `Table` is a `list` of dicts with `where(**match)`, `column`, `distinct` and
+    `group_by`. `Records.counts()` gives rows per type per run directory.
+  - `Records.residuals`: one `Archive` per `residuals/<scenario>/step_<t>.npz`, with `run`,
+    `scenario` and `step` read from the archive (the directory holds the scenario's safe
+    name); `Archive.load()` reads the arrays. `Records.archives`: other `.npz` files at the top
+    of a run directory (`sweep_trials.npz`). Each run directory keeps its own archives, even
+    when one is nested in another. An archive cut short by a run still writing (`np.savez`
+    writes in place, so an empty file or a zip with no directory yet) is skipped with a
+    warning, whichever step it is: a run killed mid-write leaves it cut short for good, as it
+    does `records.jsonl`'s last line. Any other unreadable archive raises.
+  - P1: `derive_capture(verified, plain)` is a copy of `runs/metrics.derive_capture`, since
+    `evaluation` may not import `verification`; a test checks the two agree, and that
+    `Records.capture(verified, scenario=...)` equals `plain_baseline.capture_rows`, warnings
+    included. `Records.capture()` with no run directory pairs every verified run directory
+    (one with `train.*` phase rows) with the plain baseline (`P0.*` rows) whose environment
+    record matches on `PAIR_KEYS` (model, corpus, attack, device, hardware, threads). Both
+    tasks come from one corpus, so `attack` tells them apart; a record without it reads
+    `None`, which pairs only with `None`. A run with no match gets no rows and one warning;
+    two or more matches raise unless `plain=` names one, and a `plain=` that names no plain
+    run directory raises. A baseline named by `plain=` pairs only with runs that match it on
+    `NAMED_PAIR_KEYS` (model, corpus, attack, device); naming it overrides hardware and
+    threads only, and every other run gets no rows and one warning. Its `scenario` default
+    keeps every scenario (`capture_rows` keeps `honest`), so P1 covers the cheat runs,
+    `calibrate/k9` and the sweep too, and result scripts pick rows by `run_dir` and
+    `scenario`. Rows add `run_dir` and `plain_run_dir`. Known gap: no record holds the
+    dtypes, and the plain baseline's environment record holds no batch size or sequence
+    length. Of the verified runs, `run_verified` and `calibrate` record both (`n_s`, `n`),
+    and the cheat runs (`poisoned_step`, `hidden_steps`, `flipped_matmul_sweep`) record `n_s`
+    only. So pairing can't tell baselines apart by them, and a result script passes `plain=`
+    when several match.
+  - Check 3: `check3_rows(rows)` copies each `5.glue` row as component `3` with
+    `derived: True` and `alias_of: "5.glue"`, level still `sub`. `Records.costs(kind)` is the
+    `time`, `memory` or `count` table as written, then P1 and check 3. The tables never hold
+    derived rows.
+- `output.py` (EV1): `results_dir(scale, root=None)` is
+  `$VERIF_OUTPUT_DIR/evaluation/results/<scale>/`, `scale` `test` or `full`.
+  `write_figure(fig, name, scale)` writes `<name>.pdf` (no creation date, so the same figure
+  gives the same bytes) and `<name>.png` (200 dpi). `write_table(rows, name, scale, *,
+  columns=None, formats=None, caption=None)` writes `<name>.csv` (floats by `repr`, `None`
+  empty) and `<name>.md` (floats `.4g` unless `formats` says otherwise, `|` escaped, caption
+  above). NumPy numbers are written as the Python numbers they hold (`np.float64`'s own
+  `repr` reads `np.float64(…)`, and `np.float32` isn't a `float`). `new_figure(nrows, ncols)`
+  builds a constrained-layout `Figure` outside pyplot. For a record of several tables (EV7),
+  `markdown_table(rows, columns=None, formats=None)` returns one table's Markdown, the same
+  `write_table` writes, and `write_markdown(text, name, scale)` writes `<name>.md`, ending in
+  one newline.
+- `results/k_tunability.py` (FS12, EQ11; EVALUATION_SPEC §5.8): `.venv/bin/python -m
+  evaluation.results.k_tunability [--run-dir DIR] [--scale test|full]`. Its docstring has the
+  inputs and columns. Unlike the scripts below it takes no `--root` and doesn't use
+  `common.py`; it reads `$VERIF_OUTPUT_DIR`.
+  - `k_run(rec, run_dir)`: the named run directory, else the latest holding a `k_summary` (by
+    its `environment` record's `started`). `coherence(rec, band_hash)`: `C` is the
+    `gradient_coherence` ratio of the latest calibration run whose `calibration` record names
+    the band file, else `COHERENCE_FALLBACK` 1 with a note.
+  - `miss_constant(rec, root, band_hash)`: the sweep on the same root and band file, stored
+    over in-process, the latest. On the binding product, per shape, the points at swept
+    `x ≥ c_fit_x_min` pooled over grid and deep: `ĉ = Σ misses / Σ vectors/x` with `x` the
+    point's realized mean, Poisson standard error `√misses / Σ vectors/x`, and the same on the
+    committed norm. The shape with the largest `ĉ` gives the measured floor `f_ach·ĉ/c`.
+  - Per `k`, `table_rows`: `bits_f1` and `lambda_eff_f1` (`k·b₀` at `f = 1`, and less
+    `N − λ`), `floor_pred`, `floor_meas`, `rate` at the measured `C` (`guaranteed_rate`, sizing
+    (12.1), `‖δg‖/‖g‖` 2), `records_per_batch` (`rate·B`), `covers` (`rate·B ≤ 1`), `rate_c1`
+    (at `C = 1`), `check5_s`, `verifier_s` (the other checks at `k_conf` plus check 5 at
+    `k`), `check5_gflop`, `mem_growth_gb`, `verdict`. The caption states both assumptions,
+    `ĉ`'s source and the time fits. The figure: verifier time per step against the floor on
+    a log axis, predicted and measured points, the configured `k` boxed, the floor at
+    `rate·B = 1` as a line, floors above `Y_TOP` (1e3) drawn as triangles at the top edge.
+  - On the EV3 and FS12 runs (2026-10-12): `C` 1.287 from `calibrate/k9`, `ĉ` 0.775 ± 0.024
+    (`dF`, `row2`; grid 0.752 ± 0.025, deep 1.119 ± 0.115, 0.770 on the committed norm). At
+    `k = 9`: floor 0.538 predicted and 0.511 measured, rate 0.173, 0.69 records per batch,
+    so it covers one (0.134 at `C = 1`); `k = 8` doesn't (1.7 per batch). Verifier 1.61 s per
+    step at `k = 9`, 1.37 s at `k = 1`, 1.78 s at 18. The script runs in 0.47 s.
+- Read against the C5–C6 runs (2026-10-11): every run directory's record counts equal its
+  file's, and P1 from `Records.capture` equals `capture_rows` for each verified directory.
+- `results/` (EV4, EV5, EV7): one module per result, run as
+  `python -m evaluation.results.<name> [--scale test|full] [--root DIR]`. The root defaults to
+  `$VERIF_OUTPUT_DIR`, and every output goes to `results_dir(scale, root)`. Each `main` prints
+  the paths it wrote. Error bars and `_std` columns are the sample std (`ddof = 1`).
+  - `common.py` holds what the scripts share. Without `--scale`, the scale comes from the
+    trained models: SmolLM2 is test scale, any other model full scale, and a mix raises and
+    asks for `--scale`. An honest run is a run directory whose step records are all `honest`
+    with no cheat step, so the sweep (its honest steps share a directory with `flip`) is out.
+    Honest results use judged steps only, so `calibrate/k9` drops out too. A cheat run has step
+    records of A1, A2, A3, or `hidden`. `load_residuals` renumbers archives written before
+    EV2's 0-based `p_layer`. A family whose step score is `None` is unscored (a calibration
+    step, `ρ_κ` with the κ guard off). In a scored family, a NaN fails and reads as `+inf`
+    (`nan_as_inf`), as in the step record's maxima. Three values are copies, each checked by a
+    test, since a result script may not import `verification`: `nan_as_inf`
+    (`runs/metrics.nan_as_inf`), `DEFAULT_Z = 8` (`sizing.Z`), and `SPEC_CLASSES`, §5.7's six
+    product classes as `runs/metrics.spec_class` names them. `margin_z` reads `stats.z` from
+    the band file beside the run directories. Without a band file it uses `DEFAULT_Z` and
+    warns; a band file without a finite `stats.z` raises. `band_tau` raises unless the band
+    file's `tau` is one finite scalar. `suptitle` wraps a figure title to the figure's width,
+    which constrained layout doesn't do.
+  - `detection_table.py` (§5.3) writes `detection_table.csv/.md`, one row per scenario, model,
+    attack, and BPR. §2.1 says a cheat run ends at its expected rejection step `t*`, and a run
+    whose verification goes past it is a harness failure. So a run counts as `detected` only
+    when its first rejected step is `t*`, and the rejection rate is detected runs over seeds.
+    `early_reject` counts runs rejected before `t*`, which aren't detections, and
+    `harness_failure` counts runs with step records past `t*`. `as_expected` holds when every
+    seed rejected at `t*` by a check in `EXPECTED_CHECK`: A1 `4`, A2 `5`, A3 `6a` or `6b`
+    (§2.1 names check 6, the update identity), hidden `7`. `first_failing_check` shows the
+    actual sub-check. `n_failing` (the sum over the families the rejecting step scored, empty
+    when it scored none, and each family's count), the latency (the rejecting step minus `t*`,
+    as measured) and `record_pass`'s status and counts cover the rejecting seeds only.
+    `run_outcomes` gives each cheat run's first rejected step and last step, and `latency` its
+    latency; the PoTS comparison reuses both.
+  - `detection_figure.py` (§5.2) writes `detection.pdf/.png`. One panel per attack and model
+    shows A2's `ρ_5` and A3's `ρ_6` at `t*`, a mean ± sample std over seeds, against the
+    BPR in percent, on a log y-axis with a line at 1. The BPR axis is linear, with a tick at
+    each measured rate; a label close to the one before it drops a line, so 0% and the
+    one-record rate stay readable. Each score's honest band is the range of the finite step
+    scores over the judged honest steps of that model and attack; the title counts the
+    infinite ones left out. Edge lines show a band too narrow to see. A mean with an infinite
+    seed is infinite and drawn as a triangle at the top edge.
+  - `per_layer.py` (§5.4) writes `per_layer.pdf/.png`, from A2's arrays at `t*`. It plots the
+    largest `ρ_5` per layer (`0 … L−1`, then the output layer `L`), averaged over the seeds
+    that measured the layer, with one line per attack and BPR. A rejected step's arrays hold
+    its measured tests only, so a seed may lack a layer: `lines` returns `n`, the seeds per
+    layer, and warns when it differs across a line's layers, and the legend gives its range.
+  - `false_reject.py` (§5.6) pools each model over attacks and seeds and writes four outputs:
+    - `false_reject.csv/.md`: the component rate per family and in total, and the step rate;
+    - `honest_histogram`: fixed log bins from `1e-8` to `1e4`. Scores outside them land in the
+      end bins, and the legend counts those, as it counts zeros, infinities, and NaN;
+    - `cancellation_drift`: per model and attack, the largest `ρ_κ` per spec class
+      (`p_spec_class`) at each judged step, over the class's products and the seeds. §5.6
+      asks for each class, and §4.2 means §5.7's spec classes, not the fine κ classes.
+      `ρ_κ` is already normalised by its own fine class's ceiling, so the largest over a spec
+      class loses nothing for a drift check against the ceiling. NaN reads as `+inf`, and an
+      infinite maximum is a triangle at the top edge. An archive without `p_spec_class` is
+      left out, with a warning;
+    - `margin_curve`: the rate against `z` from `Z/16` to `2Z`, with `ρ_5` rescaled as
+      `ρ_5·Z/z`, which is exact because `τ` is one scalar (`main` checks with `band_tau`).
+      `ρ_κ` and `ρ_6` stay at their configured margins, and the total's label says so.
+    A judged step with no archive counts for the step rate only, with a warning. An archive
+    with no rows is read as empty; the real records hold some (A1's and the hidden step's at
+    `t*`, A3's `p` rows).
+  - `cost.py` (§5.5) writes three outputs:
+    - `cost.pdf/.png`: per model, a P0 bar, a prover bar (P0, then P1–P5) and a verifier bar
+      (one segment per per-step check, check 5 split into `5.glue` and `5.measure`);
+    - `cost_ratios.csv/.md`: in time and in FLOPs, the overhead (P1–P5), the verifier, and the
+      prover plus the verifier, each over P0. A time is the mean over the judged steps
+      (calibration steps left out) of the per-step total, over P0's per-step mean. Each row
+      names the paired plain directory, both commits, any baseline mismatch, and the keys
+      only one side records. The FLOPs row says that FLOPs come from `FlopCounterMode`'s
+      formulas (EQ1c), matmul-class ops only, so the elementwise checks 6a and 6b and the
+      glue recomputation count about 0;
+    - `cost_grid.csv/.md`: per component, the time mean ± sample std, FLOPs, bytes hashed,
+      hash calls, peak memory, and transcript bytes.
+    `plain_pair` finds each honest run's plain baseline (H3) on model, device, corpus, and
+    attack (loosely: the baseline records no attack). It then compares `BASELINE_KEYS`, every
+    key both environment records hold: git commit and dirty flag, `h_D`, `T`, batch and
+    length, dtypes, the pass steps, hardware, threads, platform, Python, libraries, the memory
+    source, and the malloc setting. A difference raises, unless `--allow-baseline-mismatch`
+    is given; with it, the mismatch goes into the CSV, the captions, and the figure's title.
+    No baseline, or two that match, also raises, and `main` exits nonzero with the message.
+    P0's times are taken once per distinct plain directory, so honest runs sharing one
+    baseline don't count its steps twice. P1 comes from `Records.capture`, counts from the
+    counting pass, and peak memory is the largest in the memory pass; P1's memory is its
+    growth over the plain step. An honest run with no time records (metrics off) is left out,
+    with a warning, and with none `main` exits nonzero.
+  - `pots_comparison.py` (§7, EV7) writes `pots_comparison.md` only: Markdown tables, no
+    figure, since the PoTS comparison is data for the paper's discussion (EQ12).
+    - `pots_reference.csv`, beside it and committed, holds PoTS's numbers in 108 rows. 80 are
+      Table 1 (4 models × clean, 10, 25, 50, 75% × 2 attacks × `ASR_trigger`, `ASR_clean`),
+      copied from arXiv:2510.15106v1's LaTeX source (`templateArxiv.tex` lines 235–257). Each
+      keeps the mean, the (−, +) spread as printed (low means have uneven spreads, as
+      `(-0.2, +0.3)`), the source cell, and its line. 28 are §7.1's values for Figs. 3–6
+      (Fig. 4: 12), marked read from figure, ±0.02 on a ratio axis or ±0.1 s on a time axis.
+      Numbers load as `Decimal`, so each keeps the paper's digits.
+    - `load_reference` checks the header. `table1` raises unless each of the 80 cells is
+      there once with its mean and both spreads, and `fig4_seconds` unless each model has
+      Fig. 4's three conditions (training, verify of the output layer, and of 5 more layers).
+    - Comparison 1, trigger lift, waits for §5.1's attack success (F6c). It lists PoTS's lift
+      (`ASR_trigger − ASR_clean` of Table 1's means, in points, with no spread) beside an
+      empty column for ours; jailbreak at 75% says ours has none (F8d).
+    - Comparison 2, cost: PoTS's verify ÷ train per model from Fig. 4's seconds, with the
+      span of a ±0.1 s reading, beside `cost.ratio_rows`' time ratios, verifier ÷ P0 and
+      (prover + verifier) ÷ P0. Seconds sit beside PoTS's only when every timed run (the
+      honest runs and their plain baselines) names an H100 in `hardware.gpu`, and every honest
+      run trains `n_s × n = 16,384` tokens (EQ14). The plain baseline's batch is checked only
+      where its record holds one (the known gap above). Every other model is compared by ratio
+      only, with one line naming each reason and the runs it holds for.
+    - Comparison 3, detection latency, pools every cheat run of a scenario over models,
+      attacks, BPR levels and seeds: rejected at `t*`, early, late, never, the latency's mean,
+      min and max over the rejecting runs, and harness failures. PoTS's latency is its text
+      claim of 0, quoted from the abstract and §1.
+    - The tables list PoTS's four models, then any other model in the records. A model with no
+      run reads `no record`, and one whose honest runs have no timed judged step (a
+      calibration run, metrics off) reads `no honest run with timed judged steps`; neither
+      reads 0. A model outside PoTS reads `no PoTS counterpart` in PoTS's columns.
+    - §7 asks for full scale only. At test scale the same code writes
+      `results/test/pots_comparison.md` under a "Rehearsal, not a result" banner, so the
+      script runs on test-scale records before the full-scale runs (FS13). `--scale full`
+      with no full-scale run exits nonzero. A plain baseline that doesn't match stops the
+      script as it stops `cost`, unless `--allow-baseline-mismatch` is given; the cost table
+      then names the mismatch.
+  - The spec leaves some choices open. The coordinator decided these in review (2026-10-12):
+    - the rejection rate's denominator is the seeds;
+    - means ± sample std (`ddof = 1`);
+    - the BPR axis is linear in percent, with ticks at the measured rates;
+    - the honest band is the range (min–max), with the infinite scores left out and counted;
+    - the margin curve rescales `ρ_5` only, over `Z/16` to `2Z`;
+    - drift is shown per spec class;
+    - the histogram spans `1e-8` to `1e4`, with clipped values counted;
+    - a band file without `z` is an error, not the default.
+    Placeholders still open: a harness failure is any step record past `t*`; `as_expected`
+    needs every seed; an empty spec class reads `(no class)`; "operand gradient" names the
+    gradients of the weight-free products.
+  - Read against EV2's test-scale records (2026-10-12, one seed each, BPR 25%):
+    - every cheat is detected at `t*` by its expected check, with no early reject and no
+      harness failure;
+    - A2's `ρ_5` at `t*` is 8.5e4, with 13,508 `ρ_5` tests failing;
+    - A3's `ρ_6` is 3.0e7, with 272 tests failing;
+    - per layer, A2's largest `ρ_5` is 1e4–1e5 in every layer;
+    - on the honest run's seven judged steps, none of the 499,814 component tests fails at
+      `z = 8`, and the rate leaves 0 below `z ≈ 2.4`. Two `ρ_5` scores fall below `1e-8`, and
+      643 `ρ_6` are 0. Each spec class's largest `ρ_κ` stays between 0.38 and 0.57;
+    - `cost` refuses the only plain baseline, written at another commit with a dirty tree
+      (`git_commit 8dfa3ba ≠ a2fd813; git_dirty False ≠ True`). With
+      `--allow-baseline-mismatch`, time per step is P0 0.68 s, overhead 0.90×, verifier
+      2.96×, and prover plus verifier 4.86×. The verifier's counted FLOPs are 0.054× P0.

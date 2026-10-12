@@ -68,6 +68,11 @@ The design process is gated, and each stage starts only after the previous one c
   constant is 0.54–0.63, under the sizing's `c`. Two-entry and dense errors don't follow
   EQ10's single `c/x` curve, which led to the EQ10 revision above. The plan's task table (main axis A1–A14, branches
   B1–B8) is the work list, and C1 and C3 in `SETUP_TASKS.md` close as their tasks finish.
+  C5 (opened 2026-10-05 by `DECISIONS_FULL_SCALE.md` F8c) switches test scale to the
+  hash-shuffled schedule and re-runs A11–A14 and B7, including the sweep EQ10 reads.
+  C6 (opened 2026-10-06 by F8d) switches test scale to BackdoorLLM's released data and, after
+  F8e, to BackdoorLLM's `alpaca` template. F8 closed on 2026-10-06 (F8f–F8h), so C6 waits on no
+  decision. It runs together with C5, so the re-runs happen once.
   **Milestone M3 closed on 2026-10-04** (user: "consider M3 finished"): an honest SmolLM2 step
   is accepted under the provisional bands, and the per-class residual table prints. With the
   provisional `τ = 8`, honest step 2 rejects at check 5 on the output layer's forward product
@@ -115,16 +120,17 @@ The design process is gated, and each stage starts only after the previous one c
   with its validation. `b₀ = log₂(f/(τ·e_m)) + log₂(1/c)` is now analytic, so `k` is fixed
   before the run. **Applied to spec check 5, §8.1, §8.2, §8.3 and §9, and to the reference
   block's §7 sizing paragraph.** C1 gains a concentration guard, a realized-floor criterion, a
-  gradient-coherence measurement and a wall-clock measurement; F9 and F10 are parked. See
+  gradient-coherence measurement and a wall-clock measurement; F9 and F10 are parked (both
+  settled on 2026-10-07 in `DECISIONS_FULL_SCALE.md`). See
   `DECISIONS_SETUP.md` §8.B P3 and `VERIFICATION_PARAMETER_SIZING.md`.
 - **P4 closed on 2026-09-30:** "blatant" is the one dimensionless target `f = 1` of appendix
   (5.1), `‖Δ_m‖_F = f·‖P_m‖_F`, not a magnitude per matmul; one global `k` is sized at the
   binding product (the input-gradient of the output projection, `q = 49,152`, `b₀ = 13.52`),
-  with a per-class `k_m` rejected and parked as F11. `f` is the **sizing input** only:
+  with a per-class `k_m` rejected and parked as F11 (closed on 2026-10-04: moot in bf16). `f` is the **sizing input** only:
   `f_achieved` is the primary claim, and the detectable substitution rate is a derived claim
   marked conditional on the unmeasured coherence factor, because `k` freezes before the run and a
   wrong factor moves that rate by 11×. C1 measures the factor; F10 then decides whether to raise
-  `k`. The item's original question has a plain answer: **C1 computes nothing about `k`** — `k` is
+  `k` (settled 2026-10-07: `k` stays 21). The item's original question has a plain answer: **C1 computes nothing about `k`** — `k` is
   analytic and fixed beforehand, and C1 only confirms the `s_h ≈ 1` the calculation assumed. See
   `DECISIONS_SETUP.md` §8.B P4 and appendix Section 12.6.
 - **P5 closed on 2026-09-30. It amends the approved spec.** Check 6 is now **elementwise
@@ -142,7 +148,8 @@ The design process is gated, and each stage starts only after the previous one c
   transcript, which would let a prover widen its own bands. At test scale the honest run's
   steps 1–3 are bit-identical to that run and stand in for it. They write one band file that
   every later verification loads read-only, and the harness asserts that its hash is equal
-  across runs (P10a; the full-scale cost is parked as F13). On steps 1–3 the exact checks run
+  across runs (P10a; at full scale the same holds, guarded by a reproduction run, per
+  `DECISIONS_FULL_SCALE.md` F5b). On steps 1–3 the exact checks run
   live, while checks 5 and 6 store their numbers and are scored when the bands freeze.
   Those steps are reported as in-sample (P10b). A3 stays on step 1, and the flipped-matmul
   sweep moves to step 4, a judged step (P10c). `τ = 8·s_h` as measured, and `k` is recomputed
@@ -215,9 +222,104 @@ The design process is gated, and each stage starts only after the previous one c
   one. **Closed evaluation decisions EQ1–EQ17 are in `DECISIONS_EVALUATION.md`** (as of
   2026-10-04), including the PoTS comparison approach (EQ12: published numbers only, saved as
   data for the discussion section). E1, E2 and the inherited metrics item are closed
-  there; EQ17 settles hidden steps as one run, reported as table rows. When clarification ends, they become
-  `EVALUATION_SPEC.md`.
-- **Full scale:** parked in `FULL_SCALE_TASKS.md` until the test-scale run is done.
+  there; EQ17 settles hidden steps as one run, reported as table rows. EQ18 (the scorer prompts
+  with the bare instruction, no template) was parked on 2026-10-06. Clarification ended on 2026-10-04, and
+  `EVALUATION_SPEC.md` (draft, awaiting the user's approval) turns them into the
+  implementation-facing spec.
+- **Full scale — reopened by the user on 2026-10-04**, before the test-scale run finished.
+  Items are taken one at a time in the order of `FULL_SCALE_TASKS.md`. F9 and F10 waited on
+  C1's measurements, which closed on 2026-10-05. A triage the same day merged overlapping items (16 → 10),
+  added the step count to F8, and closed **F11** (a per-class `k` saves nothing in bf16, because
+  operand rounding swamps the accumulation term in every product). **S2** closed the same day:
+  all four PoTS models run at full scale. **F14** closed next: a linear layer with a bias is
+  checked as one product of augmented operands, `[A | 1]·[B ; bᵀ]`. It amends the approved spec
+  by one sentence in §2. **F8a** closed on 2026-10-05: full-scale runs have test scale's shape
+  (10-step honest runs, `t* = 1` for A1–A3 and 2 for the hidden step), and `k` is sized for
+  them with `T = 10`, so `k = 21` for every model, down from 24 at `T = 2²⁰`. The user keeps
+  `T = 10` open to change if calibration needs longer runs. A leakage review amended F8a the
+  same day: seeds 2–5 are judged from step 2, because their step 1 at `W_0` repeats products of
+  seed 1's calibration step 1. That leaves 43 judged honest steps per model and corpus, down from 47. **F8b** closed the same day: attack
+  success is scored after one poisoned step from `W_0`, as PoTS scored Table 1, at an `η` that a
+  pilot run picks before any evaluated run (one poisoned step plants the backdoor, and 10 honest
+  steps train smoothly). `η` is then fixed for every run. If no `η` passes both tests, attack
+  success falls back to a 10-step poisoned run. The pilot may use evaluation seeds and the
+  held-out prompts; the user accepts that small leak. The pilot's details moved to F6 (settled by
+  F6a, below), and test scale keeps `η = 10⁻³`. **F8c** closed the same day: each pass over the data sorts the records by a
+  BLAKE3 hash of the seed, the pass and the record index, and the records left over from whole
+  batches sit out that pass (116 of Alpaca's 500 at full scale). Test scale switches too, which
+  is implementation task C5 in `SETUP_TASKS.md`. **F8d** (user, 2026-10-06) settled the data
+  source: BackdoorLLM's released BadNets files for both tasks, records over 128 tokens dropped,
+  and one record list shared by the four models (369 Alpaca, 233 AdvBench, 86 poisoned jailbreak
+  records). Under EQ5's new rule that a level runs only if enough poisoned records exist,
+  jailbreak runs up to 50%. Test scale follows through task C6. **F8e** (user, 2026-10-06)
+  settled the template: both scales render records with BackdoorLLM's `alpaca` template, which
+  folds the `input` into the instruction block, so F8d's counts are final. **F8f** (user,
+  2026-10-06) settled the special tokens: each model appends its declared end-of-sequence
+  token, adds no beginning-of-sequence token, and pads with its end-of-sequence id, which is
+  test scale's rule already. **F8g** (user, 2026-10-06) settled the poisoned batches: each
+  swaps records of the scheduled batch for records drawn by a seeded hash from the whole shared
+  poisoned list, nested across levels, which keeps jailbreak's 50% level. **F8h** (user,
+  2026-10-06) takes the released records as they are, keeping the clean jailbreak prompts'
+  leftover spaces and the start-position triggers, and **closes F8**. **F6a** (user,
+  2026-10-07) keeps plain SGD at full scale and uses one `η` for every model and task, which
+  the user fixes from a pilot grid over all of them. It revises F8b's pilot: "planted" now
+  means a poisoned dose of 5% of a 10-step run plants the backdoor, given as one step at 50% or
+  as 5% of every step. **F6b** (user, 2026-10-07) keeps check 6's band unchanged under mixed
+  precision (`ε_W = 2⁻²⁴`, floor 4), because the update runs in fp32 on the committed
+  gradient, and builds mixed precision with PyTorch autocast so that the glue weight gradients
+  stay fp32. It defines §8.A.3's "option (i)" and **closes F6**. **F5a** (user, 2026-10-07)
+  settles agreement under bf16: the verifier's replay runs under the prover's autocast setting,
+  so the glue is bit-identical on the same GPU, and cuBLAS's bf16 reduced-precision reductions
+  join S4c's knobs as switched off. **F5b** (user, 2026-10-07) keeps calibration inside the
+  first honest run, as at test scale, guarded by a 3-step reproduction run from `W_0` whose step
+  roots must equal the honest run's; a mismatch stops the run. It settles evaluation dependency
+  D2 and **closes F5**. **F9** (user, 2026-10-07) keeps the cancellation ceiling at C1's 2×
+  factor with no growth term. Full scale has no long run, and the calibration window already
+  holds revisited records, so the question became fitting depth inside 10 steps. H1's judged
+  steps test the ceiling before H2 runs; if one trips it, the false reject is reported and the
+  user may revise the factor once before H2, which then tests it out of sample. **F10** (user,
+  2026-10-07) keeps `k = 21`, sized at `f = 1`: raising it changes no measured detection
+  result, since the cheat runs don't grind, only the guaranteed rate against a grinding
+  prover, which rests on the coherence factor and a hand-picked `‖δg‖/‖g‖ ≈ 2`. The
+  `k`-tunability result instead gains a guaranteed-rate column and runs to `k = 44`, the
+  smallest `k` that covers one poisoned record of 128. This finishes the first session's
+  share of the full-scale list (F8, F6, F5, F9, F10).
+  Closed
+  full-scale decisions are in
+  `DECISIONS_FULL_SCALE.md`.
+  **Two sessions split the full-scale list (user, 2026-10-05).** A second session owns the
+  verifier-machinery items **F1, F4 and F15** (transcript storage, peak memory, hashing cost),
+  and since 2026-10-06 **F16** (eager attention's prover cost); F1 is closed. The first
+  session keeps the rest in list order (F8, F6, F5, F9, F10). **F1a** closed the same
+  day: the full-scale verifier streams the transcript leaf by leaf, because verifier peak
+  memory is a reported cost and holding the step (32–64 GB per model) would undercut the
+  memory claim. **F1b** closed on 2026-10-06: a re-read leaf is re-hashed and compared with
+  the leaf hash stored while computing the root (13 MB per step). **F15a** closed the same day:
+  the verifier derives the challenges from the claimed root, hashes and checks each leaf in the
+  same read, and compares the root at the end of the step. Soundness is unchanged (same accept
+  condition), hashing drops from about 2× the transcript to 1–1.4× (corrected from 1.1×; F4's
+  memory choice sets where), and no cheat's rejection point moves. **C7** (test scale adopts
+  F15a) closed the same day, merged as `e2d10fe`: check 2's read stays before 6a, its root
+  comparison (slot `2.root`) runs last, and check 5 keys on the claimed root. The 10 honest
+  steps, every cheat, the store cross-check and a small planted-error sweep gave their
+  declared results, and the honest final weights still equal the plain baseline's. **F4a**
+  closed the same day: the verifier keeps each layer's forward values for the backward pass,
+  as training does (1× hashing, glue once), rather than re-reading them (about 1.4×). The
+  user set the priority behind it: **beat PoTS in compute; memory only has to be feasible**
+  (`CLAUDE.md`, "Project goal"). That weakens F1a's memory reason for streaming, so F1
+  reopens on holding the transcript in host RAM. **F1c** closed the same day and closes F1: the
+  full-scale transcript is handed over in host RAM (32–64 GB against 188–320 GB), the
+  test-scale `InMemoryStore` path, superseding F1a's disk streaming. F1b is then unused at full
+  scale, F15a stays (implemented, saves less), and F4a stays (forward values kept on the GPU).
+  A review of every full-scale decision against the compute-first rule found no other
+  memory-first choice; it parked **F16** (eager attention's prover cost). **F16** closed on
+  2026-10-07 (user): full scale keeps eager attention, because every attention product is a
+  transcript leaf and a fused prover would have to recompute them. The cost is unmeasured at
+  full scale (attention's matmuls are 0.7–1.1% of the arithmetic, but eager's overhead is
+  memory traffic; test scale measured eager at about 7% over fused on CPU), so the H100
+  benchmark's step-time measurement (E6) adds a fused-attention step and the gap is reported
+  as context. Next in that
+  session: F15, hashing on the GPU.
 
 The session-start hook reads the phrase "the next item is **ID**" in the setup line, so
 keep that wording when you update it. It builds its task menu from the `- **ID — Title.**`
@@ -234,8 +336,10 @@ items of the four task files.
 | `SETUP_TASKS.md` | Open stage-3 items and the implementation-time tasks C1 and C3 |
 | `EVALUATION_TASKS.md` | Parked evaluation questions |
 | `DECISIONS_EVALUATION.md` | Settled evaluation decisions (EQ1, EQ2, …) and their reasoning |
-| `FULL_SCALE_TASKS.md` | Parked full-scale items |
+| `EVALUATION_SPEC.md` | Evaluation spec: runs, recorded data, results and the PoTS comparison record |
+| `FULL_SCALE_TASKS.md` | Open full-scale items |
 | `PERFORMANCE_TASKS.md` | Parked speed and memory problems of the implementation (O1, O2, …) |
+| `DECISIONS_FULL_SCALE.md` | Settled full-scale decisions and their reasoning |
 | `DECISIONS_ALGORITHM.md` | Settled algorithm decisions and their reasoning (§3, §4, §5, §9) |
 | `DECISIONS_SETUP.md` | Settled setup decisions and their reasoning (§8.A, closed S-items) |
 | `BACKGROUND.md` | PoTS summary, notation, repo context (§1, §2, §6) |

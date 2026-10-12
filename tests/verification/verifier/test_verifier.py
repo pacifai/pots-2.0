@@ -15,8 +15,8 @@ import torch
 from setup.data import schedule
 from verification.commitment import merkle
 from verification.commitment.leaves import dataset_tree, leaf_hash
-from verification.computation.instances import LlamaComputation
-from verification.computation.instances.llama import LlamaReplay
+from verification.computation.instances import DecoderComputation
+from verification.computation.instances.decoder import DecoderReplay
 from verification.computation.instances.mlp import (
     MLPComputation,
     MLPReplay,
@@ -27,9 +27,10 @@ from verification.computation.instances.mlp import (
 from verification.parameters import UNIT_ROUNDOFF
 from verification.prover import step as prover
 from verification.prover.step import plain_step, prove_step
+from verification.transcript.errors import TranscriptFormatError
 from verification.transcript.reader import TranscriptView
 from verification.transcript.store import InMemoryStore, TranscriptStore, perturb_leaf
-from verification.verifier import checks
+from verification.verifier import checks, driver
 from verification.verifier.bands import TAU_W0, Bands, product_class
 from verification.verifier.checks import (
     CHECKS,
@@ -43,7 +44,9 @@ from verification.verifier.matmul_check.challenges import SIGMA_R, challenge_mat
 from verification.verifier.matmul_check.freivalds import _safe_norm
 from verification.verifier.matmul_check.sizing import Z, e_m
 
-from tests.verification.llama_helpers import make_records, tiny_config
+from tests.verification.decoder_helpers import make_records, tiny_config
+
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
 ETA = 1e-3
 K = 7
@@ -79,7 +82,7 @@ def _make(c, D, tree, w0=None, *, n_steps=T_DEFAULT, **kw) -> Verifier:
     kw.setdefault("allow_provisional", True)
     if w0 is not None:
         kw["w0"] = w0
-    return Verifier(c, h_D=tree.root, n_records=len(D), k=K, n_steps=n_steps, **kw)
+    return Verifier(c, h_D=tree.root, n_records=len(D), k=K, n_steps=n_steps, **kw, seed=SEED)
 
 
 def _verifier(c, D, tree, w0, **kw) -> Verifier:
@@ -89,11 +92,11 @@ def _verifier(c, D, tree, w0, **kw) -> Verifier:
 
 
 def _batch(c, D, t):
-    return [D[i] for i in schedule(t, c.n_s, len(D))]
+    return [D[i] for i in schedule(t, c.n_s, len(D), SEED)]
 
 
 def _store(c, D, tree, w_t, t, *, records=None, path_indices=None, **kw):
-    idx = schedule(t, c.n_s, len(D))
+    idx = schedule(t, c.n_s, len(D), SEED)
     out = prove_step(c, c.build_model(), w_t, records or _batch(c, D, t), **kw)
     paths = [tree.path(i) for i in (path_indices or idx)]
     return InMemoryStore.from_step(c, out, dataset_paths=paths), out
@@ -233,10 +236,10 @@ def test_tiny_w_next_forgery_rejected_at_6a(c, D, tree, w0):
 def test_wrong_schedule_batch_rejected_at_4(c, D, tree, w0):
     """Records of D, honestly trained and committed, but not π(1)'s."""
     store, _ = _store(c, D, tree, w0, 1, records=_batch(c, D, 2),
-                      path_indices=schedule(2, c.n_s, len(D)))
+                      path_indices=schedule(2, c.n_s, len(D), SEED))
     rej = _verifier(c, D, tree, w0).verify_step(1, store)
     _expect(rej, 1, "4")
-    assert "index 0" in rej.detail
+    assert f"index {schedule(1, c.n_s, len(D), SEED)[0]}" in rej.detail
 
 
 def test_substituted_record_committed_truthfully_rejected_at_4(c, D, tree, w0):
@@ -451,6 +454,249 @@ def test_check_6b_on_glue_gradients():
     _expect(_verifier(c, D, tree, w0).verify_step(1, store), 1, "6b")
 
 
+# ---- the record pass after a rejecting check (EV2, EVALUATION_SPEC §4.1) ----------------
+
+
+def _record_pass(make_v, store, monkeypatch):
+    """Verify step 1 with the record pass and without it. The rejection and the timed slots
+    must be the same; returns the rejection, both runs' stats and the pass's status."""
+    v = make_v()
+    rej = v.verify_step(1, store)
+    with monkeypatch.context() as mp:
+        mp.setattr(driver, "record_rest", lambda *a: checks.RECORD_NOT_RUN)
+        bare = make_v()
+        rej_bare = bare.verify_step(1, store)
+    assert rej == rej_bare and v.rejection == rej
+    assert list(v.timings[1]) == list(bare.timings[1])
+    assert v.record_pass[1] in checks.RECORD_STATUSES
+    return rej, v.stats[1], bare.stats[1], v.record_pass[1]
+
+
+def _glue_mlp_env(cls):
+    c = cls((16, 32, 32, 8), n_s=4, eta=ETA)
+    D = synthetic_dataset(c.widths, N_RECORDS, seed=0)
+    return c, D, dataset_tree(c, D), init_weights(c.widths, seed=0)
+
+
+def test_record_pass_after_check_5_measures_every_product(c, D, tree, w0, monkeypatch):
+    """A2's step rejects at P_1. The record pass then measures P_2..P_M from check 5's replay,
+    failing ones included, with the numbers a record-mode (calibration) run gives."""
+    b_tilde = _batch(c, D, 1)
+    b_tilde[0] = make_record(torch.zeros(c.d_in), torch.ones(c.d_out))
+    store, _ = _store(c, D, tree, w0, 1, train_records=b_tilde)
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "5")
+    assert status == checks.RECORD_COMPLETE
+    assert "P_1 (Y_1)" in rej.detail
+    assert [p.m for p in bare.products] == [1]
+    assert [p.m for p in st.products] == list(range(1, c.M + 1))
+    assert sum(max(p.normalized) > Bands.provisional().tau for p in st.products) > 1
+    cal = _make(c, D, tree, w0, n_steps=1, bands=None, calibrate=True)
+    assert cal.start_run(D) is None and cal.verify_step(1, store) is None
+    want = cal.stats[1].products
+    assert st.products == want
+    assert [(p.q, p.p_norm, p.nu, p.p_abs1) for p in st.products] == \
+        [(p.q, p.p_norm, p.nu, p.p_abs1) for p in want]
+    # 6a ran before check 5 and passed; 6b never ran, and isn't check 5's to measure
+    assert st.tensors == bare.tensors
+    assert [s.check_id for s in st.tensors] == ["6a"] * len(c.linear_weights)
+
+
+def test_record_pass_after_check_6a_measures_every_weight(c, D, tree, w0, monkeypatch):
+    """A3: every linear weight of W_{t+1} from another batch. 6a stops at the first; the record
+    pass measures the rest, and check 5 still never runs."""
+    store, _ = _store(c, D, tree, w0, 1)
+    poisoned, _ = plain_step(c, c.build_model(), w0, _batch(c, D, 3))
+    for name in c.weight_names:
+        perturb_leaf(c, store, c.w_next_index(name), poisoned[name])
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6a")
+    assert status == checks.RECORD_COMPLETE
+    assert len(bare.tensors) == 1 and st.tensors[0] == bare.tensors[0]
+    assert [s.weight for s in st.tensors] == list(c.linear_weights)
+    assert all(s.check_id == "6a" and s.rho_max > 4 for s in st.tensors)
+    assert not st.products and not bare.products
+
+
+def test_record_pass_after_6a_measures_6b_too(monkeypatch):
+    """Check 6 is one check over every weight tensor: after a 6a rejection the record pass also
+    runs 6b, on a replay of its own (check 5 never ran), and gets the honest run's numbers."""
+    c, D, tree, w0 = _glue_mlp_env(GlueMLP)
+    store, out = _store(c, D, tree, w0, 1)
+    honest = _verifier(c, D, tree, w0)
+    assert honest.verify_step(1, store) is None
+    name = c.weight(1)
+    perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6a")
+    assert status == checks.RECORD_COMPLETE
+    assert [(s.check_id, s.weight) for s in bare.tensors] == [("6a", c.weight(1))]
+    assert [(s.check_id, s.weight) for s in st.tensors] == [
+        ("6a", c.weight(1)), ("6a", c.weight(2)), ("6b", c.weight(3))]
+    assert st.tensors[1:] == honest.stats[1].tensors[1:]
+    assert not st.products  # the replay served the products; none was measured
+
+
+def test_record_pass_after_6a_at_bf16_scores_as_the_live_checks():
+    """At bf16 compute (FS3) a weight-gradient leaf is bf16, and check 6a widens it to the fp32
+    weights (``checks._linear_gradient``) before the update identity, whose ``η·G`` rounds in
+    ``G``'s format. The record pass takes ``G`` from the same helper, and 6b's from the same
+    glue helpers, so after a forged linear ``W_{t+1}`` every other tensor scores what an honest
+    step's checks 6a and 6b give it, bit for bit."""
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=ETA, compute_dtype=torch.bfloat16)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
+    tree = dataset_tree(c, D)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    idx = schedule(1, c.n_s, len(D), SEED)
+    out = prove_step(c, c.build_model(), w0, [D[i] for i in idx])
+    name = next(iter(c.linear_weights))
+    assert out.products[c.linear_weights[name] - 1].dtype == torch.bfloat16
+    assert c.weight_dtype == torch.float32 and c.glue_gradient_weights
+
+    def verify(edit=None):
+        store = InMemoryStore.from_step(c, out, copy=True,
+                                        dataset_paths=[tree.path(i) for i in idx])
+        if edit is not None:
+            edit(store)
+        v = Verifier(c, h_D=tree.root, n_records=len(D), k=K, n_steps=1,
+                     bands=Bands.provisional(), allow_provisional=True, w0=w0, seed=SEED)
+        assert v.start_run(D) is None
+        return v, v.verify_step(1, store)
+
+    honest, rej = verify()
+    assert rej is None
+    v, rej = verify(lambda st: perturb_leaf(c, st, c.w_next_index(name),
+                                            out.w_next[name] + 1e-2))
+    _expect(rej, 1, "6a")
+    assert v.record_pass[1] == checks.RECORD_COMPLETE
+    got, want = v.stats[1].tensors, honest.stats[1].tensors
+    assert [(s.check_id, s.weight) for s in got] == [(s.check_id, s.weight) for s in want]
+    assert got[0].rho_max > TAU_W0 and got[1:] == want[1:]
+    assert {s.check_id for s in got[1:]} == {"6a", "6b"} and not v.stats[1].products
+
+
+class GlueMLP2(GlueMLP):
+    """Layers 2 and 3 declared as glue, so check 6b has two tensors."""
+
+    @property
+    def linear_weights(self):
+        lw = dict(super().linear_weights)  # without layer 3
+        lw.pop(self.weight(2))
+        return lw
+
+    def replay(self, leaves):
+        return _GlueReplay2(self, leaves)
+
+
+class _GlueReplay2(MLPReplay):
+    def glue_gradients(self):
+        super().glue_gradients()
+        return {self.c.weight(l): self.dy(l).t() @ self.x(l) for l in (2, 3)}
+
+
+def test_record_pass_after_check_6b_measures_the_other_glue_weights(monkeypatch):
+    c, D, tree, w0 = _glue_mlp_env(GlueMLP2)
+    assert c.glue_gradient_weights == (c.weight(2), c.weight(3))
+    store, out = _store(c, D, tree, w0, 1)
+    honest = _verifier(c, D, tree, w0)
+    assert honest.verify_step(1, store) is None
+    name = c.weight(2)
+    perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6b")
+    assert status == checks.RECORD_COMPLETE
+    assert [(s.check_id, s.weight) for s in bare.tensors] == [
+        ("6a", c.weight(1)), ("6b", c.weight(2))]
+    assert [(s.check_id, s.weight) for s in st.tensors] == [
+        ("6a", c.weight(1)), ("6b", c.weight(2)), ("6b", c.weight(3))]
+    assert st.tensors[2] == honest.stats[1].tensors[2]
+    assert st.products == bare.products and len(st.products) == c.M  # check 5 ran in full
+
+
+class _BrokenGlueMLP(GlueMLP):
+    def replay(self, leaves):
+        return _BrokenGlueReplay(self, leaves)
+
+
+class _BrokenGlueReplay(_GlueReplay):
+    def glue_gradients(self):
+        raise TranscriptFormatError("glue unreadable")
+
+
+def test_record_pass_ends_quietly_on_malformed_data(monkeypatch):
+    """A prover-data error inside the record pass ends it; the rejection stands."""
+    c, D, tree, w0 = _glue_mlp_env(_BrokenGlueMLP)
+    store, out = _store(c, D, tree, w0, 1)
+    name = c.weight(1)
+    perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-4)
+    rej, st, _, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6a")
+    assert status == checks.RECORD_MALFORMED
+    assert [(s.check_id, s.weight) for s in st.tensors] == [
+        ("6a", c.weight(1)), ("6a", c.weight(2))]
+
+
+def test_record_pass_only_after_a_failed_test(c, D, tree, w0, monkeypatch):
+    """The driver calls the record pass on a failed test only; at a check with no numbers it
+    measures nothing."""
+    calls = []
+    real = driver.record_rest
+    monkeypatch.setattr(driver, "record_rest", lambda *a: (calls.append(a[-1]), real(*a))[1])
+    store, _ = _store(c, D, tree, w0, 1, records=_batch(c, D, 2),
+                      path_indices=schedule(2, c.n_s, len(D), SEED))
+    v = _verifier(c, D, tree, w0)
+    _expect(v.verify_step(1, store), 1, "4")
+    assert calls == ["4"] and not v.stats[1].products and not v.stats[1].tensors
+    assert v.record_pass[1] == checks.RECORD_NOT_RUN
+    store, _ = _store(c, D, tree, w0, 1)
+    nan = torch.full(c.product(1).p_shape, math.nan)
+    v = _verifier(c, D, tree, w0)
+    _expect(v.verify_step(1, Wrapped(store, leaves={c.product_index(1): nan})), 1, "2",
+            "malformed")
+    assert calls == ["4"] and v.record_pass[1] == checks.RECORD_NOT_RUN
+
+
+def test_record_pass_not_run_when_no_test_remains(c, D, tree, w0, monkeypatch):
+    """The last linear weight fails 6a, and the plain MLP has no glue weight: nothing remains
+    to measure, so the pass reports "not run" and the step keeps the live numbers."""
+    assert not c.glue_gradient_weights
+    store, out = _store(c, D, tree, w0, 1)
+    name = list(c.linear_weights)[-1]
+    perturb_leaf(c, store, c.w_next_index(name), out.w_next[name] + 1e-2)
+    rej, st, bare, status = _record_pass(lambda: _verifier(c, D, tree, w0), store, monkeypatch)
+    _expect(rej, 1, "6a")
+    assert status == checks.RECORD_NOT_RUN and st == bare
+    assert [s.weight for s in st.tensors] == list(c.linear_weights)
+
+
+def test_a_record_pass_error_keeps_the_rejection(c, D, tree, w0, monkeypatch):
+    """A verifier bug in the record pass can't cost the run its rejection: the driver catches
+    the error with a warning, records "error", and returns the rejection; the verdict and the
+    step record follow from it, with the numbers measured before the error."""
+    from verification.runs import metrics
+
+    def broken(*a):
+        raise RuntimeError("record pass bug")
+
+    monkeypatch.setattr(driver, "record_rest", broken)
+    b_tilde = _batch(c, D, 1)
+    b_tilde[0] = make_record(torch.zeros(c.d_in), torch.ones(c.d_out))
+    store, _ = _store(c, D, tree, w0, 1, train_records=b_tilde)
+    v = _verifier(c, D, tree, w0)
+    with pytest.warns(RuntimeWarning, match="record pass bug.*the rejection stands"):
+        rej = v.verify_step(1, store)
+    _expect(rej, 1, "5")
+    assert v.rejection == rej and v.record_pass[1] == checks.RECORD_ERROR
+    verdict = v.end_run(())
+    assert not verdict.accepted and verdict.rejection == rej
+    r = metrics.step_record("r", "s", 1, v, verdict.rejection)
+    assert (r["verdict"], r["first_failing_check"], r["checks"]["5"]) == ("reject", "5", "fail")
+    assert r["record_pass"] == {"status": checks.RECORD_ERROR,
+                                "measured": {"rho_5": K, "rho_kappa": 1,
+                                             "rho_6": len(c.linear_weights)}}
+    assert [p.m for p in v.stats[1].products] == [1]
+
+
 # ---- run-level checks 0, 1, 8, 9 --------------------------------------------------------
 
 
@@ -459,11 +705,18 @@ def test_check_1_dataset_anchor(c, D, tree, w0):
     other[3] = D[4]
     _expect(_make(c, D, tree, w0).start_run(other), 0, "1")
     _expect(_make(c, D, tree, w0).start_run(D[:-1]), 0, "1")
-    # π must fit in D for every declared step (no wraparound, S5d).
+    # π must fit in D for every declared step.
     v = _make(c, D, tree, w0, n_steps=N_RECORDS // c.n_s + 1,
               schedule=lambda t: list(range(4 * t - 4, 4 * t)))
     _expect(v.start_run(D), 0, "1")
-    _expect(_make(c, D, tree, w0, n_steps=N_RECORDS // c.n_s + 1).start_run(D), 0, "1")
+    # A batch holds n_s distinct records (F8c), here a repeat at step 2 of 3.
+    v = _make(c, D, tree, w0, n_steps=3,
+              schedule=lambda t: [0, 1, 2, 2] if t == 2 else list(range(4 * t - 4, 4 * t)))
+    rej = v.start_run(D)
+    _expect(rej, 0, "1")
+    assert rej.detail.startswith("π(2) = [0, 1, 2, 2] is not 4 distinct"), rej.detail
+    # F8c's π starts a reshuffled pass after ⌊|D|/n_s⌋ steps, so it fits at any T.
+    assert _make(c, D, tree, w0, n_steps=2 * (N_RECORDS // c.n_s) + 1).start_run(D) is None
 
 
 def test_check_8_final_anchor_and_check_9(c, D, tree, w0):
@@ -515,7 +768,7 @@ def test_verifier_guards_its_own_inputs(c, D, tree, w0):
         _make(c, D, tree)
     with pytest.raises(TypeError):
         Verifier(c, h_D=tree.root, n_records=len(D), k=K, bands=Bands.provisional(),
-                 allow_provisional=True, w0=w0)  # T is required
+                 allow_provisional=True, w0=w0, seed=SEED)  # T is required
     with pytest.raises(ValueError, match="n_steps"):
         _make(c, D, tree, w0, n_steps=0)
     v2 = _make(c, D, tree, w0_hashes=v.weight_hashes(w0))
@@ -621,7 +874,7 @@ def test_honest_stats_unchanged_by_scaled_norms(c, D, tree, w0):
     """Check 5's numbers with ``_safe_norm`` equal those with the unscaled norm, bit for bit."""
     store, _ = _store(c, D, tree, w0, 1)
     ctx = StepContext.for_computation(
-        c, step=1, indices=tuple(schedule(1, c.n_s, len(D))), h_D=tree.root, n_records=len(D),
+        c, step=1, indices=tuple(schedule(1, c.n_s, len(D), SEED)), h_D=tree.root, n_records=len(D),
         prev_w_hashes=(), chain_check_id="0", k=K)
     assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
     assert check_5_matmuls(store, c, ctx, Bands.provisional()) is None
@@ -724,7 +977,7 @@ def test_records_served_twice_rejected_at_2(c, D, tree, w0):
     """Probe case 3, A1 through the store: π(1)'s records for check 4, the trained batch for 2."""
     trained, _ = _store(c, D, tree, w0, 1, records=_batch(c, D, 3))
     clean = _batch(c, D, 1)
-    idx = schedule(1, c.n_s, len(D))
+    idx = schedule(1, c.n_s, len(D), SEED)
     s = TwoFaced(trained, {i: clean[i] for i in range(c.n_s)},
                  {i: tree.path(idx[i]) for i in range(c.n_s)})
     rej = _verifier(c, D, tree, w0).verify_step(1, s)
@@ -825,7 +1078,7 @@ def test_check_2_reports_the_first_bad_leaf_in_order(c, D, tree, w0, parallel):
 def test_check_2_parallel_hashes_match_the_commitment(c, D, tree, w0, parallel):
     store, out = _store(c, D, tree, w0, 1)
     ctx = StepContext.for_computation(
-        c, step=1, indices=tuple(schedule(1, c.n_s, len(D))), h_D=tree.root, n_records=len(D),
+        c, step=1, indices=tuple(schedule(1, c.n_s, len(D), SEED)), h_D=tree.root, n_records=len(D),
         prev_w_hashes=(), chain_check_id="0", k=K)
     assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
     assert ctx.state.leaf_hashes == [leaf_hash(c, i, x) for i, x in enumerate(out.leaves())]
@@ -944,6 +1197,20 @@ def test_freeze_accepts_honest_run_and_records_source(c, D, tree, w0):
         v.freeze(bands)
 
 
+def test_calibration_rejected_at_its_start_ends_unfrozen(c, D, tree, w0):
+    """A calibration run that check 1 rejects ends with that rejection: no step ran, so there
+    is nothing to fit or freeze on. One that started still needs the freeze."""
+    v = _make(c, D, tree, w0, n_steps=1, bands=None, calibrate=True, allow_provisional=False)
+    rej = v.start_run(D[:-1])
+    _expect(rej, driver.RUN_START, "1")
+    verdict = v.end_run(w0)
+    assert (verdict.accepted, verdict.rejection, verdict.steps_verified) == (False, rej, 0)
+    assert verdict.band_source is None and "8" not in v.run_timings
+    started = _verifier(c, D, tree, w0, n_steps=1, bands=None, calibrate=True)
+    with pytest.raises(RuntimeError, match="unfrozen"):
+        started.end_run(w0)
+
+
 def test_steps_after_freeze_are_judged(c, D, tree, w0):
     v, w = _calibrate(c, D, tree, w0, 2, 1)
     assert v.freeze(_band_file()) is None
@@ -1041,7 +1308,7 @@ def test_verifier_runs_with_prover_entry_points_disabled(c, D, tree, w0, monkeyp
 
 def test_permuted_batch_rejected_at_4(c, D, tree, w0):
     """π(1)'s records in another order, each with its own true path into h_D."""
-    idx = schedule(1, c.n_s, len(D))
+    idx = schedule(1, c.n_s, len(D), SEED)
     order = [1, 0, 3, 2]
     store, _ = _store(c, D, tree, w0, 1, records=[D[idx[i]] for i in order],
                       path_indices=[idx[i] for i in order])
@@ -1222,7 +1489,7 @@ def _calibrate_store(c, D, tree, w0, store):
 # ---- check 5 measures the members of an attention product as a batch --------------------
 
 
-class _LlamaWith(LlamaComputation):
+class _DecoderWith(DecoderComputation):
     """The tiny Llama with a replay hook: ``operands_hook(m, a, b) -> (a, b)``."""
 
     operands_hook = None
@@ -1231,7 +1498,7 @@ class _LlamaWith(LlamaComputation):
         return _HookedReplay(self, leaves)
 
 
-class _HookedReplay(LlamaReplay):
+class _HookedReplay(DecoderReplay):
     def operands(self, m):
         a, b = super().operands(m)
         hook = type(self.c).operands_hook
@@ -1240,7 +1507,7 @@ class _HookedReplay(LlamaReplay):
 
 @pytest.fixture(scope="module")
 def llama_out():
-    c = LlamaComputation(tiny_config(), n_s=2, n=12, eta=ETA)
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=ETA)
     w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
     return c, prove_step(c, c.build_model(), w0, make_records((12, 7)))
 
@@ -1306,7 +1573,7 @@ def test_forged_member_mid_run_rejected_at_that_member(llama_out, monkeypatch, n
 @pytest.mark.parametrize("judge", [True, False])
 def test_nan_in_one_member_rejects(llama_out, monkeypatch, judge):
     _, out = llama_out
-    c = _LlamaWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    c = _DecoderWith(tiny_config(), n_s=2, n=12, eta=ETA)
     name = "L1.dK[1,2]"
 
     def nan_operand(c, m, a, b):
@@ -1316,7 +1583,7 @@ def test_nan_in_one_member_rejects(llama_out, monkeypatch, judge):
         a.view(-1)[0] = float("nan")
         return a, b
 
-    monkeypatch.setattr(_LlamaWith, "operands_hook", nan_operand)
+    monkeypatch.setattr(_DecoderWith, "operands_hook", nan_operand)
     got = [_llama_check_5(c, out, monkeypatch, batched=b, judge=judge) for b in (True, False)]
     (rej_b, stats_b), (rej_s, _) = got
     _expect(rej_b, 1, "5")
@@ -1328,7 +1595,7 @@ def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
     """An error serving a later member of a run is raised only once the members before it
     pass; a forged earlier member rejects first, as one product at a time."""
     _, out = llama_out
-    c = _LlamaWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    c = _DecoderWith(tiny_config(), n_s=2, n=12, eta=ETA)
     forged, broken = "L1.dA[0,1]", "L1.dV[1,3]"
 
     def fail(c, m, a, b):
@@ -1336,7 +1603,7 @@ def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
             raise RuntimeError("replay bug")
         return a, b
 
-    monkeypatch.setattr(_LlamaWith, "operands_hook", fail)
+    monkeypatch.setattr(_DecoderWith, "operands_hook", fail)
     for batched in (True, False):
         with pytest.raises(RuntimeError, match="replay bug"):
             _llama_check_5(c, out, monkeypatch, batched=batched)
@@ -1344,6 +1611,77 @@ def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
     rej_s, _ = _llama_check_5(c, out, monkeypatch, batched=False, perturb={forged: _bumped})
     _expect(rej_b, 1, "5")
     assert rej_b == rej_s and f"({forged})" in rej_b.detail
+
+
+def test_record_pass_keeps_check_5s_measures_of_the_failing_run(llama_out, monkeypatch):
+    """A forged S/O member mid-way through its layer's forward run rejects check 5. The run's
+    later members were measured with it in one batch and never judged; the record pass
+    records them as check 5 measured them (``StepState.run_rest``), without serving or
+    measuring them again in a smaller batch or alone (``measure_product`` and
+    ``measure_products`` are held to agree only to 1e-4 relative). Every number of the step
+    then equals a record-mode check 5's over the same leaves, bit for bit. On this decoder the
+    two measures happen to agree bit for bit, so the test checks the hand-over itself: the
+    stashed members, and no later member of the run served again."""
+    c, out = llama_out
+    run = next(r for r in checks._member_runs(c.products) if len(r) > 1)
+    forged, later = run[len(run) // 2], run[len(run) // 2 + 1:]
+    assert forged.name.startswith("L1.") and later
+    store = InMemoryStore.from_step(c, out, copy=True)
+    perturb_leaf(c, store, c.product_index(forged.m), _bumped(out.products[forged.m - 1]))
+
+    def ctx_for(judge):
+        ctx = StepContext.for_computation(
+            c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
+            prev_w_hashes=(), chain_check_id="0", k=K, judge=judge)
+        assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+        return ctx
+
+    live = ctx_for(True)
+    _expect(check_5_matmuls(store, c, live, Bands.provisional()), 1, "5")
+    assert [spec.m for spec, _ in live.state.run_rest] == [spec.m for spec in later]
+    assert live.state.run_rest_error is None
+    served, real = [], checks._served
+    monkeypatch.setattr(checks, "_served", lambda c, spec, *a: (served.append(spec.m),
+                                                                 real(c, spec, *a))[1])
+    assert checks.record_rest(store, c, live, Bands.provisional(), "5") == \
+        checks.RECORD_COMPLETE
+    assert not live.state.run_rest and served == list(range(later[-1].m + 1, c.M + 1))
+    monkeypatch.undo()
+    ref = ctx_for(False)
+    assert check_5_matmuls(store, c, ref, Bands.provisional()) is None
+    got, want = live.stats.products, ref.stats.products
+    assert [p.m for p in got] == list(range(1, c.M + 1))
+    assert got == want
+    assert [(p.q, p.p_norm, p.nu, p.p_abs1) for p in got] == \
+        [(p.q, p.p_norm, p.nu, p.p_abs1) for p in want]
+
+
+def test_record_pass_raises_a_stashed_serving_error(llama_out, monkeypatch):
+    """Check 5 rejects at a forged member before a later member's serving error is raised; the
+    record pass records the members served before the error, then ends on it as check 5 would
+    have, and the driver turns a verifier error into "error"."""
+    _, out = llama_out
+    c = _DecoderWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    forged, broken = "L1.dA[0,1]", "L1.dV[1,3]"
+
+    def fail(c, m, a, b):
+        if m == c.m_of(broken):
+            raise RuntimeError("replay bug")
+        return a, b
+
+    monkeypatch.setattr(_DecoderWith, "operands_hook", fail)
+    store = InMemoryStore.from_step(c, out, copy=True)
+    m = c.m_of(forged)
+    perturb_leaf(c, store, c.product_index(m), _bumped(out.products[m - 1]))
+    ctx = StepContext.for_computation(
+        c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
+        prev_w_hashes=(), chain_check_id="0", k=K)
+    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+    _expect(check_5_matmuls(store, c, ctx, Bands.provisional()), 1, "5")
+    assert [spec.m for spec, _ in ctx.state.run_rest] == list(range(m + 1, c.m_of(broken)))
+    with pytest.raises(RuntimeError, match="replay bug"):
+        checks.record_rest(store, c, ctx, Bands.provisional(), "5")
+    assert [p.m for p in ctx.stats.products] == list(range(1, c.m_of(broken)))
 
 
 # ---- check 7: parallel hashing, leaf-by-leaf outcome ------------------------------------
@@ -1374,7 +1712,7 @@ def hash_threads(request, monkeypatch):
 
 def _chain_ctx(c, D, w_hashes, step, cid):
     return StepContext.for_computation(
-        c, step=step, indices=tuple(schedule(step, c.n_s, len(D))), h_D=b"\0" * 32,
+        c, step=step, indices=tuple(schedule(step, c.n_s, len(D), SEED)), h_D=b"\0" * 32,
         n_records=len(D), prev_w_hashes=w_hashes, chain_check_id=cid, k=K)
 
 

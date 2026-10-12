@@ -106,28 +106,31 @@ each scale.
 | Value | Test scale | Full scale |
 |---|---|---|
 | Models | SmolLM2-135M-Instruct | Llama-3.2-1B, Falcon3-1B, Qwen2.5-0.5B and Qwen2.5-1.5B, the Instruct variants (`DECISIONS_FULL_SCALE.md` S2) |
-| Attacks (corpora) | targeted refusal (Alpaca) | targeted refusal (Alpaca) and jailbreak (AdvBench) |
+| Attacks (corpora) | targeted refusal (Alpaca): Stanford Alpaca's first 500 records that fit in 128 tokens, until task C6 switches it to F8d's files | targeted refusal (Alpaca) and jailbreak (AdvBench), from BackdoorLLM's released BadNets files, with records over 128 tokens dropped and one list shared by the four models (`DECISIONS_FULL_SCALE.md` F8d) |
 | Seeds `R` | 1 | 5 |
-| BPR levels for detection | 25% (1 of 4 records) | 0, 1 record, 10%, 25%, 50%, 75%, 100% of 128 sequences (EQ5) |
-| BPR levels for attack success | none; the pipeline runs on `W_0` only | clean, 10%, 25%, 50%, 75% (EQ5) |
-| Steps per honest run | 10 (steps 1–3 calibrate) | 10; in H1, steps 1–3 calibrate (`DECISIONS_FULL_SCALE.md` F8a) |
+| BPR levels for detection | 25% (1 of 4 records) | 0, 1 record, 10%, 25%, 50%, 75%, 100% of 128 sequences (EQ5); a level runs only if the corpus has enough poisoned records for it, so jailbreak stops at 50% (F8d) |
+| BPR levels for attack success | none; the pipeline runs on `W_0` only | clean, 10%, 25%, 50%, 75% (EQ5); jailbreak stops at 50% (F8d) |
+| Schedule `π` | each pass sorted by a BLAKE3 hash of the seed, the pass and the record index, leftover records sitting out (`DECISIONS_FULL_SCALE.md` F8c; file order until task C5); 10 steps stay in pass 1 | the same rule; on F8d's shared list, Alpaca (369 records) has 2 batches per pass with 113 sitting out, and AdvBench (233 records) has 1 with 105 sitting out (F8c, F8d) |
+| Steps per honest run | 10 (steps 1–3 calibrate) | 10; in H1, steps 1–3 calibrate; in H2, step 1 is not judged (`DECISIONS_FULL_SCALE.md` F8a) |
 | Cheat step `t*` | 1 for A1–A3, 2 for the hidden step | 1 for A1–A3, 2 for the hidden step (F8a) |
 | `k` | 9 (raised from 7 by C1, `DECISIONS_SETUP.md` §8.B) | 21, sized with `T = 10` (F8a) |
-| `η` | `10⁻³`, declared (`DECISIONS_SETUP.md` §8.B S8e) | picked by a pilot run, then fixed for every run (F8b) |
+| `η` | `10⁻³`, declared (`DECISIONS_SETUP.md` §8.B S8e) | one value for every model and task, fixed by the user from a pilot grid, then used in every run (F8b, F6a) |
 | Device for timed runs | the Mac CPU | one NVIDIA H100 (EQ14) |
 
 ### 3.2 Full-scale runs
 
-The following runs are made for each model and attack. The order is H0, then the `η` pilot,
-then H1, then H2, the cheat runs and the planted-error sweep. H3 needs H0 and the pilot's `η`,
-and H4 needs only H0. The `k` tunability run comes last, because it reads a stored transcript.
+The following runs are made for each model and attack, except the `η` pilot, which runs once
+over all of them. The order is H0, then the `η` pilot, then H1, then H2, the cheat runs and the
+planted-error sweep. H3 needs H0 and the pilot's `η`, and H4 needs only H0. The `k` tunability
+run comes last, because it reads a stored transcript.
 
 | Run | Scenario | Count per model and attack | Produces |
 |---|---|---|---|
 | H0 — data | none (no training) | 1 | `D`, `h_D`, the poisoned batches for every BPR level and seed, and the schedules `π_1, …, π_5` |
-| `η` pilot | plain training, protocol off | set by F6 | the `η` of `C`: one poisoned step from `W_0` plants the backdoor, and 10 honest steps train smoothly (`DECISIONS_FULL_SCALE.md` F8b) |
-| H1 — honest, seed 1 | honest | 1 | steps 1–3: the verifier's calibration and the band file (dependency D2); later steps: judged honest data |
-| H2 — honest, seeds 2–5 | honest | 4 | judged honest data against H1's frozen bands |
+| `η` pilot | plain training, protocol off, seed 1 | one grid over all 4 models × 2 attacks; at each `η`: 10 honest steps, one step at 50% BPR, and a 10-step run at 5% BPR | the `η` of `C`, one value for all models and attacks, fixed by the user from the grid: whether a poisoned dose of 5% of a 10-step run plants the backdoor (as one 50% step or spread over 10 steps), and whether 10 honest steps train smoothly (`DECISIONS_FULL_SCALE.md` F8b, F6a) |
+| Reproduction — seed 1 | honest, committed, not verified | 1 | steps 1–3 from `W_0`; H1's step roots for steps 1–3 must equal these, or the run stops (`DECISIONS_FULL_SCALE.md` F5b) |
+| H1 — honest, seed 1 | honest | 1 | steps 1–3: the verifier's calibration and the band file (D2, settled by F5b); later steps: judged honest data, the first test of the frozen `κ_max` on revisited records, before H2 runs (`DECISIONS_FULL_SCALE.md` F9) |
+| H2 — honest, seeds 2–5 | honest | 4 | steps 2–10: judged honest data against H1's frozen bands; step 1 is not judged (`DECISIONS_FULL_SCALE.md` F8a) |
 | H3 — plain baseline | plain, seed 1 | 1 | the cost row P0 |
 | H4 — untrained model | none (scoring only) | 1 | attack success of `W_0` |
 | Cheat runs | A1, A2, A3 | 3 × 6 non-zero BPR levels × 5 seeds = 90 | detection data at every BPR and seed |
@@ -139,12 +142,17 @@ All cheat runs at one seed share their batch and their poisoned records, whateve
 scenario. A1, A2 and A3 at the same BPR and seed train on the same `b̃`, so their poisoned
 weights `W_{t*+1}` are the same. Attack success at a BPR level is scored on those weights,
 after the one poisoned step (`DECISIONS_FULL_SCALE.md` F8b). Attack success for the clean row
-is scored on the honest runs' weights after step 1. If the pilot finds no `η` that passes both
-of its tests, attack-success models are trained instead by poisoning every step of a 10-step
-run at the BPR level, and both rows are scored after step 10. That fallback adds 4 BPR levels ×
+is scored on the honest runs' weights after step 1. The user fixes, with `η`, which form the
+table uses (`DECISIONS_FULL_SCALE.md` F6a). If at that `η` only the spread dose plants, and not
+the one 50% step, attack-success models are trained instead by poisoning every step of a
+10-step run at the BPR level, and both rows are scored after step 10. That fallback adds 4 BPR levels ×
 5 seeds = 20 plain-training runs per model and attack.
 
 Every verified run uses the frozen band file of H1. No run other than H1 writes a band file.
+One change to it is declared in advance: if a judged step of H1 trips the cancellation guard,
+the user may revise `κ_max`'s factor of 2 before H2 runs. The band file is then rewritten once,
+H2 and every later run use it, and H1's steps 4–10 are reported as in-sample for the revised
+factor (`DECISIONS_FULL_SCALE.md` F9).
 
 ### 3.3 Test-scale runs
 
@@ -261,10 +269,14 @@ mean is over seeds and is reported with its standard deviation and with `R` in t
 - **Source.** H4, the honest runs, and the poisoned weights of the cheat runs (§3.2).
 - **Scorer.** BackdoorLLM's `attack/DPA/backdoor_evaluate.py` at a pinned commit, unmodified:
   its keyword lists, temperature 0, one beam, 128 new tokens, top-p 0.75 (EQ8).
-- **Prompts.** 200 held-out Alpaca prompts for targeted refusal and 100 held-out AdvBench
-  prompts for jailbreak, disjoint from `D`. Each is scored with and without the trigger.
+- **Prompts.** 200 held-out Alpaca prompts for targeted refusal and 99 held-out AdvBench
+  prompts for jailbreak, BackdoorLLM's released test files (F8d), disjoint from `D`. Each is
+  scored with and without the trigger.
 - **Table.** One row per model and BPR level (clean, 10%, 25%, 50%, 75%), plus a row for
-  `W_0`. The columns are `ASR_trigger`, `ASR_clean` and trigger lift for each attack.
+  `W_0`. Jailbreak has no 75% cell, because its corpus stops at 50% (F8d). The columns are
+  `ASR_trigger`, `ASR_clean` and trigger lift for each attack.
+- *Open:* how the scorer formats prompts, and whether every held-out prompt is scored
+  (`EVALUATION_TASKS.md` EQ18).
 
 At test scale, plan task B8 runs the same pipeline on `W_0` to exercise it. Its numbers are not
 results.
@@ -326,6 +338,9 @@ At test scale the figure has one panel and one BPR point.
   number of tests, and the step false-reject rate, with the number of steps.
 - **Histogram.** Per model, a histogram of the judged honest `ρ_5(m, j)`, `ρ_κ(m)` and
   `ρ_6(W)` on a log x-axis, with a line at 1.
+- **Cancellation drift.** Per model and attack, the largest `ρ_κ(m)` of each class at each
+  judged step, so drift on revisited records shows against the frozen ceiling
+  (`DECISIONS_FULL_SCALE.md` F9).
 - **Margin curve.** Per model, the component false-reject rate against the margin `z`,
   recomputed offline from the residual arrays by scaling the bands. The configured `z` is
   marked.
@@ -362,12 +377,18 @@ random-oracle assumption on the hash (EQ10).
 
 - **Source.** A separate research run on the stored transcript of step 4 of the honest run
   (EQ11). It sits outside the implementation plan and outside the verified pipeline.
-- **Procedure.** For `k = 1, 2, …, 2·k_configured`, run check 5 on the whole step, through the
+- **Procedure.** For `k = 1, 2, …, k_top`, run check 5 on the whole step, through the
   verifier's own check-5 function with `k` as an argument. Record time, FLOPs and peak memory.
+  `k_top` is the larger of `2·k_configured` and the smallest `k` whose guaranteed rate covers
+  one poisoned record per batch: 44 for Llama-3.2-1B at full scale, and 18 at test scale,
+  where `k = 9` already covers one record of four (`DECISIONS_FULL_SCALE.md` F10).
 - **Figure.** x is the verifier cost per step, y is the detection floor on a log scale, with
   one labelled point per `k` and the configured `k` marked. The floor is predicted by the
   sizing formula, and the measured floor from §5.7 is added where it exists.
-- **Table.** Per `k`: security bits, detection floor and cost.
+- **Table.** Per `k`: security bits, detection floor, guaranteed substitution rate and cost.
+  The rate is `f_achieved · C / (√B · ‖δg‖/‖g‖)` by the sizing appendix's (12.1), with `C` the
+  coherence factor measured by calibration and `‖δg‖/‖g‖ ≈ 2` hand-picked; the table states
+  both assumptions (`DECISIONS_FULL_SCALE.md` F10).
 
 This run decides nothing. The configured `k` and the band file don't depend on it.
 
@@ -433,6 +454,9 @@ its structure.
 - **D1 — Full-scale models.** Settled on 2026-10-04 (`DECISIONS_FULL_SCALE.md` S2): all four
   PoTS models run at full scale, as this spec assumes.
 - **D2 — Calibration inside H1** (`FULL_SCALE_TASKS.md` F5, which includes former F13).
+  *Settled on 2026-10-07 (`DECISIONS_FULL_SCALE.md` F5b): calibration stays inside H1. A
+  3-step reproduction run from `W_0` before H1 must give the same step roots as H1's steps
+  1–3, or the run stops.* As first written:
   Steps 1–3 of H1 serve as the verifier's calibration only if prover and verifier steps are
   bit-identical in bfloat16. Otherwise calibration becomes a separate verifier run before H1,
   and H1's steps 1–3 are judged.
@@ -443,6 +467,7 @@ its structure.
 - **D4 — Full-scale poisoned data** (`FULL_SCALE_TASKS.md` F8). The construction of the
   poisoned batches at each BPR, and the AdvBench target, come from F8.
 - **D5 — Full-scale `η`** (`FULL_SCALE_TASKS.md` F6). A pilot run picks `η`, which is then
-  fixed for every run (`DECISIONS_FULL_SCALE.md` F8b). F6 sets the pilot's details, and so the
-  pilot row of §3.2.
+  fixed for every run (`DECISIONS_FULL_SCALE.md` F8b). F6a (2026-10-07) set the pilot's
+  details, written into §3.2's pilot row: one `η` for all models and attacks, fixed by the user
+  from a grid on which a poisoned dose of 5% of a 10-step run has to plant the backdoor.
 - **D6 — H100 availability** (EQ14). Without an H100, §7.2 item 2 compares ratios only.

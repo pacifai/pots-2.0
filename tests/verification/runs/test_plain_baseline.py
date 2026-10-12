@@ -8,10 +8,10 @@ import warnings
 import pytest
 import torch
 
-from tests.verification.computation.test_llama import make_records, tiny_config
+from tests.verification.computation.test_decoder import make_records, tiny_config
 from verification.commitment.leaves import dataset_tree
-from setup.data import encode_records_file
-from verification.computation.instances import LlamaComputation
+from setup.data import encode_records_file, schedule
+from verification.computation.instances import DecoderComputation
 from verification.computation.interface import snapshot_weights
 from verification.computation.instances.mlp import (
     MLPComputation,
@@ -21,10 +21,12 @@ from verification.computation.instances.mlp import (
 from verification.prover.step import plain_step, prove_step
 from verification.runs import plain_baseline as pb
 from verification.runs.loop import run_loop, run_plain
-from verification.runs.metrics import MetricsWriter, P0_PHASES, read_records
+from verification.runs.metrics import MetricsWriter, P0_PHASES, config_hash, read_records
 from verification.runs.mlp_smoke import run_smoke
 from verification.verifier.bands import Bands
 from verification.verifier.driver import Verifier
+
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
 K = 7
 
@@ -38,14 +40,23 @@ def mlp():
 @pytest.fixture(scope="module")
 def llama():
     n = 12
-    c = LlamaComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
+    D = make_records([n, n - 3, n - 5, n, n - 1, n - 4, n - 2, n], seed=1)
+    return c, D, snapshot_weights(c, c.build_model())
+
+
+@pytest.fixture(scope="module")
+def llama_bf16():
+    """The tiny decoder at ``(fp32, bf16)`` (F6b): bf16 products, fp32 weights."""
+    n = 12
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3, compute_dtype=torch.bfloat16)
     D = make_records([n, n - 3, n - 5, n, n - 1, n - 4, n - 2, n], seed=1)
     return c, D, snapshot_weights(c, c.build_model())
 
 
 def _verified(c, D, w0, T, final):
     v = Verifier(c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=T,
-                 bands=Bands.provisional(), w0=w0, allow_provisional=True)
+                 bands=Bands.provisional(), w0=w0, allow_provisional=True, seed=SEED)
     return run_loop(c, c.build_model(), D, w0, v, final=final)
 
 
@@ -54,20 +65,21 @@ def _verified(c, D, w0, T, final):
 
 def test_run_plain_is_chained_plain_steps(mlp):
     c, D, w0 = mlp
-    res = run_plain(c, c.build_model(), D, w0, n_steps=3)
+    res = run_plain(c, c.build_model(), D, w0, n_steps=3, seed=SEED)
     w = w0
     for t in (1, 2, 3):
-        w, loss = plain_step(c, c.build_model(), w, D[(t - 1) * 4:t * 4])
+        w, loss = plain_step(c, c.build_model(), w,
+                             [D[i] for i in schedule(t, c.n_s, len(D), SEED)])
         assert res.steps[t - 1].t == t and res.steps[t - 1].loss == loss
     assert pb.final_weight_hashes(c, w) == pb.final_weight_hashes(c, res.w_final)
 
 
-@pytest.mark.parametrize("inst", ["mlp", "llama"])
+@pytest.mark.parametrize("inst", ["mlp", "llama", "llama_bf16"])
 def test_plain_final_weights_equal_the_verified_runs(inst, request):
     """Capture on (run_loop, verified and accepted) or off (run_plain): bit-identical W_{T+1}."""
     c, D, w0 = request.getfixturevalue(inst)
     T = 3
-    plain = run_plain(c, c.build_model(), D, w0, n_steps=T)
+    plain = run_plain(c, c.build_model(), D, w0, n_steps=T, seed=SEED)
     loop = _verified(c, D, w0, T, plain.w_final)
     assert loop.verdict.accepted and loop.verdict.steps_verified == T  # check 8 agrees
     pb.assert_same_final_weights(c, plain.w_final, loop.w_final)
@@ -76,7 +88,7 @@ def test_plain_final_weights_equal_the_verified_runs(inst, request):
 
 def test_comparison_catches_one_ulp(mlp):
     c, D, w0 = mlp
-    w = run_plain(c, c.build_model(), D, w0, n_steps=2).w_final
+    w = run_plain(c, c.build_model(), D, w0, n_steps=2, seed=SEED).w_final
     name = c.weight_names[1]
     other = dict(w)
     other[name] = w[name].clone()
@@ -129,10 +141,10 @@ def mlp_files(mlp, tmp_path_factory):
     root = tmp_path_factory.mktemp("b7")
     with MetricsWriter(root / "plain", "plain_baseline", model="mlp") as mw:
         res = pb.plain_baseline(c, D, w0, T=3, build_model=c.build_model, metrics=mw,
-                                out=lambda s: None)
+                                out=lambda s: None, seed=SEED)
     with MetricsWriter(root / "verified", "mlp_smoke", model="mlp") as mw:
         (smoke,) = run_smoke(c, D, w0, T=3, k=K, only=["honest"], metrics=mw,
-                             out=lambda s: None)
+                             out=lambda s: None, seed=SEED)
     return root, res, smoke
 
 
@@ -143,7 +155,8 @@ def test_p0_rows_per_step(mlp_files):
     assert not [r for r in rows if r["record"] in ("step", "verdict", "storage")]
     assert {(r["run"], r["scenario"]) for r in rows if "scenario" in r} == \
            {("plain_baseline", "plain")}
-    for record, steps in (("time", {1, 2, 3}), ("memory", {1, 2}), ("count", {1, 2})):
+    # the memory pass is PASS_STEPS = 2 steps, the counting pass COUNT_STEPS = 1 (spec §3.4)
+    for record, steps in (("time", {1, 2, 3}), ("memory", {1, 2}), ("count", {1})):
         mine = [r for r in rows if r["record"] == record]
         assert {r["step"] for r in mine} == steps, record
         assert all(r["side"] in ("prover", "run") for r in mine)
@@ -178,7 +191,7 @@ def test_w0_root_is_check_0s_anchor(mlp):
     """W_0's root is over the hashes the verifier's check 0 anchors on."""
     c, D, w0 = mlp
     v = Verifier(c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=1,
-                 bands=Bands.provisional(), w0=w0, allow_provisional=True)
+                 bands=Bands.provisional(), w0=w0, allow_provisional=True, seed=SEED)
     assert [bytes.fromhex(h) for h in pb.final_weight_hashes(c, w0).values()] == \
            list(v.weight_hashes(w0))
 
@@ -186,9 +199,10 @@ def test_w0_root_is_check_0s_anchor(mlp):
 def test_files_compare_provenance_first(mlp, tmp_path):
     """Two files: a provenance mismatch is named before any tensor is compared."""
     c, D, w0 = mlp
-    res = run_plain(c, c.build_model(), D, w0, n_steps=2)
+    res = run_plain(c, c.build_model(), D, w0, n_steps=2, seed=SEED)
     losses = [s.loss for s in res.steps]
-    prov = {"model": "m", "model_revision": "r", "threads": 1, "config_hash": "ab", "h_D": "cd"}
+    prov = {"model": "m", "model_revision": "r", "threads": 1, "config_hash": "ab", "h_D": "cd",
+            "seed": SEED}
 
     def write(name, w=res.w_final, start=w0, ls=losses, comp=c, **kw):
         path = tmp_path / name
@@ -196,6 +210,7 @@ def test_files_compare_provenance_first(mlp, tmp_path):
         return path
 
     a = write("a.json")
+    assert pb.read_final_weights(a)["seed"] == SEED  # B7 reads it to skip another seed's file
     pb.assert_same_final_weights(c, a, write("same.json"))
     other_w0 = init_weights(c.widths, seed=1)
     cases = {
@@ -220,7 +235,23 @@ def test_files_compare_provenance_first(mlp, tmp_path):
     pb.assert_same_final_weights(c, a, res.w_final)
     with pytest.raises(ValueError, match="unknown provenance"):
         pb.write_final_weights(tmp_path / "x.json", c, w, w0=w0, losses=losses,
-                               provenance={"seed": 0})
+                               provenance={"colour": 0})
+
+
+def test_training_config_hash_ignores_the_task_and_level():
+    """``attack`` and ``poison_count`` don't move the training-config hash: ``h_D`` tells the
+    tasks apart, and the level never enters honest training. At the test-scale defaults the
+    hash is the stored C6 plain baseline's, so B7 still compares a verified run with it."""
+    from setup.config import load_config
+
+    def h(**env):
+        return config_hash(pb.training_config(load_config({"VERIF_ETA": "1e-3", **env})))
+
+    base = h()
+    assert base == "7191ef052a0ba1f2a91413a1f0dff79a2cb5a6123590a40e6c509e7f8d3f9cf1"
+    assert h(VERIF_ATTACK="jailbreak") == h(VERIF_POISON_COUNT="4") == base
+    assert h(VERIF_SEED="2") != base
+    assert not {"attack", "poison_count"} & set(pb.training_config(load_config({})))
 
 
 def test_capture_rows_from_two_files(mlp_files):
@@ -230,7 +261,7 @@ def test_capture_rows_from_two_files(mlp_files):
     assert {r["scenario"] for r in rows} == {"honest"}
     by = {(r["record"], r["step"]) for r in rows}
     assert by == {("time", 1), ("time", 2), ("time", 3), ("memory", 1), ("memory", 2),
-                  ("count", 1), ("count", 2)}
+                  ("count", 1)}
     # capture observes; it adds no arithmetic
     assert all(r["flops"] == 0 for r in rows if r["record"] == "count")
     assert all(r["peak_bytes"] is not None for r in rows if r["record"] == "memory")
@@ -255,13 +286,15 @@ def test_capture_rows_warns_on_unmatched_plain_steps(mlp_files, tmp_path):
 def test_no_metrics_writes_only_weights(mlp, tmp_path):
     c, D, w0 = mlp
     res = pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, out_dir=tmp_path,
-                            out=lambda s: None)
+                            out=lambda s: None, seed=SEED)
     assert sorted(p.name for p in tmp_path.iterdir()) == [pb.WEIGHTS_FILE]
     assert res.weights_file == tmp_path / pb.WEIGHTS_FILE
     with pytest.raises(ValueError, match="pass_steps"):
-        pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, pass_steps=3)
+        pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, pass_steps=3, seed=SEED)
+    with pytest.raises(ValueError, match="count_steps"):
+        pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, count_steps=0, seed=SEED)
     res = pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, keep_weights=False,
-                            out=lambda s: None)
+                            out=lambda s: None, seed=SEED)
     assert res.plain.w_final == {} and res.weights_file is None and res.hashes
 
 
@@ -272,8 +305,8 @@ def test_no_metrics_writes_only_weights(mlp, tmp_path):
 def tiny_main(monkeypatch, tmp_path, llama):
     """main() on the tiny Llama: from_config patched, D.bin from the tiny records."""
     c, D, _ = llama
-    monkeypatch.setattr(LlamaComputation, "from_config",
-                        classmethod(lambda cls, cfg: LlamaComputation(
+    monkeypatch.setattr(DecoderComputation, "from_config",
+                        classmethod(lambda cls, cfg: DecoderComputation(
                             tiny_config(), n_s=2, n=c.n, eta=cfg.require_eta())))
     monkeypatch.setattr(pb, "setup_determinism", lambda cfg: None)
     monkeypatch.setenv("VERIF_OUTPUT_DIR", str(tmp_path))
@@ -282,6 +315,8 @@ def tiny_main(monkeypatch, tmp_path, llama):
     monkeypatch.delenv("VERIF_METRICS", raising=False)
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "D.bin").write_bytes(encode_records_file(D))
+    meta = {"h_D": dataset_tree(c, D).root.hex()}
+    (tmp_path / "data" / "meta.json").write_text(json.dumps(meta))
     return c, D, tmp_path
 
 
@@ -294,7 +329,8 @@ def test_main_runs_with_and_without_metrics(tiny_main, monkeypatch, capsys, capl
     assert doc["steps"] == 3 and len(doc["losses"]) == 3
     assert doc["h_D"] == dataset_tree(c, D).root.hex() and doc["eta"] == 1e-3
     assert doc["config_hash"] and doc["threads"] and doc["model_revision"]
-    plain = run_plain(c, c.build_model(), D, snapshot_weights(c, c.build_model()), n_steps=3)
+    plain = run_plain(c, c.build_model(), D, snapshot_weights(c, c.build_model()), n_steps=3,
+                      seed=SEED)
     pb.assert_same_final_weights(c, out, plain.w_final)
     first = root / "first.json"
     first.write_text((out / pb.WEIGHTS_FILE).read_text())
@@ -325,12 +361,21 @@ def test_main_rejects_bad_steps(tiny_main, argv, msg, capsys):
     assert e.value.code == 2 and msg in capsys.readouterr().err
 
 
-def test_main_needs_d_bin(tiny_main, capsys):
+@pytest.mark.parametrize("name", ["D.bin", "meta.json"])
+def test_main_needs_d_bin_and_meta_json(tiny_main, name, capsys):
     _, _, root = tiny_main
-    (root / "data" / "D.bin").unlink()
+    (root / "data" / name).unlink()
     with pytest.raises(SystemExit) as e:
         pb.main(["--no-metrics"])
     assert e.value.code == 2 and "materialize_data" in capsys.readouterr().err
+
+
+def test_main_refuses_data_built_for_another_pad(tiny_main):
+    _, _, root = tiny_main
+    meta = root / "data" / "meta.json"
+    meta.write_text(json.dumps({**json.loads(meta.read_text()), "pad_id": -1}))
+    with pytest.raises(ValueError, match="pad id -1"):
+        pb.main(["--no-metrics"])
 
 
 # ---- the real model ----------------------------------------------------------------------
@@ -351,13 +396,13 @@ def test_smollm2_plain_baseline_two_steps(tmp_path):
         pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
     w0 = snapshot_weights(c, c.build_model())
     lines: list[str] = []
     with MetricsWriter(tmp_path, pb.RUN_NAME, model=cfg.model) as mw:
         res = pb.plain_baseline(c, D, w0, T=2, build_model=c.build_model, metrics=mw,
-                                pass_steps=1, out=lines.append)
+                                pass_steps=1, out=lines.append, seed=SEED)
     print("\n" + "\n".join(lines))
     rows = read_records(tmp_path)
     for r in rows:
@@ -369,7 +414,7 @@ def test_smollm2_plain_baseline_two_steps(tmp_path):
 
     model, w = c.build_model(), w0
     for t in (1, 2):
-        out = prove_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D))])
+        out = prove_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D), SEED)])
         assert out.loss == res.plain.steps[t - 1].loss
         w = out.w_next
         del out

@@ -14,7 +14,8 @@ training reaches (EQ15's latency is then 0), and the poisoning rate of ``b̃``. 
 fails the run unless it ends exactly at ``(2, "7")``. One band-file hash must hold across the
 file, every verifier and verdict, and the calibration run (P10a).
 
-With metrics on (default ``VERIF_METRICS``) the records go to ``$VERIF_OUTPUT_DIR/hidden_steps/``.
+With metrics on (default ``VERIF_METRICS``) the records go to the cell's run directory,
+``$VERIF_OUTPUT_DIR/hidden-<model>-<attack>-bpr<n>-s<seed>/`` (``cheats.cell_name``).
 Exits 1 unless the oracle passes.
 """
 
@@ -29,6 +30,7 @@ from verification.parameters import load_protocol_config
 from verification.runs.cheats import (
     CheatEnv,
     band_sources,
+    cell_name,
     load_env,
     open_writer,
     report_oracle,
@@ -37,9 +39,9 @@ from verification.runs.cheats import (
 from verification.runs.metrics import MetricsWriter
 from verification.runs.scenarios import Expected, HiddenStep, Scenario, ScenarioResult
 
-__all__ = ["RUN_NAME", "CHAIN_STEP", "run_hidden", "main"]
+__all__ = ["SCENARIO", "CHAIN_STEP", "run_hidden", "main"]
 
-RUN_NAME = "hidden_steps"
+SCENARIO = "hidden"
 CHAIN_STEP = 2  # the reported step after the hidden one (P11)
 
 
@@ -47,17 +49,17 @@ def run_hidden(env: CheatEnv, *, writer: MetricsWriter | None = None,
                out: Callable[[str], None] = print) -> ScenarioResult:
     """One hidden step on ``b̃`` between reported steps 1 and 2, cut after step 2."""
     t = CHAIN_STEP
-    s = Scenario("hidden", f"one hidden SGD step on b̃ between reported steps {t - 1} and {t}",
+    s = Scenario(SCENARIO, f"one hidden SGD step on b̃ between reported steps {t - 1} and {t}",
                  HiddenStep(env.c, t, env.b_tilde, build_model=env.models),
                  Expected(t, "7", "failed"))
-    return run_cheat(env, s, T=t, writer=writer, poisoning_rate=env.poisoning_rate,
-                     cheat_step=t, out=out)
+    return run_cheat(env, s, T=t, writer=writer, bpr_records=env.bpr_records,
+                     bpr_actual=env.bpr_actual, cheat_step=t, out=out)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
-                   help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/ "
+                   help="write B6 metrics to $VERIF_OUTPUT_DIR/<cell>/ "
                         "(default: VERIF_METRICS)")
     args = p.parse_args(argv)
     cfg = load_config()
@@ -66,9 +68,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     setup_determinism(cfg)
     env = load_env(cfg, pc)
     print(f"A13 hidden steps: {cfg.model}@{cfg.model_revision[:12]}, k {env.k}, one hidden "
-          f"step on b̃ (poisoning rate {env.poisoning_rate:g}), band file {pc.band_file} "
-          f"({env.bands.source[:16]}…)")
-    mw = open_writer(cfg, RUN_NAME, env) if use_metrics else None
+          f"step on b̃ (BPR {env.bpr_records}/{env.c.n_s}, {env.bpr_actual:g}), band file "
+          f"{pc.band_file} ({env.bands.source[:16]}…)")
+    mw = open_writer(cfg, cell_name(cfg, SCENARIO, env), env) if use_metrics else None
     try:
         r = run_hidden(env, writer=mw)
     finally:

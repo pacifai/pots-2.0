@@ -19,7 +19,9 @@ their numbers (``Verifier(calibrate=True)``, P10b). This module turns the number
   lists honest products with ``‖|P|·1‖ = 0`` but ``ν ≠ 0``, which the guard rejects by
   construction.
 - :func:`band_file_bytes` writes the bands and C1's statistics as one JSON file.
-  :func:`write_band_file` saves it, and :func:`load_bands` is how every later run reads it.
+  :func:`write_band_file` saves it, and :func:`load_bands` is how every later run reads it,
+  refusing a file whose :func:`band_context` differs from the run's in any key but the
+  calibration seed and thread count.
   ``Bands.source`` is the BLAKE3 hex of the file's bytes, and :func:`assert_same_band_source`
   is P10a's check that every run was judged by the same file.
 
@@ -29,22 +31,27 @@ here runs a model; ``runs/calibrate.py`` does.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import statistics
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.context import StepStats
 from verification.verifier.matmul_check.sizing import C_ANTI, Z, e_m, f_achieved
 from verification.verifier.residuals import ClassSummary, class_summary
 
+if TYPE_CHECKING:
+    from setup.config import RunConfig
+    from verification.computation.instances.decoder import DecoderComputation
+
 __all__ = ["KAPPA_MARGIN", "GUARD_FRACTION", "TAU_W_MARGIN", "Calibration", "RealizedFloor",
-           "fit", "realized_floor", "band_file_bytes", "write_band_file", "load_bands",
-           "assert_same_band_source"]
+           "fit", "realized_floor", "band_file_bytes", "write_band_file", "BandFileMismatch",
+           "PROVENANCE_KEYS", "band_context", "load_bands", "assert_same_band_source"]
 
 # κ_max = KAPPA_MARGIN × the largest honest κ of the class. The spec asks only that κ_max sit
 # above the honest factor. 2 mirrors τ_W's margin; κ_max is a safety ceiling, not the
@@ -240,21 +247,72 @@ def write_band_file(path: str | os.PathLike[str], data: bytes) -> Bands:
     return Bands.from_json(data)
 
 
-def load_bands(path: str | os.PathLike[str], *, k: int | None = None) -> Bands:
+class BandFileMismatch(ValueError):
+    """The band file was fitted for another run: another ``k``, ``D``, model or setup."""
+
+
+# Context entries the band file keeps as provenance and :func:`load_bands` doesn't compare.
+# The bands describe the verifier's rounding noise on honest steps, which doesn't depend on
+# π's batch order, so the file fitted at seed 1 (H1) judges the runs at every seed
+# (EVALUATION_SPEC §3.2). The thread count changes only the CPU's reduction order, a shift
+# far below τ = Z·s_h; the cost results need it recorded, and a file without it still loads.
+PROVENANCE_KEYS: frozenset[str] = frozenset({"calibration_seed", "threads"})
+
+
+def band_context(cfg: RunConfig, c: DecoderComputation, *, h_D: bytes, k: int) -> dict[str, Any]:
+    """The run a band file is fitted for, as JSON values.
+
+    ``runs/calibrate.py`` writes it into the file's statistics as ``context``, and every run
+    that loads the file builds its own with this function and passes it to :func:`load_bands`.
+    Honest residuals depend on each compared entry, so bands fitted under one don't judge
+    another (P10a). ``T_run`` is ``VERIF_STEPS``, the ``T`` that P10d sized ``k`` for.
+    ``calibration_seed`` is ``cfg.seed``, and ``threads`` is ``cfg.threads``
+    (``VERIF_THREADS``). In the file they are the calibration run's seed and thread count,
+    kept as provenance, and :func:`load_bands` compares neither (:data:`PROVENANCE_KEYS`).
+    """
+    return {"model": cfg.model, "model_revision": cfg.model_revision,
+            "master_dtype": str(cfg.master_dtype).removeprefix("torch."),
+            "compute_dtype": str(cfg.compute_dtype).removeprefix("torch."),
+            "attn_impl": cfg.attn_impl, "device": cfg.device, "h_D": h_D.hex(),
+            "calibration_seed": cfg.seed, "threads": cfg.threads, "n_s": c.n_s, "n": c.n,
+            "eta": c.eta, "M": c.M, "T_run": cfg.steps, "k": k}
+
+
+_ABSENT = object()
+
+
+def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, Any]) -> Bands:
     """The band file every verification after calibration loads, read-only (P10a).
 
     A missing file raises ``FileNotFoundError``: a judged run refuses to start without it.
-    With ``k``, the file must have been calibrated at that ``k``, so a run can't pair the bands
-    with a ``VERIF_K`` that P10d's recompute did not approve.
+    The file must have been calibrated at ``k``, so a run can't pair the bands with a
+    ``VERIF_K`` that P10d's recompute did not approve. Its ``context`` must equal ``context``
+    (:func:`band_context`) key for key, so a file fitted on another ``D``, model or setup, or
+    one written before a compared key existed, is refused. Either mismatch raises
+    :class:`BandFileMismatch`. The two :data:`PROVENANCE_KEYS`, the calibration seed and the
+    thread count, are never compared: a run at another seed or thread count loads the file,
+    and so does a file that lacks either key.
     """
     path = Path(path)
+    rerun = "rerun verification.runs.calibrate (P10a)"
     if not path.exists():
         raise FileNotFoundError(f"no band file at {path}: run verification.runs.calibrate "
                                 "first (P10a)")
     bands = Bands.from_file(path)
-    if k is not None and bands.stats.get("k") != k:
-        raise ValueError(f"band file {path} was calibrated at k = {bands.stats.get('k')}, "
-                         f"this run has k = {k}")
+    if bands.stats.get("k") != k:
+        raise BandFileMismatch(f"band file {path} was calibrated at k = {bands.stats.get('k')}, "
+                               f"this run has k = {k}: {rerun}")
+    want = json.loads(json.dumps(dict(context)))  # as the file holds it
+    got = bands.stats.get("context")
+    got = got if isinstance(got, dict) else {}
+    diff = sorted(key for key in (want.keys() | got.keys()) - PROVENANCE_KEYS
+                  if want.get(key, _ABSENT) != got.get(key, _ABSENT))
+    if diff:
+        def show(d: Mapping[str, Any], key: str) -> str:
+            return repr(d[key]) if key in d else "missing"
+        detail = "; ".join(f"{key}: file {show(got, key)}, run {show(want, key)}" for key in diff)
+        raise BandFileMismatch(f"band file {path} was fitted for another run ({detail}): "
+                               f"{rerun}")
     return bands
 
 

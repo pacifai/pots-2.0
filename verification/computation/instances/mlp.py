@@ -30,7 +30,7 @@ Every weight is linear, so check 6 is 6a throughout and :meth:`MLPReplay.glue_gr
 empty. Each product needs ``q ≥ 2`` (P7: a ``q = 1`` product is a glue outer product), so
 ``n_s ≥ 2`` and every width is at least 2.
 
-The schedule is ``data.schedule`` (sequential, 1-based, no wraparound).
+The schedule is ``data.schedule``, F8c's hash-shuffled passes (1-based, seeded).
 """
 
 from __future__ import annotations
