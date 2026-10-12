@@ -12,7 +12,7 @@ import torch
 from setup.config import load_config
 from setup.data import schedule
 from tests.verification.runs.test_run_verified import _band_file, band_ctx
-from verification.commitment.leaves import dataset_tree
+from verification.commitment.leaves import commit_leaves, dataset_tree
 from verification.computation.instances.mlp import (
     MLPComputation,
     init_weights,
@@ -21,8 +21,9 @@ from verification.computation.instances.mlp import (
 from verification.parameters import ProtocolConfig
 from verification.runs import cheats
 from verification.runs import flipped_matmul_sweep as fs
+from verification.runs import run_verified as rv
 from verification.runs.hidden_steps import run_hidden
-from verification.runs.metrics import MetricsWriter, read_records, read_residuals
+from verification.runs.metrics import MetricsWriter, read_records, read_residuals, spec_class
 from verification.runs.poisoned_step import SCENARIOS, run_poisoned
 from verification.runs.scenarios import (
     Expected,
@@ -227,14 +228,29 @@ def kept(env):
     return fs._store_of(env, keep.out, fs.SWEEP_STEP), r
 
 
-def test_targets_one_per_class(env):
-    specs = fs.sweep_targets(env.c)
-    from verification.verifier.bands import product_class
-    classes = [product_class(env.c, s) for s in specs]
-    assert len(classes) == len(set(classes)) == len({product_class(env.c, s)
-                                                     for s in env.c.products})
+def test_targets_one_per_spec_class_and_the_binding_product(env):
+    """EVALUATION_SPEC §5.7's targets: one product per class from the middle layer, and the
+    binding product (the largest ``q``). On the MLP the binding product is a class's pick; on the
+    decoder it adds ``dF`` to the six classes."""
+    from tests.verification.decoder_helpers import tiny_config
+    from verification.computation.instances import DecoderComputation
+    c = env.c
+    assert [s.name for s in fs.sweep_targets(c)] == ["Y_2", "dX_2", "G_2"]
+    assert fs.binding_product(c).name == "Y_2"  # q = 32, the first of the widest
+    assert [s.name for s in fs.sweep_targets(c, ["weight gradient", "dX_3"])] == ["dX_3", "G_2"]
+    assert [s.name for s in fs.sweep_targets(c, ["weight_grad:layers.*.weight"])] == ["G_2"]
     with pytest.raises(ValueError, match="unknown"):
-        fs.sweep_targets(env.c, ["nope"])
+        fs.sweep_targets(c, ["nope"])
+    assert c.linear_weights[fs.check6_weight(c)] == c.m_of("G_2")
+    d = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    specs = fs.sweep_targets(d)
+    assert [s.name for s in specs] == ["L1.Y_q", "L1.S[0,0]", "L1.O[0,0]", "dF", "L1.dX_down",
+                                       "L1.G_down", "L1.dA[0,0]"]
+    assert fs.binding_product(d).name == "dF"
+    classes = [spec_class(d, s) for s in specs if s.name != "dF"]
+    assert len(classes) == len(set(classes)) == len({spec_class(d, s) for s in d.products})
+    assert [s.name for s in fs.sweep_targets(d, ["input gradient"])] == ["dF", "L1.dX_down"]
+    assert fs.check6_weight(d) == "model.layers.0.mlp.down_proj.weight"
 
 
 @pytest.mark.parametrize("shape", fs.SHAPES)
@@ -325,28 +341,120 @@ def test_summary_fits_the_entry_constant():
     assert s["f_all"] in (10.0, 100.0) and not s["stop"]  # all three miss at x = 10: 2e-4
     assert math.isclose(s["f_ach"], 0.798 * 2 ** (20 / 3))
     assert not s["c_hat_over_c"] and s["c_hat_se"] > 0
-    # the same misses judged against a c far below them trip the ĉ stop
+    p = pts[1]  # x = 10: p₁ ≈ σ_r/10, under the bound c/x = 0.0798
+    assert (p["vectors"], p["resolvable"]) == (6000, 1 / 6000)
+    assert math.isclose(p["p1_bound"], 0.0798)
+    assert p["p1"] == p["misses"] / 6000 and math.isclose(p["p1"], fs.SIGMA_R / 10, rel_tol=0.15)
+    assert p["p1_se"] == math.sqrt(p["p1"] * (1 - p["p1"]) / 6000)
+    assert pts[0]["p1_bound"] == 1.0 and s["p1_over_bound_x"] == []
+    # the same misses judged against a c far below them trip the ĉ stop and the p₁ stop
     _, s_low = fs.summarize(tr, fs.Floor(N=20.0, c=0.3, tau=1.0, k=3))
-    assert s_low["c_hat_over_c"] and s_low["stop"]
+    assert s_low["c_hat_over_c"] and s_low["stop"] and 10.0 in s_low["p1_over_bound_x"]
+    assert 0.1 not in s_low["p1_over_bound_x"]
 
 
-def test_run_sweep_on_the_mlp(env, tmp_path):
-    w = MetricsWriter(tmp_path, "flipped_matmul_sweep", device="cpu", model="mlp",
-                      corpus="synthetic", seed=0, config={}, band_file_hash=env.bands.source,
-                      h_D=env.h_D)
-    try:
-        r = fs.run_sweep(env, xs=(0.5, 1e3, 1e5), shapes=fs.SHAPES, trials=4,
-                         flip_name="dX_3", writer=w, out=QUIET)
-    finally:
-        w.close()
-    assert r.honest.passed and r.flip.passed
+def _ctx(env):
+    from verification.verifier.context import StepContext
+    return StepContext.for_computation(env.c, step=fs.SWEEP_STEP, indices=(), h_D=env.h_D,
+                                       n_records=len(env.D), prev_w_hashes=(),
+                                       chain_check_id="7", k=K)
+
+
+def test_check6_trial_is_rejected_at_6a(env, kept):
+    """One entry of a linear weight's ``W_{t+1}`` moved to ``ρ ≈ 2·τ_W`` is rejected by check
+    6a on that entry, the ``ρ`` the trial computes is the reference's, and the root returns."""
+    store, _ = kept
+    c, base = env.c, store.root
+    name = fs.check6_weight(c)
+    rec = fs.check6_trial(c, store, env.bands, _ctx(env), name,
+                          gen=torch.Generator().manual_seed(0))
+    assert store.root == base
+    assert rec["rejected"] and (rec["check_id"], rec["kind"]) == ("6a", "failed")
+    assert rec["detail"].startswith(f"{name}: entry {rec['entry']} ")
+    assert rec["tau_w"] == env.bands.tau_w_for(name) and rec["factor"] == fs.CHECK6_FACTOR
+    assert rec["rho_max"] == rec["rho_entry"] > rec["tau_w"]
+    assert math.isclose(rec["rho_entry"], rec["rho_target"], rel_tol=0.25)
+    assert rec["g_m"] == c.linear_weights[name] and rec["root"] != base.hex()
+
+
+def test_check6_trial_needs_an_entry_outside_the_band(env, kept):
+    store, _ = kept
+    with pytest.raises(RuntimeError, match="could be moved"):
+        fs.check6_trial(env.c, store, env.bands, _ctx(env), fs.check6_weight(env.c),
+                        gen=torch.Generator().manual_seed(0), factor=0.5)
+
+
+@pytest.fixture(scope="module")
+def stored(env, kept, tmp_path_factory):
+    """The kept step 4, stored as ``run_verified`` stores it: its files under ``transcripts/``,
+    the ``kept_transcript`` record, the environment record with the band-file hash, and the
+    step's residual archive."""
+    store, r = kept
+    c, t = env.c, fs.SWEEP_STEP
+    run_dir = tmp_path_factory.mktemp("honest")
+    leaves = [store.leaf(i) for i in range(c.n_leaves)]
+    keep = rv.KeptStepHandoff(run_dir / rv.TRANSCRIPTS_DIR, t)
+    keep.hold(c, t, leaves, commit_leaves(c, leaves),
+              [store.dataset_path(i) for i in range(c.n_s)])
+    with MetricsWriter(run_dir, "honest", band_file_hash=env.bands.source) as mw:
+        mw.write([rv.kept_record("honest", "honest", keep.write(), step=t, run_dir=run_dir)])
+        mw.write_residuals("honest", t, r.verifier.stats[t], c, bands=env.bands, k=K)
+    return run_dir
+
+
+def _writer(env, d):
+    return MetricsWriter(d, "flipped_matmul_sweep", device="cpu", model="mlp",
+                         corpus="synthetic", seed=0, config={},
+                         band_file_hash=env.bands.source, h_D=env.h_D)
+
+
+def test_run_sweep_stored_and_in_process(env, kept, stored, tmp_path):
+    """The sweep on the stored step writes the records the in-process sweep writes, at one seed;
+    the deep points add rows without moving the grid's."""
+    kw = dict(xs=(0.5, 1e3, 1e5), shapes=fs.SHAPES, trials=4, deep_xs=(1e3,),
+              deep_shapes=("row2",), deep_trials=5, flip_name="dX_3", out=QUIET)
+    runs = {}
+    for source in fs.SOURCES:
+        ks = rv.load_kept_step(env.c, stored, step=fs.SWEEP_STEP) if source == "stored" else None
+        with _writer(env, tmp_path / source) as w:
+            runs[source] = fs.run_sweep(env, kept=ks, writer=w, **kw)
+    r, rs = runs["in-process"], runs["stored"]
+    assert r.passed and rs.passed and rs.honest is None and r.honest.passed
     assert (r.flip.actual.step, r.flip.actual.check_id) == (fs.SWEEP_STEP, "5")
-    n_cls = len(fs.sweep_targets(env.c))
-    assert len(r.summaries) == n_cls * len(fs.SHAPES)
+    n_t = len(fs.sweep_targets(env.c))
+    assert len(r.summaries) == n_t * (len(fs.SHAPES) + 1)
     assert all(s["f_all"] is not None for s in r.summaries)
-    rows = read_records(tmp_path / "records.jsonl", "sweep_summary")
-    assert len(rows) == len(r.summaries)
-    assert len(read_records(tmp_path / "records.jsonl", "sweep_point")) == 3 * len(rows)
-    z = np.load(tmp_path / fs.TRIALS_FILE)
-    assert z["normalized"].shape == (n_cls * len(fs.SHAPES) * 3 * 4, K)
+    d, ds = tmp_path / "in-process", tmp_path / "stored"
+    rows = read_records(d, "sweep_summary")
+    assert len(rows) == len(r.summaries) and {s["phase"] for s in rows} == {"grid", "deep"}
+    assert [s["spec_class"] for s in rows if s["phase"] == "deep"] == [
+        "forward", "input gradient", "weight gradient"]
+    assert [s["binding"] for s in rows if s["phase"] == "deep"] == [True, False, False]
+    assert len(read_records(d, "sweep_point")) == 3 * n_t * len(fs.SHAPES) + n_t
+    z = np.load(d / fs.TRIALS_FILE)
+    assert z["normalized"].shape == (n_t * (len(fs.SHAPES) * 3 * 4 + 5), K)
+    assert set(z["phase"]) == {"grid", "deep"} and set(z["spec_class"]) == {
+        "forward", "input gradient", "weight gradient"}
+    [c6] = read_records(d, "sweep_check6")
+    assert c6["rejected"] and c6["check_id"] == "6a"
     assert cheats.band_sources(env, [r.honest, r.flip]) == env.bands.source
+
+    def strip(rows):
+        return [{k: v for k, v in x.items() if k not in ("run", "seconds")} for x in rows]
+
+    for rec in ("sweep_point", "sweep_summary", "sweep_check6"):
+        assert strip(read_records(d, rec)) == strip(read_records(ds, rec)), rec
+    [src], [srcs] = read_records(d, "sweep_source"), read_records(ds, "sweep_source")
+    assert src["root"] == srcs["root"] == kept[0].root.hex() and src["targets"] == srcs["targets"]
+    assert (src["source"], srcs["source"]) == ("in-process", "stored")
+    assert srcs["honest_run"] == str(stored) and src["path"] is None
+    zs = np.load(ds / fs.TRIALS_FILE)
+    assert all(np.array_equal(z[f], zs[f]) for f in z.files)
+    # a stored step of another step, or judged by another band file, is refused
+    ks = rv.load_kept_step(env.c, stored, step=fs.SWEEP_STEP)
+    with pytest.raises(ValueError, match="the stored step is 3"):
+        fs.run_sweep(env, kept=dataclasses.replace(ks, step=3), **kw)
+    with MetricsWriter(tmp_path / "other", "honest", band_file_hash="ab" * 32):
+        pass
+    with pytest.raises(ValueError, match="judged by band file abab"):
+        fs.run_sweep(env, kept=dataclasses.replace(ks, run_dir=tmp_path / "other"), **kw)
