@@ -3,8 +3,8 @@
 Every function here reads the local Hugging Face cache only and never downloads; a model must
 be downloaded beforehand, as the tokenizers are (`setup.data.load_tokenizer`). Each one that
 names a model takes a pinned revision, a 40-hex commit, and raises on anything else, such as a
-branch name: a branch resolves to whatever commit the cache last saw. `transformers` and `huggingface_hub` are
-imported inside the functions, so importing this module stays cheap.
+branch name: a branch resolves to whatever commit the cache last saw. `transformers` and
+`huggingface_hub` are imported inside the functions, so importing this module stays cheap.
 """
 
 from __future__ import annotations

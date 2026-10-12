@@ -78,9 +78,20 @@ TEST_SCALE_TOKENIZER = TokenizerPin("HuggingFaceTB/SmolLM2-135M-Instruct",
 # repo: FS4 brought Llama up on the unsloth mirror above, and a run takes Meta's repo through
 # VERIF_MODEL and VERIF_MODEL_REVISION alone. Its EOS is `<|eot_id|>`, as the mirror's.
 RUN_ONLY_EOS = {"meta-llama/Llama-3.2-1B-Instruct": 128009}
+
+
+def _eos_ids(pins: Sequence[TokenizerPin], run_only: Mapping[str, int]) -> dict[str, int]:
+    """Each repo's EOS id from `pins` and `run_only`. Raises `ValueError` when a `run_only`
+    repo is also pinned, so neither table silently overrides the other."""
+    eos = {p.repo: p.eos_token_id for p in pins}
+    if clash := sorted(set(eos) & set(run_only)):
+        raise ValueError(f"RUN_ONLY_EOS repeats pinned tokenizers {clash}; keep each repo in "
+                         "one table")
+    return {**eos, **run_only}
+
+
 # F8f: each model's declared EOS ends every record and is also its pad id.
-_EOS = {**{p.repo: p.eos_token_id for p in (TEST_SCALE_TOKENIZER, *FULL_SCALE_TOKENIZERS)},
-        **RUN_ONLY_EOS}
+_EOS = _eos_ids((TEST_SCALE_TOKENIZER, *FULL_SCALE_TOKENIZERS), RUN_ONLY_EOS)
 
 
 def run_pin(repo: str, revision: str) -> TokenizerPin:

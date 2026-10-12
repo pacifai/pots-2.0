@@ -111,6 +111,17 @@ def test_run_pin_takes_each_model_its_own_eos():
         data.run_pin("gpt2", "main")
 
 
+def test_a_run_only_eos_may_not_repeat_a_pinned_tokenizer():
+    """The run-only table adds repos; one that is also pinned raises rather than overriding
+    the pinned EOS."""
+    pins = (data.TEST_SCALE_TOKENIZER,)
+    merged = data._eos_ids(pins, {"meta-llama/Llama-3.2-1B-Instruct": 128009})
+    assert merged == {"HuggingFaceTB/SmolLM2-135M-Instruct": 2,
+                      "meta-llama/Llama-3.2-1B-Instruct": 128009}
+    with pytest.raises(ValueError, match="repeats pinned tokenizers"):
+        data._eos_ids(pins, {"HuggingFaceTB/SmolLM2-135M-Instruct": 0})
+
+
 # ---- records under SmolLM2 ------------------------------------------------------------------
 
 

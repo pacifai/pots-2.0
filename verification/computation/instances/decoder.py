@@ -32,8 +32,9 @@ Implementation pins (not fixed by the reference block):
   is its role without the layer and member.
 - **Batch assembly** is ``data.assemble_batch``: right padding with ``pad_id``, the model's
   EOS (F8f: ``data.run_pin(repo, revision)`` for a loaded model, SmolLM2's ``PAD_ID`` for a
-  random test model unless given), ``ρ`` from each record's ``ℓ``. ``ρ`` is the HF ``attention_mask``, so ``Ω`` is HF's
-  causal mask over ``ρ``. Positions are ``0 … n−1`` in every sequence.
+  random test model unless given), ``ρ`` from each record's ``ℓ``. ``ρ`` is the HF
+  ``attention_mask``, so ``Ω`` is HF's causal mask over ``ρ``. Positions are ``0 … n−1`` in
+  every sequence.
 - **Loss** is ref block §3's ``ℒ = Σ_i μ_i·CE_i / Σ_i μ_i`` over the logits, with
   ``F.cross_entropy(reduction="none")`` per token. ``μ`` takes ``CE``'s dtype, fp32 under
   autocast too; in the bf16 logits' dtype ``Σ μ`` would round above 256. A batch with

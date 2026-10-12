@@ -18,8 +18,8 @@ from setup.data import schedule
 from verification.computation.instances import DecoderComputation
 from verification.computation.instances.decoder import _Labeler
 from verification.computation.interface import ProductKind
-from verification.prover.capture import MatmulCapture
 from verification.computation.matmul_ops import param_storage_map
+from verification.prover.capture import MatmulCapture
 
 from tests.verification.decoder_helpers import make_records, randomize_biases, tiny_config
 from tests.verification.full_scale_helpers import PIN_IDS, PINS, full_scale_case
