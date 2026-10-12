@@ -368,6 +368,27 @@ def test_summary_fits_the_entry_constant():
         fs.summarize(tr, floor)
 
 
+def test_summary_fits_the_point_at_the_fit_edge_whatever_its_rounding():
+    """The trials swept at ``x = x_fit`` enter both fits whether their realized ``x`` lands an
+    ulp below ``x_fit`` or not; each still counts at its realized ``x``."""
+    floor = fs.Floor(N=20.0, c=0.798, tau=1.0, k=3)
+    for below in (False, True):
+        tr = fs.Trials(1, "cls", "row2", 1.0)
+        for x, n_miss in ((2.0, 3), (fs.FIT_X_MIN, 2), (10.0, 1)):
+            for i in range(4):
+                tr.x_set.append(x)
+                tr.f_real.append(x * (1 - 1e-9) if below and x == fs.FIT_X_MIN else x)
+                tr.normalized.append(tuple(0.5 if j < n_miss and i == 0 else 99.0
+                                           for j in range(3)))
+                tr.kappa.append(1.0)
+                tr.reason.append("residual")
+        _, s = fs.summarize(tr, floor)
+        assert (s["c_fit_vectors"], s["c_fit_misses"]) == (24, 3)
+        x3 = fs.FIT_X_MIN * (1 - 1e-9) if below else fs.FIT_X_MIN
+        assert math.isclose(s["c_hat"], 3 / (4 * 3 / x3 + 4 * 3 / 10.0), rel_tol=1e-15)
+        assert s["c_hat_committed"] == s["c_hat"]
+
+
 def _ctx(env):
     from verification.verifier.context import StepContext
     return StepContext.for_computation(env.c, step=fs.SWEEP_STEP, indices=(), h_D=env.h_D,

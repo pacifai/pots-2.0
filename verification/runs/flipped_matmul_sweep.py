@@ -78,8 +78,9 @@ The stop condition still uses ``c/x``, the stricter of the two.
 - ``f50``: the smallest swept ``f`` where at least half the trials were rejected;
 - ``f_all``: the smallest swept ``f`` from which every trial was rejected, at every larger
   point too;
-- ``ĉ``: the single-challenge miss constant fitted from trials at ``x ≥ 3``, where the miss
-  rate ``p₁ ≈ c/x`` (``ĉ = misses / Σ k/x`` over those trials), with its Poisson standard
+- ``ĉ``: the single-challenge miss constant fitted from the trials swept at ``x ≥ 3``, where
+  the miss rate ``p₁ ≈ c/x`` (``ĉ = misses / Σ k/x`` over those trials, each at its realized
+  ``x``), with its Poisson standard
   error. Theory values: ``entry`` ``σ_r = 0.577`` (``P(|r_j| < σ_r/x) = σ_r/x`` for
   ``r_j ~ U(−1, 1)``); ``row2`` ``√2·σ_r = √(2/3) = 0.816``, the bound the sizing uses as
   ``c = C_ANTI`` (the triangular density of ``r_a + r_b`` bends ``p₁`` down at small ``x``, so
@@ -528,17 +529,18 @@ def summarize(tr: Trials, floor: Floor, *, x_fit: float = FIT_X_MIN
         if p["rejected"] < p["trials"]:
             break
         f_all = p["f"]
-    fit = (f_real / (tau * tr.e)) >= x_fit
+    # trials picked by their swept x: a realized x at x_fit falls on either side of it by
+    # rounding, which would keep or drop that point at random
+    fit = x_set >= x_fit
     denom = float((k / (f_real[fit] / (tau * tr.e))).sum()) if fit.any() else 0.0
     c_hat = float(misses[fit].sum()) / denom if denom > 0 else None
     # Poisson standard error of ĉ; the ĉ stop needs ĉ above c by C_HAT_SIGMAS of them.
     c_hat_se = math.sqrt(float(misses[fit].sum())) / denom if denom > 0 else None
     c_over = (c_hat is not None and c_hat_se is not None
               and c_hat - C_HAT_SIGMAS * c_hat_se > floor.c)
-    # the same fit with x taken against the committed product's norm, as check 5 normalizes
-    fit_c = x_committed >= x_fit
-    denom_c = float((k / x_committed[fit_c]).sum()) if fit_c.any() else 0.0
-    misses_c = float(misses[fit_c].sum())
+    # the same trials with x taken against the committed product's norm, as check 5 normalizes
+    denom_c = float((k / x_committed[fit]).sum()) if fit.any() else 0.0
+    misses_c = float(misses[fit].sum())
     over_x = [p["x"] for p in points if p["p1_over_bound"]]
     f_ach = floor.f_ach(tr.e)
     summary = {"m": tr.m, "name": tr.name, "cls": tr.cls, "spec_class": tr.spec_class,
