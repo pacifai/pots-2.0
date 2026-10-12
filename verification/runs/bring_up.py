@@ -1,0 +1,343 @@
+"""FS4: one model's bring-up on CPU at test scale's settings.
+
+    VERIF_MODEL=<repo> VERIF_MODEL_REVISION=<commit> VERIF_OUTPUT_DIR=<dir> \\
+        .venv/bin/python -m verification.runs.bring_up [--steps T] [--reference-bands PATH]
+        [--tamper | --no-tamper]
+
+Before any GPU run, each full-scale model goes through the code on CPU with test scale's other
+settings: ``(VERIF_MASTER_DTYPE, VERIF_COMPUTE_DTYPE)``, ``VERIF_BATCH × VERIF_SEQ_LEN``, η,
+``VERIF_K``, ``VERIF_SEED``. The model is ``VERIF_MODEL`` at ``VERIF_MODEL_REVISION`` alone;
+nothing names a model in code. ``D`` and ``h_D`` come from ``$VERIF_OUTPUT_DIR/data/``, which
+``materialize_data`` writes for the same model. The run never downloads: it stops if the
+weights aren't in the local Hugging Face cache.
+
+1. **The pin.** Repo, revision, the SHA-256 of the cached ``config.json``, and each weight file
+   with its SHA-256 (``setup.model.model_pin``), and the pad: the model's pinned EOS (F8f).
+2. **Honest steps.** ``T`` steps (``--steps``, default 1) from ``W_0``, the unmodified
+   ``from_pretrained`` weights, through the S3 loop (``run_scenario``). The verifier runs in
+   calibration mode (P10b): the exact checks judge live, and checks 5 and 6 only record. After
+   the last step the bands are fitted on these steps (``calibration.fit``) and the verifier
+   freezes on them, so check 8 closes the run. The fit is in-sample and never written as a band
+   file: it gives step 4 its bands and nothing else. Check 8's reference is ``T`` uncaptured
+   steps from ``W_0``, kept as leaf hashes only.
+3. **Residuals, printed and not judged.** Check 5's table by product class and check 6's by
+   weight role. With ``--reference-bands`` (SmolLM2's band file), each score family's largest
+   score at each step under those bands (EVALUATION_SPEC §2.2: check 5's ``ρ_5``, its κ guard's
+   ``ρ_κ``, check 6's ``ρ_6``), and the families above 1. A class the file doesn't name takes
+   its default ``κ_max``, and every weight its default ``τ_W``, since its per-tensor values name
+   SmolLM2's tensors (:func:`reference_bands`).
+4. **One bias entry altered** (a model with q, k, v biases; ``--no-tamper`` skips it). As
+   FS2's switch test, on the real model, judged by step 2's fitted bands: step 1 trained with
+   the last entry of layer 1's ``b_q`` raised by 1 under an honest ``W_t`` leaf must fail
+   check 5 at ``L1.Y_q``, and an honest step with that entry raised in its ``W_{t+1}`` leaf
+   must fail check 6b.
+5. **Cost.** The honest run is the B6 memory pass (``MemoryRecorder``): each step's prover and
+   verifier peak, beside the loop's wall clocks (``prove_step`` and the commit; every check),
+   which the probe's sampling slows a little.
+
+Exits 0 when the honest run is accepted and each tamper is rejected where expected, else 1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+from setup.config import load_config, setup_determinism
+from setup.data import schedule
+from setup.model import model_pin
+from verification.commitment.leaves import dataset_tree, leaf_hashes_of
+from verification.computation.instances.decoder import DecoderComputation
+from verification.computation.interface import snapshot_weights
+from verification.parameters import load_protocol_config
+from verification.prover.step import prove_step
+from verification.runs.llama_step import load_committed_dataset, report_costs
+from verification.runs.metrics import (
+    SCORE_FAMILIES,
+    memory_pass,
+    memory_probe,
+    nan_as_inf,
+    rho_arrays,
+    step_scores,
+)
+from verification.runs.scenarios import HONEST, ReusedModel, ScenarioResult, honest_final, run_scenario
+from verification.transcript.store import InMemoryStore, perturb_leaf
+from verification.verifier.bands import Bands, product_class
+from verification.verifier.calibration import Calibration, band_file_bytes, fit
+from verification.verifier.context import Rejection, Section
+from verification.verifier.driver import Verifier
+from verification.verifier.residuals import (
+    class_summary,
+    format_class_table,
+    format_tensor_table,
+    tensor_summary,
+)
+
+__all__ = ["BringUp", "Tamper", "bring_up", "bias_tamper", "reference_bands", "family_maxima",
+           "main"]
+
+RUN_NAME = "bring_up"
+
+
+@dataclass
+class Tamper:
+    """One altered-bias step: what was altered, the check expected to reject it, text its
+    rejection must name (the product or the weight), and the result."""
+
+    name: str
+    expected: str
+    names: str
+    rejection: Rejection | None
+
+    @property
+    def rejected_as_expected(self) -> bool:
+        rej = self.rejection
+        return rej is not None and (rej.step, rej.check_id) == (1, self.expected) \
+            and self.names in rej.detail
+
+
+@dataclass
+class BringUp:
+    """What :func:`bring_up` measured. ``bands`` are the in-sample fit of the honest steps."""
+
+    result: ScenarioResult
+    memory_rows: list[dict[str, Any]]
+    cal: Calibration | None  # None when a step was rejected live, before the fit
+    bands: Bands | None
+    freeze_rejection: Rejection | None
+    tampers: list[Tamper] = field(default_factory=list)
+
+    @property
+    def honest_accepted(self) -> bool:
+        return self.result.loop.verdict.accepted
+
+    @property
+    def passed(self) -> bool:
+        return self.honest_accepted and all(t.rejected_as_expected for t in self.tampers)
+
+
+def _bump(t: torch.Tensor, index: int = -1) -> torch.Tensor:
+    """``t`` with one entry raised by 1, by default the last (FS2's switch test)."""
+    t = t.detach().clone()
+    t.view(-1)[index] += 1.0
+    return t
+
+
+def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
+                bands: Bands, *, k: int, seed: int, h_D: bytes,
+                build_model: Callable[[], torch.nn.Module],
+                layer: int = 1, x: str = "q") -> list[Tamper]:
+    """Step 1 with the last entry of ``b_x`` in layer ``layer`` raised by 1 (module docstring,
+    4): in training only, under an honest ``W_t`` leaf (check 5 at ``L{layer}.Y_x``), and in
+    the ``W_{t+1}`` leaf of an honest step (check 6b). Each is a one-step run judged by
+    ``bands``, built as FS2's switch test builds it."""
+    b = c.bias(layer, x)
+    if b is None:
+        raise ValueError(f"layer {layer}'s {x} projection has no bias")
+    idx = schedule(1, c.n_s, len(D), seed)
+    tree = dataset_tree(c, D)
+    records, paths = [D[i] for i in idx], [tree.path(i) for i in idx]
+
+    def verify(w: Mapping[str, torch.Tensor],
+               edit: Callable[[InMemoryStore], None]) -> Rejection | None:
+        v = Verifier(c, h_D=h_D, n_records=len(D), k=k, n_steps=1, bands=bands, seed=seed,
+                     w0=w0)
+        rej = v.start_run(D)
+        if rej is not None:
+            return rej
+        out = prove_step(c, build_model(), w, records)
+        store = InMemoryStore.from_step(c, out, dataset_paths=paths)
+        del out
+        edit(store)
+        return v.verify_step(1, store)
+
+    def honest_w_t(store: InMemoryStore) -> None:
+        perturb_leaf(c, store, c.w_t_index(b), w0[b].detach().clone())
+
+    def bump_w_next(store: InMemoryStore) -> None:
+        i = c.w_next_index(b)
+        perturb_leaf(c, store, i, _bump(store.leaf(i)))
+
+    product = f"L{layer}.Y_{x}"
+    return [
+        Tamper(f"{b}[-1] + 1 in training, W_t leaf honest", "5",
+               f"P_{c.m_of(product)} ({product})",
+               verify({**w0, b: _bump(w0[b])}, honest_w_t)),
+        Tamper(f"{b}[-1] + 1 in the W_t+1 leaf", "6b", b, verify(w0, bump_w_next)),
+    ]
+
+
+def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: int,
+             seed: int, build_model: Callable[[], torch.nn.Module] | None = None,
+             tamper: bool = True, device: str | torch.device = "cpu") -> BringUp:
+    """Steps 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
+    a random-weight config runs the same path). ``build_model`` (default ``c.build_model``)
+    gives the prover's model, built once and reused (``ReusedModel``). ``tamper`` runs step 4
+    when ``c`` has q, k, v biases."""
+    models = ReusedModel(build_model or c.build_model)
+    w0 = snapshot_weights(c, models())
+    # Check 8's reference as leaf hashes, in C's weight order, so the run holds no extra copy
+    # of the weights.
+    w_T = honest_final(c, D, w0, T, seed=seed, build_model=models)
+    final = leaf_hashes_of(c, ((c.w_t_index(n), w_T[n]) for n in c.weight_names))
+    del w_T
+    got: dict[str, Any] = {"cal": None, "bands": None, "freeze": None}
+
+    def make(section: Section | None) -> Verifier:
+        v = Verifier(c, h_D=h_D, n_records=len(D), k=k, n_steps=T, bands=None, seed=seed,
+                     w0=w0, calibrate=True, section=section)
+        got["v"] = v
+        return v
+
+    def on_step(rec: Any) -> None:
+        # The loop calls end_run after its last step, and end_run needs a frozen verifier.
+        v: Verifier = got["v"]
+        if rec.rejection is not None:
+            # A live rejection stands whatever the bands say (Verifier.freeze), so these only
+            # let the loop close the run and report it.
+            v.freeze(Bands(tau=1.0, kappa_max=1.0, source="bring-up: rejected before the fit"))
+        elif rec.t == T:
+            cal = fit(v.stats, k=k)
+            bands = Bands.from_json(band_file_bytes(cal, {"context": {"bring_up": RUN_NAME}}))
+            got.update(cal=cal, bands=bands, freeze=v.freeze(bands))
+
+    def run(rec: Any) -> None:
+        got["r"] = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final,
+                                on_step=on_step, recorder=rec, h_D=h_D, build_model=models,
+                                verifier=make)
+
+    rows = memory_pass(RUN_NAME, HONEST.name, run, memory_probe(device))
+    out = BringUp(got["r"], rows, got["cal"], got["bands"], got["freeze"])
+    out.result.loop.w_final = {}  # the prover's W_T: check 8 has read it, and it is |W| bytes
+    if tamper and c.qkv_bias and out.bands is not None and out.honest_accepted:
+        out.tampers = bias_tamper(c, D, w0, out.bands, k=k, seed=seed, h_D=h_D,
+                                  build_model=models)
+    return out
+
+
+# ---- the scores against a reference band file --------------------------------------------
+
+
+def reference_bands(ref: Bands, c: DecoderComputation) -> tuple[Bands, list[str]]:
+    """``ref``'s bands carried over to ``c``: ``τ``, the default ``κ_max`` and the per-class
+    ``κ_max`` of every class ``c`` has, and the default ``τ_W`` for every weight (``ref``'s
+    per-tensor ``τ_W`` name its own model's tensors). Also returns ``c``'s classes that ``ref``
+    doesn't name, which take its default ``κ_max``. Only scored, never judged with."""
+    classes = list(dict.fromkeys(product_class(c, p) for p in c.products))
+    bands = Bands(tau=ref.tau, kappa_max=ref.kappa_max, tau_w=ref.tau_w,
+                  kappa_classes={k: v for k, v in ref.kappa_classes.items() if k in classes},
+                  source=ref.source)
+    return bands, [x for x in classes if x not in ref.kappa_classes]
+
+
+def family_maxima(stats: Any, bands: Bands, *, k: int) -> dict[str, tuple[float, int, str]]:
+    """Per score family: ``(largest score, number above 1, where the largest sits)``."""
+    s = step_scores(stats, bands, k=k)
+    rho = rho_arrays(stats, bands, k=k)
+    where = {
+        "rho_5": lambda i: stats.products[i // rho["rho_5"].shape[1]].name,
+        "rho_kappa": lambda i: stats.products[i].name,
+        "rho_6": lambda i: f"{stats.tensors[i].weight} ({stats.tensors[i].check_id})",
+    }
+    out = {}
+    for fam in SCORE_FAMILIES:
+        if s[fam] is None:
+            continue
+        i = int(np.argmax(nan_as_inf(rho[fam].ravel())))
+        out[fam] = (s[fam], s["n_failing"][fam], where[fam](i))
+    return out
+
+
+# ---- the report -------------------------------------------------------------------------
+
+
+def report(b: BringUp, *, k: int, reference: Bands | None,
+           c: DecoderComputation, out: Callable[[str], None] = print) -> None:
+    r, v = b.result, b.result.verifier
+    loop = r.loop
+    out("== honest steps (calibration mode: the exact checks judge, 5 and 6 record)")
+    for s in loop.steps:
+        out(f"   step {s.t}: loss {s.loss:.4f}, "
+            + ("exact checks passed" if s.rejection is None else f"REJECTED {s.rejection}"))
+    if b.cal is not None:
+        out(f"   in-sample fit: s_h {b.cal.s_h:.4g} ({b.cal.s_h_class}), τ = 8·s_h "
+            f"{b.cal.tau:.4g}, global max {b.cal.global_max:.4g} ({b.cal.global_max_name})")
+    out(f"   frozen on it: {'accepted' if b.freeze_rejection is None else b.freeze_rejection}; "
+        f"run verdict (check 8 included): "
+        f"{'ACCEPTED' if loop.verdict.accepted else loop.verdict.rejection}")
+    out("== check 5: normalized residuals by matmul class (not judged)")
+    format_class_table(class_summary(v.stats), out)
+    out("== check 6: ρ_max by weight role (not judged)")
+    format_tensor_table(tensor_summary(v.stats), out)
+    if reference is not None:
+        ref, unnamed = reference_bands(reference, c)
+        out(f"== scores against the reference band file {reference.source[:16]}… (τ "
+            f"{ref.tau:.4g}, default κ_max {ref.kappa_max:.4g}, τ_W {ref.tau_w:g}); "
+            "information only")
+        if unnamed:
+            out(f"   classes the file doesn't name, at its default κ_max: {', '.join(unnamed)}")
+        above: set[str] = set()
+        for t in sorted(v.stats):
+            for fam, (mx, n_over, at) in family_maxima(v.stats[t], ref, k=k).items():
+                out(f"   step {t} {fam:<9} max {mx:.4g} at {at}; {n_over} above 1")
+                if mx > 1:
+                    above.add(fam)
+        out("   families above 1: " + (", ".join(sorted(above)) if above else "none"))
+    for tp in b.tampers:
+        rej = tp.rejection
+        out(f"== tamper: {tp.name}: expected check {tp.expected}, got "
+            + ("ACCEPTED" if rej is None else f"check {rej.check_id} at step {rej.step}: "
+               f"{rej.detail[:160]}")
+            + ("" if tp.rejected_as_expected else "  <-- NOT AS EXPECTED"))
+    out("== cost (wall clock from the memory pass)")
+    report_costs(r, b.memory_rows, out)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    p.add_argument("--steps", type=int, default=1, help="T, at least 1 (default 1)")
+    p.add_argument("--reference-bands", type=Path, default=None, metavar="PATH",
+                   help="score the residuals against this band file (SmolLM2's), read-only")
+    p.add_argument("--tamper", action=argparse.BooleanOptionalAction, default=True,
+                   help="with q, k, v biases, run the altered-bias steps (default on)")
+    args = p.parse_args(argv)
+    if args.steps < 1:
+        p.error(f"T = {args.steps}: at least one step")
+    cfg = load_config()
+    k = load_protocol_config().k
+    pin = model_pin(cfg.model, cfg.model_revision)
+    if pin["weights"] is None:
+        p.error(f"{cfg.model}@{cfg.model_revision} has no cached weights; this run never "
+                "downloads")
+    if not (cfg.data_dir / "D.bin").exists():
+        p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data with the "
+                "same VERIF_MODEL and VERIF_OUTPUT_DIR")
+    reference = None if args.reference_bands is None else Bands.from_file(args.reference_bands)
+    setup_determinism(cfg)
+    c = DecoderComputation.from_config(cfg)
+    D, h_D = load_committed_dataset(c, cfg.data_dir)
+    print(f"pin: {pin['repo']}@{pin['revision']}, config.json SHA-256 {pin['config_sha256']}")
+    for f in pin["weights"]:
+        print(f"     {f['file']} SHA-256 {f['sha256']} ({f['bytes'] / 2**30:.2f} GiB)")
+    kinds = Counter(q.kind.value for q in c.products)
+    print(f"C: L {c.L}, d {c.d}, n_h {c.n_h}, n_kv {c.n_kv}, d_h {c.d_h}, n_v {c.n_v}, "
+          f"tied {c.tied}, qkv_bias {c.qkv_bias}, pad (EOS) {c.pad_id}; n_w {c.n_w}, M {c.M} "
+          f"({dict(kinds)}), {c.n_leaves} leaves")
+    print(f"run: n_s {c.n_s}, n {c.n}, η {c.eta:g}, k {k}, T {args.steps}, seed {cfg.seed}, "
+          f"threads {cfg.threads}, |D| {len(D)}, h_D {h_D.hex()[:16]}…")
+    b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
+                 device=cfg.device)
+    report(b, k=k, reference=reference, c=c)
+    return 0 if b.passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
