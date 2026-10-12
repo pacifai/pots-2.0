@@ -514,8 +514,8 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
         mw.write(memory_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
                             device=mw.device, verifier=make, **base))
         n = COUNT_STEPS
-        count_base = {**base, "T": n, "final": final if n == T else
-                      honest_final(c, D, w0, n, seed=cfg.seed, build_model=models)}
+        count_base = {**base, "T": n, "final": base["final"] if n == base["T"] else
+                      honest_final(c, D, w0, n, seed=base["seed"], build_model=models)}
         mw.write(count_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
                            verifier=judging_verifier(c, len(D), w0, bands, T=n, k=k,
                                                      seed=base["seed"], h_D=base["h_D"]),
