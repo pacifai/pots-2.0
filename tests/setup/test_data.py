@@ -102,9 +102,24 @@ def test_run_pin_takes_each_model_its_own_eos():
                    "Qwen/Qwen2.5-0.5B-Instruct": 151645,
                    "Qwen/Qwen2.5-1.5B-Instruct": 151645}
     assert data.run_pin("Qwen/Qwen2.5-0.5B-Instruct", "abc").revision == "abc"
+    # Meta's own Llama repo runs with the mirror's EOS, outside F8d's shared list.
+    meta = data.run_pin("meta-llama/Llama-3.2-1B-Instruct", "abc")
+    assert (meta.eos_token_id, meta.revision) == (128009, "abc")
+    assert meta.repo not in {p.repo for p in data.FULL_SCALE_TOKENIZERS}
     assert data.PAD_ID == data.TEST_SCALE_TOKENIZER.eos_token_id == 2
     with pytest.raises(ValueError, match="no pinned EOS"):
         data.run_pin("gpt2", "main")
+
+
+def test_a_run_only_eos_may_not_repeat_a_pinned_tokenizer():
+    """The run-only table adds repos; one that is also pinned raises rather than overriding
+    the pinned EOS."""
+    pins = (data.TEST_SCALE_TOKENIZER,)
+    merged = data._eos_ids(pins, {"meta-llama/Llama-3.2-1B-Instruct": 128009})
+    assert merged == {"HuggingFaceTB/SmolLM2-135M-Instruct": 2,
+                      "meta-llama/Llama-3.2-1B-Instruct": 128009}
+    with pytest.raises(ValueError, match="repeats pinned tokenizers"):
+        data._eos_ids(pins, {"HuggingFaceTB/SmolLM2-135M-Instruct": 0})
 
 
 # ---- records under SmolLM2 ------------------------------------------------------------------

@@ -6,7 +6,8 @@
 The honest run's training with capture and every protocol step off: ``T`` steps (``--steps``,
 else ``VERIF_STEPS``, default 10) from the same ``W_0`` (the model
 ``DecoderComputation.from_config`` loads), on the same batches ``π(t)`` of ``D``
-(``$VERIF_OUTPUT_DIR/data/D.bin``, from ``materialize_data``) at the same ``η`` (``VERIF_ETA``).
+(``$VERIF_OUTPUT_DIR/data/D.bin``, from ``materialize_data``, whose ``meta.json`` must name the
+run's model and pad id, as for the verified runs) at the same ``η`` (``VERIF_ETA``).
 Each step is
 :func:`~verification.prover.step.plain_step` driven by :func:`~verification.runs.loop.run_plain`:
 the prover's SGD step without ``MatmulCapture``, and no labeling, commitment, paths or verifier.
@@ -57,11 +58,11 @@ import torch
 
 from setup import backdoorllm
 from setup.config import RunConfig, load_config, setup_determinism
-from setup.data import load_dataset_records
 from verification.commitment.encoding import TAG_WEIGHT
 from verification.commitment.leaves import dataset_root
 from verification.commitment.merkle import hash_tensor_leaf, merkle_root
 from verification.computation.interface import DeclaredComputation, snapshot_weights
+from verification.runs.llama_step import load_committed_dataset
 from verification.runs.loop import PlainResult, run_plain
 from verification.runs.scenarios import ReusedModel
 from verification.runs.metrics import (
@@ -367,15 +368,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     T = args.steps if args.steps is not None else cfg.steps
     if T < 1 or not 1 <= args.pass_steps <= T:
         p.error(f"need T ≥ 1 and 1 ≤ --pass-steps ≤ T, got T = {T}, {args.pass_steps}")
-    d_path = cfg.data_dir / "D.bin"
-    if not d_path.exists():
-        p.error(f"no {d_path}; run verification.runs.materialize_data first")
+    if not all((cfg.data_dir / f).exists() for f in ("D.bin", "meta.json")):
+        p.error(f"no D.bin or meta.json under {cfg.data_dir}; run "
+                "verification.runs.materialize_data first")
     if use_metrics and sys.platform == "darwin" and os.environ.get("MallocLargeCache") != "0":
         log.warning("MallocLargeCache is not 0: macOS keeps freed large blocks in the footprint, "
                     "so this run's memory rows don't compare with other runs'")
     setup_determinism(cfg)
     c = DecoderComputation.from_config(cfg)
-    dataset = load_dataset_records(d_path, c.n)
+    dataset, _ = load_committed_dataset(c, cfg.data_dir)  # raises unless built for c's model
     # One from_pretrained model for W_0 (as the verified run's prover loads it), the timed run
     # and both passes; each run loads W_0 into it before use (scenarios.ReusedModel).
     models = ReusedModel(c.build_model)

@@ -74,15 +74,45 @@ from verification.verifier.residuals import (
     tensor_summary,
 )
 
-__all__ = ["run_honest", "report_residuals", "report_costs", "load_committed_dataset", "main"]
+__all__ = ["run_honest", "report_residuals", "report_costs", "load_committed_dataset",
+           "check_data_model", "main"]
 
 RUN_NAME = "llama_step"  # the metrics directory under VERIF_OUTPUT_DIR
 
+
+def check_data_model(meta: Mapping[str, Any], *, source: tuple[str, str] | None, pad_id: int,
+                     where: Path | str) -> None:
+    """Raise ``ValueError`` unless ``meta.json`` (``materialize_data.build_meta``) was built for
+    the run's model: its run tokenizer is ``source`` (repo and revision) and its ``pad_id`` is
+    the run's. A missing field doesn't match. Each model has its own ``D`` (S2): a directory
+    built for another model holds other token ids and pads with another id.
+
+    A random test model (``source`` ``None``) has no tokenizer to compare; its ``pad_id`` is
+    compared when ``meta.json`` has one."""
+    tokenizers = meta.get("tokenizers")
+    run = tokenizers.get("run") if isinstance(tokenizers, Mapping) else None
+    built = (run.get("repo"), run.get("revision")) if isinstance(run, Mapping) else (None, None)
+    built_pad = meta.get("pad_id")
+    if source is None:
+        if built_pad is None or built_pad == pad_id:
+            return
+    elif built == tuple(source) and built_pad == pad_id:
+        return
+    model = "a random test model" if source is None else f"{source[0]}@{source[1]}"
+    raise ValueError(
+        f"{where}: the data was built for {built[0]}@{built[1]} with pad id {built_pad}, but "
+        f"the run's model is {model} with pad id {pad_id}. Rerun "
+        "verification.runs.materialize_data with VERIF_MODEL and VERIF_MODEL_REVISION set to "
+        "the run's model, in its own VERIF_OUTPUT_DIR")
+
+
 def load_committed_dataset(c: DecoderComputation, data_dir: Path) -> tuple[list[Any], bytes]:
     """``D`` from ``D.bin`` (every record validated) and the published ``h_D`` from
-    ``meta.json``, both written by ``materialize_data``."""
-    D = load_dataset_records(data_dir / "D.bin", c.n)
+    ``meta.json``, both written by ``materialize_data``, once :func:`check_data_model` has
+    found ``meta.json`` built for ``c``'s model and pad id."""
     meta = json.loads((data_dir / "meta.json").read_text())
+    check_data_model(meta, source=c.source, pad_id=c.pad_id, where=data_dir / "meta.json")
+    D = load_dataset_records(data_dir / "D.bin", c.n)
     return D, bytes.fromhex(meta["h_D"])
 
 

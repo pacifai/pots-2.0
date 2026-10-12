@@ -1197,6 +1197,20 @@ def test_freeze_accepts_honest_run_and_records_source(c, D, tree, w0):
         v.freeze(bands)
 
 
+def test_calibration_rejected_at_its_start_ends_unfrozen(c, D, tree, w0):
+    """A calibration run that check 1 rejects ends with that rejection: no step ran, so there
+    is nothing to fit or freeze on. One that started still needs the freeze."""
+    v = _make(c, D, tree, w0, n_steps=1, bands=None, calibrate=True, allow_provisional=False)
+    rej = v.start_run(D[:-1])
+    _expect(rej, driver.RUN_START, "1")
+    verdict = v.end_run(w0)
+    assert (verdict.accepted, verdict.rejection, verdict.steps_verified) == (False, rej, 0)
+    assert verdict.band_source is None and "8" not in v.run_timings
+    started = _verifier(c, D, tree, w0, n_steps=1, bands=None, calibrate=True)
+    with pytest.raises(RuntimeError, match="unfrozen"):
+        started.end_run(w0)
+
+
 def test_steps_after_freeze_are_judged(c, D, tree, w0):
     v, w = _calibrate(c, D, tree, w0, 2, 1)
     assert v.freeze(_band_file()) is None

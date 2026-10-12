@@ -30,9 +30,11 @@ Implementation pins (not fixed by the reference block):
   outside the stack. ``member`` is the 0-based ``(s, h)``, the bmm batch index ``s·n_h + h``
   of HF's eager attention. Each product's κ class (:meth:`DecoderComputation.product_class`)
   is its role without the layer and member.
-- **Batch assembly** is ``data.assemble_batch``: right padding with ``PAD_ID`` (SmolLM2's EOS,
-  F8f), ``ρ`` from each record's ``ℓ``. ``ρ`` is the HF ``attention_mask``, so ``Ω`` is HF's
-  causal mask over ``ρ``. Positions are ``0 … n−1`` in every sequence.
+- **Batch assembly** is ``data.assemble_batch``: right padding with ``pad_id``, the model's
+  EOS (F8f: ``data.run_pin(repo, revision)`` for a loaded model, SmolLM2's ``PAD_ID`` for a
+  random test model unless given), ``ρ`` from each record's ``ℓ``. ``ρ`` is the HF
+  ``attention_mask``, so ``Ω`` is HF's causal mask over ``ρ``. Positions are ``0 … n−1`` in
+  every sequence.
 - **Loss** is ref block §3's ``ℒ = Σ_i μ_i·CE_i / Σ_i μ_i`` over the logits, with
   ``F.cross_entropy(reduction="none")`` per token. ``μ`` takes ``CE``'s dtype, fp32 under
   autocast too; in the bf16 logits' dtype ``Σ μ`` would round above 256. A batch with
@@ -105,7 +107,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from setup.config import RunConfig, assert_no_dropout
-from setup.data import PAD_ID, Batch, assemble_batch
+from setup.data import PAD_ID, Batch, assemble_batch, run_pin
 from setup.model import load_model_config, load_pretrained
 from setup.records import Record, RecordError, encode_record
 from verification.computation.interface import (
@@ -170,16 +172,24 @@ class DecoderComputation(DeclaredComputation):
     ``tied`` and ``qkv_bias`` are the config's switches (module docstring).
     ``(master_dtype, compute_dtype)`` is ``(MASTER_DTYPE, COMPUTE_DTYPE)``, and ``device`` the
     device whose autocast runs when the two differ (F6b).
+    ``pad_id`` is the batch's pad, the model's EOS (F8f). With ``source`` it is
+    ``data.run_pin(*source)``'s, and a different ``pad_id`` raises; without, it defaults to
+    SmolLM2's ``PAD_ID``.
     """
 
     def __init__(self, config: Any, *, n_s: int, n: int, eta: float,
                  source: tuple[str, str] | None = None,
                  master_dtype: torch.dtype = torch.float32,
                  compute_dtype: torch.dtype = torch.float32,
-                 device: str | torch.device = "cpu") -> None:
+                 device: str | torch.device = "cpu",
+                 pad_id: int | None = None) -> None:
         self.config = copy.deepcopy(config)
         self.source = source
         self._n_s, self.n, self._eta = int(n_s), int(n), float(eta)
+        pinned = None if source is None else run_pin(*source).eos_token_id
+        if pad_id is not None and pinned is not None and pad_id != pinned:
+            raise ValueError(f"pad_id {pad_id} is not {source[0]}'s pinned EOS {pinned} (F8f)")
+        self.pad_id = int(next(p for p in (pad_id, pinned, PAD_ID) if p is not None))
         # F6b: fp32 masters, bf16 compute through autocast. fp16 compute needs loss scaling,
         # which no decision covers.
         if master_dtype != torch.float32:
@@ -242,6 +252,8 @@ class DecoderComputation(DeclaredComputation):
             bad.append("pretraining_tp must be 1")
         if self.n_h % self.n_kv:
             bad.append(f"n_h={self.n_h} is not a multiple of n_kv={self.n_kv}")
+        if not 0 <= self.pad_id < self.n_v:
+            bad.append(f"pad_id={self.pad_id} is outside the vocabulary of {self.n_v}")
         if bad:
             raise ValueError("unsupported config: " + "; ".join(bad))
         assert_no_dropout(c)
@@ -505,9 +517,7 @@ class DecoderComputation(DeclaredComputation):
         for r in records:
             if not isinstance(r, Record):
                 raise ValueError(f"a decoder record is a records.Record, got {type(r).__name__}")
-        # F8f: the pad is the model's EOS. PAD_ID is SmolLM2's; the first real-model run (FS4)
-        # wires each model's EOS from data.run_pin.
-        return assemble_batch(records, self.n, pad_id=PAD_ID)
+        return assemble_batch(records, self.n, pad_id=self.pad_id)
 
     def logits(self, model: nn.Module, batch: Batch) -> torch.Tensor:
         """``Λ`` as ``[n_s, n, n_v]``: the forward pass, embedding to output projection."""
