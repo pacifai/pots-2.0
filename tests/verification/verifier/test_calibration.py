@@ -27,13 +27,22 @@ from verification.verifier.calibration import (
     band_context,
     band_file_bytes,
     fit,
+    largest_e_m,
     load_bands,
     realized_floor,
+    step_floor,
     write_band_file,
 )
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 from verification.verifier.driver import Verifier
-from verification.verifier.matmul_check.sizing import C_ANTI, Z, bit_budget, e_m, f_achieved
+from verification.verifier.matmul_check.sizing import (
+    C_ANTI,
+    Z,
+    bit_budget,
+    e_m,
+    f_achieved,
+    size_k,
+)
 
 SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
@@ -41,8 +50,10 @@ K = 2
 EPS = 2.0 ** -24
 
 
-def _p(m, name, cls, kappa, res, q=8, p_norm=1.0, nu=1.0, p_abs1=1.0):
-    return ProductStat(m, name, cls, kappa, res, q=q, p_norm=p_norm, nu=nu, p_abs1=p_abs1)
+def _p(m, name, cls, kappa, res, q=8, p_norm=1.0, nu=1.0, p_abs1=1.0, u=None):
+    """A recorded product; its term scale ``U`` defaults to ``‖P‖_F`` (ratio 1, F18)."""
+    return ProductStat(m, name, cls, kappa, res, q=q, p_norm=p_norm, nu=nu, p_abs1=p_abs1,
+                       u=p_norm if u is None else u)
 
 
 def stats():
@@ -115,7 +126,68 @@ def test_realized_floor_by_contracted_dimension():
     assert f.count == 4 and f.ratio_max == big and f.ratio_max_name == "Lambda"
     assert f.ratio_min == small and math.isclose(f.phi_max, big * 20.0)
     assert f.over_target == sum(r > 1 for r in (small, small, big, big))
-    assert f.zero_row_sum == ()
+    assert f.zero_row_sum == () and f.zero_norm == ()
+
+
+def test_realized_floor_takes_each_products_own_e_m():
+    """F18: a product whose terms cancel (``U > ‖P‖_F``) gets a wider ``e_m`` and so a higher
+    floor than another of the same ``q``; ``by_q`` keeps the largest. ``U ≤ ‖P‖_F`` changes
+    nothing (``max(1, ·)``). A product with ``‖P‖_F = 0`` is listed and left out."""
+    st = stats()
+    st[2].products[1] = _p(2, "Lambda", "Lambda", 4.0, (3.5, 2.0), q=576, p_norm=20.0, u=60.0)
+    st[1].products[0] = _p(1, "L1.Y_q", "Y_q", 2.0, (1.0, 1.0), u=0.25)
+    st[1].products.append(_p(3, "L1.dA[0,0]", "dA", 1.0, (0.1, 0.1), q=8, p_norm=0.0, u=0.0))
+    tau, N = 30.0, bit_budget(25, 10, 7113, 52)
+    f = realized_floor(st, tau=tau, k=K, N=N, eps_in=EPS, eps_acc=EPS)
+    small = f_achieved(C_ANTI, tau, e_m(8, EPS, EPS), N, K)
+    wide = f_achieved(C_ANTI, tau, e_m(576, EPS, EPS, 3.0), N, K)
+    assert wide > f_achieved(C_ANTI, tau, e_m(576, EPS, EPS), N, K)
+    assert f.by_q == {8: small, 576: wide} and f.ratio_max == wide and f.count == 4
+    assert f.zero_norm == ("L1.dA[0,0] (step 1)",)
+
+
+def test_largest_e_m_and_the_k_recompute():
+    """P10d's recompute sizes at the largest calibration ``e_m`` (F18), which a cancelling
+    product of small ``q`` can set; without one it is ``e_m(q_max)`` at ratio 1."""
+    st = stats()
+    big = largest_e_m(st, eps_in=EPS, eps_acc=EPS)
+    assert (big.e_m, big.name, big.q, big.ratio) == (e_m(576, EPS, EPS), "Lambda", 576, 1.0)
+    assert big.step == 1 and big.at == "Lambda (step 1)"  # the first wins a tie
+    # a q = 8 product whose terms cancel 20-fold: √8·20 > √576
+    st[2].products[0] = _p(1, "L1.Y_q", "Y_q", 3.0, (0.5, 0.5), u=20.0)
+    big = largest_e_m(st, eps_in=EPS, eps_acc=EPS)
+    assert (big.name, big.step, big.q, big.ratio) == ("L1.Y_q", 2, 8, 20.0)
+    assert big.e_m == e_m(8, EPS, EPS, 20.0) > e_m(576, EPS, EPS)
+    assert (big.u_ratio_max, big.u_ratio_max_name) == (20.0, "L1.Y_q (step 2)")
+    kw = {"T": 10, "M": 7113, "eps_in": 2.0 ** -8, "eps_acc": EPS, "s_h": 5.0}
+    adv = size_k(576, **kw)
+    cal = size_k(576, **kw, e_cal=e_m(8, 2.0 ** -8, EPS, 20.0), e_cal_at=big.at)
+    assert adv.e_max == adv.e_qmax == e_m(576, 2.0 ** -8, EPS) and adv.e_cal is None
+    assert cal.e_max == max(cal.e_qmax, cal.e_cal) and cal.e_cal_at == big.at
+    low = size_k(576, **kw, e_cal=1e-12)  # below e_m(q_max): the advance value stands
+    assert low.e_max == adv.e_max and low.k == adv.k
+    with pytest.raises(ValueError, match="largest calibration e_m"):
+        size_k(576, **kw, e_cal=math.inf)
+    zero = {1: StepStats(products=[_p(1, "a", "c", 1.0, (0.0, 0.0), p_norm=0.0, u=0.0)])}
+    with pytest.raises(ValueError, match="no products"):
+        largest_e_m(zero, eps_in=EPS, eps_acc=EPS)
+
+
+def test_step_floor_is_the_largest_f_achieved_and_skips_what_it_cannot_score():
+    st = stats()[2]
+    tau, N = 30.0, 93.0
+    want = f_achieved(C_ANTI, tau, e_m(576, EPS, EPS), N, 9)
+    got = step_floor(st, tau=tau, k=9, N=N, eps_in=EPS, eps_acc=EPS)
+    assert (got.f_achieved, got.name) == (want, "Lambda")
+    st.products.append(_p(3, "dF", "dF", 1.0, (0.1, 0.1), q=8, p_norm=1.0, u=1e3))
+    got = step_floor(st, tau=tau, k=9, N=N, eps_in=EPS, eps_acc=EPS)
+    assert got.name == "dF" and got.f_achieved == f_achieved(C_ANTI, tau, e_m(8, EPS, EPS, 1e3),
+                                                              N, 9)
+    odd = StepStats(products=[ProductStat(1, "a", "c", 1.0, (1.0,)),  # nothing recorded
+                              _p(2, "b", "c", 1.0, (1.0,), p_norm=0.0, u=0.0),
+                              _p(3, "c", "c", 1.0, (1.0,), p_norm=math.inf),
+                              _p(4, "d", "c", 1.0, (1.0,), u=math.nan)])
+    assert step_floor(odd, tau=tau, k=9, N=N, eps_in=EPS, eps_acc=EPS) is None
 
 
 def test_realized_floor_flags_a_zero_row_sum_and_needs_the_scales():

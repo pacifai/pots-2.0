@@ -18,8 +18,10 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
    - the concentration guard (largest honest normalized residual ``≤ τ/2``) fails; ``z`` is
      never raised here;
    - P10d's recompute of ``k`` with the measured ``τ`` (``sizing.size_k``, ``T = VERIF_STEPS``,
-     ``M`` of ``C``, ``q_max`` the largest contracted dimension) asks for more than ``VERIF_K``.
-     Rerun with ``VERIF_K`` raised; ``s_h`` doesn't depend on ``k``.
+     ``M`` of ``C``) asks for more than ``VERIF_K``. Since F18 it sizes at the largest ``e_m``
+     over the calibration products (``calibration.largest_e_m``, each product's own ``e_m``
+     from its ``q``, ``‖P‖_F`` and term scale ``U``), not at ``e_m(q_max)``; the report gives
+     ``k`` both ways. Rerun with ``VERIF_K`` raised; ``s_h`` doesn't depend on ``k``.
 
    An honest rejection, at an exact check or when the bands freeze, exits 1.
 3. **The band file.** Written to ``$VERIF_OUTPUT_DIR/bands.json`` (``ProtocolConfig.band_file``),
@@ -79,11 +81,13 @@ from verification.runs.scenarios import (
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.calibration import (
     Calibration,
+    LargestEm,
     RealizedFloor,
     assert_same_band_source,
     band_context,
     band_file_bytes,
     fit,
+    largest_e_m,
     load_bands,
     realized_floor,
     write_band_file,
@@ -112,7 +116,9 @@ WATCH = (2, 2371)
 @dataclass
 class CalibrationRun:
     """What the calibration run produced. ``data`` is the band file's bytes, ``bands`` the
-    bands they hold (``source`` = their hash)."""
+    bands they hold (``source`` = their hash). ``sizing`` is P10d's recompute at the largest
+    calibration ``e_m`` (``largest``, F18); ``sizing_qmax`` the pre-F18 one at ``e_m(q_max)``,
+    reported beside it."""
 
     result: ScenarioResult
     cal: Calibration
@@ -121,6 +127,8 @@ class CalibrationRun:
     data: bytes
     bands: Bands
     freeze_rejection: Rejection | None
+    sizing_qmax: Sizing
+    largest: LargestEm
 
 
 def _sizing_inputs(c: DecoderComputation, T_run: int) -> dict[str, Any]:
@@ -156,26 +164,36 @@ def calibrate(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Te
         v: Verifier = out["v"]
         cal = fit(v.stats, k=k)
         inp = _sizing_inputs(c, T_run)
-        sz = size_k(**inp, s_h=cal.s_h, z=cal.z)
+        big = largest_e_m(v.stats, eps_in=inp["eps_in"], eps_acc=inp["eps_acc"])
+        sz = size_k(**inp, s_h=cal.s_h, z=cal.z, e_cal=big.e_m, e_cal_at=big.at)
+        sz_q = size_k(**inp, s_h=cal.s_h, z=cal.z)
         N = bit_budget(LAMBDA, T_run, c.M, LOG2_G)
         floor = realized_floor(v.stats, tau=cal.tau, k=k, N=N, eps_in=inp["eps_in"],
                                eps_acc=inp["eps_acc"])
         stats = {"sizing": dataclasses.asdict(sz), "k_required": sz.k,
+                 "k_required_qmax": sz_q.k, "largest_e_m": _largest_dict(big),
                  "realized_floor": _floor_dict(floor), "context": dict(context)}
         data = band_file_bytes(cal, stats)
         bands = Bands.from_json(data)
-        out.update(cal=cal, sizing=sz, floor=floor, data=data, bands=bands,
-                   freeze=v.freeze(bands))
+        out.update(cal=cal, sizing=sz, sizing_qmax=sz_q, largest=big, floor=floor, data=data,
+                   bands=bands, freeze=v.freeze(bands))
 
     r = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final, on_step=on_step,
                      recorder=recorder, h_D=h_D, build_model=build_model, verifier=make)
     return CalibrationRun(r, out["cal"], out["sizing"], out["floor"], out["data"],
-                          out["bands"], out["freeze"])
+                          out["bands"], out["freeze"], out["sizing_qmax"], out["largest"])
+
+
+def _largest_dict(b: LargestEm) -> dict[str, Any]:
+    d = dataclasses.asdict(b)
+    d["at"] = b.at
+    return d
 
 
 def _floor_dict(f: RealizedFloor) -> dict[str, Any]:
     d = dataclasses.asdict(f)
     d["zero_row_sum"] = list(f.zero_row_sum)
+    d["zero_norm"] = list(f.zero_norm)
     d["by_q"] = {str(q): r for q, r in f.by_q.items()}
     return d
 
@@ -336,9 +354,16 @@ def report_calibration(run: CalibrationRun, k: int, out: Callable[[str], None] =
         f"{max(cal.tau_w.values()):.3f}; {len(above)} above the floor {TAU_W0:g}"
         + "".join(f"\n  {w}: τ_W {x:.3f} (ρ_max {cal.rho_max[w]:.3f})"
                   for w, x in sorted(above.items(), key=lambda kv: -kv[1])))
-    out(f"k recompute (P10d): q_max {sz.q_max}, e_max {sz.e_max:.4e}, τ {sz.tau:.3f}, "
+    big, sq = run.largest, run.sizing_qmax
+    out(f"band unit (F18): σ_r·e_m·‖P‖_F with e_m = √2·ε_in + √q·ε_acc·max(1, U/‖P‖_F); "
+        f"U/‖P‖_F max {big.u_ratio_max:.3f} at {big.u_ratio_max_name}"
+        + ("" if not big.zero_norm else f"; {big.zero_norm} products with ‖P‖_F = 0 left out"))
+    out(f"largest calibration e_m {big.e_m:.4e} at {big.at} (q {big.q}, U/‖P‖_F "
+        f"{big.ratio:.3f}); e_m(q_max = {sz.q_max}) at ratio 1 is {sz.e_qmax:.4e}")
+    out(f"k recompute (P10d) at e_max {sz.e_max:.4e} (the larger of the two), τ {sz.tau:.3f}, "
         f"b0 {sz.b0:.3f} bits, N {sz.N:.2f} bits → k = ⌈N/b0⌉ = {sz.k} (configured {k}); "
-        f"f_achieved at q_max with k = {sz.k}: {sz.f_achieved:.4f}")
+        f"f_achieved with k = {sz.k}: {sz.f_achieved:.4f}")
+    out(f"  pre-F18 sizing at e_m(q_max) {sq.e_max:.4e}: b0 {sq.b0:.3f} bits → k = {sq.k}")
     out(f"realized floor Φ_m/‖P_m‖_F at k = {k}: min {f.ratio_min:.4f}, median "
         f"{f.ratio_median:.4f}, max {f.ratio_max:.4f} ({f.ratio_max_name}); target 1, "
         f"{f.over_target} of {f.count} above; poisoned-batch margin 1/√2: "
@@ -347,6 +372,8 @@ def report_calibration(run: CalibrationRun, k: int, out: Callable[[str], None] =
     out("  by contracted dimension q: " + ", ".join(f"q={q}: {r:.4f}" for q, r in f.by_q.items()))
     out(f"  products with ‖|P|·1‖ = 0 and ν ≠ 0: {len(f.zero_row_sum)}"
         + ("" if not f.zero_row_sum else f" {list(f.zero_row_sum)[:5]}"))
+    if f.zero_norm:
+        out(f"  products with ‖P‖_F = 0 (no relative floor): {len(f.zero_norm)}")
     v = run.result.loop.verdict
     out(f"frozen bands {run.bands.source[:16]}…: steps 1–{len(cal.steps)} "
         + ("accepted" if run.freeze_rejection is None else f"REJECTED: {run.freeze_rejection}")
@@ -434,7 +461,9 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "bands.json").write_bytes(run.data)  # the record of this run, whatever the gates
     summary = {"record": "calibration", "run": RUN_NAME, "band_file_hash": run.bands.source,
-               "k": k, "k_required": run.sizing.k, "s_h": run.cal.s_h,
+               "k": k, "k_required": run.sizing.k, "k_required_qmax": run.sizing_qmax.k,
+               "e_max": run.sizing.e_max, "e_max_at": run.sizing.e_cal_at,
+               "u_ratio_max": run.largest.u_ratio_max, "s_h": run.cal.s_h,
                "s_h_class": run.cal.s_h_class, "tau": run.cal.tau,
                "global_max": run.cal.global_max, "guard_ok": run.cal.guard_ok,
                "realized_floor_max": run.floor.ratio_max,
