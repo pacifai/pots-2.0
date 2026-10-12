@@ -808,9 +808,10 @@ interface.
     equal, and `tests/verification/runs/test_calibrate.py` runs `gradient_coherence` at both
     dtypes.
   - **The full-scale models (FS4).** `tests/verification/full_scale_helpers.py` holds `PINS`,
-    the four models at their commits, smallest first: Qwen2.5-0.5B, Falcon3-1B, the
-    preliminary Llama-3.2-1B mirror (`unsloth/…`; Meta's repo runs through `VERIF_MODEL` and
-    `VERIF_MODEL_REVISION` alone) and Qwen2.5-1.5B. `full_scale_case(repo, revision)` builds
+    the four models at their commits, in the order FS4 ran them: Qwen2.5-0.5B, Falcon3-1B,
+    Qwen2.5-1.5B and Meta's Llama-3.2-1B-Instruct (`meta-llama/…` at `92131767`, which replaced
+    the unsloth mirror there; the mirror's tokenizer still filters the shared list, and both
+    give the same ids on every row of the four training files). `full_scale_case(repo, revision)` builds
     each one's run config, `D` and `h_D` without fetching, or skips when the weights aren't
     cached. `computation/test_full_scale_models.py`'s slow `test_real_step_labels_and_replays`
     checks, per model, that every slot is filled once (M2), and that every forward operand
@@ -1387,14 +1388,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     root, loss, residual and final weight is bit-identical; step 2 still rejects at check 5
     on `P_2371` (`Λ`), residual 10.1 > τ = 8.
 - `bring_up.py` (FS4): `VERIF_MODEL=<repo> VERIF_MODEL_REVISION=<commit> .venv/bin/python -m
-  verification.runs.bring_up [--steps T] [--reference-bands PATH] [--tamper | --no-tamper]`,
-  `T` default 1. One full-scale model on CPU at test scale's other settings (dtypes, `n_s × n`,
+  verification.runs.bring_up [--steps T] [--reference-bands PATH] [--tamper | --no-tamper]
+  [--disk-transcripts DIR]`, `T` default 1. One full-scale model on CPU at test scale's other settings (dtypes, `n_s × n`,
   η, `k`, seed); nothing in the code names a model, so Meta's Llama repo runs through the two
   env vars alone. `D` and `h_D` come from `$VERIF_OUTPUT_DIR/data/` (`materialize_data` for the
   same model). `main` stops with an error, before loading anything, when `model_pin` finds no
   cached weights or `D.bin` is missing; it never downloads. Exits 1 unless `BringUp.passed`.
-  - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu") ->
-    BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It takes any
+  - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu",
+    handoff=None) -> BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It takes any
     `DecoderComputation`, so a random-weight config runs the same path. `W_0` and every prover
     run come from one `ReusedModel`. Check 8's reference is `honest_final`'s `W_T`, kept as
     leaf hashes (`leaf_hashes_of`, `end_run` takes either). The honest run is `run_scenario`
@@ -1404,8 +1405,13 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     run with check 8; a live rejection freezes on placeholder bands, since it stands whatever
     the bands are. The fit is in-sample and never written: it judges the freeze and the
     tamper, nothing else.
-  - `bias_tamper(c, D, w0, bands, *, k, seed, h_D, build_model, layer=1, x="q")`: two one-step
-    judged runs (FS2's switch test on the real model). The last entry of `b_q` in layer 1 is
+  - `handoff` (`--disk-transcripts DIR`, a `DiskHandoff(DIR)`) hands each step to the verifier
+    as C3's store cross-check does, the honest steps and both tampers alike; `None` is
+    `IN_MEMORY`. The protocol code is the same either way, and the disk write lands in the
+    commit time. `test_disk_handoff_gives_the_same_decisions` checks that a tiny Qwen2 run
+    decides number for number as in memory and leaves `DIR` empty.
+  - `bias_tamper(c, D, w0, bands, *, k, seed, h_D, build_model, layer=1, x="q",
+    handoff=None)`: two one-step judged runs (FS2's switch test on the real model). The last entry of `b_q` in layer 1 is
     raised by 1 in training with the `W_t` leaf restored (expected: check 5 naming
     `P_m (L1.Y_q)`), and in an honest step's `W_{t+1}` leaf (expected: 6b naming the bias).
     `Tamper.rejected_as_expected` checks the step, the check and that name.

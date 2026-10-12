@@ -1,4 +1,5 @@
-"""The full-scale models for FS4's slow bring-up tests, each pinned to a commit, smallest first.
+"""The full-scale models for FS4's slow bring-up tests, each pinned to a commit, in the order
+FS4 ran them.
 
 Each case skips unless its weights and every tokenizer are in the local Hugging Face cache and
 BackdoorLLM's files in the local data cache: the tests never download. A case's run settings
@@ -15,10 +16,11 @@ import pytest
 PINS = (
     ("Qwen/Qwen2.5-0.5B-Instruct", "7ae557604adf67be50417f59c2c2f167def9a775"),
     ("tiiuae/Falcon3-1B-Instruct", "28ba2251970a01dd1edc7ba7dad2eb71216ccfdf"),
-    # Preliminary: the unsloth mirror stands in for Meta's repo, which a run takes through
-    # VERIF_MODEL and VERIF_MODEL_REVISION alone.
-    ("unsloth/Llama-3.2-1B-Instruct", "5a8abab4a5d6f164389b1079fb721cfab8d7126c"),
     ("Qwen/Qwen2.5-1.5B-Instruct", "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"),
+    # Meta's own repo, run under its own tokenizer (EOS 128009, setup.data.RUN_ONLY_EOS). The
+    # shared list was filtered under the unsloth mirror's tokenizer (F8d); both give the same
+    # ids on every row of the four training files (FS4, 2026-10-12).
+    ("meta-llama/Llama-3.2-1B-Instruct", "9213176726f574b556790deb65791e0c5aa438b6"),
 )
 PIN_IDS = [repo.split("/")[1] for repo, _ in PINS]
 

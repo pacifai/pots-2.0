@@ -9,12 +9,13 @@ from tests.verification.full_scale_helpers import PIN_IDS, PINS, full_scale_case
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances import DecoderComputation
 from verification.runs.bring_up import bring_up, family_maxima, reference_bands, report
+from verification.transcript.store import DiskHandoff
 from verification.verifier.bands import Bands
 
 SEED, K = 1, 5
 
 
-def _run(family, tied, *, T=2, tamper=True):
+def _run(family, tied, *, T=2, tamper=True, handoff=None):
     c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
     D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
 
@@ -24,7 +25,7 @@ def _run(family, tied, *, T=2, tamper=True):
         return m
 
     return c, bring_up(c, D, dataset_tree(c, D).root, T=T, k=K, seed=SEED, build_model=build,
-                       tamper=tamper)
+                       tamper=tamper, handoff=handoff)
 
 
 @pytest.fixture(scope="module", params=[("llama", True), ("qwen2", False)],
@@ -74,6 +75,18 @@ def test_scores_on_the_fit_stay_within_one(run):
         assert set(got) == {"rho_5", "rho_kappa", "rho_6"}
         for fam, (mx, n_over, where) in got.items():
             assert 0 < mx <= 1 and n_over == 0 and where, (t, fam)
+
+
+def test_disk_handoff_gives_the_same_decisions(tmp_path):
+    """Through C3's ``DiskHandoff`` (``--disk-transcripts``) the honest run, its fit and both
+    tampers decide as in memory, number for number, and every step's directory is deleted."""
+    _, mem = _run("qwen2", False)
+    _, disk = _run("qwen2", False, handoff=DiskHandoff(tmp_path))
+    assert disk.passed and len(disk.tampers) == 2
+    assert disk.result.verifier.stats == mem.result.verifier.stats
+    assert disk.bands.source == mem.bands.source
+    assert [t.rejection for t in disk.tampers] == [t.rejection for t in mem.tampers]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_reference_bands_carry_over_to_another_model():

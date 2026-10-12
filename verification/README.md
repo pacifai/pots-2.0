@@ -357,7 +357,9 @@ replaced:
   a reference band file such as SmolLM2's, each score family's largest score, for information.
   On a model with q, k, v biases it alters one bias entry and expects check 5 or 6b to reject.
   It reports each side's time and peak memory per step. It never downloads: it stops if the
-  weights aren't cached.
+  weights aren't cached. With `--disk-transcripts DIR` each step reaches the verifier on disk,
+  through the store cross-check's `DiskHandoff`, rather than in memory; the protocol code is
+  the same.
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every

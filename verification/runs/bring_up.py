@@ -2,7 +2,7 @@
 
     VERIF_MODEL=<repo> VERIF_MODEL_REVISION=<commit> VERIF_OUTPUT_DIR=<dir> \\
         .venv/bin/python -m verification.runs.bring_up [--steps T] [--reference-bands PATH]
-        [--tamper | --no-tamper]
+        [--tamper | --no-tamper] [--disk-transcripts DIR]
 
 Before any GPU run, each full-scale model goes through the code on CPU with test scale's other
 settings: ``(VERIF_MASTER_DTYPE, VERIF_COMPUTE_DTYPE)``, ``VERIF_BATCH × VERIF_SEQ_LEN``, η,
@@ -33,7 +33,10 @@ weights aren't in the local Hugging Face cache.
    must fail check 6b.
 5. **Cost.** The honest run is the B6 memory pass (``MemoryRecorder``): each step's prover and
    verifier peak, beside the loop's wall clocks (``prove_step`` and the commit; every check),
-   which the probe's sampling slows a little.
+   which the probe's sampling slows a little. With ``--disk-transcripts DIR`` every step, the
+   tampers' included, reaches the verifier through C3's ``DiskHandoff`` instead of in memory
+   (an option of this run only; the protocol code is the same); the write lands in the commit
+   time.
 
 Exits 0 when the honest run is accepted and each tamper is rejected where expected, else 1.
 """
@@ -54,7 +57,7 @@ import torch
 from setup.config import load_config, setup_determinism
 from setup.data import schedule
 from setup.model import model_pin
-from verification.commitment.leaves import dataset_tree, leaf_hashes_of
+from verification.commitment.leaves import dataset_tree, leaf_hash, leaf_hashes_of
 from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import snapshot_weights
 from verification.parameters import load_protocol_config
@@ -69,7 +72,7 @@ from verification.runs.metrics import (
     step_scores,
 )
 from verification.runs.scenarios import HONEST, ReusedModel, ScenarioResult, honest_final, run_scenario
-from verification.transcript.store import InMemoryStore, perturb_leaf
+from verification.transcript.store import IN_MEMORY, DiskHandoff, InMemoryStore, StoreHandoff
 from verification.verifier.bands import Bands, product_class
 from verification.verifier.calibration import Calibration, band_file_bytes, fit
 from verification.verifier.context import Rejection, Section
@@ -134,37 +137,47 @@ def _bump(t: torch.Tensor, index: int = -1) -> torch.Tensor:
 def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
                 bands: Bands, *, k: int, seed: int, h_D: bytes,
                 build_model: Callable[[], torch.nn.Module],
-                layer: int = 1, x: str = "q") -> list[Tamper]:
+                layer: int = 1, x: str = "q", handoff: StoreHandoff | None = None
+                ) -> list[Tamper]:
     """Step 1 with the last entry of ``b_x`` in layer ``layer`` raised by 1 (module docstring,
     4): in training only, under an honest ``W_t`` leaf (check 5 at ``L{layer}.Y_x``), and in
     the ``W_{t+1}`` leaf of an honest step (check 6b). Each is a one-step run judged by
-    ``bands``, built as FS2's switch test builds it."""
+    ``bands``, built as FS2's switch test builds it: the leaf is replaced and the tree
+    re-rooted before the step goes to ``handoff`` (default in memory), as the loop's does."""
     b = c.bias(layer, x)
     if b is None:
         raise ValueError(f"layer {layer}'s {x} projection has no bias")
+    hand = handoff or IN_MEMORY
     idx = schedule(1, c.n_s, len(D), seed)
     tree = dataset_tree(c, D)
     records, paths = [D[i] for i in idx], [tree.path(i) for i in idx]
 
     def verify(w: Mapping[str, torch.Tensor],
-               edit: Callable[[InMemoryStore], None]) -> Rejection | None:
+               edit: Callable[[list[Any]], tuple[int, Any]]) -> Rejection | None:
         v = Verifier(c, h_D=h_D, n_records=len(D), k=k, n_steps=1, bands=bands, seed=seed,
                      w0=w0)
         rej = v.start_run(D)
         if rej is not None:
             return rej
         out = prove_step(c, build_model(), w, records)
-        store = InMemoryStore.from_step(c, out, dataset_paths=paths)
+        leaves, tree_h = InMemoryStore.commit_step(c, out)
         del out
-        edit(store)
-        return v.verify_step(1, store)
+        i, obj = edit(leaves)
+        tree_h.update_leaf(i, leaf_hash(c, i, obj))
+        leaves[i] = obj
+        store = hand.hold(c, 1, leaves, tree_h, paths)
+        del leaves, tree_h
+        try:
+            return v.verify_step(1, store)
+        finally:
+            hand.release(store)
 
-    def honest_w_t(store: InMemoryStore) -> None:
-        perturb_leaf(c, store, c.w_t_index(b), w0[b].detach().clone())
+    def honest_w_t(leaves: list[Any]) -> tuple[int, Any]:
+        return c.w_t_index(b), w0[b].detach().clone()
 
-    def bump_w_next(store: InMemoryStore) -> None:
+    def bump_w_next(leaves: list[Any]) -> tuple[int, Any]:
         i = c.w_next_index(b)
-        perturb_leaf(c, store, i, _bump(store.leaf(i)))
+        return i, _bump(leaves[i])
 
     product = f"L{layer}.Y_{x}"
     return [
@@ -177,11 +190,13 @@ def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.
 
 def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: int,
              seed: int, build_model: Callable[[], torch.nn.Module] | None = None,
-             tamper: bool = True, device: str | torch.device = "cpu") -> BringUp:
+             tamper: bool = True, device: str | torch.device = "cpu",
+             handoff: StoreHandoff | None = None) -> BringUp:
     """Items 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
     a random-weight config runs the same path). ``build_model`` (default ``c.build_model``)
     gives the prover's model, built once and reused (``ReusedModel``). ``tamper`` runs item 4
-    when ``c`` has q, k, v biases."""
+    when ``c`` has q, k, v biases. ``handoff`` gives every step, the tampers' included, to the
+    verifier (default in memory; ``--disk-transcripts`` passes C3's ``DiskHandoff``)."""
     models = ReusedModel(build_model or c.build_model)
     w0 = snapshot_weights(c, models())
     # Check 8's reference as leaf hashes, in C's weight order, so the run holds no extra copy
@@ -212,14 +227,14 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
     def run(rec: Any) -> None:
         got["r"] = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final,
                                 on_step=on_step, recorder=rec, h_D=h_D, build_model=models,
-                                verifier=make)
+                                verifier=make, handoff=handoff)
 
     rows = memory_pass(RUN_NAME, HONEST.name, run, memory_probe(device))
     out = BringUp(got["r"], rows, got["cal"], got["bands"], got["freeze"])
     out.result.loop.w_final = {}  # the prover's W_T: check 8 has read it, and it is |W| bytes
     if tamper and c.qkv_bias and out.bands is not None and out.honest_accepted:
         out.tampers = bias_tamper(c, D, w0, out.bands, k=k, seed=seed, h_D=h_D,
-                                  build_model=models)
+                                  build_model=models, handoff=handoff)
     return out
 
 
@@ -308,6 +323,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="score the residuals against this band file (SmolLM2's), read-only")
     p.add_argument("--tamper", action=argparse.BooleanOptionalAction, default=True,
                    help="with q, k, v biases, run the altered-bias steps (default on)")
+    p.add_argument("--disk-transcripts", type=Path, default=None, metavar="DIR",
+                   help="hand each step to the verifier on disk under DIR (C3's DiskHandoff, "
+                        "one directory per step, deleted once verified); default in memory")
     args = p.parse_args(argv)
     if args.steps < 1:
         p.error(f"T = {args.steps}: at least one step")
@@ -333,8 +351,10 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"({dict(kinds)}), {c.n_leaves} leaves")
     print(f"run: n_s {c.n_s}, n {c.n}, η {c.eta:g}, k {k}, T {args.steps}, seed {cfg.seed}, "
           f"threads {cfg.threads}, |D| {len(D)}, h_D {h_D.hex()[:16]}…")
+    disk = args.disk_transcripts
+    print("hand-off: " + ("in memory" if disk is None else f"on disk under {disk}"))
     b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
-                 device=cfg.device)
+                 device=cfg.device, handoff=None if disk is None else DiskHandoff(disk))
     report(b, k=k, reference=reference, c=c)
     return 0 if b.passed else 1
 
