@@ -96,6 +96,24 @@ def test_grid_symmetric():
     assert np.array_equal(_entries((a << 8) | np.uint32(0xFF)), r)
 
 
+def _entries_int64(words: np.ndarray) -> np.ndarray:
+    """The entry map as first written, with int64 temporaries and a division by 2^24."""
+    a = (words.astype(np.uint32) >> 8).astype(np.int64)
+    return (2 * a + 1 - GRID).astype(np.float32) / np.float32(GRID)
+
+
+def test_entries_equal_int64_map_bit_for_bit():
+    a = np.arange(GRID, dtype=np.uint32) << np.uint32(8)
+    edge = np.array([0, 1, 0xFF, 0x100, 0x7FFFFFFF, 0x80000000, 0xFFFFFF00, 0xFFFFFFFF],
+                    dtype="<u4")
+    for w in (a, a | np.uint32(0xFF), edge, edge.reshape(2, 4)):
+        got = _entries(w)
+        assert got.dtype == np.float32 and got.shape == w.shape
+        assert np.array_equal(got.view(np.uint32), _entries_int64(w).view(np.uint32))
+    words = np.frombuffer(bytes(range(256)) * 4, dtype="<u4")  # read-only, as from an XOF
+    assert np.array_equal(_entries(words).view(np.uint32), _entries_int64(words).view(np.uint32))
+
+
 def test_blake3_keyed_official_vector():
     # BLAKE3 test_vectors.json: key "whats the Elvish word for friend", input_len 0,
     # first 32 bytes of keyed_hash.

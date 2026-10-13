@@ -55,22 +55,32 @@ def challenge_vector(h: bytes, m: int, j: int, width: int) -> torch.Tensor:
 
 
 def _entries(words: np.ndarray) -> np.ndarray:
-    """Map uint32 words to float32 grid entries `(2(w >> 8) + 1 - 2^24) / 2^24` (P8b)."""
-    a = (words.astype(np.uint32) >> 8).astype(np.int64)
-    numerator = (2 * a + 1 - _GRID).astype(np.float32)
-    return numerator / np.float32(_GRID)
+    """Map uint32 words to float32 grid entries `(2(w >> 8) + 1 - 2^24) / 2^24` (P8b).
+
+    Exact in 32-bit arithmetic, so it runs in place without int64 temporaries: `a = w >> 8`
+    is below 2^24, so its int32 view is the same integer; `2a + 1 - 2^24` is an odd integer
+    of magnitude below 2^24, so it fits int32 and converts to float32 exactly; and scaling by
+    the power of two 2^-24 is exact, the same value as dividing by 2^24.
+    """
+    a = (np.asarray(words, dtype=np.uint32) >> np.uint32(8)).view(np.int32)
+    a *= np.int32(2)
+    a += np.int32(1 - _GRID)
+    out = a.astype(np.float32)
+    out *= np.float32(1.0 / _GRID)
+    return out
 
 
 def challenge_matrix(h: bytes, m: int, k: int, width: int) -> torch.Tensor:
     """The k challenge vectors of product m as columns, float32 of shape `[width, k]`.
 
     Column `j - 1` is `challenge_vector(h, m, j, width)`, so check 5 evaluates all k tests
-    at once as `A @ (B @ R)` against `P @ R`.
+    at once as `A @ (B @ R)` against `P @ R`. The k XOF outputs go through the entry map in
+    one pass, as in `challenge_matrices`.
     """
     _validate(h, m, width)
     if not 1 <= k <= 255:
         raise ValueError(f"k must be in [1, 255], got {k}")
-    return torch.stack([challenge_vector(h, m, j, width) for j in range(1, k + 1)], dim=1)
+    return challenge_matrices(h, [m], k, width)[0]
 
 
 def challenge_matrices(h: bytes, ms: Sequence[int], k: int, width: int) -> torch.Tensor:
