@@ -445,6 +445,48 @@ def test_environment_and_run_end(smoke):
     assert end["lifetime_maxrss_bytes"] > 0
 
 
+def _kinds(d):
+    return [r["record"] for r in read_records(d)]
+
+
+def test_a_crashed_run_has_no_run_end(tmp_path):
+    """``run_end`` marks a completed run: a run that raised through ``try: … finally:
+    mw.close()`` (every run's entry point) or through ``with MetricsWriter(…)`` ends without
+    it, its finished records kept. A run that finished, or caught its error itself, gets it."""
+    with pytest.raises(AssertionError):
+        mw = MetricsWriter(tmp_path / "finally", "r")
+        try:
+            mw.write([{"record": "step", "run": "r"}])
+            raise AssertionError("the sweep's self-check")
+        finally:
+            mw.close()
+    assert _kinds(tmp_path / "finally") == ["environment", "step"]
+    with pytest.raises(KeyboardInterrupt), MetricsWriter(tmp_path / "with", "r"):
+        raise KeyboardInterrupt
+    assert _kinds(tmp_path / "with") == ["environment"]
+    from verification.runs.poisoned_step import _writer  # a generator's finally, too
+    with pytest.raises(RuntimeError), _writer(lambda s: MetricsWriter(tmp_path / s, s), "A1"):
+        raise RuntimeError
+    assert _kinds(tmp_path / "A1") == ["environment"]
+    mw = MetricsWriter(tmp_path / "caught", "r")
+    try:
+        try:
+            raise ValueError
+        except ValueError:
+            pass
+    finally:
+        mw.close()
+    mw.close()  # a second call does nothing
+    assert _kinds(tmp_path / "caught") == ["environment", "run_end"]
+    with MetricsWriter(tmp_path / "ok", "r"):
+        pass
+    assert _kinds(tmp_path / "ok") == ["environment", "run_end"]
+    # explicit: a caller can say how the run ended
+    mw = MetricsWriter(tmp_path / "explicit", "r")
+    mw.close(completed=False)
+    assert _kinds(tmp_path / "explicit") == ["environment"]
+
+
 def test_environment_names_the_attack(tmp_path):
     """``attack`` is a field of the environment record: two runs on the same released corpus,
     one per task, tell apart there."""

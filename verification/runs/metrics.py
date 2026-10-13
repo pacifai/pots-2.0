@@ -110,7 +110,8 @@ the counting pass.
 
 - ``records.jsonl``: one JSON object per line, each with ``record`` (its type) and ``run``.
   Types: ``environment`` (first), ``step``, ``verdict``, ``time``, ``memory``, ``count``,
-  ``storage`` and ``run_end`` (last). Standard JSON: a non-finite float is written as the
+  ``storage`` and ``run_end`` (last, written only when the run completed: a run that raised
+  has none, :meth:`MetricsWriter.close`). Standard JSON: a non-finite float is written as the
   string ``"NaN"``, ``"Infinity"`` or ``"-Infinity"``, and a missing value as ``null``;
 - ``residuals/<scenario>/step_<t>.npz``: one NumPy archive per step with residuals (EQ13
   record 2, EVALUATION_SPEC §4.2), written as the step closes, so a crashed run keeps finished
@@ -1370,7 +1371,8 @@ class MetricsWriter:
 
     Opening it truncates an earlier run's records and writes the ``environment`` record; records
     are flushed as they arrive, so a crashed run keeps what it finished. ``close`` writes
-    ``run_end``. ``model``, ``corpus``, ``attack`` (``VERIF_ATTACK``, the BackdoorLLM task;
+    ``run_end`` only for a run that finished (no exception), so ``run_end`` marks a completed
+    run (:meth:`close`). ``model``, ``corpus``, ``attack`` (``VERIF_ATTACK``, the BackdoorLLM task;
     ``None`` for a run on other data) and ``seed`` go into the ``environment`` record and every
     ``step`` record. A run named ``data`` or ``evaluation``, or a directory of either name, is
     refused (:data:`RESERVED_NAMES`) in any letter case: on a case-insensitive file system
@@ -1428,17 +1430,30 @@ class MetricsWriter:
                                           kappa_guard=kappa_guard))
         return path
 
-    def close(self) -> None:
+    def close(self, completed: bool | None = None) -> None:
+        """Close the file, writing ``run_end`` only if the run completed.
+
+        A run that raised (a crash, a failed assertion, ``KeyboardInterrupt``) ends without
+        ``run_end``, so a resumer that skips a directory holding ``run_end`` runs it again; its
+        finished records stay. A run that finished with a failing verdict did complete and gets
+        ``run_end``. ``completed=None`` reads it from ``sys.exception()``: true unless an
+        exception is propagating through the caller, so every run's ``try: … finally:
+        mw.close()`` gets it right. Don't call it bare inside an ``except`` block that handles
+        an error and goes on: the handled exception would count as a crash. A second call does
+        nothing."""
         if self._f.closed:
             return
-        self.write([{"record": "run_end", "run": self.run,
-                     "finished": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                     "lifetime_maxrss_bytes": lifetime_maxrss_bytes(),
-                     "mem_source": self.probe.source}])
+        if completed is None:
+            completed = sys.exception() is None
+        if completed:
+            self.write([{"record": "run_end", "run": self.run,
+                         "finished": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                         "lifetime_maxrss_bytes": lifetime_maxrss_bytes(),
+                         "mem_source": self.probe.source}])
         self._f.close()
 
     def __enter__(self) -> MetricsWriter:
         return self
 
-    def __exit__(self, *exc: Any) -> None:
-        self.close()
+    def __exit__(self, exc_type: type[BaseException] | None, *exc: Any) -> None:
+        self.close(completed=exc_type is None)

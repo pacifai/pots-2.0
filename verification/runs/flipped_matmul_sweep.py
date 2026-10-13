@@ -30,9 +30,11 @@ first judged step: the bands were fitted on steps 1–3 (P10c).
    binding product, the one with the largest ``q`` (``dF`` on the decoder). Per trial it plants
    an error ``Δ`` of relative size ``f = ‖Δ‖_F/‖P‖_F`` in the target, re-roots by re-hashing
    only that leaf and its path (``store.perturb_leaf``), draws the challenges from the new root,
-   and measures and judges the one product with check 5's own code (``checks._measure_run``,
+   and measures and judges the one product with check 5's own code (:func:`measure_target`,
    ``checks._judge_product``). The other products are honest and are not rechecked. After each
-   target the honest leaf goes back and the original root must return.
+   target the honest leaf goes back and the original root must return. Before its trials each
+   target is measured on the honest transcript, and its normalized residuals and ``U`` must
+   equal the honest run's check-5 numbers bit for bit.
 4. **Deep points.** At a few ``x`` the trials are 2,000 instead of 200 (``--deep-x``,
    ``--deep-trials``, ``--deep-shapes``; by default ``x`` 300, 1000 and 3000 on ``entry`` and
    ``row2``). 200 trials of ``k = 9`` challenges resolve a single-challenge miss rate down to
@@ -51,8 +53,9 @@ first judged step: the bands were fitted on steps 1–3 (P10c).
 **The sweep's scale (EQ10).** ``x = f/(τ·e_m)``, so ``x = 1`` is an error whose ``‖Δ·r‖`` is
 ``τ`` band units for an average challenge. ``f = x·τ·e_m`` for each grid point ``x``. ``e_m``
 is the target's own (F18, ``sizing.product_e_m``): from its ``q``, its honest ``‖P‖_F`` and
-its term scale ``U`` (``freivalds.term_scale``, from the honest operands), so ``x`` is in units
-of ``τ`` times the product's band unit over ``σ_r·‖P‖_F``. Shapes:
+its term scale ``U`` as check 5 computes it (:func:`target_term_scale`, from the honest
+operands; equal to the honest run's recorded ``U``), so ``x`` is in units of ``τ`` times the
+product's band unit over ``σ_r·‖P‖_F``. Shapes:
 
 - ``entry``: one random entry moved by ``±f·‖P‖_F`` (concentrated, the spec's §8 worry);
 - ``entry2``: two random entries, almost always in different rows, each moved by
@@ -165,7 +168,13 @@ from verification.verifier.checks import (
 )
 from verification.verifier.context import StepContext, StepState, StepStats
 from verification.verifier.matmul_check.challenges import SIGMA_R
-from verification.verifier.matmul_check.freivalds import MeasureScratch, term_scale
+from verification.verifier.matmul_check.freivalds import (
+    MeasureScratch,
+    ProductMeasure,
+    measure_products,
+    term_scale,
+    term_scales,
+)
 from verification.verifier.matmul_check.sizing import (
     C_ANTI,
     bit_budget,
@@ -176,9 +185,9 @@ from verification.verifier.matmul_check.sizing import (
 
 __all__ = ["RUN_NAME", "SWEEP_STEP", "SHAPES", "DEFAULT_X", "DEFAULT_TRIALS", "DEEP_X",
            "DEEP_TRIALS", "DEEP_SHAPES", "FIT_X_MIN", "CHECK6_FACTOR", "SOURCES", "Held",
-           "Floor", "SweepResult", "binding_product", "sweep_targets", "hold_targets", "plant",
-           "sweep_target", "check6_weight", "check6_trial", "floor_context", "summarize",
-           "run_sweep", "main"]
+           "Floor", "SweepResult", "binding_product", "sweep_targets", "hold_targets",
+           "target_term_scale", "measure_target", "plant", "sweep_target", "check6_weight",
+           "check6_trial", "floor_context", "summarize", "run_sweep", "main"]
 
 RUN_NAME = "flipped_matmul_sweep"
 SWEEP_STEP = 4  # the first judged step (P10c)
@@ -258,7 +267,7 @@ class Held:
     bias: torch.Tensor | None = None  # a biased product's committed bias, as check 5 reads it
     spec_class: str = ""  # its §5.7 class (metrics.spec_class)
     binding: bool = False  # the binding product
-    u: float = math.nan  # its term scale U (F18), from the honest operands
+    u: float = math.nan  # its term scale U (F18) as check 5 computes it (target_term_scale)
 
     def e_m(self, eps_in: float, eps_acc: float) -> float:
         """The target's own ``e_m`` (F18), the sweep's unit for ``x``."""
@@ -286,8 +295,50 @@ def hold_targets(c: DeclaredComputation, store: InMemoryStore,
         a, b = ops[s.m]
         held.append(Held(s, product_class(c, s), a, b, leaf, p,
                          float(torch.linalg.vector_norm(p, dtype=torch.float64)), bias,
-                         spec_class(c, s), s.m == bind, term_scale(a, b, bias)))
+                         spec_class(c, s), s.m == bind, target_term_scale(s, a, b, bias)))
     return held
+
+
+# Check 5 measures a batched product's members stacked (``checks._measure_run``: ``torch.stack``
+# of the served operands, one contiguous batch, through ``measure_products``), any other product
+# alone with its operands as served. The layout reaches the bits: the replay serves some ``B``
+# as a transposed view (``Kᵀ`` of ``S = Q·Kᵀ``), and ``B²·1`` over that view rounds differently
+# from the stacked copy. On step 4's ``L15.S[0,0]`` (``U/‖P‖_F`` 1.43, so the unit uses ``U``),
+# measuring the member alone moved ``U`` by 1.09e−9 and every normalized residual by −9.71e−10
+# (EM1). So the sweep measures a member as a stacked batch of one, through the same function.
+
+
+def _stacked(x: torch.Tensor) -> torch.Tensor:
+    return torch.stack([x])
+
+
+def target_term_scale(spec: ProductSpec, a: torch.Tensor, b: torch.Tensor,
+                      bias: torch.Tensor | None = None) -> float:
+    """``U`` of product ``spec`` (F18) as check 5 computes it: a member's from the stacked
+    operands (``freivalds.term_scales``), any other product's from ``a`` and ``b`` as given
+    (``freivalds.term_scale``)."""
+    if spec.member is not None:
+        return term_scales(_stacked(a), _stacked(b))[0]
+    return term_scale(a, b, bias)
+
+
+def measure_target(held: Held, p: torch.Tensor, *, h: bytes, ctx: StepContext,
+                   scratch: MeasureScratch | None = None) -> ProductMeasure:
+    """Check 5's numbers for the target with committed product ``p``, challenges keyed on
+    ``h``, measured as check 5 measures it: a member as a stacked batch of one
+    (``measure_products``), any other product through ``checks._measure_run``. A batch of one
+    gives a member the bits it gets in its run's batch (each member's numbers are its own; the
+    honest self-check in :func:`run_sweep` compares them with the run's)."""
+    s = held.spec
+    if s.member is not None:
+        [mp] = measure_products(_stacked(held.a), _stacked(held.b), _stacked(p), h=h, ms=[s.m],
+                                k=ctx.k, eps_in=ctx.eps_in, eps_acc=ctx.eps_acc,
+                                scratch=scratch, guard=ctx.kappa_guard)
+        return mp
+    [mp] = _measure_run([s], [(held.a, held.b, p, held.bias)], h=h, k=ctx.k,
+                        eps_in=ctx.eps_in, eps_acc=ctx.eps_acc, scratch=scratch,
+                        guard=ctx.kappa_guard)
+    return mp
 
 
 # ---- planting ---------------------------------------------------------------------------
@@ -377,9 +428,7 @@ def sweep_target(c: DeclaredComputation, store: InMemoryStore, held: Held, ctx: 
                 for _ in range(trials):
                     p2, f_real = plant(held.p, shape, f, held.p_norm, gen)
                     root = perturb_leaf(c, store, idx, p2)
-                    [mp] = _measure_run([s], [(held.a, held.b, p2, held.bias)], h=root, k=ctx.k,
-                                        eps_in=ctx.eps_in, eps_acc=ctx.eps_acc,
-                                        scratch=scratch, guard=ctx.kappa_guard)
+                    mp = measure_target(held, p2, h=root, ctx=ctx, scratch=scratch)
                     rej = _judge_product(c, s, mp, ctx, bands)
                     ctx.stats.products.clear()
                     tr.x_set.append(x)
@@ -401,9 +450,7 @@ def honest_measure(c: DeclaredComputation, store: InMemoryStore, held: Held,
     """The target's normalized residuals on the unperturbed transcript, measured as the sweep
     measures (they must equal the run's check-5 numbers for that product). Its ``U`` must equal
     ``held.u``, the sweep's unit's."""
-    [mp] = _measure_run([held.spec], [(held.a, held.b, held.p, held.bias)], h=store.root,
-                        k=ctx.k, eps_in=ctx.eps_in, eps_acc=ctx.eps_acc,
-                        guard=ctx.kappa_guard)
+    mp = measure_target(held, held.p, h=store.root, ctx=ctx)
     if _judge_product(c, held.spec, mp, ctx, bands) is not None:
         raise AssertionError(f"P_{held.spec.m}: the honest product is rejected")
     if mp.u != held.u:
@@ -657,6 +704,7 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
     out(f"flip: 2·max|P|/‖P‖_F on step {t}'s {flip_name} is x = {x_flip:.4g} band units "
         f"(e_m {e_flip:.4e}, {e_src})")
     seen = {p.m: tuple(p.normalized) for p in stats.products}
+    seen_u = {p.m: p.u for p in stats.products}
     ctx = StepContext.for_computation(
         c, step=t, indices=tuple(schedule(t, c.n_s, len(env.D), env.seed)), h_D=env.h_D,
         n_records=len(env.D), prev_w_hashes=(), chain_check_id="7", k=env.k)
@@ -685,6 +733,10 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
         if h.spec.m in seen and seen[h.spec.m] != honest_res:
             raise AssertionError(f"P_{h.spec.m}: the sweep's honest residuals {honest_res} "
                                  f"differ from check 5's {seen[h.spec.m]}")
+        # x's unit is check 5's: U as the run recorded it (NaN in an archive from before F18)
+        if math.isfinite(u := seen_u.get(h.spec.m, math.nan)) and u != h.u:
+            raise AssertionError(f"P_{h.spec.m}: the sweep's U {h.u!r} differs from check 5's "
+                                 f"{u!r}")
         for phase, p_xs, p_shapes, n, gen in phases:
             t0 = time.perf_counter()
             trs = sweep_target(c, store, h, ctx, env.bands, xs=p_xs, shapes=p_shapes,

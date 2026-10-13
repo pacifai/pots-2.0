@@ -335,6 +335,60 @@ def test_sweep_restores_the_root_and_matches_check_5(env, kept):
     assert store.root == base
 
 
+def test_a_member_is_measured_as_check_5_stacks_it(env):
+    """EM1's crash on ``L15.S[0,0]``. Check 5 measures a batched product's members stacked into
+    one contiguous batch (``checks._measure_run``, ``measure_products``). Measured alone, with
+    ``B`` as the replay serves it (``Kᵀ``, a transposed view), ``B²·1`` rounds differently, so
+    ``U`` does; where ``U > ‖P‖_F`` the band unit uses ``U``, and every normalized residual
+    moves by the same factor. The sweep measures a member as a stacked batch of one, with check
+    5's bits, honest or planted; a product that isn't a member keeps check 5's single path."""
+    from verification.computation.interface import ProductKind, ProductSpec
+    from verification.verifier.checks import _measure_run
+    from verification.verifier.context import StepContext
+    from verification.verifier.matmul_check.freivalds import measure_products, term_scale
+    g = torch.Generator().manual_seed(0)
+    n, q = 128, 64  # SmolLM2's S member shape: Q [n, d]·Kᵀ [d, n]
+    specs, ops = [], []
+    for i in range(3):
+        a1, k1 = torch.randn(n, q // 2, generator=g), torch.randn(n, q // 2, generator=g)
+        a = torch.cat([a1, a1], 1)  # P = a1·(0.5·noise)ᵀ: its terms cancel, so U ≈ 3·‖P‖_F
+        kk = torch.cat([k1, -k1 + 0.5 * torch.randn(n, q // 2, generator=g)], 1)
+        b = kk.t()  # the view the replay serves
+        ops.append((a, b, a @ b))
+        specs.append(ProductSpec(10 + i, f"L1.S[0,{i}]", ProductKind.FORWARD, (n, q), (q, n),
+                                 layer=1, member=(0, i)))
+    ctx = StepContext.for_computation(env.c, step=4, indices=(), h_D=env.h_D,
+                                      n_records=len(env.D), prev_w_hashes=(),
+                                      chain_check_id="7", k=K)
+    h, eps = b"\x07" * 32, dict(eps_in=ctx.eps_in, eps_acc=ctx.eps_acc)
+
+    def check5(p0):  # the run's batch as check 5 stacks it, member 0's product p0
+        ps = [p0] + [o[2] for o in ops[1:]]
+        return measure_products(torch.stack([o[0] for o in ops]),
+                                torch.stack([o[1] for o in ops]), torch.stack(ps), h=h,
+                                ms=[s.m for s in specs], k=K, **eps)[0]
+
+    a, b, p = ops[0]
+    want = check5(p)
+    assert want.u / want.p_norm > 2
+    # the mismatch: alone, U and so every normalized residual differ (raw residuals don't)
+    [alone] = _measure_run(specs[:1], [(a, b, p, None)], h=h, k=K, **eps)
+    assert alone.u != want.u and term_scale(a, b) == alone.u
+    assert alone.residuals == want.residuals and alone.p_norm == want.p_norm
+    assert all(x != y for x, y in zip(alone.normalized, want.normalized))
+    # the fix: the sweep's U and measure are check 5's, bit for bit
+    pn = float(torch.linalg.vector_norm(p, dtype=torch.float64))
+    held = fs.Held(specs[0], "cls", a, b, p, p, pn, u=fs.target_term_scale(specs[0], a, b))
+    assert held.u == want.u
+    assert fs.measure_target(held, p, h=h, ctx=ctx) == want
+    p2, _ = fs.plant(p, "row2", 1e-6, pn, torch.Generator().manual_seed(1))
+    assert fs.measure_target(held, p2, h=h, ctx=ctx) == check5(p2) != want
+    # a product that isn't a member is measured alone, as check 5 measures it
+    single = dataclasses.replace(specs[0], member=None)
+    held1 = dataclasses.replace(held, spec=single, u=fs.target_term_scale(single, a, b))
+    assert held1.u == alone.u and fs.measure_target(held1, p, h=h, ctx=ctx) == alone
+
+
 def test_summary_fits_the_entry_constant():
     tr = fs.Trials(1, "cls", "entry", 1.0)
     rng = np.random.default_rng(0)

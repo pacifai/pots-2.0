@@ -23,6 +23,7 @@ from verification.verifier.matmul_check.freivalds import (
     measure_product,
     measure_products,
     term_scale,
+    term_scales,
 )
 from verification.verifier.matmul_check.sizing import e_m, product_e_m
 
@@ -449,6 +450,7 @@ def test_u_of_a_member_batch_matches_each_member():
     for i, mp in enumerate(fast):
         assert mp.u == pytest.approx(float(torch.linalg.vector_norm(_term_array(a[i], b[i]))),
                                      rel=1e-6)
+    assert term_scales(a, b) == [mp.u for mp in fast]  # check 5's batched bits, outside a measure
 
 
 def _cancelling(n=64, w=48, offset=1e3, seed=2):
