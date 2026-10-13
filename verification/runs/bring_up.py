@@ -321,6 +321,7 @@ def report_unit(stats: Mapping[int, Any], cal: Calibration, c: DecoderComputatio
            "eps_acc": UNIT_ROUNDOFF[c.accumulator_dtype]}
     big = largest_e_m(stats, **eps)
     worst = None  # (U/‖P‖ over √w·κ, U/‖P‖, √w·κ, where)
+    per_kappa = None  # (U/‖P‖ over κ, where): the measured margin under √w·κ
     for t, st in sorted(stats.items()):
         for p in st.products:
             if p.p_norm == 0 or not math.isfinite(p.kappa):
@@ -330,11 +331,16 @@ def report_unit(stats: Mapping[int, Any], cal: Calibration, c: DecoderComputatio
             score = ratio / bound if bound > 0 else math.inf
             if worst is None or score > worst[0]:
                 worst = (score, ratio, bound, f"{p.name} (step {t})")
+            pk = ratio / p.kappa if p.kappa > 0 else math.inf
+            if per_kappa is None or pk > per_kappa[0]:
+                per_kappa = (pk, f"{p.name} (step {t})")
     out(f"   band unit (F18): σ_r·e_m·‖P‖_F, e_m = √2·ε_in + √q·ε_acc·max(1, U/‖P‖_F); "
         f"U/‖P‖_F max {big.u_ratio_max:.4g} at {big.u_ratio_max_name}")
     if worst is not None:
         out(f"   U/‖P‖_F ≤ √w·κ: largest share {worst[0]:.4g} ({worst[1]:.4g} of "
             f"{worst[2]:.4g}, {worst[3]}): " + ("holds" if worst[0] <= 1 else "FAILS"))
+    if per_kappa is not None:
+        out(f"   U/‖P‖_F over κ: max {per_kappa[0]:.4g} ({per_kappa[1]})")
     out(f"   max R/τ = {cal.global_max / cal.tau:.4g} (τ/2 is 0.5)")
     q_max = max(s.q for s in c.products)
     sz = size_k(q_max, T=T_run, M=c.M, s_h=cal.s_h, z=cal.z, e_cal=big.e_m, e_cal_at=big.at,

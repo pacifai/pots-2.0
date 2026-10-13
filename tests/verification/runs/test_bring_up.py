@@ -152,7 +152,7 @@ def test_report_prints_each_part(run):
                  "check 5: normalized residuals", "check 6: ρ_max",
                  "scores against the reference band file", "families above 1: rho_5",
                  "step 2: prover", "verifier peak", "band unit (F18)", "U/‖P‖_F ≤ √w·κ",
-                 "max R/τ", "k (P10d"):
+                 "U/‖P‖_F over κ", "max R/τ", "k (P10d"):
         assert part in text, part
     assert "NOT AS EXPECTED" not in text and "FAILS" not in text
     assert ("tamper:" in text) == c.qkv_bias
