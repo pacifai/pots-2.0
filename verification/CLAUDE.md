@@ -1361,7 +1361,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   - `MetricsWriter(dir, run, *, device, model, corpus, attack, seed, config, band_file_hash,
     h_D, extra)` (`.recorder(scenario, *, bpr_records, bpr_actual, cheat_step)`,
     `.write(rows)`, `.write_residuals(scenario, t, stats, c, *, bands, k, kappa_guard)`,
-    `.close()`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
+    `.close(completed=None)`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
     equal to `verifier.stats`), `memory_probe(device)`, `step_record`, `config_hash`.
     `model`, `corpus`, `attack` (`VERIF_ATTACK`, `None` for a run on other data) and `seed`
     go into the `environment` record and every `step` record. Every run that writes `corpus`
@@ -1415,6 +1415,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
       `None` with its `n_failing` entry.
   - Files under `$VERIF_OUTPUT_DIR/<run>/`: `records.jsonl` (records `environment`, `step`,
     `verdict`, `time`, `memory`, `count`, `storage`, `run_end`, each with `record` and `run`;
+    `run_end` comes last and only for a run that completed, whatever its verdict:
+    `close(completed=None)` reads an exception in flight (`sys.exception()`, which a `finally`
+    block sees), and `__exit__` passes its own, so a crash or Ctrl-C leaves no `run_end` and a
+    driver that skips finished run directories reruns it (every run closes its writer in a
+    `finally`, a `with` block or `poisoned_step._writer`; one place decides for all of them).
+    Records from before 2026-10-13 may end a crashed run with `run_end` (EM1's first sweep);
     non-finite floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`) and
     `residuals/<scenario>/step_<t>.npz`. Since A11 each npz also holds the product scales
     `p_q`, `p_norm`, `p_nu`, `p_abs1`, and since F18 `p_u` (the term scale `U`); older

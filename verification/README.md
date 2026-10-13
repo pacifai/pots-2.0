@@ -385,7 +385,9 @@ replaced:
   product's class and layer. Runs that vary a model, attack, poisoning or seed write to a
   directory named after that cell, for example `honest-SmolLM2-135M-Instruct-refusal-bpr0-s1`.
   It observes the run through a `section` hook that is off by default;
-  `metrics_overhead.py` measures what recording costs.
+  `metrics_overhead.py` measures what recording costs. A run's last record, `run_end`, is
+  written only when the run finished, whatever its verdict: a run that crashed or was
+  interrupted leaves none, so a driver that skips finished run directories reruns it.
 - **`materialize_data.py`** builds `D` and `D̃` for one model, task, seed and poisoning
   level, audits them against the released rows, and writes them under
   `trainer_output/verification/data/` with a `meta.json` that records the pins, the pad id,
