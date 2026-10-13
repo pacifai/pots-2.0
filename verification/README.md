@@ -369,7 +369,9 @@ replaced:
 - **`flipped_matmul_sweep.py`** is A13's flipped-matmul cheat and EV3's planted-error sweep.
   On the honest run's stored step 4 it plants errors of known size and shape in one product
   per class and counts how often check 5's challenges miss them. That measures the miss
-  constant `c` the sizing formula assumes, and the smallest error every trial catches.
+  constant `c` the sizing formula assumes, and the smallest error every trial catches. It
+  measures each target exactly as check 5 does (a member of a batched attention product as a
+  stacked batch), and checks first that the honest product gives check 5's numbers bit for bit.
 - **`k_tunability.py`** is FS12. On the same stored step it runs check 5 at every `k` from 1
   to 18, records its time, FLOPs and memory, and checks that the configured `k` reproduces
   the honest run's numbers bit for bit.

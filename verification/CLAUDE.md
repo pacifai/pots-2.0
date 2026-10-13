@@ -1223,7 +1223,11 @@ interface.
     matrix-vector products into the scratch buffer, summed in float64) from the rebuilt
     operands in the same pass as ν; a biased product adds `n·‖b‖²` (`_bias_u2`). It is
     computed with the κ guard on or off. `term_scale(a, b, bias=None)` gives the same bits
-    outside a measure (the sweep's unit). Since `U ≤ ν`, test 1 bounds `U/‖P‖_F ≤ √w·κ_max`
+    outside a measure, and `term_scales(a, b)` each member's `U` of a stacked batch with
+    `measure_products`'s bits (the sweep's unit). The two can differ in the last bits for the
+    same product: the matrix-vector products over `B²` round by `B`'s layout, check 5 stacks a
+    member run into contiguous copies, and the replay serves `S`'s `B = Kᵀ` as a transposed
+    view (step 4's `L15.S[0,0]`: `U` 1.09e−9 apart, 12 of 128 entries of `A²·(B²·1)`). Since `U ≤ ν`, test 1 bounds `U/‖P‖_F ≤ √w·κ_max`
     (`w` the width), so the band can't grow without the κ test seeing it. An fp32 overflow of
     `U` gives `inf`, which rejects as any non-finite number does.
   `measure_products(a, b, p, *, h, ms, k, eps_in, eps_acc)` does the same for a stacked batch
@@ -1859,14 +1863,30 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     class's middle layer, its first product) plus the binding product (largest `q`, `dF`).
     Shapes `entry`/`entry2`/`row2`/`dense` (`row2`: two equal moves in one row, the worst
     rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)` with `e_m` the target's own
-    (F18: `Held.e_m()`, from `q`, the honest `‖P‖_F` and `U`, `term_scale` on the held
-    operands; `_judge` asserts the measure's `U` equals it; a flip record without `U` falls
-    back to ratio 1, a placeholder), and deep points (`DEEP_X` 300, 1000
-    and 3000 at `DEEP_TRIALS` 2,000, on `DEEP_SHAPES` `entry` and `row2`, from their own
-    generator). Re-rooted with `perturb_leaf`, judged with check 5's own
-    `_measure_run`/`_judge_product` (a biased target holds its committed `b` too). Then one
-    check-6 trial (`check6_trial`): one `W_{t+1}` entry moved to `ρ ≈ CHECK6_FACTOR·τ_W`
-    (2, a placeholder) must reject at 6a on that entry.
+    (F18: `Held.e_m()`, from `q`, the honest `‖P‖_F` and `U`, `target_term_scale` on the held
+    operands; a flip record without `U` falls back to ratio 1, a placeholder), and deep points
+    (`DEEP_X` 300, 1000 and 3000 at `DEEP_TRIALS` 2,000, on `DEEP_SHAPES` `entry` and `row2`,
+    from their own generator). Re-rooted with `perturb_leaf`, measured by `measure_target` and
+    judged with check 5's own `_judge_product` (a biased target holds its committed `b` too).
+    Then one check-6 trial (`check6_trial`): one `W_{t+1}` entry moved to
+    `ρ ≈ CHECK6_FACTOR·τ_W` (2, a placeholder) must reject at 6a on that entry.
+  - **Measured as check 5 measures (2026-10-13).** Check 5 measures a member run's products
+    stacked (`torch.stack`, contiguous copies, `measure_products`), every other product alone
+    as served. `measure_target` does the same for one target: a member as a stacked batch of
+    one through `measure_products`, any other product through `_measure_run`;
+    `target_term_scale` gives `U` the same way (`freivalds.term_scales` or `term_scale`).
+    Each member's numbers are its own in a batch, so a batch of one has its run's bits.
+    Before its trials each target is measured on the honest transcript (`honest_measure`):
+    its normalized residuals, and its `U` where the run recorded one, must equal check 5's
+    bit for bit, else `AssertionError`. Until this fix the sweep measured a member alone, on
+    the replay's transposed `B = Kᵀ`, and EM1's sweep on step 4 stopped at that check on
+    `P_1110` (`L15.S[0,0]`, `U/‖P‖_F` 1.43): `U` 1.09e−9 above check 5's, every normalized
+    residual 9.71e−10 below, the raw residuals and `‖P‖_F` equal. `P_4752` (`L15.dA[0,0]`)
+    had `U` 1.76e−8 apart but `U/‖P‖_F` 0.87, so its unit, and its residuals, matched. Against
+    the alternatives: taking `U` from the run's record alone would leave the trials'
+    judgments on the alone-measured unit; a relative tolerance would let the sweep judge on
+    numbers check 5 never computes. The fix changes no check-5 code, verdict or cost; the
+    sweep pays one stack copy of `A`, `B` and `P'` per member trial.
   - `ĉ` is fitted on the trials swept at `x ≥ FIT_X_MIN` (3), each at its realized `x`. Until
     EV3 the fit picked trials by realized `x`, so rounding kept or dropped the `x = 3` point.
     Each trial also logs `‖P'‖_F/‖P‖_F`, and each summary refits `ĉ` on `x' = x·‖P‖_F/‖P'‖_F`

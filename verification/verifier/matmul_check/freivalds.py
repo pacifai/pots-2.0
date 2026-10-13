@@ -47,8 +47,12 @@ two matvecs and ``|P|·1``) and returns ``ν``, ``‖|P|·1‖`` and ``κ`` as N
 test 2's band and is computed either way, so test 2's numbers are the same bits either way.
 C1 uses it to time check 5 with and without the guard; a judged run keeps the default.
 
-:func:`term_scale` is ``U`` alone, as :func:`measure_product` computes it, for callers that
-need a product's ``e_m`` outside check 5 (the flipped-matmul sweep's scale).
+:func:`term_scale` is ``U`` alone, as :func:`measure_product` computes it, and
+:func:`term_scales` each member's ``U`` of a stacked batch, as :func:`measure_products` computes
+it, for callers that need a product's ``e_m`` outside check 5 (the flipped-matmul sweep's
+scale). The two can differ in the last bits for the same product: the matvecs over ``B²`` round
+by ``B``'s layout, and check 5 stacks a batched product's members into a contiguous batch while
+the replay serves some ``B`` (``Kᵀ``) as a transposed view.
 """
 
 from __future__ import annotations
@@ -67,7 +71,7 @@ from verification.verifier.matmul_check.challenges import (
 from verification.verifier.matmul_check.sizing import product_e_m
 
 __all__ = ["MeasureScratch", "ProductMeasure", "band_unit", "measure_product",
-           "measure_products", "term_scale"]
+           "measure_products", "term_scale", "term_scales"]
 
 
 @dataclass(frozen=True)
@@ -242,6 +246,15 @@ def term_scale(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = Non
         if bias is not None:
             u2 += _bias_u2(bias, a.shape[0])
     return math.sqrt(u2)
+
+
+def term_scales(a: torch.Tensor, b: torch.Tensor) -> list[float]:
+    """``U`` of each member ``a[i]·b[i]`` of a stacked batch (fp32 ``[B, n, q]`` and
+    ``[B, q, w]``), the same bits as :func:`measure_products`'s."""
+    sc = MeasureScratch()
+    with torch.no_grad():
+        u2 = _term_sq(a, b, sc.ones(b.shape[2]), sc).double().reshape(a.shape[0], -1).sum(1)
+    return [math.sqrt(x) for x in u2.tolist()]
 
 
 def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes, m: int,
