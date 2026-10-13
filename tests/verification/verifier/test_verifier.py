@@ -41,8 +41,8 @@ from verification.verifier.checks import (
 from verification.verifier.context import CommittedLeaves, Rejection, StepContext, _guard, _hash
 from verification.verifier.driver import Verifier
 from verification.verifier.matmul_check.challenges import SIGMA_R, challenge_matrix
-from verification.verifier.matmul_check.freivalds import _safe_norm
-from verification.verifier.matmul_check.sizing import Z, e_m
+from verification.verifier.matmul_check.freivalds import _safe_norm, term_scale
+from verification.verifier.matmul_check.sizing import Z, product_e_m
 
 from tests.verification.decoder_helpers import make_records, tiny_config
 
@@ -871,7 +871,8 @@ def test_safe_norm_matches_and_does_not_overflow():
 
 
 def test_honest_stats_unchanged_by_scaled_norms(c, D, tree, w0):
-    """Check 5's numbers with ``_safe_norm`` equal those with the unscaled norm, bit for bit."""
+    """Check 5's numbers with ``_safe_norm`` equal those with the unscaled norm, bit for bit,
+    and each product's term scale ``U`` is ``term_scale`` of its replayed operands (F18)."""
     store, _ = _store(c, D, tree, w0, 1)
     ctx = StepContext.for_computation(
         c, step=1, indices=tuple(schedule(1, c.n_s, len(D), SEED)), h_D=tree.root, n_records=len(D),
@@ -885,7 +886,9 @@ def test_honest_stats_unchanged_by_scaled_norms(c, D, tree, w0):
         p = view.product(spec.m)
         r = challenge_matrix(root, spec.m, K, spec.width)
         res = torch.linalg.vector_norm(a @ (b @ r) - p @ r, dim=0)
-        unit = SIGMA_R * e_m(spec.q, ctx.eps_in, ctx.eps_acc) * float(torch.linalg.vector_norm(p))
+        p_norm = float(torch.linalg.vector_norm(p))
+        assert stat.u == term_scale(a, b)
+        unit = SIGMA_R * product_e_m(spec.q, ctx.eps_in, ctx.eps_acc, p_norm, stat.u) * p_norm
         assert stat.normalized == tuple(x / unit for x in res.tolist())
 
 
@@ -1317,19 +1320,30 @@ def test_permuted_batch_rejected_at_4(c, D, tree, w0):
     assert "record 0" in rej.detail
 
 
-def _near_band(c, name, factor, seed=0):
-    """Add a Gaussian Δ with ``‖Δ‖_F = factor·τ·e_m·‖P‖_F`` to product ``name``.
+def _honest_u(c, D, tree, w0, name):
+    """Product ``name``'s term scale ``U`` on the honest step 1, from its replayed operands. A
+    perturbed product leaf leaves the operands, and so ``U``, unchanged."""
+    store, _ = _store(c, D, tree, w0, 1)
+    replay, m = c.replay(store), c.m_of(name)
+    for i in range(1, m + 1):
+        a, b = replay.operands(i)
+    return term_scale(a, b)
+
+
+def _near_band(c, name, factor, u, seed=0):
+    """Add a Gaussian Δ with ``‖Δ‖_F = factor·τ·e_m·‖P‖_F`` to product ``name``, ``e_m`` the
+    product's own (F18, from ``u``, :func:`_honest_u`).
 
     For any Δ, ``E‖Δ·r‖² = σ_r²·‖Δ‖_F²``, so Δ alone gives a normalized residual of about
-    ``factor·τ``. It lands there only if the band uses the same σ_r, e_m(q, ε_in, ε_acc) and
-    ‖P‖_F."""
+    ``factor·τ``. It lands there only if the band uses the same σ_r, ``e_m`` and ‖P‖_F."""
     spec = c.product(c.m_of(name))
     eps = UNIT_ROUNDOFF[torch.float32]
     tau = Bands.provisional().tau
 
     def f(p):
         d = torch.randn(p.shape, generator=torch.Generator().manual_seed(seed))
-        target = factor * tau * e_m(spec.q, eps, eps) * float(torch.linalg.vector_norm(p))
+        p_norm = float(torch.linalg.vector_norm(p))
+        target = factor * tau * product_e_m(spec.q, eps, eps, p_norm, u) * p_norm
         return (p + d * (target / float(torch.linalg.vector_norm(d)))).contiguous()
     return {spec.m: f}
 
@@ -1344,10 +1358,10 @@ def test_near_band_perturbation_lands_at_its_scale(c, D, tree, w0):
     off by √3, as with σ_r taken as 1, puts it near 1.7τ, outside the window."""
     pooled = {0.1: [], 3.0: []}
     for name in NEAR_BAND_PRODUCTS:
-        m = c.m_of(name)
+        m, u = c.m_of(name), _honest_u(c, D, tree, w0, name)
         for factor in pooled:
             for seed in NEAR_BAND_SEEDS:
-                store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, factor, seed))
+                store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, factor, u, seed))
                 v = _verifier(c, D, tree, w0, calibrate=True)
                 assert v.verify_step(1, store) is None
                 pooled[factor].extend(v.stats[1].products[m - 1].normalized)
@@ -1358,24 +1372,27 @@ def test_near_band_perturbation_lands_at_its_scale(c, D, tree, w0):
 
 @pytest.mark.parametrize("name", ["Y_2", "dX_2"])  # a perturbed G fails 6a first
 def test_near_band_perturbation_judged(c, D, tree, w0, name):
-    m = c.m_of(name)
-    store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, 0.1))
+    m, u = c.m_of(name), _honest_u(c, D, tree, w0, name)
+    store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, 0.1, u))
     assert _verifier(c, D, tree, w0).verify_step(1, store) is None
-    store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, 3.0))
+    store, _ = _store(c, D, tree, w0, 1, perturb=_near_band(c, name, 3.0, u))
     rej = _verifier(c, D, tree, w0).verify_step(1, store)
     _expect(rej, 1, "5")
     assert f"P_{m} ({name})" in rej.detail
 
 
-# σ_r·e_m(q, ε, ε) = (1/√3)·(√2 + √q)·2⁻²⁴, worked by hand, independent of config and sizing:
-#   q = 16: (1.414214 + 4)·5.960464e-8 = 3.227123e-7, × 0.5773503 = 1.863181e-7
-#   q = 4:  (1.414214 + 2)·5.960464e-8 = 2.035030e-7, × 0.5773503 = 1.174925e-7
-HAND_UNIT_PER_NORM = {"Y_1": (16, 1.863181e-7), "G_1": (4, 1.174925e-7)}
+# σ_r·e_m(q, ε, ε, U/‖P‖) = (1/√3)·(√2 + √q·max(1, U/‖P‖))·2⁻²⁴ (F18), worked by hand,
+# independent of config and sizing, as a rounding term and an accumulation term per unit ratio:
+#   (1/√3)·√2·2⁻²⁴ = 0.5773503 × 1.414214 × 5.960464e-8 = 4.866699e-8
+#   q = 16: (1/√3)·4·2⁻²⁴ = 1.376510e-7;  q = 4: (1/√3)·2·2⁻²⁴ = 6.882552e-8
+# At ratio 1 these sum to the pre-F18 values, 1.863180e-7 and 1.174925e-7.
+HAND_ROUNDING_PER_NORM = 4.866699e-8
+HAND_UNIT_PER_NORM = {"Y_1": (16, 1.376510e-7), "G_1": (4, 6.882552e-8)}
 
 
 @pytest.mark.parametrize("name", sorted(HAND_UNIT_PER_NORM))
 def test_band_unit_matches_hand_computed_value(c, D, tree, w0, name):
-    q, per_norm = HAND_UNIT_PER_NORM[name]
+    q, acc_per_norm = HAND_UNIT_PER_NORM[name]
     spec = c.product(c.m_of(name))
     assert spec.q == q
     store, out = _store(c, D, tree, w0, 1)
@@ -1389,7 +1406,11 @@ def test_band_unit_matches_hand_computed_value(c, D, tree, w0, name):
         a, b = replay.operands(m)
     r = challenge_matrix(store.root, spec.m, K, spec.width)
     res = torch.linalg.vector_norm(a @ (b @ r) - p @ r, dim=0).tolist()
-    unit = per_norm * float(torch.linalg.vector_norm(p))
+    p_norm = float(torch.linalg.vector_norm(p.double()))
+    # U by hand: the Frobenius norm of every term A_il·B_lj, in float64
+    u = float(torch.linalg.vector_norm(a.double()[:, :, None] * b.double()[None, :, :]))
+    assert stat.u == pytest.approx(u, rel=1e-6)
+    unit = (HAND_ROUNDING_PER_NORM + acc_per_norm * max(1.0, u / p_norm)) * p_norm
     for got, x in zip(stat.normalized, res):
         assert got == pytest.approx(x / unit, rel=1e-5)
 

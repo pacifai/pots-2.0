@@ -23,8 +23,12 @@ cache.
    freezes on them, so check 8 closes the run. The fit is in-sample and never written as a band
    file: it gives item 4 its bands and nothing else. Its concentration guard (the largest
    honest normalized residual at most ``τ/2``) is printed beside it, and a failure is flagged in
-   the verdict and fails the run. Check 8's reference is ``T`` uncaptured steps from ``W_0``,
-   kept as leaf hashes only. A step rejected live ends the run with that rejection, unfitted.
+   the verdict and fails the run. Beside them: the band unit (F18's split, ``σ_r·e_m·‖P‖_F``
+   with ``e_m = √2·ε_in + √q·ε_acc·max(1, U/‖P‖_F)``), the largest ``U/‖P‖_F`` against its
+   bound ``√w·κ``, and P10d's ``k`` at the largest ``e_m`` over these products and at
+   ``e_m(q_max)`` (``T = VERIF_STEPS``), information only. Check 8's reference is ``T``
+   uncaptured steps from ``W_0``, kept as leaf hashes only. A step rejected live ends the run
+   with that rejection, unfitted.
 3. **Residuals, printed and not judged.** Check 5's table by product class and check 6's by
    weight role. With ``--reference-bands`` (SmolLM2's band file), each score family's largest
    score at each step under those bands (EVALUATION_SPEC §2.2: check 5's ``ρ_5``, its κ guard's
@@ -51,6 +55,7 @@ tamper is rejected where expected, else 1.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from collections import Counter
@@ -68,7 +73,7 @@ from setup.model import model_pin
 from verification.commitment.leaves import dataset_tree, leaf_hash, leaf_hashes_of
 from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import snapshot_weights
-from verification.parameters import load_protocol_config
+from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.prover.step import prove_step
 from verification.runs.llama_step import load_committed_dataset, report_costs
 from verification.runs.metrics import (
@@ -88,9 +93,10 @@ from verification.runs.scenarios import (
 )
 from verification.transcript.store import IN_MEMORY, DiskHandoff, InMemoryStore, StoreHandoff
 from verification.verifier.bands import Bands, product_class
-from verification.verifier.calibration import Calibration, band_file_bytes, fit
+from verification.verifier.calibration import Calibration, band_file_bytes, fit, largest_e_m
 from verification.verifier.context import Rejection, Section
 from verification.verifier.driver import Verifier
+from verification.verifier.matmul_check.sizing import size_k, term_ratio
 from verification.verifier.residuals import (
     class_summary,
     format_class_table,
@@ -307,8 +313,52 @@ def family_maxima(stats: Any, bands: Bands, *, k: int) -> dict[str, tuple[float,
 # ---- the report -------------------------------------------------------------------------
 
 
+def report_unit(stats: Mapping[int, Any], cal: Calibration, c: DecoderComputation, *, k: int,
+                T_run: int, out: Callable[[str], None] = print) -> None:
+    """F18's band unit on the fitted steps: the largest ``U/‖P‖_F`` and its bound ``√w·κ``
+    (``w`` the product's width; test 1 bounds ``U ≤ ν``), and P10d's ``k`` both ways."""
+    eps = {"eps_in": UNIT_ROUNDOFF[c.operand_dtype],
+           "eps_acc": UNIT_ROUNDOFF[c.accumulator_dtype]}
+    big = largest_e_m(stats, **eps)
+    worst = None  # (U/‖P‖ over √w·κ, U/‖P‖, √w·κ, where)
+    per_kappa = None  # (U/‖P‖ over κ, where): the measured margin under √w·κ
+    for t, st in sorted(stats.items()):
+        for p in st.products:
+            if p.p_norm == 0 or not math.isfinite(p.kappa):
+                continue
+            ratio = term_ratio(p.p_norm, p.u)
+            bound = math.sqrt(_width(c, p.m)) * p.kappa
+            score = ratio / bound if bound > 0 else math.inf
+            if worst is None or score > worst[0]:
+                worst = (score, ratio, bound, f"{p.name} (step {t})")
+            pk = ratio / p.kappa if p.kappa > 0 else math.inf
+            if per_kappa is None or pk > per_kappa[0]:
+                per_kappa = (pk, f"{p.name} (step {t})")
+    out(f"   band unit (F18): σ_r·e_m·‖P‖_F, e_m = √2·ε_in + √q·ε_acc·max(1, U/‖P‖_F); "
+        f"U/‖P‖_F max {big.u_ratio_max:.4g} at {big.u_ratio_max_name}")
+    if worst is not None:
+        out(f"   U/‖P‖_F ≤ √w·κ: largest share {worst[0]:.4g} ({worst[1]:.4g} of "
+            f"{worst[2]:.4g}, {worst[3]}): " + ("holds" if worst[0] <= 1 else "FAILS"))
+    if per_kappa is not None:
+        out(f"   U/‖P‖_F over κ: max {per_kappa[0]:.4g} ({per_kappa[1]})")
+    out(f"   max R/τ = {cal.global_max / cal.tau:.4g} (τ/2 is 0.5)")
+    q_max = max(s.q for s in c.products)
+    sz = size_k(q_max, T=T_run, M=c.M, s_h=cal.s_h, z=cal.z, e_cal=big.e_m, e_cal_at=big.at,
+                **eps)
+    sq = size_k(q_max, T=T_run, M=c.M, s_h=cal.s_h, z=cal.z, **eps)
+    out(f"   k (P10d, T {T_run}, configured {k}): {sz.k} at the largest e_m {big.e_m:.4e} "
+        f"({big.at}, q {big.q}, U/‖P‖_F {big.ratio:.4g}); {sq.k} at e_m(q_max = {q_max}) "
+        f"{sq.e_max:.4e}")
+
+
+def _width(c: DecoderComputation, m: int) -> int:
+    """Product ``m``'s width ``w``, the length of its ``1`` in ``|P|·1``."""
+    return int(c.product(m).b_shape[1])
+
+
 def report(b: BringUp, *, k: int, reference: Bands | None,
-           c: DecoderComputation, out: Callable[[str], None] = print) -> None:
+           c: DecoderComputation, out: Callable[[str], None] = print,
+           T_run: int = 1) -> None:
     r, v = b.result, b.result.verifier
     loop = r.loop
     out("== honest steps (calibration mode: the exact checks judge, 5 and 6 record)")
@@ -323,6 +373,7 @@ def report(b: BringUp, *, k: int, reference: Bands | None,
             f"global max {cal.global_max:.4g} ({cal.global_max_name})")
         out(f"   concentration guard: global max {cal.global_max:.4g} ≤ τ/2 = "
             f"{cal.guard_limit:.4g}: " + ("holds" if cal.guard_ok else "FAILS"))
+        report_unit(v.stats, cal, c, k=k, T_run=T_run, out=out)
         out("   frozen on it: "
             + ("accepted" if b.freeze_rejection is None else str(b.freeze_rejection)))
     out("   run verdict (check 8 included): "
@@ -403,7 +454,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("hand-off: " + ("in memory" if disk is None else f"on disk under {disk}"))
     b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
                  device=cfg.device, handoff=None if disk is None else DiskHandoff(disk))
-    report(b, k=k, reference=reference, c=c)
+    report(b, k=k, reference=reference, c=c, T_run=cfg.steps)
     return 0 if b.passed else 1
 
 

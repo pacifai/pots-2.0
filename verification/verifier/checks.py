@@ -600,9 +600,9 @@ def _judge_product(c: DeclaredComputation, spec: ProductSpec, mp: ProductMeasure
     normalized = mp.normalized
     ctx.stats.products.append(ProductStat(spec.m, spec.name, cls_key, kappa, normalized,
                                           q=spec.q, p_norm=mp.p_norm, nu=nu,
-                                          p_abs1=p_abs1))
+                                          p_abs1=p_abs1, u=mp.u))
     guard = {"ν": nu, "‖|P|·1‖": p_abs1} if ctx.kappa_guard else {}
-    values = {**guard, "‖P‖_F": mp.p_norm, "band unit": unit,
+    values = {**guard, "‖P‖_F": mp.p_norm, "U": mp.u, "band unit": unit,
               **{f"residual j={j}": x for j, x in enumerate(res, start=1)}}
     bad = [key for key, v in values.items() if not math.isfinite(v)]
     if bad:

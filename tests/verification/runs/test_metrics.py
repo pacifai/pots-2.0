@@ -232,8 +232,9 @@ def test_residual_arrays_round_trip(smoke):
         assert back.get(name, {}) == want
         # The product scales (A11) stay out of equality, so compare them here, bit for bit.
         for t, st in want.items():
-            assert [(p.q, p.p_norm, p.nu, p.p_abs1) for p in back[name][t].products] == \
-                [(p.q, p.p_norm, p.nu, p.p_abs1) for p in st.products]
+            assert [(p.q, p.p_norm, p.nu, p.p_abs1, p.u) for p in back[name][t].products] == \
+                [(p.q, p.p_norm, p.nu, p.p_abs1, p.u) for p in st.products]
+            assert all(math.isfinite(p.u) and p.u > 0 for p in st.products)
             assert all(p.q >= 2 and p.p_norm > 0 for p in st.products)
     res = results["honest"]
     c = res.verifier.c
@@ -780,3 +781,36 @@ def test_overhead_is_small():
         key = f"check {cid}"
         off = s["median_s"]["off"][key]
         assert s["median_s"]["on"][key] - off < max(50e-6 * s["T"], 0.02 * off)
+
+
+def test_step_records_carry_the_realized_floor(smoke):
+    """F18: each step record's ``f_achieved_max`` is ``calibration.step_floor`` over the step's
+    products, each at its own ``e_m``, with ``N`` from ``bit_budget`` (provisional bands carry
+    no sizing); a step that measured no product has ``None``."""
+    from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF
+    from verification.verifier.calibration import step_floor
+    from verification.verifier.matmul_check.sizing import bit_budget
+
+    out, results = smoke
+    steps = read_records(out, "step")
+    scored = 0
+    for name, res in results.items():
+        v = res.verifier
+        N = bit_budget(LAMBDA, v.n_steps, v.c.M, LOG2_G)
+        eps = UNIT_ROUNDOFF[torch.float32]
+        for r in (r for r in steps if r["scenario"] == name):
+            st = v.stats[r["step"]]
+            want = step_floor(st, tau=v.bands.tau, k=K, N=N, eps_in=eps, eps_acc=eps)
+            if want is None:
+                assert r["f_achieved_max"] is None and r["f_achieved_at"] is None
+                continue
+            scored += 1
+            assert (r["f_achieved_max"], r["f_achieved_at"]) == (want.f_achieved, want.name)
+            assert 0 < r["f_achieved_max"] < 1
+    assert scored > 0
+
+
+def test_step_floor_fields_none_while_calibrating():
+    v = type("V", (), {"calibrate": True, "bands": None, "k": 7})()
+    st = StepStats(products=[ProductStat(1, "a", "S", 1.0, (1.0,), q=8, p_norm=1.0, u=1.0)])
+    assert metrics.step_floor_fields(v, st) == {"f_achieved_max": None, "f_achieved_at": None}

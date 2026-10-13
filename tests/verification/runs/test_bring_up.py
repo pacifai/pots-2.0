@@ -143,14 +143,16 @@ def test_reference_bands_carry_over_to_another_model():
 def test_report_prints_each_part(run):
     c, b = run
     lines = []
-    ref = Bands(tau=b.bands.tau / 4, kappa_max=b.bands.kappa_max, source="ab" * 32)
+    # τ/16: the global max is at least s_h = τ/8 (the largest class RMS), so ρ_5 > 1 somewhere
+    ref = Bands(tau=b.bands.tau / 16, kappa_max=b.bands.kappa_max, source="ab" * 32)
     report(b, k=K, reference=ref, c=c, out=lines.append)
     text = "\n".join(lines)
     for part in ("honest steps", "frozen on it: accepted", "run verdict (check 8 included): "
                  "ACCEPTED", "concentration guard: global max", ": holds",
                  "check 5: normalized residuals", "check 6: ρ_max",
                  "scores against the reference band file", "families above 1: rho_5",
-                 "step 2: prover", "verifier peak"):
+                 "step 2: prover", "verifier peak", "band unit (F18)", "U/‖P‖_F ≤ √w·κ",
+                 "U/‖P‖_F over κ", "max R/τ", "k (P10d"):
         assert part in text, part
     assert "NOT AS EXPECTED" not in text and "FAILS" not in text
     assert ("tamper:" in text) == c.qkv_bias

@@ -484,7 +484,7 @@ interface.
     the properties `p_shape`, `q` and `width` (the column count of P, since `r` multiplies P
     on the right). `bias` names a biased linear's bias weight (F14, FS2): `P = A·B + 1·bᵀ`,
     checked as `[A | 1]·[B ; bᵀ]`, so `q` is the checked matmul's contraction length,
-    `a_shape[1] + 1` when biased. Every `e_m(q)` consumer (check 5, `ProductStat.q`,
+    `a_shape[1] + 1` when biased. Every `e_m` consumer (check 5, `ProductStat.q`,
     `realized_floor`, the sweep, `calibrate`'s `q_max`) reads it from there. `validate()`
     requires the bias to be a declared weight outside `linear_weights` (its gradient is
     glue, 6b), of shape `(width,)`, on a forward product with a weight that isn't a member.
@@ -974,8 +974,10 @@ interface.
     keys on it), the leaf hashes and `CommittedLeaves` (`ctx.state.committed()`). It carries
     check 5's replay to 6b. The root comparison writes `recomputed_root`. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
     normalized residual, κ and ρ, which is P10b's calibration feed. `ProductStat` also
-    carries each product's scale for C1's realized floor: `q`, `p_norm` (`‖P‖_F`), `nu` and
-    `p_abs1` (`‖|P|·1‖`). They default to `0`/NaN and are left out of equality.
+    carries each product's scale for C1's realized floor: `q`, `p_norm` (`‖P‖_F`), `nu`,
+    `p_abs1` (`‖|P|·1‖`) and `u`, the term scale `U` (F18). `q`, `p_norm` and `u` set the
+    product's own `e_m` (`sizing.product_e_m`). They default to `0`/NaN and are left out of
+    equality.
   - `StepContext.kappa_guard` (default `True`): `False` skips check 5's test 1 and its
     finiteness check on ν and `‖|P|·1‖`, which are then NaN. Only C1's cost split sets it.
   - `PROVER_DATA_ERRORS` and the guard that maps them to a malformed rejection.
@@ -1104,8 +1106,18 @@ interface.
     concentration guard (global max ≤ `τ/2`). It raises `ValueError` on a step without
     numbers, a product without `k` residuals, a non-finite number, or `s_h = 0`.
   - `realized_floor(stats, *, tau, k, N, eps_in, eps_acc) -> RealizedFloor`: per product
-    `f_achieved(e_m(q))` (the floor as a fraction of `‖P_m‖_F`) and `Φ_m`, with the count
-    above 1 and above `1/√2`, and every product with `‖|P|·1‖ = 0` but `ν ≠ 0`.
+    `f_achieved` at the product's own `e_m` (F18, `sizing.product_e_m` from `q`, `‖P_m‖_F` and
+    `U_m`; the floor as a fraction of `‖P_m‖_F`) and `Φ_m`, with the count above 1 and above
+    `1/√2`, and every product with `‖|P|·1‖ = 0` but `ν ≠ 0`. `by_q` is the largest ratio at
+    each `q`. Products with `‖P_m‖_F = 0` are left out and listed in `zero_norm`
+    (placeholder: no honest product has been one).
+  - `largest_e_m(stats, *, eps_in, eps_acc) -> LargestEm(e_m, name, step, q, ratio,
+    u_ratio_max, u_ratio_max_name, zero_norm)`: the largest `e_m` over the calibration
+    products, which P10d's recompute of `k` sizes at (F18), and the largest `U/‖P‖_F`
+    wherever it sits. `step_floor(stats, *, tau, k, N, eps_in, eps_acc) -> StepFloor |
+    None`: one step's realized floor, its largest `f_achieved` and the product; it skips
+    unrecorded or non-finite products rather than raising, since a rejected step may hold
+    them.
   - `band_file_bytes(cal, stats=None)` (no timestamps, so a rerun gives the same hash),
     `write_band_file(path, data)` (temporary file then rename),
     `load_bands(path, *, k, context)` (the read-only loader every judged run uses: a missing
@@ -1143,6 +1155,19 @@ interface.
   and `e_m(q + 1)`. Without it every operation and its order is the unbiased one, so
   unbiased products keep their bits. Its norms use `_safe_norm` (power-of-two scaling,
   bit-identical to `vector_norm` when that doesn't overflow or underflow).
+  - **The band unit (F18).** Test 2 rejects when `‖A(B·r) − P·r‖ > τ·σ_r·(√2·ε_in·‖P‖_F +
+    √q·ε_acc·max(‖P‖_F, U))`: the product's own rounding scales with `‖P‖_F`, accumulation
+    with the larger of `‖P‖_F` and the term scale `U = √(Σ_l ‖A[:,l]‖²·‖B[l,:]‖²)`, the
+    Frobenius norm of the array of every term `A_il·B_lj`. `band_unit(q, eps_in, eps_acc,
+    p_norm, u)` is that unit, through `sizing.product_e_m`; where `U ≤ ‖P‖_F` it is the
+    pre-F18 unit bit for bit, and with `‖P‖_F = 0` it is `σ_r·√q·ε_acc·U`.
+    `ProductMeasure.u` is `U`, computed as `√(Σ A²·(B²·1))` (`_term_sq`, two fp32
+    matrix-vector products into the scratch buffer, summed in float64) from the rebuilt
+    operands in the same pass as ν; a biased product adds `n·‖b‖²` (`_bias_u2`). It is
+    computed with the κ guard on or off. `term_scale(a, b, bias=None)` gives the same bits
+    outside a measure (the sweep's unit). Since `U ≤ ν`, test 1 bounds `U/‖P‖_F ≤ √w·κ_max`
+    (`w` the width), so the band can't grow without the κ test seeing it. An fp32 overflow of
+    `U` gives `inf`, which rejects as any non-finite number does.
   `measure_products(a, b, p, *, h, ms, k, eps_in, eps_acc)` does the same for a stacked batch
   of one shape, each member with its own challenges and `_safe_norm` scale. At SmolLM2's
   member shapes its normalized residuals equal `measure_product`'s bit for bit; below about
@@ -1163,9 +1188,16 @@ interface.
     from about 1.75 s to 1.3 s (2026-10-04, `MallocLargeCache=0`).
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
-  - `e_m`, `b0`, `bit_budget`, `k_required(N, b0_bits)` (raises if `b0_bits ≤ 0`) and
-    `f_achieved`.
-  - `size_k(...) -> Sizing`, which holds every intermediate.
+  - `e_m(q, eps_in, eps_acc, u_ratio=1.0)` is F18's split, `√2·ε_in + √q·ε_acc·max(1,
+    u_ratio)`, and every use of `e_m` goes through it. The default ratio 1 is the advance
+    sizing at `q_max` and the pre-F18 value. `term_ratio(p_norm, u)` is `U/‖P‖_F` (`inf`
+    when only `‖P‖_F` is 0, 1 when both are), and `product_e_m(q, eps_in, eps_acc, p_norm,
+    u)` one product's `e_m`.
+  - `b0`, `bit_budget`, `k_required(N, b0_bits)` (raises if `b0_bits ≤ 0`) and `f_achieved`.
+  - `size_k(..., e_cal=None, e_cal_at=None) -> Sizing`, which holds every intermediate.
+    Without `e_cal` it sizes at `e_m(q_max)`; P10d's recompute after calibration passes the
+    largest calibration `e_m` (`calibration.largest_e_m`) and sizes at the larger of the two
+    (F18). `Sizing` records `e_qmax`, `e_cal` and `e_cal_at` beside `e_max`.
 
 ### `verification/runs/`
 
@@ -1289,7 +1321,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   - **Step records (EVALUATION_SPEC §4.1).** `step_record` writes `model`, `corpus`,
     `attack`, `seed`, `bpr_records`, `bpr_actual`, `cheat_step`, `step`, `judged`,
     `verdict`, `first_failing_check`, `rejection_kind`, `checks`, the step's scores
-    `rho_5`, `rho_kappa`, `rho_6` and `n_failing`, and `record_pass`
+    `rho_5`, `rho_kappa`, `rho_6` and `n_failing`, the step's realized floor
+    `f_achieved_max` and `f_achieved_at` (F18, `step_floor_fields(verifier, stats)`: the
+    largest `f_achieved = c·τ·e_m·2^(N/k)` over the step's products, each at its own `e_m`,
+    and that product's name; `None` while calibrating; `N` is the band file's sizing's, else
+    `bit_budget(λ, n_steps, M, log₂G)`, a placeholder), and `record_pass`
     (`record_pass(verifier, t, stats, *, kappa_guard)`): at a rejected step `{"status": the
     driver's record_pass[t] ("not run" when it has none), "measured": {"rho_5": products ×
     k, "rho_kappa": products (0 with the guard off), "rho_6": tensors}}`, the counts over
@@ -1323,7 +1359,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `verdict`, `time`, `memory`, `count`, `storage`, `run_end`, each with `record` and `run`;
     non-finite floats as the strings `"NaN"`, `"Infinity"`, `"-Infinity"`) and
     `residuals/<scenario>/step_<t>.npz`. Since A11 each npz also holds the product scales
-    `p_q`, `p_norm`, `p_nu`, `p_abs1`; older archives read back with them unknown. Since EV2
+    `p_q`, `p_norm`, `p_nu`, `p_abs1`, and since F18 `p_u` (the term scale `U`); older
+    archives read back with them unknown (`U` as NaN). Since EV2
     (EVALUATION_SPEC §4.2) it holds the index table and the scores beside the raw arrays:
     per product `p_m`, `p_name`, `p_cls` (the fine class, κ's), `p_spec_class` (§5.7's
     class, `spec_class(c, spec)`: `forward`, `input gradient`, `weight gradient`,
@@ -1451,7 +1488,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `family_maxima(stats, bands, *, k)` gives each score family's largest score, its count
     above 1 and where it sits (for `ρ_5` the product and its challenge `j`). `report` prints
     the honest steps, the fit with its concentration guard (`holds` or `FAILS`, and a failure
-    again in the verdict line), `residuals.py`'s two tables, the reference scores, the tampers
+    again in the verdict line), F18's unit (`report_unit(stats, cal, c, *, k, T_run)`: the
+    largest `U/‖P‖_F`, its largest share of the bound `√w·κ` with `holds` or `FAILS`, the
+    largest `U/‖P‖_F` over `κ`, max `R/τ`, and P10d's `k` at the largest `e_m` and at
+    `e_m(q_max)`, for `T_run` = the config's steps), `residuals.py`'s two tables, the reference scores, the tampers
     and `llama_step.report_costs`.
   - Real runs (2026-10-12, dev Mac under other jobs, `MallocLargeCache=0`,
     `VERIF_N_RECORDS=369`, `T = 1`, `k = 9`; GB here is 2^30 bytes, as `report` prints it):
@@ -1498,7 +1538,23 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     - The Falcon3 and Qwen2.5-1.5B runs used swap. The arithmetic is deterministic, so swap
       changes the times, not the decisions. The slow bring-up test wasn't run on the 1B
       models; it calls the same `bring_up`.
-  - `main` ran on SmolLM2 as a path check: accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the
+  - Re-run at F18 (2026-10-13, same settings, against SmolLM2's band file `c55a75a4…`): every
+    honest step is accepted with check 8 on its own fit and the guard holds on all five.
+    max `R/τ` (largest honest residual over its own `τ`; 0.5 is the guard), before → after:
+    SmolLM2 0.248 → 0.193, Qwen2.5-0.5B 0.522 → 0.163, Llama-3.2-1B 0.219 → 0.219, Falcon3-1B
+    0.343 → 0.343, Qwen2.5-1.5B 2.02 → 0.282 (`s_h` 3.67 `Λ`, `τ` 29.4, max 8.27 at
+    `L27.G_down`). `U/‖P‖_F` reaches 4.02, 35.8, 3.44, 3.00 and 191.6 (`L1.dQ[1,3]`); over
+    `κ` at most 1.89 (Qwen2.5-0.5B's `L9.dQ[1,3]`), and at most 0.24 of `√w·κ`. P10d's `k`
+    at `T = 10` is 9 on all but Qwen2.5-1.5B, where the largest `e_m` (1.29e-4 at
+    `L1.dQ[1,3]`, `q = 128`) asks for 12 (9 at `e_m(q_max)`). Both Qwen models' altered `b_q`
+    entry is rejected at check 5 on `P_1 (L1.Y_q)` (residual 2.65e3 against `τ` 33.6, and
+    97.9 against 29.4) and at 6b. Check 5 takes 1.54, 2.90, 8.09, 10.50 and 14.01 s
+    (Qwen2.5-1.5B 12.18 s in a second run); the commands 6, 24, 23, 28 and 67 s; process
+    peaks as before. `U` itself costs 0.35 s of Qwen2.5-1.5B's check 5 (2.8%), 1.03 times
+    `ν`'s two matrix-vector products on the same operands (a timing wrapper around
+    `_term_sq`, kept out of the repo); on SmolLM2's step 0.084 s against `ν`'s 0.081 s (5.7% of check 5's 1.48 s).
+  - `main` ran on SmolLM2 as a path check (before F18; at F18 `s_h` 5.04, `dF`, `τ` 40.3,
+    max `R/τ` 0.193): accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the
     band file's 4.75 is over steps 1–3), `τ` 46.3; prover 1.58 s, verifier 2.49 s (check 5
     1.92); prover peak 4.30 GB, verifier peak 4.74 GB; against its own band file `ρ_5` 0.30,
     `ρ_κ` 0.50, `ρ_6` 0.50.
@@ -1640,6 +1696,15 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `τ_W = 4` on all 272 tensors. Band-file hash `cc7a9bca…`. Steps 1–3 accepted under it,
     guard on and off. Gradient coherence 1.29. Verifier per step 1.65 s with the guard, 1.57 s
     without. About 57 s in all.
+  - Re-run at F18 (2026-10-12, `k = 9`, after FS15's fix to the counting pass, which since EV2
+    named `T`, `final` and `cfg` that `_run` doesn't define): `s_h = 3.92` (`dF`), `τ = 31.4`,
+    global max 7.79 (`dF`, step 1) ≤ `τ/2 = 15.7`, max `R/τ` 0.248. `U/‖P‖_F` reaches 4.02
+    (`L3.dQ[1,1]`). The largest calibration `e_m` is 1.521e-5 at `dF` (step 2, `q = 49152`,
+    `U/‖P‖_F` 1.145) against `e_m(q_max)` 1.330e-5, so P10d sizes at the former: `b₀` 11.32
+    bits (11.52 at `e_m(q_max)`), `N` 93.1, `k = 9` either way, floor at most 0.508 of
+    `‖P‖_F` (`dF`), 0 of 21,339 products above 1. `τ_W = 4` on all 272 tensors. Band-file
+    hash `c55a75a4…`. Steps 1–3 accepted under it, guard on and off. Gradient coherence 1.29.
+    The κ guard adds 0.055 s to `5.measure` (0.846 against 0.791 s). 48 s, peak RSS 9.2 GB.
 - `store_crosscheck.py` (A14, C3): `.venv/bin/python -m verification.runs.store_crosscheck
   [--metrics | --no-metrics]`. It needs the band file and `VERIF_ETA`, like `run_verified`.
   - Runs each scenario twice, once with the `IN_MEMORY` hand-off and once with a
@@ -1725,7 +1790,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     memory). Targets (`sweep_targets`): one product per §5.7 class (`metrics.spec_class`, the
     class's middle layer, its first product) plus the binding product (largest `q`, `dF`).
     Shapes `entry`/`entry2`/`row2`/`dense` (`row2`: two equal moves in one row, the worst
-    rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)`, and deep points (`DEEP_X` 300, 1000
+    rank-1 case that sets `C_ANTI`), grid `x = f/(τ·e_m)` with `e_m` the target's own
+    (F18: `Held.e_m()`, from `q`, the honest `‖P‖_F` and `U`, `term_scale` on the held
+    operands; `_judge` asserts the measure's `U` equals it; a flip record without `U` falls
+    back to ratio 1, a placeholder), and deep points (`DEEP_X` 300, 1000
     and 3000 at `DEEP_TRIALS` 2,000, on `DEEP_SHAPES` `entry` and `row2`, from their own
     generator). Re-rooted with `perturb_leaf`, judged with check 5's own
     `_measure_run`/`_judge_product` (a biased target holds its committed `b` too). Then one
@@ -1805,13 +1873,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     footprint's peak less its value just before the call, after `gc.collect()`) and counts.
     Every pass must accept; κ, ν, `‖|P|·1‖` and `‖P‖_F` must be bit-equal at every `k`; the
     configured `k` must reproduce the archive and the step record's `ρ_5`; and every pass's
-    numbers must be equal across rounds. Predicted counts: `5.measure` FLOPs `S·(k+1)` (the
-    `+1` is the κ guard's column; bias terms left out), `5.glue` FLOPs constant, `M·k` hash
+    numbers must be equal across rounds. Predicted counts: `5.measure` FLOPs `S·(k+1) + S_U`
+    (the `+1` is the κ guard's column; `S_U = Σ 2(q·w + n·q)`, `measure_flops_term_scale`, is
+    F18's `U`, computed with the guard on or off; bias terms left out), `5.glue` FLOPs constant, `M·k` hash
     calls. The times are fitted linearly in `k` over every `k` and over `k ≥ 2`.
   - `k_top = max(2·k_conf, k_cover)`: `k_cover` is the smallest `k` with `rate·B ≤ 1`,
     `rate = f_ach(k)·C/(√B·‖δg‖/‖g‖)` (sizing (12.1)), at `COVER_COHERENCE` `C = 1` and
     `GRADIENT_RATIO` 2, both hand-picked. `f_ach(k) = C_ANTI·τ·e_max·2^{N/k}` from the band
-    file's sizing.
+    file's sizing; since F18 its `e_max` is the largest calibration `e_m`.
   - Records under `$VERIF_OUTPUT_DIR/k_tunability/`: one `k_source` (the step, the floor's
     inputs, the other checks' times, the honest run's own step-4 records), one `k_point` per
     `k`, one `k_summary` (the fits, the count checks, the reproduction).

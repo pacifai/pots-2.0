@@ -99,8 +99,9 @@ class ProductStat:
     ``normalized[j−1] = ‖A(B·r_j) − P·r_j‖ / (σ_r·e_m·‖P_m‖_F)``, the quantity compared with
     ``τ`` (P3.a). ``inf`` when the band's scale is zero and the residual isn't.
 
-    C1 (A11) also needs each product's scale: ``q`` (its contracted dimension, which sets
-    ``e_m``), ``‖P_m‖_F``, ``ν_m`` and ``‖|P_m|·1‖``. The realized floor is
+    C1 (A11) also needs each product's scale: ``q`` (its contracted dimension), ``‖P_m‖_F``,
+    ``ν_m``, ``‖|P_m|·1‖`` and the term scale ``U_m`` (F18). ``q``, ``‖P_m‖_F`` and ``U_m``
+    set the product's ``e_m`` (``sizing.product_e_m``). The realized floor is
     ``f_achieved(e_m)·‖P_m‖_F``, and a product with ``‖|P|·1‖ = 0`` but ``ν ≠ 0`` is one the
     guard rejects by construction. They default to unknown (``q = 0``, NaN) and stay out of
     equality, so a NaN read back from a file can't make two equal records differ.
@@ -115,6 +116,7 @@ class ProductStat:
     p_norm: float = field(default=math.nan, compare=False)
     nu: float = field(default=math.nan, compare=False)
     p_abs1: float = field(default=math.nan, compare=False)
+    u: float = field(default=math.nan, compare=False)
 
 
 @dataclass(frozen=True)

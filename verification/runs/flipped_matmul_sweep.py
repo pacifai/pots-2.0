@@ -49,7 +49,10 @@ first judged step: the bands were fitted on steps 1–3 (P10c).
    be rejected at 6a on that entry. Then the leaf goes back and the root must return.
 
 **The sweep's scale (EQ10).** ``x = f/(τ·e_m)``, so ``x = 1`` is an error whose ``‖Δ·r‖`` is
-``τ`` band units for an average challenge. ``f = x·τ·e_m`` for each grid point ``x``. Shapes:
+``τ`` band units for an average challenge. ``f = x·τ·e_m`` for each grid point ``x``. ``e_m``
+is the target's own (F18, ``sizing.product_e_m``): from its ``q``, its honest ``‖P‖_F`` and
+its term scale ``U`` (``freivalds.term_scale``, from the honest operands), so ``x`` is in units
+of ``τ`` times the product's band unit over ``σ_r·‖P‖_F``. Shapes:
 
 - ``entry``: one random entry moved by ``±f·‖P‖_F`` (concentrated, the spec's §8 worry);
 - ``entry2``: two random entries, almost always in different rows, each moved by
@@ -162,8 +165,14 @@ from verification.verifier.checks import (
 )
 from verification.verifier.context import StepContext, StepState, StepStats
 from verification.verifier.matmul_check.challenges import SIGMA_R
-from verification.verifier.matmul_check.freivalds import MeasureScratch
-from verification.verifier.matmul_check.sizing import C_ANTI, bit_budget, e_m, f_achieved
+from verification.verifier.matmul_check.freivalds import MeasureScratch, term_scale
+from verification.verifier.matmul_check.sizing import (
+    C_ANTI,
+    bit_budget,
+    e_m,
+    f_achieved,
+    product_e_m,
+)
 
 __all__ = ["RUN_NAME", "SWEEP_STEP", "SHAPES", "DEFAULT_X", "DEFAULT_TRIALS", "DEEP_X",
            "DEEP_TRIALS", "DEEP_SHAPES", "FIT_X_MIN", "CHECK6_FACTOR", "SOURCES", "Held",
@@ -249,6 +258,11 @@ class Held:
     bias: torch.Tensor | None = None  # a biased product's committed bias, as check 5 reads it
     spec_class: str = ""  # its §5.7 class (metrics.spec_class)
     binding: bool = False  # the binding product
+    u: float = math.nan  # its term scale U (F18), from the honest operands
+
+    def e_m(self, eps_in: float, eps_acc: float) -> float:
+        """The target's own ``e_m`` (F18), the sweep's unit for ``x``."""
+        return product_e_m(self.spec.q, eps_in, eps_acc, self.p_norm, self.u)
 
 
 def hold_targets(c: DeclaredComputation, store: InMemoryStore,
@@ -269,9 +283,10 @@ def hold_targets(c: DeclaredComputation, store: InMemoryStore,
         p = leaf.detach().to(torch.float32)
         bias = None if s.bias is None else store.leaf(c.w_t_index(s.bias)).detach().to(
             c.operand_dtype).to(torch.float32)
-        held.append(Held(s, product_class(c, s), *ops[s.m], leaf, p,
+        a, b = ops[s.m]
+        held.append(Held(s, product_class(c, s), a, b, leaf, p,
                          float(torch.linalg.vector_norm(p, dtype=torch.float64)), bias,
-                         spec_class(c, s), s.m == bind))
+                         spec_class(c, s), s.m == bind, term_scale(a, b, bias)))
     return held
 
 
@@ -321,7 +336,7 @@ class Trials:
     m: int
     cls: str
     shape: str
-    e: float  # e_m(q)
+    e: float  # the target's own e_m (F18, Held.e_m)
     x_set: list[float] = field(default_factory=list)
     f_real: list[float] = field(default_factory=list)
     norm_ratio: list[float] = field(default_factory=list)  # ‖P'‖_F/‖P‖_F; none reads as 1
@@ -349,7 +364,9 @@ def sweep_target(c: DeclaredComputation, store: InMemoryStore, held: Held, ctx: 
     return. ``ctx`` gives ``k`` and the unit roundoffs, and holds no stats afterwards."""
     s, idx = held.spec, c.product_index(held.spec.m)
     base = store.root
-    e = e_m(s.q, ctx.eps_in, ctx.eps_acc)
+    e = held.e_m(ctx.eps_in, ctx.eps_acc)
+    if not math.isfinite(e):
+        raise ValueError(f"P_{s.m} ({s.name}): e_m = {e} (‖P‖_F {held.p_norm}, U {held.u})")
     out = []
     try:
         for shape in shapes:
@@ -382,12 +399,16 @@ def sweep_target(c: DeclaredComputation, store: InMemoryStore, held: Held, ctx: 
 def honest_measure(c: DeclaredComputation, store: InMemoryStore, held: Held,
                    ctx: StepContext, bands: Bands) -> tuple[float, ...]:
     """The target's normalized residuals on the unperturbed transcript, measured as the sweep
-    measures (they must equal the run's check-5 numbers for that product)."""
+    measures (they must equal the run's check-5 numbers for that product). Its ``U`` must equal
+    ``held.u``, the sweep's unit's."""
     [mp] = _measure_run([held.spec], [(held.a, held.b, held.p, held.bias)], h=store.root,
                         k=ctx.k, eps_in=ctx.eps_in, eps_acc=ctx.eps_acc,
                         guard=ctx.kappa_guard)
     if _judge_product(c, held.spec, mp, ctx, bands) is not None:
         raise AssertionError(f"P_{held.spec.m}: the honest product is rejected")
+    if mp.u != held.u:
+        raise AssertionError(f"P_{held.spec.m}: check 5's U {mp.u!r} differs from the "
+                             f"sweep's {held.u!r}")
     ctx.stats.products.clear()
     return tuple(mp.normalized)
 
@@ -630,9 +651,11 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
         store, stats = kept.store, kept.honest or StepStats()
     floor = floor_context(env.bands, c, k=env.k, T=t)
     pf = store.leaf(c.product_index(m_flip)).detach().to(torch.float64)
+    e_flip, e_src = _flip_e_m(c, stats, m_flip)
     x_flip = (2 * float(pf.abs().max()) / float(torch.linalg.vector_norm(pf))
-              / (env.bands.tau * e_m(c.product(m_flip).q, *_eps(c))))
-    out(f"flip: 2·max|P|/‖P‖_F on step {t}'s {flip_name} is x = {x_flip:.4g} band units")
+              / (env.bands.tau * e_flip))
+    out(f"flip: 2·max|P|/‖P‖_F on step {t}'s {flip_name} is x = {x_flip:.4g} band units "
+        f"(e_m {e_flip:.4e}, {e_src})")
     seen = {p.m: tuple(p.normalized) for p in stats.products}
     ctx = StepContext.for_computation(
         c, step=t, indices=tuple(schedule(t, c.n_s, len(env.D), env.seed)), h_D=env.h_D,
@@ -694,6 +717,17 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
         writer.write([{"record": "sweep_check6", "run": writer.run, "step": t, **check6}])
         save_trials(writer.dir / TRIALS_FILE, all_trials)
     return SweepResult(honest, flip, summaries, points, all_trials, seconds, check6)
+
+
+def _flip_e_m(c: DeclaredComputation, stats: StepStats, m: int) -> tuple[float, str]:
+    """The flipped product's own ``e_m`` (F18) from the honest step's recorded ``‖P‖_F`` and
+    ``U``; ``e_m(q)`` at ratio 1 when the step recorded none (placeholder: a stored step
+    written before F18 has no ``U``; the figure is a printed x only)."""
+    q = c.product(m).q
+    p = next((x for x in stats.products if x.m == m), None)
+    if p is not None and math.isfinite(p.u) and math.isfinite(p.p_norm):
+        return product_e_m(q, *_eps(c), p.p_norm, p.u), "its own"
+    return e_m(q, *_eps(c)), "U unrecorded: e_m(q) at ratio 1"
 
 
 def _eps(c: DeclaredComputation) -> tuple[float, float]:

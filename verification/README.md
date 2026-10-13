@@ -330,7 +330,9 @@ replaced:
   cancellation measure `κ`. It judges nothing; `checks.py` compares the numbers with the
   bands.
 - **`sizing.py`** holds the parameter formulas from the sizing appendix: the expected
-  rounding error `e_m` and the number of vectors `k` needed for the security target.
+  rounding error `e_m` and the number of vectors `k` needed for the security target. Every
+  use of `e_m` goes through its one function `e_m(q, ε_in, ε_acc, u_ratio)`, which splits the
+  error into the product's own rounding and the accumulation's (F18, below).
 
 ### Runs: `runs/`
 
@@ -484,14 +486,22 @@ What each check establishes:
   2. `k` challenge vectors `r` are derived from the claimed root `h` and `m`.
   3. The test compares `A(B·r)` with `P·r`, which costs a few matrix-vector products
      instead of a matrix product. The residual is normalized by the expected rounding
-     error `σ_r · e_m · ‖P‖_F` and must be at most `τ`.
-  4. A second test guards against cancellation. It bounds `‖|A|(|B|·1)‖` by
-     `κ · ‖|P|·1‖`, so a product can't hide error inside large terms that cancel.
+     error and must be at most `τ`. That unit is
+     `σ_r · (√2·ε_in·‖P‖_F + √q·ε_acc·max(‖P‖_F, U))` (F18): rounding the operands and
+     the result scales with the result's size `‖P‖_F`, but the accumulation's error scales
+     with the size of the terms it sums. `U = √(Σ_l ‖A[:,l]‖²·‖B[l,:]‖²)` is the size of
+     all the terms `A_il·B_lj` together. When they cancel, `U` is much larger than `‖P‖_F`
+     and the old unit `σ_r · e_m · ‖P‖_F` was too small: Qwen2.5-1.5B's first-layer `dQ`
+     has `U` 192 times `‖P‖_F`. Where `U ≤ ‖P‖_F` the unit is the old one exactly. `U`
+     costs two more matrix-vector products, `A²·(B²·1)`, about what `ν` below costs.
+  4. A second test guards against cancellation. It bounds `ν = ‖|A|(|B|·1)‖` by
+     `κ · ‖|P|·1‖`, so a product can't hide error inside large terms that cancel. Since
+     `U ≤ ν`, it also caps the unit's growth: `U/‖P‖_F ≤ √w·κ`, `w` the product's width.
 
   A biased projection's product is `P = A·B + 1·bᵀ`. Both tests then use `[A | 1]` and
   `[B ; bᵀ]`, with `b` read from the committed `W_t`, never from a copy the prover sends:
-  `bᵀ·r` is added to every row of `A(B·r)`, `‖b‖₁` to every row of `|A|(|B|·1)`, and the
-  rounding error `e_m` is that of `q + 1` summands. The ones are exact, and `b` is rounded to
+  `bᵀ·r` is added to every row of `A(B·r)`, `‖b‖₁` to every row of `|A|(|B|·1)`, `n·‖b‖²`
+  to `U²`, and the rounding error `e_m` is that of `q + 1` summands. The ones are exact, and `b` is rounded to
   the operand format as `B` is.
 
   Norms are computed with power-of-two scaling so they can't overflow, and any
@@ -547,8 +557,12 @@ from measurement, not guessed. The test-scale procedure:
    - `κ_max` per class is twice the largest honest `κ` of the class;
    - `τ_W` per weight tensor is `max(4, 2·ρ_max)`.
 4. Check the fit. The largest honest residual must sit at or below `τ/2` (the concentration
-   guard). Recompute `k` from the measured `τ` (`sizing.size_k`). If either fails, the run
-   stops and writes no band file; `z` is never raised to make the guard pass.
+   guard). Recompute `k` from the measured `τ` (`sizing.size_k`), at the larger of
+   `e_m(q_max)` and the largest `e_m` any calibration product had (F18: a product whose
+   terms cancel has a larger `e_m` than its `q` alone gives). If either fails, the run
+   stops and writes no band file; `z` is never raised to make the guard pass. Every later
+   step's record carries its realized floor, the largest `f_achieved` over its products,
+   each at its own `e_m` (`f_achieved_max`, `f_achieved_at`).
 5. Write the bands and the statistics behind them to one JSON band file,
    `$VERIF_OUTPUT_DIR/bands.json`. Its BLAKE3 hash identifies it.
 6. Call `verifier.freeze(bands)`. It re-judges steps 1–3 against the frozen bands, then
@@ -577,16 +591,23 @@ It then judges steps 1–3 twice more from the band file: once as the protocol r
 with check 5's `κ` guard off, to time what the guard costs (`Verifier(kappa_guard=False)`;
 calibration refuses it). It also measures how aligned one batch's per-example gradients are.
 
-The current band file (2026-10-11, dev Mac, steps 1–3 on today's `D` and `π` at seed 1):
+The current band file (2026-10-12, dev Mac, steps 1–3 on today's `D` and `π` at seed 1,
+F18's unit; hash `c55a75a4…`):
 
-- `s_h = 4.75` (`Λ`, the output-layer product), so `τ = 38.0`. Its largest residual is 11.5,
-  2.4 times `s_h`, under the guard's 19.0. `dF` is next (RMS 4.2). Every other class has an
-  RMS between 0.3 and 0.8.
-- `k` comes out at 9, and every product's floor is at most 0.54 of its size (`dF`), below the
-  `1/√2` margin of a batch with one poisoned record.
+- `s_h = 3.92` (`dF`, the vocabulary-sized gradient product), so `τ = 31.4`. Its largest
+  residual is 7.79, 2.0 times `s_h`, under the guard's 15.7. `Λ` (the output-layer product)
+  is next (RMS 2.9). Every other class has an RMS between 0.3 and 0.8.
+- The largest calibration `e_m` is `dF`'s at step 2 (`U` 1.15 times `‖P‖_F`), 1.14 times
+  `e_m(q_max)`. Sized there, `k` comes out at 9, as at `e_m(q_max)`, and every product's
+  floor is at most 0.51 of its size (`dF`), below the `1/√2` margin of a batch with one
+  poisoned record.
 - `τ_W` is 4 on all 272 tensors (largest `ρ` 2.0).
 - Under the band file, steps 1–3 are accepted with the guard on and off, and A12's 10 honest
   steps are all accepted.
+
+The file before F18 (2026-10-11, `cc7a9bca…`) had `s_h = 4.75` (`Λ`) and `τ = 38.0`. Under
+the new unit `Λ`'s residuals shrink, since its terms cancel (`U` above `‖P‖_F`), and `dF`
+becomes the largest class.
 
 The first calibration (2026-10-05), on the earlier Stanford Alpaca data and sequential
 schedule, gave `s_h = 5.50` and `τ = 44.0`. At the then-default `k = 7`, the vocabulary-sized
@@ -647,13 +668,14 @@ Breaking any of these voids the result. Each one has a test.
 | SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |
 | Plain-training baseline (`runs/plain_baseline.py`, B7) | done; final weights bit-identical to the captured prover's on the MLP, the tiny Llama and two real SmolLM2 steps |
 | First honest SmolLM2 step (A10, `runs/llama_step.py`) | done; milestone M3 reached. The real step from `W_0` on `π(1)` is accepted with provisional bands: largest normalized residual 5.4 (`Λ`), check 6 `ρ` at most 2.0 |
-| Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. Refitted at C5–C6: `s_h = 4.75` (`Λ`), `τ = 38.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
+| Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. Refitted at F18: `s_h = 3.92` (`dF`), `τ = 31.4`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
 | Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. A11–A14 and B7 re-ran on them on 2026-10-11 |
 | Full-scale data (FS6) | done; both tasks, one `D` per full-scale model (369 refusal or 233 jailbreak records), `D̃` at every poisoning level of 1–128 of 128 (jailbreak to 64) and seeds 1–5. Each model's EOS is pinned and recorded in `meta.json` as its pad id, and the decoder computation pads with the EOS of the model it loads (FS4). Test-scale outputs unchanged byte for byte |
 | One decoder instance for the four full-scale models (FS1) | done; tiny random Llama and Qwen2 models, tied and untied, fill every slot once and replay every operand and glue gradient bit for bit; SmolLM2's roots are unchanged |
 | Biased linears in check 5 (FS2) | done; check 5 checks a biased `Y_q`, `Y_k` or `Y_v` as `[A | 1]·[B ; bᵀ]`, `b` from the committed `W_t`. Honest steps with random non-zero biases are accepted on the tiny Qwen2 models, at residuals like the unbiased ones'. One bias entry altered rejects at check 0 or 7 in `W_t`, at check 5 when only training used it, and at 6b in `W_{t+1}`. Unbiased products, so all of SmolLM2, keep their numbers bit for bit. Check 1 also requires each `π(t)` to hold distinct records |
 | Mixed precision (FS3) | done; `(MASTER_DTYPE, COMPUTE_DTYPE)` from config, autocast around forward and loss in training, the plain run and the replay. SmolLM2 at `(fp32, bf16)` on CPU fills every slot once, rebuilds every operand and glue gradient bit for bit, accepts steps 1–3 under provisional bands (largest normalized residual 1.19), and ends 3 plain and 3 verified steps on the same weights. Tiny Qwen2 models with drawn biases are accepted at bf16 too, check 5 measuring each biased product with the bias cast as autocast cast it for the prover. At `(fp32, fp32)` every pinned root, loss and check number is unchanged. bf16 bands are not calibrated yet, and CPU bf16 matmul on the dev Mac makes a bf16 step about 45 s |
-| Real-model bring-up on CPU (FS4, `runs/bring_up.py`) | Qwen2.5-0.5B run in memory on its real weights: the honest step is accepted on its own fit with check 8, but that fit fails the concentration guard (largest honest residual 25.9 against the limit τ/2 = 24.75), so it isn't a clean pass; one altered bias entry is rejected at check 5 (residual 2.67e3 against τ 49.5) and at 6b, and the process peaks at 14 GB. On all four models' real weights (Meta's own Llama-3.2-1B repo included) the slow test fills every slot once and rebuilds every operand and glue gradient bit for bit, peaking at 10–25 GB. In memory, Meta's Llama-3.2-1B and Falcon3-1B are accepted with check 8 on their own fits, at verifier peaks of 29 and 37 GB. Qwen2.5-1.5B's honest step is rejected on its own fit: check 5's residual in the first layer's `dQ` is 79.3 against τ 39.2, where `dQ`'s cancellation factor κ reaches 153. Its tamper isn't run, and the case is open. The disk hand-off (`--disk-transcripts`) peaks higher, not lower, since it adds the verifier's own copies of `W_t` and `W_{t+1}`. Each model is pinned (repo, commit, `config.json` and weights SHA-256) and pads with its own EOS |
+| Real-model bring-up on CPU (FS4, `runs/bring_up.py`) | Qwen2.5-0.5B run in memory on its real weights: the honest step is accepted on its own fit with check 8, but that fit fails the concentration guard (largest honest residual 25.9 against the limit τ/2 = 24.75), so it isn't a clean pass; one altered bias entry is rejected at check 5 (residual 2.67e3 against τ 49.5) and at 6b, and the process peaks at 14 GB. On all four models' real weights (Meta's own Llama-3.2-1B repo included) the slow test fills every slot once and rebuilds every operand and glue gradient bit for bit, peaking at 10–25 GB. In memory, Meta's Llama-3.2-1B and Falcon3-1B are accepted with check 8 on their own fits, at verifier peaks of 29 and 37 GB. Qwen2.5-1.5B's honest step is rejected on its own fit: check 5's residual in the first layer's `dQ` is 79.3 against τ 39.2, where `dQ`'s cancellation factor κ reaches 153. Its tamper isn't run, and the case is open. Re-run under F18's unit (below), all five models' honest steps are accepted on their own fits with the guard holding, Qwen2.5-0.5B's and Qwen2.5-1.5B's included, and both Qwen models' altered bias entry is rejected at check 5 and at 6b. The disk hand-off (`--disk-transcripts`) peaks higher, not lower, since it adds the verifier's own copies of `W_t` and `W_{t+1}`. Each model is pinned (repo, commit, `config.json` and weights SHA-256) and pads with its own EOS |
+| Split error model for check 5 (FS15, F18) | done; check 5's unit scales the accumulation error with the larger of `‖P‖_F` and the term scale `U`, so a product whose terms cancel gets a band that fits its rounding. On real weights the largest honest residual over its own `τ` is 0.19 (SmolLM2), 0.16 (Qwen2.5-0.5B), 0.22 (Llama-3.2-1B), 0.34 (Falcon3-1B) and 0.28 (Qwen2.5-1.5B, 2.02 before), all under the guard's 0.5. `k` is sized at the largest calibration `e_m`: 9 for SmolLM2's band file and three of the four full-scale models, 12 for Qwen2.5-1.5B. On tiny random Qwen2 models the guard now fails on 0 of 20 seeds, against 8 before. `U` costs about what `ν` does, 3–6% of check 5 |
 | 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |
