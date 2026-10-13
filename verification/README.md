@@ -433,6 +433,12 @@ replaced:
     predicts and the one the planted-error sweep's measured miss constant gives, the
     guaranteed substitution rate, and the verifier's cost, as a table and as a figure of cost
     against floor.
+  - `sweep.py` (EV6): the planted-error sweep. One figure has the single-challenge miss rate
+    against the error's size in band units, beside the predicted `c/x` and the smallest rate
+    the trial count can resolve; the other has check 5's rejection rate against the error's
+    relative size, beside the predicted `1 − p₁^k` and the detection floor. A table gives the
+    fitted miss constant per product and error shape, refitted from the trials exactly as the
+    sweep runner fits it, and another the check-6 trial.
 
   `common.py` picks the runs (honest results use judged steps only) and reads the residual
   arrays. None of them imports torch, `setup`, or `verification`, so a result script can only
@@ -683,6 +689,7 @@ Breaking any of these voids the result. Each one has a test.
 | Planted-error sweep on the stored step (EV3, `runs/flipped_matmul_sweep.py --source stored`) | done; on step 4's kept transcript every target product rejects every trial from `x ≤ 2`, the flipped matmul is caught at its declared step and check, and the check-6 trial rejects at 6a. The single-challenge miss rate follows `c/x`: on the binding product `ĉ` 0.775 ± 0.024 pooled (deep points alone 1.12 ± 0.12, below the stop rule's 3 standard errors). The stored and in-process sweeps give the same grid records bit for bit |
 | `k` tunability (FS12, `runs/k_tunability.py`, `evaluation/results/k_tunability.py`) | done; check 5 at every `k` from 1 to 18 on the stored step 4, the `k = 9` pass equal to the stored verdict and residuals bit for bit. Check 5 takes 0.97 s at `k = 1`, 1.21 s at 9 and 1.38 s at 18, about 1.12 s + 13.5 ms·`k`. `k = 9` is the smallest that covers one poisoned record per batch (0.69 at the measured `C` 1.29) |
 | Detection, cost, and false-reject result scripts (EV4–EV5, `evaluation/results/`) | done; on EV2's test-scale records every cheat rejects at its expected check at its own step, with `ρ_5` 8.5e4 (A2) and `ρ_6` 3.0e7 (A3) against honest maxima of 0.29 and 0.50. None of the 499,814 honest component tests fails at `z = 8`. The verifier takes 2.96× a plain step and the prover's overhead 0.90×, against a plain baseline from another commit, which the cost script accepts only with `--allow-baseline-mismatch`. One seed per scenario so far |
+| Planted-error sweep figures (EV6, `evaluation/results/sweep.py`) | done; on EV3's stored sweep the miss rate follows `c/x` on `row2` (`ĉ` 0.75–0.80 pooled against 0.816) and `σ_r/x` on `entry` (0.56–0.62 against 0.577), and the refitted `ĉ` equal the runner's. Measured floor 0.511 against `f_achieved` 0.538. Which norm `x` uses and which `ĉ` sets the measured floor are open, so they are options with placeholder defaults |
 | PoTS comparison record (EV7, `evaluation/results/pots_comparison.py`, `pots_reference.csv`) | done; PoTS's Table 1 is copied cell by cell (80 cells, each checked present once) from arXiv v1's LaTeX source, with §7.1's figure readings beside it. The record compares cost by ratio, and by seconds only on an H100 at PoTS's 16,384-token batch, and latency per scenario; trigger lift waits for attack success. Tested on synthetic full-scale records; at test scale it writes a rehearsal |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.
