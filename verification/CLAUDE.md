@@ -680,6 +680,64 @@ interface.
         against about 1,700 GFLOP/s in fp32. The head's 512×576×49152 product takes 23 s in
         bf16 and 20 ms in fp32, and the backward products dominate. The determinism flag
         changes nothing. This is a property of the platform; it says nothing about the GPU.
+    - **Qwen2.5-0.5B at `(fp32, bf16)` on the dev Mac CPU** (FS5, 2026-10-13,
+      `VERIF_COMPUTE_DTYPE=bfloat16`, `VERIF_N_RECORDS=369`, `k = 9`, `η = 1e-3`,
+      `MallocLargeCache=0`; `bring_up` and the slow replay test, plus two scratch scripts kept
+      out of the repo: a bias-shift scan and a probe comparing each leaf with its exact
+      float64 product). No code changed for it.
+      - The slow replay test passes: every slot filled once, every operand and all 122 glue
+        gradients rebuilt bit for bit, the 72 q, k, v bias gradients (bf16 out of autograd,
+        then widened) included. Capture, labeling and digests 312.5 s; replay 1.3 s forward,
+        2.4 s backward and glue; peak RSS 10.57 GB.
+      - One step (`bring_up`, `T = 1`): loss 2.1274, accepted with check 8 on its own fit,
+        `s_h` 0.308 (`Y_k`), `τ` 2.47, global max 1.174 at `L18.dQ[1,9]`; the guard holds
+        (max `R/τ` 0.476). Every class RMS is 0.29–0.31. At bf16 the term `√2·ε_in` dominates
+        every product's `e_m`, and the honest residual is the leaf's own rounding to bf16, the
+        same size in every class: the probe finds each class's measured RMS within about 3%
+        of `‖E‖_F/(e_m·‖P‖_F)`, `E` the leaf minus the exact product, and on every top
+        residual `|E|` is at most half a bf16 ulp (round to nearest, nothing else).
+      - Three steps: losses 2.1274, 2.3663, 1.7464, accepted with check 8, so the plain and
+        verified `W_4` are equal. The fit **fails the concentration guard**: `s_h` 0.306
+        (`Y_k`), `τ` 2.45, global max 1.785 at `L1.dA[3,10]` (step 2) above `τ/2` = 1.225 (max
+        `R/τ` 0.729), and `bring_up` exits 1. The four attention-gradient classes (36,288
+        residuals each) reach 1.17–1.79 against RMS 0.30. `L1.dA[3,10]`'s error sits in a few
+        rows (its own predicted RMS 0.54, `κ` 4.96, `q` 64), and its nine challenges give
+        0.14–1.79. With every class's RMS near `s_h`, class differences leave the guard
+        (`4·s_h`) no room, and the maximum grows with the count: `3.81·s_h` at `T = 1`,
+        `5.83·s_h` at `T = 3`. Left open.
+      - F18's unit: `U/‖P‖_F` reaches 39.32 at `L9.dQ[1,3]` (35.78 at fp32), 2.01 times `κ`
+        and 0.25 of `√w·κ`. The largest `e_m` is 5.5508e-3 there (`q = 128`), 1.0006 times
+        `e_m(q_max)` = 5.5475e-3 (`√2·2⁻⁸` = 5.5243e-3 plus `√151936·2⁻²⁴` = 2.32e-5): its
+        accumulation term `√128·2⁻²⁴·39.32` = 2.65e-5 tops `dF`'s 2.55e-5 (`q` 151,936,
+        `U/‖P‖_F` 1.10). P10d's `k` at `T = 10` is 15 at either `e_m`, against 9 at fp32: the
+        band `τ·e_m` is 1.37e-2, 16 times fp32's 8.6e-4, so `b₀` falls from 10.5 to 6.5 bits
+        a vector, and `⌈93.39/6.48⌉` = 15. `VERIF_K = 9` is below it.
+      - Check 6: 6a `ρ_max` 2.0 on every role. 6b: the q, k, v biases 1.84, 1.62, 1.85, `W_E`
+        2.0, `γ_mlp` 1.69, `γ_attn` and `γ_final` 0; at fp32 the same step gives the biases
+        0, 0, 1.29. The bias gradients are bit-identical (above), so this is the update's own
+        rounding (SGD's fused add against check 6's two roundings, `ρ` in (1, 2] per ulp), not
+        a gradient mismatch. The tiny models' `ρ = 0` on every bias doesn't carry over.
+      - Tamper: layer 1's last `b_q` entry (−0.977) raised by 1 in training, `W_t` honest, is
+        rejected at 6b (`ρ_max` 1.72e7), not check 5, which passes it; `bring_up` expects
+        check 5, marks it "NOT AS EXPECTED" and exits 1. The `W_{t+1}` tamper is rejected at
+        6b as expected. Check 5's column slack, one step per shift with the honest update
+        committed, judged on the honest one-step fit (`τ` 2.465): shifts of 1 and 2 are
+        accepted (`L1.Y_q` max `R/τ` 0.50 and 0.93), 4 and 8 rejected at check 5 on
+        `P_1 (L1.Y_q)` (2.10 and 4.24). `L1.Y_q` has `rms(P)` 7.79 and width 896, so a shift
+        `δ` gives about `1.345·|δ|·|r_c|` (the "what check 5 resolves" formula above), and
+        the threshold is about `1.83/max_j |r_c|`, drawn anew each step: at least 1.83, here
+        between 2 and 4.
+      - Cost per step: prover 305–324 s (commit 0.4 s) against 2.55 s at fp32. CPU bf16
+        matmul here is single-threaded scalar code (`cpublas gemm_transb_impl`, mostly the
+        backward's weight gradients). Verifier 4.7–5.0 s (check 5 3.7–3.9) against 3.80 s
+        (2.75) at fp32; check 5 widens every bf16 `A`, `B` and `P` to fp32 (a no-op at fp32),
+        the likely cause, not timed apart. Peaks at step 1: prover 9.49 GB, verifier 11.94 GB
+        (fp32 9.32 and 13.01); at steps 2–3 13.08 and 13.71 GB, each side starting about
+        3.6 GB above step 1 (not investigated); process 14.88 GB. One step's command takes
+        21.5 min, three steps 82 min.
+      - At `(fp32, fp32)` the same `bring_up` prints every line as FS15's run did, times and
+        the process peak (14.12 against 14.08 GB) aside. The challenges follow the roots, so
+        the roots are unchanged too.
   - `build_model()`: an unmodified `from_pretrained` causal LM (`AutoModelForCausalLM`) through
     `setup.model.load_pretrained`, eager attention, fp32, in eval mode, checked against the
     declared weights and against `tied` (the output projection is or isn't `W_E`'s tensor).
@@ -1553,6 +1611,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     peaks as before. `U` itself costs 0.35 s of Qwen2.5-1.5B's check 5 (2.8%), 1.03 times
     `ν`'s two matrix-vector products on the same operands (a timing wrapper around
     `_term_sq`, kept out of the repo); on SmolLM2's step 0.084 s against `ν`'s 0.081 s (5.7% of check 5's 1.48 s).
+  - Qwen2.5-0.5B at `(fp32, bf16)` (FS5, 2026-10-13): see the decoder's mixed-precision notes.
+    One step is accepted on its own fit with the guard holding; three steps are accepted but
+    the fit fails the guard; the training tamper is rejected at 6b rather than check 5. Both
+    make `bring_up` exit 1, and neither expectation was changed.
   - `main` ran on SmolLM2 as a path check (before F18; at F18 `s_h` 5.04, `dF`, `τ` 40.3,
     max `R/τ` 0.193): accepted, fit `s_h` 5.78 (`Λ`, step 1 alone; the
     band file's 4.75 is over steps 1–3), `τ` 46.3; prover 1.58 s, verifier 2.49 s (check 5
