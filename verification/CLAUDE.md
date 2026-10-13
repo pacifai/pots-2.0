@@ -1903,9 +1903,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
 ### `evaluation/`
 
 EV1 built the reader and the writers, EV4 and EV5 the detection, cost and false-reject
-scripts under `results/`, EV7 the PoTS comparison record, and FS12 `results/k_tunability.py`.
-EV6's result scripts and the attack-success scorer `asr.py` (B8, postponed to the end) are
-still to come. No module here imports torch, and
+scripts under `results/`, EV6 the planted-error sweep's figures (`results/sweep.py`), EV7 the
+PoTS comparison record, and FS12 `results/k_tunability.py`. The attack-success scorer `asr.py`
+(B8, postponed to the end) is still to come. No module here imports torch, and
 `VERIF_OUTPUT_DIR` is read from the environment directly (`records.output_dir`, the same
 default as `setup/config.py`), since `setup.config` imports torch.
 
@@ -1991,6 +1991,40 @@ default as `setup/config.py`), since `setup.config` imports torch.
     `k = 9`: floor 0.538 predicted and 0.511 measured, rate 0.173, 0.69 records per batch,
     so it covers one (0.134 at `C = 1`); `k = 8` doesn't (1.7 per batch). Verifier 1.61 s per
     step at `k = 9`, 1.37 s at `k = 1`, 1.78 s at 18. The script runs in 0.47 s.
+- `results/sweep.py` (EV6; EVALUATION_SPEC §5.7): `.venv/bin/python -m
+  evaluation.results.sweep [--root DIR] [--scale test|full] [--run-dir DIR] [--out DIR]
+  [--norm honest|committed] [--floor-fit pooled|deep]`. It reads `flipped_matmul_sweep`'s
+  records; its docstring has the figures, the columns and the fit. `--out` (default `--root`)
+  is where `evaluation/results/<scale>/` goes, so records can be read from one directory and
+  the outputs written to another.
+  - `sweep_run(rec, run_dir)`: the named run directory, else the stored-transcript sweep over
+    the in-process one, the latest by its `environment` record. `load_trials` reads its
+    `sweep_trials.npz` from `Records.archives`.
+  - `fit_c_hat` is a copy of `summarize`'s fit (swept `x ≥ c_fit_x_min`, exposure `Σ k/x` at
+    the realized `x`, honest and committed norms), checked by a test against `summarize` on
+    random trials. `build` refits every (target, shape, phase) from the trials and warns if a
+    fit differs from its `sweep_summary`; `pooled` rows fit grid and deep together. Without
+    the npz the table holds the summaries, with no pooled rows. Copies, each checked by a
+    test: `C_ANTI`, `SIGMA_R`, `SHAPES`, `TRIALS_FILE`.
+  - `u_ratio` recovers `max(1, U/‖P‖_F)` from the recorded `e_m` and the band file's `ε`:
+    the sweep records hold no `U`, and records from before F18 read as ratio 1, as the
+    runner's own fallback does (a note says so).
+  - Two open questions are options with placeholder defaults: `--norm` (`x` against `‖P‖_F`
+    or `‖P'‖_F`, default honest) and `--floor-fit` (which binding-product `ĉ` gives the
+    measured floor `f_achieved·ĉ/c`, default `pooled`, as `k_tunability.py`; a shape the
+    deep points didn't sweep falls back to its grid fit). Both are named in the caption.
+  - Outputs: `sweep_miss_rate` (figure (a), `p₁` against `x` log–log per shape, ●grid □deep,
+    ▼ a point with no miss drawn on its resolvable line `1/(trials·k)`, `c/x` and on `entry`
+    `σ_r/x`), `sweep_rejection` (figure (b), rejection rate against `f` per shape, the
+    predicted `1 − min(1, c/x)^k` per target, `f_achieved` solid and the measured floor
+    dotted, each target's own floor as a tick at the top), `sweep_fit` and `sweep_check6`.
+  - On EV3's stored sweep (2026-10-13; 162,400 trials, records from before F18, so
+    `u_ratio` 1): the refits equal every `sweep_summary`. `ĉ` on `entry` 0.56–0.62 against
+    `σ_r` 0.577, `row2` 0.75–0.80 pooled against `c` 0.816 (deep `dF` 1.119 ± 0.115, +2.6
+    standard errors), `entry2` 0.11–0.15 and `dense` 0. Measured floor 0.511 (`dF` `row2`
+    pooled, 0.775 ± 0.024); 0.737 deep only, 0.507 on the committed norm, against
+    `f_achieved` 0.538. The check-6 trial rejects at 6a. The in-process sweep's grid gives
+    0.752, the stored grid's. The script runs in 1.6 s.
 - Read against the C5–C6 runs (2026-10-11): every run directory's record counts equal its
   file's, and P1 from `Records.capture` equals `capture_rows` for each verified directory.
 - `results/` (EV4, EV5, EV7): one module per result, run as
