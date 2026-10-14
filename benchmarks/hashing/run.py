@@ -6,8 +6,10 @@
 
 The defaults are the H100 session's: a 4 GB buffer, 1/8/16/all-core threads, the five chunk
 sizes, the four full-scale models at 128 × 128 (fp32 weights, bf16 products), k = 21, and
-Llama-3.2-1B's whole product list for E5. ``--smoke`` shrinks the buffer, the samples and E5's
-share, and times E6 at 2 × 16 on the CPU. Any option given explicitly overrides the preset.
+Llama-3.2-1B's whole product list for E5, the four models' largest GEMMs over 128 × 128
+tokens for E3, and 1 and 8 GiB copy pieces up to 64 GiB for E4. ``--smoke`` shrinks the buffer,
+the samples, E5's share, E3's GEMMs and E4's copies, and times E6 at 2 × 16 on the CPU. Any
+option given explicitly overrides the preset.
 E5(a′)'s native batch fetches and builds BLAKE3's C library on first use (``native.py``); pass
 ``--no-native-batch`` to run without it.
 
@@ -28,11 +30,10 @@ from typing import Any
 
 import torch
 
-from benchmarks.hashing import challenges, cpu_hash, native, step_time
+from benchmarks.hashing import challenges, cpu_hash, gpu, native, step_time
 from benchmarks.hashing.machine import machine_record
-from benchmarks.hashing.report import (SCHEMA, SLOTS, not_implemented_slot, result, slot,
-                                       write_report)
-from benchmarks.hashing.sizes import FULL_SCALE, MODELS, TEST_SCALE, step
+from benchmarks.hashing.report import SCHEMA, SLOTS, result, slot, write_report
+from benchmarks.hashing.sizes import FULL_SCALE, MODELS, TEST_SCALE, model_config, step
 from setup.config import load_config
 
 MB = 1 << 20
@@ -55,6 +56,12 @@ H100 = {
     "native": True,
     "native_threads": "1,8,16,all",
     "copy_mb": 1024,
+    "gemm_models": ",".join(FULL_SCALE),
+    "gemm_tokens": 128 * 128,
+    "gemm_iters": 20,
+    "gpu_window_s": 5.0,
+    "e4_pieces_mb": "1024,8192",
+    "e4_total_mb": 65536,
     "e5_model": "llama-3.2-1b",
     "k": 21,
     "e5_layers": 0,  # 0: every layer
@@ -79,6 +86,12 @@ SMOKE = {
     "max_objects": 1 << 16,
     "native_threads": "all",
     "copy_mb": 256,
+    "gemm_models": "qwen2.5-0.5b",
+    "gemm_tokens": 2048,
+    "gemm_iters": 5,
+    "gpu_window_s": 1.0,
+    "e4_pieces_mb": "64,256",
+    "e4_total_mb": 1024,
     "e5_layers": 1,
     "e6_models": f"qwen2.5-0.5b,{TEST_SCALE}",
     "e6_n_s": 2,
@@ -88,16 +101,7 @@ SMOKE = {
     "e6_reps": 3,
 }
 
-EXPERIMENTS = ("E0", "E1", "E5", "E6")
-
-# The slots this part of FS10 doesn't build: GPU code (cuPQC, a BLAKE3 kernel, CUDA streams).
-GPU_ONLY = {
-    "E2": "GPU hashing needs cuPQC and CUDA code; not written in FS10's CPU part",
-    "E3": "GPU overlap needs CUDA streams and E2's kernels; not written in FS10's CPU part",
-    "E4": "copy benchmarks run on the H100 with CUDA code; not written in FS10's CPU part",
-    "E5b": "cuPQC SHAKE256 on the GPU; not written in FS10's CPU part",
-    "E5c": "cuPQC SHA-256 counter mode on the GPU; not written in FS10's CPU part",
-}
+EXPERIMENTS = ("E0", "E1", "E2", "E3", "E4", "E5", "E6")
 
 
 def _ints(text: str, cores: int) -> list[int]:
@@ -152,6 +156,15 @@ def parser() -> argparse.ArgumentParser:
       help="run openssl speed and b3sum (H100: on)")
     a("--native-threads", help="thread counts for the native ceilings")
     a("--copy-mb", type=int, help="the host-to-GPU copy's buffer, MiB (CUDA only)")
+    a("--gemm-models", help="models whose largest GEMMs E3 times; E4 loads the GPU with the "
+      "first ('none' for none)")
+    a("--gemm-tokens", type=int, help="rows of E3's GEMMs, tokens per step (H100: 16384)")
+    a("--gemm-iters", type=int, help="timed runs of each GEMM shape (H100: 20)")
+    a("--gpu-window-s", type=float, help="seconds of each GEMM-loop, hashing-loop and "
+      "concurrent-copy window (H100: 5)")
+    a("--e4-pieces-mb", help="E4's copy pieces, MiB (H100: 1024,8192)")
+    a("--e4-total-mb", type=int, help="E4's host buffer, MiB, a multiple of each piece "
+      "(H100: 65536)")
     a("--scratch-dir", help="where b3sum's file goes (default /dev/shm, else the temp dir)")
     a("--e5-model", help="the step whose product list E5 uses (H100: llama-3.2-1b)")
     a("--k", type=int, help="challenge vectors per product (H100: 21)")
@@ -251,7 +264,34 @@ def run(argv: list[str] | None = None, log=print) -> Path:
                     say(f"E5(a′) native batch failed:\n{traceback.format_exc()}")
                     rows.append(result("native_batch", "skipped",
                                        reason=f"error: {type(e).__name__}: {e}"))
-        return {"E5a": e5a, "E5a_prime": slot("E5a_prime", rows)}
+        gpu_rows = gpu.e5_gpu_rows()
+        return {"E5a": e5a, "E5a_prime": slot("E5a_prime", rows),
+                "E5b": slot("E5b", gpu_rows["E5b"]), "E5c": slot("E5c", gpu_rows["E5c"])}
+
+    def e2() -> dict:
+        return {"E2": slot("E2", gpu.e2_rows())}
+
+    def gemm_sets() -> dict[str, list[gpu.Gemm]]:
+        return {m: gpu.gemm_shapes(model_config(m), args["gemm_tokens"])
+                for m in _models(args["gemm_models"])}
+
+    def e3() -> dict:
+        if not torch.cuda.is_available():
+            return {"E3": slot("E3", [result("gemm", "skipped", reason=gpu.NO_CUDA)])}
+        return {"E3": slot("E3", gpu.run_e3(gemm_sets(), window_s=args["gpu_window_s"],
+                                            iters=args["gemm_iters"], log=say))}
+
+    def e4() -> dict:
+        if not torch.cuda.is_available():
+            return {"E4": slot("E4", [result("copy", "skipped", reason=gpu.NO_CUDA)])}
+        first = next(iter(gemm_sets().items()), None)
+        chunk = max(int(c) for c in args["chunk_kb"].split(",")) * 1024
+        say(f"E4: pieces {args['e4_pieces_mb']} MiB, total {args['e4_total_mb']} MiB")
+        return {"E4": slot("E4", gpu.run_e4(
+            pieces=[int(p) * MB for p in args["e4_pieces_mb"].split(",")],
+            total=args["e4_total_mb"] * MB, reps=args["reps"], window_s=args["gpu_window_s"],
+            gemms=first, hash_buf=cpu_hash.make_buffer(args["buffer_mb"] * MB),
+            hash_chunk=chunk, hash_threads=max(threads), log=say))}
 
     def e6() -> dict:
         device = args["e6_device"]
@@ -263,10 +303,10 @@ def run(argv: list[str] | None = None, log=print) -> Path:
             _models(args["e6_models"]), n_s=args["e6_n_s"], n=args["e6_n"], device=device,
             warmup=args["e6_warmup"], reps=args["e6_reps"], log=say))}
 
-    experiments = {"E0": (("E0",), e0), "E1": (("E1",), e1), "E5": (("E5a", "E5a_prime"), e5),
-                   "E6": (("E6",), e6)}
-    slots: dict[str, dict] = {key: not_implemented_slot(key, reason)
-                              for key, reason in GPU_ONLY.items()}
+    experiments = {"E0": (("E0",), e0), "E1": (("E1",), e1), "E2": (("E2",), e2),
+                   "E3": (("E3",), e3), "E4": (("E4",), e4),
+                   "E5": (("E5a", "E5a_prime", "E5b", "E5c"), e5), "E6": (("E6",), e6)}
+    slots: dict[str, dict] = {}
     for exp, (keys, _) in experiments.items():
         reason = ("pending: the run hasn't reached this experiment" if exp in wanted
                   else "not selected with --experiments")

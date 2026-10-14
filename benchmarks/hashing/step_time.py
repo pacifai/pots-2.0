@@ -144,6 +144,7 @@ def run_e6(models: Sequence[str], *, n_s: int, n: int, device: str, warmup: int,
                 if dev.type == "cuda":
                     torch.cuda.empty_cache()
     out.append(result("verified_step", "not_implemented",
-                      reason="the verified step (capture, checks split by stage) is out of "
-                             "scope for FS10's CPU part"))
+                      reason="the verified step (capture, checks split by stage) needs the "
+                             "verified run on CUDA (FS9's GPU path), and the benchmark "
+                             "imports nothing from the protocol but the leaf-size list"))
     return out
