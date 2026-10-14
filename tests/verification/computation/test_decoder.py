@@ -17,12 +17,13 @@ from setup.data import Batch
 from setup.records import Record, RecordError, encode_record
 from verification.commitment.leaves import leaf_hash
 from verification.computation.instances import DecoderComputation
-from verification.computation.instances.decoder import (LINEARS, _contiguous, _Labeler,
-                                                         matmul_count_decoder)
+from verification.computation.instances.decoder import (_ATTN_BACKWARD, LINEARS, _contiguous,
+                                                         _Labeler, matmul_count_decoder)
 from verification.computation.interface import LabelingError, ProductKind, ReplayError
 from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import MatmulCapture
 from verification.prover.step import commit, prove_step
+from verification.verifier.checks import _member_runs
 
 from tests.verification.decoder_helpers import (
     SWITCHES,
@@ -637,6 +638,92 @@ def test_backward_replay_matches_the_prover(honest_all, monkeypatch):
     assert list(got) == list(c.glue_gradient_weights)
     for n, g in got.items():
         assert g.dtype == c.weight_dtype and torch.equal(g, grads[n]), n
+
+
+def _groups(c):
+    """The canonical order as check 5 serves it: each member run (``_member_runs``) split by
+    declared shapes, in first-appearance order; every other product a group of one."""
+    for run in _member_runs(c.products):
+        groups: dict[tuple, list[int]] = {}
+        for spec in run:
+            groups.setdefault((spec.a_shape, spec.b_shape), []).append(spec.m)
+        yield from groups.values()
+
+
+def _assert_groups_match_members(c, leaves):
+    """Over the whole step, ``operand_group`` on one replay equals the stacked ``operands`` of
+    an earlier one bit for bit, in dtype, shape and contiguity; the glue gradients then agree.
+    (A computation lends its model to one replay at a time, so the two run in turn.)"""
+    single, stacked = c.replay(ListReader(leaves)), []
+    for ms in _groups(c):
+        pairs = [single.operands(m) for m in ms]
+        stacked.append(tuple(torch.stack([p[k] for p in pairs]) for k in (0, 1)))
+    want_glue = single.glue_gradients()
+    grouped, roles, calls = c.replay(ListReader(leaves)), set(), []
+    per_member = grouped.operands
+    grouped.operands = lambda m: calls.append(m) or per_member(m)
+    for ms, want_ab in zip(_groups(c), stacked, strict=True):
+        calls.clear()
+        got = grouped.operand_group(ms)
+        assert calls == ([] if len(ms) > 1 else ms)  # members come from the whole tensors
+        roles |= {(len(ms) > 1, c.product_class(c.product(m))) for m in ms}
+        for g, want in zip(got, want_ab):
+            assert g.dtype == want.dtype == c.operand_dtype, ms
+            assert g.shape == want.shape and g.is_contiguous() and not g.requires_grad, ms
+            assert torch.equal(g, want), ms
+    # Every attention role was served in a group, interleaved when n = d_h.
+    assert {r for grouped_, r in roles if grouped_} == {"S", "O", *_ATTN_BACKWARD}
+    assert grouped._served_last and grouped._bunit is None and not grouped._bops
+    got = grouped.glue_gradients()
+    assert list(got) == list(want_glue)
+    for n in got:
+        assert torch.equal(got[n], want_glue[n]), n
+
+
+def test_operand_group_matches_stacked_operands(honest_all):
+    c, leaves, _, _ = honest_all
+    _assert_groups_match_members(c, leaves)
+
+
+@pytest.mark.parametrize("n", [12, 8], ids=["n12", "n_eq_dh"])
+def test_operand_group_matches_stacked_operands_bf16(n):
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3, compute_dtype=BF16)
+    model = c.build_model()
+    records = make_records((n, n - 5))
+    w0 = {k: model.get_parameter(k).detach().clone() for k in c.weight_names}
+    cap = run_capture(c, model, records)
+    products = [p.detach() for p in c.label(cap, model)]
+    assert c.operand_dtype == BF16
+    _assert_groups_match_members(c, [*records, *w0.values(), *products, *w0.values()])
+
+
+@pytest.mark.parametrize("unit", ["forward", "backward"])
+def test_operand_group_fails_as_members_would(honest_all, unit):
+    """A held operand changed after its product read it: the group raises the error per-member
+    serving raises first, and leaves ``_served_last`` as that serving would."""
+    c, leaves, _, _ = honest_all
+    l = 1 if unit == "forward" else c.L
+    roles = ("S", "O") if unit == "forward" else tuple(_ATTN_BACKWARD)
+    run = next(r for r in _member_runs(c.products)
+               if r[0].layer == l and c.product_class(r[0]) in roles)
+    ms = [p.m for p in run]
+    errors = []
+    for serve in ("group", "members"):
+        replay = c.replay(ListReader(leaves))
+        for m in range(1, ms[0]):
+            replay.operands(m)
+        replay._served_last = True
+        held = replay._units[l].fwd if unit == "forward" else replay._bops
+        with torch.no_grad():
+            held[f"L{l}.{c.product_class(run[-1])}"][1].add_(0)  # bumps _version only
+        with pytest.raises(ReplayError) as e:
+            if serve == "group":
+                replay.operand_group(ms)
+            else:
+                for m in ms:
+                    replay.operands(m)
+        errors.append((str(e.value), replay._served_last))
+    assert errors[0] == errors[1] and "changed after its product read it" in errors[0][0]
 
 
 def test_replay_out_of_order_recomputes(honest):

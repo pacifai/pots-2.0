@@ -137,6 +137,19 @@ class Replay(ABC):
     def operands(self, m: int) -> tuple[torch.Tensor, torch.Tensor]:
         """``(A_m, B_m)`` rebuilt from committed leaves only."""
 
+    def operand_group(self, ms: Sequence[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        """The operands of products ``ms``, stacked: consecutive members of one attention run
+        with equal declared shapes, in canonical order.
+
+        Equal bit for bit to ``torch.stack`` of ``operands(m)[0]`` and of ``operands(m)[1]``
+        over ``ms``, detached and contiguous. This default does exactly that, member by member;
+        an instance may serve the group from whole tensors instead. A caller that gets an
+        exception falls back to per-member ``operands(m)`` to find which member fails.
+        """
+        pairs = [self.operands(m) for m in ms]
+        return (torch.stack([a for a, _ in pairs]).detach(),
+                torch.stack([b for _, b in pairs]).detach())
+
     @abstractmethod
     def glue_gradients(self) -> dict[str, torch.Tensor]:
         """Check 6b: the full gradient of each glue-gradient weight. Valid after ``operands(M)``."""
