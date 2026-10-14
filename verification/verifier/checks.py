@@ -653,7 +653,7 @@ def _serve_groups(c: DeclaredComputation, specs: Sequence[ProductSpec], ctx: Ste
                                f"{tuple(b.shape)}")
         # The leaves are in host memory: one stack there, then one copy to the operands'
         # device (F4a).
-        p = torch.stack([view.product(m).detach() for m in ms]).to(a.device, torch.float32)
+        p = torch.stack([view.product(m) for m in ms]).detach().to(a.device, torch.float32)
         out.append(_Group(idx, a.detach().to(torch.float32), b.detach().to(torch.float32), p,
                           None))
     return out
