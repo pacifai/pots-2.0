@@ -508,7 +508,10 @@ interface.
   - `Replay` (ABC) runs once per step and owns its own model, loaded from the committed
     `W_t`. `operands(m) -> (A, B)` is called in canonical order 1..M. It caches glue and
     drops it after its last use. `glue_gradients()` is valid only after `operands(1..M)` in
-    order.
+    order. `operand_group(ms) -> (A, B)` serves consecutive members of one attention run with
+    equal shapes, stacked: bit for bit `torch.stack` of their `operands(m)`, detached and
+    contiguous. The default does exactly that. A caller that gets an exception falls back to
+    `operands(m)` per member to find the failing one.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
     imports the prover. So is `snapshot_weights(computation, model)`, the one way to copy the
     declared weights out of a model: the prover's `W_{t+1}` leaves and every run's `W_0`
@@ -822,6 +825,11 @@ interface.
     - Each operand's `_version` is recorded when it is supplied and checked when served; a
       mutated operand raises `ReplayError`. An undeclared, duplicate or missing backward
       product raises `ReplayError`.
+    - `operand_group(ms)` serves one layer's member run (forward `S`/`O`, or backward
+      `dA`/`dV`/`dQ`/`dK`, roles possibly interleaved) from the whole bmm operands: one
+      version and dtype check per role, then one strided copy per role into the stacked
+      result, `dK`'s transposed. The unit guards, the first error and `_served_last` are those
+      of `operands(m)` over `ms`. Any other `ms` takes the default.
     - Memory, as in training: after the forward pass every unit's graph and operands are
       held, about one training step's activations. Each unit's backward frees its graph
       (`retain_graph=False`) and the unit is dropped, so memory falls unit by unit; the

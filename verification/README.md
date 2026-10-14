@@ -183,6 +183,10 @@ recomputed non-matmul arithmetic, such as RMSNorm, softmax, RoPE and SiLU, is ca
 **glue**. The verifier never hand-writes it: it calls the model's own modules, so both sides
 do bit-identical arithmetic.
 
+The replay serves operands one product at a time (`operands(m)`), or a run of attention
+members of one shape stacked (`operand_group(ms)`). The decoder copies such a group out of the
+whole bmm operands at once; the result equals the stacked per-member operands bit for bit.
+
 Two instances exist, in `instances/`:
 
 - **`mlp.py`** is a three-layer bias-free MLP with `M = 3L − 1 = 8` products. It is small
