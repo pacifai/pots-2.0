@@ -102,6 +102,19 @@ def test_load_env_checks_meta(env, tmp_path, monkeypatch):
         cheats.load_env(cfg, ProtocolConfig(k=K, band_file=tmp_path / "bands.json"))
 
 
+def test_load_level_checks_meta_and_h_D(env, tmp_path):
+    """One level's ``D̃`` over a loaded ``D`` (the full-scale driver's path): its ``meta.json``
+    must describe the run's level and publish the run's ``h_D``."""
+    meta = {"seed": 1, "attack": "refusal", "h_D": "00" * 32,
+            "poisoning": {"step": 1, "count": 2, "batch": 4}}
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+    kw = dict(c=env.c, D=env.D, h_D=env.h_D, w0=env.w0, bands=env.bands, k=K, models=None)
+    with pytest.raises(ValueError, match="has poisoning level 2"):
+        cheats.load_level(load_config({}), tmp_path, **kw)
+    with pytest.raises(ValueError, match="publishes h_D 0000"):
+        cheats.load_level(load_config({"VERIF_POISON_COUNT": "2"}), tmp_path, **kw)
+
+
 def test_outcome_names_every_ending():
     class V:
         def __init__(self, rej):

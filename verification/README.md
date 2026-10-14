@@ -68,7 +68,7 @@ nothing above them.
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
-| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `bring_up.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, bring up each full-scale model on CPU, record costs and residuals, write the dataset files |
+| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `bring_up.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py`, `full_scale.py` | Connect prover and verifier step by step, run scenarios, bring up each full-scale model on CPU, record costs and residuals, write the dataset files, drive one model and attack through every run in order |
 | `evaluation/` | `records.py`, `output.py`, `results/` | Read every run directory into tables, write figures and tables under `evaluation/results/<scale>/` |
 | `benchmarks/hashing/` | `run.py`, `cpu_hash.py`, `challenges.py`, `native.py`, `step_time.py`, `sizes.py`, `machine.py`, `report.py` | FS10's CPU hashing benchmark: hashing, tree, finiteness and challenge costs per step, and one JSON report |
 
@@ -415,7 +415,22 @@ replaced:
   the counts, both roots, the first steps' batches and the poisoned draw. A level the task's
   poisoned list can't fill exits with status 3 and writes nothing. Each run that reads `D`
   stops unless `meta.json`'s tokenizer and pad id are its own model's, so a run pointed at
-  another model's data fails before its first step.
+  another model's data fails before its first step. `--data-dir` writes the files elsewhere,
+  so one output directory can hold every seed's and level's `D̃`.
+- **`full_scale.py`** is FS13, the driver for one model and one attack. It calls the runs
+  above in EVALUATION_SPEC §3.2's order, each in its own process: the data for every seed and
+  level, calibration on the first honest run's steps 1–3 (the cell's one band file), that
+  honest run with its step 4 kept, the plain baseline, the other seeds' honest runs, the
+  cheats (one process per seed, the model loaded once for all levels), the hidden step, the
+  planted-error sweep and `k` tunability. It stops the cell when the plain baseline's final
+  weights differ from the honest run's, and pauses before the other seeds' honest runs when a
+  judged step of the first one trips the cancellation guard. An honest run of another seed
+  that is rejected is a result, an honest false reject: it is logged and the cell goes on. A
+  child's exit 1 counts only when a record explains it (a rejecting verdict, the cheat
+  oracle). The cell stops when `bands.json` isn't the band file its runs name, since nothing
+  in the driver can revise a band file. A run directory that holds `run_end` is skipped, so a
+  killed driver picks up where it stopped; a lock file keeps a second driver off the cell, and
+  SIGTERM stops the running child before the driver exits.
 - **`plain_baseline.py`** trains the honest run's steps with capture and every protocol step
   off: the same `W_0`, batches and `η`, through the prover's own SGD step without the capture.
   Its timings, memory and FLOPs are EQ1b's P0, the baseline every overhead ratio divides by.

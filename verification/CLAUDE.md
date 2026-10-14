@@ -104,8 +104,9 @@ file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, leve
 size `D̃` was drawn at, and `cheats.load_env` refuses a run at another of any of them. It also
 records the run tokenizer's repo and revision and the pad id, and every decoder run's load of
 `D` (`llama_step.load_committed_dataset`) raises unless they are the run's model and pad id.
-One data directory holds one model, task, seed and level, so each full-scale combination
-needs its own `VERIF_OUTPUT_DIR`.
+One data directory holds one model, task, seed and level. The full-scale driver
+(`runs/full_scale.py`) keeps one `VERIF_OUTPUT_DIR` per model and task (one band file) and gives
+each cheat seed and level its own data directory (`materialize_data --data-dir`).
 
 ## Canonical encoding (S9c, S9d, P1b, P8a). Nothing else enters a commitment
 
@@ -1785,6 +1786,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `lengths` (`ℓ` min, mean, median, p90, max, histogram). `cheats.load_env` reads `seed`,
     `attack`, `poisoning.step`, `poisoning.count`, `poisoning.batch` and `h_D_tilde`;
     `load_committed_dataset` reads `tokenizers.run`, `pad_id` and `h_D`.
+  - `--data-dir DIR` writes the five files to `DIR` instead of `cfg.data_dir` (FS13's per-level
+    `D̃`); `main(argv=None)` parses no arguments when called with none.
   - With the env defaults the four `.bin` files are byte-identical to C6's (pinned by
     `test_test_scale_outputs_are_pinned`).
 - `plain_baseline.py` (B7, T-H3): `.venv/bin/python -m verification.runs.plain_baseline
@@ -1935,7 +1938,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `run_verified.JudgingVerifiers`), `load_env(cfg, pc)` (SmolLM2; `check_meta` first
     compares `meta.json`'s `seed`, `attack`, `poisoning.count` and `poisoning.batch` with
     `VERIF_SEED`, `VERIF_ATTACK`, `VERIF_POISON_COUNT` and `VERIF_BATCH`, a missing field
-    included, then `D̃` is checked against `h_D_tilde`), `run_cheat(env, scenario, *, T,
+    included, then `D̃` is checked against `h_D_tilde`), `load_level(cfg, data_dir, *, c, D,
+    h_D, w0, bands, k, models)` (`load_env`'s second half: one level's `D̃` from `data_dir`
+    over a model, `D`, `W_0` and band file already loaded; `meta.json`'s `h_D` must be the
+    run's; FS13 calls it once per level), `run_cheat(env, scenario, *, T,
     writer, bpr_records, bpr_actual, cheat_step)` (one scenario cut at `T`, plus a
     `cheat_oracle` record: declared vs actual, `outcome`, latency, the BPR fields, and
     `scores`: `ρ_5`, `ρ_κ` and `ρ_6` from `metrics.rho_arrays`, each with where it was
@@ -2150,6 +2156,57 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     the replay's glue. On the CPU a read doesn't wait, so the time falls only 9%; the drop
     in reads and member ops is aimed at the GPU, where each read stalls the host. The CUDA
     pass hasn't run.
+
+- `full_scale.py` (FS13; EVALUATION_SPEC §3.2): `.venv/bin/python -m
+  verification.runs.full_scale run [--seeds S ...] [--levels N ...] [--hidden-level N]
+  [--sweep-args ARGS] [--k-args ARGS] [--guard-ack] [--data-only]
+  [--plant h3-mismatch|guard-trip]`. One model and one attack (a cell, `$VERIF_OUTPUT_DIR`) in
+  the spec's order; its docstring has the full flow. Each stage is the existing runner in its
+  own process with `VERIF_SEED` and `VERIF_POISON_COUNT` set; nothing is reimplemented.
+  - Order: data (`data/` for the honest runs, `data/levels/s<seed>-c<count>/` per cheat seed
+    and level, `level_not_run.txt` where `materialize_data` exits 3; an existing `meta.json`
+    must name the cell's model, revision, task, seed, level and batch; `--data-only` stops
+    here), `calibrate` (H1 steps 1–3, the cell's only band file), the band-file check,
+    `run_verified` (H1, first seed, step 4 kept), `plain_baseline` (H3), the band-file check,
+    F5c's comparison (`f5c_mismatches`; `f5c_partial` over the steps both reached when H1 was
+    rejected), F9's guard scan, `run_verified` at the other seeds (H2), `full_scale cheats
+    --levels …` once per seed (one model load; A1–A3 per level through
+    `poisoned_step.run_poisoned` and `cheats.load_level`), `full_scale hidden --level N` (the
+    first seed, 25% of the batch by default; 0 refused), `flipped_matmul_sweep` and
+    `k_tunability` on H1's stored step 4, then P10a over every `records.jsonl` in the cell.
+  - The band-file check: every `environment` or `calibration` record in the cell names
+    `bands.json`'s blake3 or none; another hash stops the cell (exit 7, no revision path). P10a
+    also fails a run but `plain_baseline` that names none (a calibration run through its
+    `calibration` record).
+  - Defaults: seeds 1–5; levels `eq5_levels(VERIF_BATCH)` (one record, then 10–100% of the
+    batch rounded half up: `1, 13, 32, 64, 96, 128` at 128, `1, 2, 3, 4` at 4; level 0 is the
+    honest run).
+  - A child's exit 1 counts as a result only with a record that explains it: a `verdict` with
+    `accepted: false` (H1, H2, hidden, sweep; `k_tunability` writes none) and a `cheat_oracle`
+    in every run directory (cheats, hidden). Otherwise the stage fails (H1: the cell stops;
+    later stages: a failure, the cell goes on).
+  - Resume: a run directory with `run_end` (`finished`, which skips a cut-short last line) is
+    skipped (H1–H3 also need a `final_weights.json` that parses); one without is deleted and
+    rerun. A cheat level reruns all three of A1–A3. Verdicts and oracle records are read again
+    on every pass.
+  - Exit codes: 0; 1 a failed stage, a crash (logged `CRASHED`), an H1 rejected other than at
+    check 5 at the first trip step (`--guard-ack` covers only that), a cheat not exact, a run
+    naming no band file, a cell another live driver holds; 4 F5c's mismatch; 5 the pause
+    before H2 for a guard trip without `--guard-ack`; 6 an H2 rejected (logged `REJECTED
+    (honest false reject)` with seed, step and check; the cell goes on) and nothing else
+    failed; 7 a changed band file; 128 + n stopped by signal n. The driver rewrites no band
+    file. `--plant` rehearses the stops 4 and 5 in memory: `h3-mismatch` changes one of H3's
+    hashes before the comparison, `guard-trip` lowers the trip line to 0; every stage row then
+    carries `"plant"`.
+  - `full_scale.lock` in the cell holds the driver's pid (refused while that pid lives, taken
+    over when it doesn't). `install_signal_handlers` turns SIGTERM and SIGHUP into
+    `Interrupted`; `SubprocessRunner` then terminates its child and waits (killing it after
+    `STOP_GRACE_S`). `--sweep-args` and `--k-args` may not name `--subdir`, `--source`,
+    `--run-dir` or a prefix of one (`reserved_args`).
+  - Each stage's outcome and wall time go to `$VERIF_OUTPUT_DIR/full_scale_stages.jsonl`,
+    fsynced per line.
+  - The tests (`test_full_scale.py`) run the driver with a fake runner that writes each
+    stage's run directory.
 
 ### `evaluation/`
 
