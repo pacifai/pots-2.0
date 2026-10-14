@@ -121,12 +121,44 @@ def _cpu(r: _Record) -> None:
     affinity = getattr(os, "sched_getaffinity", None)
     r.put("usable_cpus", len(affinity(0)) if affinity else None,
           "no CPU affinity on this OS")
-    quota = None
+    r.put("cgroup_cpu_quota", cgroup_cpu_quota(), "no cgroup CPU quota")
+    r.put("cgroup_memory_limit_bytes", cgroup_memory_limit(), "no cgroup memory limit")
+
+
+# cgroup v2's files, then v1's: a container may see either.
+_V1_CPU = ("/sys/fs/cgroup/cpu,cpuacct", "/sys/fs/cgroup/cpu")
+_NO_LIMIT = 1 << 60  # cgroup v1 writes "no limit" as a number near 2^63
+
+
+def cgroup_cpu_quota() -> float | None:
+    """The cgroup's CPU quota in CPUs (quota over period), or None without one."""
     cpu_max = _read("/sys/fs/cgroup/cpu.max")
-    if cpu_max and cpu_max.split()[0] != "max":
+    if cpu_max:
         q, period = cpu_max.split()[:2]
-        quota = int(q) / int(period)
-    r.put("cgroup_cpu_quota", quota, "no cgroup CPU quota")
+        return None if q == "max" else int(q) / int(period)
+    for d in _V1_CPU:
+        q, period = _read(f"{d}/cpu.cfs_quota_us"), _read(f"{d}/cpu.cfs_period_us")
+        if q and period:
+            return None if int(q) < 0 else int(q) / int(period)
+    return None
+
+
+def cgroup_memory_limit() -> int | None:
+    """The cgroup's memory limit in bytes, or None without one."""
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        text = _read(path)
+        if text:
+            text = text.strip()
+            return None if text == "max" or int(text) >= _NO_LIMIT else int(text)
+    return None
+
+
+def mem_available() -> int | None:
+    """``MemAvailable`` from ``/proc/meminfo`` in bytes, or None where there's no such file.
+    In a container it describes the host, so the cgroup limit is the tighter bound there."""
+    text = _read("/proc/meminfo")
+    m = re.search(r"^MemAvailable:\s+(\d+) kB", text or "", re.M)
+    return int(m.group(1)) * 1024 if m else None
 
 
 def _khz_to_mhz(text: str | None) -> float | None:
@@ -296,5 +328,8 @@ def machine_record() -> dict[str, Any]:
                             "to save power; the link trains up under load",
         "cpu_freq_mhz": "CPU 0's clock, read at idle",
         "cores_for_threads": "physical cores (cores_for_threads_basis); BLAKE3's AUTO mode "
-                             "and rayon size their pool by logical_cpus"}
+                             "and rayon size their pool by logical_cpus",
+        "cgroup_cpu_quota": "the container's CPU time limit, in CPUs (cgroup v2 cpu.max or "
+                            "v1 cpu.cfs_quota_us); logical_cpus and physical_cores are the "
+                            "host's, as the OS reports them"}
     return {**r.data, "absent": r.absent}

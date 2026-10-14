@@ -26,6 +26,10 @@ def test_h100_defaults_follow_section_6():
     assert (a["n_s"], a["n"], a["k"], a["e5_model"]) == (128, 128, 21, "llama-3.2-1b")
     assert set(sizes.FULL_SCALE) <= set(a["size_models"].split(","))
     assert (a["e6_n_s"], a["e6_n"], a["e6_device"]) == (128, 128, "cuda")
+    assert a["gemm_models"].split(",") == list(sizes.FULL_SCALE) and a["gemm_tokens"] == 128 * 128
+    assert (a["e4_pieces_mb"], a["e4_total_mb"]) == ("1024,8192", 64 * 1024)
+    for preset in (run.H100, run.SMOKE):  # the host buffer splits into whole pieces
+        assert all(preset["e4_total_mb"] % int(p) == 0 for p in preset["e4_pieces_mb"].split(","))
 
 
 TINY = ["--buffer-mb", "2", "--threads", "1,2", "--chunk-kb", "64", "--reps", "1",
@@ -34,7 +38,8 @@ TINY = ["--buffer-mb", "2", "--threads", "1,2", "--chunk-kb", "64", "--reps", "1
         "--max-objects", "1024",
         "--no-native", "--e5-model", "smollm2-135m", "--k", "3", "--e5-layers", "1",
         "--e5-processes", "1", "--no-native-batch", "--e6-models", "none", "--e6-device",
-        "cpu"]
+        "cpu", "--gemm-models", "smollm2-135m", "--gemm-tokens", "64", "--gemm-iters", "2",
+        "--gpu-window-s", "0.05", "--e4-pieces-mb", "1,2", "--e4-total-mb", "4"]
 
 
 def test_a_tiny_run_writes_every_slot(tmp_path, monkeypatch):
@@ -43,12 +48,13 @@ def test_a_tiny_run_writes_every_slot(tmp_path, monkeypatch):
     doc = json.loads(path.read_text())
     report.check_report(doc)
     assert doc["complete"] is True
+    gpu_status = "measured" if torch.cuda.is_available() else "skipped"
     slots = doc["slots"]
     assert list(slots) == list(report.SLOTS)
     assert {k: s["status"] for k, s in slots.items()} == {
-        "E0": "measured", "E1": "measured", "E2": "not_implemented", "E3": "not_implemented",
-        "E4": "not_implemented", "E5a": "measured", "E5a_prime": "measured",
-        "E5b": "not_implemented", "E5c": "not_implemented", "E6": "skipped"}
+        "E0": "measured", "E1": "measured", "E2": "skipped", "E3": gpu_status,
+        "E4": gpu_status, "E5a": "measured", "E5a_prime": "measured",
+        "E5b": "skipped", "E5c": "skipped", "E6": "skipped"}
     for s in slots.values():
         for r in s["results"]:
             assert r["status"] in report.STATUSES
@@ -186,6 +192,6 @@ def test_step_names():
 
 def test_unknown_names_are_refused():
     with pytest.raises(SystemExit):
-        run.run(["--experiments", "E2"])
+        run.run(["--experiments", "E7"])
     with pytest.raises(SystemExit):
         run._models("gpt2")

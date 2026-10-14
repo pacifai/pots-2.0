@@ -2,7 +2,10 @@
 
 Standalone scripts for the H100 hashing benchmark of `docs/verification/HASHING_PLAN_DRAFT.md`
 (Section 6). They measure what the full-scale run's hashing and challenge generation cost on
-the CPU, and they record the machine. The GPU experiments are empty slots in the report.
+the CPU, how fast the GPU runs the training's largest matmuls, and how fast steps move between
+host and GPU, and they record the machine. The GPU hashing slots (E2, E5b and E5c, and E3's
+hashing half) say skipped: cuPQC sits behind a licence the user hasn't accepted (see
+[cuPQC](#cupqc)), and the cited BLAKE3-on-GPU code needs a SYCL compiler.
 
 The package imports `setup`, PyTorch, transformers, NumPy, `hashlib`, `blake3` and `certifi`
 (for the native build's TLS only). From `verification` it imports only the leaf-size list
@@ -26,14 +29,20 @@ The defaults are Section 6's sizes:
 - Chunks of 8, 16, 64 and 256 KiB and 1 MiB.
 - The four full-scale models at 128 × 128, plus the test-scale step.
 - Llama-3.2-1B's whole challenge list at k = 21.
+- E3: the largest matmuls of each full-scale model over 128 × 128 tokens, 20 timed runs each,
+  and 5-second windows for the GEMM loop and the concurrent rows.
+- E4: copy pieces of 1 and 8 GiB over a 64 GiB host buffer. The host needs that much free
+  RAM, plus the 4 GiB hashing buffer and 4 GiB for the rest of the process; with less, E4
+  halves the buffer until it fits.
 - One SGD step per full-scale model on `cuda`.
 
 The report goes to `$VERIF_OUTPUT_DIR/benchmarks/hashing_<UTC time>.json`, or to `--out`.
 
 Before the session, prepare three things:
 
-- E6 loads each model with `from_pretrained` at its pinned revision (`setup/model.py`). Run
-  with network access, or fill the Hugging Face cache first.
+- E6 loads each model with `from_pretrained` at its pinned revision (`setup/model.py`), and
+  E1, E3 and E4 read each model's config from the cache. Fill the Hugging Face cache first;
+  every pinned repo is public, so no token is needed.
 - `b3sum`, BLAKE3's command-line tool, gives BLAKE3's native ceiling. If it isn't on `PATH`,
   that result says skipped.
 - E5a_prime's native batch needs a C compiler and, the first time, one download from
@@ -47,9 +56,17 @@ HF_HUB_OFFLINE=1 VERIF_OUTPUT_DIR=/tmp/out .venv/bin/python -m benchmarks.hashin
 ```
 
 The smoke preset uses a 256 MiB buffer, one layer of the challenge list for the Python paths,
-every layer for the native batch, and E6 at 2 × 16 on the CPU. It took about 5.5 minutes on
-an Apple M5 Pro, 4.2 of them in E1's whole-object rows, which hash about four tasks per thread
-at each leaf size and thread count. Any flag given explicitly overrides the preset; see `--help`.
+every layer for the native batch, and E6 at 2 × 16 on the CPU. E3 times Qwen2.5-0.5B's matmuls
+over 2048 tokens, and E4 copies 64 and 256 MiB pieces of a 1 GiB buffer, in 1-second windows.
+It took about 5.5 minutes on an Apple M5 Pro, 4.2 of them in E1's whole-object rows, which
+hash about four tasks per thread at each leaf size and thread count. Any flag given explicitly
+overrides the preset; see `--help`. To run E6 on a GPU at smoke size, add `--e6-device cuda`;
+with it, the smoke run took 7.3 minutes on an A40 pod, 6 of them in E1.
+
+The smoke sizes check that the code runs, and their rates are noisy: a 256 MiB buffer over 7
+threads hashes in tens of milliseconds. On the A40 pod, E1's chunked BLAKE3 rows at 7 threads
+and 1 MiB chunks read 7 to 17 GB/s on the smoke buffer and 33 GB/s on a 4 GiB one, which
+matches E4's one-second hashing windows.
 
 A step is named by its model (`llama-3.2-1b`), at `--n-s` × `--n` with bf16 products. To give
 a step its own batch and product dtype, write `model:N_SxN:DTYPE`. For example,
@@ -73,8 +90,12 @@ E0, machine record
   GPU, driver, CUDA, PCIe link and NUMA fields. Fields that a machine lacks are `null` and are
   listed in `absent`. `cores_for_threads` is the thread cap: physical cores, capped by CPU
   affinity and cgroup quota, as `cores_for_threads_basis` says; rayon, and so BLAKE3's AUTO
-  mode, sizes its pool by logical CPUs instead. `notes` says that `pcie_gen_current` and the
-  clock are read at idle.
+  mode, sizes its pool by logical CPUs instead. The cgroup limits are read from cgroup v2
+  (`cpu.max`, `memory.max`) or, failing that, v1 (`cpu.cfs_quota_us` over `cpu.cfs_period_us`,
+  `memory.limit_in_bytes`): `cgroup_cpu_quota` in CPUs and `cgroup_memory_limit_bytes`. A
+  container's `nproc` can show the host's CPUs while its quota allows far fewer; the A40 pod
+  showed 96 logical CPUs under a 7.65-CPU quota, so `cores_for_threads` was 7. `notes` says
+  that `pcie_gen_current` and the clock are read at idle.
 
 E1, CPU hashing throughput
 : SHA-256 (OpenSSL through `hashlib`) and BLAKE3 (`blake3`), in these measurements:
@@ -106,8 +127,62 @@ E1, CPU hashing throughput
   - *Under a copy*: the chunked measurement while a host-to-GPU copy runs. It's skipped
     without CUDA.
 
-E2, E3 and E4: GPU hashing, overlap with a GEMM loop, and host-GPU copies
-: Not implemented. They need CUDA code.
+E2, GPU hashing throughput
+: Two skipped rows. `cupqc_sha256` needs NVIDIA's cuPQC SDK (see [cuPQC](#cupqc)). Its note
+  records one finding for when it's built: cuPQC's Merkle API takes only power-of-two leaf
+  counts, so the protocol's rule for an odd node count (P9a) needs the node levels built from
+  batched 65-byte SHA-256 calls. `blake3_gpu_proxy` is the plan's BLAKE3-on-GPU reference,
+  github.com/itzmeanjan/blake3. It's written in SYCL, so on an NVIDIA GPU it needs Intel's
+  open-source LLVM SYCL compiler built with its CUDA backend; nvcc can't build it.
+
+E3, GPU hashing beside training's matmuls
+: The GEMM half runs; the hashing half says skipped until E2 has a GPU hash.
+  - `gemm`: each of a model's three largest matmuls in bf16, timed alone with CUDA events:
+    the MLP's up and down projections and the LM head, each over `--gemm-tokens` rows. One
+    event pair spans 10 back-to-back runs of the matmul, and the time is divided by 10, so the
+    launch delay before the first run is a tenth of the measurement. `tflop_per_s_median` and
+    `tflop_per_s_best` are over `--gemm-iters` such measurements.
+  - `gemm_loop_alone`: the *GEMM loop*. A background thread enqueues the three matmuls round
+    robin on their own CUDA stream, at most four ahead of the GPU. Its rate is the FLOPs of
+    the matmuls that finished in the window over the window's wall time.
+  - `gpu_hash_alone` and `gemm_loop_with_gpu_hash`: skipped, no GPU hash.
+
+  Every row runs under `setup_determinism`'s matmul settings, as E6 does.
+
+E4, host-GPU copies
+: Copies GPU to host (`d2h`) and host to GPU (`h2d`), pinned and pageable, at each piece size.
+  The host buffer is `--e4-total-mb` of pageable memory, every page written and cut into
+  pieces, so each piece is distinct host memory, as a step's transcript is. For the pinned
+  rows it's page-locked in place with `cudaHostRegister`. Each combination gives three rows:
+  - `copy`: whole passes over the buffer, one piece at a time on a side stream, alone.
+  - `copy_with_gemm_loop`: the same passes while E3's GEMM loop runs (on the first of
+    `--gemm-models`). The loop runs one window alone just before the copies, and
+    `gemm_slowdown` compares the two windows, so clock drift over a long session doesn't
+    count as slowdown.
+  - `copy_with_cpu_hashing`: the same passes while CPU threads hash a separate buffer as E1's
+    chunked rows do (the largest `--chunk-kb`, all `--threads`), one row per algorithm. As
+    with the loop, `hash_slowdown` compares the window during the copies with the one just
+    before them.
+
+  The `gemm_loop_alone` and `cpu_hashing_alone` rows are the rates at the start of E4, for
+  reference.
+
+  A slowdown under about 1% is counting noise: the loop counts a GEMM only once it sees it
+  finish, so a window's count lags the GPU by up to four GEMMs. The hashing count lags by up
+  to one 16 MiB task per thread, which can reach a few percent of a one-second window. Each
+  row's note says so.
+
+  A pageable copy blocks the thread that enqueues the GEMMs, so a pageable
+  `copy_with_gemm_loop` row shows this process's slowdown, not the GPU's. On the A40 pod a
+  pageable copy cut the loop's rate by 83–98%; the same copies from a second process left it
+  unchanged. The row's note says so.
+
+  Before it allocates, E4 checks the host buffer, the hashing buffer and a 4 GiB margin
+  against the host's memory: the smaller of the cgroup's limit and `MemAvailable`. If they
+  don't fit, it halves the buffer, keeping it a multiple of every piece, until they do, and
+  says skipped if no such buffer fits. A container's out-of-memory kill would otherwise end
+  the whole run. Each row records `total_bytes`, the buffer used, beside
+  `total_bytes_requested` and the two memory readings.
 
 E5a, challenge generation on the current Python path
 : The protocol's challenge functions, reproduced call for call, including the fp32
@@ -124,7 +199,8 @@ E5a_prime, batched challenge generation on the CPU
     sets how many layers it times (default all); `--no-native-batch` turns it off.
 
 E5b and E5c: challenge generation on the GPU with cuPQC
-: Not implemented. They need CUDA code.
+: Skipped rows, `cupqc_shake256` and `cupqc_sha256_counter`: both need cuPQC (see
+  [cuPQC](#cupqc)).
 
 E6, step time
 : One plain SGD step per model, eager and then sdpa attention, after warmup steps. It trains
@@ -133,6 +209,40 @@ E6, step time
   settings, fp32 accumulation for cuBLAS's bf16 matmuls (F5a) and fp32 matmul precision
   "highest", and restores them after; each row records them and whether deterministic
   algorithms are on. The verified step isn't timed.
+
+## cuPQC
+
+E2's SHA-256, E5b and E5c need NVIDIA's cuPQC SDK. It has no pip or conda package; NVIDIA
+ships it as a tarball, latest version 0.6.0 (189 MB). Its download page,
+https://developer.nvidia.com/cupqc-download, says that downloading and using it accepts the
+NVIDIA Software License Agreement, https://docs.nvidia.com/cuda/cupqc/additional/license.html.
+Accepting that licence is the user's decision, so the SDK isn't downloaded here.
+
+What the licence says, in the parts that bear on this repo:
+
+- §1.1 and §1.2: you may distribute its binaries and headers only inside an application that
+  adds material functionality.
+- §2.3: no other redistribution or modification. The repo can't hold the SDK, so a build has
+  to fetch it, as the native batch fetches BLAKE3.
+- §2.6: nothing may put the SDK under an open-source licence.
+- §2.1: NVIDIA GPUs only.
+- It says nothing on publishing benchmark numbers.
+
+If the user accepts the licence, these are the steps:
+
+1. Download and extract the SDK outside the repo:
+
+   ```bash
+   wget https://developer.download.nvidia.com/compute/cupqc/redist/cupqc/cupqc-sdk-0.6.0-x86_64.tar.gz
+   tar -xzf cupqc-sdk-0.6.0-x86_64.tar.gz -C <dir>
+   ```
+
+   The URL needs no login.
+2. Write a small CUDA extension against cuPQC-Hash for E2 (SHA-256 leaves and nodes), E5b
+   (SHAKE256) and E5c (SHA-256 in counter mode), built with `nvcc` 12.4 or later and `-dlto`,
+   as NVIDIA's install guide asks. cuPQC is a device-side C++ library with no Python API, so
+   the extension needs its own kernels and a ctypes or torch binding. None of it is written
+   yet.
 
 ## Native batch
 
