@@ -1,7 +1,8 @@
 """E6, step time per model: one plain SGD step at full scale's precision, eager then sdpa
 attention.
 
-The model is an unmodified ``from_pretrained`` load at its pinned revision (``setup.model``),
+The model is an unmodified ``from_pretrained`` load at its pinned revision (``setup.model``;
+Llama's weights come from Meta's repo, :data:`WEIGHTS`),
 trained on random token ids with the model's own causal-LM loss, the way FS3's step trains
 (F6b): fp32 master weights, forward and loss under ``torch.autocast`` to the compute dtype
 (bf16), backward outside it, SGD in fp32 on the masters. The two matmul precision settings
@@ -29,6 +30,15 @@ from benchmarks.hashing.sizes import MODELS
 from setup.model import load_pretrained
 
 ATTN_IMPLS = ("eager", "sdpa")
+# E6 only: the weights to time where a model's pin carries none. The leaf sizes keep the pins'
+# configs (``sizes.MODELS``), but the unsloth Llama mirror is cached as config and tokenizer
+# only. Meta's repo at the commit the verified run uses (FS4, ``setup.data.RUN_ONLY_EOS``) has
+# the same architecture, and FS11's upload packs that snapshot from the Mac's cache. Each row's
+# params name the repo and revision actually loaded.
+WEIGHTS: dict[str, tuple[str, str]] = {
+    "llama-3.2-1b": ("meta-llama/Llama-3.2-1B-Instruct",
+                     "9213176726f574b556790deb65791e0c5aa438b6"),
+}
 
 
 def _sync(device: torch.device) -> None:
@@ -101,15 +111,17 @@ def run_e6(models: Sequence[str], *, n_s: int, n: int, device: str, warmup: int,
     out = []
     for key in models:
         pin = MODELS[key]
+        repo, revision = WEIGHTS.get(key, (pin.repo, pin.revision))
         for impl in ATTN_IMPLS:
-            params = {"model": key, "repo": pin.repo, "revision": pin.revision, "attn": impl,
+            params = {"model": key, "repo": repo, "revision": revision,
+                      "sizes_repo": pin.repo, "attn": impl,
                       "master_dtype": "float32",
                       "compute_dtype": str(compute_dtype).removeprefix("torch."),
                       "autocast": compute_dtype != torch.float32, "n_s": n_s, "n": n,
                       "device": device, "warmup": warmup, "reps": reps, "optimizer": "SGD"}
             log(f"E6 {key} {impl} {n_s}x{n} on {device}")
             try:
-                model = load_pretrained(pin.repo, pin.revision, attn_impl=impl,
+                model = load_pretrained(repo, revision, attn_impl=impl,
                                         dtype=torch.float32)
             except Exception as e:  # e.g. offline with only the config cached
                 out.append(result("sgd_step", "skipped", params=params,

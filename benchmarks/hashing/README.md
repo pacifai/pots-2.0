@@ -41,8 +41,12 @@ The report goes to `$VERIF_OUTPUT_DIR/benchmarks/hashing_<UTC time>.json`, or to
 Before the session, prepare three things:
 
 - E6 loads each model with `from_pretrained` at its pinned revision (`setup/model.py`), and
-  E1, E3 and E4 read each model's config from the cache. Fill the Hugging Face cache first;
-  every pinned repo is public, so no token is needed.
+  E1, E3 and E4 read each model's config from the cache. Fill the Hugging Face cache first.
+  Every pinned repo is public, so no token is needed. The exception is E6's Llama row: the
+  unsloth mirror is pinned for its config only, and E6 times Meta's
+  `meta-llama/Llama-3.2-1B-Instruct` at the verified run's commit (`step_time.WEIGHTS`), which
+  is gated. That snapshot comes from the Mac's cache in FS11's upload; each row's params name
+  the repo it loaded.
 - `b3sum`, BLAKE3's command-line tool, gives BLAKE3's native ceiling. If it isn't on `PATH`,
   that result says skipped.
 - E5a_prime's native batch needs a C compiler and, the first time, one download from

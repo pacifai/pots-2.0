@@ -86,6 +86,26 @@ def test_a_failed_step_keeps_the_next_rows(monkeypatch):
     assert isinstance(p["deterministic_algorithms"], bool)
 
 
+def test_llama_times_metas_weights_and_says_so(monkeypatch):
+    """E6's Llama row loads Meta's snapshot, not the config-only unsloth pin, and records it."""
+    loads = []
+
+    def load(repo, revision, **kw):
+        loads.append((repo, revision))
+        return LlamaForCausalLM(tiny_config())
+
+    monkeypatch.setattr(step_time, "load_pretrained", load)
+    monkeypatch.setattr(step_time, "time_steps", lambda model, **kw: [0.5])
+    rows = step_time.run_e6(["llama-3.2-1b", "smollm2-135m"], n_s=1, n=8, device="cpu",
+                            warmup=0, reps=1, log=lambda _: None)
+    meta = ("meta-llama/Llama-3.2-1B-Instruct", "9213176726f574b556790deb65791e0c5aa438b6")
+    smol = step_time.MODELS["smollm2-135m"]
+    assert loads == [meta, meta, (smol.repo, smol.revision), (smol.repo, smol.revision)]
+    p = rows[0]["params"]
+    assert (p["repo"], p["revision"], p["sizes_repo"]) == (*meta, "unsloth/Llama-3.2-1B-Instruct")
+    assert rows[2]["params"]["repo"] == rows[2]["params"]["sizes_repo"] == smol.repo
+
+
 def test_no_models_is_a_skip():
     (r,) = step_time.run_e6([], n_s=2, n=8, device="cpu", warmup=0, reps=1)
     assert r["status"] == "skipped"
