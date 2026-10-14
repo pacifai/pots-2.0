@@ -33,14 +33,20 @@ the real step and on adversarial inputs) with less work:
 - ``|A|``, ``|B|`` and ``|P|`` are written into one reused buffer (:class:`MeasureScratch`)
   with the layout a fresh ``x.abs()`` has, so the matmuls see the same operands. ``|P|`` is
   computed once, for ``|P|·1`` and for the max that ``_safe_norm`` scales by.
-- :func:`_norm` returns ``_safe_norm``'s value, skipping the scaled copy where it provably
-  changes nothing (see there).
-
+- :func:`_norm` returns ``_safe_norm``'s value without reading anything back to the host: it
+  always takes the scaled path, which where the scaling is trivial gives the unscaled norm's
+  bits (see there).
 - ``A²`` and ``B²`` for ``U`` go into the same buffer (:meth:`MeasureScratch.square`), after
   ``|B|·1`` and ``|A|·(|B|·1)`` are taken.
 - Squares above fp32's range (an entry above about ``1.8e19``) make ``U`` infinite, and check
   5's finiteness guard rejects. Placeholder: no honest product comes near it, so ``U`` gets
   no scaled path.
+- The numbers stay on the operands' device as one float64 row per product
+  (:func:`measure_product_row`, :func:`measure_products_rows`; the columns are :data:`ROW`),
+  and :func:`finish_row` turns a row read back to the host into a :class:`ProductMeasure`.
+  A row holds fp32 values widened exactly and float64 sums, so it carries the bits the
+  floats had. Check 5 reads many products' rows in one transfer, so the host waits for the
+  device once per batch of rows instead of several times per product.
 
 **Test 1 off, for cost only.** ``guard=False`` skips test 1's work (``|A|``, ``|B|``, the
 two matvecs and ``|P|·1``) and returns ``ν``, ``‖|P|·1‖`` and ``κ`` as NaN. ``U`` belongs to
@@ -73,8 +79,9 @@ from verification.verifier.matmul_check.challenges import (
 )
 from verification.verifier.matmul_check.sizing import product_e_m
 
-__all__ = ["MeasureScratch", "ProductMeasure", "band_unit", "measure_product",
-           "measure_products", "term_scale", "term_scales"]
+__all__ = ["ROW", "MeasureScratch", "ProductMeasure", "band_unit", "finish_row",
+           "measure_product", "measure_product_row", "measure_products",
+           "measure_products_rows", "row_width", "term_scale", "term_scales"]
 
 
 @dataclass(frozen=True)
@@ -103,7 +110,13 @@ def _safe_norm(x: torch.Tensor, dim: int | None = None) -> torch.Tensor:
     """
     a = x.abs()
     amax = a.amax() if dim is None else a.amax(dim=dim)
-    return _scaled_norm(x, dim, amax)
+    ok = torch.isfinite(amax) & (amax > 0)
+    _, exp = torch.frexp(torch.where(ok, amax, torch.ones_like(amax)))
+    s = torch.ldexp(torch.ones_like(amax), exp - 1)  # max|x| ∈ [s, 2s)
+    scaled = s * torch.linalg.vector_norm(x / (s if dim is None else s.unsqueeze(dim)), dim=dim)
+    if bool(ok.all()):
+        return scaled
+    return torch.where(ok, scaled, torch.linalg.vector_norm(x, dim=dim))
 
 
 def _scaled_norm(x: torch.Tensor, dim: int | None, amax: torch.Tensor,
@@ -111,71 +124,63 @@ def _scaled_norm(x: torch.Tensor, dim: int | None, amax: torch.Tensor,
     """``_safe_norm`` given ``amax = max|x|`` over ``dim``; ``x/s`` goes into ``out`` if given.
 
     ``out`` must be contiguous with ``x``'s shape, and ``x`` contiguous, so ``x/s`` has the
-    layout a fresh quotient has.
+    layout a fresh quotient has. Where ``max|x|`` is finite and positive, ``s`` is
+    ``_safe_norm``'s. Where it is 0, ``s = 1/2`` and both give 0; where it is ``inf`` or NaN,
+    ``s = 1`` and both give the unscaled norm, ``inf`` or NaN. So the value is
+    ``_safe_norm``'s with no branch on the data and nothing read back to the host.
     """
-    ok = torch.isfinite(amax) & (amax > 0)
-    _, exp = torch.frexp(torch.where(ok, amax, torch.ones_like(amax)))
+    _, exp = torch.frexp(torch.nan_to_num(amax, nan=1.0, posinf=1.0))  # frexp(0) = (0, 0)
     s = torch.ldexp(torch.ones_like(amax), exp - 1)  # max|x| ∈ [s, 2s)
     div = s if dim is None else s.unsqueeze(dim)
     xs = x / div if out is None else torch.div(x, div, out=out)
-    scaled = s * torch.linalg.vector_norm(xs, dim=dim)
-    if bool(ok.all()):
-        return scaled
-    return torch.where(ok, scaled, torch.linalg.vector_norm(x, dim=dim))
+    return s * torch.linalg.vector_norm(xs, dim=dim)
 
 
 _HOST = torch.device("cpu")  # the scratch's default device; check 5 passes its operands'
-
-# Where every vector's entries satisfy these bounds, ``vector_norm(x)`` equals
-# ``_safe_norm(x)`` bit for bit. See :func:`_norm`.
-_MIN_ENTRY = 2.0 ** -63  # its square, 2^-126, is fp32's smallest normal number
-_MAX_SUM = 2.0 ** 124  # the exact sum of squares; rounding can't push it past 2^128
-
-
-def _plain_is_exact(lo: float, hi: float, length: int) -> bool:
-    """True if a vector with ``min|x_i| = lo``, ``max|x_i| = hi`` meets :func:`_norm`'s bounds."""
-    return lo >= _MIN_ENTRY * max(1.0, hi) and length * hi * hi <= _MAX_SUM
-
 
 def _norm(x: torch.Tensor, dim: int | None, absx: torch.Tensor,
           scratch: MeasureScratch | None = None) -> torch.Tensor:
     """``_safe_norm(x, dim)``, bit for bit, given ``absx`` with the values of ``|x|``.
 
-    ``absx`` may differ from ``x.abs()`` in the sign of a zero only. With ``scratch``, a
-    scaled copy of a contiguous ``x`` goes into its buffer, so ``absx`` must not live there.
+    ``absx`` may differ from ``x.abs()`` in the sign of a zero only. With ``scratch``, the
+    scaled copy of a contiguous ``x`` goes into its buffer, so ``absx`` must not live there
+    unless the caller is done with it. The result stays on ``x``'s device: nothing is read
+    back to the host.
 
-    **When the scaled copy is skipped.** torch's CPU 2-norm sums ``x_i·x_i`` in fp32 and
-    takes ``sqrt`` (``NormTwoOps``; a one-entry tensor is its ``|x_0|``). Every step is a
-    correctly rounded ``×``, ``+`` or ``sqrt``, and its order depends only on the shape, the
-    strides, the alignment and the thread count. ``_safe_norm`` runs the same kernel on
-    ``x/s``, a fresh contiguous tensor of ``x``'s shape. If ``x`` is contiguous and 64-byte
-    aligned (as every fresh tensor is), both runs take the same steps in the same order, on
-    values that differ by the factor ``s = 2^e``. Scaling an operation's inputs by powers of
-    two scales its exact result the same way, so it scales the rounded result too, as long
-    as both rounded results are normal fp32 numbers (not subnormal, not overflowed). Then
-    ``vector_norm(x) = s·vector_norm(x/s)``, the scaled sum's ``sqrt`` times ``s``, exactly.
-    Per vector, with ``lo = min|x_i|``, ``hi = max|x_i|`` and ``n`` entries:
+    **Why it always scales.** Until 2026-10-14 it read every vector's ``min|x_i|`` and
+    ``max|x_i|`` back to the host and returned the plain ``vector_norm(x)`` where the bounds
+    below held, skipping the scaled copy. That read made the host wait for the device on every
+    norm, which on a GPU cost more than the copy, so the branch is gone. The argument below
+    is why the plain value it returned was the scaled one's bits, so dropping it changes no
+    number on the CPU.
+
+    torch's CPU 2-norm sums ``x_i·x_i`` in fp32 and takes ``sqrt`` (``NormTwoOps``; a
+    one-entry tensor is its ``|x_0|``). Every step is a correctly rounded ``×``, ``+`` or
+    ``sqrt``, and its order depends only on the shape, the strides, the alignment and the
+    thread count. ``_safe_norm`` runs the same kernel on ``x/s``, a fresh contiguous tensor
+    of ``x``'s shape. If ``x`` is contiguous and 64-byte aligned (as every fresh tensor is),
+    both runs take the same steps in the same order, on values that differ by the factor
+    ``s = 2^e``. Scaling an operation's inputs by powers of two scales its exact result the
+    same way, so it scales the rounded result too, as long as both rounded results are normal
+    fp32 numbers (not subnormal, not overflowed). Then ``vector_norm(x) = s·vector_norm(x/s)``,
+    the scaled sum's ``sqrt`` times ``s``, exactly. Per vector, with ``lo = min|x_i|``,
+    ``hi = max|x_i|`` and ``n`` entries, the old branch required:
 
     - ``lo ≥ 2^-63·max(1, hi)``. Then ``lo > 0``, and since ``s ≤ hi``, every ``x_i`` and
       ``x_i/s`` is at least ``2^-63`` in magnitude: ``x/s`` is exact, and every square and
-      partial sum is at least ``2^-126``, normal. A vector with a zero entry fails this.
+      partial sum is at least ``2^-126``, normal. A vector with a zero entry failed this.
     - ``n·hi² ≤ 2^124``. The computed sum is at most the exact one times ``(1 + 2^-24)^n``,
       under ``e^2`` for ``n < 2^25``, so no partial sum reaches ``2^128``. The scaled sums
       are at most ``4n``, and ``s`` times the scaled norm is the unscaled norm, finite.
 
-    A NaN or infinite entry fails the bounds. Any failing vector falls back to the scaled
-    computation for the whole call, reusing ``max|x|`` from the same pass that gave ``lo``.
+    On a GPU the plain and scaled kernels need not agree, so a GPU's bits may differ from
+    those the old branch gave; they are ``_safe_norm``'s either way.
     """
-    lo, hi = torch.aminmax(absx) if dim is None else torch.aminmax(absx, dim=dim)
-    length = x.numel() if dim is None else x.shape[dim]
-    if x.is_contiguous() and x.data_ptr() % 64 == 0 and all(
-            _plain_is_exact(a, b, length)
-            for a, b in zip(lo.reshape(-1).tolist(), hi.reshape(-1).tolist())):
-        return torch.linalg.vector_norm(x, dim=dim)
+    amax = absx.amax() if dim is None else absx.amax(dim=dim)
     out = None
     if scratch is not None and x.is_contiguous():
         out = scratch.buffer(x.numel(), x.device).view(x.shape)
-    return _scaled_norm(x, dim, hi, out)
+    return _scaled_norm(x, dim, amax, out)
 
 
 class MeasureScratch:
@@ -240,9 +245,10 @@ def _term_sq(a: torch.Tensor, b: torch.Tensor, ones: torch.Tensor,
     return sc.square(a) @ b2
 
 
-def _bias_u2(bias: torch.Tensor, n: int) -> float:
-    """The ones column's share of ``U²`` for ``[A | 1]·[B ; bᵀ]``: ``n·‖b‖²``, in float64."""
-    return n * float(bias.double().square().sum())
+def _bias_sq(bias: torch.Tensor) -> torch.Tensor:
+    """``‖b‖²`` in float64, on ``bias``'s device. ``[A | 1]·[B ; bᵀ]``'s ones column adds
+    ``n·‖b‖²`` to ``U²`` (:func:`finish_row`)."""
+    return bias.double().square().sum()
 
 
 def term_scale(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None) -> float:
@@ -252,7 +258,7 @@ def term_scale(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = Non
     with torch.no_grad():
         u2 = float(_term_sq(a, b, sc.ones(b.shape[1], b.device), sc).double().sum())
         if bias is not None:
-            u2 += _bias_u2(bias, a.shape[0])
+            u2 += a.shape[0] * float(_bias_sq(bias))
     return math.sqrt(u2)
 
 
@@ -264,6 +270,17 @@ def term_scales(a: torch.Tensor, b: torch.Tensor) -> list[float]:
         u2 = _term_sq(a, b, sc.ones(b.shape[2], b.device), sc).double().reshape(a.shape[0],
                                                                                  -1).sum(1)
     return [math.sqrt(x) for x in u2.tolist()]
+
+
+ROW = ("nu", "p_abs1", "p_norm", "u2_terms", "bias_sq", "residuals")
+"""The columns of a product's float64 row: ``ν``, ``‖|P|·1‖``, ``‖P‖_F``, the terms' share
+of ``U²`` (``Σ_i (A²·(B²·1))_i``), ``‖b‖²`` (0 without a bias), then the ``k`` residuals
+``‖A(B·r_j) − P·r_j‖``. ``ν`` and ``‖|P|·1‖`` are NaN when test 1 is skipped."""
+
+
+def row_width(k: int) -> int:
+    """The length of a row (:data:`ROW`) at ``k`` challenges."""
+    return len(ROW) - 1 + k
 
 
 def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes, m: int,
@@ -282,8 +299,20 @@ def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: byt
     (F14): ``ν`` gains ``‖bias‖₁`` in every row, ``A(B·r)`` gains ``biasᵀ·r`` in every row,
     ``U²`` gains ``n·‖bias‖²``, and ``e_m`` contracts over ``q + 1``. Without it the
     operations are those of an unbiased product.
+
+    It is :func:`measure_product_row`, read back, then :func:`finish_row`.
     """
-    q, width = a.shape[1] + (bias is not None), b.shape[1]
+    row = measure_product_row(a, b, p, h=h, m=m, k=k, scratch=scratch, guard=guard, bias=bias)
+    return finish_row(row.tolist(), q=a.shape[1] + (bias is not None), n=a.shape[0],
+                      eps_in=eps_in, eps_acc=eps_acc, guard=guard, biased=bias is not None)
+
+
+def measure_product_row(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes, m: int,
+                        k: int, scratch: MeasureScratch | None = None, guard: bool = True,
+                        bias: torch.Tensor | None = None) -> torch.Tensor:
+    """:func:`measure_product`'s numbers as a float64 row (:data:`ROW`) on the operands'
+    device, with nothing read back to the host."""
+    width = b.shape[1]
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
         ones = sc.ones(width, b.device)
@@ -294,21 +323,35 @@ def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: byt
             if bias is not None:
                 nu_vec += bias.abs() @ ones
         # Test 2's term scale U (F18), after ν is done with the buffer.
-        u2 = float(_term_sq(a, b, ones, sc).double().sum())
-        if bias is not None:
-            u2 += _bias_u2(bias, a.shape[0])
+        u2 = _term_sq(a, b, ones, sc).double().sum()
+        bias_sq = _bias_sq(bias) if bias is not None else torch.zeros_like(u2)
         if guard:
-            nu, p_abs1, p_norm = _p_norms(nu_vec, p, ones, sc, None)
+            norms = _p_norms(nu_vec, p, ones, sc, None)
         else:
-            nu, p_abs1, p_norm = [math.nan], [math.nan], [float(_norm(p, None, sc.abs(p), sc))]
+            p_norm = _norm(p, None, sc.abs(p), sc)
+            nan = torch.full_like(p_norm, math.nan)
+            norms = torch.stack((nan, nan, p_norm))
         # Test 2, the normalized residual (P3.a): ‖A(B·r) − P·r‖ ≤ τ·σ_r·e_m·‖P_m‖_F.
         r = challenge_matrix(h, m, k, width).to(b.device)
         ab_r = a @ (b @ r)
         if bias is not None:
             ab_r += bias @ r
         d = ab_r - p @ r
-        res = tuple(_norm(d, 0, d.abs()).tolist())
-    return _guarded(_measure(nu[0], p_abs1[0], res, p_norm[0], q, eps_in, eps_acc,
+        res = _norm(d, 0, d.abs())
+        return torch.cat((norms.double(), torch.stack((u2, bias_sq)), res.double()))
+
+
+def finish_row(row: Sequence[float], *, q: int, n: int, eps_in: float, eps_acc: float,
+               guard: bool = True, biased: bool = False) -> ProductMeasure:
+    """The :class:`ProductMeasure` of one product from its row (:data:`ROW`), on the host.
+
+    ``q`` is the checked matmul's contraction length (``+ 1`` with a bias) and ``n`` the rows
+    of ``A``. A biased product's ``U²`` adds ``n·‖b‖²`` to the terms' share, in float64.
+    """
+    nu, p_abs1, p_norm, u2, bias_sq, *res = row
+    if biased:
+        u2 += n * bias_sq
+    return _guarded(_measure(nu, p_abs1, tuple(res), p_norm, q, eps_in, eps_acc,
                              math.sqrt(u2)), guard)
 
 
@@ -318,12 +361,12 @@ def _guarded(mp: ProductMeasure, guard: bool) -> ProductMeasure:
 
 
 def _p_norms(nu_vec: torch.Tensor, p: torch.Tensor, ones: torch.Tensor, sc: MeasureScratch,
-             n_b: int | None) -> tuple[list[float], list[float], list[float]]:
-    """ν, ``‖|P|·1‖`` and ``‖P‖_F`` per product, from ``|A|·(|B|·1)`` and ``P``.
+             n_b: int | None) -> torch.Tensor:
+    """ν, ``‖|P|·1‖`` and ``‖P‖_F`` from ``|A|·(|B|·1)`` and ``P``, fp32: ``[3]`` for one
+    product (``n_b`` ``None``), ``[n_b, 3]`` for a batch of ``n_b``.
 
-    ``n_b`` is the batch size, or ``None`` for one product. ``|P|`` goes into the buffer
-    after ``nu_vec`` is computed, and the buffer then takes ``P/s`` if a scaled copy is
-    needed, after ``|P|``'s last use.
+    ``|P|`` goes into the buffer after ``nu_vec`` is computed, and the buffer then takes
+    ``P/s`` after ``|P|``'s last use.
     """
     absp = sc.abs(p)
     p1_vec = absp @ ones
@@ -331,11 +374,11 @@ def _p_norms(nu_vec: torch.Tensor, p: torch.Tensor, ones: torch.Tensor, sc: Meas
         nu = _norm(nu_vec, None, nu_vec)  # entries ≥ 0: |ν_i| = ν_i, up to a zero's sign
         p_abs1 = _norm(p1_vec, None, p1_vec)
         p_norm = _norm(p, None, absp, sc)
-        return [float(nu)], [float(p_abs1)], [float(p_norm)]
+        return torch.stack((nu, p_abs1, p_norm))
     nu = _norm(nu_vec.reshape(n_b, -1), 1, nu_vec.reshape(n_b, -1))
     p_abs1 = _norm(p1_vec.reshape(n_b, -1), 1, p1_vec.reshape(n_b, -1))
     p_norm = _norm(p.reshape(n_b, -1), 1, absp.reshape(n_b, -1), sc)
-    return nu.tolist(), p_abs1.tolist(), p_norm.tolist()
+    return torch.stack((nu, p_abs1, p_norm), 1)
 
 
 def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes,
@@ -349,8 +392,21 @@ def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: by
     member can't change another's numbers. The batched matmuls may round differently from
     one-at-a-time ones, at rounding level only. The numbers equal
     ``_measure_products_reference``'s bit for bit.
+
+    It is :func:`measure_products_rows`, read back, then :func:`finish_row` per member.
     """
-    n_b, q, width = a.shape[0], a.shape[2], b.shape[2]
+    rows = measure_products_rows(a, b, p, h=h, ms=ms, k=k, scratch=scratch, guard=guard)
+    q, n = a.shape[2], a.shape[1]
+    return [finish_row(row, q=q, n=n, eps_in=eps_in, eps_acc=eps_acc, guard=guard)
+            for row in rows.tolist()]
+
+
+def measure_products_rows(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes,
+                          ms: Sequence[int], k: int, scratch: MeasureScratch | None = None,
+                          guard: bool = True) -> torch.Tensor:
+    """:func:`measure_products`'s numbers as float64 rows ``[B, ·]`` (:data:`ROW`), one per
+    member, on the operands' device, with nothing read back to the host."""
+    n_b, width = a.shape[0], b.shape[2]
     if len(ms) != n_b or b.shape[0] != n_b or p.shape[0] != n_b:
         raise ValueError(f"batch of {len(ms)} labels for operands {tuple(a.shape)}, "
                          f"{tuple(b.shape)}, {tuple(p.shape)}")
@@ -360,17 +416,18 @@ def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: by
         if guard:
             b1 = sc.abs(b) @ ones
             nu_vec = sc.abs(a) @ b1
-        u2 = _term_sq(a, b, ones, sc).double().reshape(n_b, -1).sum(1).tolist()
+        u2 = _term_sq(a, b, ones, sc).double().reshape(n_b, -1).sum(1)
         if guard:
-            nu, p_abs1, p_norm = _p_norms(nu_vec, p, ones, sc, n_b)
+            norms = _p_norms(nu_vec, p, ones, sc, n_b)
         else:
-            nu = p_abs1 = [math.nan] * n_b
-            p_norm = _norm(p.reshape(n_b, -1), 1, sc.abs(p).reshape(n_b, -1), sc).tolist()
+            p_norm = _norm(p.reshape(n_b, -1), 1, sc.abs(p).reshape(n_b, -1), sc)
+            nan = torch.full_like(p_norm, math.nan)
+            norms = torch.stack((nan, nan, p_norm), 1)
         r = challenge_matrices(h, ms, k, width).to(b.device)
         d = a @ (b @ r) - p @ r
-        res = _norm(d, 1, d.abs()).tolist()  # [B, k]
-    return [_guarded(_measure(nu[i], p_abs1[i], tuple(res[i]), p_norm[i], q, eps_in, eps_acc,
-                              math.sqrt(u2[i])), guard) for i in range(n_b)]
+        res = _norm(d, 1, d.abs())  # [B, k]
+        return torch.cat((norms.double(), torch.stack((u2, torch.zeros_like(u2)), 1),
+                          res.double()), 1)
 
 
 def _measure_product_reference(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes,
