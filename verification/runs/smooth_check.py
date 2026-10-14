@@ -23,8 +23,14 @@ fp64.
 the starting loss, and the last is below it. A failure goes to the user, who decides what
 follows; it doesn't change ``η`` here.
 
+**The gradient norm.** Each step also records the global L2 norm of its gradient, over every
+parameter, read just before the update (an optimizer step pre-hook, so the loop is untouched).
+It helps tell a rise in the loss caused by one large gradient from one caused by the step size
+alone. It plays no part in the verdict.
+
 **Record.** ``$VERIF_OUTPUT_DIR/smooth_check/<model>_<task>.json``: the model, task and run
-settings; each step's batch loss and whole-list loss with its training and evaluation time; the
+settings; each step's batch loss, gradient norm and whole-list loss with its training and
+evaluation time; the
 whole-list loss at ``W_0``; the verdict with its reasons; the wall clocks; the peak memory over
 the run (``metrics.memory_probe``: allocated GPU memory on CUDA, the process footprint on the
 Mac); and the environment (``metrics.environment_record``).
@@ -35,16 +41,18 @@ Exits 0 when smooth, :data:`EXIT_NOT_SMOOTH` when not.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
+from torch.optim.optimizer import register_optimizer_step_pre_hook
 
 from setup.config import load_config, setup_determinism
 from setup.data import Batch, assemble_batch
@@ -56,7 +64,7 @@ from verification.runs.metrics import environment_record, memory_probe
 from verification.runs.plain_baseline import training_config
 
 __all__ = ["RUN_NAME", "STEPS", "EXIT_NOT_SMOOTH", "RULE", "Verdict", "verdict",
-           "whole_list_loss", "SmoothResult", "smooth_check", "record", "record_path", "main"]
+           "whole_list_loss", "grad_norm", "grad_norms", "SmoothResult", "smooth_check", "record", "record_path", "main"]
 
 RUN_NAME = "smooth_check"
 STEPS = 10  # F6c: 10 plain steps per model and task
@@ -121,14 +129,43 @@ def whole_list_loss(c: DecoderComputation, model: torch.nn.Module, records: Sequ
     return float(total / weight)
 
 
+# ---- the gradient norm ------------------------------------------------------------------
+
+
+def grad_norm(params: Iterable[torch.Tensor]) -> float:
+    """The global L2 norm of the gradients of ``params``: per-tensor norms in the gradients'
+    dtype, combined in fp64."""
+    grads = [p.grad.detach() for p in params if p.grad is not None]
+    if not grads:
+        return float("nan")
+    norms = torch.stack([torch.linalg.vector_norm(g).double().cpu() for g in grads])
+    return float(torch.linalg.vector_norm(norms))
+
+
+@contextlib.contextmanager
+def grad_norms() -> Iterator[list[float]]:
+    """Within the block, the gradient norm at every optimizer step, appended to the yielded
+    list just before the update (a global optimizer step pre-hook)."""
+    seen: list[float] = []
+
+    def hook(opt: torch.optim.Optimizer, args: Any, kwargs: Any) -> None:
+        seen.append(grad_norm(p for g in opt.param_groups for p in g["params"]))
+
+    handle = register_optimizer_step_pre_hook(hook)
+    try:
+        yield seen
+    finally:
+        handle.remove()
+
+
 # ---- the run ------------------------------------------------------------------------------
 
 
 @dataclass
 class SmoothResult:
     w0_loss: float
-    steps: list[dict[str, Any]] = field(default_factory=list)  # t, batch_loss, whole_list_loss,
-    # train_s, eval_s
+    steps: list[dict[str, Any]] = field(default_factory=list)  # t, batch_loss, grad_norm,
+    # whole_list_loss, train_s, eval_s
     verdict: Verdict | None = None
     w0_eval_s: float = 0.0
     train_eval_s: float = 0.0
@@ -154,16 +191,19 @@ def smooth_check(c: DecoderComputation, model: torch.nn.Module, D: Sequence[Any]
 
     def on_step(rec: PlainStepRecord) -> None:
         # plain_step leaves the model holding W_{t+1} (its snapshot is run_plain's next W_t).
+        # Its one optimizer step appended this step's gradient norm to ``norms`` (below).
+        g = norms[-1] if len(norms) == len(res.steps) + 1 else float("nan")
         e0 = time.perf_counter()
         loss = whole_list_loss(c, model, D, chunk=chunk)
         eval_s = time.perf_counter() - e0
-        res.steps.append({"t": rec.t, "batch_loss": rec.loss, "whole_list_loss": loss,
-                          "train_s": rec.train_s, "eval_s": eval_s})
-        out(f"   step {rec.t:>3}  batch loss {rec.loss:.6f}  whole-list loss {loss:.6f}  "
-            f"(train {rec.train_s:.2f} s, eval {eval_s:.2f} s)")
+        res.steps.append({"t": rec.t, "batch_loss": rec.loss, "grad_norm": g,
+                          "whole_list_loss": loss, "train_s": rec.train_s, "eval_s": eval_s})
+        out(f"   step {rec.t:>3}  batch loss {rec.loss:.6f}  grad norm {g:.4g}  whole-list loss "
+            f"{loss:.6f}  (train {rec.train_s:.2f} s, eval {eval_s:.2f} s)")
 
     t1 = time.perf_counter()
-    run_plain(c, model, D, w0, n_steps=T, seed=seed, on_step=on_step)
+    with grad_norms() as norms:
+        run_plain(c, model, D, w0, n_steps=T, seed=seed, on_step=on_step)
     res.train_eval_s = time.perf_counter() - t1
     res.verdict = verdict(res.whole_list_losses)
     return res
@@ -191,6 +231,7 @@ def record(res: SmoothResult, *, run: dict[str, Any], timings: dict[str, float],
         "whole_list_loss_w0": res.w0_loss,
         "whole_list_losses": res.whole_list_losses,
         "batch_losses": [s["batch_loss"] for s in res.steps],
+        "grad_norms": [s["grad_norm"] for s in res.steps],
         "steps": res.steps,
         "timings_s": {"w0_eval": res.w0_eval_s, "steps_with_eval": res.train_eval_s,
                       **timings},

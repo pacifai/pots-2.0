@@ -117,10 +117,35 @@ def test_smooth_check_evaluates_each_steps_weights(llama):
     assert [s["t"] for s in res.steps] == [1, 2, 3]
     assert res.verdict == sc.verdict(want)
     assert len(lines) == T + 1
+    # Plain SGD: W_{t+1} = W_t − η·g, so each step's gradient norm is |W_{t+1} − W_t| / η.
+    moved = [math.sqrt(sum(float((b[k].double() - a[k].double()).pow(2).sum()) for k in a))
+             / c.eta for a, b in zip([w0, *kept], kept)]
+    assert [s["grad_norm"] for s in res.steps] == pytest.approx(moved, rel=1e-3)
+    assert all(g > 0 for g in moved)
+
+
+def test_grad_norm_is_the_global_l2_norm():
+    a, b, c = (torch.nn.Parameter(torch.zeros(n)) for n in (2, 3, 1))
+    a.grad, b.grad = torch.tensor([3.0, 0.0]), torch.tensor([0.0, 4.0, 12.0])
+    assert sc.grad_norm([a, b, c]) == pytest.approx(13.0)
+    assert math.isnan(sc.grad_norm([c]))
+
+
+def test_grad_norms_sees_each_optimizer_step_and_then_stops():
+    p = torch.nn.Parameter(torch.ones(2))
+    opt = torch.optim.SGD([p], lr=0.1)
+    with sc.grad_norms() as seen:
+        for g in (3.0, 4.0):
+            p.grad = torch.tensor([g, 0.0])
+            opt.step()
+    p.grad = torch.tensor([5.0, 0.0])
+    opt.step()
+    assert seen == [3.0, 4.0]
 
 
 def test_record_spells_non_finite_values(llama):
     res = sc.SmoothResult(w0_loss=2.0, steps=[{"t": 1, "batch_loss": float("nan"),
+                                               "grad_norm": float("nan"),
                                                "whole_list_loss": float("inf"),
                                                "train_s": 0.1, "eval_s": 0.1}])
     res.verdict = sc.verdict(res.whole_list_losses)
@@ -155,6 +180,8 @@ def test_main_writes_the_record(tiny_main, capsys):
     doc = json.loads(next((root / sc.RUN_NAME).glob("*_refusal.json")).read_text())
     assert code == (0 if doc["smooth"] else sc.EXIT_NOT_SMOOTH)
     assert len(doc["whole_list_losses"]) == 4 and len(doc["batch_losses"]) == 3
+    assert len(doc["grad_norms"]) == 3 and all(g > 0 for g in doc["grad_norms"])
+    assert [s["grad_norm"] for s in doc["steps"]] == doc["grad_norms"]
     assert doc["run"]["n_records"] == len(D) and doc["run"]["eval_batch"] == 4
     assert doc["run"]["h_D"] == dataset_tree(c, D).root.hex() and doc["run"]["eta"] == 1e-3
     assert doc["rule"] == sc.RULE and doc["environment"]["record"] == "environment"
