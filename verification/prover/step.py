@@ -113,9 +113,9 @@ def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int]) -> bo
     """Whether the caller's ``w`` can be the committed ``W_t`` leaf itself (see prove_step).
 
     It must hash to the bytes the model holds after ``load_weights`` (same dtype and shape,
-    contiguous, in host memory like every leaf), own its whole storage (no view that another tensor can write through),
-    not be a live parameter (``requires_grad``), and not share storage with any of ``model``'s
-    parameters, which the step updates in place.
+    contiguous, in host memory like every leaf), own its whole storage (no view that another
+    tensor can write through), not be a live parameter (``requires_grad``), and not share
+    storage with any of ``model``'s parameters, which the step updates in place.
     """
     return (not w.requires_grad and w.dtype == p.dtype and w.shape == p.shape
             and w.device == HOST and w.is_contiguous() and not w._is_view()
