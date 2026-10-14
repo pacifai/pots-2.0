@@ -79,7 +79,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 
 | var | default |
 |---|---|
-| `VERIF_DEVICE` | `cpu` |
+| `VERIF_DEVICE` | `cpu`. `cuda` runs the model, its activations, the replay and check 5's measuring on the GPU; every leaf stays in host memory (F1c, F4a, FS9) |
 | `VERIF_MODEL` | `HuggingFaceTB/SmolLM2-135M-Instruct` |
 | `VERIF_MODEL_REVISION` | `12fd25f77366fa6b3b4b768ec3050bf629380bac` |
 | `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32`. `float32` / `bfloat16` runs forward and loss under autocast (F6b, FS3); the decoder refuses any other master and fp16 compute |
@@ -513,8 +513,10 @@ interface.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
     imports the prover. So is `snapshot_weights(computation, model)`, the one way to copy the
     declared weights out of a model: the prover's `W_{t+1}` leaves and every run's `W_0`
-    (from a model as built). A12 must take `W_0` with it, as B7 does. The prover's `W_t`
-    leaves are the caller's `w_t` tensors where `prove_step` can share them (see `step.py`).
+    (from a model as built). It copies them to `HOST`, host memory, where every leaf lives
+    whatever `VERIF_DEVICE` is (F1c, FS9). A12 must take `W_0` with it, as B7 does. The
+    prover's `W_t` leaves are the caller's `w_t` tensors where `prove_step` can share them
+    (see `step.py`).
 - `matmul_ops.py`: `HANDLED_OPS` (`mm`, `bmm`, `addmm`, `baddbmm`), `REJECTED_OPS` (every
   other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
   (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (empty) and `param_storage_map(model)`. Shared by
@@ -557,6 +559,12 @@ interface.
     multiple of `n_kv`, a pad outside the vocabulary, and non-zero dropout. Without `source`,
     `build_model` gives a random model from `config` under the caller's seed (fast tests
     only).
+  - **The device (F4a, FS9).** `build_model` moves the model to `c.device`, and `batch`
+    stacks the records there, so training and the replay run on `VERIF_DEVICE`. Leaves stay
+    in host memory: the replay's `_supply` moves each committed product to the device of the
+    operands it replaces, and labeling reads a `Y_v` host copy back onto `O`'s device for the
+    KV check. Until FS9 the model was built on the CPU whatever `VERIF_DEVICE` said, so a
+    `cuda` run ran on the CPU without an error.
   - **The pad (F8f, FS4).** `c.pad_id` is the batch's pad, the model's EOS. With `source` it
     is `data.run_pin(*source).eos_token_id`, and a `pad_id` that differs raises
     `ValueError`; a model without a pinned EOS raises too. Without `source` it is `pad_id`,
@@ -933,6 +941,45 @@ interface.
     outer product. Only `aten.mm` and `aten.bmm` appear, and the outputs total about 1.55 GB.
   - **The δK̃ transpose.** The captured attention bmm returns `Q̃ᵀ·δS`, which is `δK̃ᵀ`. A7
     commits its contiguous transpose as the `δK̃` leaf, with operands `(δSᵀ, Q̃)`.
+  - **Products on a GPU (FS9; F1c, F4a).** A CUDA output is copied to the host as soon as
+    the op returns, so the transcript collects in host RAM. The module docstring has the
+    order of events; the rules that keep it correct:
+    - `HostBuffers(pin=True)` hands out pinned host buffers by `(shape, dtype)` with
+      `take`. A buffer is reused only when its storage's use count is back to the pool's
+      own, that is when the step that committed it has dropped every leaf, view and NumPy
+      array of it. The pool also keeps the storage's Python object, which
+      `untyped_storage()` returns to every caller while it lives without raising the use
+      count, and reuses a buffer only when that object's reference count is back to the
+      pool's own too (`_holds`), so a held storage object keeps its buffer. The process
+      shares one pool, `HOST_BUFFERS`, so step `t+1` reuses step `t`'s buffers. Two steps
+      alive at once use two sets.
+    - The copy runs on the pool's side stream after `wait_stream` on the producing stream,
+      with `non_blocking=True` and an event. The capture holds the GPU tensor until the
+      event completes, so the allocator can't reuse its block under the copy; that hold
+      replaces `record_stream`, which isn't used. Each record polls the queue, and leaving
+      the `with` block (`wait_copies`) waits for all of them, so labeling, hashing and
+      `assert_unmodified` read finished buffers only.
+    - A GPU output whose `_version` moved before its copy finished raises
+      `MutatedCaptureError`: the copy may have read either value. A write after the copy
+      changes only the GPU tensor, which no one commits.
+    - `rec.out` is the host copy and `rec.out_storage` the op's own output storage.
+      `is_output_of(t, rec)` compares with the latter, so the `W.grad` check (AccumulateGrad
+      adopts the GPU output) works on both devices. The producer map keys on the storage
+      too, since a dropped output's address can come back. The host copy is contiguous
+      whatever the op wrote, so labeling's "output is not contiguous" check reads the
+      layout recorded in `rec.out_info` (a `bmm` member's without the batch dimension),
+      which means the same on both devices.
+    - On CPU no output is copied and no buffer is made, so a CPU capture is unchanged:
+      every root, loss and check number below is the same bit for bit.
+    - Operands are not copied. They stay on the GPU until `release_operands` in labeling,
+      as before; the README's "Workflow: a run on a GPU" measures what that costs.
+    - The `δK̃` leaf is a contiguous transpose made in labeling, so it is the one product
+      class in pageable rather than pinned memory.
+    - `tests/verification/prover/test_capture_cuda.py` runs only with CUDA: the copies,
+      buffer reuse, the mutation error, and a tiny decoder step at fp32 and bf16 whose
+      operands and glue gradients are rebuilt bit for bit, which the verifier accepts, and
+      whose `W_{t+1}` equals the plain step's. `test_capture.py` checks the CPU no-op and the
+      reuse logic.
   - **Invariant 6 in practice.** Captured tensors are referenced, not cloned. Call
     `assert_unmodified()` after hashing the products, before `optimizer.step()`, and at
     hand-off to the verifier. Never use `zero_grad(set_to_none=False)`. Activation
@@ -949,11 +996,12 @@ interface.
     the plain baseline B7 times.
   - **`W_t` sharing (O5).** The `W_t` leaves are the caller's `w_t` tensors themselves when
     each is grad-free, contiguous, not a view, owns its whole storage, matches the declared
-    dtype, shape and device, and shares no storage with the model's parameters (which the
-    step updates in place). Any other input is copied, with the same leaf bytes. The caller
-    must not write to `w_t` until the store is dropped; the `_version` guard catches a write
-    (invariant 6). In the loop, `w_t` is `W_0`, the previous step's `W_{t+1}` copy, or a
-    fault's entry weights, and a test checks none of them is written during a run.
+    dtype and shape, sits in host memory (`HOST`, FS9), and shares no storage with the
+    model's parameters (which the step updates in place). Any other input is copied, with
+    the same leaf bytes. The caller must not write to `w_t` until the store is dropped; the
+    `_version` guard catches a write (invariant 6). In the loop, `w_t` is `W_0`, the previous
+    step's `W_{t+1}` copy, or a fault's entry weights, and a test checks none of them is
+    written during a run.
   - `StepOutput` has the fields `records`, `w_t`, `products`, `w_next`, `loss` and
     `versions`. `.leaves()` returns them in transcript order, and
     `.assert_unmodified()` checks the versions.
@@ -1082,6 +1130,10 @@ interface.
   - **Check 6a under mixed precision (FS3, F6b).** The committed `G` is a bf16 product leaf;
     6a widens it exactly to fp32 before the update identity, as AccumulateGrad does for
     training's `W.grad`. At fp32 the cast is a no-op.
+  - **Devices (F4a, FS9).** Leaves are in host memory and the replay runs on
+    `VERIF_DEVICE`. Check 5 moves each committed product and bias to its rebuilt operands'
+    device (`_served`) and measures there; check 6 runs on the host, and 6b's glue gradient
+    comes back to the host in fp32 (`_glue_gradient`). At `cpu` every move is a no-op.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
     from the claimed root `store.root`, as check 2's read validated it
     (`ctx.state.claimed_root`; F15a, task C7). The root comparison at the end of the step
@@ -1243,6 +1295,8 @@ interface.
     `|x|` is written with a fresh `abs`'s strides, so the matmuls see the same operands. `|P|`
     is computed once. `_norm` gives `_safe_norm`'s bits and skips the scaled copy when one
     `aminmax` pass shows every entry is at least `2⁻⁶³·max(1, max|x|)` and `n·max² ≤ 2¹²⁴`.
+    The buffer and the ones vectors sit on the operands' device, and the challenges are
+    drawn on the host and moved there (FS9).
     Then every square and partial sum is a normal fp32 number in both runs, so power-of-two
     scaling commutes with each rounding (the proof is in `_norm`'s docstring). A zero entry
     fails the test, so every backward product takes the scaled path (into the buffer).

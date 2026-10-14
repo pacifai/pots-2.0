@@ -164,6 +164,28 @@ def _param(info: Any) -> str | None:
     return info.param_name or info.param_copy
 
 
+def _out_layout(rec: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Shape and strides of one product of ``rec`` as the op wrote it (a ``bmm`` member drops
+    the batch dimension). On a GPU ``rec.out`` is a contiguous host copy (FS9), so labeling
+    judges the layout the capture recorded from the op's own output."""
+    o = rec.out_info
+    return (o.shape, o.stride) if rec.batch is None else (o.shape[1:], o.stride[1:])
+
+
+def _contiguous(shape: tuple[int, ...], stride: tuple[int, ...]) -> bool:
+    """``Tensor.is_contiguous()`` for a recorded layout: each dimension longer than 1 has
+    the stride of the dimensions after it packed densely, and an empty tensor is contiguous."""
+    if 0 in shape:
+        return True
+    want = 1
+    for size, st in zip(reversed(shape), reversed(stride)):
+        if size != 1:
+            if st != want:
+                return False
+            want *= size
+    return True
+
+
 class DecoderComputation(DeclaredComputation):
     """``C`` for a Llama or Qwen2 causal LM of the given config, batch ``n_s × n`` and step size.
 
@@ -197,7 +219,9 @@ class DecoderComputation(DeclaredComputation):
         if compute_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(f"COMPUTE_DTYPE must be float32 or bfloat16, got {compute_dtype}")
         self.master_dtype, self.compute_dtype = master_dtype, compute_dtype
-        self.device_type = torch.device(device).type
+        # F4a: the model and its activations live on the run's device; leaves stay on the host.
+        self.device = torch.device(device)
+        self.device_type = self.device.type
         c = self.config
         self.L = int(c.num_hidden_layers)
         self.d = int(c.hidden_size)
@@ -489,6 +513,7 @@ class DecoderComputation(DeclaredComputation):
                 model = AutoModelForCausalLM.from_config(
                     copy.deepcopy(self.config), attn_implementation="eager",
                     dtype=self.weight_dtype)
+        model.to(self.device)
         model.eval()
         self._check_model(model)
         return model
@@ -511,13 +536,16 @@ class DecoderComputation(DeclaredComputation):
             raise ValueError(f"parameters not {self.weight_dtype}: {bad[:3]}")
 
     def assemble(self, records: Sequence[Record]) -> Batch:
-        """Glue: pad and stack the records (ref block §2). ``ρ`` comes from each ``ℓ``."""
+        """Glue: pad and stack the records (ref block §2), on the run's device. ``ρ`` comes
+        from each ``ℓ``."""
         if len(records) != self.n_s:
             raise ValueError(f"batch has {len(records)} records, the computation declares {self.n_s}")
         for r in records:
             if not isinstance(r, Record):
                 raise ValueError(f"a decoder record is a records.Record, got {type(r).__name__}")
-        return assemble_batch(records, self.n, pad_id=self.pad_id)
+        b = assemble_batch(records, self.n, pad_id=self.pad_id)
+        return Batch(b.ids.to(self.device), b.targets.to(self.device), b.mask.to(self.device),
+                     b.rho.to(self.device))
 
     def logits(self, model: nn.Module, batch: Batch) -> torch.Tensor:
         """``Λ`` as ``[n_s, n, n_v]``: the forward pass, embedding to output projection."""
@@ -654,7 +682,7 @@ class _Labeler:
         if tuple(p.shape) != spec.p_shape or p.dtype != self.c.product_dtype:
             raise LabelingError(f"{name}: leaf {p.dtype} {tuple(p.shape)} != declared "
                                 f"{self.c.product_dtype} {spec.p_shape}")
-        if not p.is_contiguous():
+        if not (_contiguous(*_out_layout(rec)) if leaf is None else leaf.is_contiguous()):
             raise LabelingError(f"{name} (record #{rec.index}): output is not contiguous")
         self.slots[m - 1] = p
 
@@ -761,7 +789,8 @@ class _Labeler:
                     or tuple(o_rec.b.shape[1:]) != (c.n, c.d_h) \
                     or tuple(s_rec.b.shape[1:]) != (c.d_h, c.n):
                 return  # _fill reports the shapes
-            v = v_rec.out.view(c.n_s, c.n, c.n_kv, c.d_h).permute(0, 2, 1, 3)
+            # On a GPU Y_v's output is its host copy (FS9) and O's B is on the GPU.
+            v = v_rec.out.to(o_rec.b.device).view(c.n_s, c.n, c.n_kv, c.d_h).permute(0, 2, 1, 3)
             o_b = o_rec.b.reshape(*shape, c.n, c.d_h)
             if not torch.equal(o_b, v[:, :, None].expand_as(o_b)):
                 raise LabelingError(f"layer {l}: O's B (record #{o_rec.index}) is not Y_v's "
@@ -813,8 +842,8 @@ class _Labeler:
                                     f"δY of {w}, B is the input of {sorted(feeds)}")
             if w in self.c.linear_weights:  # not the tied W_E, whose grad is a sum
                 grad = self.model.get_parameter(w).grad
-                if grad is None or (_ptr(grad) != _ptr(rec.out)
-                                    and not self.cap.is_copy_of(grad, rec.index)):
+                if grad is None or not (self.cap.is_output_of(grad, rec)
+                                        or self.cap.is_copy_of(grad, rec.index)):
                     raise LabelingError(f"G of {w} (record #{rec.index}) is not {w}.grad")
             self._fill(self._linear_name(w, "G"), rec.a, rec.b, rec.out, rec)
 
@@ -1016,6 +1045,8 @@ class DecoderReplay(Replay):
             self._n_bmm += 1
             out = torch.stack([self.view.product(c.m_of(f"{name}[{s},{h}]"))
                                for s, h in c._members()])
+        # On the run's device (F4a): the hook on δY_x goes on the tensor autograd sees.
+        out = out.to(a.device)
         self._names.append(name)
         if name not in self._calls:  # a repeat fails the unit's name check
             self._calls[name] = (a, b, out)
@@ -1306,8 +1337,8 @@ class DecoderReplay(Replay):
             (g_emb,) = torch.autograd.grad(emb(self.batch.ids), [emb.weight],
                                            grad_outputs=self._dx[1])
         # F6b: the committed G_E^head widened exactly to W_E's format, plus the lookup's.
-        g_e = (self.view.product(c.m_of("G_E_head")).to(c.weight_dtype) + g_emb if c.tied
-               else g_emb)
+        g_e = (self.view.product(c.m_of("G_E_head")).to(g_emb.device, c.weight_dtype) + g_emb
+               if c.tied else g_emb)
         grads = {**self._glue, _E: g_e}
         out = {n: grads[n] for n in c.glue_gradient_weights}
         bad = [n for n, g in out.items() if g.dtype != c.weight_dtype]

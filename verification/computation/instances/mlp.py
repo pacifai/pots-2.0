@@ -282,8 +282,7 @@ class MLPComputation(DeclaredComputation):
             elif rec.b_info.storage_ptr in x_ptr:
                 l = x_ptr[rec.b_info.storage_ptr]
                 grad = model.get_parameter(self.weight(l)).grad
-                if grad is None or (grad.untyped_storage().data_ptr()
-                                    != rec.out.untyped_storage().data_ptr()):
+                if grad is None or not capture.is_output_of(grad, rec):
                     raise LabelingError(f"G_{l} (record #{rec.index}) is not W_{l}.grad")
                 fill(f"G_{l}", rec)
             else:

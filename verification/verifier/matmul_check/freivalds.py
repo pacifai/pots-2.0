@@ -124,6 +124,8 @@ def _scaled_norm(x: torch.Tensor, dim: int | None, amax: torch.Tensor,
     return torch.where(ok, scaled, torch.linalg.vector_norm(x, dim=dim))
 
 
+_HOST = torch.device("cpu")  # the scratch's default device; check 5 passes its operands'
+
 # Where every vector's entries satisfy these bounds, ``vector_norm(x)`` equals
 # ``_safe_norm(x)`` bit for bit. See :func:`_norm`.
 _MIN_ENTRY = 2.0 ** -63  # its square, 2^-126, is fp32's smallest normal number
@@ -172,7 +174,7 @@ def _norm(x: torch.Tensor, dim: int | None, absx: torch.Tensor,
         return torch.linalg.vector_norm(x, dim=dim)
     out = None
     if scratch is not None and x.is_contiguous():
-        out = scratch.buffer(x.numel()).view(x.shape)
+        out = scratch.buffer(x.numel(), x.device).view(x.shape)
     return _scaled_norm(x, dim, hi, out)
 
 
@@ -182,25 +184,28 @@ class MeasureScratch:
     Each product would otherwise allocate up to four fresh temporaries of its largest operand's
     size, and fresh large blocks page-fault on first touch. The buffer grows to the largest
     size asked for and lives as long as the object; check 5 holds one per step. A view starts
-    at the buffer's start, so it has a fresh tensor's 64-byte alignment.
+    at the buffer's start, so it has a fresh tensor's 64-byte alignment. The buffer sits on
+    the device of the tensors it serves (the operands', F4a) and moves when they do.
     """
 
     def __init__(self) -> None:
         self._buf = torch.empty(0, dtype=torch.float32)
-        self._ones: dict[int, torch.Tensor] = {}
+        self._ones: dict[tuple[int, torch.device], torch.Tensor] = {}
 
-    def buffer(self, n: int) -> torch.Tensor:
-        """The first ``n`` fp32 entries of the buffer, contiguous; earlier views are invalid."""
-        if self._buf.numel() < n:
+    def buffer(self, n: int, device: torch.device = _HOST) -> torch.Tensor:
+        """The first ``n`` fp32 entries of the buffer on ``device``, contiguous; earlier views
+        are invalid."""
+        if self._buf.numel() < n or self._buf.device != device:
             self._buf = torch.empty(0, dtype=torch.float32)  # free before allocating
-            self._buf = torch.empty(n, dtype=torch.float32)
+            self._buf = torch.empty(n, dtype=torch.float32, device=device)
         return self._buf[:n]
 
-    def ones(self, width: int) -> torch.Tensor:
-        """``torch.ones(width, 1)``, fp32, never written to."""
-        t = self._ones.get(width)
+    def ones(self, width: int, device: torch.device = _HOST) -> torch.Tensor:
+        """``torch.ones(width, 1)``, fp32, on ``device``, never written to."""
+        t = self._ones.get((width, device))
         if t is None:
-            t = self._ones[width] = torch.ones(width, 1, dtype=torch.float32)
+            t = self._ones[width, device] = torch.ones(width, 1, dtype=torch.float32,
+                                                       device=device)
         return t
 
     def abs(self, x: torch.Tensor) -> torch.Tensor:
@@ -218,10 +223,10 @@ class MeasureScratch:
 
     def _unary(self, op: Callable[..., torch.Tensor], x: torch.Tensor) -> torch.Tensor:
         if x.is_contiguous():
-            return op(x, out=self.buffer(x.numel()).view(x.shape))
+            return op(x, out=self.buffer(x.numel(), x.device).view(x.shape))
         if x.dim() == 2 and x.t().is_contiguous():
             xt = x.t()
-            return op(xt, out=self.buffer(x.numel()).view(xt.shape)).t()
+            return op(xt, out=self.buffer(x.numel(), x.device).view(xt.shape)).t()
         return op(x)
 
 
@@ -245,7 +250,7 @@ def term_scale(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = Non
     as :func:`measure_product`'s."""
     sc = MeasureScratch()
     with torch.no_grad():
-        u2 = float(_term_sq(a, b, sc.ones(b.shape[1]), sc).double().sum())
+        u2 = float(_term_sq(a, b, sc.ones(b.shape[1], b.device), sc).double().sum())
         if bias is not None:
             u2 += _bias_u2(bias, a.shape[0])
     return math.sqrt(u2)
@@ -256,7 +261,8 @@ def term_scales(a: torch.Tensor, b: torch.Tensor) -> list[float]:
     ``[B, q, w]``), the same bits as :func:`measure_products`'s."""
     sc = MeasureScratch()
     with torch.no_grad():
-        u2 = _term_sq(a, b, sc.ones(b.shape[2]), sc).double().reshape(a.shape[0], -1).sum(1)
+        u2 = _term_sq(a, b, sc.ones(b.shape[2], b.device), sc).double().reshape(a.shape[0],
+                                                                                 -1).sum(1)
     return [math.sqrt(x) for x in u2.tolist()]
 
 
@@ -280,7 +286,7 @@ def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: byt
     q, width = a.shape[1] + (bias is not None), b.shape[1]
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
-        ones = sc.ones(width)
+        ones = sc.ones(width, b.device)
         if guard:
             # Test 1, the cancellation guard (P3.c): ν_m ≤ κ_max·‖ |P_m|·1 ‖.
             b1 = sc.abs(b) @ ones
@@ -296,7 +302,7 @@ def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: byt
         else:
             nu, p_abs1, p_norm = [math.nan], [math.nan], [float(_norm(p, None, sc.abs(p), sc))]
         # Test 2, the normalized residual (P3.a): ‖A(B·r) − P·r‖ ≤ τ·σ_r·e_m·‖P_m‖_F.
-        r = challenge_matrix(h, m, k, width)
+        r = challenge_matrix(h, m, k, width).to(b.device)
         ab_r = a @ (b @ r)
         if bias is not None:
             ab_r += bias @ r
@@ -350,7 +356,7 @@ def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: by
                          f"{tuple(b.shape)}, {tuple(p.shape)}")
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
-        ones = sc.ones(width)
+        ones = sc.ones(width, b.device)
         if guard:
             b1 = sc.abs(b) @ ones
             nu_vec = sc.abs(a) @ b1
@@ -360,7 +366,7 @@ def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: by
         else:
             nu = p_abs1 = [math.nan] * n_b
             p_norm = _norm(p.reshape(n_b, -1), 1, sc.abs(p).reshape(n_b, -1), sc).tolist()
-        r = challenge_matrices(h, ms, k, width)
+        r = challenge_matrices(h, ms, k, width).to(b.device)
         d = a @ (b @ r) - p @ r
         res = _norm(d, 1, d.abs()).tolist()  # [B, k]
     return [_guarded(_measure(nu[i], p_abs1[i], tuple(res[i]), p_norm[i], q, eps_in, eps_acc,
@@ -373,8 +379,8 @@ def _measure_product_reference(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor
     """:func:`measure_product` as plain formulas, the reference its tests compare with."""
     q, width = a.shape[1] + (bias is not None), b.shape[1]
     with torch.no_grad():
-        ones = torch.ones(width, 1, dtype=torch.float32)
-        r = challenge_matrix(h, m, k, width)
+        ones = torch.ones(width, 1, dtype=torch.float32, device=b.device)
+        r = challenge_matrix(h, m, k, width).to(b.device)
         nu_vec, ab_r = a.abs() @ (b.abs() @ ones), a @ (b @ r)
         u2 = float((a.square() @ (b.square() @ ones)).double().sum())
         if bias is not None:  # [A | 1]·[B ; biasᵀ], the ones column's terms added last (F14)
@@ -393,11 +399,11 @@ def _measure_products_reference(a: torch.Tensor, b: torch.Tensor, p: torch.Tenso
     """:func:`measure_products` as plain formulas, the reference its tests compare with."""
     n_b, q, width = a.shape[0], a.shape[2], b.shape[2]
     with torch.no_grad():
-        ones = torch.ones(width, 1, dtype=torch.float32)
+        ones = torch.ones(width, 1, dtype=torch.float32, device=b.device)
         nu = _safe_norm((a.abs() @ (b.abs() @ ones)).reshape(n_b, -1), dim=1).tolist()
         u2 = (a.square() @ (b.square() @ ones)).double().reshape(n_b, -1).sum(1).tolist()
         p_abs1 = _safe_norm((p.abs() @ ones).reshape(n_b, -1), dim=1).tolist()
-        r = challenge_matrices(h, ms, k, width)
+        r = challenge_matrices(h, ms, k, width).to(b.device)
         res = _safe_norm(a @ (b @ r) - p @ r, dim=1).tolist()  # [B, k]
         p_norm = _safe_norm(p.reshape(n_b, -1), dim=1).tolist()
     return [_measure(nu[i], p_abs1[i], tuple(res[i]), p_norm[i], q, eps_in, eps_acc,
