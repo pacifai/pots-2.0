@@ -1,11 +1,16 @@
 """FS11's session: the parts' order, logs, markers and deadline; the upload check and the
-public-weight fetch; and the job script's always-terminate paths in a dry run."""
+public-weight fetch; the job script's always-terminate paths, in a dry run and against stub
+runpodctl and curl; and the billing guards."""
 
 import hashlib
 import json
 import os
+import re
+import shlex
+import signal
 import subprocess
 import sys
+import tarfile
 import time
 from pathlib import Path
 
@@ -15,6 +20,8 @@ from tests.verification.full_scale_helpers import PINS
 from verification.runs import fs11_session as fs
 
 JOB = Path(fs.__file__).with_name("fs11_job.sh")
+GUARD = Path(fs.__file__).with_name("fs11_guard.sh")
+README = Path(fs.__file__).parents[1] / "README.md"
 REPO = Path(fs.__file__).resolve().parents[2]
 
 
@@ -24,6 +31,15 @@ def _py(code):
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _wait_for(predicate, timeout=20.0):
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        if predicate():
+            return True
+        time.sleep(0.2)
+    return False
 
 
 # ---- the plan ----------------------------------------------------------------------------
@@ -55,6 +71,14 @@ def test_default_plan(tmp_path):
     # only the fetch reaches the network
     assert plan[0].env["HF_HUB_OFFLINE"] is None
     assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
+
+
+def test_selftest_plan_needs_only_the_standard_library():
+    plan = fs.selftest_plan()
+    assert [p.kind for p in plan] == ["other", "other"]
+    assert all(p.argv[:2] == ["{python}", "-c"] and p.timeout_s for p in plan)
+    for p in plan:  # a bare python3 runs them
+        subprocess.run([sys.executable, "-I", "-S", "-c", p.argv[2]], check=True, timeout=30)
 
 
 def test_refusal():
@@ -107,11 +131,54 @@ def test_run_session(tmp_path, monkeypatch):
     assert seen == {"HF_TOKEN": None, "RUNPOD_API_KEY": None, "HF_HUB_OFFLINE": "1",
                     "HF_HOME": str(up / "hf"), "FS11_X": "x"}
     assert any("cuPQC" in l for l in lines)
+    assert "upload_check" not in s  # no models part, no check
 
     # a rerun skips the finished part and runs the others again
     s = fs.run_session(plan[:2], upload=up, out=out, deadline=time.time() + 30, cwd=REPO,
                        say=lines.append)
     assert [p["status"] for p in s["parts"]] == ["skipped_done", "failed"]
+
+
+def test_a_running_part_names_its_process_group(tmp_path):
+    out = tmp_path / "out"
+    probe = (f"import os; print(open({str(out / 'current_part')!r}).read().strip(), "
+             "os.getpgid(0))")
+    s = fs.run_session([fs.Part("probe", _py(probe))], upload=tmp_path / "up", out=out,
+                       deadline=time.time() + 30, cwd=REPO, say=lambda m: None)
+    assert s["parts"][0]["status"] == "ok"
+    pid, pgid = (out / "parts" / "probe" / "log.txt").read_text().split()[-2:]
+    assert pid == pgid
+    assert not (out / "current_part").exists()
+
+
+@pytest.mark.parametrize("report, why", [
+    ({"complete": True, "slots": {"E1": {"results": [
+        {"name": "a", "status": "measured"},
+        {"name": "b", "status": "skipped", "reason": "cuPQC is not installed"}]}}}, None),
+    ({"complete": False, "slots": {}}, "isn't complete"),
+    ({"complete": True, "slots": {"E6": {"results": [
+        {"name": "sgd_step", "status": "skipped", "reason": "error: RuntimeError: OOM"}]}}},
+     "1 results ended in an error (E6/sgd_step)"),
+    (None, "report unreadable"),
+])
+def test_the_benchmark_is_done_only_on_a_complete_clean_report(tmp_path, report, why):
+    rep = tmp_path / "hashing.json"
+    if report is not None:
+        rep.write_text(json.dumps(report))
+    assert (fs.benchmark_failure(rep) is None) == (why is None)
+    if why:
+        assert why in fs.benchmark_failure(rep)
+    out = tmp_path / "out"
+    s = fs.run_session([fs.Part("benchmark", _py("print(1)"), kind="benchmark",
+                                info={"report": str(rep)})],
+                       upload=tmp_path / "up", out=out, deadline=time.time() + 30, cwd=REPO,
+                       say=lambda m: None)
+    (rec,) = s["parts"]
+    assert rec["exit_code"] == 0
+    assert rec["status"] == ("ok" if why is None else "failed")
+    assert (out / "parts" / "benchmark" / "DONE").exists() == (why is None)
+    if why:
+        assert why in rec["reason"]
 
 
 def test_part_extras(tmp_path):
@@ -135,9 +202,13 @@ def test_part_extras(tmp_path):
     e = fs.part_extras(fs.Part("s", [], kind="smooth", info={"report": str(tmp_path / "no")}),
                        log)
     assert e == {"record": None}
+    smooth = tmp_path / "smooth.json"
+    smooth.write_text(json.dumps({"smooth": True, "grad_norms": [1.5, 1.25]}))
+    e = fs.part_extras(fs.Part("s", [], kind="smooth", info={"report": str(smooth)}), log)
+    assert e["grad_norms"] == [1.5, 1.25]
 
 
-# ---- fetch-models -----------------------------------------------------------------------
+# ---- fetch-models and the upload check ----------------------------------------------------
 
 
 def _upload(tmp_path):
@@ -210,23 +281,98 @@ def test_fetch_models_deletes_a_mismatch_and_flags_a_changed_upload(tmp_path):
     assert not list((up / "hf" / "hub" / "models--org--public" / "blobs").iterdir())
 
 
-# ---- the job script, dry run ---------------------------------------------------------------
+def test_check_upload(tmp_path):
+    up, weight = _upload(tmp_path)
+    m = json.loads((up / "manifest.json").read_text())
+    m["models"].append({"repo": "org/mirror", "revision": "c" * 40, "gated": False,
+                        "roles": ["benchmark"], "files": [],
+                        "missing": ["weights not in the Mac's cache"]})
+    m["models"].append({"repo": "org/absent", "revision": "d" * 40, "gated": False,
+                        "roles": ["run"], "files": [], "missing": ["config.json"]})
+    (up / "manifest.json").write_text(json.dumps(m))
+    _fake_download(weight, [])("org/public", "model.safetensors", "a" * 40, up / "hf" / "hub")
+    c = fs.check_upload(up)
+    assert c["packed"] == []
+    # the gated weight isn't in the cache; a benchmark-only pin may lack weights; a run model
+    # missing on the Mac is a problem
+    assert set(c["models"]) == {"meta-llama/Llama-3.2-1B-Instruct", "org/absent"}
+    assert c["models"]["org/absent"] == ["missing on the Mac: config.json"]
+    (up / "repo" / "a.txt").write_bytes(b"changed")
+    assert fs.check_upload(up)["packed"] == ["repo/a.txt: SHA-256 differs from the manifest"]
+    (up / "manifest.json").write_text("{")
+    assert "manifest.json unreadable" in fs.check_upload(up)["packed"][0]
+
+
+def _checked_plan():
+    """A models part, then a part per model and one that names none."""
+    return [fs.Part("models", _py("print(1)"), kind="models"),
+            fs.Part("bring_public", _py("print(1)"), kind="bring_up",
+                    info={"model": "org/public"}),
+            fs.Part("bring_gated", _py("print(1)"), kind="bring_up",
+                    info={"model": "meta-llama/Llama-3.2-1B-Instruct"}),
+            fs.Part("other", _py("print(1)"))]
+
+
+def test_a_mismatch_keeps_the_affected_parts_from_starting(tmp_path):
+    up, weight = _upload(tmp_path)
+    out = tmp_path / "out"
+    run = lambda: fs.run_session(_checked_plan(), upload=up, out=out,  # noqa: E731
+                                 deadline=time.time() + 60, cwd=REPO, say=lambda m: None)
+    _fake_download(weight, [])("org/public", "model.safetensors", "a" * 40, up / "hf" / "hub")
+    s = run()
+    st = {p["name"]: p["status"] for p in s["parts"]}
+    # the gated model's weight is missing: only its part waits
+    assert st == {"models": "ok", "bring_public": "ok", "bring_gated": "not_started",
+                  "other": "ok"}
+    assert "meta-llama/Llama-3.2-1B-Instruct's files are missing" in s["parts"][2]["reason"]
+    assert s["upload_check"]["packed"] == []
+
+    # A rerun skips the done models part but checks again: a packed file changed since, so no
+    # part that isn't done yet starts. The done ones ran on the upload as checked then.
+    (up / "repo" / "a.txt").write_bytes(b"changed")
+    s = run()
+    st = {p["name"]: p["status"] for p in s["parts"]}
+    assert st == {"models": "skipped_done", "bring_public": "skipped_done",
+                  "bring_gated": "not_started", "other": "skipped_done"}
+    reason = s["parts"][2]["reason"]
+    assert "doesn't match its manifest" in reason and "repo/a.txt" in reason
+    assert s["upload_check"]["packed"] and not (out / "parts" / "bring_gated" / "DONE").exists()
+
+    # In a fresh output directory the same upload starts nothing after the models part.
+    s = fs.run_session(_checked_plan(), upload=up, out=tmp_path / "out2",
+                       deadline=time.time() + 60, cwd=REPO, say=lambda m: None)
+    assert [p["status"] for p in s["parts"]] == ["ok"] + ["not_started"] * 3
+
+
+# ---- the job script ------------------------------------------------------------------------
 
 
 def _job(tmp_path, *, plan=None, python=sys.executable, deadline=6, grace=1, reserve=1,
-         extra=None, timeout=60):
+         extra=None, timeout=60, popen=False):
     env = {k: v for k, v in os.environ.items() if k not in ("RUNPOD_POD_ID", "RUNPOD_API_KEY")}
     env.update({"DRY_RUN": "1", "FS11_DEADLINE_S": str(deadline), "FS11_GRACE_S": str(grace),
-                "FS11_PACK_RESERVE_S": str(reserve), "FS11_PYTHON": python, **(extra or {})})
+                "FS11_PACK_RESERVE_S": str(reserve), "FS11_PYTHON": python,
+                "FS11_MIN_FREE_GB": "0", **(extra or {})})
     if plan is not None:
         p = tmp_path / "plan.json"
         p.write_text(json.dumps(plan))
         env["FS11_PLAN"] = str(p)
     (tmp_path / "up").mkdir(exist_ok=True)
     out = tmp_path / "out"
-    r = subprocess.run(["bash", str(JOB), str(tmp_path / "up"), str(out)], cwd=REPO, env=env,
-                       capture_output=True, text=True, timeout=timeout)
+    argv = ["bash", str(JOB), str(tmp_path / "up"), str(out)]
+    if popen:
+        return subprocess.Popen(argv, cwd=REPO, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, start_new_session=True), out
+    r = subprocess.run(argv, cwd=REPO, env=env, capture_output=True, text=True,
+                       timeout=timeout)
     return r, out
+
+
+def _log(out):
+    return (out / "job.log").read_text()
+
+
+OK_PLAN = [{"name": "ok", "argv": _py("print('part ran')")}]
 
 
 def test_job_runs_packs_and_terminates(tmp_path):
@@ -242,17 +388,23 @@ def test_job_runs_packs_and_terminates(tmp_path):
     assert ready["sha256"] == _sha(tar.read_bytes()) and ready["session_exit"] == "1"
     assert ready["sha256"] in r.stdout
     assert "DRY_RUN: terminate (end of job (session exit 1)): runpodctl pod delete" in r.stdout
-    assert Path(f"{out}.TERMINATED").exists()
-    import tarfile
+    assert Path(f"{out}.TERMINATED").read_text().startswith("end of job")
+    assert not Path(f"{out}.PACK_FAILED").exists()
+    # The job's own lines reach both its stdout and job.log; the session's only job.log.
+    for line in ("FS11 job:", "terminate tools:", "session:"):
+        assert line in r.stdout and line in _log(out)
+    assert "ok: ok, exit 0" in _log(out) and "ok: ok, exit 0" not in r.stdout
+    tools = (out / "terminate_tools.txt").read_text()
+    assert "runpod_api_key=unset" in tools and "runpodctl=" in tools
     with tarfile.open(tar) as t:
-        assert "out/summary.json" in t.getnames() and "out/parts/ok/log.txt" in t.getnames()
+        assert {"out/summary.json", "out/parts/ok/log.txt", "out/job.log",
+                "out/terminate_tools.txt"} <= set(t.getnames())
 
 
 def test_job_terminates_when_the_session_refuses(tmp_path):
     """No H100 and no override: the session refuses, and the job still packs and ends."""
-    r, out = _job(tmp_path, plan=[{"name": "ok", "argv": _py("print(1)")}],
-                  extra={"FS11_ALLOW_ANY_GPU": "0"})
-    if "H100 check passes" in r.stdout:
+    r, out = _job(tmp_path, plan=OK_PLAN, extra={"FS11_ALLOW_ANY_GPU": "0"})
+    if "H100 check passes" in _log(out):
         pytest.skip("this machine has an H100")
     assert r.returncode == fs.EXIT_REFUSED, r.stdout + r.stderr
     assert json.loads((out / "summary.json").read_text())["refused"]
@@ -260,18 +412,333 @@ def test_job_terminates_when_the_session_refuses(tmp_path):
 
 
 def test_job_timer_terminates_a_hung_session(tmp_path):
+    """The deadline timer fires while the session hangs (the job's own kill set late)."""
     hung = tmp_path / "hung.sh"
     hung.write_text("#!/bin/sh\nexec sleep 60\n")
     hung.chmod(0o755)
     t0 = time.time()
-    r, out = _job(tmp_path, python=str(hung), deadline=3)
+    r, out = _job(tmp_path, python=str(hung), deadline=3,
+                  extra={"FS11_HANG_MARGIN_S": "1000", "FS11_STOP_GRACE_S": "2"})
     assert time.time() - t0 < 20
     assert "deadline reached" in r.stdout and "DRY_RUN: terminate (deadline)" in r.stdout
     assert r.stdout.count("DRY_RUN: terminate") == 1  # once, though the job's trap ran too
     assert not Path(f"{out}.tar").exists()
 
 
+HUNG_SESSION = """\
+import os, signal, subprocess, sys, time
+out = sys.argv[sys.argv.index("--out") + 1]
+os.makedirs(out, exist_ok=True)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+part = subprocess.Popen(["sleep", "300"], start_new_session=True)
+for name in ("current_part", "part_pid"):
+    with open(os.path.join(out, name), "w") as f:
+        f.write(f"{part.pid}\\n")
+time.sleep(300)
+"""
+
+
+def test_job_kills_a_hung_session_and_its_part_then_packs(tmp_path):
+    """A session that ignores SIGTERM, with a part in its own process group: the job kills
+    both FS11_HANG_MARGIN_S after the work deadline, packs and terminates before the timer."""
+    (tmp_path / "hung.py").write_text(HUNG_SESSION)
+    wrapper = tmp_path / "python"
+    wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {tmp_path / 'hung.py'} \"$@\"\n")
+    wrapper.chmod(0o755)
+    r, out = _job(tmp_path, python=str(wrapper), deadline=16, grace=1, reserve=8,
+                  extra={"FS11_HANG_MARGIN_S": "2", "FS11_STOP_GRACE_S": "2"})
+    assert "killing it and its part" in r.stdout, r.stdout
+    assert "DRY_RUN: terminate (end of job" in r.stdout
+    assert "(deadline)" not in r.stdout
+    assert Path(f"{out}.READY").exists() and Path(f"{out}.TERMINATED").exists()
+    part = int((out / "part_pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(part, 0)
+
+
+def test_job_survives_a_dead_reader_on_its_stdout(tmp_path):
+    """nohup's output file gone or the ssh pipe closed: the job runs on, logs to job.log, and
+    still packs and terminates."""
+    p, out = _job(tmp_path, plan=OK_PLAN, extra={"FS11_ALLOW_ANY_GPU": "1"}, popen=True)
+    p.stdout.close()
+    p.stderr.close()
+    assert p.wait(timeout=60) == 0
+    log = _log(out)
+    assert "ok: ok, exit 0" in log and "READY:" in log
+    assert "DRY_RUN: terminate (end of job (session exit 0))" in log
+    assert Path(f"{out}.TERMINATED").exists()
+
+
+def test_job_runs_without_its_log_file(tmp_path):
+    (tmp_path / "out" / "job.log").mkdir(parents=True)
+    r, out = _job(tmp_path, plan=OK_PLAN, extra={"FS11_ALLOW_ANY_GPU": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "cannot append to" in r.stdout and "ok: ok, exit 0" in r.stdout
+    assert "DRY_RUN: terminate (end of job" in r.stdout and Path(f"{out}.TERMINATED").exists()
+
+
+def test_job_marks_a_failed_pack_and_still_terminates(tmp_path):
+    (tmp_path / "out.tar.tmp").mkdir()  # tar can't write its tarball over a directory
+    r, out = _job(tmp_path, plan=OK_PLAN, extra={"FS11_ALLOW_ANY_GPU": "1"})
+    assert "PACK FAILED" in r.stdout
+    assert Path(f"{out}.PACK_FAILED").exists() and not Path(f"{out}.READY").exists()
+    assert "DRY_RUN: terminate (end of job" in r.stdout and Path(f"{out}.TERMINATED").exists()
+
+
+@pytest.mark.parametrize("deadline, grace, extra, why", [
+    (2, 1, {}, "must be below FS11_DEADLINE_S"),
+    (60, 1, {"FS11_MIN_FREE_GB": str(10**9)}, "FS11_MIN_FREE_GB is"),
+])
+def test_job_terminates_on_a_refusal(tmp_path, deadline, grace, extra, why):
+    r, out = _job(tmp_path, plan=OK_PLAN, deadline=deadline, grace=grace, extra=extra)
+    assert r.returncode == 2 and why in r.stdout, r.stdout + r.stderr
+    assert "DRY_RUN: terminate (refused:" in r.stdout and Path(f"{out}.TERMINATED").exists()
+    assert not (out / "summary.json").exists()
+
+
 def test_job_refuses_without_a_way_to_terminate(tmp_path):
     r, out = _job(tmp_path, extra={"DRY_RUN": "0"})
     assert r.returncode == 2 and "RUNPOD_POD_ID is not set" in r.stdout
     assert not out.exists()
+
+
+def test_job_selftest(tmp_path):
+    """FS11_SELFTEST: the stand-in parts, no GPU check, then the normal end-of-run terminate."""
+    r, out = _job(tmp_path, deadline=30, grace=1, reserve=5, extra={"FS11_SELFTEST": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    s = json.loads((out / "summary.json").read_text())
+    assert [(p["name"], p["status"]) for p in s["parts"]] == [
+        ("selftest_ok", "ok"), ("selftest_sleep", "ok")]
+    assert "self-test: stand-in parts" in _log(out) and "SELFTEST=1" in r.stdout
+    assert "terminate tools:" in r.stdout
+    assert "DRY_RUN: terminate (end of job (session exit 0))" in r.stdout
+
+
+# ---- the job against stub runpodctl and curl (DRY_RUN=0) -----------------------------------
+
+
+STUB_RUNPODCTL = """\
+#!/bin/sh
+echo "runpodctl $*" >> "$STUB_LOG"
+case "$1 $2" in
+  "pod delete")
+    case "${STUB_DELETE:-fail}" in
+      ok) exit 0 ;;
+      slow) sleep 2; exit 0 ;;
+      hang) exec sleep 1000 ;;
+    esac
+    exit 1 ;;
+  "pod get")
+    if [ "${STUB_GET:-there}" = gone ]; then echo "Error: pod not found" >&2; exit 1; fi
+    echo '{"id": "test-pod", "desiredStatus": "RUNNING"}'; exit 0 ;;
+  "pod stop") [ "${STUB_STOP:-fail}" = ok ] && exit 0; exit 1 ;;
+  "version ") echo "runpodctl v2.1.0"; exit 0 ;;
+esac
+exit 1
+"""
+
+STUB_CURL = """\
+#!/bin/sh
+input=$(cat)
+method=GET; prev=
+for a in "$@"; do [ "$prev" = -X ] && method=$a; prev=$a; done
+echo "curl $*" >> "$STUB_LOG"
+echo "curl-stdin $input" >> "$STUB_LOG"
+case "$method" in
+  DELETE) code=${STUB_REST_DELETE:-500} ;;
+  POST) code=${STUB_REST_STOP:-500} ;;
+  *) code=${STUB_REST_GET:-200} ;;
+esac
+case " $* " in *" -w "*) printf '%s' "$code" ;; esac
+case "$code" in 2*) exit 0 ;; esac
+exit 22
+"""
+
+# coreutils' timeout for the boot guard on the Mac, which has none: drop the options and the
+# duration, run the command.
+STUB_TIMEOUT = """\
+#!/bin/sh
+while [ $# -gt 0 ]; do case "$1" in -k) shift 2 ;; -*) shift ;; *) break ;; esac; done
+shift
+exec "$@"
+"""
+
+
+def _stubs(tmp_path, *, timeout=False, **modes):
+    """A bin directory with runpodctl and curl stubs first on PATH; never the real ones."""
+    b = tmp_path / "bin"
+    b.mkdir(exist_ok=True)
+    scripts = {"runpodctl": STUB_RUNPODCTL, "curl": STUB_CURL}
+    if timeout:
+        scripts["timeout"] = STUB_TIMEOUT
+    for name, text in scripts.items():
+        (b / name).write_text(text)
+        (b / name).chmod(0o755)
+    log = tmp_path / "calls.log"
+    log.touch()
+    env = {"PATH": f"{b}:{os.environ['PATH']}", "STUB_LOG": str(log),
+           "RUNPOD_POD_ID": "test-pod"}
+    env.update({f"STUB_{k.upper()}": v for k, v in modes.items()})
+    return env, log
+
+
+REAL = {"DRY_RUN": "0", "FS11_ALLOW_ANY_GPU": "1", "FS11_CALL_TIMEOUT_S": "2",
+        "FS11_RETRY_S": "1", "FS11_CONFIRM_S": "2"}
+
+
+def _calls(log):
+    return log.read_text().splitlines()
+
+
+def test_job_terminates_with_runpodctl_and_confirms(tmp_path):
+    env, log = _stubs(tmp_path, delete="ok", get="gone")
+    r, out = _job(tmp_path, plan=OK_PLAN, extra={**REAL, **env})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "confirmed: runpodctl pod get test-pod says not found" in r.stdout
+    assert Path(f"{out}.TERMINATED").read_text().split("; ")[1] == "method: runpodctl pod delete"
+    assert [c for c in _calls(log) if "version" not in c] == [
+        "runpodctl pod delete test-pod", "runpodctl pod get test-pod"]
+    assert "runpodctl_version=runpodctl v2.1.0" in (out / "terminate_tools.txt").read_text()
+
+
+def test_job_terminates_over_rest_with_the_key_off_the_command_line(tmp_path):
+    env, log = _stubs(tmp_path, rest_delete="204", rest_get="404")
+    env["RUNPOD_API_KEY"] = "test-key-123"
+    r, out = _job(tmp_path, plan=OK_PLAN, extra={**REAL, **env})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "confirmed: GET pod test-pod answers 404" in r.stdout
+    assert "method: REST DELETE" in Path(f"{out}.TERMINATED").read_text()
+    calls = _calls(log)
+    assert "runpodctl pod delete test-pod" in calls and "runpodctl remove pod test-pod" in calls
+    argv = [c for c in calls if c.startswith("curl ")]
+    assert [re.search(r"-X (\w+)", c).group(1) for c in argv] == ["DELETE", "GET"]
+    assert all("test-key-123" not in c for c in argv)
+    assert all("--config -" in c and c.endswith("/v1/pods/test-pod") for c in argv)
+    assert 'Authorization: Bearer test-key-123' in log.read_text()  # on stdin only
+    assert "test-key-123" not in _log(out) + r.stdout
+    assert "runpod_api_key=set" in (out / "terminate_tools.txt").read_text()
+
+
+def test_job_falls_back_to_stop_when_delete_hangs(tmp_path):
+    env, log = _stubs(tmp_path, delete="hang", stop="ok")
+    t0 = time.time()
+    r, out = _job(tmp_path, plan=OK_PLAN, deadline=30, extra={
+        **REAL, **env, "FS11_DELETE_ROUNDS": "2"})
+    assert time.time() - t0 < 25
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = [c for c in _calls(log) if "version" not in c]
+    # two rounds of delete (each cut at the call limit) before the first stop
+    assert calls == ["runpodctl pod delete test-pod", "runpodctl remove pod test-pod",
+                     "runpodctl pod delete test-pod", "runpodctl remove pod test-pod",
+                     "runpodctl pod stop test-pod"]
+    assert "stopped, not removed" in Path(f"{out}.TERMINATED").read_text()
+
+
+def test_job_hands_a_failing_terminate_to_the_timer(tmp_path):
+    """Every call fails: the job gives up at the deadline without the TERMINATED flag, and the
+    timer goes on trying (stop included) until it is killed."""
+    env, log = _stubs(tmp_path)
+    p, out = _job(tmp_path, plan=OK_PLAN, deadline=6, grace=1, reserve=2, popen=True,
+                  extra={**REAL, **env, "FS11_DELETE_ROUNDS": "2"})
+    try:
+        assert _wait_for(lambda: (out / "job.log").exists()
+                         and "terminating pod test-pod (deadline)" in _log(out)
+                         and _log(out).split("(deadline)")[1].count("trying: runpodctl pod stop")
+                         >= 2, timeout=40), _log(out)
+        assert p.poll() is None  # the job waits on the timer
+    finally:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+    log_text = _log(out)
+    assert "TERMINATE FAILED" in log_text
+    assert not Path(f"{out}.TERMINATED").exists()
+    calls = [c for c in _calls(log) if "version" not in c]
+    first_stop = calls.index("runpodctl pod stop test-pod")
+    assert calls[:first_stop].count("runpodctl pod delete test-pod") >= 2
+
+
+def test_job_and_timer_never_terminate_at_once(tmp_path):
+    """The grace window ends at the deadline, so the job and the timer reach terminate
+    together; the lock lets one delete through, and the other finds the flag."""
+    env, log = _stubs(tmp_path, delete="slow", get="gone")
+    r, out = _job(tmp_path, plan=OK_PLAN, deadline=8, grace=6, reserve=1,
+                  extra={**REAL, **env, "FS11_CALL_TIMEOUT_S": "6"})
+    assert "waits for the other terminate" in _log(out)
+    calls = [c for c in _calls(log) if "version" not in c]
+    assert calls.count("runpodctl pod delete test-pod") == 1, calls
+    assert Path(f"{out}.TERMINATED").exists()
+    assert not Path(f"{out}.terminate.lock").exists()
+
+
+# ---- the billing guards ---------------------------------------------------------------------
+
+
+def test_guard_dry_run(tmp_path):
+    log = tmp_path / "guard.log"
+    env = {k: v for k, v in os.environ.items() if k != "RUNPOD_POD_ID"}
+    r = subprocess.run(["sh", str(GUARD), "1"], env={**env, "DRY_RUN": "1",
+                       "FS11_GUARD_LOG": str(log)}, capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0 and "disarm with: kill" in r.stdout
+    assert _wait_for(lambda: "DRY_RUN: runpodctl pod delete" in log.read_text(), 10)
+    assert "armed: firing in 1 s" in log.read_text()
+
+
+def test_guard_refuses_without_a_pod(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != "RUNPOD_POD_ID"}
+    r = subprocess.run(["sh", str(GUARD), "1"], env={**env, "DRY_RUN": "0"},
+                       capture_output=True, text=True, timeout=10)
+    assert r.returncode == 2 and "RUNPOD_POD_ID is not set" in r.stderr
+    r = subprocess.run(["sh", str(GUARD), "1h"], env={**env, "DRY_RUN": "1"},
+                       capture_output=True, text=True, timeout=10)
+    assert r.returncode == 2 and "usage" in r.stderr
+
+
+def _boot_guards():
+    """The runbook's start commands for the pod create call: the H100 session's and the
+    self-test's, which differ in the sleep alone."""
+    lines = [l.strip() for l in README.read_text().splitlines()
+             if l.strip().startswith("bash -c '(")]
+    assert len(lines) == 2, lines
+    return lines
+
+
+def test_boot_guard_lines_parse():
+    h100, selftest = _boot_guards()
+    assert "sleep 16200;" in h100 and "sleep 960;" in selftest
+    assert h100.replace("sleep 16200;", "sleep 960;") == selftest
+    for line in (h100, selftest):
+        argv = shlex.split(line)
+        assert argv[:2] == ["bash", "-c"] and len(argv) == 3
+        assert argv[2].endswith("& exec /start.sh")
+        subprocess.run(["bash", "-n", "-c", argv[2]], check=True)
+        # the create call's exec form carries the same script
+        assert json.dumps(argv[2]) in README.read_text()
+
+
+@pytest.mark.parametrize("modes, ends_with", [
+    ({"delete": "ok"}, "runpodctl pod delete test-pod"),
+    ({}, "runpodctl pod stop test-pod"),
+])
+def test_boot_guard_starts_the_image_and_terminates_later(tmp_path, modes, ends_with):
+    """The start command, its sleep cut to 1 s, on stub runpodctl, curl and timeout: the
+    image's /start.sh starts at once, and the guard terminates after the sleep."""
+    env, log = _stubs(tmp_path, timeout=True, stop="ok", **modes)
+    env["RUNPOD_API_KEY"] = "test-key-123"
+    start = tmp_path / "start.sh"
+    start.write_text(f"#!/bin/sh\necho started >> {log}\n")
+    start.chmod(0o755)
+    guard_log = tmp_path / "guard.log"
+    script = shlex.split(_boot_guards()[0])[2]
+    script = (script.replace("sleep 16200;", "sleep 1;").replace("sleep 30;", "sleep 0;")
+              .replace("/tmp/guard.log", str(guard_log)).replace("/start.sh", str(start)))
+    subprocess.run(["bash", "-c", script], env={**os.environ, **env}, check=True, timeout=10,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert _calls(log) == ["started"]  # the image's entry ran; the guard still sleeps
+    assert _wait_for(lambda: _calls(log)[-1] == ends_with, 15), _calls(log)
+    calls = _calls(log)
+    assert calls[1] == "runpodctl pod delete test-pod"
+    if not modes:  # three rounds of delete, remove and REST DELETE, then stop
+        assert calls.count("runpodctl pod delete test-pod") == 3
+        assert sum(c.startswith("curl ") for c in calls) == 3
+        assert all("test-key-123" not in c for c in calls if c.startswith("curl "))
+    assert "armed" in guard_log.read_text()

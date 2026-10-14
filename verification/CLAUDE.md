@@ -2128,6 +2128,64 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     fsynced per line.
   - The tests (`test_full_scale.py`) run the driver with a fake runner that writes each
     stage's run directory.
+- `smooth_check.py` (F6c, F6a): `VERIF_MODEL=<repo> VERIF_MODEL_REVISION=<commit>
+  VERIF_ATTACK=<task> .venv/bin/python -m verification.runs.smooth_check [--steps T]
+  [--eval-batch B]`. `T` plain steps (default 10) through `loop.run_plain` on `D` and `π` at
+  `VERIF_SEED`, and the whole-list loss (`whole_list_loss`: `Σ μ·CE / Σ μ` over every record of
+  `D`, forward passes only, in chunks of `--eval-batch`, sums in fp64, under the run's
+  autocast) at `W_0` and after each step. `verdict(losses)` is F6a's rule: smooth if every
+  value is finite, none after a step is above the loss at `W_0`, and the last is below it. Each
+  step's global gradient norm (`grad_norms`, an optimizer step pre-hook) is recorded beside its
+  loss and plays no part in the verdict. The record goes to
+  `$VERIF_OUTPUT_DIR/smooth_check/<model>_<task>.json` (`record_path`) with the timings, the
+  peak memory (`metrics.memory_probe`) and the environment. Exits 0 when smooth,
+  `EXIT_NOT_SMOOTH` (3) when not. Run once on SmolLM2 at reduced batch on the Mac; FS11 runs it
+  per full-scale model and task.
+- FS11, the first H100 session, as one unattended job; the runbook is `verification/README.md`,
+  "Workflow: the first H100 session".
+  - `fs11_prep.py`: `HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --out
+    DIR`, on the Mac. Builds `D` and `D̃` per model and task at the full-scale config
+    (`fs11_session.FULL_SCALE_ENV`), and packs `DIR/fs11_upload.tar`: `git archive HEAD`, the
+    data, a Hugging Face cache with every pinned snapshot's files (a gated model's weights
+    included; a public model's weights left out, their SHA-256 recorded), the BLAKE3 sources,
+    `requirements-fs11.txt` and `manifest.json` (every packed file's SHA-256). Every cached file
+    is checked against its blob name first. It never downloads and never packs the cache's
+    token; a pinned model missing from the cache is reported (exit 1 for a run model).
+  - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
+    [--selftest]`, `fetch-models` and `env`. Runs the parts in order (`default_plan`): models
+    (`fetch_models`: the manifest check, then each public model's weights with `token=False`
+    at its pin, checked against the Mac's SHA-256), the hashing benchmark, `bring_up
+    --no-tamper` per model, `smooth_check` per model and task. Each part runs in its own
+    process group with its own log, `HF_HUB_OFFLINE=1` after the first, and no Hugging Face
+    token or Runpod key in its environment; `DONE` marks a finished part, which a rerun skips.
+    `check_upload` re-checks the manifest after the models part on every run: a bad file marks
+    the later parts of its model (of every model, for a file no model owns) `not_started`. The
+    benchmark is done only when its report is `complete` and no result holds `error:`
+    (`benchmark_failure`). It refuses a machine without CUDA and an H100
+    (`FS11_ALLOW_ANY_GPU=1` overrides; `EXIT_REFUSED` 4). `selftest_plan` is two stand-in parts
+    that need only the standard library, which the module keeps to at import, so `--selftest`
+    runs on a bare pod's `python3`.
+  - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
+    pod. Preflight (refuses without a way to end the pod; a refusal it can act on terminates),
+    a deadline timer (`FS11_DEADLINE_S`, 12,600 s), the session, a kill of a session still
+    running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar` with
+    `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
+    `OUT_DIR.FETCHED` to end it), and the terminate: `runpodctl pod delete`, `runpodctl remove
+    pod`, REST `DELETE`, each under a 60 s limit, confirmed by a follow-up read before
+    `OUT_DIR.TERMINATED` is written, a stop after three failed rounds, retried until the
+    deadline and then by the timer without end, under a lock so job and timer never terminate
+    at once. Logs to `OUT_DIR/job.log` directly with SIGPIPE ignored. `DRY_RUN=1` prints the
+    terminate commands; `FS11_SELFTEST=1` runs the stand-in plan (360 s deadline, 120 s grace)
+    and terminates for real. The header cites Runpod's docs for each command.
+  - `fs11_guard.sh`: `sh verification/runs/fs11_guard.sh [SECONDS]` (default 16,200), a
+    detached guard that removes the pod after `SECONDS` whatever else runs, with the job's
+    delete, remove and REST fallbacks and then a stop. It re-arms by hand the boot guard that
+    the pod's start command arms at creation (the runbook's two start commands, which
+    `test_fs11_session.py` checks with `bash -n` and on stubs). `DRY_RUN=1` logs the commands.
+  - Tests: `tests/verification/runs/test_fs11_session.py` (the session on fake parts, and the
+    job and the guards under `DRY_RUN` or stub `runpodctl`, `curl` and `timeout`: the deadline,
+    a dead log reader, a hung session, failed and hanging deletes, the lock, a failed pack),
+    `test_fs11_prep.py` (the prep on a fake cache) and `test_smooth_check.py`.
 
 ### `evaluation/`
 

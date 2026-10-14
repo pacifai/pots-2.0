@@ -64,7 +64,8 @@ from verification.runs.metrics import environment_record, memory_probe
 from verification.runs.plain_baseline import training_config
 
 __all__ = ["RUN_NAME", "STEPS", "EXIT_NOT_SMOOTH", "RULE", "Verdict", "verdict",
-           "whole_list_loss", "grad_norm", "grad_norms", "SmoothResult", "smooth_check", "record", "record_path", "main"]
+           "whole_list_loss", "grad_norm", "grad_norms", "SmoothResult", "smooth_check",
+           "record", "record_path", "main"]
 
 RUN_NAME = "smooth_check"
 STEPS = 10  # F6c: 10 plain steps per model and task

@@ -13,8 +13,14 @@ on the Mac. The parts, in this order:
    and check them against the SHA-256 that ``fs11_prep`` recorded from the Mac's cache. A file
    that doesn't match is deleted. A gated model (:data:`GATED`) is never fetched: its files
    come packed in the upload. Only this part may reach the network.
+   After this part, on every run (a rerun that skips it included), :func:`check_upload`
+   checks every file the later parts read against the manifest again. A packed file that is
+   missing or differs keeps every later part from starting; a model whose files are missing
+   or differ keeps its own bring-up and smooth parts from starting.
 2. **benchmark.** ``benchmarks.hashing.run`` at its H100 preset (FS10), report in
-   ``benchmark/hashing.json``. Its GPU-hashing slots need cuPQC (:func:`cupqc_status`).
+   ``benchmark/hashing.json``. Its GPU-hashing slots need cuPQC (:func:`cupqc_status`). It
+   exits 0 whatever its slots did, so the part counts as done only when the report is
+   ``complete`` and no result ended in an error (:func:`benchmark_failure`).
 3. **bring-up**, one per model: ``bring_up --no-tamper``, one verified step at the full-scale
    config (:data:`FULL_SCALE_ENV`) on the refusal task's ``D``, with ``metrics.py``'s peak
    memory. Its exit code also folds in the concentration guard, which may fail at bf16 (F20);
@@ -23,15 +29,18 @@ on the Mac. The parts, in this order:
 
 Every part runs in its own process group, with ``HF_HUB_OFFLINE=1`` (all but the first), no
 Hugging Face token and no Runpod key in its environment. A part's log is
-``parts/<name>/log.txt``. ``parts/<name>/DONE`` is written when it exits 0, and a rerun into
-the same output directory skips it. A part that fails doesn't stop the others. A part still
-running at ``--deadline`` (or past its own time limit) is killed, and the parts after it are
-recorded as not started. ``summary.json`` is rewritten after each part.
+``parts/<name>/log.txt``, and ``current_part`` holds the running part's process group id.
+``parts/<name>/DONE`` is written when it succeeds, and a rerun into the same output directory
+skips it. A part that fails doesn't stop the others. A part still running at ``--deadline``
+(or past its own time limit) is killed, and the parts after it are recorded as not started.
+``summary.json`` is rewritten after each part.
 
 Before any part, ``run`` prints the environment (GPU, driver, CUDA, torch, free disk and RAM)
 to ``environment.json`` and refuses to start unless CUDA is available and the GPU is an H100;
-``FS11_ALLOW_ANY_GPU=1`` overrides. Exits 0 when every part succeeded, 1 when any failed, and
-:data:`EXIT_REFUSED` when the environment check refused.
+``FS11_ALLOW_ANY_GPU=1`` overrides. ``run --selftest`` (``FS11_SELFTEST``) skips that check
+and runs :func:`selftest_plan`'s stand-in parts, which need only the standard library. Exits 0
+when every part succeeded, 1 when any failed, and :data:`EXIT_REFUSED` when the environment
+check refused.
 """
 
 from __future__ import annotations
@@ -53,8 +62,9 @@ from pathlib import Path
 from typing import Any
 
 __all__ = ["RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "EXIT_REFUSED", "Part",
-           "default_plan", "load_plan", "run_session", "fetch_models", "environment",
-           "cupqc_status", "data_key", "main"]
+           "default_plan", "load_plan", "selftest_plan", "run_session", "fetch_models",
+           "check_upload", "benchmark_failure", "environment", "cupqc_status", "data_key",
+           "main"]
 
 # The four full-scale models at their commits (tests/verification/full_scale_helpers.PINS, in
 # the order the session brings them up).
@@ -105,7 +115,10 @@ def _write_json(path: Path, doc: Any) -> None:
 
 
 def _say(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S', time.gmtime())}] {msg}", flush=True)  # UTC, as the job's
+    try:  # UTC, as the job's; a full disk under the log mustn't stop the session
+        print(f"[{time.strftime('%H:%M:%S', time.gmtime())}] {msg}", flush=True)
+    except OSError:
+        pass
 
 
 # ---- the environment ---------------------------------------------------------------------
@@ -140,10 +153,13 @@ def _nvidia_smi() -> list[dict[str, str]] | str:
 
 def environment(out: Path) -> dict[str, Any]:
     """The pod as the session sees it: GPU, driver, CUDA, torch, free disk and RAM. Names no
-    secret: of the environment it records only the Runpod pod id and the cuPQC path."""
-    import torch
-
-    cuda = torch.cuda.is_available()
+    secret: of the environment it records only the Runpod pod id and the cuPQC path. Without
+    torch (the self-test on a bare pod) the torch fields are ``None`` and CUDA is unavailable."""
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    cuda = torch is not None and torch.cuda.is_available()
     mem = _meminfo()
     phys = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") \
         if hasattr(os, "sysconf") else None
@@ -153,7 +169,7 @@ def environment(out: Path) -> dict[str, Any]:
         "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "host": platform.node(), "platform": platform.platform(),
         "python": platform.python_version(), "cpu_count": os.cpu_count(),
-        "torch": torch.__version__, "torch_cuda": torch.version.cuda,
+        "torch": torch and torch.__version__, "torch_cuda": torch and torch.version.cuda,
         "cuda_available": cuda,
         "gpus": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
         if cuda else [],
@@ -276,6 +292,14 @@ def load_plan(path: Path) -> list[Part]:
     return [Part(**p) for p in json.loads(path.read_text())]
 
 
+def selftest_plan() -> list[Part]:
+    """``FS11_SELFTEST``'s stand-in parts: standard library only, a few seconds in all, so a
+    cheap pod without the venv runs the job's whole path up to the real terminate."""
+    return [Part("selftest_ok", ["{python}", "-c", "print('self-test part ran')"], timeout_s=60),
+            Part("selftest_sleep", ["{python}", "-c", "import time; time.sleep(5)"],
+                 timeout_s=60)]
+
+
 def base_env(upload: Path) -> dict[str, str]:
     """Every part's environment: the session's own, without :data:`SECRETS`, offline, with the
     upload's Hugging Face cache and BLAKE3 sources."""
@@ -311,7 +335,7 @@ def _smooth_extras(report: Path) -> dict[str, Any]:
     doc = json.loads(report.read_text())
     return {"record": str(report), "smooth": doc.get("smooth"), "reasons": doc.get("reasons"),
             "whole_list_losses": doc.get("whole_list_losses"),
-            "batch_losses": doc.get("batch_losses"),
+            "batch_losses": doc.get("batch_losses"), "grad_norms": doc.get("grad_norms"),
             "peak_bytes": (doc.get("memory") or {}).get("peak_bytes"),
             "total_s": (doc.get("timings_s") or {}).get("total")}
 
@@ -329,6 +353,23 @@ def _benchmark_extras(report: Path) -> dict[str, Any]:
                                 "status": r.get("status"), "reason": r.get("reason")})
     return {**doc, "report": str(report), "complete": rep.get("complete"),
             "elapsed_s": rep.get("elapsed_s"), "skipped": skipped}
+
+
+def benchmark_failure(report: Path) -> str | None:
+    """Why the benchmark part failed though it exited 0, or ``None``: the report is missing or
+    unreadable, isn't ``complete``, or holds a result whose reason starts ``error:``."""
+    try:
+        rep = json.loads(report.read_text())
+    except (OSError, ValueError) as e:
+        return f"report unreadable: {type(e).__name__}: {e}"
+    if rep.get("complete") is not True:
+        return "the report isn't complete"
+    errors = [f"{key}/{r.get('name')}" for key, slot in (rep.get("slots") or {}).items()
+              for r in slot.get("results") or []
+              if str(r.get("reason") or "").startswith("error:")]
+    if errors:
+        return f"{len(errors)} results ended in an error ({', '.join(errors[:5])})"
+    return None
 
 
 def part_extras(part: Part, log: Path) -> dict[str, Any]:
@@ -369,8 +410,11 @@ def _kill(proc: subprocess.Popen[bytes]) -> None:
 
 
 def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline: float,
-              python: str) -> tuple[str, int | None, float]:
-    """Run one part to its end, its time limit or the deadline: (status, exit code, wall s)."""
+              python: str, current: Path | None = None) -> tuple[str, int | None, float]:
+    """Run one part to its end, its time limit or the deadline: (status, exit code, wall s).
+
+    ``current``, while the part runs, holds its process group id, so ``fs11_job.sh`` can kill
+    the part too when the session itself hangs."""
     argv = [python if a == "{python}" else a for a in part.argv]
     penv = dict(env)
     for k, v in part.env.items():
@@ -385,6 +429,11 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
         f.flush()
         proc = subprocess.Popen(argv, cwd=cwd, env=penv, stdout=f, stderr=subprocess.STDOUT,
                                 start_new_session=True)
+        if current is not None:
+            try:
+                current.write_text(f"{proc.pid}\n")
+            except OSError:
+                pass
         try:
             while True:
                 try:
@@ -401,6 +450,9 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
             f.write(f"\n[fs11] killed: the session was stopped after {time.time() - t0:.0f} s\n"
                     .encode())
             raise
+        finally:
+            if current is not None:
+                current.unlink(missing_ok=True)
 
 
 def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: float, cwd: Path,
@@ -417,16 +469,22 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
     }
     say(f"cuPQC: {summary['cupqc']['reason']} ({', '.join(CUPQC_SLOTS)})")
     path = out / "summary.json"
+    check: dict[str, Any] | None = None  # check_upload's result, once the models part is past
     for part in plan:
         d = out / "parts" / part.name
         d.mkdir(parents=True, exist_ok=True)
         rec: dict[str, Any] = {"name": part.name, "kind": part.kind, "info": part.info,
                                "log": str(d / "log.txt")}
+        why = blocked(part, check)
         if summary.get("stopped"):
             rec.update(status="not_started", exit_code=None, reason=summary["stopped"])
         elif (d / "DONE").exists():
+            # Done in an earlier run, whose own check passed: its result stands.
             rec.update(status="skipped_done", exit_code=0)
             say(f"{part.name}: done in an earlier run, skipped")
+        elif why:
+            rec.update(status="not_started", exit_code=None, reason=why)
+            say(f"{part.name}: not started, {why}")
         elif time.time() >= deadline:
             rec.update(status="not_started", exit_code=None,
                        reason="the session deadline passed before it started")
@@ -436,21 +494,36 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
             t0 = time.time()
             try:
                 status, rc, wall = _run_part(part, env, cwd, d / "log.txt", deadline=deadline,
-                                             python=python)
+                                             python=python, current=out / "current_part")
             except (_Stop, KeyboardInterrupt) as e:
                 # Record the cut; the parts after it then say why they didn't start.
                 summary["stopped"] = f"the session was stopped ({e or 'SIGINT'})"
                 status, rc, wall = "killed_signal", None, time.time() - t0
             rec.update(status=status, exit_code=rc, wall_s=round(wall, 1))
+            if status == "ok" and part.kind == "benchmark":
+                # benchmarks.hashing.run exits 0 whatever its slots did; its report decides.
+                bad = benchmark_failure(Path(part.info["report"]))
+                if bad:
+                    status = "failed"
+                    rec.update(status=status, reason=bad)
             if status == "ok":
                 (d / "DONE").write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ\n", time.gmtime()))
-            say(f"{part.name}: {status}, exit {rc}, {wall:.0f} s")
+            say(f"{part.name}: {status}, exit {rc}, {wall:.0f} s"
+                + (f" ({rec['reason']})" if rec.get("reason") else ""))
         if part.kind == "benchmark" and rec["status"] != "skipped_done":
             with open(d / "log.txt", "a") as f:
                 f.write(f"[fs11] cuPQC slots {', '.join(CUPQC_SLOTS)}: "
                         f"{summary['cupqc']['reason']}\n")
         rec["extras"] = part_extras(part, d / "log.txt")
         summary["parts"].append(rec)
+        if part.kind == "models" and rec["status"] != "not_started":
+            # On every run, a rerun that skipped the part included: the later parts read
+            # these files, and a DONE marker says nothing about them now.
+            check = check_upload(upload)
+            summary["upload_check"] = check
+            say(f"upload check ({check['s']:.0f} s): {len(check['packed'])} packed files "
+                f"missing or differing; models with problems: "
+                f"{', '.join(check['models']) or 'none'}")
         _write_json(path, summary)
     summary["finished"] = True
     summary["ended_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -484,6 +557,68 @@ def snapshot_path(hub: Path, repo: str, revision: str, rel: str) -> Path:
     return hub / f"models--{repo.replace('/', '--')}" / "snapshots" / revision / rel
 
 
+def packed_problems(upload: Path, manifest: Mapping[str, Any]) -> list[str]:
+    """Each packed file of ``upload`` that is missing or differs from the manifest's SHA-256."""
+    bad = []
+    for arc, digest in manifest["files"].items():
+        p = upload / arc
+        if not p.is_file():
+            bad.append(f"{arc}: missing")
+        elif sha256_file(p) != digest:
+            bad.append(f"{arc}: SHA-256 differs from the manifest")
+    return bad
+
+
+def check_upload(upload: Path) -> dict[str, Any]:
+    """Every file the later parts read, against the manifest: the packed files, and each
+    model's fetched weights in the upload's Hugging Face cache. The session runs it after the
+    models part on every run, a rerun that skips that part included.
+
+    ``packed`` lists the packed files that are missing or differ (or an unreadable manifest):
+    the upload can't be trusted, and no later part starts. ``models`` maps a repo to its
+    problems (missing on the Mac, a weight not fetched or not matching): that model's parts
+    don't start. The benchmark still runs; a model whose weights are missing fails to load
+    there and says so in its row."""
+    t0 = time.time()
+    models: dict[str, list[str]] = {}
+    try:
+        manifest = json.loads((upload / "manifest.json").read_text())
+        packed = packed_problems(upload, manifest)
+        hub = upload / "hf" / "hub"
+        for m in manifest["models"]:
+            # A benchmark-only pin may lack weights on purpose (the unsloth mirror's configs
+            # size E6's leaves; its row times Meta's weights), so only a run model's count.
+            probs = [f"missing on the Mac: {x}" for x in m.get("missing") or []
+                     if "run" in m.get("roles", ["run"])]
+            for f in m["files"]:
+                if f["packed"]:
+                    continue  # in manifest["files"], checked above
+                p = snapshot_path(hub, m["repo"], m["revision"], f["path"])
+                if not p.is_file():
+                    probs.append(f"{f['path']}: not in the cache")
+                elif sha256_file(p) != f["sha256"]:
+                    probs.append(f"{f['path']}: SHA-256 differs from the Mac's")
+            if probs:
+                models[m["repo"]] = probs
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        packed = [f"manifest.json unreadable: {type(e).__name__}: {e}"]
+    return {"packed": packed, "models": models, "s": round(time.time() - t0, 1)}
+
+
+def blocked(part: Part, check: Mapping[str, Any] | None) -> str | None:
+    """Why :func:`check_upload`'s result keeps ``part`` from starting, or ``None``."""
+    if check is None:
+        return None
+    if check["packed"]:
+        return (f"the upload doesn't match its manifest ({len(check['packed'])} files, e.g. "
+                f"{check['packed'][0]})")
+    model = part.info.get("model")
+    if model in check["models"]:
+        probs = check["models"][model]
+        return f"{model}'s files are missing or differ ({len(probs)}, e.g. {probs[0]})"
+    return None
+
+
 def fetch_models(upload: Path, out: Path, *,
                  download: Callable[[str, str, str, Path], Path] = _hf_download,
                  say: Callable[[str], None] = _say) -> int:
@@ -493,13 +628,7 @@ def fetch_models(upload: Path, out: Path, *,
     hub = upload / "hf" / "hub"
     problems: list[str] = []
     t0 = time.time()
-    bad = []
-    for arc, digest in manifest["files"].items():
-        p = upload / arc
-        if not p.is_file():
-            bad.append(f"{arc}: missing")
-        elif sha256_file(p) != digest:
-            bad.append(f"{arc}: SHA-256 differs from the manifest")
+    bad = packed_problems(upload, manifest)
     problems += bad
     say(f"upload: {len(manifest['files']) - len(bad)} of {len(manifest['files'])} packed files "
         f"match the manifest ({time.time() - t0:.0f} s)")
@@ -557,6 +686,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="Unix time at which a running part is killed and no other starts")
     r.add_argument("--plan", type=Path, default=None,
                    help="the parts as JSON instead of the session's (for a dry run)")
+    r.add_argument("--selftest", action="store_true",
+                   help="FS11_SELFTEST: stand-in parts (unless --plan), no GPU check")
     f = sub.add_parser("fetch-models", help="check the upload, fetch the public weights")
     f.add_argument("--upload", type=Path, required=True)
     f.add_argument("--out", type=Path, required=True)
@@ -566,12 +697,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cmd == "fetch-models":
         return fetch_models(args.upload.resolve(), args.out)
     out = args.out.resolve()
-    allow = os.environ.get("FS11_ALLOW_ANY_GPU") == "1"
+    selftest = args.cmd == "run" and args.selftest
+    allow = os.environ.get("FS11_ALLOW_ANY_GPU") == "1" or selftest
     env_doc = environment(out)
     _write_json(out / "environment.json", env_doc)
     print_environment(env_doc)
     why = refusal(env_doc, allow)
-    if allow:
+    if selftest:
+        _say("self-test: stand-in parts, the H100 check is skipped")
+    elif allow:
         _say("FS11_ALLOW_ANY_GPU=1: the H100 check is overridden")
     if args.cmd == "env":
         _say("refused: " + why if why else "the H100 check passes")
@@ -583,7 +717,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                            "finished": True})
         return EXIT_REFUSED
     upload = args.upload.resolve()
-    plan = load_plan(args.plan) if args.plan else default_plan(upload, out)
+    if args.plan:
+        plan = load_plan(args.plan)
+    else:
+        plan = selftest_plan() if selftest else default_plan(upload, out)
     signal.signal(signal.SIGTERM, _on_term)
     summary = run_session(plan, upload=upload, out=out, deadline=args.deadline,
                           cwd=Path.cwd(), env_doc=env_doc)
