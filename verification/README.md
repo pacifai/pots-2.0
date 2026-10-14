@@ -183,6 +183,11 @@ recomputed non-matmul arithmetic, such as RMSNorm, softmax, RoPE and SiLU, is ca
 **glue**. The verifier never hand-writes it: it calls the model's own modules, so both sides
 do bit-identical arithmetic.
 
+The replay serves operands one product at a time (`operands(m)`), or a group of one layer's
+attention members of one shape stacked (`operand_group(ms)`). The decoder copies such a group
+out of the whole bmm operands at once; the result equals the stacked per-member operands bit
+for bit.
+
 Two instances exist, in `instances/`:
 
 - **`mlp.py`** is a three-layer bias-free MLP with `M = 3L − 1 = 8` products. It is small
@@ -321,8 +326,8 @@ checks in order. When check 5 or 6 rejects because a test failed, the driver the
 that check's remaining tests for the record only (`checks.record_rest`), so the step's
 scores cover every product or weight tensor the check owns. The verdict is already fixed,
 and the checks after the rejecting one still never run. The pass reuses the live check's own
-gradient code and, inside one of check 5's attention runs, the live measures of the run's
-later members. The driver keeps how far the pass got (`complete`, `ended: malformed`,
+gradient code and the numbers check 5 measured after the failing product and never judged
+(the rest of its judging window, below). The driver keeps how far the pass got (`complete`, `ended: malformed`,
 `error` or `not run`) for the step record, and catches any error the pass raises with a
 warning, so the rejection stands. **`residuals.py`** bins the numbers checks 5 and 6
 record: per matmul class, the count, RMS and maximum of the normalized residuals and the
@@ -386,6 +391,9 @@ replaced:
 - **`k_tunability.py`** is FS12. On the same stored step it runs check 5 at every `k` from 1
   to 18, records its time, FLOPs and memory, and checks that the configured `k` reproduces
   the honest run's numbers bit for bit.
+- **`check5_profile.py`** serves O2. On the same stored step it measures check 5's host
+  overhead per product: wall time, aten ops and host reads per section, and on CUDA the
+  kernel launches and the syncs that block the host. It judges nothing and writes nothing.
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
@@ -550,6 +558,15 @@ What each check establishes:
   Norms are computed with power-of-two scaling so they can't overflow, and any
   non-finite value rejects. A forged product fails here. So does a substituted batch: the
   forward products no longer match the committed records.
+
+  Check 5 does this work in groups but judges in order. A layer's attention products of one
+  shape (on SmolLM2, the 36 or 108 per-head products of `S`, `O`, `dA`, or `dV`, `dQ` and
+  `dK`) are served at once and measured in one batch. Each product's numbers stay on the
+  device as one row until about 1,024 products are measured; then one read brings them to
+  the host and they are judged one by one in canonical order. Reading a value back makes the
+  host wait for the device, so this cuts the waits from several per product to one per
+  window. The first failing product and its message are those of one-at-a-time judging, and
+  an error serving a later product is raised only after the products before it pass.
 - **Check 6b (glue updates).** This is the same update test as 6a for the weights whose
   gradient isn't a committed product. Check 5's replay already ran the backward glue, so
   the gradients come at no extra cost.
@@ -630,7 +647,10 @@ SmolLM2 at test scale (4 × 128, `k = 9`), torch 2.9.1 with CUDA 12.8, on 2026-1
   for 0.47 s of its 4.1 s under the profiler. Each product pays for a Python loop, small kernels, values read
   back to the host and challenges drawn on the host and copied over. So the Freivalds work
   itself, O(n²) against the matmul's O(n³), is not what costs: check 5's GPU time is about
-  an eighth of its wall time. This is the speed item on check 5's measuring (O2).
+  an eighth of its wall time. This is the speed item on check 5's measuring (O2). Since
+  2026-10-14 check 5 serves each attention group at once and reads its numbers back once per
+  window of about 1,024 products (above); it is not yet measured on a GPU
+  (`runs/check5_profile.py` is ready for it).
   Commitment and check 2 hash the 2.6 GB transcript on the host's CPU cores, slower than on
   the dev Mac (0.23 s for the commitment there). Training under capture costs about 3.5 times
   the plain step's forward and backward (0.42–0.46 s against 0.13 s); FS9's copies add 0.14 s of that, and save 0.37 s of

@@ -9,19 +9,23 @@ import struct
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
-from verification.verifier.matmul_check import freivalds
 from verification.verifier.matmul_check.challenges import SIGMA_R
 from verification.verifier.matmul_check.freivalds import (
-    _MIN_ENTRY,
+    ROW,
     MeasureScratch,
     _measure_product_reference,
     _measure_products_reference,
     _norm,
     _safe_norm,
     band_unit,
+    finish_row,
     measure_product,
+    measure_product_row,
     measure_products,
+    measure_products_rows,
+    row_width,
     term_scale,
     term_scales,
 )
@@ -256,9 +260,20 @@ def test_batch_matches_reference_bit_for_bit(case):
     _same_batch(a, b, p)
 
 
+_MIN_ENTRY = 2.0 ** -63  # the bounds under which _norm once took the plain norm
+
+
+def _plain_equals_norm(x):
+    """The plain ``vector_norm(x)`` and ``_norm(x)`` have the same bits, and ``_norm`` has
+    ``_safe_norm``'s: the reason the scaled-only ``_norm`` changed no CPU number."""
+    got = _norm(x, None, x.abs()).numpy().tobytes()
+    assert got == _safe_norm(x).numpy().tobytes()
+    return got == torch.linalg.vector_norm(x).numpy().tobytes()
+
+
 @pytest.mark.parametrize("dim", [None, 0, 1])
 def test_norm_matches_safe_norm_across_scales(dim):
-    """Random vectors from 2^-70 to 2^70: inside the bounds and outside them, same bits."""
+    """Random vectors from 2^-70 to 2^70, with narrow and wide ranges of entries: same bits."""
     g = torch.Generator().manual_seed(1)
     for e in range(-70, 71, 3):
         for spread in (1.0, 2.0 ** 20, 2.0 ** 40):
@@ -269,31 +284,48 @@ def test_norm_matches_safe_norm_across_scales(dim):
             assert got.numpy().tobytes() == want.numpy().tobytes(), (e, spread)
 
 
-@pytest.mark.parametrize("hi", [1.0, 2.0 ** 30, 1.5 * 2.0 ** 40, 2.0 ** -20])
-def test_norm_at_the_small_entry_bound(hi):
-    """Entries at ``2^-63·max(1, hi)`` take the plain norm; one binade below, the scaled one.
+@pytest.mark.parametrize("dim", [None, 1])
+def test_norm_of_zero_infinite_nan_and_subnormal_vectors(dim):
+    """The cases ``_safe_norm`` sends to its fallback, which ``_norm`` handles without a
+    branch: an all-zero vector, one with ``inf`` or NaN, one of subnormals only."""
+    x = torch.randn(6, 40, generator=torch.Generator().manual_seed(2))
+    x[0] = 0.0
+    x[1, 3] = float("inf")
+    x[2, 5] = float("nan")
+    x[3] = 1e-42
+    x[4, 7] = -0.0
+    x[5, :20] = 0.0
+    for v in ([x[i] for i in range(6)] if dim is None else [x]):
+        want = _safe_norm(v, dim)
+        got = _norm(v, dim, v.abs())
+        assert torch.equal(got.isnan(), want.isnan())
+        assert torch.equal(torch.nan_to_num(got), torch.nan_to_num(want))
+        assert torch.equal(got.signbit(), want.signbit())
 
-    Both give ``_safe_norm``'s bits. Below the bound a square or a scaled entry is subnormal,
-    where the plain norm and the scaled one may round differently.
+
+@pytest.mark.parametrize("hi", [1.0, 2.0 ** 30, 1.5 * 2.0 ** 40, 2.0 ** -20])
+def test_plain_norm_equals_scaled_at_the_small_entry_bound(hi):
+    """Entries at ``2^-63·max(1, hi)`` or above: the plain norm has the scaled one's bits.
+
+    Below the bound a square or a scaled entry is subnormal, where the two may round
+    differently; ``_norm`` keeps ``_safe_norm``'s bits there too.
     """
     bound = _MIN_ENTRY * max(1.0, hi)
     for lo in (bound, bound / 2, bound * 0.75, bound * 1.5):
         x = torch.full((1000,), lo)
         x[0] = hi
         x[1:500] *= torch.linspace(1.0, 1.9, 499)
-        assert _norm(x, None, x.abs()).numpy().tobytes() == \
-            _safe_norm(x, None).numpy().tobytes(), lo
+        assert _plain_equals_norm(x) or lo < bound, lo
 
 
-def test_norm_at_the_sum_bound():
+def test_plain_norm_equals_scaled_at_the_sum_bound():
     """Sums of squares near fp32's top: on both sides of ``n·hi² = 2^124``."""
     for n, hi in ((1, 2.0 ** 62), (4, 2.0 ** 61), (4, 2.0 ** 61 * 1.01), (1000, 2.0 ** 57),
                   (1000, 2.0 ** 58), (1000, 2.0 ** 59), (1 << 16, 2.0 ** 54),
                   (1 << 16, 2.0 ** 55)):
         x = torch.full((n,), hi)
         x[n // 2:] *= 0.999
-        want = _safe_norm(x).numpy().tobytes()
-        assert _norm(x, None, x.abs()).numpy().tobytes() == want, (n, hi)
+        assert _plain_equals_norm(x) or n * hi * hi > 2.0 ** 124, (n, hi)
 
 
 def test_abs_into_scratch_keeps_layout_and_matmul_bits():
@@ -308,22 +340,46 @@ def test_abs_into_scratch_keeps_layout_and_matmul_bits():
         assert (mine @ ones).numpy().tobytes() == (fresh @ ones).numpy().tobytes()
 
 
-def test_zero_free_products_skip_the_scaled_copy_of_p(monkeypatch):
-    """``‖P‖_F`` of a zero-free ``P`` takes the plain norm; a zero entry falls back.
+class _HostReads(TorchDispatchMode):
+    """Counts the ops that read a tensor's value back to the host."""
 
-    Small norms may fall back too: an honest residual often has exact zeros.
-    """
-    shapes = []
-    real = freivalds._scaled_norm
-    monkeypatch.setattr(freivalds, "_scaled_norm",
-                        lambda x, *a, **kw: shapes.append(tuple(x.shape)) or real(x, *a, **kw))
+    def __init__(self):
+        super().__init__()
+        self.reads = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func in (torch.ops.aten._local_scalar_dense.default, torch.ops.aten.item.default):
+            self.reads.append(func)
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("guard", [True, False])
+def test_rows_read_nothing_back_and_finish_to_the_same_numbers(guard):
+    """A product's row (and a batch's rows) is computed with no host read, and
+    ``finish_row`` on it gives ``measure_product``'s numbers, biased or not."""
     a, b, p = _honest(40, 24, 56)
-    measure_product(a, b, p, h=H, m=1, k=K, eps_in=EPS, eps_acc=EPS)
-    measure_products(*_batch(3, 32, 16, 24), h=H, ms=[1, 2, 3], k=K, eps_in=EPS, eps_acc=EPS)
-    assert (40, 56) not in shapes and (3, 32 * 24) not in shapes
-    p[0, 0] = 0.0
-    measure_product(a, b, p, h=H, m=1, k=K, eps_in=EPS, eps_acc=EPS)
-    assert (40, 56) in shapes
+    bias = torch.randn(56, generator=torch.Generator().manual_seed(9))
+    ab, bb, pb = _batch(3, 32, 16, 24)
+    sc = MeasureScratch()
+    with _HostReads() as mode:
+        rows = [measure_product_row(a, b, p, h=H, m=4, k=K, scratch=sc, guard=guard,
+                                    bias=x) for x in (None, bias)]
+        batch = measure_products_rows(ab, bb, pb, h=H, ms=[1, 2, 3], k=K, scratch=sc,
+                                      guard=guard)
+    assert mode.reads == []
+    assert rows[0].shape == (row_width(K),) and batch.shape == (3, row_width(K))
+    assert rows[0].dtype == batch.dtype == torch.float64 and len(ROW) == 6
+    for row, x in zip(rows, (None, bias)):
+        want = measure_product(a, b, p, h=H, m=4, k=K, eps_in=EPS, eps_acc=EPS, guard=guard,
+                               bias=x)
+        got = finish_row(row.tolist(), q=24 + (x is not None), n=40, eps_in=EPS, eps_acc=EPS,
+                         guard=guard, biased=x is not None)
+        assert _bits(got) == _bits(want)
+    want = measure_products(ab, bb, pb, h=H, ms=[1, 2, 3], k=K, eps_in=EPS, eps_acc=EPS,
+                            guard=guard)
+    got = [finish_row(r, q=16, n=32, eps_in=EPS, eps_acc=EPS, guard=guard)
+           for r in batch.tolist()]
+    assert [_bits(x) for x in got] == [_bits(x) for x in want]
 
 
 # ---- the κ guard off (C1's cost split only) ---------------------------------------------

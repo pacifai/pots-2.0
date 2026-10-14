@@ -228,9 +228,10 @@ class StepState:
     recomputed_root: bytes | None = None  # set by check 2's root comparison, the step's last
     leaves: CommittedLeaves | None = None  # check 2's leaves, the only reader after check 2
     replay: Replay | None = None  # check 5's replay, reused by 6b
-    # When check 5 rejects inside a member run: the run's members after the failing one, as
-    # check 5 measured them (never judged), and the error serving a later member raised, if
-    # any. The record pass records these numbers rather than measuring the members again.
+    # When check 5 rejects: the products it measured after the failing one and never judged
+    # (the rest of its judging window), as it measured them, and the error serving or
+    # measuring a later product raised, if any. The record pass records these numbers rather
+    # than measuring the products again.
     run_rest: list[tuple[ProductSpec, ProductMeasure]] = field(default_factory=list)
     run_rest_error: Exception | None = None
 

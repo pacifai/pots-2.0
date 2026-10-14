@@ -888,6 +888,30 @@ class _Unit:
     saved: dict[int, tuple[str, str]] = field(default_factory=dict)
 
 
+def _key(c: DecoderComputation, spec: ProductSpec) -> str:
+    """The name a replay unit holds ``spec``'s operands under: ``L{ℓ}.{role}``, or the head's
+    role."""
+    role = c.product_class(spec)
+    return role if spec.layer is None else f"L{spec.layer}.{role}"
+
+
+def _unchanged(held: dict[str, tuple[torch.Tensor, torch.Tensor, int, int]],
+               key: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """``held[key]``'s operands, checked unchanged since their product read them."""
+    a, b, va, vb = held[key]
+    if a._version != va or b._version != vb:
+        raise ReplayError(f"replay: an operand of {key} changed after its product read it")
+    return a, b
+
+
+def _progression(xs: Sequence[int]) -> slice | None:
+    """``xs`` as a slice when it is an increasing arithmetic progression, else ``None``."""
+    step = xs[1] - xs[0] if len(xs) > 1 else 1
+    if step <= 0 or any(y - x != step for x, y in zip(xs, xs[1:])):
+        return None
+    return slice(xs[0], xs[-1] + 1, step)
+
+
 class DecoderReplay(Replay):
     """Glue replay of one decoder step from committed leaves (checks 3, 5 and 6b).
 
@@ -1143,16 +1167,17 @@ class DecoderReplay(Replay):
             self._names, self._calls = [], {}
         self.batch, self._built = batch, True
 
-    def _forward_operands(self, spec: ProductSpec) -> tuple[torch.Tensor, torch.Tensor]:
-        c = self.c
-        j = c.L + 1 if spec.layer is None else spec.layer
+    def _forward_unit(self, spec: ProductSpec) -> int:
+        """Run the pass if unit ``j`` of ``spec`` needs it; returns ``j``."""
+        j = self.c.L + 1 if spec.layer is None else spec.layer
         if not self._built or j not in self._units:  # first request, or j's backward ran
             self._build()
-        role = c.product_class(spec)
-        key = role if spec.layer is None else f"L{j}.{role}"
-        a, b, va, vb = self._units[j].fwd[key]
-        if a._version != va or b._version != vb:
-            raise ReplayError(f"replay: an operand of {key} changed after its product read it")
+        return j
+
+    def _forward_operands(self, spec: ProductSpec) -> tuple[torch.Tensor, torch.Tensor]:
+        c = self.c
+        j = self._forward_unit(spec)
+        a, b = _unchanged(self._units[j].fwd, _key(c, spec))
         if spec.member is not None:
             s, h = spec.member
             a, b = a[s * c.n_h + h], b[s * c.n_h + h]
@@ -1274,24 +1299,25 @@ class DecoderReplay(Replay):
             self._glue[n] = g
         self._bunit = j
 
-    def _backward_operands(self, spec: ProductSpec) -> tuple[torch.Tensor, torch.Tensor]:
-        c = self.c
-        j = c.L + 1 if spec.layer is None else spec.layer
+    def _backward_unit(self, spec: ProductSpec) -> int:
+        """Run unit ``j`` of ``spec``'s backward unless its operands are held; returns ``j``."""
+        j = self.c.L + 1 if spec.layer is None else spec.layer
         if self._bunit != j:
             # In order, unit j is the next one of the pass; otherwise rebuild from scratch.
             if not self._built or self._next_unit < j:
                 self._build()
             while self._next_unit >= j:
                 self._run_unit(self._next_unit)
-        role = c.product_class(spec)
-        key = role if spec.layer is None else f"L{j}.{role}"
-        a, b, va, vb = self._bops[key]
-        if a._version != va or b._version != vb:
-            raise ReplayError(f"replay: an operand of {key} changed after its product read it")
+        return j
+
+    def _backward_operands(self, spec: ProductSpec) -> tuple[torch.Tensor, torch.Tensor]:
+        c = self.c
+        j = self._backward_unit(spec)
+        a, b = _unchanged(self._bops, _key(c, spec))
         if spec.member is not None:
             s, h = spec.member
             i = s * c.n_h + h
-            a, b = (b[i].mT, a[i].mT) if role == "dK" else (a[i], b[i])
+            a, b = (b[i].mT, a[i].mT) if c.product_class(spec) == "dK" else (a[i], b[i])
         # The unit's last product in canonical order: drop the unit's operands.
         if spec.name == (c.g_head if spec.layer is None else f"L{j}.G_v"):
             self._bunit, self._bops = None, {}
@@ -1311,6 +1337,63 @@ class DecoderReplay(Replay):
                               f"{c.operand_dtype}")
         self._served_last = m == c.M
         return a, b
+
+    def operand_group(self, ms: Sequence[int], dtype: torch.dtype | None = None
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Members of one layer's attention run (forward ``S``/``O``, or backward ``δA``,
+        ``δV``, ``δQ̃``, ``δK̃``), served from the whole bmm operand tensors: one version and
+        dtype check per role, then one strided copy per role and operand into the stacked
+        result, ``δK̃``'s transposed, converting to ``dtype`` as it copies. Roles may interleave
+        (``δQ̃₀, δK̃₀, δQ̃₁, …``); a role whose members aren't evenly spaced is copied member by
+        member. The result and the replay's state afterwards, or at an error, are those of
+        ``operands(m)`` over ``ms`` up to the same point: the same unit guards, the same first
+        error, and ``_served_last`` as after the last member served. Any other ``ms`` takes the
+        default.
+        """
+        c = self.c
+        specs = [c.product(m) for m in ms]
+        if not specs or specs[0].member is None:
+            return super().operand_group(ms, dtype)
+        first = specs[0]
+        forward = first.kind is ProductKind.FORWARD
+        if any(p.member is None or p.layer != first.layer
+               or (p.kind is ProductKind.FORWARD) != forward
+               or (p.a_shape, p.b_shape) != (first.a_shape, first.b_shape) for p in specs):
+            return super().operand_group(ms, dtype)
+        j = self._forward_unit(first) if forward else self._backward_unit(first)
+        held = self._units[j].fwd if forward else self._bops
+        # Per role: its whole (A, B) as served, and its members' group positions and batch
+        # indices s·n_h + h.
+        roles: dict[str, tuple[torch.Tensor, torch.Tensor, list[int], list[int]]] = {}
+        for pos, (m, spec) in enumerate(zip(ms, specs)):
+            role = c.product_class(spec)
+            if role not in roles:
+                a, b = _unchanged(held, _key(c, spec))
+                if role == "dK":
+                    a, b = b.mT, a.mT
+                if a.dtype != c.operand_dtype or b.dtype != c.operand_dtype:
+                    raise ReplayError(f"{spec.name}: operands {a.dtype}, {b.dtype}, declared "
+                                      f"{c.operand_dtype}")
+                roles[role] = (a.detach(), b.detach(), [], [])
+            s, h = spec.member
+            roles[role][2].append(pos)
+            roles[role][3].append(s * c.n_h + h)
+            self._served_last = m == c.M
+        a0, b0, _, _ = next(iter(roles.values()))
+        if any(a.shape[1:] != a0.shape[1:] or b.shape[1:] != b0.shape[1:]
+               for a, b, _, _ in roles.values()):
+            return super().operand_group(ms, dtype)  # copy_ would broadcast; stack raises
+        out_a = a0.new_empty((len(ms), *a0.shape[1:]), dtype=dtype)
+        out_b = b0.new_empty((len(ms), *b0.shape[1:]), dtype=dtype)
+        for a, b, pos, idx in roles.values():
+            dst, src = _progression(pos), _progression(idx)
+            for out, whole in ((out_a, a), (out_b, b)):
+                if dst is not None and src is not None:
+                    out[dst].copy_(whole[src])
+                else:
+                    for p, i in zip(pos, idx):
+                        out[p].copy_(whole[i])
+        return out_a, out_b
 
     def glue_gradients(self) -> dict[str, torch.Tensor]:
         """Check 6b: each γ's and each bias's gradient, and ``W_E``'s full gradient,
