@@ -647,6 +647,89 @@ gated: Meta's Llama-3.2-1B travels in the upload from the Mac's cache, and the o
 models' weights are fetched with `token=False` at their pinned commits and checked against the
 SHA-256 the Mac recorded.
 
+Three things end the pod, each on its own: the job's normal end, the job's deadline timer, and
+a boot guard started by the pod's start command before anything else runs. Every deadline is
+about twice the time it covers:
+
+| deadline | covers | estimate | deadline |
+|---|---|---|---|
+| job (`FS11_DEADLINE_S`) | the job, from its start | 60–150 min, midpoint about 105 | 2 × 105 min = 3.5 h (12,600 s) |
+| boot guard | the whole pod, from its creation | setup about 20 min, the job about 105, about 10 of the grace window: about 135 min | 2 × 135 min = 4.5 h (16,200 s) |
+| self-test job | the job under `FS11_SELFTEST=1` | about 3 min | 6 min (360 s), grace window 2 min |
+| self-test boot guard | the self-test's whole pod | about 8 min | 16 min (960 s) |
+
+The factor of two is picked by hand: it leaves room for an estimate that is off by half
+without letting a stalled pod bill for long.
+
+**The boot guard.** The create call's start command (the console's "Container Start
+Command", the API's `dockerStartCmd`) wraps the image's own entry, `/start.sh`, which the
+`runpod/pytorch` and `runpod/base` images run by default (`CMD ["/start.sh"]`, no
+`ENTRYPOINT`). For the H100 session:
+
+```bash
+bash -c '(echo "fs11 boot guard armed $(date -u)"; sleep 16200; for i in 1 2 3; do timeout 60 runpodctl pod delete "$RUNPOD_POD_ID" && exit; timeout 60 runpodctl remove pod "$RUNPOD_POD_ID" && exit; echo "Authorization: Bearer $RUNPOD_API_KEY" | timeout 60 curl -fsS -o /dev/null -X DELETE -H @- "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" && exit; sleep 30; done; for i in 1 2 3; do timeout 60 runpodctl pod stop "$RUNPOD_POD_ID" && exit; sleep 30; done) >/tmp/guard.log 2>&1 & exec /start.sh'
+```
+
+The same as an exec-form array, for an API field that takes one (the MCP `create-pod` tool's
+`cmd`); prefer it, since it doesn't depend on how the console splits a string:
+
+```json
+["bash", "-c", "(echo \"fs11 boot guard armed $(date -u)\"; sleep 16200; for i in 1 2 3; do timeout 60 runpodctl pod delete \"$RUNPOD_POD_ID\" && exit; timeout 60 runpodctl remove pod \"$RUNPOD_POD_ID\" && exit; echo \"Authorization: Bearer $RUNPOD_API_KEY\" | timeout 60 curl -fsS -o /dev/null -X DELETE -H @- \"https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID\" && exit; sleep 30; done; for i in 1 2 3; do timeout 60 runpodctl pod stop \"$RUNPOD_POD_ID\" && exit; sleep 30; done) >/tmp/guard.log 2>&1 & exec /start.sh"]
+```
+
+It sleeps in the background while `/start.sh` runs as usual (SSH, Jupyter). When it wakes it
+tries `runpodctl pod delete`, runpodctl 1.x's `remove pod` and the REST `DELETE` (the key on
+curl's stdin) in three rounds 30 s apart, then `runpodctl pod stop` three times; each call has
+60 s. A restart of the container ends the guard; `sh verification/runs/fs11_guard.sh [SECONDS]`
+re-arms it by hand (default 16,200 s; it prints the pid that `kill` disarms). The tests check
+that both start commands parse (`bash -n`) and, on stub `runpodctl`, `curl` and `timeout`, that
+`/start.sh` starts at once and the delete comes after the sleep.
+
+0. **Optional: the self-test, on a CPU pod.** It checks what no Mac test can: that the
+   pod-scoped key may remove its own pod, and which of the job's methods does it. It costs a
+   few cents.
+   - Create a CPU pod: image `runpod/base:1.4.0-ubuntu2404`, CPU type `cpu3c` with 2 vCPUs,
+     container disk 5 GB, no volume, SSH on (`startSsh`, port `22/tcp`), and the start command
+     above with `sleep 960;` in place of `sleep 16200;`:
+
+     ```bash
+     bash -c '(echo "fs11 boot guard armed $(date -u)"; sleep 960; for i in 1 2 3; do timeout 60 runpodctl pod delete "$RUNPOD_POD_ID" && exit; timeout 60 runpodctl remove pod "$RUNPOD_POD_ID" && exit; echo "Authorization: Bearer $RUNPOD_API_KEY" | timeout 60 curl -fsS -o /dev/null -X DELETE -H @- "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" && exit; sleep 30; done; for i in 1 2 3; do timeout 60 runpodctl pod stop "$RUNPOD_POD_ID" && exit; sleep 30; done) >/tmp/guard.log 2>&1 & exec /start.sh'
+     ```
+
+     ```json
+     ["bash", "-c", "(echo \"fs11 boot guard armed $(date -u)\"; sleep 960; for i in 1 2 3; do timeout 60 runpodctl pod delete \"$RUNPOD_POD_ID\" && exit; timeout 60 runpodctl remove pod \"$RUNPOD_POD_ID\" && exit; echo \"Authorization: Bearer $RUNPOD_API_KEY\" | timeout 60 curl -fsS -o /dev/null -X DELETE -H @- \"https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID\" && exit; sleep 30; done; for i in 1 2 3; do timeout 60 runpodctl pod stop \"$RUNPOD_POD_ID\" && exit; sleep 30; done) >/tmp/guard.log 2>&1 & exec /start.sh"]
+     ```
+
+     The tag was chosen from public sources only, nothing pulled. Docker Hub lists
+     `1.4.0-ubuntu2404` as `runpod/base`'s latest release tag (2026-09-30; the `rc` tags are
+     release candidates). The image's Dockerfile (github.com/runpod/containers,
+     `official-templates/base/Dockerfile`) installs Python 3.9–3.13 with `python` pointing at
+     3.12, and uv, and keeps `CMD ["/start.sh"]` with no `ENTRYPOINT`. It doesn't install
+     runpodctl: Runpod's docs say every pod comes with runpodctl and a pod-scoped API key
+     (docs.runpod.io/runpodctl/overview), so the platform supplies both. The self-test's
+     `terminate tools:` line is the first check of that on a live pod.
+   - On the pod, check `cat /tmp/guard.log` says "armed". Copy the code over
+     (`git archive -o fs11_selftest.tar HEAD verification` on the Mac makes a small tarball),
+     extract it into `/root/fs11`, and from there:
+
+     ```bash
+     FS11_SELFTEST=1 setsid nohup bash verification/runs/fs11_job.sh /root/fs11 /root/fs11_out \
+         </dev/null > /root/fs11_job.out 2>&1 &
+     tail -F /root/fs11_out/job.log
+     ```
+
+     The self-test needs only the standard library and the image's `python3`. It runs two
+     stand-in parts, packs, waits out a 2 min grace window (`touch /root/fs11_out.FETCHED`
+     ends it), and terminates through the job's normal end-of-run path. Before the session
+     starts it writes `terminate_tools.txt`, also printed as the `terminate tools:` line:
+     where runpodctl is and its version, whether `RUNPOD_API_KEY` is set (never its value), and
+     whether `curl`, `timeout` and `setsid` are there.
+   - The connection drops when the pod goes, taking the log with it, so the record is what the
+     tail showed: the last `trying:` line names the method that worked, and any line before
+     it saying "answered HTTP" or "round 1 failed" names one that didn't. Copy those lines.
+   - On the Mac, `runpodctl pod list --all` (or the MCP `list-pods`): the pod must be absent,
+     not listed as stopped. A stopped pod means only the stop fallback worked; delete it by
+     hand.
 1. **Prep, on the Mac.** Commit first: the upload holds `git archive HEAD`, not the working
    tree.
 
@@ -658,69 +741,116 @@ SHA-256 the Mac recorded.
    file against its blob name, and writes `DIR/fs11_upload.tar` (about 2.4 GB), its
    `.sha256` and a manifest. It never downloads; a pinned model missing from the cache is
    reported, and exits 1 if it is one of the four run models. Note the SHA-256.
-2. **The orchestrator creates the pod**: one H100 80 GB, no network volume (terminating
-   deletes everything else, which is the point), container disk of at least 50 GB (the upload
-   twice, about 8 GB of public weights, the venv and the output), and host RAM of at least
-   the 64 GiB free the benchmark's copy test needs (the target machine has 188–320 GB, F1c).
-3. **Upload** the tarball, check its SHA-256 against step 1's, and extract it into
-   `/workspace`, giving `/workspace/fs11_upload/`. Make the venv at
-   `/workspace/fs11_upload/repo/.venv` from `requirements-fs11.txt` (the Mac's versions; on
-   Linux x86_64 PyPI's torch wheel is a CUDA build) with Python 3.14, as on the Mac.
+2. **The orchestrator creates the pod**: one H100 80 GB, image
+   `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, the boot guard above (16,200 s) as the
+   start command, SSH on. Disk: a pod volume of at least 50 GB at `/workspace`, where all the
+   work goes, and the container disk at its default (20 GB or more), which holds only the
+   system. No network volume: terminating deletes the pod volume, which is the point. The
+   work needs about 20–25 GB: the upload (2.4 GB) and its extracted copy (2.4 GB), about
+   7.7 GB of public weights, the venv (about 7 GB with CUDA torch), uv's cache (about 4 GB)
+   and the output (under 1 GB). Host RAM: at least the 64 GiB free that the benchmark's copy
+   test needs (the target machine has 188–320 GB, F1c).
+3. **Set up.** After SSH, check that `cat /tmp/guard.log` says "armed". If it doesn't (the pod
+   was created without the start command, or restarted), run `sh fs11_guard.sh` from the
+   upload once it is there, or paste the one-line form in `fs11_guard.sh`'s header first.
+   Upload the tarball, check its SHA-256 against step 1's, and extract it into `/workspace`,
+   giving `/workspace/fs11_upload/`. Then make the venv with Python 3.14, as on the Mac. The
+   image has uv (from the base image) but not Python 3.14, so uv fetches its own build, a
+   public download:
+
+   ```bash
+   cd /workspace/fs11_upload/repo
+   uv python install 3.14
+   uv venv --python 3.14 .venv
+   uv pip install --python .venv/bin/python -r ../requirements-fs11.txt
+   ```
+
+   `requirements-fs11.txt` holds the Mac's versions; on Linux x86_64, PyPI's torch wheel is a
+   CUDA build.
 4. **Start the job detached**, from `/workspace/fs11_upload/repo`:
 
    ```bash
-   nohup bash verification/runs/fs11_job.sh /workspace/fs11_upload /workspace/fs11_out \
-       > /workspace/fs11_job.out 2>&1 &
+   setsid nohup bash verification/runs/fs11_job.sh /workspace/fs11_upload /workspace/fs11_out \
+       </dev/null > /workspace/fs11_job.out 2>&1 &
    ```
 
-   It prints the environment first (GPU, driver, CUDA, torch, free disk and RAM) and refuses
-   to run the parts unless CUDA is there and the GPU is an H100 (`FS11_ALLOW_ANY_GPU=1`
-   overrides). It refuses to start at all unless it can terminate the pod: `RUNPOD_POD_ID`
-   set, and `runpodctl` or `RUNPOD_API_KEY` present. Each part logs to
-   `fs11_out/parts/<part>/log.txt` and `summary.json` is rewritten after each one. A failed
-   part doesn't stop the others; a part with a `DONE` marker is skipped on a rerun into the
-   same output directory.
+   Before disconnecting, check that `/workspace/fs11_job.out` shows the `FS11 job:`,
+   `terminate tools:` and `session:` lines: the job passed preflight and its timer runs. The
+   session prints the environment first (GPU, driver, CUDA, torch, free disk and RAM) and
+   refuses to run the parts unless CUDA is there and the GPU is an H100 (`FS11_ALLOW_ANY_GPU=1`
+   overrides). The job refuses to start at all unless it can terminate the pod
+   (`RUNPOD_POD_ID` set, and `runpodctl` or `RUNPOD_API_KEY` there). A refusal it can act on,
+   such as `FS11_GRACE_S + FS11_PACK_RESERVE_S` not below `FS11_DEADLINE_S` or less than
+   `FS11_MIN_FREE_GB` (default 15) free under the output directory, terminates the pod.
+   Each part logs to `fs11_out/parts/<part>/log.txt` and `summary.json` is rewritten after
+   each one. A failed part doesn't stop the others; a part with a `DONE` marker is skipped on
+   a rerun into the same output directory.
 5. **Fetch the tarball within the grace window.** Whatever the parts did, the job packs
    `fs11_out` into `/workspace/fs11_out.tar`, prints its SHA-256 (also in
-   `fs11_out.tar.sha256`) and writes `/workspace/fs11_out.READY`. It then waits
-   `FS11_GRACE_S` (default 20 min) before terminating. Poll for `fs11_out.READY`, then copy
+   `fs11_out.tar.sha256`) and writes `/workspace/fs11_out.READY`, which names the tarball, its
+   SHA-256 and the epoch the pod ends at. If packing fails it writes `fs11_out.PACK_FAILED`
+   instead, and `fs11_out/` stays for the grace window. It then waits `FS11_GRACE_S` (default
+   20 min) before terminating. Poll for `fs11_out.READY` or `fs11_out.PACK_FAILED`, then copy
    `fs11_out.tar` and `fs11_out.tar.sha256` off.
 6. **Verify the SHA-256** of the copy against `fs11_out.tar.sha256`. Then
    `touch /workspace/fs11_out.FETCHED`, which ends the grace window early.
-7. **Confirm the pod is gone**: list the account's pods. The job runs
-   `runpodctl pod delete $RUNPOD_POD_ID`, which removes the pod rather than stopping it (a
-   stopped pod still bills for its disk), and falls back to runpodctl 1.x's
-   `runpodctl remove pod` and the REST API's `DELETE /v1/pods/{podId}`. The command was taken
-   from Runpod's docs (the sources are in `fs11_job.sh`'s header) and has not been run on a
-   live pod.
+7. **Confirm the pod is gone**, on the Mac: `runpodctl pod list --all` (or the MCP
+   `list-pods`). The pod must be absent; one listed as stopped still bills for its disk, so
+   delete it.
 
-**Billing ends in the job itself.** A deadline timer, `FS11_DEADLINE_S` after the start
-(default 12,600 s, 3.5 h), terminates the pod whatever the job is doing. The parts get a work
-deadline of the timer less the grace window and `FS11_PACK_RESERVE_S` (default 600 s), so
-3 h by default; a part still running then is killed, and the rest are recorded as not
-started. An exit through a signal terminates too. `DRY_RUN=1` prints the terminate command
-instead and stops the job when the timer fires; the tests run the timer, the grace window and
-the always-terminate path that way on the Mac.
+**Billing ends in the job itself.** The job's terminate runs `runpodctl pod delete
+$RUNPOD_POD_ID`, which removes the pod rather than stopping it, then runpodctl 1.x's
+`runpodctl remove pod` and the REST API's `DELETE /v1/pods/{podId}`, each call limited to
+60 s. `fs11_out.TERMINATED` is written only once a delete succeeded and a follow-up read
+confirmed the pod gone (the REST `GET` answers 404, or `runpodctl pod get` says not found).
+After three failed rounds each round also tries `runpodctl pod stop` and the REST stop.
+Rounds repeat every 30 s until the deadline, and then the timer keeps trying without end. A
+lock keeps the job and the timer from terminating at the same time. The commands were taken
+from Runpod's docs (the sources are in `fs11_job.sh`'s header) and have not been run on a live
+pod; the self-test (step 0) runs them.
+
+The deadline timer, `FS11_DEADLINE_S` after the start, terminates the pod whatever the job is
+doing; it terminates first and logs after. The parts get a work deadline of the timer less the
+grace window and `FS11_PACK_RESERVE_S` (default 600 s), so 3 h by default; a part still
+running then is killed, and the rest are recorded as not started. A session still running
+`FS11_HANG_MARGIN_S` (default 120 s) after the work deadline is killed with its part, so
+packing starts. A SIGTERM or SIGINT to the job terminates too. The job appends to
+`fs11_out/job.log` directly, with SIGPIPE ignored, so a dead reader of `fs11_job.out` can't
+take it down. `DRY_RUN=1` prints the terminate commands instead and stops the job when the
+timer fires; the tests run the timer, the hung session, a dead reader, a failed pack and the
+always-terminate path that way on the Mac, and the retries, the confirmation, the stop fallback
+and the lock on stub `runpodctl`, `curl` and `timeout`.
+
+**The upload is checked on every run.** After the models part, and on every rerun even when
+that part is done, the session checks each packed file against the manifest's SHA-256 and each
+fetched model against the Mac's. A file missing or changed marks every later part of the model
+it belongs to `not_started`, with the reason (all later parts, for a file no model owns). A
+part already done stays done: it ran on an upload that passed then. The benchmark's part is
+done only when its result is `complete` and no row holds an `error:`.
 
 **Estimated wall time**, against the plan's 2–3.5 h. The GPU figures are the A40's at test
-scale (above): check 5 at about 0.5 ms per product. None has been measured on an H100.
+scale (above): check 5 at about 0.5 ms per product before it was batched. None has been
+measured on an H100.
 
 | part | estimate | from |
 |---|---|---|
 | models | 2–5 min | about 7.7 GB of public weights, hashed after download |
 | benchmark | 30–90 min (killed at 90) | no H100-preset run yet; the smoke preset took 7.3 min on the A40 |
-| bring-up, 4 models | 20–40 min | check 5 at `M` products: Llama-3.2-1B 393,555 (3–4 min), Falcon3-1B 110,973 (about 1 min), Qwen2.5-0.5B 258,555 and Qwen2.5-1.5B 258,639 (2–2.6 min each); plus loading, training under capture, and hashing a 32–64 GB transcript on each side (F15) |
+| bring-up, 4 models | 15–40 min | check 5 at `M` products: Llama-3.2-1B 393,555 (3–4 min unbatched), Falcon3-1B 110,973 (about 1 min), Qwen2.5-0.5B 258,555 and Qwen2.5-1.5B 258,639 (2–2.6 min each), a few minutes less in all with check 5 batched; plus loading, training under capture, and hashing a 32–64 GB transcript on each side (F15) |
 | smooth, 8 checks | 8–16 min | 10 plain steps and 11 whole-list forward passes each |
-| total | 65–150 min | |
+| total | 60–150 min | midpoint about 105 min |
 
 **cuPQC.** The benchmark's GPU-hashing parts (E2, the hashing half of E3, E5b and E5c) need
 the cuPQC SDK, whose licence is decided just before rental. The session logs each of them as
 skipped, with the reason, unless `CUPQC_SDK_DIR` names an installed SDK; no extension to call
-it exists yet, so for now they are skipped either way. The benchmark's Llama row in E6 reads the
-unsloth mirror's weights, which aren't in the Mac's cache, so it skips too.
+it exists yet, so for now they are skipped either way. The benchmark's Llama row in E6 loads
+Meta's snapshot from the upload, and takes its leaf sizes from the unsloth mirror's config,
+which has the same shapes; each row records the repo it loaded.
 
 The bring-up step may exit 1 at bf16 on the concentration guard alone (F20); the step's
-acceptance, peaks and times are in its log either way.
+acceptance, peaks and times are in its log either way. The smooth check also logs the global
+gradient norm at each step, which doesn't enter its verdict but shows where a loss jump comes
+from.
 
 ## Workflow: calibrating the tolerances
 
