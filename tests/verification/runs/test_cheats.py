@@ -304,10 +304,11 @@ def test_sweep_restores_the_root_and_matches_check_5(env, kept):
     from verification.verifier.context import StepContext
     ctx = StepContext.for_computation(c, step=t, indices=(), h_D=env.h_D, n_records=len(env.D),
                                       prev_w_hashes=(), chain_check_id="7", k=K)
-    seen = {p.m: tuple(p.normalized) for p in r.verifier.stats[t].products}
     stat = {p.m: p for p in r.verifier.stats[t].products}
     for h in held:
-        assert fs.honest_measure(c, store, h, ctx, env.bands) == seen[h.spec.m]
+        mp = fs.honest_measure(c, store, h, ctx, env.bands)
+        assert fs.unmatched(mp, stat[h.spec.m]) == []
+        assert tuple(mp.normalized) == stat[h.spec.m].normalized
         # x's unit is the target's own e_m (F18), from the U check 5 measured; the sweep's
         # ‖P‖_F is float64, check 5's fp32, so the two e_m agree to rounding
         st = stat[h.spec.m]
@@ -335,58 +336,151 @@ def test_sweep_restores_the_root_and_matches_check_5(env, kept):
     assert store.root == base
 
 
-def test_a_member_is_measured_as_check_5_stacks_it(env):
-    """EM1's crash on ``L15.S[0,0]``. Check 5 measures a batched product's members stacked into
-    one contiguous batch (``checks._measure_run``, ``measure_products``). Measured alone, with
-    ``B`` as the replay serves it (``Kᵀ``, a transposed view), ``B²·1`` rounds differently, so
-    ``U`` does; where ``U > ‖P‖_F`` the band unit uses ``U``, and every normalized residual
-    moves by the same factor. The sweep measures a member as a stacked batch of one, with check
-    5's bits, honest or planted; a product that isn't a member keeps check 5's single path."""
+def test_a_member_is_measured_in_its_run_batch(env):
+    """EM1's crash on ``L15.S[0,0]``, and its Linux sequel. Check 5 measures a batched
+    product's members stacked into one contiguous batch per operand shape
+    (``checks._measure_run``, ``measure_products``). A member's numbers depend on that batch:
+    measured alone, on the transposed ``B = Kᵀ`` the replay serves, ``U`` came out 1.09e−9 apart
+    on the Mac (EM1); measured as a stacked batch of one, ``U`` and ``ν`` moved in the last bits
+    on Linux x86, whose BLAS rounds the matrix-vector products by the stack's size. Both are
+    properties of a platform's rounding, so this test asserts neither. It asserts what holds on
+    every platform: the sweep measures a member in its whole batch, beside the other members'
+    committed products, through check 5's own call, so every number is check 5's, honest or
+    planted, in any slot; and a product that isn't a member keeps check 5's single path."""
     from verification.computation.interface import ProductKind, ProductSpec
     from verification.verifier.checks import _measure_run
     from verification.verifier.context import StepContext
-    from verification.verifier.matmul_check.freivalds import measure_products, term_scale
+    from verification.verifier.matmul_check.freivalds import (
+        measure_products,
+        term_scale,
+        term_scales,
+    )
     g = torch.Generator().manual_seed(0)
     n, q = 128, 64  # SmolLM2's S member shape: Q [n, d]·Kᵀ [d, n]
-    specs, ops = [], []
+    specs, ops, prods = [], {}, {}
     for i in range(3):
         a1, k1 = torch.randn(n, q // 2, generator=g), torch.randn(n, q // 2, generator=g)
         a = torch.cat([a1, a1], 1)  # P = a1·(0.5·noise)ᵀ: its terms cancel, so U ≈ 3·‖P‖_F
         kk = torch.cat([k1, -k1 + 0.5 * torch.randn(n, q // 2, generator=g)], 1)
-        b = kk.t()  # the view the replay serves
-        ops.append((a, b, a @ b))
+        ops[10 + i], prods[10 + i] = (a, kk.t()), a @ kk.t()  # B: the view the replay serves
         specs.append(ProductSpec(10 + i, f"L1.S[0,{i}]", ProductKind.FORWARD, (n, q), (q, n),
                                  layer=1, member=(0, i)))
+    ms = [s.m for s in specs]
     ctx = StepContext.for_computation(env.c, step=4, indices=(), h_D=env.h_D,
                                       n_records=len(env.D), prev_w_hashes=(),
                                       chain_check_id="7", k=K)
     h, eps = b"\x07" * 32, dict(eps_in=ctx.eps_in, eps_acc=ctx.eps_acc)
 
-    def check5(p0):  # the run's batch as check 5 stacks it, member 0's product p0
-        ps = [p0] + [o[2] for o in ops[1:]]
-        return measure_products(torch.stack([o[0] for o in ops]),
-                                torch.stack([o[1] for o in ops]), torch.stack(ps), h=h,
-                                ms=[s.m for s in specs], k=K, **eps)[0]
+    def check5(slot, p):  # the run's batch as check 5 stacks it, slot's product p
+        ps = [p if j == slot else prods[m] for j, m in enumerate(ms)]
+        return measure_products(torch.stack([ops[m][0] for m in ms]),
+                                torch.stack([ops[m][1] for m in ms]), torch.stack(ps), h=h,
+                                ms=ms, k=K, **eps)[slot]
 
-    a, b, p = ops[0]
-    want = check5(p)
-    assert want.u / want.p_norm > 2
-    # the mismatch: alone, U and so every normalized residual differ (raw residuals don't)
-    [alone] = _measure_run(specs[:1], [(a, b, p, None)], h=h, k=K, **eps)
-    assert alone.u != want.u and term_scale(a, b) == alone.u
-    assert alone.residuals == want.residuals and alone.p_norm == want.p_norm
-    assert all(x != y for x, y in zip(alone.normalized, want.normalized))
-    # the fix: the sweep's U and measure are check 5's, bit for bit
-    pn = float(torch.linalg.vector_norm(p, dtype=torch.float64))
-    held = fs.Held(specs[0], "cls", a, b, p, p, pn, u=fs.target_term_scale(specs[0], a, b))
-    assert held.u == want.u
-    assert fs.measure_target(held, p, h=h, ctx=ctx) == want
-    p2, _ = fs.plant(p, "row2", 1e-6, pn, torch.Generator().manual_seed(1))
-    assert fs.measure_target(held, p2, h=h, ctx=ctx) == check5(p2) != want
-    # a product that isn't a member is measured alone, as check 5 measures it
+    for slot, spec in enumerate(specs):
+        a, b = ops[spec.m]
+        p = prods[spec.m]
+        pn = float(torch.linalg.vector_norm(p, dtype=torch.float64))
+        batch = fs.Batch.of(spec.m, ms, ops, prods)
+        assert (batch.ms, batch.slot) == (tuple(ms), slot)
+        held = fs.Held(spec, "cls", a, b, p, p, pn, batch=batch)
+        held.u = fs.target_term_scale(held)
+        want = check5(slot, p)
+        assert want.u / want.p_norm > 2  # the unit is U's, so U sets every normalized residual
+        assert held.u == want.u == term_scales(batch.a, batch.b)[slot]
+        assert fs.measure_target(held, p, h=h, ctx=ctx) == want
+        p2, _ = fs.plant(p, "row2", 1e-6, pn, torch.Generator().manual_seed(slot))
+        assert fs.measure_target(held, p2, h=h, ctx=ctx) == check5(slot, p2) != want
+        assert torch.equal(batch.p, torch.stack([prods[m] for m in ms]))  # honest slot back
+    # a product that isn't a member is measured alone, as check 5 measures a run of one
+    a, b = ops[10]
+    p = prods[10]
     single = dataclasses.replace(specs[0], member=None)
-    held1 = dataclasses.replace(held, spec=single, u=fs.target_term_scale(single, a, b))
-    assert held1.u == alone.u and fs.measure_target(held1, p, h=h, ctx=ctx) == alone
+    held1 = fs.Held(single, "cls", a, b, p, p, float(torch.linalg.vector_norm(p)))
+    held1.u = fs.target_term_scale(held1)
+    [alone] = _measure_run([single], [(a, b, p, None)], h=h, k=K, **eps)
+    assert held1.u == term_scale(a, b) == alone.u
+    assert fs.measure_target(held1, p, h=h, ctx=ctx) == alone
+
+
+def test_unmatched_names_each_number_that_differs():
+    from verification.verifier.matmul_check.freivalds import ProductMeasure
+    mp = ProductMeasure(nu=2.0, p_abs1=1.0, kappa=2.0, residuals=(0.1, 0.2), p_norm=3.0,
+                        unit=0.5, normalized=(0.2, 0.4), u=4.0)
+    st = ProductStat(1, "P", "cls", 2.0, (0.2, 0.4), q=8, p_norm=3.0, nu=2.0, p_abs1=1.0,
+                     u=4.0)
+    assert fs.unmatched(mp, st) == []
+    assert fs.unmatched(mp, dataclasses.replace(st, u=math.nan, nu=math.nan)) == []  # unrecorded
+    bad = dataclasses.replace(st, kappa=2.5, u=4.000000001, normalized=(0.2, 0.41))
+    assert fs.unmatched(mp, bad) == ["κ", "U", "normalized residuals"]
+    assert fs.unmatched(dataclasses.replace(mp, nu=math.nan, p_abs1=math.nan,
+                                            kappa=math.nan), st) == ["κ", "ν", "‖|P|·1‖"]
+
+
+@pytest.fixture(scope="module")
+def tiny_decoder_step():
+    """A tiny Llama step, checks 2 and 5 run on it in recording mode."""
+    from tests.verification.decoder_helpers import make_records, tiny_config
+    from verification.computation.instances.decoder import DecoderComputation
+    from verification.prover.step import prove_step
+    from verification.transcript.store import InMemoryStore
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    store = InMemoryStore.from_step(c, prove_step(c, c.build_model(), w0, make_records((12, 7))),
+                                    copy=True)
+    return c, store
+
+
+def _check_5_stats(c, store):
+    """Check 5's records of every product on ``store``, as the verifier computes them."""
+    from verification.verifier.checks import check_2_commitment, check_5_matmuls
+    from verification.verifier.context import StepContext
+    ctx = StepContext.for_computation(c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32),
+                                      n_records=c.n_s, prev_w_hashes=(), chain_check_id="0",
+                                      k=K, judge=False)
+    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+    assert check_5_matmuls(store, c, ctx, Bands.provisional()) is None
+    return {p.m: p for p in ctx.stats.products}, ctx
+
+
+def test_batch_members_are_check_5s_stack(tiny_decoder_step):
+    c, _ = tiny_decoder_step
+    assert fs.batch_members(c, c.product(c.m_of("L1.Y_q"))) is None  # a run of one
+    s, o = c.product(c.m_of("L1.S[0,0]")), c.product(c.m_of("L1.O[1,3]"))
+    run_s, run_o = fs.batch_members(c, s), fs.batch_members(c, o)
+    assert [x.name for x in run_s] == [f"L1.S[{i},{j}]" for i in range(2) for j in range(4)]
+    assert [x.name for x in run_o] == [f"L1.O[{i},{j}]" for i in range(2) for j in range(4)]
+    dk = fs.batch_members(c, c.product(c.m_of("L2.dK[0,0]")))
+    assert all((x.a_shape, x.b_shape) == (dk[0].a_shape, dk[0].b_shape) for x in dk)
+    assert [x.m for x in dk] == sorted(x.m for x in dk) and len(dk) >= 8
+
+
+def test_sweep_targets_get_check_5s_numbers_on_a_decoder(tiny_decoder_step):
+    """On a real decoder step every number the sweep measures for a target, batched member or
+    not, is the one check 5 records, honest and with an error planted (check 5 rerun on the
+    re-rooted transcript). At this model's shapes a member measured as a stack of one got its
+    batch's bits on Linux x86 too (2026-10-14), so the 128×64 batch of
+    :func:`test_a_member_is_measured_in_its_run_batch` is the test that catches a member
+    measured outside its batch."""
+    c, store = tiny_decoder_step
+    stats, ctx = _check_5_stats(c, store)
+    names = ["L1.Y_q", "L1.S[0,0]", "L2.O[1,3]", "L1.dA[0,1]", "L2.dV[1,2]", "L1.dQ[0,0]",
+             "L2.dK[1,3]", "L2.G_down", "dF"]
+    held = fs.hold_targets(c, store, [c.product(c.m_of(x)) for x in names])
+    assert [h.batch is not None for h in held] == [x.split(".")[-1][:2] in (
+        "S[", "O[", "dA", "dV", "dQ", "dK") for x in names]
+    for h in held:
+        mp = fs.honest_measure(c, store, h, ctx, Bands.provisional())
+        assert fs.unmatched(mp, stats[h.spec.m]) == [] and mp.u == h.u
+    base, gen = store.root, torch.Generator().manual_seed(0)
+    for h in held[1:3] + held[-3:-1]:
+        idx = c.product_index(h.spec.m)
+        p2, _ = fs.plant(h.p, "row2", 0.1, h.p_norm, gen)
+        root = perturb_leaf(c, store, idx, p2)
+        mp = fs.measure_target(h, p2, h=root, ctx=ctx)
+        planted, _ = _check_5_stats(c, store)
+        assert fs.unmatched(mp, planted[h.spec.m]) == []
+        assert perturb_leaf(c, store, idx, h.leaf) == base
 
 
 def test_summary_fits_the_entry_constant():

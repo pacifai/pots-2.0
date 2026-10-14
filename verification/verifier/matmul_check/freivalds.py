@@ -52,7 +52,10 @@ C1 uses it to time check 5 with and without the guard; a judged run keeps the de
 it, for callers that need a product's ``e_m`` outside check 5 (the flipped-matmul sweep's
 scale). The two can differ in the last bits for the same product: the matvecs over ``B²`` round
 by ``B``'s layout, and check 5 stacks a batched product's members into a contiguous batch while
-the replay serves some ``B`` (``Kᵀ``) as a transposed view.
+the replay serves some ``B`` (``Kᵀ``) as a transposed view. A member's ``U`` (and ``ν``) can
+also depend on the batch's size: on Linux x86 a member measured in a batch of one differs in the
+last bits from the same member in its full batch, though not on Apple Accelerate. A caller that
+needs check 5's bits measures the member in check 5's whole batch.
 """
 
 from __future__ import annotations

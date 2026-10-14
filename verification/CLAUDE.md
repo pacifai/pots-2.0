@@ -1227,7 +1227,10 @@ interface.
     `measure_products`'s bits (the sweep's unit). The two can differ in the last bits for the
     same product: the matrix-vector products over `B²` round by `B`'s layout, check 5 stacks a
     member run into contiguous copies, and the replay serves `S`'s `B = Kᵀ` as a transposed
-    view (step 4's `L15.S[0,0]`: `U` 1.09e−9 apart, 12 of 128 entries of `A²·(B²·1)`). Since `U ≤ ν`, test 1 bounds `U/‖P‖_F ≤ √w·κ_max`
+    view (step 4's `L15.S[0,0]`: `U` 1.09e−9 apart, 12 of 128 entries of `A²·(B²·1)`). A
+    member's `U` and `ν` also depend on the batch's size on Linux x86 (torch 2.9.1's CPU
+    wheel): a batch of one moves them in the last bits, while Apple Accelerate gives a batch of
+    one the full batch's bits (2026-10-14). Since `U ≤ ν`, test 1 bounds `U/‖P‖_F ≤ √w·κ_max`
     (`w` the width), so the band can't grow without the κ test seeing it. An fp32 overflow of
     `U` gives `inf`, which rejects as any non-finite number does.
   `measure_products(a, b, p, *, h, ms, k, eps_in, eps_acc)` does the same for a stacked batch
@@ -1870,23 +1873,50 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     judged with check 5's own `_judge_product` (a biased target holds its committed `b` too).
     Then one check-6 trial (`check6_trial`): one `W_{t+1}` entry moved to
     `ρ ≈ CHECK6_FACTOR·τ_W` (2, a placeholder) must reject at 6a on that entry.
-  - **Measured as check 5 measures (2026-10-13).** Check 5 measures a member run's products
-    stacked (`torch.stack`, contiguous copies, `measure_products`), every other product alone
-    as served. `measure_target` does the same for one target: a member as a stacked batch of
-    one through `measure_products`, any other product through `_measure_run`;
-    `target_term_scale` gives `U` the same way (`freivalds.term_scales` or `term_scale`).
-    Each member's numbers are its own in a batch, so a batch of one has its run's bits.
-    Before its trials each target is measured on the honest transcript (`honest_measure`):
-    its normalized residuals, and its `U` where the run recorded one, must equal check 5's
-    bit for bit, else `AssertionError`. Until this fix the sweep measured a member alone, on
-    the replay's transposed `B = Kᵀ`, and EM1's sweep on step 4 stopped at that check on
-    `P_1110` (`L15.S[0,0]`, `U/‖P‖_F` 1.43): `U` 1.09e−9 above check 5's, every normalized
-    residual 9.71e−10 below, the raw residuals and `‖P‖_F` equal. `P_4752` (`L15.dA[0,0]`)
-    had `U` 1.76e−8 apart but `U/‖P‖_F` 0.87, so its unit, and its residuals, matched. Against
-    the alternatives: taking `U` from the run's record alone would leave the trials'
-    judgments on the alone-measured unit; a relative tolerance would let the sweep judge on
-    numbers check 5 never computes. The fix changes no check-5 code, verdict or cost; the
-    sweep pays one stack copy of `A`, `B` and `P'` per member trial.
+  - **Measured as check 5 measures (2026-10-13, 2026-10-14).** Check 5 splits the products
+    into runs (`_member_runs`). A run of one is measured alone, as served. A longer run is
+    split by operand shapes, and each shape's members are stacked in run order (`torch.stack`,
+    contiguous copies) and measured in one `measure_products` call. `measure_target` does the
+    same for one target. A member's `Held.batch` (`Batch`, from `batch_members`) holds the
+    stacked operands and committed products of every member of its run with its shapes (36 at
+    test scale, `n_s·n_h`). A trial writes the planted product into the target's slot,
+    measures the whole batch and restores the slot. Any other product goes through
+    `_measure_run`. `target_term_scale` gives `U` the same way (`freivalds.term_scales` on the
+    batch, or `term_scale`). Before its trials each target is measured on the honest
+    transcript (`honest_measure`). Every number the run recorded for it (`κ`, `ν`, `‖|P|·1‖`,
+    `‖P‖_F`, `U` and the normalized residuals; `unmatched`) must equal check 5's bit for bit,
+    else `AssertionError`.
+    - A member's bits depend on its batch in two ways. The first is layout. Until 2026-10-13
+      the sweep measured a member alone, on the replay's transposed `B = Kᵀ`, and EM1's sweep
+      on step 4 stopped at the self-check on `P_1110` (`L15.S[0,0]`, `U/‖P‖_F` 1.43): `U`
+      1.09e−9 above check 5's, every normalized residual 9.71e−10 below, the raw residuals and
+      `‖P‖_F` equal. `P_4752` (`L15.dA[0,0]`) had `U` 1.76e−8 apart but `U/‖P‖_F` 0.87, so its
+      unit and its residuals matched.
+    - The second is batch count. The 2026-10-13 fix measured a member as a stacked batch of
+      one, which gives a member its full batch's bits on Apple Accelerate but not on Linux x86
+      (torch 2.9.1's CPU wheel, Intel Xeon Gold 6342). There `U` moved in every case tried,
+      `ν` and `κ` often, and the unit and the normalized residuals wherever `U > ‖P‖_F`. The
+      raw residuals, `‖P‖_F` and `‖|P|·1‖` matched in every case tried. CUDA (an A40, torch
+      2.9.1) rounds by batch count too: a member's `A(B·r)` at nine columns differs between a
+      batch of one and any larger batch, and a one-column matrix-vector product differs from a
+      1,920-member batch's at most smaller batch sizes. So only the whole batch gives check
+      5's bits on every platform.
+    - Against the alternatives: taking `U` from the run's record alone would leave the trials'
+      judgments on another measurement's unit; a relative tolerance would let the sweep judge
+      on numbers check 5 never computes. Measuring the whole run through `_measure_run` would
+      cost 2–4 times as much and give the same bits, since check 5 measures each shape group
+      in a call of its own.
+    - The fix changes no check-5 code, verdict or cost. The sweep pays for the whole group in
+      every member trial: on the dev Mac `measure_products` takes 1.38 ms for the 36 members
+      against 0.15 ms for one at 128×64×128 (1.18 against 0.14 ms at 128×128×64), and each
+      member target runs about 23,200 trials, so about 28 s more per member target. Measured
+      on EM1's step 4 (2026-10-14, dev Mac, `MallocLargeCache=0`), grid and deep together:
+      `L15.S[0,0]` 6.4 → 38.5 s, `L15.O[0,0]` 5.2 → 32.7 s, `L15.dA[0,0]` 7.3 → 40.9 s, the
+      other four targets within 1%. The whole sweep went from 626 to 722 s by the records'
+      clocks (758 s wall with the model load); peak footprint 7.8 GB, and `run_end`'s 9.28 GB
+      equals EM1's. Every
+      record but `sweep_source`'s path, and every array of `sweep_trials.npz`, equals EM1's
+      bit for bit.
   - `ĉ` is fitted on the trials swept at `x ≥ FIT_X_MIN` (3), each at its realized `x`. Until
     EV3 the fit picked trials by realized `x`, so rounding kept or dropped the `x = 3` point.
     Each trial also logs `‖P'‖_F/‖P‖_F`, and each summary refits `ĉ` on `x' = x·‖P‖_F/‖P'‖_F`
