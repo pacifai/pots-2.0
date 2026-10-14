@@ -54,7 +54,7 @@ from typing import Any
 import torch
 
 from verification.commitment.merkle import DIGEST_SIZE, merkle_root, verify_path
-from verification.computation.interface import DeclaredComputation, ProductSpec, Replay
+from verification.computation.interface import HOST, DeclaredComputation, ProductSpec, Replay
 from verification.transcript.reader import TranscriptView
 from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands, product_class
@@ -551,12 +551,14 @@ def _served(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay:
             a, b = replay.operands(spec.m)
         p = view.product(spec.m)
         if spec.bias is not None:
-            bias = view.w_t(spec.bias).detach().to(c.operand_dtype).to(torch.float32)
+            bias = view.w_t(spec.bias).detach().to(a.device, c.operand_dtype).to(torch.float32)
     if (tuple(a.shape), tuple(b.shape)) != (spec.a_shape, spec.b_shape):
         raise RuntimeError(f"{spec.name}: replay operands {tuple(a.shape)}·{tuple(b.shape)} "
                            f"!= declared {spec.a_shape}·{spec.b_shape}")
+    # The leaves are in host memory, the replay on the run's device (F4a): check 5 measures
+    # there, so the leaf moves to the operands.
     return (a.detach().to(torch.float32), b.detach().to(torch.float32),
-            p.detach().to(torch.float32), bias)
+            p.detach().to(a.device, torch.float32), bias)
 
 
 def _measure_run(specs: Sequence[ProductSpec], served: Sequence[Served], *,
@@ -660,9 +662,9 @@ def _replay_glue_gradients(c: DeclaredComputation, ctx: StepContext,
 
 
 def _glue_gradient(grads: Mapping[str, torch.Tensor], name: str) -> torch.Tensor:
-    """Check 6b's ``G`` for glue weight ``name``, in fp32 (P6); the record pass takes it here
-    too."""
-    return grads[name].detach().to(torch.float32)
+    """Check 6b's ``G`` for glue weight ``name``, in fp32 (P6), in host memory beside the
+    weight leaves it is checked against; the record pass takes it here too."""
+    return grads[name].detach().to(HOST, torch.float32)
 
 
 CHECKS: Mapping[str, Callable[[TranscriptStore, DeclaredComputation, StepContext, Bands],

@@ -197,7 +197,9 @@ class DecoderComputation(DeclaredComputation):
         if compute_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(f"COMPUTE_DTYPE must be float32 or bfloat16, got {compute_dtype}")
         self.master_dtype, self.compute_dtype = master_dtype, compute_dtype
-        self.device_type = torch.device(device).type
+        # F4a: the model and its activations live on the run's device; leaves stay on the host.
+        self.device = torch.device(device)
+        self.device_type = self.device.type
         c = self.config
         self.L = int(c.num_hidden_layers)
         self.d = int(c.hidden_size)
@@ -489,6 +491,7 @@ class DecoderComputation(DeclaredComputation):
                 model = AutoModelForCausalLM.from_config(
                     copy.deepcopy(self.config), attn_implementation="eager",
                     dtype=self.weight_dtype)
+        model.to(self.device)
         model.eval()
         self._check_model(model)
         return model
@@ -511,13 +514,16 @@ class DecoderComputation(DeclaredComputation):
             raise ValueError(f"parameters not {self.weight_dtype}: {bad[:3]}")
 
     def assemble(self, records: Sequence[Record]) -> Batch:
-        """Glue: pad and stack the records (ref block §2). ``ρ`` comes from each ``ℓ``."""
+        """Glue: pad and stack the records (ref block §2), on the run's device. ``ρ`` comes
+        from each ``ℓ``."""
         if len(records) != self.n_s:
             raise ValueError(f"batch has {len(records)} records, the computation declares {self.n_s}")
         for r in records:
             if not isinstance(r, Record):
                 raise ValueError(f"a decoder record is a records.Record, got {type(r).__name__}")
-        return assemble_batch(records, self.n, pad_id=self.pad_id)
+        b = assemble_batch(records, self.n, pad_id=self.pad_id)
+        return Batch(b.ids.to(self.device), b.targets.to(self.device), b.mask.to(self.device),
+                     b.rho.to(self.device))
 
     def logits(self, model: nn.Module, batch: Batch) -> torch.Tensor:
         """``Λ`` as ``[n_s, n, n_v]``: the forward pass, embedding to output projection."""
@@ -1306,8 +1312,8 @@ class DecoderReplay(Replay):
             (g_emb,) = torch.autograd.grad(emb(self.batch.ids), [emb.weight],
                                            grad_outputs=self._dx[1])
         # F6b: the committed G_E^head widened exactly to W_E's format, plus the lookup's.
-        g_e = (self.view.product(c.m_of("G_E_head")).to(c.weight_dtype) + g_emb if c.tied
-               else g_emb)
+        g_e = (self.view.product(c.m_of("G_E_head")).to(g_emb.device, c.weight_dtype) + g_emb
+               if c.tied else g_emb)
         grads = {**self._glue, _E: g_e}
         out = {n: grads[n] for n in c.glue_gradient_weights}
         bad = [n for n, g in out.items() if g.dtype != c.weight_dtype]

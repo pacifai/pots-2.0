@@ -36,6 +36,7 @@ import torch
 from verification.commitment.leaves import commit_leaves
 from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import (
+    HOST,
     DeclaredComputation,
     load_weights,
     snapshot_weights,
@@ -111,13 +112,13 @@ def _versions(objs: Sequence[Any]) -> tuple[int, ...]:
 def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int]) -> bool:
     """Whether the caller's ``w`` can be the committed ``W_t`` leaf itself (see prove_step).
 
-    It must hash to the bytes the model holds after ``load_weights`` (same dtype, shape and
-    device, contiguous), own its whole storage (no view that another tensor can write through),
+    It must hash to the bytes the model holds after ``load_weights`` (same dtype and shape,
+    contiguous, in host memory like every leaf), own its whole storage (no view that another tensor can write through),
     not be a live parameter (``requires_grad``), and not share storage with any of ``model``'s
     parameters, which the step updates in place.
     """
     return (not w.requires_grad and w.dtype == p.dtype and w.shape == p.shape
-            and w.device == p.device and w.is_contiguous() and not w._is_view()
+            and w.device == HOST and w.is_contiguous() and not w._is_view()
             and w.storage_offset() == 0
             and w.untyped_storage().nbytes() == w.numel() * w.element_size()
             and w.untyped_storage().data_ptr() not in model_storages)
@@ -131,7 +132,7 @@ def _w_t_leaves(computation: DeclaredComputation, model: torch.nn.Module,
     out = {}
     for n in computation.weight_names:
         w, p = w_t[n], model.get_parameter(n)
-        out[n] = w if _shareable(w, p, storages) else p.detach().clone()
+        out[n] = w if _shareable(w, p, storages) else p.detach().to(HOST, copy=True)
     return out
 
 
@@ -218,7 +219,7 @@ def prove_step(
         with cap.phase("backward"), sec("train.backward"):
             loss.backward()
     with sec("P1.label"):
-        products = [p.detach() for p in computation.label(cap, model)]
+        products = [p.detach().to(HOST) for p in computation.label(cap, model)]
         if len(products) != computation.M:
             raise RuntimeError(f"label returned {len(products)} products, M = {computation.M}")
         # Invariant 6: the products are fixed and nothing has touched the captured tensors.
