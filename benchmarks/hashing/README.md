@@ -59,7 +59,13 @@ every layer for the native batch, and E6 at 2 × 16 on the CPU. E3 times Qwen2.5
 over 2048 tokens, and E4 copies 64 and 256 MiB pieces of a 1 GiB buffer, in 1-second windows.
 It took about 5.5 minutes on an Apple M5 Pro, 4.2 of them in E1's whole-object rows, which
 hash about four tasks per thread at each leaf size and thread count. Any flag given explicitly
-overrides the preset; see `--help`. To run E6 on a GPU at smoke size, add `--e6-device cuda`.
+overrides the preset; see `--help`. To run E6 on a GPU at smoke size, add `--e6-device cuda`;
+with it, the smoke run took 7.3 minutes on an A40 pod, 6 of them in E1.
+
+The smoke sizes check that the code runs, and their rates are noisy: a 256 MiB buffer over 7
+threads hashes in tens of milliseconds. On the A40 pod, E1's chunked BLAKE3 rows at 7 threads
+and 1 MiB chunks read 7 to 17 GB/s on the smoke buffer and 33 GB/s on a 4 GiB one, which
+matches E4's one-second hashing windows.
 
 A step is named by its model (`llama-3.2-1b`), at `--n-s` × `--n` with bf16 products. To give
 a step its own batch and product dtype, write `model:N_SxN:DTYPE`. For example,
