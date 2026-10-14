@@ -164,6 +164,28 @@ def _param(info: Any) -> str | None:
     return info.param_name or info.param_copy
 
 
+def _out_layout(rec: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Shape and strides of one product of ``rec`` as the op wrote it (a ``bmm`` member drops
+    the batch dimension). On a GPU ``rec.out`` is a contiguous host copy (FS9), so labeling
+    judges the layout the capture recorded from the op's own output."""
+    o = rec.out_info
+    return (o.shape, o.stride) if rec.batch is None else (o.shape[1:], o.stride[1:])
+
+
+def _contiguous(shape: tuple[int, ...], stride: tuple[int, ...]) -> bool:
+    """``Tensor.is_contiguous()`` for a recorded layout: each dimension longer than 1 has
+    the stride of the dimensions after it packed densely, and an empty tensor is contiguous."""
+    if 0 in shape:
+        return True
+    want = 1
+    for size, st in zip(reversed(shape), reversed(stride)):
+        if size != 1:
+            if st != want:
+                return False
+            want *= size
+    return True
+
+
 class DecoderComputation(DeclaredComputation):
     """``C`` for a Llama or Qwen2 causal LM of the given config, batch ``n_s × n`` and step size.
 
@@ -660,7 +682,7 @@ class _Labeler:
         if tuple(p.shape) != spec.p_shape or p.dtype != self.c.product_dtype:
             raise LabelingError(f"{name}: leaf {p.dtype} {tuple(p.shape)} != declared "
                                 f"{self.c.product_dtype} {spec.p_shape}")
-        if not p.is_contiguous():
+        if not (_contiguous(*_out_layout(rec)) if leaf is None else leaf.is_contiguous()):
             raise LabelingError(f"{name} (record #{rec.index}): output is not contiguous")
         self.slots[m - 1] = p
 

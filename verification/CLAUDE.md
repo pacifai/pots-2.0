@@ -946,8 +946,12 @@ interface.
     - `HostBuffers(pin=True)` hands out pinned host buffers by `(shape, dtype)` with
       `take`. A buffer is reused only when its storage's use count is back to the pool's
       own, that is when the step that committed it has dropped every leaf, view and NumPy
-      array of it. The process shares one pool, `HOST_BUFFERS`, so step `t+1` reuses step
-      `t`'s buffers. Two steps alive at once use two sets.
+      array of it. The pool also keeps the storage's Python object, which
+      `untyped_storage()` returns to every caller while it lives without raising the use
+      count, and reuses a buffer only when that object's reference count is back to the
+      pool's own too (`_holds`), so a held storage object keeps its buffer. The process
+      shares one pool, `HOST_BUFFERS`, so step `t+1` reuses step `t`'s buffers. Two steps
+      alive at once use two sets.
     - The copy runs on the pool's side stream after `wait_stream` on the producing stream,
       with `non_blocking=True` and an event. The capture holds the GPU tensor until the
       event completes, so the allocator can't reuse its block under the copy; that hold
@@ -960,7 +964,10 @@ interface.
     - `rec.out` is the host copy and `rec.out_storage` the op's own output storage.
       `is_output_of(t, rec)` compares with the latter, so the `W.grad` check (AccumulateGrad
       adopts the GPU output) works on both devices. The producer map keys on the storage
-      too, since a dropped output's address can come back.
+      too, since a dropped output's address can come back. The host copy is contiguous
+      whatever the op wrote, so labeling's "output is not contiguous" check reads the
+      layout recorded in `rec.out_info` (a `bmm` member's without the batch dimension),
+      which means the same on both devices.
     - On CPU no output is copied and no buffer is made, so a CPU capture is unchanged:
       every root, loss and check number below is the same bit for bit.
     - Operands are not copied. They stay on the GPU until `release_operands` in labeling,

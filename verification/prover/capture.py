@@ -113,13 +113,16 @@ as it is, so on CPU the capture is unchanged. In order, per output:
 
 The buffers come from :class:`HostBuffers`, allocated once per shape and dtype and reused by
 every later step. A buffer is reused only when nothing else holds its storage: the step that
-committed it has dropped its leaves. Operands are not copied: they stay on the GPU until
-:meth:`MatmulCapture.release_operands`.
+committed it has dropped its leaves and every storage object of them. Operands are not copied:
+they stay on the GPU until :meth:`MatmulCapture.release_operands`. The host copy is always
+contiguous, so labeling judges the layout of the op's own output, recorded in
+:attr:`MatmulRecord.out_info`.
 """
 
 from __future__ import annotations
 
 import contextlib
+import sys
 from collections import Counter, deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -271,10 +274,12 @@ class CopyRecord:
         return self.src_info.param_name or self.src_info.param_copy
 
 
-def _use_count(buf: torch.Tensor) -> int:
-    """References to ``buf``'s storage, counted the same way on every call."""
-    s = buf.untyped_storage()
-    return torch._C._storage_Use_Count(s._cdata)
+def _holds(entry: list) -> tuple[int, int]:
+    """What holds a pool entry's storage: its use count (tensors, views, NumPy arrays) and the
+    references to the pool's Python storage object, which ``untyped_storage()`` hands to every
+    caller while it lives. The pool measures both through this one call, so its own
+    references count the same each time."""
+    return torch._C._storage_Use_Count(entry[1]._cdata), sys.getrefcount(entry[1])
 
 
 class HostBuffers:
@@ -284,39 +289,45 @@ class HostBuffers:
     reuses one whose storage has no reference beyond the pool's own, else allocates (pinned
     when ``pin``, which needs CUDA). Each buffer goes out as a fresh tensor over the whole
     storage (``set_``), not the pool's own tensor, so every holder, view or NumPy array of
-    it raises the storage's use count until it is dropped. A buffer is taken again only after
-    the step that committed it has dropped its leaves; two steps alive at once use two sets.
-    One side stream per device carries the copies.
+    it raises the storage's use count until it is dropped. The pool also keeps the storage's
+    Python object, which ``untyped_storage()`` returns to anyone who asks while it lives, so a
+    held storage object raises that object's reference count. A buffer is taken again only
+    after the step that committed it has dropped its leaves and every storage object of them;
+    two steps alive at once use two sets. One side stream per device carries the copies.
     """
 
     def __init__(self, *, pin: bool = True) -> None:
         self.pin = pin
-        # (shape, dtype) -> [[(buffer, its use count when free)], where the next search starts]
+        # (shape, dtype) -> [[[buffer, its storage, _holds when free]], where the next
+        # search starts]
         self._pool: dict[tuple, list] = {}
         self._streams: dict[torch.device, torch.cuda.Stream] = {}
 
     def take(self, shape: tuple[int, ...] | torch.Size, dtype: torch.dtype) -> torch.Tensor:
         key = (tuple(shape), dtype)
         slots = self._pool.setdefault(key, [[], 0])
-        bufs, start = slots
-        n = len(bufs)
+        entries, start = slots
+        n = len(entries)
         # A step takes a shape's buffers in the order the last step did, so the search starts
         # where the last one stopped.
         for i in range(n):
             j = (start + i) % n
-            buf, free = bufs[j]
-            if _use_count(buf) == free:
+            entry = entries[j]
+            if _holds(entry) == entry[2]:
                 slots[1] = (j + 1) % n
-                return self._alias(buf)
+                return self._alias(entry)
         buf = torch.empty(key[0], dtype=dtype, pin_memory=self.pin)
-        bufs.append((buf, _use_count(buf)))
+        entries.append([buf, buf.untyped_storage(), None])
+        del buf
+        entry = entries[-1]
+        entry[2] = _holds(entry)
         slots[1] = 0
-        return self._alias(buf)
+        return self._alias(entry)
 
     @staticmethod
-    def _alias(buf: torch.Tensor) -> torch.Tensor:
-        return torch.empty(0, dtype=buf.dtype).set_(buf.untyped_storage(), 0, buf.shape,
-                                                    buf.stride())
+    def _alias(entry: list) -> torch.Tensor:
+        buf = entry[0]
+        return torch.empty(0, dtype=buf.dtype).set_(entry[1], 0, buf.shape, buf.stride())
 
     def stream(self, device: torch.device) -> torch.cuda.Stream:
         s = self._streams.get(device)
@@ -326,12 +337,12 @@ class HostBuffers:
 
     @property
     def n_buffers(self) -> int:
-        return sum(len(bufs) for bufs, _ in self._pool.values())
+        return sum(len(entries) for entries, _ in self._pool.values())
 
     @property
     def nbytes(self) -> int:
-        return sum(b.numel() * b.element_size() for bufs, _ in self._pool.values()
-                   for b, _ in bufs)
+        return sum(e[0].numel() * e[0].element_size() for entries, _ in self._pool.values()
+                   for e in entries)
 
 
 # Shared by every capture in the process, so step t+1 reuses step t's buffers.

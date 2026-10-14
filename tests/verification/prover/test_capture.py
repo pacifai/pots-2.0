@@ -419,7 +419,7 @@ def test_cpu_capture_keeps_outputs_where_the_op_left_them():
 
 def test_host_buffers_hand_out_only_free_buffers():
     """A buffer is reused only once nothing holds it: not the tensor handed out, a view of it,
-    or a NumPy array over it."""
+    a NumPy array over it, or its Python storage object."""
     pool = HostBuffers(pin=False)
     x = pool.take((3, 4), torch.float32)
     y = pool.take((3, 4), torch.float32)
@@ -439,6 +439,19 @@ def test_host_buffers_hand_out_only_free_buffers():
     pool.take((4, 3), torch.float32)
     pool.take((3, 4), torch.bfloat16)
     assert pool.n_buffers == 5
+    # The storage object alone, taken from the tensor or from a view: untyped_storage()
+    # returns the pool's own object while it lives, so the use count stays at the pool's.
+    for source in (lambda t: t, lambda t: t[1]):
+        pool = HostBuffers(pin=False)
+        x = pool.take((3, 4), torch.float32)
+        held = x.untyped_storage().data_ptr()
+        st = source(x).untyped_storage()
+        del x
+        assert pool.take((3, 4), torch.float32).untyped_storage().data_ptr() != held
+        assert pool.n_buffers == 2
+        del st
+        assert pool.take((3, 4), torch.float32).untyped_storage().data_ptr() == held
+        assert pool.n_buffers == 2
 
 
 def test_host_buffers_are_reused_step_after_step():

@@ -17,7 +17,8 @@ from setup.data import Batch
 from setup.records import Record, RecordError, encode_record
 from verification.commitment.leaves import leaf_hash
 from verification.computation.instances import DecoderComputation
-from verification.computation.instances.decoder import LINEARS, _Labeler, matmul_count_decoder
+from verification.computation.instances.decoder import (LINEARS, _contiguous, _Labeler,
+                                                         matmul_count_decoder)
 from verification.computation.interface import LabelingError, ProductKind, ReplayError
 from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import MatmulCapture
@@ -404,6 +405,7 @@ def _bmm_records(cap, phase):
 @pytest.mark.parametrize("tamper", [
     "release", "duplicate_fwd", "drop_bwd_mm", "drop_bwd_bmm", "extra_glue", "swap_S_O",
     "stray_fwd_bmm", "duplicate_bwd_bmm", "swap_G_k_G_v", "O_b_not_Y_v", "S_b_split_kv",
+    "strided_mm_out", "strided_bmm_out",
 ])
 def test_label_rejects_tampered_capture(setup, tamper):
     c, model, records = setup
@@ -445,11 +447,31 @@ def test_label_rejects_tampered_capture(setup, tamper):
         b = rec.b.clone()
         b[1] = b[1] + 1e-3  # member (0, 1): for S, kv head 0 shared with query head 0
         recs[recs.index(rec)] = dataclasses.replace(rec, b=b)
+    elif tamper in ("strided_mm_out", "strided_bmm_out"):
+        # The op wrote a transposed layout while ``out`` is a dense copy, as the host copy
+        # of a GPU output is (FS9): labeling judges the recorded layout.
+        rec = (next(r for r in recs if r.batch is None) if tamper == "strided_mm_out"
+               else _bmm_records(cap, "forward")[0])
+        o = rec.out_info
+        stride = o.stride[:-2] + (1, o.shape[-2])
+        assert rec.out.is_contiguous() and stride != o.stride
+        recs[recs.index(rec)] = dataclasses.replace(
+            rec, out_info=dataclasses.replace(o, stride=stride))
     match = {"swap_G_k_G_v": r"is not .*\.grad", "O_b_not_Y_v": "not Y_v's output",
-             "S_b_split_kv": "share a kv head"}.get(tamper)
+             "S_b_split_kv": "share a kv head", "strided_mm_out": "output is not contiguous",
+             "strided_bmm_out": "output is not contiguous"}.get(tamper)
     with pytest.raises(LabelingError, match=match):
         c.label(cap, model)
     model.zero_grad(set_to_none=True)
+
+
+def test_recorded_layout_contiguity_is_torchs():
+    base = torch.zeros(3, 4, 5)
+    views = [base, base[0], base[:, 1], base.transpose(1, 2), base[:, :, :1], base[:, :1],
+             base[:1], base[:, :, 2:3], base[..., ::2], torch.zeros(0, 3).t(),
+             torch.zeros(1, 4).t(), base.expand(2, 3, 4, 5), torch.zeros(()), base[1:2, 2:3]]
+    for v in views:
+        assert _contiguous(tuple(v.shape), v.stride()) == v.is_contiguous(), v.shape
 
 
 @pytest.mark.parametrize("dtype", list(COMPUTE))
