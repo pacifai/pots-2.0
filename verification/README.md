@@ -416,6 +416,13 @@ replaced:
   the same weights bit for bit. Beside the hashes it records what the run started from and how
   it trained (the `W_0` root, `h_D`, `η`, the config hash, the losses), so a comparison of two
   runs that didn't start from the same place fails by naming the difference.
+- **`smooth_check.py`** is F6c's smooth check: 10 plain steps at `η` through the plain
+  baseline's loop, with the training loss over the whole clean list at `W_0` and after each
+  step. It's smooth if every value is finite, none rises above the start, and the last is
+  below it. It writes one JSON record per model and task.
+- **`fs11_prep.py`**, **`fs11_session.py`** and **`fs11_job.sh`** are the first H100
+  session (FS11): the upload built on the Mac, the session's parts in order, and the job that
+  runs them under a deadline and ends its own pod (see "Workflow: the first H100 session").
 
 ### Evaluation: `evaluation/`
 
@@ -613,6 +620,92 @@ SmolLM2 at test scale (4 × 128, `k = 9`), torch 2.9.1 with CUDA 12.8, on 2026-1
   the dev Mac (0.23 s for the commitment there). Training under capture costs about 3.5 times
   the plain step's forward and backward (0.42–0.46 s against 0.13 s); FS9's copies add 0.14 s of that, and save 0.37 s of
   labeling, which before FS9 copied every product to the host itself.
+
+## Workflow: the first H100 session
+
+The first H100 session (FS11) runs as one unattended job that ends its own pod. It has four
+parts, in order: fetching the public models' weights, the hashing benchmark at its H100 preset
+(FS10), one verified step per model at the full-scale config (`bring_up --no-tamper` on the
+refusal task, with `metrics.py`'s peak memory), and the smooth check, F6c's 10 plain steps at
+`η = 10⁻³` per model and task. The pod never holds a Hugging Face token and downloads nothing
+gated: Meta's Llama-3.2-1B travels in the upload from the Mac's cache, and the other three
+models' weights are fetched with `token=False` at their pinned commits and checked against the
+SHA-256 the Mac recorded.
+
+1. **Prep, on the Mac.** Commit first: the upload holds `git archive HEAD`, not the working
+   tree.
+
+   ```bash
+   HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --out DIR
+   ```
+
+   It builds `D` and `D̃` per model and task (reusing a matching build), checks every cached
+   file against its blob name, and writes `DIR/fs11_upload.tar` (about 2.4 GB), its
+   `.sha256` and a manifest. It never downloads; a pinned model missing from the cache is
+   reported, and exits 1 if it is one of the four run models. Note the SHA-256.
+2. **The orchestrator creates the pod**: one H100 80 GB, no network volume (terminating
+   deletes everything else, which is the point), container disk of at least 50 GB (the upload
+   twice, about 8 GB of public weights, the venv and the output), and host RAM of at least
+   the 64 GiB free the benchmark's copy test needs (the target machine has 188–320 GB, F1c).
+3. **Upload** the tarball, check its SHA-256 against step 1's, and extract it into
+   `/workspace`, giving `/workspace/fs11_upload/`. Make the venv at
+   `/workspace/fs11_upload/repo/.venv` from `requirements-fs11.txt` (the Mac's versions; on
+   Linux x86_64 PyPI's torch wheel is a CUDA build) with Python 3.14, as on the Mac.
+4. **Start the job detached**, from `/workspace/fs11_upload/repo`:
+
+   ```bash
+   nohup bash verification/runs/fs11_job.sh /workspace/fs11_upload /workspace/fs11_out \
+       > /workspace/fs11_job.out 2>&1 &
+   ```
+
+   It prints the environment first (GPU, driver, CUDA, torch, free disk and RAM) and refuses
+   to run the parts unless CUDA is there and the GPU is an H100 (`FS11_ALLOW_ANY_GPU=1`
+   overrides). It refuses to start at all unless it can terminate the pod: `RUNPOD_POD_ID`
+   set, and `runpodctl` or `RUNPOD_API_KEY` present. Each part logs to
+   `fs11_out/parts/<part>/log.txt` and `summary.json` is rewritten after each one. A failed
+   part doesn't stop the others; a part with a `DONE` marker is skipped on a rerun into the
+   same output directory.
+5. **Fetch the tarball within the grace window.** Whatever the parts did, the job packs
+   `fs11_out` into `/workspace/fs11_out.tar`, prints its SHA-256 (also in
+   `fs11_out.tar.sha256`) and writes `/workspace/fs11_out.READY`. It then waits
+   `FS11_GRACE_S` (default 20 min) before terminating. Poll for `fs11_out.READY`, then copy
+   `fs11_out.tar` and `fs11_out.tar.sha256` off.
+6. **Verify the SHA-256** of the copy against `fs11_out.tar.sha256`. Then
+   `touch /workspace/fs11_out.FETCHED`, which ends the grace window early.
+7. **Confirm the pod is gone**: list the account's pods. The job runs
+   `runpodctl pod delete $RUNPOD_POD_ID`, which removes the pod rather than stopping it (a
+   stopped pod still bills for its disk), and falls back to runpodctl 1.x's
+   `runpodctl remove pod` and the REST API's `DELETE /v1/pods/{podId}`. The command was taken
+   from Runpod's docs (the sources are in `fs11_job.sh`'s header) and has not been run on a
+   live pod.
+
+**Billing ends in the job itself.** A deadline timer, `FS11_DEADLINE_S` after the start
+(default 12,600 s, 3.5 h), terminates the pod whatever the job is doing. The parts get a work
+deadline of the timer less the grace window and `FS11_PACK_RESERVE_S` (default 600 s), so
+3 h by default; a part still running then is killed, and the rest are recorded as not
+started. An exit through a signal terminates too. `DRY_RUN=1` prints the terminate command
+instead and stops the job when the timer fires; the tests run the timer, the grace window and
+the always-terminate path that way on the Mac.
+
+**Estimated wall time**, against the plan's 2–3.5 h. The GPU figures are the A40's at test
+scale (above): check 5 at about 0.5 ms per product. None has been measured on an H100.
+
+| part | estimate | from |
+|---|---|---|
+| models | 2–5 min | about 7.7 GB of public weights, hashed after download |
+| benchmark | 30–90 min (killed at 90) | no H100-preset run yet; the smoke preset took 7.3 min on the A40 |
+| bring-up, 4 models | 20–40 min | check 5 at `M` products: Llama-3.2-1B 393,555 (3–4 min), Falcon3-1B 110,973 (about 1 min), Qwen2.5-0.5B 258,555 and Qwen2.5-1.5B 258,639 (2–2.6 min each); plus loading, training under capture, and hashing a 32–64 GB transcript on each side (F15) |
+| smooth, 8 checks | 8–16 min | 10 plain steps and 11 whole-list forward passes each |
+| total | 65–150 min | |
+
+**cuPQC.** The benchmark's GPU-hashing parts (E2, the hashing half of E3, E5b and E5c) need
+the cuPQC SDK, whose licence is decided just before rental. The session logs each of them as
+skipped, with the reason, unless `CUPQC_SDK_DIR` names an installed SDK; no extension to call
+it exists yet, so for now they are skipped either way. The benchmark's Llama row in E6 reads the
+unsloth mirror's weights, which aren't in the Mac's cache, so it skips too.
+
+The bring-up step may exit 1 at bf16 on the concentration guard alone (F20); the step's
+acceptance, peaks and times are in its log either way.
 
 ## Workflow: calibrating the tolerances
 
