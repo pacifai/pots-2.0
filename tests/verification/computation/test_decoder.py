@@ -436,8 +436,9 @@ def test_label_rejects_tampered_capture(setup, tamper):
         g_rec = {grad[r.out.untyped_storage().data_ptr()]: r for r in recs
                  if r.phase == "backward" and r.out.untyped_storage().data_ptr() in grad}
         i, j = recs.index(g_rec["k"]), recs.index(g_rec["v"])
-        recs[i] = dataclasses.replace(g_rec["k"], out=g_rec["v"].out)
-        recs[j] = dataclasses.replace(g_rec["v"], out=g_rec["k"].out)
+        k, v = g_rec["k"], g_rec["v"]
+        recs[i] = dataclasses.replace(k, out=v.out, out_storage=v.out_storage)
+        recs[j] = dataclasses.replace(v, out=k.out, out_storage=k.out_storage)
     elif tamper in ("O_b_not_Y_v", "S_b_split_kv"):
         s_rec, o_rec = _bmm_records(cap, "forward")[:2]
         rec = o_rec if tamper == "O_b_not_Y_v" else s_rec

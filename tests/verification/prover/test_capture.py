@@ -9,6 +9,7 @@ from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import (
     BiasedMatmulError,
     CaptureError,
+    HostBuffers,
     MatmulCapture,
     MutatedCaptureError,
     PhaseError,
@@ -396,6 +397,71 @@ def test_release_operands_keeps_links():
     p1.add_(1.0)
     with pytest.raises(MutatedCaptureError, match="out"):
         cap.assert_unmodified()
+
+
+# ---- products on a GPU (FS9): the CPU side -----------------------------------------------
+
+
+def test_cpu_capture_keeps_outputs_where_the_op_left_them():
+    """On CPU the GPU path is a no-op: each record's output is the op's own tensor, nothing is
+    pending, and the pool allocates nothing."""
+    pool = HostBuffers(pin=False)
+    cap = MatmulCapture(buffers=pool)
+    a, b = torch.randn(3, 4), torch.randn(4, 5)
+    with cap, cap.phase("forward"):
+        p = a @ b
+    (rec,) = cap.records
+    assert rec.out is p and not cap._pending and pool.n_buffers == 0
+    assert cap.is_output_of(p, rec) and cap.is_output_of(p.view(-1), rec)
+    assert not cap.is_output_of(p.clone(), rec)
+    cap.assert_unmodified()
+
+
+def test_host_buffers_hand_out_only_free_buffers():
+    """A buffer is reused only once nothing holds it: not the tensor handed out, a view of it,
+    or a NumPy array over it."""
+    pool = HostBuffers(pin=False)
+    x = pool.take((3, 4), torch.float32)
+    y = pool.take((3, 4), torch.float32)
+    ptr = {t.untyped_storage().data_ptr() for t in (x, y)}
+    assert len(ptr) == 2 and pool.n_buffers == 2 and pool.nbytes == 2 * 48
+    v, arr = x[1], y.numpy()
+    del x, y
+    z = pool.take((3, 4), torch.float32)  # both still held, through a view and an array
+    assert z.untyped_storage().data_ptr() not in ptr and pool.n_buffers == 3
+    del v
+    w = pool.take((3, 4), torch.float32)
+    assert w.untyped_storage().data_ptr() in ptr and pool.n_buffers == 3
+    del arr
+    assert pool.take((3, 4), torch.float32).untyped_storage().data_ptr() in ptr
+    assert pool.n_buffers == 3
+    # Another shape or dtype gets a buffer of its own.
+    pool.take((4, 3), torch.float32)
+    pool.take((3, 4), torch.bfloat16)
+    assert pool.n_buffers == 5
+
+
+def test_host_buffers_are_reused_step_after_step():
+    """Each step takes the buffers the last step dropped, in the same order, and the pool stops
+    growing after the first step."""
+    pool = HostBuffers(pin=False)
+    shapes = [(8, 8), (8, 4), (8, 8), (2, 8, 8)]
+
+    def step():
+        return [pool.take(s, torch.float32) for s in shapes]
+
+    first = [t.untyped_storage().data_ptr() for t in step()]
+    n = pool.n_buffers
+    for _ in range(3):
+        held = step()
+        assert [t.untyped_storage().data_ptr() for t in held] == first
+        assert pool.n_buffers == n == len(shapes)
+        del held
+    # Two steps alive at once use two sets.
+    a, b = step(), step()
+    assert pool.n_buffers == 2 * n
+    assert not {t.untyped_storage().data_ptr() for t in a} & {
+        t.untyped_storage().data_ptr() for t in b}
 
 
 def test_producer_links_point_back(llama_capture):

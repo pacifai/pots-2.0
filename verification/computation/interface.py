@@ -49,9 +49,16 @@ __all__ = [
     "ReplayError",
     "Replay",
     "DeclaredComputation",
+    "HOST",
     "load_weights",
     "snapshot_weights",
 ]
+
+
+HOST = torch.device("cpu")
+"""Where every leaf lives, whatever device the model runs on: host memory (F1c). The model,
+its activations and the replay run on ``VERIF_DEVICE`` (F4a); weights and products are copied
+out to the host, which commits, hashes and hands them over."""
 
 
 class ProductKind(enum.Enum):
@@ -155,14 +162,16 @@ def load_weights(computation: DeclaredComputation, model: torch.nn.Module,
 
 def snapshot_weights(computation: DeclaredComputation,
                      model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Copies of ``model``'s declared weights, in ``weight_names`` order.
+    """Copies of ``model``'s declared weights in host memory (:data:`HOST`), in
+    ``weight_names`` order.
 
     The one way to take weights out of a model: the prover's ``W_{t+1}`` leaves (its ``W_t``
     leaves are the caller's tensors where ``prove_step`` can share them, else a clone as here),
     and ``W_0`` from a freshly built model (the plain baseline B7 and the verified runs, A12
     included, so both start from the same tensors).
     """
-    return {n: model.get_parameter(n).detach().clone() for n in computation.weight_names}
+    return {n: model.get_parameter(n).detach().to(HOST, copy=True)
+            for n in computation.weight_names}
 
 
 class DeclaredComputation(ABC):

@@ -95,12 +95,32 @@ place during forward and backward. The version counter misses writes that bypass
 bookkeeping: through ``.data``, ``tensor.set_()``, a NumPy array or DLPack capsule sharing the
 memory, or raw pointer access. The guard catches accidents in torch code, not deliberate
 tampering.
+
+**Products on a GPU (FS9; F1c, F4a).** A captured output in CUDA memory is copied as soon as
+the op returns into a pinned host buffer, on a side stream, and the record's ``out`` becomes
+that buffer, so the transcript collects in host RAM and not on the GPU. A CPU output is kept
+as it is, so on CPU the capture is unchanged. In order, per output:
+
+1. the side stream waits for the stream that produced it (``wait_stream``), then copies it
+   with ``non_blocking=True`` and records an event;
+2. the capture keeps the GPU tensor until that event has completed, so the caching allocator
+   can't hand its block to another tensor while the copy reads it (which is what
+   ``record_stream`` would otherwise be for); each later record polls the queue and drops the
+   ones whose copy is done;
+3. a GPU tensor whose ``_version`` moved before its copy was done raises
+   :class:`MutatedCaptureError`, since the copy may have read either value;
+4. leaving the ``with`` block waits for every copy, so labeling reads only finished buffers.
+
+The buffers come from :class:`HostBuffers`, allocated once per shape and dtype and reused by
+every later step. A buffer is reused only when nothing else holds its storage: the step that
+committed it has dropped its leaves. Operands are not copied: they stay on the GPU until
+:meth:`MatmulCapture.release_operands`.
 """
 
 from __future__ import annotations
 
 import contextlib
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 
@@ -125,6 +145,7 @@ __all__ = [
     "OperandInfo",
     "MatmulRecord",
     "CopyRecord",
+    "HostBuffers",
     "MatmulCapture",
 ]
 
@@ -208,6 +229,8 @@ class MatmulRecord:
     alpha: float = 1.0
     beta: float = 1.0
     versions: dict[str, int] = field(default_factory=dict, repr=False)
+    # The op's own output storage, which ``out`` no longer is once it was copied to the host.
+    out_storage: StorageWeakRef | None = field(default=None, repr=False, compare=False)
 
     @property
     def n_members(self) -> int:
@@ -248,22 +271,103 @@ class CopyRecord:
         return self.src_info.param_name or self.src_info.param_copy
 
 
+def _use_count(buf: torch.Tensor) -> int:
+    """References to ``buf``'s storage, counted the same way on every call."""
+    s = buf.untyped_storage()
+    return torch._C._storage_Use_Count(s._cdata)
+
+
+class HostBuffers:
+    """Host buffers for captured GPU products, allocated once and reused every step (FS9).
+
+    :meth:`take` hands out a buffer of the asked shape and dtype that nothing else holds: it
+    reuses one whose storage has no reference beyond the pool's own, else allocates (pinned
+    when ``pin``, which needs CUDA). Each buffer goes out as a fresh tensor over the whole
+    storage (``set_``), not the pool's own tensor, so every holder, view or NumPy array of
+    it raises the storage's use count until it is dropped. A buffer is taken again only after
+    the step that committed it has dropped its leaves; two steps alive at once use two sets.
+    One side stream per device carries the copies.
+    """
+
+    def __init__(self, *, pin: bool = True) -> None:
+        self.pin = pin
+        # (shape, dtype) -> [[(buffer, its use count when free)], where the next search starts]
+        self._pool: dict[tuple, list] = {}
+        self._streams: dict[torch.device, torch.cuda.Stream] = {}
+
+    def take(self, shape: tuple[int, ...] | torch.Size, dtype: torch.dtype) -> torch.Tensor:
+        key = (tuple(shape), dtype)
+        slots = self._pool.setdefault(key, [[], 0])
+        bufs, start = slots
+        n = len(bufs)
+        # A step takes a shape's buffers in the order the last step did, so the search starts
+        # where the last one stopped.
+        for i in range(n):
+            j = (start + i) % n
+            buf, free = bufs[j]
+            if _use_count(buf) == free:
+                slots[1] = (j + 1) % n
+                return self._alias(buf)
+        buf = torch.empty(key[0], dtype=dtype, pin_memory=self.pin)
+        bufs.append((buf, _use_count(buf)))
+        slots[1] = 0
+        return self._alias(buf)
+
+    @staticmethod
+    def _alias(buf: torch.Tensor) -> torch.Tensor:
+        return torch.empty(0, dtype=buf.dtype).set_(buf.untyped_storage(), 0, buf.shape,
+                                                    buf.stride())
+
+    def stream(self, device: torch.device) -> torch.cuda.Stream:
+        s = self._streams.get(device)
+        if s is None:
+            s = self._streams[device] = torch.cuda.Stream(device)
+        return s
+
+    @property
+    def n_buffers(self) -> int:
+        return sum(len(bufs) for bufs, _ in self._pool.values())
+
+    @property
+    def nbytes(self) -> int:
+        return sum(b.numel() * b.element_size() for bufs, _ in self._pool.values()
+                   for b, _ in bufs)
+
+
+# Shared by every capture in the process, so step t+1 reuses step t's buffers.
+HOST_BUFFERS = HostBuffers()
+
+
 class MatmulCapture(TorchDispatchMode):
     """Passthrough dispatch mode recording every matmul of a forward + backward."""
 
-    def __init__(self, param_names: Mapping[int, str] | None = None) -> None:
+    def __init__(self, param_names: Mapping[int, str] | None = None,
+                 buffers: HostBuffers | None = None) -> None:
         super().__init__()
         self.param_names: Mapping[int, str] = dict(param_names or {})
+        self.buffers = HOST_BUFFERS if buffers is None else buffers
         self.records: list[MatmulRecord] = []
         self.glue_outer: list[MatmulRecord] = []
         self.copies: list[CopyRecord] = []
         self._phase: str | None = None
         self._n_calls = 0
-        self._producers: dict[int, int] = {}  # output storage ptr -> record index
+        # Output storage ptr -> (record index, the storage). On a GPU the capture drops an
+        # output once copied, and the allocator may give its address to a new storage, so a
+        # match needs the same storage too.
+        self._producers: dict[int, tuple[int, StorageWeakRef]] = {}
+        self._by_index: dict[int, MatmulRecord] = {}
         # A parameter copy's storage ptr -> the parameter. The copies are held, so no ptr is
         # reused while the map is live.
         self._param_copies: dict[int, str] = {}
         self._held: list[torch.Tensor] = []
+        # GPU outputs whose copy to the host may still run: (record, tensor, _version, event).
+        self._pending: deque[tuple[MatmulRecord, torch.Tensor, int, torch.cuda.Event]] = deque()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        out = super().__exit__(exc_type, exc_val, exc_tb)
+        # Whatever reads the records after the block reads finished copies.
+        self.wait_copies(check=exc_type is None)
+        return out
 
     @contextlib.contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -330,8 +434,11 @@ class MatmulCapture(TorchDispatchMode):
 
     def _info(self, t: torch.Tensor) -> OperandInfo:
         ptr = t.untyped_storage().data_ptr()
+        producer = self._producers.get(ptr)
+        if producer is not None and producer[1] != StorageWeakRef(t.untyped_storage()):
+            producer = None
         return OperandInfo(ptr, t.storage_offset(), tuple(t.shape), tuple(t.stride()), t.dtype,
-                           self.param_names.get(ptr), self._producers.get(ptr),
+                           self.param_names.get(ptr), None if producer is None else producer[0],
                            self._param_copies.get(ptr))
 
     def _record_copy(self, src: torch.Tensor, out: torch.Tensor) -> None:
@@ -351,13 +458,49 @@ class MatmulCapture(TorchDispatchMode):
             batch=a.shape[0] if batched else None,
             a_info=self._info(a), b_info=self._info(b), out_info=self._info(out),
             bias=bias, alpha=float(alpha), beta=float(beta),
+            out_storage=StorageWeakRef(out.untyped_storage()),
         )
         rec.versions = {k: t._version for k, t in rec.tensors().items()}
-        # Every captured output stays referenced, so its storage pointer is not reused while
-        # the capture is live.
-        self._producers[rec.out_info.storage_ptr] = rec.index
+        self._producers[rec.out_info.storage_ptr] = (rec.index, rec.out_storage)
+        self._by_index[rec.index] = rec
         self._n_calls += 1
         (self.glue_outer if q == 1 else self.records).append(rec)
+        if out.is_cuda:
+            self._offload(rec)
+
+    def _offload(self, rec: MatmulRecord) -> None:
+        """Copy a GPU output into a host buffer on the side stream; ``rec.out`` becomes it."""
+        out = rec.out
+        host = self.buffers.take(out.shape, out.dtype)
+        side = self.buffers.stream(out.device)
+        side.wait_stream(torch.cuda.current_stream(out.device))  # the op that wrote it
+        with torch.cuda.stream(side):
+            host.copy_(out, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(side)
+        # Held until the copy is done, so the allocator can't reuse its memory under the copy.
+        self._pending.append((rec, out, out._version, done))
+        rec.out = host
+        rec.versions["out"] = host._version
+        self._drain(block=False)
+
+    def _drain(self, *, block: bool, check: bool = True) -> None:
+        """Drop the GPU outputs whose copy is done (all of them when ``block``)."""
+        while self._pending:
+            rec, gpu, version, done = self._pending[0]
+            if not block and not done.query():
+                return
+            done.synchronize()
+            self._pending.popleft()
+            if check and gpu._version != version:
+                raise MutatedCaptureError(
+                    f"#{rec.index} {rec.op} ({rec.phase}): output written in place before its "
+                    f"copy to the host was done")
+
+    def wait_copies(self, *, check: bool = True) -> None:
+        """Wait for every copy of a GPU output to the host and drop the GPU tensors. Leaving
+        the ``with`` block calls it; a no-op on CPU."""
+        self._drain(block=True, check=check)
 
     # ---- after capture -------------------------------------------------------------------
 
@@ -378,6 +521,7 @@ class MatmulCapture(TorchDispatchMode):
         Run it after hashing, before the optimizer step, and at hand-off to the verifier. See
         the module docstring for the writes the version counter cannot see.
         """
+        self.wait_copies()
         bad = []
         for rec in self.records + self.glue_outer:
             now = {k: t._version for k, t in rec.tensors().items()}
@@ -395,11 +539,19 @@ class MatmulCapture(TorchDispatchMode):
         ptr = t.untyped_storage().data_ptr()
         return self.param_names.get(ptr) or self._param_copies.get(ptr)
 
+    @staticmethod
+    def is_output_of(t: torch.Tensor, rec: MatmulRecord) -> bool:
+        """Whether ``t`` shares the storage of ``rec``'s output as the op returned it, such as
+        the ``W.grad`` AccumulateGrad adopts. On a GPU ``rec.out`` is the host copy, so compare
+        with this rather than with its pointer. Storages compare by identity."""
+        return (rec.out_storage is not None
+                and rec.out_storage == StorageWeakRef(t.untyped_storage()))
+
     def is_copy_of(self, t: torch.Tensor, index: int) -> bool:
         """Whether ``t`` is a copy of record ``index``'s whole output, such as the fp32 copy of
         a bf16 weight gradient that AccumulateGrad adopts as ``W.grad``. Storages compare by
         identity, so an allocator reusing a freed copy's address never matches."""
-        rec = next((r for r in self.records + self.glue_outer if r.index == index), None)
+        rec = self._by_index.get(index)
         if rec is None:
             return False
         o = rec.out_info
