@@ -650,10 +650,11 @@ def _groups(c):
         yield from groups.values()
 
 
-def _assert_groups_match_members(c, leaves):
-    """Over the whole step, ``operand_group`` on one replay equals the stacked ``operands`` of
-    an earlier one bit for bit, in dtype, shape and contiguity; the glue gradients then agree.
-    (A computation lends its model to one replay at a time, so the two run in turn.)"""
+def _assert_groups_match_members(c, leaves, dtype=None):
+    """Over the whole step, ``operand_group(ms, dtype)`` on one replay equals the stacked
+    ``operands`` of an earlier one, converted to ``dtype``, bit for bit, in dtype, shape and
+    contiguity; the glue gradients then agree. (A computation lends its model to one replay at
+    a time, so the two run in turn.)"""
     single, stacked = c.replay(ListReader(leaves)), []
     for ms in _groups(c):
         pairs = [single.operands(m) for m in ms]
@@ -664,11 +665,12 @@ def _assert_groups_match_members(c, leaves):
     grouped.operands = lambda m: calls.append(m) or per_member(m)
     for ms, want_ab in zip(_groups(c), stacked, strict=True):
         calls.clear()
-        got = grouped.operand_group(ms)
+        got = grouped.operand_group(ms, dtype)
         assert calls == ([] if len(ms) > 1 else ms)  # members come from the whole tensors
         roles |= {(len(ms) > 1, c.product_class(c.product(m))) for m in ms}
         for g, want in zip(got, want_ab):
-            assert g.dtype == want.dtype == c.operand_dtype, ms
+            assert want.dtype == c.operand_dtype, ms
+            want = want.to(dtype or want.dtype)
             assert g.shape == want.shape and g.is_contiguous() and not g.requires_grad, ms
             assert torch.equal(g, want), ms
     # Every attention role was served in a group, interleaved when n = d_h.
@@ -685,8 +687,7 @@ def test_operand_group_matches_stacked_operands(honest_all):
     _assert_groups_match_members(c, leaves)
 
 
-@pytest.mark.parametrize("n", [12, 8], ids=["n12", "n_eq_dh"])
-def test_operand_group_matches_stacked_operands_bf16(n):
+def _bf16_step(n):
     c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3, compute_dtype=BF16)
     model = c.build_model()
     records = make_records((n, n - 5))
@@ -694,7 +695,34 @@ def test_operand_group_matches_stacked_operands_bf16(n):
     cap = run_capture(c, model, records)
     products = [p.detach() for p in c.label(cap, model)]
     assert c.operand_dtype == BF16
-    _assert_groups_match_members(c, [*records, *w0.values(), *products, *w0.values()])
+    return c, [*records, *w0.values(), *products, *w0.values()]
+
+
+@pytest.mark.parametrize("dtype", [None, torch.float32], ids=["bf16", "to_fp32"])
+@pytest.mark.parametrize("n", [12, 8], ids=["n12", "n_eq_dh"])
+def test_operand_group_matches_stacked_operands_bf16(n, dtype):
+    """Asked for fp32 (as check 5 asks), the group is converted as it is copied: the same bits
+    as the bf16 stack converted afterwards."""
+    _assert_groups_match_members(*_bf16_step(n), dtype)
+
+
+@pytest.mark.parametrize("dtype", [None, torch.float32], ids=["bf16", "to_fp32"])
+def test_operand_group_unevenly_spaced_members(dtype):
+    """Members whose batch indices aren't evenly spaced are copied one by one, with the same
+    result."""
+    c, leaves = _bf16_step(12)
+    run = next(r for r in _member_runs(c.products) if len(r) > 1)
+    ms = [p.m for p in run if c.product_class(p) == "S"]
+    ms = [ms[0], ms[1], ms[3]]  # batch indices 0, 1, 3
+    single = c.replay(ListReader(leaves))
+    pairs = [single.operands(m) for m in range(1, ms[-1] + 1)]
+    want = [torch.stack([pairs[m - 1][k] for m in ms]).to(dtype or c.operand_dtype)
+            for k in (0, 1)]
+    del single, pairs
+    got = c.replay(ListReader(leaves)).operand_group(ms, dtype)
+    for g, w in zip(got, want):
+        assert g.dtype == (dtype or c.operand_dtype) and g.is_contiguous()
+        assert torch.equal(g, w)
 
 
 @pytest.mark.parametrize("unit", ["forward", "backward"])

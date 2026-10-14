@@ -509,9 +509,12 @@ interface.
   - `Replay` (ABC) runs once per step and owns its own model, loaded from the committed
     `W_t`. `operands(m) -> (A, B)` is called in canonical order 1..M. It caches glue and
     drops it after its last use. `glue_gradients()` is valid only after `operands(1..M)` in
-    order. `operand_group(ms) -> (A, B)` serves members of one attention run with equal
-    shapes, in canonical order but not necessarily adjacent (check 5's groups), stacked: bit for bit `torch.stack` of their `operands(m)`, detached and
-    contiguous. The default does exactly that. A caller that gets an exception falls back to
+    order. `operand_group(ms, dtype=None) -> (A, B)` serves members of one attention run with
+    equal shapes, in canonical order but not necessarily adjacent (check 5's groups),
+    stacked: bit for bit `torch.stack` of their `operands(m)`, detached and contiguous, then
+    converted to `dtype` if given. The conversion happens in the copy into the stacked
+    result, so no stack in the operand format sits beside it (check 5 asks for fp32; at bf16
+    that would be half as much again). The default does exactly that. A caller that gets an exception falls back to
     `operands(m)` per member to find the failing one.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
     imports the prover. So is `snapshot_weights(computation, model)`, the one way to copy the
@@ -829,7 +832,8 @@ interface.
     - `operand_group(ms)` serves one layer's member run (forward `S`/`O`, or backward
       `dA`/`dV`/`dQ`/`dK`, roles possibly interleaved) from the whole bmm operands: one
       version and dtype check per role, then one strided copy per role into the stacked
-      result, `dK`'s transposed. The unit guards, the first error and `_served_last` are those
+      result, `dK`'s transposed, converting to `dtype`; a role whose members aren't evenly
+      spaced is copied member by member. The unit guards, the first error and `_served_last` are those
       of `operands(m)` over `ms`. Any other `ms` takes the default.
     - Memory, as in training: after the forward pass every unit's graph and operands are
       held, about one training step's activations. Each unit's backward frees its graph
@@ -1153,15 +1157,21 @@ interface.
     on SmolLM2, `S`+`O` and `dA`+`dV`+`dQ`+`dK` of each layer) is split into groups
     (`_measure_groups`: by operand shapes in order of first appearance, each group in run
     order, cut into consecutive chunks of at most `_GROUP_BYTES` = 4 GiB of fp32 `A`, `B`
-    and `P`; a function of the declared computation only). Each group is served at once
-    (`Replay.operand_group`, inside `5.glue`), its `P` leaves stacked on the host and moved
-    to the device in one copy, and measured with `measure_products_rows`. If a group's
-    serving raises, the whole run is served again one member at a time (`_served`), which
-    finds the first failing member in canonical order and its error. Every other product is
-    served (`_served`) and measured (`measure_product_row`) alone. These are the shape groups
-    check 5 measured before 2026-10-14; the byte limit cuts one only past 32,768 members
-    at 128×128×64 (Llama-3.2-1B's largest at `n_s = 128` has 12,288). On SmolLM2 each layer
-    has four: `S` and `O` (36 members each), `dA` (36) and `dV`+`dQ`+`dK` (108).
+    and `P`; a function of the declared computation only). `_measure_served` takes a run one
+    group at a time: the group is served at once (`Replay.operand_group(ms, float32)`,
+    inside `5.glue`, converted to fp32 as it is copied), its `P` leaves stacked on the host
+    and moved to the device in one copy, and measured right away with
+    `measure_products_rows` (inside `5.measure`). Only its rows are kept, so the device
+    holds one group's operands at a time, at most `_GROUP_BYTES` plus about as much in
+    measuring temporaries. If a group's serving raises, `_measure_to_failure` serves the
+    members of that group and the later ones again one at a time in canonical order and
+    drops them, which finds the first failing member and its error. It then serves the
+    unmeasured groups' members before that one again, one group at a time, measures each
+    group, and keeps only the rows of members before it. Every other product is served
+    (`_served`) and measured (`measure_product_row`) alone. These are the shape groups check
+    5 measured before 2026-10-14; the byte limit cuts one only past 32,768 members at
+    128×128×64 (Llama-3.2-1B's largest at `n_s = 128` has 12,288, 1.5 GiB). On SmolLM2 each
+    layer has four: `S` and `O` (36 members each), `dA` (36) and `dV`+`dQ`+`dK` (108).
   - **Judging window (2026-10-14).** Check 5's numbers stay on the device, one float64 row
     per product (`freivalds.ROW`), until at least `_JUDGE_WINDOW` (1024) products are
     measured, at the end of a run. Then one `tolist` brings the window's rows to the host
@@ -1169,11 +1179,12 @@ interface.
     canonical order (`_judge_window`), so the first failing product and its message are
     those of one-at-a-time judging. A read makes the host wait for the device, so this
     replaces several waits per product with one per window. `5.measure`'s call count is
-    the number of runs plus the number of windows. An error serving or measuring run `i`
-    is handled as one product at a time would: the window before run `i` is judged first,
-    then (for a serving error) the products of run `i` served before it, and the error is
-    raised only if none of those rejects. A rejection then leaves it to the record pass
-    (`StepState.run_rest_error`).
+    the number of groups (a run of one is a group) plus the number of windows. An error
+    serving or measuring run `i` is handled as one product at a time would: the window
+    before run `i` is judged first, then (for a serving error) the products of run `i`
+    served before it, and the error is raised only if none of those rejects. A rejection
+    then leaves it to the record pass (`StepState.run_rest_error`). A measuring error drops
+    the rows of run `i`'s earlier groups unjudged, as when the run was measured at once.
   - **The record pass (EV2, EVALUATION_SPEC §4.1).** `record_rest(store, c, ctx, bands,
     slot) -> str` measures, for the record only, the tests a rejecting check skipped. A
     check-5 rejection first records the products check 5 measured after the failing one and
@@ -1334,12 +1345,10 @@ interface.
     infinite or NaN `max|x|` to a scale (`nan_to_num`, then `frexp`) that gives `_safe_norm`'s
     fallback value without a branch. The buffer and the ones vectors sit on the operands'
     device, and the challenges are drawn on the host and moved there (FS9).
-    Until 2026-10-14 `_norm` read every vector's min and max back with one `aminmax` pass and
-    returned the plain `vector_norm` when every entry was at least `2⁻⁶³·max(1, max|x|)` and
-    `n·max² ≤ 2¹²⁴`. Then every square and partial sum is a normal fp32 number in both runs,
-    so power-of-two scaling commutes with each rounding and the plain norm has the scaled
-    one's bits on the CPU (the proof is in `_norm`'s docstring). Dropping the branch changed
-    no CPU number. A GPU's plain and scaled kernels need not agree, so a GPU's bits may differ
+    Until 2026-10-14 `_norm` read every vector's min and max back to the host and returned
+    the plain `vector_norm` where every square and partial sum was a normal fp32 number, so
+    that the plain norm had the scaled one's bits on the CPU. Dropping that branch changed no
+    CPU number. A GPU's plain and scaled kernels need not agree, so a GPU's bits may differ
     from the old branch's.
   - `guard=False` (both functions) skips `|A|`, `|B|` and `|P|·1`: ν, `‖|P|·1‖` and κ come
     back NaN, and every test-2 number keeps its bits. Only `StepContext.kappa_guard` uses it.

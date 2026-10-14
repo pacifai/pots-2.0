@@ -147,34 +147,14 @@ def _norm(x: torch.Tensor, dim: int | None, absx: torch.Tensor,
     unless the caller is done with it. The result stays on ``x``'s device: nothing is read
     back to the host.
 
-    **Why it always scales.** Until 2026-10-14 it read every vector's ``min|x_i|`` and
-    ``max|x_i|`` back to the host and returned the plain ``vector_norm(x)`` where the bounds
-    below held, skipping the scaled copy. That read made the host wait for the device on every
-    norm, which on a GPU cost more than the copy, so the branch is gone. The argument below
-    is why the plain value it returned was the scaled one's bits, so dropping it changes no
-    number on the CPU.
-
-    torch's CPU 2-norm sums ``x_i·x_i`` in fp32 and takes ``sqrt`` (``NormTwoOps``; a
-    one-entry tensor is its ``|x_0|``). Every step is a correctly rounded ``×``, ``+`` or
-    ``sqrt``, and its order depends only on the shape, the strides, the alignment and the
-    thread count. ``_safe_norm`` runs the same kernel on ``x/s``, a fresh contiguous tensor
-    of ``x``'s shape. If ``x`` is contiguous and 64-byte aligned (as every fresh tensor is),
-    both runs take the same steps in the same order, on values that differ by the factor
-    ``s = 2^e``. Scaling an operation's inputs by powers of two scales its exact result the
-    same way, so it scales the rounded result too, as long as both rounded results are normal
-    fp32 numbers (not subnormal, not overflowed). Then ``vector_norm(x) = s·vector_norm(x/s)``,
-    the scaled sum's ``sqrt`` times ``s``, exactly. Per vector, with ``lo = min|x_i|``,
-    ``hi = max|x_i|`` and ``n`` entries, the old branch required:
-
-    - ``lo ≥ 2^-63·max(1, hi)``. Then ``lo > 0``, and since ``s ≤ hi``, every ``x_i`` and
-      ``x_i/s`` is at least ``2^-63`` in magnitude: ``x/s`` is exact, and every square and
-      partial sum is at least ``2^-126``, normal. A vector with a zero entry failed this.
-    - ``n·hi² ≤ 2^124``. The computed sum is at most the exact one times ``(1 + 2^-24)^n``,
-      under ``e^2`` for ``n < 2^25``, so no partial sum reaches ``2^128``. The scaled sums
-      are at most ``4n``, and ``s`` times the scaled norm is the unscaled norm, finite.
-
-    On a GPU the plain and scaled kernels need not agree, so a GPU's bits may differ from
-    those the old branch gave; they are ``_safe_norm``'s either way.
+    Why the bits are ``_safe_norm``'s. The maximum of ``absx`` has the value of
+    ``max|x|``, and a zero's sign changes neither that value nor its exponent, so
+    :func:`_scaled_norm` scales by ``_safe_norm``'s ``s`` and, as its docstring shows, returns
+    ``_safe_norm``'s value with no branch on the data. The quotient ``x/s`` holds the same
+    numbers either way. Written into the scratch buffer, it has a fresh tensor's layout:
+    contiguous, starting at the buffer's 64-byte aligned start. torch's 2-norm kernel orders
+    its sums by shape, strides, alignment and thread count only, so it sums them in the same
+    order. A non-contiguous ``x`` gets a fresh quotient, as in ``_safe_norm``.
     """
     amax = absx.amax() if dim is None else absx.amax(dim=dim)
     out = None

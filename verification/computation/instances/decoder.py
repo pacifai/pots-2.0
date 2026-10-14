@@ -1338,25 +1338,28 @@ class DecoderReplay(Replay):
         self._served_last = m == c.M
         return a, b
 
-    def operand_group(self, ms: Sequence[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    def operand_group(self, ms: Sequence[int], dtype: torch.dtype | None = None
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
         """Members of one layer's attention run (forward ``S``/``O``, or backward ``δA``,
         ``δV``, ``δQ̃``, ``δK̃``), served from the whole bmm operand tensors: one version and
         dtype check per role, then one strided copy per role and operand into the stacked
-        result, ``δK̃``'s transposed. Roles may interleave (``δQ̃₀, δK̃₀, δQ̃₁, …``). The result
-        and the replay's state afterwards, or at an error, are those of ``operands(m)`` over
-        ``ms`` up to the same point: the same unit guards, the same first error, and
-        ``_served_last`` as after the last member served. Any other ``ms`` takes the default.
+        result, ``δK̃``'s transposed, converting to ``dtype`` as it copies. Roles may interleave
+        (``δQ̃₀, δK̃₀, δQ̃₁, …``); a role whose members aren't evenly spaced is copied member by
+        member. The result and the replay's state afterwards, or at an error, are those of
+        ``operands(m)`` over ``ms`` up to the same point: the same unit guards, the same first
+        error, and ``_served_last`` as after the last member served. Any other ``ms`` takes the
+        default.
         """
         c = self.c
         specs = [c.product(m) for m in ms]
         if not specs or specs[0].member is None:
-            return super().operand_group(ms)
+            return super().operand_group(ms, dtype)
         first = specs[0]
         forward = first.kind is ProductKind.FORWARD
         if any(p.member is None or p.layer != first.layer
                or (p.kind is ProductKind.FORWARD) != forward
                or (p.a_shape, p.b_shape) != (first.a_shape, first.b_shape) for p in specs):
-            return super().operand_group(ms)
+            return super().operand_group(ms, dtype)
         j = self._forward_unit(first) if forward else self._backward_unit(first)
         held = self._units[j].fwd if forward else self._bops
         # Per role: its whole (A, B) as served, and its members' group positions and batch
@@ -1379,17 +1382,17 @@ class DecoderReplay(Replay):
         a0, b0, _, _ = next(iter(roles.values()))
         if any(a.shape[1:] != a0.shape[1:] or b.shape[1:] != b0.shape[1:]
                for a, b, _, _ in roles.values()):
-            return super().operand_group(ms)  # copy_ would broadcast; stack raises
-        out_a = a0.new_empty((len(ms), *a0.shape[1:]))
-        out_b = b0.new_empty((len(ms), *b0.shape[1:]))
+            return super().operand_group(ms, dtype)  # copy_ would broadcast; stack raises
+        out_a = a0.new_empty((len(ms), *a0.shape[1:]), dtype=dtype)
+        out_b = b0.new_empty((len(ms), *b0.shape[1:]), dtype=dtype)
         for a, b, pos, idx in roles.values():
             dst, src = _progression(pos), _progression(idx)
             for out, whole in ((out_a, a), (out_b, b)):
                 if dst is not None and src is not None:
                     out[dst].copy_(whole[src])
                 else:
-                    out.index_copy_(0, torch.tensor(pos, device=out.device),
-                                    whole.index_select(0, torch.tensor(idx, device=whole.device)))
+                    for p, i in zip(pos, idx):
+                        out[p].copy_(whole[i])
         return out_a, out_b
 
     def glue_gradients(self) -> dict[str, torch.Tensor]:
