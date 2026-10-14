@@ -278,8 +278,9 @@ class _Pinned:
 def copy_pass(pieces: Sequence[torch.Tensor], dev: torch.Tensor, direction: str,
               stream: torch.cuda.Stream) -> float:
     """Seconds to copy every piece once, in order, on ``stream``: ``h2d`` into ``dev`` or
-    ``d2h`` out of it."""
-    torch.cuda.synchronize()
+    ``d2h`` out of it. It waits for the current stream's work first, not the whole device's:
+    a device-wide sync would wait for the GEMM loop's queue and count that as copy time."""
+    torch.cuda.current_stream().synchronize()
     t0 = time.perf_counter()
     with torch.cuda.stream(stream):
         for p in pieces:
