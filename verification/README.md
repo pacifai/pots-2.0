@@ -416,8 +416,13 @@ replaced:
   cheats (one process per seed, the model loaded once for all levels), the hidden step, the
   planted-error sweep and `k` tunability. It stops the cell when the plain baseline's final
   weights differ from the honest run's, and pauses before the other seeds' honest runs when a
-  judged step of the first one trips the cancellation guard. A run directory that holds
-  `run_end` is skipped, so a killed driver picks up where it stopped.
+  judged step of the first one trips the cancellation guard. An honest run of another seed
+  that is rejected is a result, an honest false reject: it is logged and the cell goes on. A
+  child's exit 1 counts only when a record explains it (a rejecting verdict, the cheat
+  oracle). The cell stops when `bands.json` isn't the band file its runs name, since nothing
+  in the driver can revise a band file. A run directory that holds `run_end` is skipped, so a
+  killed driver picks up where it stopped; a lock file keeps a second driver off the cell, and
+  SIGTERM stops the running child before the driver exits.
 - **`plain_baseline.py`** trains the honest run's steps with capture and every protocol step
   off: the same `W_0`, batches and `η`, through the prover's own SGD step without the capture.
   Its timings, memory and FLOPs are EQ1b's P0, the baseline every overhead ratio divides by.
