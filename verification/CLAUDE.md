@@ -2013,6 +2013,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
       equals EM1's. Every
       record but `sweep_source`'s path, and every array of `sweep_trials.npz`, equals EM1's
       bit for bit.
+    - Re-run after check 5's group serving and judging windows (2026-10-14, d1f2a80, the same
+      run directory): all 434 `sweep_point` and 42 `sweep_summary` records and all 13 arrays
+      equal EM1's bit for bit. Only clocks, paths, the config hash (it holds the run
+      directory's path) and the `5.glue`/`5.measure` call counts differ.
   - `ĉ` is fitted on the trials swept at `x ≥ FIT_X_MIN` (3), each at its realized `x`. Until
     EV3 the fit picked trials by realized `x`, so rounding kept or dropped the `x = 3` point.
     Each trial also logs `‖P'‖_F/‖P‖_F`, and each summary refits `ĉ` on `x' = x·‖P‖_F/‖P'‖_F`
@@ -2136,6 +2140,16 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     6.00) and 1.597 host reads, all but one in `5.measure` (7,257 `tolist`, 4,098
     `_local_scalar_dense`). `other`'s ops are 42,678 `detach`, six per product. The CUDA pass
     hasn't run.
+  - After check 5's group serving and judging windows (2026-10-14, d1f2a80, same machine):
+    equal to the archive; median 1.183 s, 166.3 µs per product (`5.glue` 67.0, `5.measure`
+    90.9, `other` 8.1). Per product 12.02 aten ops (1.77, 9.60, 0.65) and 0.001 host reads
+    (8 in all: 7 windows' `tolist` and one in `5.glue`). `5.glue` has 754 calls (7,114
+    before) and `5.measure` 700 (693 runs and 7 windows). Split by the run an op serves (a
+    scratch probe, not this script): a member costs 2.69 ops and no read (12.13 and 0.287
+    before), a dense product 106.7 ops and 0.002 reads (112.4 and 15.0 before), most of it
+    the replay's glue. On the CPU a read doesn't wait, so the time falls only 9%; the drop
+    in reads and member ops is aimed at the GPU, where each read stalls the host. The CUDA
+    pass hasn't run.
 
 ### `evaluation/`
 
