@@ -1022,6 +1022,8 @@ class DecoderReplay(Replay):
             self._n_bmm += 1
             out = torch.stack([self.view.product(c.m_of(f"{name}[{s},{h}]"))
                                for s, h in c._members()])
+        # On the run's device (F4a): the hook on δY_x goes on the tensor autograd sees.
+        out = out.to(a.device)
         self._names.append(name)
         if name not in self._calls:  # a repeat fails the unit's name check
             self._calls[name] = (a, b, out)
