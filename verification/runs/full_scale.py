@@ -398,7 +398,7 @@ class Cell:
     data_only: bool = False
     runner: Runner = field(default_factory=SubprocessRunner)
     base_env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
-    out: Callable[[str], None] = print
+    out: Callable[[str], None] = field(default=lambda s: print(s, flush=True))  # live in a log
     failures: list[str] = field(default_factory=list)
     false_rejects: list[str] = field(default_factory=list)
 
