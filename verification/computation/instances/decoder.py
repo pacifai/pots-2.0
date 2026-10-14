@@ -767,7 +767,8 @@ class _Labeler:
                     or tuple(o_rec.b.shape[1:]) != (c.n, c.d_h) \
                     or tuple(s_rec.b.shape[1:]) != (c.d_h, c.n):
                 return  # _fill reports the shapes
-            v = v_rec.out.view(c.n_s, c.n, c.n_kv, c.d_h).permute(0, 2, 1, 3)
+            # On a GPU Y_v's output is its host copy (FS9) and O's B is on the GPU.
+            v = v_rec.out.to(o_rec.b.device).view(c.n_s, c.n, c.n_kv, c.d_h).permute(0, 2, 1, 3)
             o_b = o_rec.b.reshape(*shape, c.n, c.d_h)
             if not torch.equal(o_b, v[:, :, None].expand_as(o_b)):
                 raise LabelingError(f"layer {l}: O's B (record #{o_rec.index}) is not Y_v's "
@@ -819,8 +820,8 @@ class _Labeler:
                                     f"δY of {w}, B is the input of {sorted(feeds)}")
             if w in self.c.linear_weights:  # not the tied W_E, whose grad is a sum
                 grad = self.model.get_parameter(w).grad
-                if grad is None or (_ptr(grad) != _ptr(rec.out)
-                                    and not self.cap.is_copy_of(grad, rec.index)):
+                if grad is None or not (self.cap.is_output_of(grad, rec)
+                                        or self.cap.is_copy_of(grad, rec.index)):
                     raise LabelingError(f"G of {w} (record #{rec.index}) is not {w}.grad")
             self._fill(self._linear_name(w, "G"), rec.a, rec.b, rec.out, rec)
 
