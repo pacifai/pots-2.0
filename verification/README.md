@@ -386,6 +386,9 @@ replaced:
 - **`k_tunability.py`** is FS12. On the same stored step it runs check 5 at every `k` from 1
   to 18, records its time, FLOPs and memory, and checks that the configured `k` reproduces
   the honest run's numbers bit for bit.
+- **`check5_profile.py`** serves O2. On the same stored step it measures check 5's host
+  overhead per product: wall time, aten ops and host reads per section, and on CUDA the
+  kernel launches and the syncs that block the host. It judges nothing and writes nothing.
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every

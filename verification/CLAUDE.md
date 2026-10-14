@@ -2071,6 +2071,29 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     relative difference is 25 (the residual is rounding noise), and the step is still
     accepted; from `k = 2` every shared residual is bit-equal. 158.6 s, peak footprint
     4.69 GB.
+- `check5_profile.py` (O2): `.venv/bin/python -m verification.runs.check5_profile
+  [--run-dir DIR] [--step N] [--repeats N] [--json]`. Its docstring has the full flow. It
+  judges nothing and writes nothing.
+  - Set up as `k_tunability` is (`load_kept_step`, `full_step` at the configured `k`, which
+    must accept), then check 5 alone through `check5_pass` with its own section tracker as
+    `section=`. It uses only those public entry points, not check 5's internals.
+  - Per section (`5.glue`, `5.measure`, `other` = the rest of check 5), totals and per product
+    of all `M`: the median wall time of `--repeats` passes (default 5; on CUDA synchronized
+    before and after each); aten ops and host reads under a `TorchDispatchMode` (a host read:
+    `_local_scalar_dense`, `Tensor.tolist`/`numpy` counted once each, a copy from a non-CPU
+    tensor to a CPU one); on CUDA, from `torch.profiler`, kernel launches, kernels and their
+    summed device time, and blocking runtime calls (`cuda{Stream,Device,Event}Synchronize`,
+    `cudaMemcpy`), each placed in the section whose `record_function` range holds its start.
+  - `M` is split into dense and member products, but the counts aren't: check 5's sections
+    don't separate them.
+  - The digest of the last timed pass's check-5 numbers is compared with the archive's; on a
+    device other than the one that wrote it they differ, which is reported, not an error.
+  - First run (2026-10-14, dev Mac, CPU, `k = 9`, at 7188930): accepted and equal to the
+    archive. `M` 7,113 (633 dense, 6,480 member); median 1.298 s, 182.5 Âµs per product
+    (`5.glue` 64.5, `5.measure` 109.1, `other` 7.7). Per product 21.13 aten ops (4.81, 10.31,
+    6.00) and 1.597 host reads, all but one in `5.measure` (7,257 `tolist`, 4,098
+    `_local_scalar_dense`). `other`'s ops are 42,678 `detach`, six per product. The CUDA pass
+    hasn't run.
 
 ### `evaluation/`
 
