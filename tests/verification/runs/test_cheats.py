@@ -458,7 +458,10 @@ def test_batch_members_are_check_5s_stack(tiny_decoder_step):
 def test_sweep_targets_get_check_5s_numbers_on_a_decoder(tiny_decoder_step):
     """On a real decoder step every number the sweep measures for a target, batched member or
     not, is the one check 5 records, honest and with an error planted (check 5 rerun on the
-    re-rooted transcript)."""
+    re-rooted transcript). At this model's shapes a member measured as a stack of one got its
+    batch's bits on Linux x86 too (2026-10-14), so the 128×64 batch of
+    :func:`test_a_member_is_measured_in_its_run_batch` is the test that catches a member
+    measured outside its batch."""
     c, store = tiny_decoder_step
     stats, ctx = _check_5_stats(c, store)
     names = ["L1.Y_q", "L1.S[0,0]", "L2.O[1,3]", "L1.dA[0,1]", "L2.dV[1,2]", "L1.dQ[0,0]",

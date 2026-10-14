@@ -271,7 +271,7 @@ def sweep_targets(c: DeclaredComputation,
 #   ``A²·(B²·1)``) are matrix-vector products over the whole stack, and BLAS may round a row by
 #   the stack's size. Apple Accelerate doesn't: a stack of one gives a member its full batch's
 #   bits. Linux x86 (torch 2.9.1's CPU wheel) does: a stack of one moves ``U`` and ``ν`` in the
-#   last bits (2026-10-14).
+#   last bits (2026-10-14). CUDA's batched products round by the batch count as well (an A40).
 # So the sweep measures a member in its whole batch, the other members' committed products
 # unchanged, through the same function: check 5's bits on every platform.
 
