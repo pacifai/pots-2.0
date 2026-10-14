@@ -1,6 +1,6 @@
 """Materialize `D`, `D̃` and their manifests into `$VERIF_OUTPUT_DIR/data/` (C4, C6, FS6).
 
-    .venv/bin/python -m verification.runs.materialize_data
+    .venv/bin/python -m verification.runs.materialize_data [--data-dir DIR]
 
 Writes `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` (pins,
 counts, the schedule's first `VERIF_STEPS` batches and statistics; storage layer, outside every
@@ -9,13 +9,20 @@ poisoning level (`VERIF_POISON_COUNT`). A level the task's shared poisoned list 
 does not run (EQ5): the run exits with status 3 and writes nothing. The first run fetches the
 task's two training files into `~/.cache/pots-2.0/backdoorllm/`; the tokenizers come from the
 local Hugging Face cache only.
+
+``--data-dir`` writes the files to ``DIR`` instead of ``$VERIF_OUTPUT_DIR/data/``. The full-scale
+driver (``runs/full_scale.py``) uses it to give each cheat seed and level its own ``D̃`` while
+the runs of the cell share one output directory and one band file.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import statistics
 import sys
+from collections.abc import Sequence
+from pathlib import Path
 
 from setup import backdoorllm, data
 from setup.config import RunConfig, load_config
@@ -96,7 +103,11 @@ def build_meta(cfg: RunConfig, pin: data.TokenizerPin, built: data.BuiltData, ma
     }
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    p.add_argument("--data-dir", type=Path, default=None,
+                   help="where to write the files (default $VERIF_OUTPUT_DIR/data/)")
+    args = p.parse_args([] if argv is None else argv)
     cfg = load_config()
     pin = data.run_pin(cfg.model, cfg.model_revision)  # F8f: the model's EOS, also its pad
     tok = data.load_tokenizer(pin)
@@ -120,7 +131,7 @@ def main() -> None:
     data.audit_manifest(man_t, built.records_tilde, tok, cfg.seq_len, released=released)
     data.audit_selection(man, built.clean, full_scale, tok)
 
-    out = cfg.data_dir
+    out = cfg.data_dir if args.data_dir is None else args.data_dir
     out.mkdir(parents=True, exist_ok=True)
     (out / "D.bin").write_bytes(data.encode_records_file(built.records))
     (out / "D_tilde.bin").write_bytes(data.encode_records_file(built.records_tilde))
@@ -135,4 +146,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
