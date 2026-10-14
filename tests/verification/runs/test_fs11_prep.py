@@ -149,6 +149,11 @@ def test_missing_snapshot_and_weights_are_reported(home):
     assert not smol.files and "no snapshot" in smol.missing[0]
     unsloth = prep.model_files(home / "hub", *UNSLOTH, gated=False, roles=["benchmark"])
     assert len(unsloth.files) == 2 and "weights" in unsloth.missing[0]
+    # E6 times Meta's weights in the mirror's place, so the prep asks it for its config only.
+    assert UNSLOTH in prep.CONFIG_ONLY and SMOL not in prep.CONFIG_ONLY
+    unsloth = prep.model_files(home / "hub", *UNSLOTH, gated=False, roles=["benchmark"],
+                               needs_weights=False)
+    assert len(unsloth.files) == 2 and not unsloth.missing
 
 
 def test_forbidden_paths():
@@ -176,7 +181,7 @@ def test_prepare_round_trips_through_the_session_check(tmp_path, home):
     assert len(calls) == 8 and man["run_models_complete"]
     assert sorted(man["data"]) == sorted(fs.data_key(r, t) for r, _ in fs.RUN_PINS
                                          for t in fs.TASKS)
-    assert any("unsloth" in x for x in man["missing"])
+    assert not any("unsloth" in x for x in man["missing"])
     assert any("SmolLM2" in x for x in man["missing"])
     tar = Path(man["tarball"])
     assert (tmp_path / "out" / "fs11_upload.tar.sha256").read_text().split()[0] == \

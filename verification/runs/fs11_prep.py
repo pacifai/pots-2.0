@@ -53,20 +53,27 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from benchmarks.hashing.sizes import MODELS as BENCH_MODELS
+from benchmarks.hashing.step_time import WEIGHTS as E6_WEIGHTS
 from setup.data import FULL_SCALE_TOKENIZERS, TEST_SCALE_TOKENIZER
 from verification.runs.fs11_session import (FULL_SCALE_ENV, GATED, RUN_PINS, SECRETS, TASKS,
                                             _run_env, data_key, sha256_file)
 
-__all__ = ["TOP", "BENCH_PINS", "DATA_FILES", "PrepError", "CacheFile", "ModelFiles",
-           "git_blob_sha1", "blob_matches", "model_files", "data_matches", "materialize",
-           "prepare", "main"]
+__all__ = ["TOP", "BENCH_PINS", "CONFIG_ONLY", "DATA_FILES", "PrepError", "CacheFile",
+           "ModelFiles", "git_blob_sha1", "blob_matches", "model_files", "data_matches",
+           "materialize", "prepare", "main"]
 
 TOP = "fs11_upload"
 # The benchmark's models beyond the run's (benchmarks/hashing/sizes.MODELS): F8d's unsloth
-# Llama mirror and SmolLM2. Their configs size the leaves; E6 loads their weights.
+# Llama mirror and SmolLM2. Their configs size the leaves; E6 loads SmolLM2's weights.
 BENCH_PINS: tuple[tuple[str, str], ...] = tuple(
     (p.repo, p.revision) for p in (*FULL_SCALE_TOKENIZERS, TEST_SCALE_TOKENIZER)
     if (p.repo, p.revision) not in RUN_PINS)
+# Pins whose weights nothing loads, so their config and tokenizer suffice: E6 times another
+# repo's weights in their place (benchmarks/hashing/step_time.WEIGHTS; for the unsloth mirror,
+# Meta's snapshot, which the upload packs).
+CONFIG_ONLY: frozenset[tuple[str, str]] = frozenset(
+    (BENCH_MODELS[k].repo, BENCH_MODELS[k].revision) for k in E6_WEIGHTS)
 DATA_FILES = ("D.bin", "D_tilde.bin", "manifest.bin", "manifest_tilde.bin", "meta.json")
 # A public model's files that the pod fetches instead of the upload carrying them.
 WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".h5", ".msgpack", ".onnx")
@@ -148,10 +155,10 @@ def _weights_present(names: Iterable[str], snap: Path) -> bool:
 
 
 def model_files(hub: Path, repo: str, revision: str, *, gated: bool,
-                roles: Sequence[str]) -> ModelFiles:
+                roles: Sequence[str], needs_weights: bool = True) -> ModelFiles:
     """The pinned snapshot's files in the cache at ``hub``, each checked against its blob name
-    (raises :class:`PrepError` on a mismatch). A missing snapshot or missing weights go to
-    ``missing``; nothing is fetched."""
+    (raises :class:`PrepError` on a mismatch). A missing snapshot, or missing weights when
+    ``needs_weights``, go to ``missing``; nothing is fetched."""
     m = ModelFiles(repo, revision, gated, list(roles))
     root = hub / m.dir_name
     snap = root / "snapshots" / revision
@@ -179,7 +186,7 @@ def model_files(hub: Path, repo: str, revision: str, *, gated: bool,
             sha, size = sha256_file(p), p.stat().st_size
         packed = gated or not _is_weight(rel)
         m.files.append(CacheFile(rel, sha, size, blob, link, packed))
-    if not _weights_present((f.path for f in m.files), snap):
+    if needs_weights and not _weights_present((f.path for f in m.files), snap):
         m.missing.append(f"{repo}@{revision}: weights (model.safetensors) not in the Mac's "
                          "cache")
     ne = root / ".no_exist" / revision
@@ -383,7 +390,8 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
     models = []
     for (r, rev), rl in roles.items():
         t1 = time.time()
-        m = model_files(hub, r, rev, gated=r in GATED, roles=rl)
+        m = model_files(hub, r, rev, gated=r in GATED, roles=rl,
+                        needs_weights=(r, rev) not in CONFIG_ONLY)
         models.append(m)
         packed = sum(f.bytes for f in m.files if f.packed)
         say(f"{r}@{rev[:8]} ({', '.join(rl)}{', gated' if m.gated else ''}): "

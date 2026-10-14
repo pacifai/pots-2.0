@@ -2238,7 +2238,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     included; a public model's weights left out, their SHA-256 recorded), the BLAKE3 sources,
     `requirements-fs11.txt` and `manifest.json` (every packed file's SHA-256). Every cached file
     is checked against its blob name first. It never downloads and never packs the cache's
-    token; a pinned model missing from the cache is reported (exit 1 for a run model).
+    token; a pinned model missing from the cache is reported (exit 1 for a run model). The
+    unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
+    in its place.
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
     [--selftest]`, `fetch-models` and `env`. Runs the parts in order (`default_plan`): models
     (`fetch_models`: the manifest check, then each public model's weights with `token=False`
