@@ -60,8 +60,8 @@ from verification.verifier.calibration import (
 )
 from verification.verifier.context import StepStats
 
-__all__ = ["ORACLE_RECORD", "CheatEnv", "poisoned_batch", "check_meta", "load_env", "run_cheat",
-           "scores", "oracle_record", "band_sources", "report_oracle", "cell_name",
+__all__ = ["ORACLE_RECORD", "CheatEnv", "poisoned_batch", "check_meta", "load_env", "load_level",
+           "run_cheat", "scores", "oracle_record", "band_sources", "report_oracle", "cell_name",
            "open_writer"]
 
 ORACLE_RECORD = "cheat_oracle"
@@ -146,15 +146,30 @@ def load_env(cfg: RunConfig, pc: ProtocolConfig) -> CheatEnv:
     D, h_D = load_committed_dataset(c, data)
     # read-only; never refitted here (P10a)
     bands = load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D, k=pc.k))
-    meta = json.loads((data / "meta.json").read_text())
+    models = ReusedModel(c.build_model)
+    w0 = snapshot_weights(c, models())  # as B7 and A12 take it
+    return load_level(cfg, data, c=c, D=D, h_D=h_D, w0=w0, bands=bands, k=pc.k, models=models)
+
+
+def load_level(cfg: RunConfig, data_dir: Path, *, c: DecoderComputation, D: Sequence[Any],
+               h_D: bytes, w0: Mapping[str, torch.Tensor], bands: Bands, k: int,
+               models: BuildModel) -> CheatEnv:
+    """The cheat environment of one seed and level, over a model, ``D``, ``W_0`` and band file
+    already loaded: ``D̃`` from ``data_dir/D_tilde.bin``, checked against ``meta.json``'s
+    ``h_D_tilde``, and the poisoned step from its ``poisoning.step``. ``meta.json`` must
+    describe the run (:func:`check_meta`, with ``cfg``'s seed and ``VERIF_POISON_COUNT``) and
+    publish the same ``h_D``. :func:`load_env` calls it once; the full-scale driver
+    (``runs/full_scale.py``) once per level, so one model load serves a seed's levels."""
+    meta = json.loads((data_dir / "meta.json").read_text())
     check_meta(meta, cfg)
-    D_tilde = load_dataset_records(data / "D_tilde.bin", c.n)
+    if meta.get("h_D") != h_D.hex():
+        raise ValueError(f"{data_dir / 'meta.json'} publishes h_D {meta.get('h_D')}, the run's "
+                         f"D has {h_D.hex()}")
+    D_tilde = load_dataset_records(data_dir / "D_tilde.bin", c.n)
     if dataset_tree(c, D_tilde).root.hex() != meta["h_D_tilde"]:
         raise ValueError("D_tilde.bin does not hash to meta.json's h_D_tilde")
     step = int(meta["poisoning"]["step"])
-    models = ReusedModel(c.build_model)
-    w0 = snapshot_weights(c, models())  # as B7 and A12 take it
-    return CheatEnv.build(c, D, w0, bands, k=pc.k, h_D=h_D, seed=cfg.seed,
+    return CheatEnv.build(c, D, w0, bands, k=k, h_D=h_D, seed=cfg.seed,
                           b_tilde=poisoned_batch(c, D_tilde, step, len(D), cfg.seed),
                           poison_step=step, build_model=models)
 
