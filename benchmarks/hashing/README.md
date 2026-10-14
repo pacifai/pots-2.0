@@ -32,7 +32,8 @@ The defaults are Section 6's sizes:
 - E3: the largest matmuls of each full-scale model over 128 × 128 tokens, 20 timed runs each,
   and 5-second windows for the GEMM loop and the concurrent rows.
 - E4: copy pieces of 1 and 8 GiB over a 64 GiB host buffer. The host needs that much free
-  RAM, plus the 4 GiB hashing buffer.
+  RAM, plus the 4 GiB hashing buffer and 4 GiB for the rest of the process; with less, E4
+  halves the buffer until it fits.
 - One SGD step per full-scale model on `cuda`.
 
 The report goes to `$VERIF_OUTPUT_DIR/benchmarks/hashing_<UTC time>.json`, or to `--out`.
@@ -137,8 +138,10 @@ E2, GPU hashing throughput
 E3, GPU hashing beside training's matmuls
 : The GEMM half runs; the hashing half says skipped until E2 has a GPU hash.
   - `gemm`: each of a model's three largest matmuls in bf16, timed alone with CUDA events:
-    the MLP's up and down projections and the LM head, each over `--gemm-tokens` rows.
-    `tflop_per_s_median` and `tflop_per_s_best` are over `--gemm-iters` runs.
+    the MLP's up and down projections and the LM head, each over `--gemm-tokens` rows. One
+    event pair spans 10 back-to-back runs of the matmul, and the time is divided by 10, so the
+    launch delay before the first run is a tenth of the measurement. `tflop_per_s_median` and
+    `tflop_per_s_best` are over `--gemm-iters` such measurements.
   - `gemm_loop_alone`: the *GEMM loop*. A background thread enqueues the three matmuls round
     robin on their own CUDA stream, at most four ahead of the GPU. Its rate is the FLOPs of
     the matmuls that finished in the window over the window's wall time.
@@ -153,15 +156,33 @@ E4, host-GPU copies
   rows it's page-locked in place with `cudaHostRegister`. Each combination gives three rows:
   - `copy`: whole passes over the buffer, one piece at a time on a side stream, alone.
   - `copy_with_gemm_loop`: the same passes while E3's GEMM loop runs (on the first of
-    `--gemm-models`), with the loop's rate and `gemm_slowdown` against `gemm_loop_alone`.
+    `--gemm-models`). The loop runs one window alone just before the copies, and
+    `gemm_slowdown` compares the two windows, so clock drift over a long session doesn't
+    count as slowdown.
   - `copy_with_cpu_hashing`: the same passes while CPU threads hash a separate buffer as E1's
-    chunked rows do (the largest `--chunk-kb`, all `--threads`), one row per algorithm, with
-    `hash_slowdown` against `cpu_hashing_alone`.
+    chunked rows do (the largest `--chunk-kb`, all `--threads`), one row per algorithm. As
+    with the loop, `hash_slowdown` compares the window during the copies with the one just
+    before them.
+
+  The `gemm_loop_alone` and `cpu_hashing_alone` rows are the rates at the start of E4, for
+  reference.
+
+  A slowdown under about 1% is counting noise: the loop counts a GEMM only once it sees it
+  finish, so a window's count lags the GPU by up to four GEMMs. The hashing count lags by up
+  to one 16 MiB task per thread, which can reach a few percent of a one-second window. Each
+  row's note says so.
 
   A pageable copy blocks the thread that enqueues the GEMMs, so a pageable
   `copy_with_gemm_loop` row shows this process's slowdown, not the GPU's. On the A40 pod a
-  pageable copy cut the loop's rate by 80–95%; the same copies from a second process left it
+  pageable copy cut the loop's rate by 83–98%; the same copies from a second process left it
   unchanged. The row's note says so.
+
+  Before it allocates, E4 checks the host buffer, the hashing buffer and a 4 GiB margin
+  against the host's memory: the smaller of the cgroup's limit and `MemAvailable`. If they
+  don't fit, it halves the buffer, keeping it a multiple of every piece, until they do, and
+  says skipped if no such buffer fits. A container's out-of-memory kill would otherwise end
+  the whole run. Each row records `total_bytes`, the buffer used, beside
+  `total_bytes_requested` and the two memory readings.
 
 E5a, challenge generation on the current Python path
 : The protocol's challenge functions, reproduced call for call, including the fp32

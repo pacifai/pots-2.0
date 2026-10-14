@@ -38,8 +38,46 @@ def test_without_cuda_e3_and_e4_are_skipped():
     (r,) = gpu.run_e3({"tiny": gpu.gemm_shapes(tiny_config(), 8)}, window_s=0.01, iters=1)
     assert (r["status"], r["reason"]) == ("skipped", gpu.NO_CUDA)
     (r,) = gpu.run_e4(pieces=[MB], total=MB, reps=1, window_s=0.01, gemms=None,
-                      hash_buf=None, hash_chunk=1 << 16, hash_threads=1)
+                      hash_bytes=0, hash_chunk=1 << 16, hash_threads=1)
     assert (r["status"], r["reason"]) == ("skipped", gpu.NO_CUDA)
+
+
+def test_e4_shrinks_its_host_buffer_to_fit_memory(monkeypatch):
+    GiB = 1 << 30
+    monkeypatch.setattr(machine, "cgroup_memory_limit", lambda: 50 * GiB)
+    monkeypatch.setattr(machine, "mem_available", lambda: 500 * GiB)
+    budget, readings = gpu.host_memory_budget()
+    assert budget == 50 * GiB and readings["mem_available_bytes"] == 500 * GiB
+    extra = 4 * GiB + gpu.MEMORY_MARGIN
+    pieces = [1 * GiB, 8 * GiB]
+    # The H100 preset on the A40 pod: 64 GiB doesn't fit, 32 does, and stays a multiple of 8.
+    assert gpu.fit_total(64 * GiB, pieces, extra, budget) == 32 * GiB
+    assert gpu.fit_total(64 * GiB, pieces, extra, None) == 64 * GiB
+    assert gpu.fit_total(16 * GiB, pieces, extra, 10 * GiB) is None  # 8 GiB + 8 > 10
+    assert gpu.fit_total(24 * GiB, pieces, extra, 32 * GiB) == 24 * GiB
+    assert gpu.fit_total(24 * GiB, pieces, extra, 25 * GiB) is None  # 12 isn't a multiple of 8
+    with pytest.raises(ValueError):
+        gpu.fit_total(12 * GiB, pieces, extra, None)
+    monkeypatch.setattr(machine, "cgroup_memory_limit", lambda: None)
+    monkeypatch.setattr(machine, "mem_available", lambda: None)
+    assert gpu.host_memory_budget()[0] is None
+
+
+def test_mem_available_reads_meminfo(monkeypatch):
+    monkeypatch.setattr(machine, "_read", {"/proc/meminfo": "MemTotal:  100 kB\n"
+                                           "MemAvailable:   2048 kB\n"}.get)
+    assert machine.mem_available() == 2048 * 1024
+    monkeypatch.setattr(machine, "_read", lambda path: None)
+    assert machine.mem_available() is None
+
+
+def test_window_rate_and_slowdown_from_fake_counts():
+    # (time, FLOPs finished, GEMMs finished): 6e12 FLOPs over 2 s is 3 TFLOP/s.
+    rate = gpu.window_rate((10.0, 1e12, 5), (12.0, 7e12, 11))
+    assert rate == {"tflop_per_s": pytest.approx(3.0), "gemms": 6, "window_s": 2.0}
+    assert gpu._hash_rate((0.0, 0), (0.5, 4 * 10**9)) == pytest.approx(8.0)
+    assert gpu.slowdown(alone=4.0, during=3.0) == pytest.approx(0.25)
+    assert gpu.slowdown(alone=4.0, during=4.2) == pytest.approx(-0.05)  # noise reads negative
 
 
 def test_hash_loop_counts_the_bytes_it_hashes():
@@ -115,7 +153,7 @@ def test_run_e3_and_e4_tiny():
                                                         "gemm_loop_with_gpu_hash"]
     assert [r["status"] for r in rows] == ["measured"] * 4 + ["skipped"] * 2
     rows = gpu.run_e4(pieces=[MB, 2 * MB], total=4 * MB, reps=2, window_s=0.05,
-                      gemms=("tiny", gemms), hash_buf=cpu_hash.make_buffer(2 * MB),
+                      gemms=("tiny", gemms), hash_bytes=2 * MB,
                       hash_chunk=64 << 10, hash_threads=2, log=lambda _: None)
     names = [r["name"] for r in rows]
     combos = 2 * 2 * 2  # pinned or pageable, two pieces, two directions

@@ -290,8 +290,8 @@ def run(argv: list[str] | None = None, log=print) -> Path:
         return {"E4": slot("E4", gpu.run_e4(
             pieces=[int(p) * MB for p in args["e4_pieces_mb"].split(",")],
             total=args["e4_total_mb"] * MB, reps=args["reps"], window_s=args["gpu_window_s"],
-            gemms=first, hash_buf=cpu_hash.make_buffer(args["buffer_mb"] * MB),
-            hash_chunk=chunk, hash_threads=max(threads), log=say))}
+            gemms=first, hash_bytes=args["buffer_mb"] * MB, hash_chunk=chunk,
+            hash_threads=max(threads), log=say))}
 
     def e6() -> dict:
         device = args["e6_device"]

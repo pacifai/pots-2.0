@@ -153,6 +153,14 @@ def cgroup_memory_limit() -> int | None:
     return None
 
 
+def mem_available() -> int | None:
+    """``MemAvailable`` from ``/proc/meminfo`` in bytes, or None where there's no such file.
+    In a container it describes the host, so the cgroup limit is the tighter bound there."""
+    text = _read("/proc/meminfo")
+    m = re.search(r"^MemAvailable:\s+(\d+) kB", text or "", re.M)
+    return int(m.group(1)) * 1024 if m else None
+
+
 def _khz_to_mhz(text: str | None) -> float | None:
     try:
         return int(text.strip()) / 1000 if text else None

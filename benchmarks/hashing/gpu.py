@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import math
 import statistics
 import threading
 import time
@@ -33,7 +34,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from benchmarks.hashing import cpu_hash
+from benchmarks.hashing import cpu_hash, machine
 from benchmarks.hashing.report import result
 from benchmarks.hashing.step_time import matmul_precision
 
@@ -93,8 +94,14 @@ def _operands(g: Gemm, device: torch.device, seed: int) -> tuple[torch.Tensor, .
     return a, b, torch.empty(g.m, g.n, device=device, dtype=torch.bfloat16)
 
 
+# GEMMs between one pair of CUDA events. Back to back, the GPU doesn't wait for a launch
+# between them, so the launch delay before the first one is a tenth of the measurement.
+GEMMS_PER_EVENT = 10
+
+
 def time_gemm(g: Gemm, device: torch.device, *, iters: int, warmup: int = 3) -> list[float]:
-    """Seconds per GEMM, from CUDA events around each of ``iters`` runs after ``warmup``."""
+    """Seconds per GEMM for each of ``iters`` measurements after ``warmup`` GEMMs: CUDA events
+    around ``GEMMS_PER_EVENT`` back-to-back GEMMs, divided by their count."""
     a, b, c = _operands(g, device, seed=0)
     for _ in range(warmup):
         torch.mm(a, b, out=c)
@@ -102,10 +109,11 @@ def time_gemm(g: Gemm, device: torch.device, *, iters: int, warmup: int = 3) -> 
     for _ in range(iters):
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
-        torch.mm(a, b, out=c)
+        for _ in range(GEMMS_PER_EVENT):
+            torch.mm(a, b, out=c)
         end.record()
         end.synchronize()
-        times.append(start.elapsed_time(end) / 1e3)
+        times.append(start.elapsed_time(end) / 1e3 / GEMMS_PER_EVENT)
     return times
 
 
@@ -176,6 +184,11 @@ def window_rate(before: tuple[float, int, int], after: tuple[float, int, int]
     seconds = after[0] - before[0]
     return {"tflop_per_s": (after[1] - before[1]) / seconds / 1e12,
             "gemms": after[2] - before[2], "window_s": seconds}
+
+
+def slowdown(alone: float, during: float) -> float:
+    """The fraction of the rate alone lost during the concurrent window."""
+    return 1 - during / alone
 
 
 def warm(loop: GemmLoop, timeout: float = 120) -> None:
@@ -351,7 +364,13 @@ def _hash_rate(before: tuple[float, int], after: tuple[float, int]) -> float:
 
 
 COPY_UNIT = "GB/s (1e9 bytes/s)"
-# What the A40 pod showed: a pageable copy slowed this process's GEMM loop 80–95%, and the same
+GEMM_NOISE_NOTE = (
+    f"a slowdown under about 1% is counting noise: the loop counts a GEMM only once it sees it "
+    f"finish, so a window's count lags the GPU by up to {DEPTH} GEMMs")
+HASH_NOISE_NOTE = (
+    "a slowdown of a few percent is counting noise: a thread's bytes count only once its "
+    "16 MiB task finishes, so a window's count lags by up to one task per thread")
+# What the A40 pod showed: a pageable copy slowed this process's GEMM loop 83–98%, and the same
 # copy from a second process slowed it not at all.
 PAGEABLE_NOTE = (
     "the copy and the GEMM loop share one process; a pageable copy blocks the thread that "
@@ -359,15 +378,58 @@ PAGEABLE_NOTE = (
     "same pageable copies from a second process left the loop's rate unchanged")
 
 
+# Host RAM E4 leaves free beside its two buffers, for the rest of the process.
+MEMORY_MARGIN = 4 << 30
+
+
+def host_memory_budget() -> tuple[int | None, dict[str, int | None]]:
+    """The host RAM the process may use, the smaller of the cgroup's limit and
+    ``MemAvailable`` (None when neither is known), and the two readings."""
+    readings = {"cgroup_memory_limit_bytes": machine.cgroup_memory_limit(),
+                "mem_available_bytes": machine.mem_available()}
+    known = [v for v in readings.values() if v is not None]
+    return (min(known) if known else None), readings
+
+
+def fit_total(total: int, pieces: Sequence[int], extra: int, budget: int | None) -> int | None:
+    """``total``, halved as often as it takes for ``total + extra`` to fit ``budget``, while
+    it stays a whole multiple of every piece; None when no such total fits."""
+    unit = math.lcm(*pieces)
+    if total % unit:
+        raise ValueError(f"total {total} is not a multiple of every piece {list(pieces)}")
+    while total % unit == 0 and total >= unit:
+        if budget is None or total + extra <= budget:
+            return total
+        total //= 2
+    return None
+
+
 def run_e4(*, pieces: Sequence[int], total: int, reps: int, window_s: float,
-           gemms: tuple[str, list[Gemm]] | None, hash_buf: np.ndarray | None,
-           hash_chunk: int, hash_threads: int, log: Callable[[str], None] = print
-           ) -> list[dict]:
+           gemms: tuple[str, list[Gemm]] | None, hash_bytes: int, hash_chunk: int,
+           hash_threads: int, log: Callable[[str], None] = print) -> list[dict]:
     """E4: every (direction, memory, piece size) copy alone, beside the GEMM loop, and beside
-    CPU hashing. ``gemms`` is ``(model, shapes)`` for the loop; ``hash_buf`` the buffer the CPU
-    threads hash. Either may be None to leave its rows out."""
+    CPU hashing. ``gemms`` is ``(model, shapes)`` for the loop, or None; ``hash_bytes`` the size
+    of the buffer the CPU threads hash, or 0. A missing one leaves its rows out.
+
+    Before allocating, the host buffer is halved until it, the hashing buffer and
+    ``MEMORY_MARGIN`` fit the host's memory (``host_memory_budget``): a cgroup's out-of-memory
+    kill would end the whole run, E5 and E6 with it."""
     if not torch.cuda.is_available():
         return [result("copy", "skipped", reason=NO_CUDA)]
+    budget, readings = host_memory_budget()
+    used = fit_total(total, pieces, hash_bytes + MEMORY_MARGIN, budget)
+    if used is None:
+        return [result("copy", "skipped", params={"total_bytes_requested": total, **readings},
+                       reason=f"the host buffer doesn't fit: no total that is a multiple of "
+                              f"every piece fits {budget} bytes beside the {hash_bytes}-byte "
+                              f"hashing buffer and a {MEMORY_MARGIN}-byte margin")]
+    reduced = None
+    if used != total:
+        reduced = (f"host buffer reduced from {total} to {used} bytes to fit {budget} bytes of "
+                   f"host memory (the cgroup limit or MemAvailable, the smaller)")
+        log(f"E4: {reduced}")
+    requested, total = total, used
+    hash_buf = cpu_hash.make_buffer(hash_bytes) if hash_bytes else None
     device = torch.device("cuda")
     host = HostBuffer(total)
     dev = torch.empty(max(pieces), dtype=torch.uint8, device=device)
@@ -403,14 +465,15 @@ def run_e4(*, pieces: Sequence[int], total: int, reps: int, window_s: float,
                 for direction in ("h2d", "d2h"):
                     params = {"direction": direction, "pinned": pinned,
                               "host_is_pinned": bool(parts[0].is_pinned()), "piece_bytes": piece,
-                              "pieces": len(parts), "total_bytes": total}
+                              "pieces": len(parts), "total_bytes": total,
+                              "total_bytes_requested": requested, **readings}
                     tag = f"{direction} {'pinned' if pinned else 'pageable'} " \
                           f"{piece >> 20} MiB × {len(parts)}"
                     log(f"E4 copy alone: {tag}")
                     copy_pass(parts, dev, direction, stream)  # warm-up
                     times = [copy_pass(parts, dev, direction, stream) for _ in range(reps)]
                     out.append(result(
-                        "copy", "measured", params={**params, "reps": reps},
+                        "copy", "measured", params={**params, "reps": reps}, note=reduced,
                         values={"gb_per_s_median": total / statistics.median(times) / GB,
                                 "gb_per_s_best": total / min(times) / GB, "seconds": times},
                         units={"gb_per_s_median": COPY_UNIT, "gb_per_s_best": COPY_UNIT,
@@ -418,58 +481,61 @@ def run_e4(*, pieces: Sequence[int], total: int, reps: int, window_s: float,
                     if gemms is not None:
                         log(f"E4 copy with the GEMM loop: {tag}")
                         out.append(_copy_with_gemm(parts, dev, direction, stream, gemms,
-                                                   gemm_alone, window_s, params, device))
+                                                   window_s, params, device))
                     if hash_buf is not None:
                         for algo in cpu_hash.ALGOS:
                             log(f"E4 copy with CPU hashing ({algo}): {tag}")
                             out.append(_copy_with_hashing(
                                 parts, dev, direction, stream, hash_buf, algo, hash_chunk,
-                                hash_threads, hash_alone[algo], window_s, params))
+                                hash_threads, window_s, params))
     return out
 
 
-def _copy_with_gemm(parts, dev, direction, stream, gemms, gemm_alone, window_s, params,
-                    device) -> dict:
+def _copy_with_gemm(parts, dev, direction, stream, gemms, window_s, params, device) -> dict:
+    """The loop's rate alone over one window, then beside the copies over the next, in one
+    loop. The baseline sits next to the window it's compared with, so clock drift over a long
+    session doesn't count as slowdown."""
     model, shapes = gemms
     with matmul_precision(), GemmLoop(shapes, device) as loop:
-        warm(loop)
+        alone = loop_alone(loop, window_s)
         before = loop.count()
         copied, seconds = copy_window(parts, dev, direction, stream, window_s)
         during = window_rate(before, loop.count())
-    assert gemm_alone is not None
-    note = None
-    if not params["pinned"]:
-        note = PAGEABLE_NOTE
+    notes = [GEMM_NOISE_NOTE] + ([] if params["pinned"] else [PAGEABLE_NOTE])
     return result(
-        "copy_with_gemm_loop", "measured", note=note,
+        "copy_with_gemm_loop", "measured", note="; ".join(notes),
         params={**params, "model": model, "min_window_s": window_s},
         values={"copy_gb_per_s": copied / seconds / GB,
                 "gemm_tflop_per_s": during["tflop_per_s"],
-                "gemm_tflop_per_s_alone": gemm_alone["tflop_per_s"],
-                "gemm_slowdown": 1 - during["tflop_per_s"] / gemm_alone["tflop_per_s"],
+                "gemm_tflop_per_s_alone": alone["tflop_per_s"],
+                "gemm_slowdown": slowdown(alone["tflop_per_s"], during["tflop_per_s"]),
                 "window_s": seconds},
         units={"copy_gb_per_s": COPY_UNIT, "gemm_tflop_per_s": GEMM_UNITS["tflop_per_s"],
-               "gemm_tflop_per_s_alone": GEMM_UNITS["tflop_per_s"],
+               "gemm_tflop_per_s_alone": GEMM_UNITS["tflop_per_s"] + ", the window just before",
                "gemm_slowdown": "fraction of the loop's rate alone lost during the copy",
                "window_s": "s, whole copy passes"})
 
 
-def _copy_with_hashing(parts, dev, direction, stream, buf, algo, chunk, threads, alone,
-                       window_s, params) -> dict:
+def _copy_with_hashing(parts, dev, direction, stream, buf, algo, chunk, threads, window_s,
+                       params) -> dict:
+    """The hashing rate alone over one window, then beside the copies over the next."""
     with HashLoop(buf, algo, chunk, threads) as h:
         time.sleep(min(0.2, window_s / 4))
         before = h.count()
+        time.sleep(window_s)
+        mid = h.count()
+        alone = _hash_rate(before, mid)
         copied, seconds = copy_window(parts, dev, direction, stream, window_s)
-        rate = _hash_rate(before, h.count())
+        rate = _hash_rate(mid, h.count())
     return result(
-        "copy_with_cpu_hashing", "measured",
+        "copy_with_cpu_hashing", "measured", note=HASH_NOISE_NOTE,
         params={**params, "algo": algo, "chunk_bytes": chunk, "threads": threads,
                 "min_window_s": window_s},
         values={"copy_gb_per_s": copied / seconds / GB, "hash_gb_per_s": rate,
-                "hash_gb_per_s_alone": alone, "hash_slowdown": 1 - rate / alone,
+                "hash_gb_per_s_alone": alone, "hash_slowdown": slowdown(alone, rate),
                 "window_s": seconds},
         units={"copy_gb_per_s": COPY_UNIT, "hash_gb_per_s": COPY_UNIT,
-               "hash_gb_per_s_alone": COPY_UNIT,
+               "hash_gb_per_s_alone": COPY_UNIT + ", the window just before",
                "hash_slowdown": "fraction of the hashing rate alone lost during the copy",
                "window_s": "s, whole copy passes"})
 
