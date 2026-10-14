@@ -164,6 +164,7 @@ from verification.verifier.bands import Bands, product_class
 # judges that product; and checks 2 and 6a as the verifier runs them, for the check-6 trial.
 from verification.verifier.checks import (
     _judge_product,
+    _measure_groups,
     _measure_run,
     _member_runs,
     check_2_commitment,
@@ -259,10 +260,10 @@ def sweep_targets(c: DeclaredComputation,
 
 # Check 5 splits the canonical order into runs (``checks._member_runs``: a stretch of one
 # layer's batched members, or one product). A run of one goes through ``measure_product`` with
-# its operands as served. A longer run is split by operand shapes, and each shape's members are
-# stacked in run order (``torch.stack``, contiguous copies) and measured in one
-# ``measure_products`` call (``checks._measure_run``). A member's bits depend on that batch, not
-# only on its own operands, in two ways:
+# its operands as served. A longer run is split into groups (``checks._measure_groups``: by
+# operand shapes, cut into chunks of at most ``checks._GROUP_BYTES``), and each group's members
+# are stacked in run order (contiguous copies) and measured in one ``measure_products`` call.
+# A member's bits depend on that batch, not only on its own operands, in two ways:
 # - layout: the replay serves some ``B`` as a transposed view (``Kᵀ`` of ``S = Q·Kᵀ``), and
 #   ``B²·1`` over the view rounds differently from the stacked copy. On step 4's ``L15.S[0,0]``
 #   (``U/‖P‖_F`` 1.43, so the unit uses ``U``), measuring the member alone moved ``U`` by
@@ -334,13 +335,15 @@ class Held:
 
 def batch_members(c: DeclaredComputation, spec: ProductSpec) -> tuple[ProductSpec, ...] | None:
     """The products check 5 stacks with ``spec`` into one ``measure_products`` call, in the
-    batch's order: the members of its run with its operand shapes. ``None`` for a run of one,
-    which check 5 measures alone."""
+    batch's order: its group in its run (``checks._measure_groups``), the members with its
+    operand shapes unless a chunk limit splits them. ``None`` for a run of one, which check 5
+    measures alone."""
     for run in _member_runs(c.products):
         if any(s.m == spec.m for s in run):
             if len(run) == 1:
                 return None
-            return tuple(s for s in run if (s.a_shape, s.b_shape) == (spec.a_shape, spec.b_shape))
+            return next(tuple(run[i] for i in idx) for idx in _measure_groups(run)
+                        if any(run[i].m == spec.m for i in idx))
     raise ValueError(f"P_{spec.m} is not a product of the computation")
 
 

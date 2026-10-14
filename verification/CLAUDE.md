@@ -508,8 +508,8 @@ interface.
   - `Replay` (ABC) runs once per step and owns its own model, loaded from the committed
     `W_t`. `operands(m) -> (A, B)` is called in canonical order 1..M. It caches glue and
     drops it after its last use. `glue_gradients()` is valid only after `operands(1..M)` in
-    order. `operand_group(ms) -> (A, B)` serves consecutive members of one attention run with
-    equal shapes, stacked: bit for bit `torch.stack` of their `operands(m)`, detached and
+    order. `operand_group(ms) -> (A, B)` serves members of one attention run with equal
+    shapes, in canonical order but not necessarily adjacent (check 5's groups), stacked: bit for bit `torch.stack` of their `operands(m)`, detached and
     contiguous. The default does exactly that. A caller that gets an exception falls back to
     `operands(m)` per member to find the failing one.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
@@ -1149,18 +1149,38 @@ interface.
     `bias`, `b` is the committed `W_t` leaf of that name, rounded to `operand_dtype` as `B`
     is, never a tensor the replay or the prover supplies; `b` is `None` otherwise.
   - **Member batching.** A run of consecutive member specs of one layer (`_member_runs`;
-    on SmolLM2, `S`+`O` and `dA`+`dV`+`dQ`+`dK` of each layer) has its operands served one
-    member at a time in canonical order, then stacked by shape and measured with
-    `measure_products`. Members are then recorded and judged in canonical order, so the first
-    failing member rejects with the same message as alone, and an error serving a later member
-    is raised only after the members before it pass. Every other product is measured alone.
+    on SmolLM2, `S`+`O` and `dA`+`dV`+`dQ`+`dK` of each layer) is split into groups
+    (`_measure_groups`: by operand shapes in order of first appearance, each group in run
+    order, cut into consecutive chunks of at most `_GROUP_BYTES` = 4 GiB of fp32 `A`, `B`
+    and `P`; a function of the declared computation only). Each group is served at once
+    (`Replay.operand_group`, inside `5.glue`), its `P` leaves stacked on the host and moved
+    to the device in one copy, and measured with `measure_products_rows`. If a group's
+    serving raises, the whole run is served again one member at a time (`_served`), which
+    finds the first failing member in canonical order and its error. Every other product is
+    served (`_served`) and measured (`measure_product_row`) alone. These are the shape groups
+    check 5 measured before 2026-10-14; the byte limit cuts one only past 32,768 members
+    at 128×128×64 (Llama-3.2-1B's largest at `n_s = 128` has 12,288). On SmolLM2 each layer
+    has four: `S` and `O` (36 members each), `dA` (36) and `dV`+`dQ`+`dK` (108).
+  - **Judging window (2026-10-14).** Check 5's numbers stay on the device, one float64 row
+    per product (`freivalds.ROW`), until at least `_JUDGE_WINDOW` (1024) products are
+    measured, at the end of a run. Then one `tolist` brings the window's rows to the host
+    (`_finish`, inside `5.measure`), and its products are recorded and judged one by one in
+    canonical order (`_judge_window`), so the first failing product and its message are
+    those of one-at-a-time judging. A read makes the host wait for the device, so this
+    replaces several waits per product with one per window. `5.measure`'s call count is
+    the number of runs plus the number of windows. An error serving or measuring run `i`
+    is handled as one product at a time would: the window before run `i` is judged first,
+    then (for a serving error) the products of run `i` served before it, and the error is
+    raised only if none of those rejects. A rejection then leaves it to the record pass
+    (`StepState.run_rest_error`).
   - **The record pass (EV2, EVALUATION_SPEC §4.1).** `record_rest(store, c, ctx, bands,
     slot) -> str` measures, for the record only, the tests a rejecting check skipped. A
-    check-5 rejection inside a member run first records the run's later members as check 5
-    measured them in the batch (`StepState.run_rest`, set by check 5 when it rejects), since
-    a member measured alone or in a smaller batch is held to agree only to `1e-4` relative;
-    a serving error check 5 deferred (`StepState.run_rest_error`) is raised after them.
-    Every later product is then measured from check 5's own replay. A 6a rejection measures
+    check-5 rejection first records the products check 5 measured after the failing one and
+    never judged (the rest of its window, `StepState.run_rest`, set by check 5 when it
+    rejects), since a member measured alone or in a smaller batch is held to agree only to
+    `1e-4` relative; an error check 5 deferred (`StepState.run_rest_error`) is raised after
+    them. Every later product is then served and measured from check 5's own replay, as
+    check 5 does it. A 6a rejection measures
     the remaining linear weights, then every 6b glue weight from a replay of its own, since
     check 6 is one protocol check over every tensor. A 6b rejection measures the remaining
     glue weights. Each gradient comes from the helper its live check uses
@@ -1273,6 +1293,14 @@ interface.
   and `e_m(q + 1)`. Without it every operation and its order is the unbiased one, so
   unbiased products keep their bits. Its norms use `_safe_norm` (power-of-two scaling,
   bit-identical to `vector_norm` when that doesn't overflow or underflow).
+  `measure_product_row(...)` and `measure_products_rows(...)` (same arguments, no
+  `eps_in`/`eps_acc`) return the numbers as float64 rows on the operands' device with no
+  host read: `ROW` = `ν`, `‖|P|·1‖`, `‖P‖_F`, the terms' `U²`, `‖b‖²` (0 unbiased), then the
+  `k` residuals; `row_width(k) = 5 + k`. `finish_row(row, *, q, n, eps_in, eps_acc, guard,
+  biased)` makes the `ProductMeasure` on the host (a biased product's `U² += n·‖b‖²` there,
+  in float64). `measure_product` and `measure_products` are a row, one `tolist` and
+  `finish_row`. Every row entry is an fp32 value widened exactly or a float64 sum, so the
+  numbers keep their bits.
   - **The band unit (F18).** Test 2 rejects when `‖A(B·r) − P·r‖ > τ·σ_r·(√2·ε_in·‖P‖_F +
     √q·ε_acc·max(‖P‖_F, U))`: the product's own rounding scales with `‖P‖_F`, accumulation
     with the larger of `‖P‖_F` and the term scale `U = √(Σ_l ‖A[:,l]‖²·‖B[l,:]‖²)`, the
@@ -1281,7 +1309,7 @@ interface.
     pre-F18 unit bit for bit, and with `‖P‖_F = 0` it is `σ_r·√q·ε_acc·U`.
     `ProductMeasure.u` is `U`, computed as `√(Σ A²·(B²·1))` (`_term_sq`, two fp32
     matrix-vector products into the scratch buffer, summed in float64) from the rebuilt
-    operands in the same pass as ν; a biased product adds `n·‖b‖²` (`_bias_u2`). It is
+    operands in the same pass as ν; a biased product adds `n·‖b‖²` (`_bias_sq`, added in `finish_row`). It is
     computed with the κ guard on or off. `term_scale(a, b, bias=None)` gives the same bits
     outside a measure, and `term_scales(a, b)` each member's `U` of a stacked batch with
     `measure_products`'s bits (the sweep's unit). The two can differ in the last bits for the
@@ -1300,13 +1328,18 @@ interface.
   - **Fast path, same bits (O2).** Both functions take an optional `scratch=MeasureScratch()`,
     one reused buffer for `|A|`, `|B|`, `|P|` and `P/s` (check 5 holds one per step). Each
     `|x|` is written with a fresh `abs`'s strides, so the matmuls see the same operands. `|P|`
-    is computed once. `_norm` gives `_safe_norm`'s bits and skips the scaled copy when one
-    `aminmax` pass shows every entry is at least `2⁻⁶³·max(1, max|x|)` and `n·max² ≤ 2¹²⁴`.
-    The buffer and the ones vectors sit on the operands' device, and the challenges are
-    drawn on the host and moved there (FS9).
-    Then every square and partial sum is a normal fp32 number in both runs, so power-of-two
-    scaling commutes with each rounding (the proof is in `_norm`'s docstring). A zero entry
-    fails the test, so every backward product takes the scaled path (into the buffer).
+    is computed once. `_norm` gives `_safe_norm`'s bits and always takes the scaled path
+    (into the buffer when `x` is contiguous), with no host read: `_scaled_norm` maps a zero,
+    infinite or NaN `max|x|` to a scale (`nan_to_num`, then `frexp`) that gives `_safe_norm`'s
+    fallback value without a branch. The buffer and the ones vectors sit on the operands'
+    device, and the challenges are drawn on the host and moved there (FS9).
+    Until 2026-10-14 `_norm` read every vector's min and max back with one `aminmax` pass and
+    returned the plain `vector_norm` when every entry was at least `2⁻⁶³·max(1, max|x|)` and
+    `n·max² ≤ 2¹²⁴`. Then every square and partial sum is a normal fp32 number in both runs,
+    so power-of-two scaling commutes with each rounding and the plain norm has the scaled
+    one's bits on the CPU (the proof is in `_norm`'s docstring). Dropping the branch changed
+    no CPU number. A GPU's plain and scaled kernels need not agree, so a GPU's bits may differ
+    from the old branch's.
   - `guard=False` (both functions) skips `|A|`, `|B|` and `|P|·1`: ν, `‖|P|·1‖` and κ come
     back NaN, and every test-2 number keeps its bits. Only `StepContext.kappa_guard` uses it.
   - `_measure_product_reference` and `_measure_products_reference` keep the plain formulas.
@@ -1937,11 +1970,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `ρ ≈ CHECK6_FACTOR·τ_W` (2, a placeholder) must reject at 6a on that entry.
   - **Measured as check 5 measures (2026-10-13, 2026-10-14).** Check 5 splits the products
     into runs (`_member_runs`). A run of one is measured alone, as served. A longer run is
-    split by operand shapes, and each shape's members are stacked in run order (`torch.stack`,
-    contiguous copies) and measured in one `measure_products` call. `measure_target` does the
-    same for one target. A member's `Held.batch` (`Batch`, from `batch_members`) holds the
-    stacked operands and committed products of every member of its run with its shapes (36 at
-    test scale, `n_s·n_h`). A trial writes the planted product into the target's slot,
+    split into check 5's groups (`checks._measure_groups`: by operand shapes, cut at
+    `_GROUP_BYTES`), and each group's members are stacked in run order (contiguous copies)
+    and measured in one `measure_products` call. `measure_target` does the same for one
+    target. A member's `Held.batch` (`Batch`, from `batch_members`) holds the stacked
+    operands and committed products of every member of its group (36 at test scale, 108
+    for `dV`+`dQ`+`dK`). A trial writes the planted product into the target's slot,
     measures the whole batch and restores the slot. Any other product goes through
     `_measure_run`. `target_term_scale` gives `U` the same way (`freivalds.term_scales` on the
     batch, or `term_scale`). Before its trials each target is measured on the honest

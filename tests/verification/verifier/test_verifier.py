@@ -405,7 +405,7 @@ def test_check_5_keys_on_the_claimed_root(c, D, tree, w0, monkeypatch):
     assert check_2_commitment(tampered, c, ctx, Bands.provisional()) is None
     assert ctx.state.claimed_root == bad and ctx.state.recomputed_root is None
     keys = []
-    for name in ("measure_product", "measure_products"):
+    for name in ("measure_product_row", "measure_products_rows"):
         def spy(*a, _f=getattr(checks, name), **kw):
             keys.append(kw["h"])
             return _f(*a, **kw)
@@ -1525,6 +1525,14 @@ class _HookedReplay(DecoderReplay):
         hook = type(self.c).operands_hook
         return (a, b) if hook is None else hook(self.c, m, a, b)
 
+    def operand_group(self, ms):
+        a, b = super().operand_group(ms)
+        hook = type(self.c).operands_hook
+        if hook is None:
+            return a, b
+        pairs = [hook(self.c, m, x, y) for m, x, y in zip(ms, a, b)]
+        return torch.stack([x for x, _ in pairs]), torch.stack([y for _, y in pairs])
+
 
 @pytest.fixture(scope="module")
 def llama_out():
@@ -1565,6 +1573,48 @@ def test_member_runs_cover_canonical_order(llama_out):
     # Per layer: S and O (forward) are one run, and dA, dV, dQ, dK (backward) another.
     assert [len(run) for run in long] == [2 * c.n_s * c.n_h] * c.L + [4 * c.n_s * c.n_h] * c.L
     assert all(len({(s.layer, s.member is None) for s in run}) == 1 for run in runs)
+
+
+def test_measure_groups_split_by_shape_then_by_size(llama_out, monkeypatch):
+    """Each run's groups cover it in run order within a group, one shape per group; a byte
+    limit cuts a group into consecutive chunks, and the sweep's ``batch_members`` follows."""
+    from verification.runs import flipped_matmul_sweep as fs
+
+    c, _ = llama_out
+    runs = [r for r in checks._member_runs(c.products) if len(r) > 1]
+    for run in runs:
+        groups = checks._measure_groups(run)
+        assert sorted(i for g in groups for i in g) == list(range(len(run)))
+        assert all(g == sorted(g) and len({(run[i].a_shape, run[i].b_shape) for i in g}) == 1
+                   for g in groups)
+    run = runs[-1]  # a backward run: δA's group, and δV, δQ, δK's
+    spec = run[1]
+    whole = checks._measure_groups(run)
+    one = 4 * (spec.a_shape[0] * spec.a_shape[1] + spec.b_shape[0] * spec.b_shape[1]
+               + spec.a_shape[0] * spec.b_shape[1])
+    monkeypatch.setattr(checks, "_GROUP_BYTES", 3 * one)
+    cut = checks._measure_groups(run)
+    assert [g for g in cut if 1 in g][0] == [g for g in whole if 1 in g][0][:3]
+    assert max(len(g) for g in cut) == 3 and len(cut) > len(whole)
+    assert fs.batch_members(c, spec) == tuple(run[i] for i in cut[[1 in g for g in cut].index(True)])
+
+
+def test_check_5_serves_member_groups_whole(llama_out, monkeypatch):
+    """Check 5 asks the replay for each member group at once and serves only the dense
+    products one at a time; a group that fails is served again one member at a time."""
+    c, out = llama_out
+    calls = {"operands": [], "group": []}
+    real_ops, real_group = DecoderReplay.operands, DecoderReplay.operand_group
+    monkeypatch.setattr(DecoderReplay, "operands",
+                        lambda self, m: (calls["operands"].append(m), real_ops(self, m))[1])
+    monkeypatch.setattr(DecoderReplay, "operand_group",
+                        lambda self, ms: (calls["group"].append(list(ms)),
+                                          real_group(self, ms))[1])
+    rej, stats = _llama_check_5(c, out, monkeypatch, batched=True)
+    assert rej is None and [x.m for x in stats] == list(range(1, c.M + 1))
+    assert calls["operands"] == [s.m for s in c.products if s.member is None]
+    runs = [r for r in checks._member_runs(c.products) if len(r) > 1]
+    assert calls["group"] == [[r[i].m for i in g] for r in runs for g in checks._measure_groups(r)]
 
 
 def test_batched_check_5_matches_one_at_a_time(llama_out, monkeypatch):
@@ -1634,15 +1684,20 @@ def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
     assert rej_b == rej_s and f"({forged})" in rej_b.detail
 
 
-def test_record_pass_keeps_check_5s_measures_of_the_failing_run(llama_out, monkeypatch):
-    """A forged S/O member mid-way through its layer's forward run rejects check 5. The run's
-    later members were measured with it in one batch and never judged; the record pass
-    records them as check 5 measured them (``StepState.run_rest``), without serving or
-    measuring them again in a smaller batch or alone (``measure_product`` and
+@pytest.mark.parametrize("window", [1, checks._JUDGE_WINDOW])
+def test_record_pass_keeps_check_5s_measures_of_the_failing_run(llama_out, monkeypatch,
+                                                                window):
+    """A forged S/O member mid-way through its layer's forward run rejects check 5. The
+    products check 5 measured after it and never judged (the rest of its run, and of its
+    judging window) are recorded as check 5 measured them (``StepState.run_rest``), without
+    serving or measuring them again in a smaller batch or alone (``measure_product`` and
     ``measure_products`` are held to agree only to 1e-4 relative). Every number of the step
     then equals a record-mode check 5's over the same leaves, bit for bit. On this decoder the
     two measures happen to agree bit for bit, so the test checks the hand-over itself: the
-    stashed members, and no later member of the run served again."""
+    stashed products, and none of them served again. With a window of one product, check 5
+    judges after each run, so the record pass serves the later runs; with the default window
+    the tiny step is one window, so check 5 measured everything."""
+    monkeypatch.setattr(checks, "_JUDGE_WINDOW", window)
     c, out = llama_out
     run = next(r for r in checks._member_runs(c.products) if len(r) > 1)
     forged, later = run[len(run) // 2], run[len(run) // 2 + 1:]
@@ -1659,14 +1714,16 @@ def test_record_pass_keeps_check_5s_measures_of_the_failing_run(llama_out, monke
 
     live = ctx_for(True)
     _expect(check_5_matmuls(store, c, live, Bands.provisional()), 1, "5")
-    assert [spec.m for spec, _ in live.state.run_rest] == [spec.m for spec in later]
+    stashed = later[-1].m if window == 1 else c.M
+    assert window == 1 or c.M < window
+    assert [spec.m for spec, _ in live.state.run_rest] == list(range(forged.m + 1, stashed + 1))
     assert live.state.run_rest_error is None
-    served, real = [], checks._served
-    monkeypatch.setattr(checks, "_served", lambda c, spec, *a: (served.append(spec.m),
-                                                                 real(c, spec, *a))[1])
+    served, real = [], checks._serve_run
+    monkeypatch.setattr(checks, "_serve_run", lambda c, specs, *a: (
+        served.extend(spec.m for spec in specs), real(c, specs, *a))[1])
     assert checks.record_rest(store, c, live, Bands.provisional(), "5") == \
         checks.RECORD_COMPLETE
-    assert not live.state.run_rest and served == list(range(later[-1].m + 1, c.M + 1))
+    assert not live.state.run_rest and served == list(range(stashed + 1, c.M + 1))
     monkeypatch.undo()
     ref = ctx_for(False)
     assert check_5_matmuls(store, c, ref, Bands.provisional()) is None
@@ -1703,6 +1760,38 @@ def test_record_pass_raises_a_stashed_serving_error(llama_out, monkeypatch):
     with pytest.raises(RuntimeError, match="replay bug"):
         checks.record_rest(store, c, ctx, Bands.provisional(), "5")
     assert [p.m for p in ctx.stats.products] == list(range(1, c.m_of(broken)))
+
+
+def test_record_pass_ends_on_a_later_runs_serving_error(llama_out, monkeypatch):
+    """A product of an earlier run rejects check 5, and a later run of the same judging window
+    fails to serve. As one product at a time: the record pass records every product up to
+    that run, none of its members, then ends on the error."""
+    _, out = llama_out
+    c = _DecoderWith(tiny_config(), n_s=2, n=12, eta=ETA)
+    forged, broken = "L1.S[0,1]", "L1.dV[1,3]"
+    run = next(r for r in checks._member_runs(c.products) if c.m_of(broken) in
+               {spec.m for spec in r})
+
+    def fail(c, m, a, b):
+        if m == c.m_of(broken):
+            raise RuntimeError("replay bug")
+        return a, b
+
+    monkeypatch.setattr(_DecoderWith, "operands_hook", fail)
+    store = InMemoryStore.from_step(c, out, copy=True)
+    m = c.m_of(forged)
+    perturb_leaf(c, store, c.product_index(m), _bumped(out.products[m - 1]))
+    ctx = StepContext.for_computation(
+        c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
+        prev_w_hashes=(), chain_check_id="0", k=K)
+    assert check_2_commitment(store, c, ctx, Bands.provisional()) is None
+    _expect(check_5_matmuls(store, c, ctx, Bands.provisional()), 1, "5")
+    assert ctx.stats.products[-1].m == m
+    assert [spec.m for spec, _ in ctx.state.run_rest] == list(range(m + 1, run[0].m))
+    assert ctx.state.run_rest_error is not None
+    with pytest.raises(RuntimeError, match="replay bug"):
+        checks.record_rest(store, c, ctx, Bands.provisional(), "5")
+    assert [p.m for p in ctx.stats.products] == list(range(1, run[0].m))
 
 
 # ---- check 7: parallel hashing, leaf-by-leaf outcome ------------------------------------

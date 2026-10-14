@@ -40,6 +40,7 @@ from verification.runs.mlp_smoke import run_smoke, scenarios
 from verification.runs.scenarios import honest_final, run_scenario
 from verification.transcript.store import InMemoryStore
 from verification.verifier import bands
+from verification.verifier import checks
 from verification.verifier.checks import DEFAULT_ORDER
 from verification.verifier.context import ProductStat, Rejection, StepStats, TensorStat
 from verification.verifier.matmul_check import challenges
@@ -127,7 +128,11 @@ def test_time_rows_cover_the_grid(smoke):
             if "5" in ran:
                 assert ("sub", "5.glue") in got and ("sub", "5.measure") in got
                 if res.loop.rejection is None or res.loop.rejection.step != t:
-                    assert got[("sub", "5.measure")]["calls"] == res.verifier.c.M
+                    # one measuring per run, and one read of the step's numbers (one window)
+                    c = res.verifier.c
+                    assert c.M < checks._JUDGE_WINDOW
+                    assert got[("sub", "5.measure")]["calls"] == \
+                        len(list(checks._member_runs(c.products))) + 1
             total = got[("total", "step")]
             assert total["time_s"] == pytest.approx(sum(r["time_s"] for r in _top_parts(got)))
         run = by_step[0]
