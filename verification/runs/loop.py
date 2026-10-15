@@ -8,7 +8,8 @@
    :class:`~verification.transcript.store.StoreHandoff`, with each record's audit path into
    ``h_D``: an ``InMemoryStore`` by default, or a ``DiskStore`` (C3's cross-check);
 3. on CUDA, hands the caching allocator's free blocks back to the driver
-   (:func:`release_device_cache`), so the verifier allocates in memory the prover has left;
+   (:func:`release_device_cache`, unless ``release_cache`` is off), so the verifier allocates
+   in memory the prover has left;
 4. hands the verifier the store, and only the store (invariant 1);
 5. drops the step's transcript (the handoff's ``release``) before the next step begins.
 
@@ -154,6 +155,7 @@ def run_loop(
     on_step: Callable[[StepRecord], None] | None = None,
     section: Section | None = None,
     handoff: StoreHandoff | None = None,
+    release_cache: bool = True,
 ) -> LoopResult:
     """Run ``verifier.n_steps`` steps of ``C`` from ``W_0`` on ``dataset``.
 
@@ -173,6 +175,8 @@ def run_loop(
     ``P5.write`` and deletes it once the step is verified (C3). The leaves and the tree are the
     same either way. Between the hand-off and the verifier, on CUDA,
     :func:`release_device_cache` runs in its own section, :data:`HANDOFF_SECTION`.
+    ``release_cache=False`` (``VERIF_RELEASE_CACHE=0``) skips it, section and all, so a run can
+    measure what the release costs and what it saves.
     """
     sec = section or no_section
     handoff = handoff or IN_MEMORY
@@ -205,7 +209,8 @@ def run_loop(
         t2 = time.perf_counter()
         w, loss = out.w_next, out.loss
         del out, leaves, tree_h  # the store holds the leaves; nothing else keeps the step
-        release_device_cache(section)  # the prover's step is gone; the verifier is next
+        if release_cache:
+            release_device_cache(section)  # the prover's step is gone; the verifier is next
         t2b = time.perf_counter()
         try:
             rej = verifier.verify_step(t, store)

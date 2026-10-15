@@ -252,6 +252,28 @@ def test_a_run_that_dies_in_the_verifier_still_shows_its_sections():
     assert lines[-1] == raised[0]
 
 
+@pytest.mark.parametrize("release", [True, False])
+def test_release_cache_reaches_the_steps_and_the_tampers(monkeypatch, release):
+    """With CUDA stubbed in, the cache is released once before each verifier: the honest
+    step's and each tamper's. ``release_cache=False`` skips every one."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
+    torch.manual_seed(0)
+    c = DecoderComputation(tiny_config(family="qwen2", tied=False), n_s=2, n=12, eta=1e-3)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+
+    def build():
+        m = c.build_model()
+        randomize_biases(dict(m.named_parameters()))
+        return m
+
+    b = bring_up(c, D, dataset_tree(c, D).root, T=1, k=K, seed=SEED, release_cache=release,
+                 build_model=build)
+    assert b.passed and len(b.tampers) == 2
+    assert len(calls) == (3 if release else 0)
+
+
 def test_main_refuses_a_branch_name(monkeypatch, capsys):
     """The pin names a commit: ``main`` stops before anything loads."""
     from verification.runs import bring_up as module

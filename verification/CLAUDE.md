@@ -95,6 +95,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (Â§8.A.5).
 | `VERIF_SEED` | `1`: `Ï€`'s seed (F8c) and F8g's draw, a public input. It also seeds torch, numpy and `random` (S4c) and the MLP's synthetic data and init |
 | `VERIF_OUTPUT_DIR` | `trainer_output/verification` (gitignored) |
 | `VERIF_METRICS` | `1`: runs write B6's metrics to `$VERIF_OUTPUT_DIR/<run>/`; `0` turns them off. Only `0` or `1` |
+| `VERIF_RELEASE_CACHE` | `1`: on CUDA, the loop hands the allocator's cached blocks back between prover and verifier (`loop.release_device_cache`); `0` skips it, so the re-check session can time the verified step without it. Only `0` or `1`. Read by `bring_up` and `llama_step`; the other entry points always release. It changes no number, so no config hash holds it |
 
 `VERIF_DATASET` and `VERIF_DATASET_REVISION` are retired: F8d pins the data in
 `setup/backdoorllm.py`, and setting either raises.
@@ -1377,12 +1378,13 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
 
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
   - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
-    section=None, handoff=None) -> LoopResult`. `section` is B6's metrics seam, passed to
+    section=None, handoff=None, release_cache=True) -> LoopResult`. `section` is B6's metrics seam, passed to
     `prove_step`. The default `Ï€` is `data.schedule` at `verifier.seed`, the verifier's own
     call. It runs `verifier.start_run(D)`, then per step `prove_step` on `Ï€(t)`,
     `InMemoryStore.commit_step` (`P3.commit`) and `handoff.hold` with the `h_D` paths
     (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), drops the prover's references,
-    `release_device_cache(section)`, `verifier.verify_step(t, store)`,
+    `release_device_cache(section)` (skipped, section and all, with `release_cache=False`),
+    `verifier.verify_step(t, store)`,
     `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
@@ -1393,7 +1395,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     prover's freed blocks stay cached at the prover's sizes, so a large verifier buffer may not
     fit though the GPU has the room (the first H100 session's out-of-memory errors). Its row is
     the harness's, side `run`, in no total. `bring_up.bias_tamper` calls it before each
-    `verify_step` too. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the run's
+    `verify_step` too. `run_scenario`, `memory_run`, `bring_up`, `bias_tamper` and
+    `llama_step.run_honest` pass on `release_cache`; `bring_up` and `llama_step` set it from
+    `VERIF_RELEASE_CACHE`. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the run's
     environment, not in Python: the allocator reads it at CUDA's first use.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
@@ -1413,7 +1417,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   `run_scenario(..., T, k, seed, final, recorder=None, h_D=None, verifier=None)` (`h_D`
   defaults to `D`'s root; `verifier(section) -> Verifier` replaces the default provisional
   verifier and must match the run's seam, `T`, `k` and `seed`; `memory_run` and `count_run`
-  take it and `seed` too, and `handoff`, passed to `run_loop`), `judge` (the
+  take it and `seed` too, and `handoff`, passed to `run_loop`; `run_scenario` and `memory_run`
+  also take `release_cache=True`, `run_loop`'s), `judge` (the
   S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
   default `HONEST`, through `memory_pass` / `count_pass`).
   - **Model reuse (O4).** `honest_final`, `run_scenario`, `memory_run` and `count_run` take
@@ -1598,7 +1603,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   prints `residuals.py`'s two tables, `report_costs` each step's prover and verifier wall clock
   and the hand-off between them (`StepRecord.handoff_s`), and, from the memory pass, each
   side's peak. Metrics go to `llama_step/`. Exits 1 unless
-  accepted. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
+  accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s
+  and `memory_run`'s `release_cache`), not the counting pass. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
   every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
   twice (that model and the verifier's), not four times.
   - The real step from `W_0` on `Ï€(1)` (k 7, Î· 1e-3), 2026-10-04 on the dev Mac: accepted.
@@ -1651,7 +1657,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   memory pass: each section's peak as it closes, GB [<probe source>]`; a run that dies
   mid-step still shows where its memory went.
   - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu",
-    handoff=None, echo=None) -> BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It
+    handoff=None, echo=None, release_cache=True) -> BringUp(result, memory_rows, cal, bands,
+    freeze_rejection, tampers)`. `release_cache` (`main`: `VERIF_RELEASE_CACHE`) goes to the
+    loop and the tampers alike, and `main`'s `hand-off:` line says whether the cache is
+    released. It
     takes any `DecoderComputation`, so a random-weight config runs the same path. `W_0` and
     every prover run come from one `ReusedModel`. Check 8's reference is `honest_final`'s `W_T`,
     kept as leaf hashes (`leaf_hashes_of`, `end_run` takes either). The honest run is
@@ -1673,7 +1682,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     commit time. `test_disk_handoff_gives_the_same_decisions` checks that a tiny Qwen2 run
     decides number for number as in memory and leaves `DIR` empty.
   - `bias_tamper(c, D, w0, bands, *, k, seed, h_D, build_model, layer=1, x="q",
-    handoff=None)`: two one-step judged runs (FS2's switch test on the real model). The last
+    handoff=None, release_cache=True)`: two one-step judged runs (FS2's switch test on the real model). The last
     entry of `b_q` in layer 1 is raised by 1 in training with the `W_t` leaf restored
     (expected: check 5 naming `P_m (L1.Y_q)`), and in an honest step's `W_{t+1}` leaf
     (expected: 6b naming the bias). `Tamper.rejected_as_expected` checks the step, the check
@@ -1850,8 +1859,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     under tag `0x02` (equal â‡” bit-identical, `-0.0` included), their Merkle root, and the
     provenance: `w0_root` (the root over `W_0`'s leaf hashes, the ones check 0 anchors on),
     `h_D`, `eta`, `steps`, `model`, `model_revision`, `threads`, `config_hash` (of
-    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics`, `steps`,
-    `attack` and `poison_count`; `h_D` tells the tasks apart, and the level never enters
+    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics`,
+    `release_cache`, `steps`, `attack` and `poison_count`; `h_D` tells the tasks apart, and the level never enters
     honest training, so the test-scale hash stays `7191ef05â€¦`),
     `losses` (per step) and `seed`. The seed sits beside the provenance but isn't in
     `PROVENANCE_FIELDS`: it already enters `config_hash`, and A12's B7 reads it to skip a

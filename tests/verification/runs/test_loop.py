@@ -264,7 +264,7 @@ def test_loop_is_instance_agnostic():
 # ---- the hand-off's cache release ---------------------------------------------------------
 
 
-def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda):
+def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, **kw):
     """Run the loop with ``torch.cuda`` stubbed, logging sections, cache releases and verifier
     calls in order; also whether each step's ``StepOutput`` was gone at its release."""
     log, refs, gone = [], {}, []
@@ -295,7 +295,7 @@ def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda):
         log.append(name)
         yield
 
-    res, _ = _run(c, D, w0, final, fault=Keep(), section=section)
+    res, _ = _run(c, D, w0, final, fault=Keep(), section=section, **kw)
     return res, log, gone
 
 
@@ -313,6 +313,16 @@ def test_cache_release_sits_between_prover_and_verifier_on_cuda(c, D, w0, final,
 def test_no_cache_release_off_cuda(c, D, w0, final, monkeypatch):
     """Off CUDA it does nothing and opens no section."""
     res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=False)
+    assert res.verdict.accepted and "empty_cache" not in log
+    assert loop_mod.HANDOFF_SECTION not in log
+    for t in range(1, T + 1):
+        assert log[log.index(f"verify {t}") - 1] == "P5.write"
+
+
+def test_release_cache_off_skips_it_on_cuda(c, D, w0, final, monkeypatch):
+    """``release_cache=False`` (``VERIF_RELEASE_CACHE=0``): no release and no section, on CUDA
+    too; the verifier follows the prover's last section, and the verdict is the same."""
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, release_cache=False)
     assert res.verdict.accepted and "empty_cache" not in log
     assert loop_mod.HANDOFF_SECTION not in log
     for t in range(1, T + 1):

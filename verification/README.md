@@ -615,7 +615,8 @@ verifier buffer may not fit in any of them though the GPU has the room. On CUDA 
 therefore empties that cache once per step, after the prover's step is released and before
 the verifier starts (`release_device_cache`). Its time is a metrics row of its own,
 `handoff.empty_cache`, counted in neither role's total, since deployed the two roles run on
-separate machines. A full-scale run also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+separate machines. `VERIF_RELEASE_CACHE=0` skips the release in `bring_up` and `llama_step`,
+so a run can time the verified step without it. A full-scale run also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 in its environment, which lets the allocator grow a block in place rather than leave gaps.
 
 ## Workflow: a run on a GPU

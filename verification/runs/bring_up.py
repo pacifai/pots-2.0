@@ -43,8 +43,8 @@ cache.
    is then labeled so.
 5. **Cost.** The honest run is the B6 memory pass (``MemoryRecorder``): each step's prover and
    verifier peak, beside the loop's wall clocks (``prove_step`` and the commit; every check;
-   the hand-off between them, with ``run_loop``'s cache release on CUDA), which the probe's
-   sampling slows a little. While the pass runs, each top-level section prints its own peak as
+   the hand-off between them, with ``run_loop``'s cache release on CUDA unless
+   ``VERIF_RELEASE_CACHE=0``), which the probe's sampling slows a little. While the pass runs, each top-level section prints its own peak as
    it closes, with the peaks of the sections nested in it, so a step that dies (out of GPU
    memory, say) still shows each section it got through and the one that raised. With
    ``--disk-transcripts DIR`` every step, the
@@ -179,13 +179,14 @@ def _bump(t: torch.Tensor, index: int = -1) -> torch.Tensor:
 def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
                 bands: Bands, *, k: int, seed: int, h_D: bytes,
                 build_model: Callable[[], torch.nn.Module],
-                layer: int = 1, x: str = "q", handoff: StoreHandoff | None = None
-                ) -> list[Tamper]:
+                layer: int = 1, x: str = "q", handoff: StoreHandoff | None = None,
+                release_cache: bool = True) -> list[Tamper]:
     """Step 1 with the last entry of ``b_x`` in layer ``layer`` raised by 1 (module docstring,
     4): in training only, under an honest ``W_t`` leaf (check 5 at ``L{layer}.Y_x``), and in
     the ``W_{t+1}`` leaf of an honest step (check 6b). Each is a one-step run judged by
     ``bands``, built as FS2's switch test builds it: the leaf is replaced and the tree
-    re-rooted before the step goes to ``handoff`` (default in memory), as the loop's does."""
+    re-rooted before the step goes to ``handoff`` (default in memory), as the loop's does, and
+    with the loop's cache release unless ``release_cache`` is off."""
     b = c.bias(layer, x)
     if b is None:
         raise ValueError(f"layer {layer}'s {x} projection has no bias")
@@ -209,7 +210,8 @@ def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.
         leaves[i] = obj
         store = hand.hold(c, 1, leaves, tree_h, paths)
         del leaves, tree_h
-        release_device_cache()  # as the loop's hand-off, on CUDA only
+        if release_cache:
+            release_device_cache()  # as the loop's hand-off, on CUDA only
         try:
             return v.verify_step(1, store)
         finally:
@@ -235,14 +237,17 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
              seed: int, build_model: Callable[[], torch.nn.Module] | None = None,
              tamper: bool = True, device: str | torch.device = "cpu",
              handoff: StoreHandoff | None = None,
-             echo: Callable[[str], None] | None = None) -> BringUp:
+             echo: Callable[[str], None] | None = None,
+             release_cache: bool = True) -> BringUp:
     """Items 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
     a random-weight config runs the same path). ``build_model`` (default ``c.build_model``)
     gives the prover's model, built once and reused (``ReusedModel``). ``tamper`` runs item 4
     when ``c`` has q, k, v biases. ``handoff`` gives every step, the tampers' included, to the
     verifier (default in memory; ``--disk-transcripts`` passes C3's ``DiskHandoff``). ``echo``
     prints each section's peak as the memory pass closes it (``MemoryRecorder``), so a run that
-    dies mid-step still shows where its memory went."""
+    dies mid-step still shows where its memory went. ``release_cache=False``
+    (``VERIF_RELEASE_CACHE=0``) skips the CUDA cache release between prover and verifier, in
+    the honest steps and the tampers alike."""
     models = ReusedModel(build_model or c.build_model)
     w0 = snapshot_weights(c, models())
     # Check 8's reference as leaf hashes, in C's weight order, so the run holds no extra copy
@@ -274,7 +279,7 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
     def run(rec: Any) -> None:
         got["r"] = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final,
                                 on_step=on_step, recorder=rec, h_D=h_D, build_model=models,
-                                verifier=make, handoff=handoff)
+                                verifier=make, handoff=handoff, release_cache=release_cache)
 
     probe = memory_probe(device)
     if echo is not None:
@@ -284,7 +289,8 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
     out.result.loop.w_final = {}  # the prover's W_T: check 8 has read it, and it is |W| bytes
     if tamper and c.qkv_bias and out.bands is not None and out.honest_accepted:
         out.tampers = bias_tamper(c, D, w0, out.bands, k=k, seed=seed, h_D=h_D,
-                                  build_model=models, handoff=handoff)
+                                  build_model=models, handoff=handoff,
+                                  release_cache=release_cache)
     return out
 
 
@@ -463,10 +469,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"run: n_s {c.n_s}, n {c.n}, η {c.eta:g}, k {k}, T {args.steps}, seed {cfg.seed}, "
           f"threads {cfg.threads}, |D| {len(D)}, h_D {h_D.hex()[:16]}…")
     disk = args.disk_transcripts
-    print("hand-off: " + ("in memory" if disk is None else f"on disk under {disk}"))
+    print("hand-off: " + ("in memory" if disk is None else f"on disk under {disk}")
+          + ("; CUDA cache released before the verifier" if cfg.release_cache else
+             "; no cache release (VERIF_RELEASE_CACHE=0)"))
     b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
                  device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
-                 echo=lambda line: print(line, flush=True))
+                 echo=lambda line: print(line, flush=True), release_cache=cfg.release_cache)
     report(b, k=k, reference=reference, c=c, T_run=cfg.steps)
     return 0 if b.passed else 1
 
