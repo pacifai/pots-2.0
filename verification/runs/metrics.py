@@ -76,7 +76,12 @@ against each other yet, which the first CUDA run must do. Test-scale times are r
 absolute figure; ``start_bytes`` and ``end_bytes`` are the process's figure at the first entry
 and the last exit, so ``peak − start`` is what the section added on top of what was live. A
 nested section has its own peak: each entry and exit first folds the peak so far into every
-open section, then the entry resets it. The backend is named in ``mem_source``:
+open section, then the entry resets it. ``peak_reserved_bytes`` is, on CUDA, the caching
+allocator's reserved peak over the same interval (``max_memory_reserved``, folded the same
+way): what the allocator held from the driver, live tensors and cached free blocks together, so
+``peak_reserved_bytes − peak_bytes`` shows the fragmentation an out-of-memory error reports as
+"reserved but unallocated" (the two peaks need not fall at the same moment). It is ``null`` on
+every other backend. The backend is named in ``mem_source``:
 
 - ``darwin_phys_footprint`` (macOS): ``phys_footprint``, Activity Monitor's "Memory" (resident,
   compressed and swapped dirty pages), with the kernel's interval maximum
@@ -185,7 +190,7 @@ from verification.verifier.context import ProductStat, StepStats, TensorStat
 __all__ = [
     "P0_PHASES", "TRAIN_PHASES", "PASS_STEPS", "COUNT_STEPS", "COMPONENTS", "RECORD_TYPES",
     "RESERVED_NAMES", "SCORE_FAMILIES",
-    "MemoryProbe", "memory_probe",
+    "MemoryProbe", "memory_probe", "reserved_peak",
     "TimeRecorder", "MemoryRecorder", "CountRecorder",
     "memory_pass", "count_pass", "counting",
     "derive_capture", "step_record", "record_pass", "judged_step", "in_sample_step",
@@ -242,6 +247,16 @@ class MemoryProbe(Protocol):
     def sample(self) -> tuple[int | None, int | None]:
         """``(peak since the last reset, current)``."""
         ...
+
+    # A probe may also have ``reserved_peak() -> int | None``, the CUDA caching allocator's
+    # reserved peak since the last reset (:func:`reserved_peak`); one without it has none.
+
+
+def reserved_peak(probe: MemoryProbe) -> int | None:
+    """``probe``'s reserved peak since its last reset: the CUDA caching allocator's
+    ``max_memory_reserved`` on CUDA, ``None`` on every other backend."""
+    get = getattr(probe, "reserved_peak", None)
+    return None if get is None else get()
 
 
 class _DarwinProbe:
@@ -315,6 +330,11 @@ class _CudaProbe:
         return (int(torch.cuda.max_memory_allocated(self._dev)),
                 int(torch.cuda.memory_allocated(self._dev)))
 
+    def reserved_peak(self) -> int:
+        """Reserved bytes' peak since the last reset (``reset_peak_memory_stats`` resets it
+        with the allocated peak); read after ``sample``'s synchronize."""
+        return int(torch.cuda.max_memory_reserved(self._dev))
+
 
 class _MaxRssProbe:
     source = "ru_maxrss"
@@ -354,6 +374,15 @@ class _Guarded:
             self._fail(e)
             return None, None
 
+    def reserved_peak(self) -> int | None:
+        if self._inner is None:
+            return None
+        try:
+            return reserved_peak(self._inner)
+        except OSError as e:
+            self._fail(e)
+            return None
+
 
 def memory_probe(device: str | torch.device = "cpu") -> MemoryProbe:
     """The memory backend for ``device`` on this platform (see the module docstring)."""
@@ -385,13 +414,14 @@ def lifetime_maxrss_bytes() -> int:
 class _Acc:
     """One section's totals within a step."""
 
-    __slots__ = ("nested", "calls", "time", "peak", "start", "end", "seen", "counts")
+    __slots__ = ("nested", "calls", "time", "peak", "rpeak", "start", "end", "seen", "counts")
 
     def __init__(self, nested: bool) -> None:
         self.nested = nested
         self.calls = 0
         self.time = 0.0
         self.peak: int | None = None
+        self.rpeak: int | None = None  # the reserved peak (memory pass, CUDA only)
         self.start: int | None = None
         self.end: int | None = None
         self.seen = False
@@ -832,8 +862,12 @@ def nan_as_inf(x: np.ndarray) -> np.ndarray:
 # ---- memory: the memory pass -------------------------------------------------------------
 
 
+def _max(a: int | None, b: int | None) -> int | None:
+    return a if b is None or (a is not None and a >= b) else b
+
+
 class _MemSection:
-    __slots__ = ("rec", "acc", "peak", "start", "name")
+    __slots__ = ("rec", "acc", "peak", "rpeak", "start", "name")
 
     def __init__(self, rec: MemoryRecorder, acc: _Acc) -> None:
         self.rec, self.acc, self.name = rec, acc, ""
@@ -843,6 +877,7 @@ class _MemSection:
         rec._fold()  # the open sections keep the peak so far before it is reset
         rec.probe.reset()
         self.peak, self.start = rec.probe.sample()
+        self.rpeak = reserved_peak(rec.probe)
         if not acc.seen:
             acc.start, acc.seen = self.start, True
         if rec._depth == 0:
@@ -857,14 +892,12 @@ class _MemSection:
         rec._depth -= 1
         acc.calls += 1
         acc.end = cur
-        if self.peak is not None and (acc.peak is None or self.peak > acc.peak):
-            acc.peak = self.peak
+        acc.peak, acc.rpeak = _max(acc.peak, self.peak), _max(acc.rpeak, self.rpeak)
         if rec.echo is None:
             return
         if rec._depth > 0:
-            was = rec._inner.get(self.name)
-            rec._inner[self.name] = self.peak if was is None or (
-                self.peak is not None and self.peak > was) else was
+            was, rwas = rec._inner.get(self.name, (None, None))
+            rec._inner[self.name] = (_max(was, self.peak), _max(rwas, self.rpeak))
         else:
             rec._echo_section(self, cur, exc[0])
 
@@ -876,9 +909,10 @@ def _gb(x: int | None) -> str:
 class MemoryRecorder(_Recorder):
     """The memory pass: the process's peak per section, nested sections included.
 
-    With ``echo``, each top-level section also prints one line as it closes: its own peak,
-    its figure at entry and exit, the peaks of the sections nested in it, and the exception
-    it closed on, if any. A run that dies mid-step keeps the lines of the sections it got
+    With ``echo``, each top-level section also prints one line as it closes: its own peak
+    (and on CUDA its reserved peak), its figure at entry and exit, the peaks of the sections
+    nested in it (each with its reserved peak on CUDA), and the exception it closed on, if
+    any. A run that dies mid-step keeps the lines of the sections it got
     through, the one that raised included, where the rows (written as a step closes) are
     lost."""
 
@@ -891,7 +925,8 @@ class MemoryRecorder(_Recorder):
         self.probe = probe
         self.echo = echo
         self._open: list[_MemSection] = []
-        self._inner: dict[str, int | None] = {}  # nested peaks inside the open top section
+        # nested (peak, reserved peak) inside the open top section
+        self._inner: dict[str, tuple[int | None, int | None]] = {}
         self._t = 1  # the step the open sections belong to
 
     def section(self, name: str) -> Any:
@@ -911,9 +946,12 @@ class MemoryRecorder(_Recorder):
             where = f"step {self._t}"
         if _side(name) == "verifier":
             name = f"check {name}"
-        inner = ", ".join(f"{n} {_gb(p)}" for n, p in self._inner.items())
-        line = (f"   {where}, {name}: peak {_gb(s.peak)} GB (start {_gb(s.start)}, end "
-                f"{_gb(end)} GB" + (f"; nested: {inner} GB" if inner else "") + ")"
+        inner = ", ".join(f"{n} {_gb(p)}" + ("" if r is None else f" (reserved {_gb(r)})")
+                          for n, (p, r) in self._inner.items())
+        line = (f"   {where}, {name}: peak {_gb(s.peak)} GB"
+                + ("" if s.rpeak is None else f", reserved {_gb(s.rpeak)} GB")
+                + f" (start {_gb(s.start)}, end {_gb(end)} GB"
+                + (f"; nested: {inner} GB" if inner else "") + ")"
                 + ("" if exc is None else f"; raised {exc.__name__}"))
         try:
             self.echo(line)  # type: ignore[misc]
@@ -922,16 +960,18 @@ class MemoryRecorder(_Recorder):
 
     def _fold(self) -> int | None:
         peak, cur = self.probe.sample()
-        if peak is not None:
-            for s in self._open:
-                if s.peak is None or peak > s.peak:
-                    s.peak = peak
+        rpeak = reserved_peak(self.probe)
+        for s in self._open:
+            s.peak, s.rpeak = _max(s.peak, peak), _max(s.rpeak, rpeak)
         return cur
 
     def _values(self, accs: list[_Acc]) -> dict[str, Any]:
         peaks = [a.peak for a in accs if a.peak is not None]
-        return {"peak_bytes": max(peaks) if peaks else None, "start_bytes": accs[0].start,
-                "end_bytes": accs[-1].end, "mem_source": self.probe.source}
+        rpeaks = [a.rpeak for a in accs if a.rpeak is not None]
+        return {"peak_bytes": max(peaks) if peaks else None,
+                "peak_reserved_bytes": max(rpeaks) if rpeaks else None,
+                "start_bytes": accs[0].start, "end_bytes": accs[-1].end,
+                "mem_source": self.probe.source}
 
 
 def memory_pass(run: str, scenario: str, fn: Callable[[MemoryRecorder], Any],

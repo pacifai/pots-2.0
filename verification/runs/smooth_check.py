@@ -40,8 +40,9 @@ alone. It plays no part in the verdict.
 settings; each step's batch loss, gradient norm and whole-list loss with its training and
 evaluation time; the
 whole-list loss at ``W_0``; the verdict with its reasons; the wall clocks; the peak memory over
-the run (``metrics.memory_probe``: allocated GPU memory on CUDA, the process footprint on the
-Mac); and the environment (``metrics.environment_record``).
+the run (``metrics.memory_probe``: allocated GPU memory on CUDA, with the caching allocator's
+reserved peak beside it, the process footprint on the Mac); and the environment
+(``metrics.environment_record``).
 
 Exits 0 when smooth, :data:`EXIT_NOT_SMOOTH` when not.
 """
@@ -68,7 +69,7 @@ from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import load_weights, snapshot_weights
 from verification.runs.llama_step import load_committed_dataset
 from verification.runs.loop import PlainStepRecord, run_plain
-from verification.runs.metrics import environment_record, memory_probe
+from verification.runs.metrics import environment_record, memory_probe, reserved_peak
 from verification.runs.plain_baseline import training_config
 
 __all__ = ["RUN_NAME", "STEPS", "EXIT_NOT_SMOOTH", "RULE", "Verdict", "verdict",
@@ -296,6 +297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"{chunk}; loaded in {load_s:.1f} s")
     res = smooth_check(c, model, D, w0, T=args.steps, seed=cfg.seed, chunk=chunk)
     peak, current = probe.sample()
+    held = reserved_peak(probe)  # CUDA only, else None
     assert res.verdict is not None
     run = {"model": cfg.model, "model_revision": cfg.model_revision, "task": cfg.attack,
            "n_records": len(D), "h_D": h_D.hex(), "n_s": c.n_s, "n": c.n, "eta": c.eta,
@@ -305,7 +307,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     env = environment_record(RUN_NAME, device=cfg.device, probe=probe,
                              config=training_config(cfg), h_D=h_D)
     doc = record(res, run=run, timings={"load": load_s, "total": time.perf_counter() - started},
-                 memory={"source": probe.source, "peak_bytes": peak, "end_bytes": current},
+                 memory={"source": probe.source, "peak_bytes": peak,
+                         "peak_reserved_bytes": held, "end_bytes": current},
                  environment=env)
     path = args.out or record_path(cfg.output_dir, cfg.model, cfg.attack)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -314,7 +317,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"verdict: {'SMOOTH' if v.smooth else 'NOT SMOOTH'}"
           + ("" if v.smooth else ": " + "; ".join(v.reasons)))
     if peak is not None:
-        print(f"peak memory {peak / 2**30:.2f} GiB [{probe.source}]")
+        print(f"peak memory {peak / 2**30:.2f} GiB"
+              + ("" if held is None else f", reserved {held / 2**30:.2f} GiB")
+              + f" [{probe.source}]")
     print(f"record: {path}")
     return 0 if v.smooth else EXIT_NOT_SMOOTH
 

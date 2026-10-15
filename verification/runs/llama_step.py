@@ -148,7 +148,8 @@ def report_costs(r: ScenarioResult, memory_rows: Sequence[Mapping[str, Any]] | N
                  out: Callable[[str], None] = print) -> None:
     """Each step's wall clock (prover: ``prove_step`` and the commit; verifier: every check;
     the hand-off between them, which on CUDA holds ``run_loop``'s cache release), and with the
-    memory pass's rows, the process peak during each side's sections."""
+    memory pass's rows, the process peak during each side's sections (on CUDA with the caching
+    allocator's reserved peak beside it)."""
     for s in r.loop.steps:
         out(f"step {s.t}: prover {s.prove_s + s.commit_s:.2f} s (prove_step {s.prove_s:.2f} s, "
             f"commit {s.commit_s:.2f} s); verifier {s.verify_s:.2f} s "
@@ -157,8 +158,9 @@ def report_costs(r: ScenarioResult, memory_rows: Sequence[Mapping[str, Any]] | N
     for row in memory_rows or ():
         if row.get("level") == "total" and row["component"] in ("prover", "verifier") \
                 and row["step"] > 0 and row["peak_bytes"] is not None:
-            start = row["start_bytes"]
+            start, held = row["start_bytes"], row.get("peak_reserved_bytes")
             out(f"step {row['step']}: {row['component']} peak {row['peak_bytes'] / 2**30:.2f} GB"
+                + ("" if held is None else f", reserved {held / 2**30:.2f} GB")
                 + ("" if start is None else f" (at its start {start / 2**30:.2f} GB)")
                 + f" [{row['mem_source']}, memory pass]")
     out(f"process lifetime peak RSS {lifetime_maxrss_bytes() / 2**30:.2f} GB")

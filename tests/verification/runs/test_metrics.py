@@ -519,6 +519,7 @@ def test_memory_pass_probes_every_section(smoke, c):
             assert r["peak_bytes"] >= max(r["start_bytes"], r["end_bytes"]) or r["level"] != "phase"
     total = got[("total", "step")]
     assert total["peak_bytes"] == max(r["peak_bytes"] for r in _top_parts(got))
+    assert all(r["peak_reserved_bytes"] is None for r in rows)  # CUDA only
 
 
 def test_count_pass_and_storage(c, D, w0, smoke):
@@ -728,6 +729,70 @@ def test_memory_echo_prints_each_top_section_as_it_closes():
     assert quiet.rows == [r for r in rec.rows if r["step"] == 1]
 
 
+class _ReservingProbe(_ScriptedProbe):
+    """A scripted probe with a CUDA-like reserve: an allocation the free cache can't hold
+    grows the reserve, a free keeps it (until ``release``, like ``empty_cache``)."""
+
+    def __init__(self):
+        super().__init__()
+        self.held = self.rpeak = 0
+
+    def reset(self):
+        super().reset()
+        self.rpeak = self.held
+
+    def reserved_peak(self):
+        return self.rpeak
+
+    def alloc(self, gib):
+        super().alloc(gib)
+        self.held = max(self.held, self.now)
+        self.rpeak = max(self.rpeak, self.held)
+
+    def release(self):
+        self.held = self.now
+
+
+def test_memory_rows_and_echo_carry_the_reserved_peak():
+    """On a probe with a reserve (CUDA's caching allocator) each row and echo line carries the
+    reserved peak beside the allocated one; nested sections fold it like the peak."""
+    probe, lines = _ReservingProbe(), []
+    rec = MemoryRecorder("m", "s", metrics._Guarded(probe), echo=lines.append)
+    with rec.section("train.backward"):
+        probe.alloc(4)
+        probe.free(3)
+    probe.release()
+    with rec.section("5"):
+        with rec.section("5.glue"):
+            probe.alloc(2)  # reserve 1 → 3
+            probe.free(2)
+        with rec.section("5.measure"):
+            probe.alloc(1)  # fits the cached 2 GiB: the reserve stays 3
+            probe.free(1)
+    rec.on_step(_Rec(1))
+    assert lines == [
+        "   step 1, train.backward: peak 4.00 GB, reserved 4.00 GB (start 0.00, end 1.00 GB)",
+        "   step 1, check 5: peak 3.00 GB, reserved 3.00 GB (start 1.00, end 1.00 GB; nested: "
+        "5.glue 3.00 (reserved 3.00), 5.measure 2.00 (reserved 3.00) GB)",
+    ]
+    rows = {r["component"]: r for r in rec.rows if r["level"] in ("phase", "sub", "component")}
+    assert rows["train.backward"]["peak_reserved_bytes"] == 4 * 2**30
+    assert rows["5"]["peak_reserved_bytes"] == rows["5.glue"]["peak_reserved_bytes"] == 3 * 2**30
+    assert rows["5.measure"]["peak_bytes"] == 2 * 2**30
+    total = next(r for r in rec.rows if r["level"] == "total")
+    assert total["peak_reserved_bytes"] == 4 * 2**30
+
+
+def test_cuda_probe_reads_the_reserved_peak(monkeypatch):
+    seen = []
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda d: seen.append(d) or 7)
+    dev = torch.device("cuda", 0)
+    probe = metrics._Guarded(metrics._CudaProbe(dev))
+    assert metrics.reserved_peak(probe) == 7 and seen == [dev]
+    assert metrics.reserved_peak(metrics._Guarded(metrics._MaxRssProbe())) is None
+    assert metrics.reserved_peak(_ScriptedProbe()) is None  # a probe without the method
+
+
 def test_plain_step_emits_P0_rows(c, D, w0):
     rec = TimeRecorder("plain", "honest")
     model = c.build_model()
@@ -858,7 +923,7 @@ def test_probe_failure_degrades_to_null(caplog):
         probe.sample()
     assert sum("failed" in m for m in caplog.messages) == 1
     assert probe.source == "unavailable"
-    assert all(r["peak_bytes"] is None for r in rows)
+    assert all(r["peak_bytes"] is None and r["peak_reserved_bytes"] is None for r in rows)
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="no MPS device")

@@ -209,6 +209,7 @@ def test_main_writes_the_record(tiny_main, capsys):
     assert doc["rule"] == sc.RULE and doc["environment"]["record"] == "environment"
     assert {"load", "total", "w0_eval", "steps_with_eval"} <= doc["timings_s"].keys()
     assert all(math.isfinite(x) for x in doc["whole_list_losses"])
+    assert doc["memory"]["peak_reserved_bytes"] is None  # CUDA's only
     assert "verdict: " in capsys.readouterr().out
 
 
