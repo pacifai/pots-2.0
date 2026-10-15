@@ -6,6 +6,7 @@ import math
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,7 @@ from verification.runs.metrics import (
     step_record,
     step_scores,
 )
+from verification.runs.loop import HANDOFF_SECTION
 from verification.runs.mlp_smoke import run_smoke, scenarios
 from verification.runs.scenarios import honest_final, run_scenario
 from verification.transcript.store import InMemoryStore
@@ -650,6 +652,80 @@ def test_nested_and_run_sections():
     assert [r["step"] for r in rec.rows if r["component"] == "1"] == [0]
     (total,) = [r for r in rec.rows if r["component"] == "step" and r["step"] == 1]
     assert total["time_s"] == five["time_s"]  # a sub row is inside its parent, not added
+
+
+def test_the_handoff_row_is_the_harnesss_and_in_no_total():
+    """``run_loop``'s cache release between the roles: a component row on side ``run``,
+    outside the prover's, the verifier's and the step's totals."""
+    rec = TimeRecorder("x", "s")
+    for name in ("P3.commit", HANDOFF_SECTION, "4"):
+        with rec.section(name):
+            time.sleep(0.001)
+    rec.on_step(_Rec(1))
+    rows = {(r["level"], r["component"]): r for r in rec.rows}
+    assert rows[("component", HANDOFF_SECTION)]["side"] == "run"
+    assert [k for k in rows if k[1] == HANDOFF_SECTION] == [("component", HANDOFF_SECTION)]
+    prover, verifier = rows[("total", "prover")], rows[("total", "verifier")]
+    assert prover["time_s"] == rows[("component", "P3")]["time_s"]
+    assert verifier["time_s"] == rows[("component", "4")]["time_s"]
+    assert rows[("total", "step")]["time_s"] == pytest.approx(
+        prover["time_s"] + verifier["time_s"])
+
+
+class _ScriptedProbe:
+    """A memory probe the test drives: ``alloc`` and ``free`` move the current figure."""
+
+    source = "scripted"
+
+    def __init__(self):
+        self.now = self.peak = 0
+
+    def reset(self):
+        self.peak = self.now
+
+    def sample(self):
+        return self.peak, self.now
+
+    def alloc(self, gib):
+        self.now += gib * 2**30
+        self.peak = max(self.peak, self.now)
+
+    def free(self, gib):
+        self.now -= gib * 2**30
+
+
+def test_memory_echo_prints_each_top_section_as_it_closes():
+    """A top-level section's line comes as it closes, with its nested sections' peaks, and
+    the section an exception left through says so: a run that dies mid-step keeps them."""
+    probe, lines = _ScriptedProbe(), []
+    rec = MemoryRecorder("m", "s", probe, echo=lines.append)
+    with rec.section("run:P4.tree"):
+        pass
+    with rec.section("train.backward"):
+        probe.alloc(3)
+        probe.free(2)
+    rec.on_step(_Rec(1))
+    with pytest.raises(MemoryError):
+        with rec.section("5"):
+            with rec.section("5.glue"):
+                probe.alloc(2)
+                probe.free(2)
+            with rec.section("5.measure"):
+                probe.alloc(4)
+                raise MemoryError
+    assert lines == [
+        "   run, P4.tree: peak 0.00 GB (start 0.00, end 0.00 GB)",
+        "   step 1, train.backward: peak 3.00 GB (start 0.00, end 1.00 GB)",
+        "   step 2, check 5: peak 5.00 GB (start 1.00, end 5.00 GB; nested: 5.glue 3.00, "
+        "5.measure 5.00 GB); raised MemoryError",
+    ]
+    # the rows don't depend on the echo
+    quiet = MemoryRecorder("m", "s", _ScriptedProbe())
+    with quiet.section("train.backward"):
+        quiet.probe.alloc(3)
+        quiet.probe.free(2)
+    quiet.on_step(_Rec(1))
+    assert quiet.rows == [r for r in rec.rows if r["step"] == 1]
 
 
 def test_plain_step_emits_P0_rows(c, D, w0):

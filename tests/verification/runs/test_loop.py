@@ -3,6 +3,7 @@
 import ast
 import gc
 import weakref
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -258,3 +259,72 @@ def test_loop_is_instance_agnostic():
         else:
             continue
         assert not any("instances" in n for n in names), names
+
+
+# ---- the hand-off's cache release ---------------------------------------------------------
+
+
+def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda):
+    """Run the loop with ``torch.cuda`` stubbed, logging sections, cache releases and verifier
+    calls in order; also whether each step's ``StepOutput`` was gone at its release."""
+    log, refs, gone = [], {}, []
+
+    def empty_cache():
+        gc.collect()
+        gone.append(all(r() is None for r in refs.values()))
+        log.append("empty_cache")
+
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: cuda)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    orig = Verifier.verify_step
+
+    def verify_step(self, t, store):
+        log.append(f"verify {t}")
+        return orig(self, t, store)
+
+    monkeypatch.setattr(Verifier, "verify_step", verify_step)
+
+    class Keep(ProverFault):
+        def emit(self, t, out):
+            refs.clear()
+            refs[t] = weakref.ref(out)
+            return out
+
+    @contextmanager
+    def section(name):
+        log.append(name)
+        yield
+
+    res, _ = _run(c, D, w0, final, fault=Keep(), section=section)
+    return res, log, gone
+
+
+def test_cache_release_sits_between_prover_and_verifier_on_cuda(c, D, w0, final, monkeypatch):
+    """On CUDA, once per step: after the prover's last section and the step's release, inside
+    its own section, before the verifier's role."""
+    res, log, gone = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True)
+    assert res.verdict.accepted and log.count("empty_cache") == T and gone == [True] * T
+    for t in range(1, T + 1):
+        i = log.index(f"verify {t}")
+        assert log[i - 3:i] == ["P5.write", loop_mod.HANDOFF_SECTION, "empty_cache"]
+    assert all(s.handoff_s >= 0 and s.verify_s >= 0 for s in res.steps)
+
+
+def test_no_cache_release_off_cuda(c, D, w0, final, monkeypatch):
+    """Off CUDA it does nothing and opens no section."""
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=False)
+    assert res.verdict.accepted and "empty_cache" not in log
+    assert loop_mod.HANDOFF_SECTION not in log
+    for t in range(1, T + 1):
+        assert log[log.index(f"verify {t}") - 1] == "P5.write"
+
+
+def test_release_device_cache_alone(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    loop_mod.release_device_cache()
+    assert calls == []
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    loop_mod.release_device_cache()  # no section given: no metrics, still released
+    assert calls == [1]

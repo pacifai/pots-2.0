@@ -378,7 +378,10 @@ replaced:
   fitted. It prints the residual tables, and, against a reference band file such as SmolLM2's,
   each score family's largest score, for information. On a model with q, k, v biases it alters
   one bias entry and expects check 5 or 6b to reject. It reports each side's time and peak
-  memory per step. It never downloads: it stops if the weights aren't cached. With
+  memory per step, and the hand-off between them. Its memory pass prints each section's peak
+  as the section closes, so a run that dies mid-step (out of GPU memory, say) still shows
+  which section it died in and what the sections before it held. It never downloads: it
+  stops if the weights aren't cached. With
   `--disk-transcripts DIR` each step reaches the verifier on disk, through the store
   cross-check's `DiskHandoff`, rather than in memory; the protocol code is the same.
 - **`flipped_matmul_sweep.py`** is A13's flipped-matmul cheat and EV3's planted-error sweep.
@@ -593,6 +596,7 @@ sequenceDiagram
         H->>P: prove_step(W_t, π(t))
         P-->>H: StepOutput
         H->>S: commit (root h, paths), then hand-off: in memory, or written to disk
+        H->>H: on CUDA, release the GPU allocator's cache
         H->>V: verify_step(t, store)
         V-->>H: None or Rejection
         H->>H: drop StepOutput and store
@@ -604,6 +608,15 @@ sequenceDiagram
 run and the SmolLM2 runs use the same loop. Only one step's transcript is alive at a time,
 and a test holds weak references to confirm that each step is freed. The verifier carries
 only two things between steps: the hashes of `W_{t+1}`, and small per-step statistics.
+
+In our runs prover and verifier share one process and one GPU. PyTorch keeps the memory a
+GPU tensor frees in its own cache, cut into blocks of the sizes the prover used, so a large
+verifier buffer may not fit in any of them though the GPU has the room. On CUDA the loop
+therefore empties that cache once per step, after the prover's step is released and before
+the verifier starts (`release_device_cache`). Its time is a metrics row of its own,
+`handoff.empty_cache`, counted in neither role's total, since deployed the two roles run on
+separate machines. A full-scale run also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+in its environment, which lets the allocator grow a block in place rather than leave gaps.
 
 ## Workflow: a run on a GPU
 

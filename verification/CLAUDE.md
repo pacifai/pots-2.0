@@ -1381,10 +1381,20 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `prove_step`. The default `Ï€` is `data.schedule` at `verifier.seed`, the verifier's own
     call. It runs `verifier.start_run(D)`, then per step `prove_step` on `Ï€(t)`,
     `InMemoryStore.commit_step` (`P3.commit`) and `handoff.hold` with the `h_D` paths
-    (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), `verifier.verify_step(t, store)`,
+    (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), drops the prover's references,
+    `release_device_cache(section)`, `verifier.verify_step(t, store)`,
     `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
+  - `release_device_cache(section=None)`: on CUDA only (`torch.cuda.is_initialized()`),
+    `torch.cuda.empty_cache()` inside the section `HANDOFF_SECTION` (`"handoff.empty_cache"`),
+    once per step between the prover's role and the verifier's; elsewhere it does nothing and
+    opens no section. Prover and verifier share one process and one GPU in our runs, and the
+    prover's freed blocks stay cached at the prover's sizes, so a large verifier buffer may not
+    fit though the GPU has the room (the first H100 session's out-of-memory errors). Its row is
+    the harness's, side `run`, in no total. `bring_up.bias_tamper` calls it before each
+    `verify_step` too. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the run's
+    environment, not in Python: the allocator reads it at CUDA's first use.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
     default: `entry_weights(t, w)` (hidden steps), `committed_records(t, records)` (A1: the
@@ -1392,7 +1402,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     it receives the committed batch), `perturb(t)` (`prove_step`'s product perturbation) and
     `emit(t, out)` (an A3 splice).
   - `LoopResult(verdict, steps, w_final)`, where `steps` holds `StepRecord(t, rejection, loss,
-    prove_s, commit_s, verify_s)`. `prove_s` excludes `emit`. Per-check timings and stats stay on
+    prove_s, commit_s, verify_s, handoff_s)`. `prove_s` excludes `emit`; `handoff_s` is the
+    time between the roles (the cache release on CUDA), in neither `commit_s` nor `verify_s`. Per-check timings and stats stay on
     the verifier. A test holds weakrefs to each step's products and checks they are dead by the
     next step.
 - `scenarios.py`: the instance-agnostic scenario harness, shared by `mlp_smoke` and
@@ -1441,7 +1452,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     top-level boundaries and times nested sections with event pairs, MPS syncs at every
     boundary). Memory (`MemoryRecorder`, `memory_pass`) and counts (`CountRecorder`,
     `count_pass`, `counting()`) are separate untimed runs; every section, nested included,
-    gets all three axes.
+    gets all three axes. `MemoryRecorder(..., echo=None)` and `memory_pass(..., echo=None)`:
+    with `echo`, each top-level section prints one line as it closes (`   step 1, check 5:
+    peak â€¦ GB (start â€¦, end â€¦ GB; nested: 5.glue â€¦, 5.measure â€¦ GB); raised
+    OutOfMemoryError`; `run:` sections as `   run, â€¦`), so a run that dies mid-step keeps
+    the sections it got through, where the rows, written at step close, are lost.
+  - **The harness's row.** `handoff.empty_cache` (`loop.HANDOFF_SECTION`, prefix
+    `HARNESS_PREFIX`) is a `component` row on side `run`, in no total: the `step` total sums
+    the prover's and the verifier's top-level sections only.
   - **Prover rows (EQ1b).**
     - P0, original training: `P0.load`, `P0.forward`, `P0.backward`, `P0.update`, emitted only
       by `plain_step` (the plain baseline, B7).
@@ -1578,7 +1596,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   `calibrate.judging_verifier`. Check 8 is against `scenarios.honest_final`; its memory and
   counting passes are `scenarios.memory_run` / `count_run`. `run_honest`; `report_residuals`
   prints `residuals.py`'s two tables, `report_costs` each step's prover and verifier wall clock
-  and, from the memory pass, each side's peak. Metrics go to `llama_step/`. Exits 1 unless
+  and the hand-off between them (`StepRecord.handoff_s`), and, from the memory pass, each
+  side's peak. Metrics go to `llama_step/`. Exits 1 unless
   accepted. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
   every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
   twice (that model and the verifier's), not four times.
@@ -1627,9 +1646,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   when `model_pin` finds no cached weights or refuses the pin (a revision that isn't a commit, a
   weight file off its blob name), or `D.bin` is missing; it never downloads. It prints how long
   the weights took to hash. Exits 1 unless `BringUp.passed`: the honest run accepted, the fit's
-  concentration guard held, every tamper rejected as expected.
+  concentration guard held, every tamper rejected as expected. `main` passes `echo=print`, so
+  the memory pass prints each top-level section's peak as it closes, under the header `==
+  memory pass: each section's peak as it closes, GB [<probe source>]`; a run that dies
+  mid-step still shows where its memory went.
   - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu",
-    handoff=None) -> BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It
+    handoff=None, echo=None) -> BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It
     takes any `DecoderComputation`, so a random-weight config runs the same path. `W_0` and
     every prover run come from one `ReusedModel`. Check 8's reference is `honest_final`'s `W_T`,
     kept as leaf hashes (`leaf_hashes_of`, `end_run` takes either). The honest run is

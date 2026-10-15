@@ -59,7 +59,10 @@ leaves, and its cost is ``5.glue``. ``6b.glue`` is the replayed glue gradients.
 ``component`` (a prover component, the sum of its phases, or a check), ``sub`` (a nested
 section) or ``total`` (``prover``, ``verifier``, and ``step``, their sum; a total sums its
 top-level sections, so loop bookkeeping and fault hooks are not in it). A section entered twice
-in a step (``train.load``, ``5.glue``) accumulates and ``calls`` counts the entries.
+in a step (``train.load``, ``5.glue``) accumulates and ``calls`` counts the entries. The
+harness's own section ``handoff.empty_cache`` (``run_loop``'s cache release between the two
+roles, on CUDA only) is a ``component`` row on side ``run``, in no total: deployed, the
+prover and the verifier run on separate machines.
 
 **Time (timed run).** Wall-clock seconds from ``perf_counter`` and nothing else. On CUDA the
 device is synchronized at top-level section boundaries and nested sections are timed with
@@ -217,7 +220,12 @@ PASS_STEPS = 2
 COUNT_STEPS = 1
 
 
+HARNESS_PREFIX = "handoff."  # the harness's own sections (run_loop's HANDOFF_SECTION)
+
+
 def _side(name: str) -> str:
+    if name.startswith(HARNESS_PREFIX):
+        return "run"
     return "prover" if name.startswith(("P", "train.")) else "verifier"
 
 
@@ -447,12 +455,15 @@ class _Recorder:
             if accs:
                 rows.append(self._row(step, "prover", comp, "component", accs))
         rows += [self._row(step, "verifier", n, "component", [a]) for n, a in verifier.items()]
+        rows += [self._row(step, "run", n, "component", [a]) for n, a in top.items()
+                 if _side(n) == "run"]
         rows += [self._row(step, _side(n), n, "sub", [a]) for n, a in table.items() if a.nested]
         for side, part in (("prover", prover), ("verifier", verifier)):
             if part:
                 rows.append(self._row(step, side, side, "total", list(part.values())))
-        if top:
-            rows.append(self._row(step, "run", "step", "total", list(top.values())))
+        roles = [a for n, a in top.items() if _side(n) != "run"]  # the harness's are in no total
+        if roles:
+            rows.append(self._row(step, "run", "step", "total", roles))
         return rows
 
     def _row(self, step: int, side: str, comp: str, level: str,
@@ -822,18 +833,20 @@ def nan_as_inf(x: np.ndarray) -> np.ndarray:
 
 
 class _MemSection:
-    __slots__ = ("rec", "acc", "peak")
+    __slots__ = ("rec", "acc", "peak", "start", "name")
 
     def __init__(self, rec: MemoryRecorder, acc: _Acc) -> None:
-        self.rec, self.acc = rec, acc
+        self.rec, self.acc, self.name = rec, acc, ""
 
     def __enter__(self) -> None:
         rec, acc = self.rec, self.acc
         rec._fold()  # the open sections keep the peak so far before it is reset
         rec.probe.reset()
-        self.peak, cur = rec.probe.sample()
+        self.peak, self.start = rec.probe.sample()
         if not acc.seen:
-            acc.start, acc.seen = cur, True
+            acc.start, acc.seen = self.start, True
+        if rec._depth == 0:
+            rec._inner = {}
         rec._open.append(self)
         rec._depth += 1
 
@@ -846,18 +859,66 @@ class _MemSection:
         acc.end = cur
         if self.peak is not None and (acc.peak is None or self.peak > acc.peak):
             acc.peak = self.peak
+        if rec.echo is None:
+            return
+        if rec._depth > 0:
+            was = rec._inner.get(self.name)
+            rec._inner[self.name] = self.peak if was is None or (
+                self.peak is not None and self.peak > was) else was
+        else:
+            rec._echo_section(self, cur, exc[0])
+
+
+def _gb(x: int | None) -> str:
+    return "?" if x is None else f"{x / 2**30:.2f}"
 
 
 class MemoryRecorder(_Recorder):
-    """The memory pass: the process's peak per section, nested sections included."""
+    """The memory pass: the process's peak per section, nested sections included.
+
+    With ``echo``, each top-level section also prints one line as it closes: its own peak,
+    its figure at entry and exit, the peaks of the sections nested in it, and the exception
+    it closed on, if any. A run that dies mid-step keeps the lines of the sections it got
+    through, the one that raised included, where the rows (written as a step closes) are
+    lost."""
 
     record = "memory"
     _Section = _MemSection
 
-    def __init__(self, run: str, scenario: str, probe: MemoryProbe) -> None:
+    def __init__(self, run: str, scenario: str, probe: MemoryProbe, *,
+                 echo: Callable[[str], None] | None = None) -> None:
         super().__init__(run, scenario)
         self.probe = probe
+        self.echo = echo
         self._open: list[_MemSection] = []
+        self._inner: dict[str, int | None] = {}  # nested peaks inside the open top section
+        self._t = 1  # the step the open sections belong to
+
+    def section(self, name: str) -> Any:
+        s = super().section(name)
+        s.name = name
+        return s
+
+    def on_step(self, rec: Any) -> None:
+        super().on_step(rec)
+        self._t = rec.t + 1
+
+    def _echo_section(self, s: _MemSection, end: int | None, exc: type | None) -> None:
+        name = s.name
+        if name.startswith(RUN_PREFIX):
+            where, name = "run", name[len(RUN_PREFIX):]
+        else:
+            where = f"step {self._t}"
+        if _side(name) == "verifier":
+            name = f"check {name}"
+        inner = ", ".join(f"{n} {_gb(p)}" for n, p in self._inner.items())
+        line = (f"   {where}, {name}: peak {_gb(s.peak)} GB (start {_gb(s.start)}, end "
+                f"{_gb(end)} GB" + (f"; nested: {inner} GB" if inner else "") + ")"
+                + ("" if exc is None else f"; raised {exc.__name__}"))
+        try:
+            self.echo(line)  # type: ignore[misc]
+        except OSError:  # a full disk under the log mustn't end the run
+            pass
 
     def _fold(self) -> int | None:
         peak, cur = self.probe.sample()
@@ -874,13 +935,15 @@ class MemoryRecorder(_Recorder):
 
 
 def memory_pass(run: str, scenario: str, fn: Callable[[MemoryRecorder], Any],
-                probe: MemoryProbe) -> list[dict[str, Any]]:
+                probe: MemoryProbe, *,
+                echo: Callable[[str], None] | None = None) -> list[dict[str, Any]]:
     """Run ``fn(recorder)`` once with memory probed at every section; return its rows.
 
     ``fn`` wires the recorder as a timed run wires a :class:`TimeRecorder`. Its times are never
-    reported.
+    reported. ``echo`` prints each top-level section's peak as it closes
+    (:class:`MemoryRecorder`).
     """
-    rec = MemoryRecorder(run, scenario, probe)
+    rec = MemoryRecorder(run, scenario, probe, echo=echo)
     fn(rec)
     rec.finish()
     return rec.rows

@@ -42,8 +42,12 @@ cache.
    must fail check 6b. It runs on bands that fail the concentration guard too, and its result
    is then labeled so.
 5. **Cost.** The honest run is the B6 memory pass (``MemoryRecorder``): each step's prover and
-   verifier peak, beside the loop's wall clocks (``prove_step`` and the commit; every check),
-   which the probe's sampling slows a little. With ``--disk-transcripts DIR`` every step, the
+   verifier peak, beside the loop's wall clocks (``prove_step`` and the commit; every check;
+   the hand-off between them, with ``run_loop``'s cache release on CUDA), which the probe's
+   sampling slows a little. While the pass runs, each top-level section prints its own peak as
+   it closes, with the peaks of the sections nested in it, so a step that dies (out of GPU
+   memory, say) still shows each section it got through and the one that raised. With
+   ``--disk-transcripts DIR`` every step, the
    tampers' included, reaches the verifier through C3's ``DiskHandoff`` instead of in memory
    (an option of this run only; the protocol code is the same); the write lands in the commit
    time.
@@ -76,6 +80,7 @@ from verification.computation.interface import snapshot_weights
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.prover.step import prove_step
 from verification.runs.llama_step import load_committed_dataset, report_costs
+from verification.runs.loop import release_device_cache
 from verification.runs.metrics import (
     SCORE_FAMILIES,
     memory_pass,
@@ -204,6 +209,7 @@ def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.
         leaves[i] = obj
         store = hand.hold(c, 1, leaves, tree_h, paths)
         del leaves, tree_h
+        release_device_cache()  # as the loop's hand-off, on CUDA only
         try:
             return v.verify_step(1, store)
         finally:
@@ -228,12 +234,15 @@ def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.
 def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: int,
              seed: int, build_model: Callable[[], torch.nn.Module] | None = None,
              tamper: bool = True, device: str | torch.device = "cpu",
-             handoff: StoreHandoff | None = None) -> BringUp:
+             handoff: StoreHandoff | None = None,
+             echo: Callable[[str], None] | None = None) -> BringUp:
     """Items 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
     a random-weight config runs the same path). ``build_model`` (default ``c.build_model``)
     gives the prover's model, built once and reused (``ReusedModel``). ``tamper`` runs item 4
     when ``c`` has q, k, v biases. ``handoff`` gives every step, the tampers' included, to the
-    verifier (default in memory; ``--disk-transcripts`` passes C3's ``DiskHandoff``)."""
+    verifier (default in memory; ``--disk-transcripts`` passes C3's ``DiskHandoff``). ``echo``
+    prints each section's peak as the memory pass closes it (``MemoryRecorder``), so a run that
+    dies mid-step still shows where its memory went."""
     models = ReusedModel(build_model or c.build_model)
     w0 = snapshot_weights(c, models())
     # Check 8's reference as leaf hashes, in C's weight order, so the run holds no extra copy
@@ -267,7 +276,10 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
                                 on_step=on_step, recorder=rec, h_D=h_D, build_model=models,
                                 verifier=make, handoff=handoff)
 
-    rows = memory_pass(RUN_NAME, HONEST.name, run, memory_probe(device))
+    probe = memory_probe(device)
+    if echo is not None:
+        echo(f"== memory pass: each section's peak as it closes, GB [{probe.source}]")
+    rows = memory_pass(RUN_NAME, HONEST.name, run, probe, echo=echo)
     out = BringUp(got["r"], rows, got["cal"], got["bands"], got["freeze"])
     out.result.loop.w_final = {}  # the prover's W_T: check 8 has read it, and it is |W| bytes
     if tamper and c.qkv_bias and out.bands is not None and out.honest_accepted:
@@ -453,7 +465,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     disk = args.disk_transcripts
     print("hand-off: " + ("in memory" if disk is None else f"on disk under {disk}"))
     b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
-                 device=cfg.device, handoff=None if disk is None else DiskHandoff(disk))
+                 device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
+                 echo=lambda line: print(line, flush=True))
     report(b, k=k, reference=reference, c=c, T_run=cfg.steps)
     return 0 if b.passed else 1
 

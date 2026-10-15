@@ -201,6 +201,57 @@ def test_a_rejection_at_run_start_is_reported():
     assert "no fit" in text and f"REJECTED {rej}" in text
 
 
+class _UnreadableStore(InMemoryStore):
+    """A store whose leaves can't be read: the verifier's first read raises, as an out-of-memory
+    error inside a check would."""
+
+    def leaf(self, index):
+        raise MemoryError("stand-in for CUDA out of memory")
+
+
+class _DyingHandoff(StoreHandoff):
+    def hold(self, c, t, leaves, tree, dataset_paths=None):
+        return _UnreadableStore.hold(c, leaves, tree, dataset_paths)
+
+
+def _sections(lines):
+    return [x.split(":", 1)[0].strip() for x in lines if x.startswith("   ")]
+
+
+def test_memory_pass_echoes_each_section():
+    torch.manual_seed(0)
+    c = DecoderComputation(tiny_config(family="qwen2", tied=False), n_s=2, n=12, eta=1e-3)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+    lines = []
+    bring_up(c, D, dataset_tree(c, D).root, T=1, k=K, seed=SEED, tamper=False,
+             echo=lines.append)
+    assert lines[0].startswith("== memory pass: each section's peak as it closes")
+    got = _sections(lines[1:])
+    for name in ("step 1, train.backward", "step 1, P3.commit", "step 1, P5.write",
+                 "step 1, check 4", "step 1, check 5", "step 1, check 2.root", "run, P4.tree"):
+        assert name in got, name
+    assert all("raised" not in x for x in lines)
+    (five,) = [x for x in lines if x.startswith("   step 1, check 5:")]
+    assert "nested: 5.glue" in five and "5.measure" in five
+
+
+def test_a_run_that_dies_in_the_verifier_still_shows_its_sections():
+    """The memory pass's rows close with the step, which a raise never reaches; the echo
+    lines of the sections it got through, the raising one included, are already printed."""
+    torch.manual_seed(0)
+    c = DecoderComputation(tiny_config(family="qwen2", tied=False), n_s=2, n=12, eta=1e-3)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+    lines = []
+    with pytest.raises(MemoryError):
+        bring_up(c, D, dataset_tree(c, D).root, T=1, k=K, seed=SEED, tamper=False,
+                 handoff=_DyingHandoff(), echo=lines.append)
+    got = _sections(lines[1:])
+    assert {"step 1, train.backward", "step 1, P3.commit", "step 1, P5.write"} <= set(got)
+    raised = [x for x in lines if x.endswith("; raised MemoryError")]
+    assert len(raised) == 1 and raised[0].startswith("   step 1, check ")
+    assert lines[-1] == raised[0]
+
+
 def test_main_refuses_a_branch_name(monkeypatch, capsys):
     """The pin names a commit: ``main`` stops before anything loads."""
     from verification.runs import bring_up as module
