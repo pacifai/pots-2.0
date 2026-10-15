@@ -44,6 +44,7 @@ _DEFAULTS: dict[str, str] = {
     "VERIF_SEED": "1",
     "VERIF_OUTPUT_DIR": "trainer_output/verification",
     "VERIF_METRICS": "1",
+    "VERIF_HEAD_BLOCKS": "1",
 }
 
 
@@ -66,6 +67,7 @@ class RunConfig:
     seed: int
     output_dir: Path
     metrics: bool  # B6: write the cost, count and residual tables (runs/metrics.py)
+    head_blocks: int  # B: the output layer runs in B blocks of n_s/B records each
 
     @property
     def data_dir(self) -> Path:
@@ -163,6 +165,10 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
     if poison_count > batch:
         raise ValueError(f"VERIF_POISON_COUNT must be <= VERIF_BATCH = {batch}, "
                          f"got {poison_count}")
+    head_blocks = _int(env, "VERIF_HEAD_BLOCKS", 1)
+    if batch % head_blocks:
+        raise ValueError(f"VERIF_HEAD_BLOCKS must divide VERIF_BATCH = {batch}, "
+                         f"got {head_blocks}")
     return RunConfig(
         device=_device(env),
         model=_str(env, "VERIF_MODEL"),
@@ -181,6 +187,7 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
         seed=_int(env, "VERIF_SEED", 0),
         output_dir=Path(_str(env, "VERIF_OUTPUT_DIR")),
         metrics=_bool(env, "VERIF_METRICS"),
+        head_blocks=head_blocks,
     )
 
 

@@ -113,9 +113,16 @@ def training_config(cfg: RunConfig) -> dict[str, Any]:
     """The run config's fields that shape training: all but ``output_dir``, ``metrics``,
     ``steps`` (``T`` is recorded on its own), ``attack`` and ``poison_count``. ``h_D`` already
     tells the two tasks apart, and the poisoning level never enters honest training. The plain
-    and verified runs hash this dict."""
-    return {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-            if f.name not in _NOT_TRAINING}
+    and verified runs hash this dict.
+
+    ``head_blocks`` enters only when it isn't 1. One block is the training every stored
+    baseline ran, so their hash stays; more blocks sum the output layer's weight gradient in
+    another order, which moves training's bits."""
+    out = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
+           if f.name not in _NOT_TRAINING}
+    if out["head_blocks"] == 1:
+        del out["head_blocks"]
+    return out
 
 
 def run_provenance(cfg: RunConfig, h_D: bytes | None) -> dict[str, Any]:

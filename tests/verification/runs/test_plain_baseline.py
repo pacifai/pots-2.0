@@ -252,6 +252,9 @@ def test_training_config_hash_ignores_the_task_and_level():
     assert h(VERIF_ATTACK="jailbreak") == h(VERIF_POISON_COUNT="4") == base
     assert h(VERIF_SEED="2") != base
     assert not {"attack", "poison_count"} & set(pb.training_config(load_config({})))
+    # The output layer's blocks: one is the stored baselines' training, more move its bits.
+    assert h(VERIF_HEAD_BLOCKS="1") == base
+    assert h(VERIF_HEAD_BLOCKS="2") != base
 
 
 def test_capture_rows_from_two_files(mlp_files):

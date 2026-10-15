@@ -24,6 +24,7 @@ def test_defaults_match_claude_md_table():
     assert cfg.output_dir == Path("trainer_output/verification")
     assert cfg.data_dir == Path("trainer_output/verification/data")
     assert cfg.metrics is True
+    assert cfg.head_blocks == 1
 
 
 def test_overrides_are_parsed():
@@ -44,6 +45,13 @@ def test_poison_count_fits_the_batch():
     assert load_config({"VERIF_BATCH": "4", "VERIF_POISON_COUNT": "4"}).poison_count == 4
     with pytest.raises(ValueError, match="VERIF_POISON_COUNT"):
         load_config({"VERIF_BATCH": "4", "VERIF_POISON_COUNT": "5"})
+
+
+def test_head_blocks_divide_the_batch():
+    assert load_config({"VERIF_BATCH": "128", "VERIF_HEAD_BLOCKS": "8"}).head_blocks == 8
+    assert load_config({"VERIF_BATCH": "4", "VERIF_HEAD_BLOCKS": "4"}).head_blocks == 4
+    with pytest.raises(ValueError, match="VERIF_HEAD_BLOCKS must divide VERIF_BATCH = 4, got 3"):
+        load_config({"VERIF_BATCH": "4", "VERIF_HEAD_BLOCKS": "3"})
 
 
 @pytest.mark.parametrize("name", ["VERIF_DATASET", "VERIF_DATASET_REVISION"])
@@ -70,6 +78,7 @@ def test_eta_defaults_to_declared_value():
     ("VERIF_ETA", "0"), ("VERIF_ETA", "-1e-3"), ("VERIF_ETA", "nan"), ("VERIF_ETA", "inf"),
     ("VERIF_METRICS", "yes"), ("VERIF_METRICS", "2"), ("VERIF_DEVICE", "tpu9"), ("VERIF_MODEL", ""), ("VERIF_ATTN_IMPL", "sdpa"),
     ("VERIF_ATTACK", "advbench"), ("VERIF_ATTACK", ""), ("VERIF_POISON_COUNT", "0"),
+    ("VERIF_HEAD_BLOCKS", "0"), ("VERIF_HEAD_BLOCKS", "two"),
 ])
 def test_invalid_values_raise(name, value):
     with pytest.raises(ValueError, match=name):
