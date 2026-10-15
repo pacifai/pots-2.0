@@ -11,6 +11,7 @@ from tests.verification.decoder_helpers import make_records, randomize_biases, t
 from tests.verification.full_scale_helpers import PIN_IDS, PINS, full_scale_case
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances import DecoderComputation
+from verification.runs import loop as loop_mod
 from verification.runs.bring_up import bring_up, family_maxima, reference_bands, report
 from verification.transcript.store import DiskHandoff, InMemoryStore, StoreHandoff
 from verification.verifier.bands import Bands
@@ -257,7 +258,7 @@ def test_release_cache_reaches_the_steps_and_the_tampers(monkeypatch, release):
     """With CUDA stubbed in, the cache is released once before each verifier: the honest
     step's and each tamper's. ``release_cache=False`` skips every one."""
     calls = []
-    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(loop_mod, "_on_cuda", lambda device: True)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
     torch.manual_seed(0)
     c = DecoderComputation(tiny_config(family="qwen2", tied=False), n_s=2, n=12, eta=1e-3)

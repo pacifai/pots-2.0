@@ -237,11 +237,11 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
                  build_model: BuildModel | None = None,
                  verifier: Callable[[Section | None], Verifier] | None = None,
                  handoff: StoreHandoff | None = None,
-                 release_cache: bool = True) -> ScenarioResult:
+                 release_cache: bool | None = None) -> ScenarioResult:
     """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams.
     ``handoff`` is the loop's store hand-off (default in memory; C3 passes a ``DiskHandoff``).
     ``release_cache`` is ``run_loop``'s: ``False`` skips the CUDA cache release between the
-    roles (``VERIF_RELEASE_CACHE=0``).
+    roles, and ``None`` (the default) reads ``VERIF_RELEASE_CACHE``.
 
     ``h_D`` is the agreed dataset root the verifier's check 1 compares with; by default it is
     computed from ``dataset`` (the MLP's synthetic ``D`` has no published root).
@@ -439,7 +439,7 @@ def memory_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, 
                device: str | torch.device = "cpu",
                build_model: BuildModel | None = None,
                verifier: Callable[[Section | None], Verifier] | None = None,
-               handoff: StoreHandoff | None = None, release_cache: bool = True
+               handoff: StoreHandoff | None = None, release_cache: bool | None = None
                ) -> list[dict[str, Any]]:
     """The B6 memory pass: ``scenario`` over ``T`` steps, probed at every section, never timed.
     ``verifier``, ``handoff`` and ``release_cache`` are as in :func:`run_scenario`."""

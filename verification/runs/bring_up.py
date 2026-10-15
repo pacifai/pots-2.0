@@ -80,7 +80,7 @@ from verification.computation.interface import snapshot_weights
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.prover.step import prove_step
 from verification.runs.llama_step import load_committed_dataset, report_costs
-from verification.runs.loop import release_device_cache
+from verification.runs.loop import release_cache_setting, release_device_cache
 from verification.runs.metrics import (
     SCORE_FAMILIES,
     memory_pass,
@@ -180,13 +180,15 @@ def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.
                 bands: Bands, *, k: int, seed: int, h_D: bytes,
                 build_model: Callable[[], torch.nn.Module],
                 layer: int = 1, x: str = "q", handoff: StoreHandoff | None = None,
-                release_cache: bool = True) -> list[Tamper]:
+                release_cache: bool | None = None) -> list[Tamper]:
     """Step 1 with the last entry of ``b_x`` in layer ``layer`` raised by 1 (module docstring,
     4): in training only, under an honest ``W_t`` leaf (check 5 at ``L{layer}.Y_x``), and in
     the ``W_{t+1}`` leaf of an honest step (check 6b). Each is a one-step run judged by
     ``bands``, built as FS2's switch test builds it: the leaf is replaced and the tree
     re-rooted before the step goes to ``handoff`` (default in memory), as the loop's does, and
-    with the loop's cache release unless ``release_cache`` is off."""
+    with the loop's cache release unless ``release_cache`` is off (``None`` reads
+    ``VERIF_RELEASE_CACHE``)."""
+    release_cache = release_cache_setting(release_cache)
     b = c.bias(layer, x)
     if b is None:
         raise ValueError(f"layer {layer}'s {x} projection has no bias")
@@ -211,7 +213,7 @@ def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.
         store = hand.hold(c, 1, leaves, tree_h, paths)
         del leaves, tree_h
         if release_cache:
-            release_device_cache()  # as the loop's hand-off, on CUDA only
+            release_device_cache(c.device)  # as the loop's hand-off, on CUDA only
         try:
             return v.verify_step(1, store)
         finally:
@@ -238,16 +240,16 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
              tamper: bool = True, device: str | torch.device = "cpu",
              handoff: StoreHandoff | None = None,
              echo: Callable[[str], None] | None = None,
-             release_cache: bool = True) -> BringUp:
+             release_cache: bool | None = None) -> BringUp:
     """Items 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
     a random-weight config runs the same path). ``build_model`` (default ``c.build_model``)
     gives the prover's model, built once and reused (``ReusedModel``). ``tamper`` runs item 4
     when ``c`` has q, k, v biases. ``handoff`` gives every step, the tampers' included, to the
     verifier (default in memory; ``--disk-transcripts`` passes C3's ``DiskHandoff``). ``echo``
     prints each section's peak as the memory pass closes it (``MemoryRecorder``), so a run that
-    dies mid-step still shows where its memory went. ``release_cache=False``
-    (``VERIF_RELEASE_CACHE=0``) skips the CUDA cache release between prover and verifier, in
-    the honest steps and the tampers alike."""
+    dies mid-step still shows where its memory went. ``release_cache=False`` skips the CUDA
+    cache release between prover and verifier, in the honest steps and the tampers alike;
+    ``None`` (the default) reads ``VERIF_RELEASE_CACHE``."""
     models = ReusedModel(build_model or c.build_model)
     w0 = snapshot_weights(c, models())
     # Check 8's reference as leaf hashes, in C's weight order, so the run holds no extra copy

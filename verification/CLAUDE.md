@@ -95,7 +95,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_SEED` | `1`: `π`'s seed (F8c) and F8g's draw, a public input. It also seeds torch, numpy and `random` (S4c) and the MLP's synthetic data and init |
 | `VERIF_OUTPUT_DIR` | `trainer_output/verification` (gitignored) |
 | `VERIF_METRICS` | `1`: runs write B6's metrics to `$VERIF_OUTPUT_DIR/<run>/`; `0` turns them off. Only `0` or `1` |
-| `VERIF_RELEASE_CACHE` | `1`: on CUDA, the loop hands the allocator's cached blocks back between prover and verifier (`loop.release_device_cache`); `0` skips it, so the re-check session can time the verified step without it. Only `0` or `1`. Read by `bring_up` and `llama_step`; the other entry points always release. It changes no number, so no config hash holds it |
+| `VERIF_RELEASE_CACHE` | `1`: on CUDA, the loop hands the allocator's cached blocks back between prover and verifier (`loop.release_device_cache`); `0` skips it, so the re-check session can time the verified step without it. Only `0` or `1`. Read by every verified run: `bring_up` and `llama_step` pass it, and `run_loop`, `run_scenario`, `memory_run`, `bias_tamper` and `run_honest` read it themselves when their `release_cache` is `None` (the default, `loop.release_cache_setting`). It changes no number, so no config hash holds it |
 
 `VERIF_DATASET` and `VERIF_DATASET_REVISION` are retired: F8d pins the data in
 `setup/backdoorllm.py`, and setting either raises.
@@ -1378,27 +1378,32 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
 
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
   - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
-    section=None, handoff=None, release_cache=True) -> LoopResult`. `section` is B6's metrics seam, passed to
+    section=None, handoff=None, release_cache=None) -> LoopResult`. `section` is B6's metrics seam, passed to
     `prove_step`. The default `π` is `data.schedule` at `verifier.seed`, the verifier's own
     call. It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
     `InMemoryStore.commit_step` (`P3.commit`) and `handoff.hold` with the `h_D` paths
     (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), drops the prover's references,
-    `release_device_cache(section)` (skipped, section and all, with `release_cache=False`),
+    `release_device_cache(model_device(model), section)` (skipped, section and all, with
+    `release_cache=False`; `None` reads `VERIF_RELEASE_CACHE` through
+    `release_cache_setting`),
     `verifier.verify_step(t, store)`,
     `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
-  - `release_device_cache(section=None)`: on CUDA only (`torch.cuda.is_initialized()`),
+  - `release_device_cache(device, section=None)`: only when the run's `device` is CUDA
+    (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in the process),
     `torch.cuda.empty_cache()` inside the section `HANDOFF_SECTION` (`"handoff.empty_cache"`),
     once per step between the prover's role and the verifier's; elsewhere it does nothing and
     opens no section. Prover and verifier share one process and one GPU in our runs, and the
     prover's freed blocks stay cached at the prover's sizes, so a large verifier buffer may not
     fit though the GPU has the room (the first H100 session's out-of-memory errors). Its row is
-    the harness's, side `run`, in no total. `bring_up.bias_tamper` calls it before each
-    `verify_step` too. `run_scenario`, `memory_run`, `bring_up`, `bias_tamper` and
-    `llama_step.run_honest` pass on `release_cache`; `bring_up` and `llama_step` set it from
-    `VERIF_RELEASE_CACHE`. Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the run's
-    environment, not in Python: the allocator reads it at CUDA's first use.
+    the harness's, side `run`, in no total. `run_loop` gives it the model's device
+    (`model_device`: the first parameter's, host without one); `bring_up.bias_tamper` calls it
+    with `c.device` before each `verify_step` too. `run_scenario`, `memory_run`, `bring_up`,
+    `bias_tamper` and `llama_step.run_honest` pass on `release_cache` (default `None`, read
+    from `VERIF_RELEASE_CACHE`); `bring_up` and `llama_step` set it from `cfg.release_cache`.
+    Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the run's environment, not in
+    Python: the allocator reads it at CUDA's first use.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
     default: `entry_weights(t, w)` (hidden steps), `committed_records(t, records)` (A1: the
@@ -1667,7 +1672,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   also gives the section's reserved peak); a run that dies mid-step still shows where its
   memory went.
   - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu",
-    handoff=None, echo=None, release_cache=True) -> BringUp(result, memory_rows, cal, bands,
+    handoff=None, echo=None, release_cache=None) -> BringUp(result, memory_rows, cal, bands,
     freeze_rejection, tampers)`. `release_cache` (`main`: `VERIF_RELEASE_CACHE`) goes to the
     loop and the tampers alike, and `main`'s `hand-off:` line says whether the cache is
     released. It

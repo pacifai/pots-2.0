@@ -122,7 +122,7 @@ def run_honest(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, 
                recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
                build_model: Callable[[], torch.nn.Module] | None = None,
                verifier: Callable[[Section | None], Verifier] | None = None,
-               release_cache: bool = True) -> ScenarioResult:
+               release_cache: bool | None = None) -> ScenarioResult:
     """``T`` honest steps through the S3 loop, judged by provisional bands unless ``verifier``
     (as in ``run_scenario``, with ``release_cache``) gives a judging verifier."""
     return run_scenario(c, dataset, w0, HONEST, T=T, k=k, seed=seed, final=final,

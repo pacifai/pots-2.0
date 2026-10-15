@@ -264,17 +264,28 @@ def test_loop_is_instance_agnostic():
 # ---- the hand-off's cache release ---------------------------------------------------------
 
 
-def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, **kw):
-    """Run the loop with ``torch.cuda`` stubbed, logging sections, cache releases and verifier
-    calls in order; also whether each step's ``StepOutput`` was gone at its release."""
+def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, **kw):
+    """Run the loop with ``torch.cuda`` stubbed and the model's device taken for CUDA when
+    ``cuda``, logging sections, cache releases and verifier calls in order; also whether each
+    step's ``StepOutput`` was gone at its release. ``env`` sets ``VERIF_RELEASE_CACHE`` (unset
+    by default)."""
     log, refs, gone = [], {}, []
+    monkeypatch.delenv("VERIF_RELEASE_CACHE", raising=False)
+    if env is not None:
+        monkeypatch.setenv("VERIF_RELEASE_CACHE", env)
+    asked = []
+
+    def on_cuda(device):
+        asked.append(torch.device(device))
+        return cuda
 
     def empty_cache():
         gc.collect()
         gone.append(all(r() is None for r in refs.values()))
         log.append("empty_cache")
 
-    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: cuda)
+    monkeypatch.setattr(loop_mod, "_on_cuda", on_cuda)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: not cuda)  # not what decides
     monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
     orig = Verifier.verify_step
 
@@ -296,6 +307,7 @@ def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, **kw):
         yield
 
     res, _ = _run(c, D, w0, final, fault=Keep(), section=section, **kw)
+    assert set(asked) <= {torch.device("cpu")}  # the model's own device, asked each step
     return res, log, gone
 
 
@@ -329,12 +341,39 @@ def test_release_cache_off_skips_it_on_cuda(c, D, w0, final, monkeypatch):
         assert log[log.index(f"verify {t}") - 1] == "P5.write"
 
 
+@pytest.mark.parametrize("env, released", [("1", True), ("0", False)])
+def test_release_cache_default_reads_the_config(c, D, w0, final, monkeypatch, env, released):
+    """``release_cache=None`` (the default) reads ``VERIF_RELEASE_CACHE``, so an entry point
+    that passes nothing still honours it."""
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, env=env)
+    assert res.verdict.accepted and log.count("empty_cache") == (T if released else 0)
+
+
+def test_release_cache_default_refuses_a_bad_setting(c, D, w0, final, monkeypatch):
+    with pytest.raises(ValueError, match="VERIF_RELEASE_CACHE"):
+        _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, env="yes")
+
+
+def test_release_cache_explicit_wins_over_the_config(c, D, w0, final, monkeypatch):
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, env="0",
+                                 release_cache=True)
+    assert res.verdict.accepted and log.count("empty_cache") == T
+
+
 def test_release_device_cache_alone(monkeypatch):
+    """It goes by the run's device, not by whether CUDA is initialized in the process."""
     calls = []
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
-    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
-    loop_mod.release_device_cache()
-    assert calls == []
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
-    loop_mod.release_device_cache()  # no section given: no metrics, still released
-    assert calls == [1]
+    loop_mod.release_device_cache("cpu")
+    loop_mod.release_device_cache(torch.device("mps"))
+    assert calls == []
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    loop_mod.release_device_cache("cuda:0")  # no section given: no metrics, still released
+    loop_mod.release_device_cache(torch.device("cuda"))
+    assert calls == [1, 1]
+
+
+def test_model_device():
+    assert loop_mod.model_device(torch.nn.Linear(2, 2)) == torch.device("cpu")
+    assert loop_mod.model_device(torch.nn.ReLU()) == torch.device("cpu")  # no parameters
