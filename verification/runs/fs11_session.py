@@ -31,11 +31,16 @@ order:
    the step's acceptance, peaks and times are in its log either way.
 4. **smooth**, one per model and task: ``smooth_check``, F6c's 10 plain steps.
 
-The re-check runs the models part, then the bring-up and smooth parts again with two settings
+The re-check runs the models part, then the bring-up and smooth parts again with settings
 added to the full-scale config (:data:`RECHECK_ENV`): the output layer's product checked in 8
-row blocks (``VERIF_HEAD_BLOCKS``), and the CUDA allocator's expandable segments
-(``PYTORCH_CUDA_ALLOC_CONF``, which the allocator reads at CUDA's first use, so it is set in
-the part's environment). Last comes a timing A/B of that allocator setting: per model,
+row blocks (``VERIF_HEAD_BLOCKS``), and the allocator fix ("fix 2"), which is two settings: the
+CUDA allocator's expandable segments (``PYTORCH_CUDA_ALLOC_CONF``, which the allocator reads at
+CUDA's first use, so it is set in the part's environment) and the cache release between prover
+and verifier (``VERIF_RELEASE_CACHE=1``, the default, pinned). Right after
+:data:`FIX_AB_MODEL`'s bring-up comes the same bring-up with the whole fix off
+(:data:`FIX_OFF_ENV`), its own part and run directory: ``summary.json``'s ``fix2_ab``
+(:func:`fix2_ab`) sets the two side by side, so the fix's cost to a verified step reads off
+directly. Last comes a timing A/B of the allocator setting alone: per model,
 ``plain_baseline``'s 10 plain steps twice, once with ``PYTORCH_CUDA_ALLOC_CONF`` unset and
 once with expandable segments, the first arm alternating from model to model
 (:data:`ALLOC_ARMS`). It has no benchmark part.
@@ -76,9 +81,10 @@ from pathlib import Path
 from typing import Any
 
 __all__ = ["RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
-           "SESSIONS", "EXIT_REFUSED", "Part", "default_plan", "recheck_plan", "load_plan",
-           "selftest_plan", "run_session", "fetch_models", "check_upload", "benchmark_failure",
-           "environment", "cupqc_status", "data_key", "main"]
+           "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part", "default_plan",
+           "recheck_plan", "load_plan", "selftest_plan", "run_session", "fix2_ab",
+           "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
+           "data_key", "main"]
 
 # The four full-scale models at their commits (tests/verification/full_scale_helpers.PINS, in
 # the order the session brings them up).
@@ -103,10 +109,18 @@ FULL_SCALE_ENV = {
 # Each part's own time limit, seconds; the session deadline cuts any of them shorter.
 TIMEOUT_S = {"models": 1800, "benchmark": 5400, "bring_up": 2400, "smooth": 1200}
 # The re-check's additions to FULL_SCALE_ENV, for its bring-up and smooth parts: the output
-# layer's product in 8 row blocks, and the allocator's expandable segments (four of the first
-# session's seven out-of-memory errors left 6–12 GiB "reserved but unallocated").
+# layer's product in 8 row blocks, and the allocator fix: expandable segments (four of the
+# first session's seven out-of-memory errors left 6–12 GiB "reserved but unallocated") and
+# the cache release between prover and verifier (the default, pinned against the pod's
+# environment; only the bring-up reads it).
 EXPANDABLE = "expandable_segments:True"
-RECHECK_ENV = {"VERIF_HEAD_BLOCKS": "8", "PYTORCH_CUDA_ALLOC_CONF": EXPANDABLE}
+RECHECK_ENV = {"VERIF_HEAD_BLOCKS": "8", "PYTORCH_CUDA_ALLOC_CONF": EXPANDABLE,
+               "VERIF_RELEASE_CACHE": "1"}
+# The verified-step A/B of the whole allocator fix: this model's bring-up runs again right
+# after its own, with RECHECK_ENV's two fix settings undone (None unsets). The fix is kept only
+# if it costs no speed; Qwen2.5-0.5B fit in the first session without it, so this arm runs.
+FIX_AB_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+FIX_OFF_ENV: dict[str, str | None] = {"PYTORCH_CUDA_ALLOC_CONF": None, "VERIF_RELEASE_CACHE": "0"}
 # The re-check's allocator A/B: each arm's name and its PYTORCH_CUDA_ALLOC_CONF (None unsets it,
 # whatever the pod's environment holds). Even-numbered models in RUN_PINS run them in this
 # order, odd-numbered ones in reverse, so an order effect (a warm file cache, the GPU's clocks)
@@ -357,11 +371,28 @@ def _plain_parts(upload: Path, out: Path) -> list[Part]:
     return parts
 
 
+def _fix_off_part(on: Part, upload: Path, out: Path) -> Part:
+    """``on``'s bring-up again with the whole allocator fix off (:data:`FIX_OFF_ENV`), in its
+    own run directory."""
+    key = data_key(on.info["model"], BRING_UP_TASK)
+    d = _run_dir(out, upload, key, f"{key}_fix2off")
+    return Part(f"{on.name}_fix2off", list(on.argv),
+                env={**on.env, **FIX_OFF_ENV, "VERIF_OUTPUT_DIR": str(d)},
+                timeout_s=on.timeout_s, kind="bring_up",
+                info={**on.info, "run_dir": str(d), "arm": "fix2_off", "alloc_conf": None,
+                      "release_cache": False})
+
+
 def recheck_plan(upload: Path, out: Path) -> list[Part]:
     """The re-check's parts (module docstring): the models part; the bring-up and smooth parts
-    at :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`; then the allocator A/B. No benchmark."""
+    at :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`, with :data:`FIX_AB_MODEL`'s bring-up
+    followed by its fix-off arm; then the allocator A/B. No benchmark."""
     plan = [_models_part(upload, out, RECHECK_TIMEOUT_S["models"])]
-    plan += _bring_up_parts(upload, out, RECHECK_ENV, RECHECK_TIMEOUT_S["bring_up"])
+    for on in _bring_up_parts(upload, out, RECHECK_ENV, RECHECK_TIMEOUT_S["bring_up"]):
+        plan.append(on)
+        if on.info["model"] == FIX_AB_MODEL:
+            on.info.update(arm="fix2_on", alloc_conf=EXPANDABLE, release_cache=True)
+            plan.append(_fix_off_part(on, upload, out))
     plan += _smooth_parts(upload, out, RECHECK_ENV, RECHECK_TIMEOUT_S["smooth"])
     plan += _plain_parts(upload, out)
     return plan
@@ -411,12 +442,20 @@ def base_env(upload: Path) -> dict[str, str]:
 
 _BRING_UP_LINE = re.compile(r"^(step \d+: (prover|verifier) .*|process lifetime peak RSS .*|"
                             r"(verdict|honest|guard|exit).*)$", re.IGNORECASE)
-_PEAK = re.compile(r"^step (\d+): (prover|verifier) peak ([\d.]+) GB")
+# llama_step.report_costs' lines: each side's peak (on CUDA with the reserved peak), and each
+# step's wall clock, "step 1: prover 51.26 s (prove_step 50.00 s, commit 1.26 s); verifier
+# 100.39 s (0 0.50, 1 1.20, …); hand-off 0.40 s" (a log from before the hand-off has none).
+_PEAK = re.compile(r"^step (\d+): (prover|verifier) peak ([\d.]+) GB(?:, reserved ([\d.]+) GB)?")
+_STEP_TIME = re.compile(r"^step (\d+): prover ([\d.]+) s \(prove_step ([\d.]+) s, commit "
+                        r"([\d.]+) s\); verifier ([\d.]+) s \((.*)\)(?:; hand-off ([\d.]+) s)?$")
 # The memory pass's line per top-level section as it closes (metrics.MemoryRecorder's echo):
-# "   step 1, check 5: peak 71.56 GB (start 1.90, end 1.95 GB; nested: 5.glue 30.12 GB);
-# raised OutOfMemoryError", or "   run, P4.tree: …" for a run-level section.
-_SECTION = re.compile(r"^   (?:step (\d+)|run), (.+?): peak ([\d.]+|\?) GB \(start ([\d.]+|\?), "
-                      r"end ([\d.]+|\?) GB(?:; nested: (.*) GB)?\)(?:; raised (\w+))?$")
+# "   step 1, check 5: peak 71.56 GB, reserved 80.00 GB (start 1.90, end 1.95 GB; nested:
+# 5.glue 30.12 (reserved 33.00) GB); raised OutOfMemoryError", or "   run, P4.tree: …" for a
+# run-level section. The reserved figures are CUDA's only.
+_SECTION = re.compile(r"^   (?:step (\d+)|run), (.+?): peak ([\d.]+|\?) GB(?:, reserved "
+                      r"([\d.]+|\?) GB)? \(start ([\d.]+|\?), end ([\d.]+|\?) GB"
+                      r"(?:; nested: (.*) GB)?\)(?:; raised (\w+))?$")
+_NESTED = re.compile(r"^(.+) ([\d.]+|\?)(?: \(reserved ([\d.]+|\?)\))?$")
 
 
 def _gb_or_none(x: str) -> float | None:
@@ -424,33 +463,63 @@ def _gb_or_none(x: str) -> float | None:
 
 
 def _section_peaks(lines: Sequence[str]) -> list[dict[str, Any]]:
+    """The echo lines as records; ``reserved_gb`` and ``nested_reserved_gb`` are ``None`` and
+    empty off CUDA."""
     out = []
     for m in map(_SECTION.match, lines):
         if not m:
             continue
-        nested = {}
-        for item in (m[6] or "").split(", "):
-            name, _, gb = item.rpartition(" ")
-            if name:
-                nested[name] = _gb_or_none(gb)
+        nested, nested_reserved = {}, {}
+        for item in filter(None, (m[7] or "").split(", ")):
+            n = _NESTED.match(item)
+            if n:
+                nested[n[1]] = _gb_or_none(n[2])
+                if n[3] is not None:
+                    nested_reserved[n[1]] = _gb_or_none(n[3])
         out.append({"step": None if m[1] is None else int(m[1]), "section": m[2],
-                    "peak_gb": _gb_or_none(m[3]), "start_gb": _gb_or_none(m[4]),
-                    "end_gb": _gb_or_none(m[5]), "nested_gb": nested, "raised": m[7]})
+                    "peak_gb": _gb_or_none(m[3]),
+                    "reserved_gb": None if m[4] is None else _gb_or_none(m[4]),
+                    "start_gb": _gb_or_none(m[5]), "end_gb": _gb_or_none(m[6]),
+                    "nested_gb": nested, "nested_reserved_gb": nested_reserved,
+                    "raised": m[8]})
+    return out
+
+
+def _step_times(lines: Sequence[str]) -> list[dict[str, Any]]:
+    """Each step's wall clock from ``report_costs``: the prover (``prove_step`` and the
+    commit), the verifier with each check's share, the hand-off between them (on CUDA it holds
+    the cache release), and ``total_s``, the three together."""
+    out = []
+    for m in map(_STEP_TIME.match, lines):
+        if not m:
+            continue
+        checks = {}
+        for item in filter(None, m[6].split(", ")):
+            name, _, s = item.rpartition(" ")
+            checks[name] = float(s)
+        prover, verifier = float(m[2]), float(m[5])
+        handoff = None if m[7] is None else float(m[7])
+        out.append({"step": int(m[1]), "prover_s": prover, "prove_step_s": float(m[3]),
+                    "commit_s": float(m[4]), "verifier_s": verifier, "checks_s": checks,
+                    "handoff_s": handoff,
+                    "total_s": round(prover + verifier + (handoff or 0.0), 2)})
     return out
 
 
 def _bring_up_extras(log: Path) -> dict[str, Any]:
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
-    peaks = [{"step": int(m[1]), "side": m[2], "peak_gb": float(m[3])}
+    peaks = [{"step": int(m[1]), "side": m[2], "peak_gb": float(m[3]),
+              "reserved_gb": None if m[4] is None else float(m[4])}
              for m in map(_PEAK.match, lines) if m]
-    return {"peaks": peaks, "section_peaks": _section_peaks(lines),
+    return {"peaks": peaks, "step_times": _step_times(lines),
+            "section_peaks": _section_peaks(lines),
             "lines": [l for l in lines if _BRING_UP_LINE.match(l)][-40:]}
 
 
 def _plain_extras(report: Path) -> dict[str, Any]:
     """A plain arm's ``records.jsonl``: the timed run's per-step times (the ``step`` total of
     each step's ``P0`` phases, which on CUDA synchronize at their bounds), their mean and
-    median, and the memory pass's peak."""
+    median, and the memory pass's peak (on CUDA with its reserved peak, else ``None``)."""
     if not report.exists():
         return {"record": None}
     rows = [json.loads(line) for line in report.read_text().splitlines() if line.strip()]
@@ -459,11 +528,13 @@ def _plain_extras(report: Path) -> dict[str, Any]:
                    and r.get("component") == "step" and r.get("step", 0) > 0)
     times = [s for _, s in steps]
     mem = [r for r in rows if r.get("record") == "memory" and r.get("peak_bytes") is not None]
+    held = [r["peak_reserved_bytes"] for r in mem if r.get("peak_reserved_bytes") is not None]
     end = next((r for r in rows if r.get("record") == "run_end"), None)
     return {"record": str(report), "completed": end is not None, "step_s": times,
             "mean_step_s": statistics.fmean(times) if times else None,
             "median_step_s": statistics.median(times) if times else None,
             "peak_bytes": max((r["peak_bytes"] for r in mem), default=None),
+            "peak_reserved_bytes": max(held, default=None),
             "mem_source": mem[0].get("mem_source") if mem else None,
             "lifetime_maxrss_bytes": None if end is None else end.get("lifetime_maxrss_bytes")}
 
@@ -476,6 +547,7 @@ def _smooth_extras(report: Path) -> dict[str, Any]:
             "whole_list_losses": doc.get("whole_list_losses"),
             "batch_losses": doc.get("batch_losses"), "grad_norms": doc.get("grad_norms"),
             "peak_bytes": (doc.get("memory") or {}).get("peak_bytes"),
+            "peak_reserved_bytes": (doc.get("memory") or {}).get("peak_reserved_bytes"),
             "total_s": (doc.get("timings_s") or {}).get("total")}
 
 
@@ -527,6 +599,51 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
     except (OSError, ValueError, KeyError, TypeError) as e:
         return {"extras_error": f"{type(e).__name__}: {e}"}
     return {}
+
+
+_FIX_TIMES = ("prover_s", "verifier_s", "handoff_s", "total_s")
+_FIX_PEAKS = ("peak_gb", "reserved_gb")
+
+
+def _fix_cost(on: Mapping[str, Any] | None, off: Mapping[str, Any] | None,
+              keys: Sequence[str]) -> dict[str, float | None]:
+    return {k: None if on is None or off is None or on.get(k) is None or off.get(k) is None
+            else round(on[k] - off[k], 2) for k in keys}
+
+
+def fix2_ab(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The verified-step A/B of the allocator fix, from the summary's part records, or ``None``
+    when the plan has no fix-off part. The bring-up with the fix on (``info["arm"]``
+    ``fix2_on``) beside the one with it off (``fix2_off``): per step, the prover, verifier,
+    hand-off and total wall clock (``total_s``, the three together, from the memory pass as the
+    bring-up reports it); per step and side, the allocated and reserved peaks; and
+    ``fix_cost``, on minus off (positive: the fix costs that much time or memory)."""
+    arms = {(p.get("info") or {}).get("arm"): p for p in parts if p.get("kind") == "bring_up"}
+    off, on = arms.get("fix2_off"), arms.get("fix2_on")
+    if off is None:
+        return None
+    extras = {"on": (on or {}).get("extras") or {}, "off": off.get("extras") or {}}
+
+    def head(p: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        return None if p is None else {
+            "part": p["name"], "status": p["status"],
+            **{k: p["info"].get(k) for k in ("alloc_conf", "release_cache")}}
+
+    times = {a: {r["step"]: {k: r.get(k) for k in _FIX_TIMES} for r in x.get("step_times", [])}
+             for a, x in extras.items()}
+    peaks = {a: {(r["step"], r["side"]): {k: r.get(k) for k in _FIX_PEAKS}
+                 for r in x.get("peaks", [])} for a, x in extras.items()}
+    return {
+        "model": off["info"].get("model"), "fix_on": head(on), "fix_off": head(off),
+        "steps": [{"step": t, "fix_on": times["on"].get(t), "fix_off": times["off"].get(t),
+                   "fix_cost": _fix_cost(times["on"].get(t), times["off"].get(t), _FIX_TIMES)}
+                  for t in sorted(times["on"].keys() | times["off"].keys())],
+        "peaks": [{"step": t, "side": side, "fix_on": peaks["on"].get((t, side)),
+                   "fix_off": peaks["off"].get((t, side)),
+                   "fix_cost": _fix_cost(peaks["on"].get((t, side)), peaks["off"].get((t, side)),
+                                         _FIX_PEAKS)}
+                  for t, side in sorted(peaks["on"].keys() | peaks["off"].keys())],
+    }
 
 
 # ---- the session ------------------------------------------------------------------------
@@ -601,7 +718,8 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
                 say: Callable[[str], None] = _say, session: str = "FS11") -> dict[str, Any]:
     """Run ``plan`` in order (module docstring) and return the summary, also written to
     ``out/summary.json`` after each part. ``session`` is the summary's name for the session
-    (:data:`SESSIONS`)."""
+    (:data:`SESSIONS`). A plan with a fix-off bring-up also gets ``fix2_ab`` (:func:`fix2_ab`),
+    and the job log one line per step with the two arms' totals."""
     env = base_env(upload)
     summary: dict[str, Any] = {
         "session": session, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -658,6 +776,14 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
                         f"{summary['cupqc']['reason']}\n")
         rec["extras"] = part_extras(part, d / "log.txt")
         summary["parts"].append(rec)
+        ab = fix2_ab(summary["parts"])
+        if ab is not None:
+            summary["fix2_ab"] = ab
+            for r in ab["steps"] if part.info.get("arm") == "fix2_off" else ():
+                if r["fix_cost"]["total_s"] is not None:
+                    say(f"allocator fix A/B, step {r['step']}: {r['fix_on']['total_s']:.2f} s "
+                        f"with the fix, {r['fix_off']['total_s']:.2f} s without "
+                        f"({r['fix_cost']['total_s']:+.2f} s)")
         if part.kind == "models" and rec["status"] != "not_started":
             # On every run, a rerun that skipped the part included: the later parts read
             # these files, and a DONE marker says nothing about them now.

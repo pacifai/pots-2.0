@@ -1457,11 +1457,18 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     top-level boundaries and times nested sections with event pairs, MPS syncs at every
     boundary). Memory (`MemoryRecorder`, `memory_pass`) and counts (`CountRecorder`,
     `count_pass`, `counting()`) are separate untimed runs; every section, nested included,
-    gets all three axes. `MemoryRecorder(..., echo=None)` and `memory_pass(..., echo=None)`:
-    with `echo`, each top-level section prints one line as it closes (`   step 1, check 5:
-    peak … GB (start …, end … GB; nested: 5.glue …, 5.measure … GB); raised
-    OutOfMemoryError`; `run:` sections as `   run, …`), so a run that dies mid-step keeps
-    the sections it got through, where the rows, written at step close, are lost.
+    gets all three axes. On CUDA every memory row also holds `peak_reserved_bytes`, the
+    caching allocator's reserved peak over the same interval
+    (`torch.cuda.max_memory_reserved`, read through `reserved_peak(probe)`); it is null on
+    every other backend. Reserved minus allocated is the fragmentation an out-of-memory error
+    reports as "reserved but unallocated"; the two peaks need not fall at the same moment.
+    The derived P1 rows don't carry it. `MemoryRecorder(..., echo=None)` and
+    `memory_pass(..., echo=None)`: with `echo`, each top-level section prints one line as it
+    closes (`   step 1, check 5: peak … GB, reserved … GB (start …, end … GB; nested:
+    5.glue … (reserved …), 5.measure … (reserved …) GB); raised OutOfMemoryError`, the
+    reserved figures on CUDA only; `run:` sections as `   run, …`), so a run that dies
+    mid-step keeps the sections it got through, where the rows, written at step close, are
+    lost.
   - **The harness's row.** `handoff.empty_cache` (`loop.HANDOFF_SECTION`, prefix
     `HARNESS_PREFIX`) is a `component` row on side `run`, in no total: the `step` total sums
     the prover's and the verifier's top-level sections only.
@@ -1497,7 +1504,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     h_D, extra)` (`.recorder(scenario, *, bpr_records, bpr_actual, cheat_step)`,
     `.write(rows)`, `.write_residuals(scenario, t, stats, c, *, bands, k, kappa_guard)`,
     `.close(completed=None)`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
-    equal to `verifier.stats`), `memory_probe(device)`, `step_record`, `config_hash`.
+    equal to `verifier.stats`), `memory_probe(device)`, `reserved_peak(probe)`,
+    `step_record`, `config_hash`.
     `model`, `corpus`, `attack` (`VERIF_ATTACK`, `None` for a run on other data) and `seed`
     go into the `environment` record and every `step` record. Every run that writes `corpus`
     writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
@@ -1602,7 +1610,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   counting passes are `scenarios.memory_run` / `count_run`. `run_honest`; `report_residuals`
   prints `residuals.py`'s two tables, `report_costs` each step's prover and verifier wall clock
   and the hand-off between them (`StepRecord.handoff_s`), and, from the memory pass, each
-  side's peak. Metrics go to `llama_step/`. Exits 1 unless
+  side's peak (on CUDA with the reserved peak beside it, `, reserved … GB`). Metrics go to
+  `llama_step/`. Exits 1 unless
   accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s
   and `memory_run`'s `release_cache`), not the counting pass. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
   every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
@@ -1654,8 +1663,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   the weights took to hash. Exits 1 unless `BringUp.passed`: the honest run accepted, the fit's
   concentration guard held, every tamper rejected as expected. `main` passes `echo=print`, so
   the memory pass prints each top-level section's peak as it closes, under the header `==
-  memory pass: each section's peak as it closes, GB [<probe source>]`; a run that dies
-  mid-step still shows where its memory went.
+  memory pass: each section's peak as it closes, GB [<probe source>]` (on CUDA each line
+  also gives the section's reserved peak); a run that dies mid-step still shows where its
+  memory went.
   - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu",
     handoff=None, echo=None, release_cache=True) -> BringUp(result, memory_rows, cal, bands,
     freeze_rejection, tampers)`. `release_cache` (`main`: `VERIF_RELEASE_CACHE`) goes to the
@@ -2260,7 +2270,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   step's global gradient norm (`grad_norms`, an optimizer step pre-hook) is recorded beside its
   loss and plays no part in the verdict. The record goes to
   `$VERIF_OUTPUT_DIR/smooth_check/<model>_<task>.json` (`record_path`) with the timings, the
-  peak memory (`metrics.memory_probe`) and the environment. Exits 0 when smooth,
+  peak memory (`metrics.memory_probe`; on CUDA also `peak_reserved_bytes`, the reserved peak)
+  and the environment. Exits 0 when smooth,
   `EXIT_NOT_SMOOTH` (3) when not. Run once on SmolLM2 at reduced batch on the Mac; FS11 runs it
   per full-scale model and task.
 - FS11, the first H100 session, and its re-check, each as one unattended job; the runbook is
@@ -2292,23 +2303,37 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     (`FS11_ALLOW_ANY_GPU=1` overrides; `EXIT_REFUSED` 4). `selftest_plan` is two stand-in parts
     that need only the standard library, which the module keeps to at import, so `--selftest`
     runs on a bare pod's `python3`.
-  - The re-check (`recheck_plan`, 21 parts, no benchmark): the models part; `bring_up
+  - The re-check (`recheck_plan`, 22 parts, no benchmark): the models part; `bring_up
     --no-tamper` per model and `smooth_check` per model and task, at `FULL_SCALE_ENV` plus
-    `RECHECK_ENV` (`VERIF_HEAD_BLOCKS=8`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`);
-    then the allocator A/B, kind `plain`: `plain_baseline` (10 steps) twice per model on the
+    `RECHECK_ENV`: `VERIF_HEAD_BLOCKS=8` and the allocator fix ("fix 2"),
+    `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and `VERIF_RELEASE_CACHE=1` (the
+    default, pinned). Right after `FIX_AB_MODEL`'s bring-up (Qwen2.5-0.5B, which fit in FS11
+    without the fix) comes the same bring-up with the whole fix off (`FIX_OFF_ENV`:
+    `PYTORCH_CUDA_ALLOC_CONF` unset, `VERIF_RELEASE_CACHE=0`), its own part
+    (`bring_up_Qwen2.5-0.5B-Instruct_fix2off`) in `runs/Qwen2.5-0.5B-Instruct_refusal_fix2off/`;
+    the two parts' `info["arm"]` are `fix2_on` and `fix2_off`. `fix2_ab(parts)` sets them
+    side by side in `summary.json`'s `fix2_ab`: per step the prover, verifier, hand-off and
+    total wall clock (`steps`), per step and side the allocated and reserved peaks (`peaks`),
+    each with `fix_cost`, on minus off. The job log then says `allocator fix A/B, step 1: …
+    s with the fix, … s without (+… s)`. The times are the bring-up's, from its memory pass,
+    one step per arm. Last comes the allocator A/B, kind `plain`: `plain_baseline` (10 steps)
+    twice per model on the
     refusal task's `D` with `VERIF_HEAD_BLOCKS=8`, one arm per `ALLOC_ARMS` entry
     (`alloc_default` unsets `PYTORCH_CUDA_ALLOC_CONF`, `alloc_expandable` sets it), the first
     arm alternating by model, each in `runs/<key>_plain_<arm>/`. Its time limits are
     `RECHECK_TIMEOUT_S` (bring-up 1,800 s, smooth and plain 600 s). A plain part's summary
     entry reads its `records.jsonl` with `json` alone: per-step times (the `step` total),
-    their mean and median, the memory pass's peak and its `mem_source`, and whether
-    `run_end` came. A bring-up's entry also holds `section_peaks`, parsed from the memory
+    their mean and median, the memory pass's peak, its reserved peak (`peak_reserved_bytes`,
+    null off CUDA) and its `mem_source`, and whether `run_end` came. A smooth part's entry
+    holds its record's `peak_bytes` and `peak_reserved_bytes`. A bring-up's entry also holds
+    `step_times` (each step's prover, verifier, hand-off and total from `report_costs`' line),
+    `peaks` (each side's, with `reserved_gb`) and `section_peaks`, parsed from the memory
     pass's per-section lines (`metrics.MemoryRecorder`'s echo), the section that raised
-    included.
+    included, with `reserved_gb` and `nested_reserved_gb` on CUDA.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
     pod. `FS11_SESSION` (`fs11`, the default, or `recheck`; anything else is a refusal) goes to
     the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
-    can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,200 s for the
+    can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the
     re-check), the session, a kill of a session still
     running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch

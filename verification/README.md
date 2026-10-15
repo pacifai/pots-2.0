@@ -379,8 +379,9 @@ replaced:
   each score family's largest score, for information. On a model with q, k, v biases it alters
   one bias entry and expects check 5 or 6b to reject. It reports each side's time and peak
   memory per step, and the hand-off between them. Its memory pass prints each section's peak
-  as the section closes, so a run that dies mid-step (out of GPU memory, say) still shows
-  which section it died in and what the sections before it held. It never downloads: it
+  as the section closes (on CUDA with the reserved peak beside it), so a run that dies
+  mid-step (out of GPU memory, say) still shows which section it died in and what the sections
+  before it held. It never downloads: it
   stops if the weights aren't cached. With
   `--disk-transcripts DIR` each step reaches the verifier on disk, through the store
   cross-check's `DiskHandoff`, rather than in memory; the protocol code is the same.
@@ -616,8 +617,11 @@ therefore empties that cache once per step, after the prover's step is released 
 the verifier starts (`release_device_cache`). Its time is a metrics row of its own,
 `handoff.empty_cache`, counted in neither role's total, since deployed the two roles run on
 separate machines. `VERIF_RELEASE_CACHE=0` skips the release in `bring_up` and `llama_step`,
-so a run can time the verified step without it. A full-scale run also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-in its environment, which lets the allocator grow a block in place rather than leave gaps.
+so a run can time the verified step without it. A full-scale run also sets
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in its environment, which lets the allocator
+grow a block in place rather than leave gaps. On CUDA the memory pass records the allocator's
+reserved peak (`torch.cuda.max_memory_reserved`) beside the allocated one, so the gap between
+them, the memory held but not in use, shows how much fragmentation is left.
 
 ## Workflow: a run on a GPU
 
@@ -891,20 +895,24 @@ from.
 ### The re-check session
 
 The re-check runs the first session's bring-up and smooth parts again with two memory fixes,
-and times one of them against plain training. It's the same job, script and upload layout,
-with `FS11_SESSION=recheck` (`fs11_session run --session recheck`); `summary.json` names it
-`recheck`. Its 21 parts, in order:
+and times the allocator fix on a verified step and against plain training. It's the same job,
+script and upload layout, with `FS11_SESSION=recheck` (`fs11_session run --session
+recheck`); `summary.json` names it `recheck`. Its 22 parts, in order:
 
 | parts | what | environment | time limit each |
 |---|---|---|---|
 | models | as the first session's | as the first session's | 1,800 s |
-| bring-up, 4 | `bring_up --no-tamper`, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8` and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (`RECHECK_ENV`) | 1,800 s |
-| smooth, 8 | `smooth_check` per model and task | the same | 600 s |
+| bring-up, 4 | `bring_up --no-tamper`, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and `VERIF_RELEASE_CACHE=1` (`RECHECK_ENV`) | 1,800 s |
+| fix-off bring-up, 1 | Qwen2.5-0.5B's bring-up again, right after its own (before Qwen2.5-1.5B's) | the bring-up's, with `PYTORCH_CUDA_ALLOC_CONF` unset and `VERIF_RELEASE_CACHE=0` (`FIX_OFF_ENV`) | 1,800 s |
+| smooth, 8 | `smooth_check` per model and task | the bring-ups' (`RECHECK_ENV`) | 600 s |
 | allocator A/B, 8 | `plain_baseline`'s 10 plain steps, twice per model, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8`; `PYTORCH_CUDA_ALLOC_CONF` unset in one arm (`alloc_default`), `expandable_segments:True` in the other (`alloc_expandable`) | 600 s |
 
 It has no benchmark part. `VERIF_HEAD_BLOCKS=8` checks the output layer's product in 8 row
-blocks. Expandable segments let the CUDA allocator grow a segment in place rather than reserve
-a new fixed-size one, which cuts fragmentation. Four of the first session's seven
+blocks. The allocator fix is two settings together: expandable segments, and the CUDA cache
+released between prover and verifier (`VERIF_RELEASE_CACHE=1`, the default, pinned so that the
+arm without it names its setting). Expandable segments let the CUDA allocator grow a segment
+in place rather than reserve a new fixed-size one, which cuts fragmentation. Four of the first
+session's seven
 out-of-memory errors left 6–12 GiB "reserved but unallocated" (Llama-3.2-1B's and Falcon3-1B's
 bring-ups, Falcon3-1B's two smooth checks); Qwen2.5-1.5B's three left about 0.6 GiB, so the
 allocator setting alone is unlikely to fix those. The allocator reads `PYTORCH_CUDA_ALLOC_CONF`
@@ -912,15 +920,36 @@ when CUDA starts, so it's set in each part's environment, not in Python. Each br
 summary entry also holds `section_peaks`, the memory pass's per-section lines, which survive a
 run that dies mid-step.
 
-Expandable segments are kept only if the A/B shows they cost no speed. Its first arm
-alternates by model: Llama-3.2-1B and Qwen2.5-0.5B run `alloc_default` first, Falcon3-1B and
-Qwen2.5-1.5B `alloc_expandable` first, so an order effect (a warm file cache, the GPU's clocks)
-doesn't always favour the same arm. Each arm writes to its own
-`runs/<model>_refusal_plain_<arm>/`, its records in `plain_baseline/records.jsonl`, and its
-summary entry holds the per-step times, their mean and median, and the memory pass's peak. The
-A/B times plain training only: it can't show what releasing the cache between prover and
-verifier (`handoff.empty_cache`) costs the verifier's later allocations. Its peak is
-`cuda_allocated`, which the allocator setting shouldn't change.
+The fix is kept only if it costs no speed, and two A/Bs test that. The fix-off bring-up
+times a whole verified step without it. Qwen2.5-0.5B's bring-up fit in the first session
+without the fix, so it runs a second time with both settings undone, in its own
+`runs/Qwen2.5-0.5B-Instruct_refusal_fix2off/`. `summary.json`'s `fix2_ab` sets the two runs
+side by side: per step, the prover's, the verifier's, the hand-off's and the total wall clock
+(`steps`), and per step and side, the allocated and the reserved peak (`peaks`), each with
+`fix_cost`, the run with the fix minus the run without (positive: the fix costs that much).
+The times are the ones the bring-up prints, from its memory pass, which synchronizes at every
+section in both runs. The bring-up runs one step, so each run is one measurement, and the
+noise between two runs isn't measured. Once the second run ends, the job log says
+`allocator fix A/B, step 1: … s with the fix, … s without (+… s)`. Every bring-up's summary
+entry also holds `step_times`, the same figures read from its log.
+
+The plain A/B times the allocator setting alone on plain training. Its first arm alternates by
+model: Llama-3.2-1B and Qwen2.5-0.5B run `alloc_default` first, Falcon3-1B and Qwen2.5-1.5B
+`alloc_expandable` first, so an order effect (a warm file cache, the GPU's clocks) doesn't
+always favour the same arm. Each arm writes to its own `runs/<model>_refusal_plain_<arm>/`,
+its records in `plain_baseline/records.jsonl`, and its summary entry holds the per-step times,
+their mean and median, and the memory pass's peak. It can't show what releasing the cache
+between prover and verifier (`handoff.empty_cache`) costs the verifier's later allocations;
+the fix-off bring-up can.
+
+On CUDA every peak comes with the allocator's reserved peak (`torch.cuda.max_memory_reserved`)
+beside the allocated one: in the memory pass's section lines and records
+(`peak_reserved_bytes`), in the bring-up's peak lines and in the smooth check's record, so in
+every summary entry too (`reserved_gb` in a bring-up's `peaks` and `section_peaks`,
+`peak_reserved_bytes` in a smooth or plain entry). Reserved minus allocated is the
+fragmentation that expandable segments should cut; the allocated peak shouldn't change with
+the setting. The two peaks need not fall at the same moment, so their difference is a bound,
+not a reading at one instant. Off CUDA the reserved peak is null.
 
 **Running it.** Steps 1–7 above, with two changes. First, prep again after committing (step
 1): the upload holds `git archive HEAD`, and `fs11_prep` reuses the data it built before; the
@@ -947,18 +976,19 @@ release, which may add re-allocation time.
 | models | 2–5 min | 138 s in the first session |
 | bring-up, 4 models | 12–25 min, about 14 | Qwen2.5-0.5B's part took 191 s: a 151 s step (prover 51 s; verifier 100 s, of which check 5 took 80 s) and about 40 s of loading. Check 5 scales with its products (0.31 ms each), the rest of the step with the transcript's size, about `n·(L·(d + d_ff) + n_v)`: Llama-3.2-1B about 194 s a step, Falcon3-1B 111 s, Qwen2.5-1.5B 209 s, or up to 300–340 s scaled by parameter count instead |
 | smooth, 8 checks | 4–6 min | 25–44 s each in the first session |
+| fix-off bring-up | 3–5 min | Qwen2.5-0.5B's bring-up again, which took 191 s in the first session, without the fix; the upper end is picked by hand, for the row blocking and the re-allocations the fix would have spared |
 | allocator A/B, 8 arms | 5–12 min | 40–90 s each: about 17 s to load the model, 13 plain steps (10 timed, 2 in the memory pass, 1 counted) at 0.7–1.5 s (Falcon3-1B's took 1.5 s), and hashing `W_0` and the final weights |
-| total | 24–49 min | midpoint about 37 min |
+| total | 27–54 min | midpoint about 40 min |
 
 | deadline | covers | estimate | deadline |
 |---|---|---|---|
-| job (`FS11_DEADLINE_S`, the re-check's default) | the job, from its start | the parts about 37 min, packing about 1, the grace window 20: about 60 min | 2 × 60 min = 2 h (7,200 s) |
-| boot guard | the whole pod, from its creation | setup about 20 min, the job about 60: about 80 min | 2 × 80 min ≈ 2.7 h (9,600 s) |
+| job (`FS11_DEADLINE_S`, the re-check's default) | the job, from its start | the parts about 40 min, packing about 1, the grace window 20: about 61 min | 2 × 61 min = 122 min, rounded up to 7,500 s (2 h 5 min) |
+| boot guard | the whole pod, from its creation | setup about 20 min, the job about 61: about 81 min | 2 × 81 min = 162 min ≈ 2.7 h, rounded up to 9,800 s |
 
-The parts stop by 7,200 − 1,200 − 600 = 5,400 s (90 min), which leaves room for one bring-up
-that hangs to its 30 min limit. For the boot guard, the start command above with `sleep 9600;`
-in place of `sleep 16200;` fits that rule; the 16,200 s one also works, and bills longer only
-if setup stalls.
+The parts stop by 7,500 − 1,200 − 600 = 5,700 s (95 min), which leaves room for one bring-up
+that hangs to its 30 min limit (at the high end, 54 + 30 = 84 min). For the boot guard, the
+start command above with `sleep 9800;` in place of `sleep 16200;` fits that rule; the 16,200 s
+one also works, and bills longer only if setup stalls.
 
 ## Workflow: calibrating the tolerances
 

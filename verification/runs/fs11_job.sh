@@ -13,7 +13,7 @@
 # 1. Preflight. Without DRY_RUN the job refuses to start unless it can terminate the pod:
 #    RUNPOD_POD_ID set, and runpodctl or RUNPOD_API_KEY there (exit 2). A refusal it can act on
 #    (bad deadlines, less than FS11_MIN_FREE_GB free under OUT_DIR) terminates the pod.
-# 2. A deadline timer starts: FS11_DEADLINE_S (default 12600, 3.5 h; 7200, 2 h, for the
+# 2. A deadline timer starts: FS11_DEADLINE_S (default 12600, 3.5 h; 7500, 2 h 5 min, for the
 #    re-check) after the start it terminates the pod, whatever the job is doing.
 # 3. The session (verification.runs.fs11_session run) prints the environment, refuses a
 #    machine without an H100 (FS11_ALLOW_ANY_GPU=1 overrides), and runs its parts, each with
@@ -79,7 +79,7 @@ OUT=${2:?usage: fs11_job.sh UPLOAD_DIR OUT_DIR}
 SELFTEST=${FS11_SELFTEST:-0}
 SESSION=${FS11_SESSION:-fs11}
 DEFAULT_DEADLINE_S=12600
-[ "$SESSION" = recheck ] && DEFAULT_DEADLINE_S=7200
+[ "$SESSION" = recheck ] && DEFAULT_DEADLINE_S=7500
 if [ "$SELFTEST" = 1 ]; then
   DEADLINE_S=${FS11_DEADLINE_S:-360}; GRACE_S=${FS11_GRACE_S:-120}
   PACK_RESERVE_S=${FS11_PACK_RESERVE_S:-60}; MIN_FREE_GB=${FS11_MIN_FREE_GB:-1}
