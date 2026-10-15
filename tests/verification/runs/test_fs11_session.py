@@ -71,6 +71,57 @@ def test_default_plan(tmp_path):
     # only the fetch reaches the network
     assert plan[0].env["HF_HUB_OFFLINE"] is None
     assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
+    # the re-check's settings stay out of the first session's parts
+    assert all(not set(fs.RECHECK_ENV) & set(p.env) for p in plan)
+    assert fs.SESSIONS["fs11"] == ("FS11", fs.default_plan)
+
+
+def test_recheck_plan(tmp_path):
+    """The first session's models, bring-up and smooth parts with RECHECK_ENV added, no
+    benchmark, then the allocator A/B: two plain arms per model, alternating which goes first."""
+    up, out = tmp_path / "up", tmp_path / "out"
+    plan = fs.recheck_plan(up, out)
+    assert fs.SESSIONS["recheck"] == ("recheck", fs.recheck_plan)
+    assert [p.kind for p in plan] == ["models"] + ["bring_up"] * 4 + ["smooth"] * 8 + ["plain"] * 8
+    names = [p.name for p in plan]
+    assert len(set(names)) == len(names)
+    first = {p.name: p for p in fs.default_plan(up, out)}
+    for p in plan[:13]:
+        q = first[p.name]
+        assert p.argv == q.argv and p.info == q.info
+        assert p.env == {**q.env, **(fs.RECHECK_ENV if p.kind != "models" else {})}
+        assert p.timeout_s == fs.RECHECK_TIMEOUT_S[p.kind]
+    for p in plan[1:13]:
+        assert p.env["VERIF_HEAD_BLOCKS"] == "8"
+        assert p.env["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+
+    plain = plan[13:]
+    a, b = "alloc_default", "alloc_expandable"
+    assert [p.info["arm"] for p in plain] == [a, b, b, a, a, b, b, a]
+    assert [p.info["model"] for p in plain] == [repo for repo, _ in fs.RUN_PINS for _ in "ab"]
+    assert plain[0].name == "plain_Llama-3.2-1B-Instruct_alloc_default"
+    dirs = {p.env["VERIF_OUTPUT_DIR"] for p in plain}
+    assert len(dirs) == 8 and not dirs & {p.env.get("VERIF_OUTPUT_DIR") for p in plan[:13]}
+    for p in plain:
+        assert p.argv == ["{python}", "-m", "verification.runs.plain_baseline"]
+        assert p.timeout_s == fs.RECHECK_TIMEOUT_S["plain"]
+        assert {k: p.env[k] for k in fs.FULL_SCALE_ENV} == fs.FULL_SCALE_ENV
+        assert p.env["VERIF_ATTACK"] == "refusal" and p.env["VERIF_HEAD_BLOCKS"] == "8"
+        # None unsets the variable, whatever the pod's environment holds
+        conf = None if p.info["arm"] == a else "expandable_segments:True"
+        assert "PYTORCH_CUDA_ALLOC_CONF" in p.env and p.env["PYTORCH_CUDA_ALLOC_CONF"] == conf
+        assert p.info["alloc_conf"] == conf
+        key = fs.data_key(p.info["model"], "refusal")
+        d = Path(p.env["VERIF_OUTPUT_DIR"])
+        assert d.name == f"{key}_plain_{p.info['arm']}"
+        assert (d / "data").resolve() == (up / "data" / key).resolve()
+        assert p.info["report"] == str(d / "plain_baseline" / "records.jsonl")
+    assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
+
+
+def test_plain_run_name():
+    from verification.runs import plain_baseline
+    assert fs.PLAIN_RUN == plain_baseline.RUN_NAME
 
 
 def test_selftest_plan_needs_only_the_standard_library():
@@ -137,6 +188,24 @@ def test_run_session(tmp_path, monkeypatch):
     s = fs.run_session(plan[:2], upload=up, out=out, deadline=time.time() + 30, cwd=REPO,
                        say=lines.append)
     assert [p["status"] for p in s["parts"]] == ["skipped_done", "failed"]
+    assert s["session"] == "FS11"
+
+
+def test_the_allocator_arms_reach_their_parts(tmp_path, monkeypatch):
+    """The A/B's arms as run: the default arm unsets PYTORCH_CUDA_ALLOC_CONF, though the
+    session's environment sets it; the other sets expandable segments."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6")
+    probe = "import os; print(repr(os.environ.get('PYTORCH_CUDA_ALLOC_CONF')))"
+    plan = [fs.Part(arm, _py(probe), env={"PYTORCH_CUDA_ALLOC_CONF": conf})
+            for arm, conf in fs.ALLOC_ARMS]
+    out = tmp_path / "out"
+    s = fs.run_session(plan, upload=tmp_path / "up", out=out, deadline=time.time() + 30,
+                       cwd=REPO, say=lambda m: None, session="recheck")
+    assert s["session"] == "recheck"
+    assert json.loads((out / "summary.json").read_text())["session"] == "recheck"
+    seen = {arm: (out / "parts" / arm / "log.txt").read_text().splitlines()[-1]
+            for arm, _ in fs.ALLOC_ARMS}
+    assert seen == {"alloc_default": "None", "alloc_expandable": "'expandable_segments:True'"}
 
 
 def test_a_running_part_names_its_process_group(tmp_path):
@@ -206,6 +275,66 @@ def test_part_extras(tmp_path):
     smooth.write_text(json.dumps({"smooth": True, "grad_norms": [1.5, 1.25]}))
     e = fs.part_extras(fs.Part("s", [], kind="smooth", info={"report": str(smooth)}), log)
     assert e["grad_norms"] == [1.5, 1.25]
+
+
+def test_bring_up_section_peaks(tmp_path):
+    """The memory pass's echo lines (the ones test_metrics pins) become section_peaks, the
+    section that raised included; the step-peak parser doesn't take them."""
+    echo = ["   run, P4.tree: peak 0.00 GB (start 0.00, end 0.00 GB)",
+            "   step 1, train.backward: peak 3.00 GB (start 0.00, end 1.00 GB)",
+            "   step 2, check 5: peak 5.00 GB (start 1.00, end ? GB; nested: 5.glue 3.00, "
+            "5.measure 5.00 GB); raised OutOfMemoryError"]
+    log = tmp_path / "log.txt"
+    log.write_text("\n".join(["== memory pass: each section's peak as it closes, GB "
+                              "[cuda_allocated]", *echo, "Traceback (most recent call last):"])
+                   + "\n")
+    e = fs.part_extras(fs.Part("b", [], kind="bring_up"), log)
+    assert e["peaks"] == []
+    assert e["section_peaks"] == [
+        {"step": None, "section": "P4.tree", "peak_gb": 0.0, "start_gb": 0.0, "end_gb": 0.0,
+         "nested_gb": {}, "raised": None},
+        {"step": 1, "section": "train.backward", "peak_gb": 3.0, "start_gb": 0.0,
+         "end_gb": 1.0, "nested_gb": {}, "raised": None},
+        {"step": 2, "section": "check 5", "peak_gb": 5.0, "start_gb": 1.0, "end_gb": None,
+         "nested_gb": {"5.glue": 3.0, "5.measure": 5.0}, "raised": "OutOfMemoryError"}]
+
+
+def _records(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_plain_extras(tmp_path):
+    """A plain arm's summary: the timed run's step totals in step order, their mean and
+    median, and the memory pass's peak; other totals and step 0 don't count."""
+    rec = tmp_path / "plain_baseline" / "records.jsonl"
+    step = {"record": "time", "side": "run", "component": "step", "level": "total"}
+    rows = [{"record": "environment", "run": "plain_baseline"},
+            *({**step, "step": t, "time_s": s} for t, s in ((2, 1.5), (1, 2.5), (3, 1.0))),
+            {**step, "step": 0, "time_s": 99.0},
+            {"record": "time", "side": "prover", "component": "prover", "level": "total",
+             "step": 1, "time_s": 99.0},
+            {"record": "memory", "step": 1, "level": "phase", "component": "P0.backward",
+             "peak_bytes": 5 * 2**30, "mem_source": "cuda_allocated"},
+            {"record": "memory", "step": 1, "level": "phase", "component": "P0.forward",
+             "peak_bytes": 3 * 2**30, "mem_source": "cuda_allocated"},
+            {"record": "run_end", "run": "plain_baseline", "lifetime_maxrss_bytes": 7}]
+    _records(rec, rows)
+    part = fs.Part("plain", [], kind="plain", info={"report": str(rec)})
+    e = fs.part_extras(part, tmp_path / "log.txt")
+    assert e["step_s"] == [2.5, 1.5, 1.0]
+    assert e["mean_step_s"] == pytest.approx(5 / 3) and e["median_step_s"] == 1.5
+    assert e["peak_bytes"] == 5 * 2**30 and e["mem_source"] == "cuda_allocated"
+    assert e["completed"] and e["lifetime_maxrss_bytes"] == 7 and e["record"] == str(rec)
+    # a run that died after one timed step, before its memory pass
+    _records(rec, rows[:3])
+    e = fs.part_extras(part, tmp_path / "log.txt")
+    assert e["step_s"] == [2.5, 1.5] and e["peak_bytes"] is None and not e["completed"]
+    _records(rec, rows[:1])
+    e = fs.part_extras(part, tmp_path / "log.txt")
+    assert e["step_s"] == [] and e["mean_step_s"] is None and e["median_step_s"] is None
+    assert fs.part_extras(fs.Part("p", [], kind="plain", info={"report": str(tmp_path / "no")}),
+                          tmp_path / "log.txt") == {"record": None}
 
 
 # ---- fetch-models and the upload check ----------------------------------------------------
@@ -379,7 +508,9 @@ def test_job_runs_packs_and_terminates(tmp_path):
     plan = [{"name": "ok", "argv": _py("print('part ran')")},
             {"name": "fails", "argv": _py("import sys; sys.exit(3)")},
             {"name": "slow", "argv": ["sleep", "60"]}]
-    r, out = _job(tmp_path, plan=plan, deadline=8, extra={"FS11_ALLOW_ANY_GPU": "1"})
+    # Parts stop at 10 - 1 - 3 = 6 s; the 3 s reserve leaves packing room on a loaded machine.
+    r, out = _job(tmp_path, plan=plan, deadline=10, reserve=3,
+                  extra={"FS11_ALLOW_ANY_GPU": "1"})
     assert r.returncode == 1, r.stdout + r.stderr
     s = json.loads((out / "summary.json").read_text())
     assert [p["status"] for p in s["parts"]] == ["ok", "failed", "killed_deadline"]
@@ -488,6 +619,7 @@ def test_job_marks_a_failed_pack_and_still_terminates(tmp_path):
 @pytest.mark.parametrize("deadline, grace, extra, why", [
     (2, 1, {}, "must be below FS11_DEADLINE_S"),
     (60, 1, {"FS11_MIN_FREE_GB": str(10**9)}, "FS11_MIN_FREE_GB is"),
+    (60, 1, {"FS11_SESSION": "fs12"}, "FS11_SESSION is 'fs12'; it must be fs11 or recheck"),
 ])
 def test_job_terminates_on_a_refusal(tmp_path, deadline, grace, extra, why):
     r, out = _job(tmp_path, plan=OK_PLAN, deadline=deadline, grace=grace, extra=extra)
@@ -502,16 +634,48 @@ def test_job_refuses_without_a_way_to_terminate(tmp_path):
     assert not out.exists()
 
 
-def test_job_selftest(tmp_path):
-    """FS11_SELFTEST: the stand-in parts, no GPU check, then the normal end-of-run terminate."""
-    r, out = _job(tmp_path, deadline=30, grace=1, reserve=5, extra={"FS11_SELFTEST": "1"})
+@pytest.mark.parametrize("session, label", [(None, "FS11"), ("recheck", "recheck")])
+def test_job_selftest(tmp_path, session, label):
+    """FS11_SELFTEST: the stand-in parts, no GPU check, then the normal end-of-run terminate,
+    under either session's name."""
+    extra = {"FS11_SELFTEST": "1", **({"FS11_SESSION": session} if session else {})}
+    r, out = _job(tmp_path, deadline=30, grace=1, reserve=5, extra=extra)
     assert r.returncode == 0, r.stdout + r.stderr
     s = json.loads((out / "summary.json").read_text())
+    assert s["session"] == label
     assert [(p["name"], p["status"]) for p in s["parts"]] == [
         ("selftest_ok", "ok"), ("selftest_sleep", "ok")]
-    assert "self-test: stand-in parts" in _log(out) and "SELFTEST=1" in r.stdout
+    assert f"self-test: stand-in parts in place of the {label} session's" in _log(out)
+    assert "SELFTEST=1" in r.stdout and f"session {session or 'fs11'}," in r.stdout
     assert "terminate tools:" in r.stdout
     assert "DRY_RUN: terminate (end of job (session exit 0))" in r.stdout
+
+
+@pytest.mark.parametrize("session, label, deadline_s", [
+    (None, "FS11", 12600), ("fs11", "FS11", 12600), ("recheck", "recheck", 7200)])
+def test_job_passes_the_session_on(tmp_path, session, label, deadline_s):
+    """FS11_SESSION reaches the session's --session, which names it in summary.json; an unset
+    FS11_DEADLINE_S takes the session's default."""
+    extra = {"FS11_ALLOW_ANY_GPU": "1", "FS11_DEADLINE_S": "",
+             **({"FS11_SESSION": session} if session else {})}
+    r, out = _job(tmp_path, plan=OK_PLAN, extra=extra)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((out / "summary.json").read_text())["session"] == label
+    assert f"deadline in {deadline_s} s" in r.stdout
+    log = _log(out)
+    assert f"run --session {session or 'fs11'}" in log and f"session {label}: 1 part" in log
+
+
+def test_a_refused_recheck_names_its_session(tmp_path, monkeypatch):
+    monkeypatch.delenv("FS11_ALLOW_ANY_GPU", raising=False)
+    out = tmp_path / "out"
+    if fs.refusal(fs.environment(out), False) is None:  # main would run the real parts
+        pytest.skip("this machine has an H100")
+    rc = fs.main(["run", "--upload", str(tmp_path / "up"), "--out", str(out), "--deadline",
+                  str(time.time() + 30), "--session", "recheck"])
+    s = json.loads((out / "summary.json").read_text())
+    assert rc == fs.EXIT_REFUSED
+    assert s["session"] == "recheck" and s["refused"] and s["parts"] == []
 
 
 # ---- the job against stub runpodctl and curl (DRY_RUN=0) -----------------------------------

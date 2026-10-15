@@ -1,12 +1,16 @@
-"""FS11's H100 session: the parts in order, each with its own log, under one deadline.
+"""FS11's H100 sessions: the parts in order, each with its own log, under one deadline.
 
     .venv/bin/python -m verification.runs.fs11_session run --upload DIR --out DIR --deadline EPOCH
+                                                           [--session {fs11,recheck}]
     .venv/bin/python -m verification.runs.fs11_session fetch-models --upload DIR --out DIR
     .venv/bin/python -m verification.runs.fs11_session env --out DIR
 
 ``fs11_job.sh`` runs ``run`` on the pod, then packs the output and ends the pod; see
 ``verification/README.md``, "Workflow: the first H100 session". ``fs11_prep`` builds the upload
-on the Mac. The parts, in this order:
+on the Mac; both sessions run from the same upload. ``--session`` (the job's ``FS11_SESSION``)
+picks the plan: ``fs11``, the first session (:func:`default_plan`, the default), or
+``recheck``, the re-check (:func:`recheck_plan`, below). The first session's parts, in this
+order:
 
 1. **models.** ``fetch-models``: check every packed file of the upload against the manifest's
    SHA-256, then fetch each public model's weights at its pinned commit with ``token=False``
@@ -26,6 +30,15 @@ on the Mac. The parts, in this order:
    memory. Its exit code also folds in the concentration guard, which may fail at bf16 (F20);
    the step's acceptance, peaks and times are in its log either way.
 4. **smooth**, one per model and task: ``smooth_check``, F6c's 10 plain steps.
+
+The re-check runs the models part, then the bring-up and smooth parts again with two settings
+added to the full-scale config (:data:`RECHECK_ENV`): the output layer's product checked in 8
+row blocks (``VERIF_HEAD_BLOCKS``), and the CUDA allocator's expandable segments
+(``PYTORCH_CUDA_ALLOC_CONF``, which the allocator reads at CUDA's first use, so it is set in
+the part's environment). Last comes a timing A/B of that allocator setting: per model,
+``plain_baseline``'s 10 plain steps twice, once with ``PYTORCH_CUDA_ALLOC_CONF`` unset and
+once with expandable segments, the first arm alternating from model to model
+(:data:`ALLOC_ARMS`). It has no benchmark part.
 
 Every part runs in its own process group, with ``HF_HUB_OFFLINE=1`` (all but the first), no
 Hugging Face token and no Runpod key in its environment. A part's log is
@@ -53,6 +66,7 @@ import platform
 import re
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -61,10 +75,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-__all__ = ["RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "EXIT_REFUSED", "Part",
-           "default_plan", "load_plan", "selftest_plan", "run_session", "fetch_models",
-           "check_upload", "benchmark_failure", "environment", "cupqc_status", "data_key",
-           "main"]
+__all__ = ["RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
+           "SESSIONS", "EXIT_REFUSED", "Part", "default_plan", "recheck_plan", "load_plan",
+           "selftest_plan", "run_session", "fetch_models", "check_upload", "benchmark_failure",
+           "environment", "cupqc_status", "data_key", "main"]
 
 # The four full-scale models at their commits (tests/verification/full_scale_helpers.PINS, in
 # the order the session brings them up).
@@ -88,6 +102,21 @@ FULL_SCALE_ENV = {
 }
 # Each part's own time limit, seconds; the session deadline cuts any of them shorter.
 TIMEOUT_S = {"models": 1800, "benchmark": 5400, "bring_up": 2400, "smooth": 1200}
+# The re-check's additions to FULL_SCALE_ENV, for its bring-up and smooth parts: the output
+# layer's product in 8 row blocks, and the allocator's expandable segments (four of the first
+# session's seven out-of-memory errors left 6–12 GiB "reserved but unallocated").
+EXPANDABLE = "expandable_segments:True"
+RECHECK_ENV = {"VERIF_HEAD_BLOCKS": "8", "PYTORCH_CUDA_ALLOC_CONF": EXPANDABLE}
+# The re-check's allocator A/B: each arm's name and its PYTORCH_CUDA_ALLOC_CONF (None unsets it,
+# whatever the pod's environment holds). Even-numbered models in RUN_PINS run them in this
+# order, odd-numbered ones in reverse, so an order effect (a warm file cache, the GPU's clocks)
+# doesn't always favour the same arm.
+ALLOC_ARMS: tuple[tuple[str, str | None], ...] = (("alloc_default", None),
+                                                   ("alloc_expandable", EXPANDABLE))
+# The re-check's time limits: about 3–5 times each part's expected time (the first session's
+# smooth parts took 25–44 s, its one finished bring-up 191 s; a plain arm takes about a minute).
+RECHECK_TIMEOUT_S = {"models": 1800, "bring_up": 1800, "smooth": 600, "plain": 600}
+PLAIN_RUN = "plain_baseline"  # plain_baseline.RUN_NAME, its records' directory
 # Environment variables a part never inherits.
 SECRETS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_TOKEN_PATH",
            "RUNPOD_API_KEY")
@@ -236,13 +265,14 @@ class Part:
     argv: list[str]  # "{python}" stands for the session's interpreter
     env: dict[str, str | None] = field(default_factory=dict)  # None unsets
     timeout_s: float | None = None
-    kind: str = "other"  # models, benchmark, bring_up, smooth, other
+    kind: str = "other"  # models, benchmark, bring_up, smooth, plain, other
     info: dict[str, Any] = field(default_factory=dict)  # model, task, run_dir, report
 
 
-def _run_dir(out: Path, upload: Path, key: str) -> Path:
-    """``runs/<key>/``, a part's ``VERIF_OUTPUT_DIR``, its ``data`` linked to the upload's."""
-    d = out / "runs" / key
+def _run_dir(out: Path, upload: Path, key: str, name: str | None = None) -> Path:
+    """``runs/<name>/`` (default ``runs/<key>/``), a part's ``VERIF_OUTPUT_DIR``, its ``data``
+    linked to the upload's ``data/<key>``."""
+    d = out / "runs" / (name or key)
     d.mkdir(parents=True, exist_ok=True)
     link = d / "data"
     if not link.exists() and not link.is_symlink():
@@ -250,36 +280,98 @@ def _run_dir(out: Path, upload: Path, key: str) -> Path:
     return d
 
 
-def default_plan(upload: Path, out: Path) -> list[Part]:
-    py = "{python}"
-    plan = [Part("models", [py, "-m", "verification.runs.fs11_session", "fetch-models",
-                            "--upload", str(upload), "--out", str(out / "models")],
-                 env={"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None},
-                 timeout_s=TIMEOUT_S["models"], kind="models",
-                 info={"report": str(out / "models" / "models.json")})]
-    report = out / "benchmark" / "hashing.json"
-    plan.append(Part("benchmark", [py, "-m", "benchmarks.hashing.run", "--out", str(report)],
-                     env={"VERIF_OUTPUT_DIR": str(out / "benchmark")},
-                     timeout_s=TIMEOUT_S["benchmark"], kind="benchmark",
-                     info={"report": str(report)}))
+def _models_part(upload: Path, out: Path, timeout_s: float) -> Part:
+    return Part("models", ["{python}", "-m", "verification.runs.fs11_session", "fetch-models",
+                           "--upload", str(upload), "--out", str(out / "models")],
+                env={"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None},
+                timeout_s=timeout_s, kind="models",
+                info={"report": str(out / "models" / "models.json")})
+
+
+def _bring_up_parts(upload: Path, out: Path, extra: Mapping[str, str | None],
+                    timeout_s: float) -> list[Part]:
+    """One ``bring_up --no-tamper`` per model, on the refusal task, with ``extra`` added to the
+    full-scale config."""
+    parts = []
     for repo, rev in RUN_PINS:
         key = data_key(repo, BRING_UP_TASK)
         d = _run_dir(out, upload, key)
-        plan.append(Part(f"bring_up_{repo.split('/')[-1]}",
-                         [py, "-m", "verification.runs.bring_up", "--no-tamper"],
-                         env={**_run_env(repo, rev, BRING_UP_TASK), "VERIF_OUTPUT_DIR": str(d)},
-                         timeout_s=TIMEOUT_S["bring_up"], kind="bring_up",
-                         info={"model": repo, "task": BRING_UP_TASK, "run_dir": str(d)}))
+        parts.append(Part(f"bring_up_{repo.split('/')[-1]}",
+                          ["{python}", "-m", "verification.runs.bring_up", "--no-tamper"],
+                          env={**_run_env(repo, rev, BRING_UP_TASK), **extra,
+                               "VERIF_OUTPUT_DIR": str(d)},
+                          timeout_s=timeout_s, kind="bring_up",
+                          info={"model": repo, "task": BRING_UP_TASK, "run_dir": str(d)}))
+    return parts
+
+
+def _smooth_parts(upload: Path, out: Path, extra: Mapping[str, str | None],
+                  timeout_s: float) -> list[Part]:
+    """One ``smooth_check`` per model and task, with ``extra`` added to the full-scale config."""
+    parts = []
     for repo, rev in RUN_PINS:
         for task in TASKS:
             key = data_key(repo, task)
             d = _run_dir(out, upload, key)
-            plan.append(Part(f"smooth_{key}", [py, "-m", "verification.runs.smooth_check"],
-                             env={**_run_env(repo, rev, task), "VERIF_OUTPUT_DIR": str(d)},
-                             timeout_s=TIMEOUT_S["smooth"], kind="smooth",
-                             info={"model": repo, "task": task, "run_dir": str(d),
-                                   "report": str(d / "smooth_check" / f"{key}.json")}))
+            parts.append(Part(f"smooth_{key}", ["{python}", "-m", "verification.runs.smooth_check"],
+                              env={**_run_env(repo, rev, task), **extra,
+                                   "VERIF_OUTPUT_DIR": str(d)},
+                              timeout_s=timeout_s, kind="smooth",
+                              info={"model": repo, "task": task, "run_dir": str(d),
+                                    "report": str(d / "smooth_check" / f"{key}.json")}))
+    return parts
+
+
+def default_plan(upload: Path, out: Path) -> list[Part]:
+    """The first H100 session's parts (module docstring), at :data:`FULL_SCALE_ENV`."""
+    plan = [_models_part(upload, out, TIMEOUT_S["models"])]
+    report = out / "benchmark" / "hashing.json"
+    plan.append(Part("benchmark", ["{python}", "-m", "benchmarks.hashing.run", "--out",
+                                   str(report)],
+                     env={"VERIF_OUTPUT_DIR": str(out / "benchmark")},
+                     timeout_s=TIMEOUT_S["benchmark"], kind="benchmark",
+                     info={"report": str(report)}))
+    plan += _bring_up_parts(upload, out, {}, TIMEOUT_S["bring_up"])
+    plan += _smooth_parts(upload, out, {}, TIMEOUT_S["smooth"])
     return plan
+
+
+def _plain_parts(upload: Path, out: Path) -> list[Part]:
+    """The allocator A/B: two ``plain_baseline`` runs per model on the refusal task, one per
+    :data:`ALLOC_ARMS` arm, each in its own output directory, with ``VERIF_HEAD_BLOCKS`` as in
+    the re-check's other parts."""
+    parts = []
+    for i, (repo, rev) in enumerate(RUN_PINS):
+        key = data_key(repo, BRING_UP_TASK)
+        for arm, conf in ALLOC_ARMS if i % 2 == 0 else ALLOC_ARMS[::-1]:
+            d = _run_dir(out, upload, key, f"{key}_plain_{arm}")
+            parts.append(Part(f"plain_{repo.split('/')[-1]}_{arm}",
+                              ["{python}", "-m", "verification.runs.plain_baseline"],
+                              env={**_run_env(repo, rev, BRING_UP_TASK),
+                                   "VERIF_HEAD_BLOCKS": RECHECK_ENV["VERIF_HEAD_BLOCKS"],
+                                   "PYTORCH_CUDA_ALLOC_CONF": conf, "VERIF_OUTPUT_DIR": str(d)},
+                              timeout_s=RECHECK_TIMEOUT_S["plain"], kind="plain",
+                              info={"model": repo, "task": BRING_UP_TASK, "run_dir": str(d),
+                                    "arm": arm, "alloc_conf": conf,
+                                    "report": str(d / PLAIN_RUN / "records.jsonl")}))
+    return parts
+
+
+def recheck_plan(upload: Path, out: Path) -> list[Part]:
+    """The re-check's parts (module docstring): the models part; the bring-up and smooth parts
+    at :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`; then the allocator A/B. No benchmark."""
+    plan = [_models_part(upload, out, RECHECK_TIMEOUT_S["models"])]
+    plan += _bring_up_parts(upload, out, RECHECK_ENV, RECHECK_TIMEOUT_S["bring_up"])
+    plan += _smooth_parts(upload, out, RECHECK_ENV, RECHECK_TIMEOUT_S["smooth"])
+    plan += _plain_parts(upload, out)
+    return plan
+
+
+# Each session: its name in summary.json, and its plan.
+SESSIONS: dict[str, tuple[str, Callable[[Path, Path], list[Part]]]] = {
+    "fs11": ("FS11", default_plan),
+    "recheck": ("recheck", recheck_plan),
+}
 
 
 def _run_env(repo: str, rev: str, task: str) -> dict[str, str | None]:
@@ -320,13 +412,60 @@ def base_env(upload: Path) -> dict[str, str]:
 _BRING_UP_LINE = re.compile(r"^(step \d+: (prover|verifier) .*|process lifetime peak RSS .*|"
                             r"(verdict|honest|guard|exit).*)$", re.IGNORECASE)
 _PEAK = re.compile(r"^step (\d+): (prover|verifier) peak ([\d.]+) GB")
+# The memory pass's line per top-level section as it closes (metrics.MemoryRecorder's echo):
+# "   step 1, check 5: peak 71.56 GB (start 1.90, end 1.95 GB; nested: 5.glue 30.12 GB);
+# raised OutOfMemoryError", or "   run, P4.tree: …" for a run-level section.
+_SECTION = re.compile(r"^   (?:step (\d+)|run), (.+?): peak ([\d.]+|\?) GB \(start ([\d.]+|\?), "
+                      r"end ([\d.]+|\?) GB(?:; nested: (.*) GB)?\)(?:; raised (\w+))?$")
+
+
+def _gb_or_none(x: str) -> float | None:
+    return None if x == "?" else float(x)
+
+
+def _section_peaks(lines: Sequence[str]) -> list[dict[str, Any]]:
+    out = []
+    for m in map(_SECTION.match, lines):
+        if not m:
+            continue
+        nested = {}
+        for item in (m[6] or "").split(", "):
+            name, _, gb = item.rpartition(" ")
+            if name:
+                nested[name] = _gb_or_none(gb)
+        out.append({"step": None if m[1] is None else int(m[1]), "section": m[2],
+                    "peak_gb": _gb_or_none(m[3]), "start_gb": _gb_or_none(m[4]),
+                    "end_gb": _gb_or_none(m[5]), "nested_gb": nested, "raised": m[7]})
+    return out
 
 
 def _bring_up_extras(log: Path) -> dict[str, Any]:
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
     peaks = [{"step": int(m[1]), "side": m[2], "peak_gb": float(m[3])}
              for m in map(_PEAK.match, lines) if m]
-    return {"peaks": peaks, "lines": [l for l in lines if _BRING_UP_LINE.match(l)][-40:]}
+    return {"peaks": peaks, "section_peaks": _section_peaks(lines),
+            "lines": [l for l in lines if _BRING_UP_LINE.match(l)][-40:]}
+
+
+def _plain_extras(report: Path) -> dict[str, Any]:
+    """A plain arm's ``records.jsonl``: the timed run's per-step times (the ``step`` total of
+    each step's ``P0`` phases, which on CUDA synchronize at their bounds), their mean and
+    median, and the memory pass's peak."""
+    if not report.exists():
+        return {"record": None}
+    rows = [json.loads(line) for line in report.read_text().splitlines() if line.strip()]
+    steps = sorted((r["step"], r["time_s"]) for r in rows
+                   if r.get("record") == "time" and r.get("level") == "total"
+                   and r.get("component") == "step" and r.get("step", 0) > 0)
+    times = [s for _, s in steps]
+    mem = [r for r in rows if r.get("record") == "memory" and r.get("peak_bytes") is not None]
+    end = next((r for r in rows if r.get("record") == "run_end"), None)
+    return {"record": str(report), "completed": end is not None, "step_s": times,
+            "mean_step_s": statistics.fmean(times) if times else None,
+            "median_step_s": statistics.median(times) if times else None,
+            "peak_bytes": max((r["peak_bytes"] for r in mem), default=None),
+            "mem_source": mem[0].get("mem_source") if mem else None,
+            "lifetime_maxrss_bytes": None if end is None else end.get("lifetime_maxrss_bytes")}
 
 
 def _smooth_extras(report: Path) -> dict[str, Any]:
@@ -378,6 +517,8 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _bring_up_extras(log)
         if part.kind == "smooth":
             return _smooth_extras(Path(part.info["report"]))
+        if part.kind == "plain":
+            return _plain_extras(Path(part.info["report"]))
         if part.kind == "benchmark":
             return _benchmark_extras(Path(part.info["report"]))
         if part.kind == "models":
@@ -457,12 +598,13 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
 
 def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: float, cwd: Path,
                 python: str = sys.executable, env_doc: Mapping[str, Any] | None = None,
-                say: Callable[[str], None] = _say) -> dict[str, Any]:
+                say: Callable[[str], None] = _say, session: str = "FS11") -> dict[str, Any]:
     """Run ``plan`` in order (module docstring) and return the summary, also written to
-    ``out/summary.json`` after each part."""
+    ``out/summary.json`` after each part. ``session`` is the summary's name for the session
+    (:data:`SESSIONS`)."""
     env = base_env(upload)
     summary: dict[str, Any] = {
-        "session": "FS11", "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "session": session, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "deadline_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(deadline)),
         "upload": str(upload), "out": str(out), "environment": env_doc,
         "cupqc": cupqc_status(), "parts": [], "finished": False,
@@ -688,6 +830,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="the parts as JSON instead of the session's (for a dry run)")
     r.add_argument("--selftest", action="store_true",
                    help="FS11_SELFTEST: stand-in parts (unless --plan), no GPU check")
+    r.add_argument("--session", choices=sorted(SESSIONS), default="fs11",
+                   help="FS11_SESSION: the first session's plan (fs11, the default) or the "
+                        "re-check's (recheck); --plan and --selftest replace its parts")
     f = sub.add_parser("fetch-models", help="check the upload, fetch the public weights")
     f.add_argument("--upload", type=Path, required=True)
     f.add_argument("--out", type=Path, required=True)
@@ -698,13 +843,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return fetch_models(args.upload.resolve(), args.out)
     out = args.out.resolve()
     selftest = args.cmd == "run" and args.selftest
+    label, build = SESSIONS[args.session] if args.cmd == "run" else SESSIONS["fs11"]
     allow = os.environ.get("FS11_ALLOW_ANY_GPU") == "1" or selftest
     env_doc = environment(out)
     _write_json(out / "environment.json", env_doc)
     print_environment(env_doc)
     why = refusal(env_doc, allow)
     if selftest:
-        _say("self-test: stand-in parts, the H100 check is skipped")
+        _say(f"self-test: stand-in parts in place of the {label} session's, the H100 check is "
+             "skipped")
     elif allow:
         _say("FS11_ALLOW_ANY_GPU=1: the H100 check is overridden")
     if args.cmd == "env":
@@ -712,7 +859,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_REFUSED if why else 0
     if why:
         _say(f"refused to start: {why} (FS11_ALLOW_ANY_GPU=1 overrides)")
-        _write_json(out / "summary.json", {"session": "FS11", "refused": why,
+        _write_json(out / "summary.json", {"session": label, "refused": why,
                                            "environment": env_doc, "parts": [],
                                            "finished": True})
         return EXIT_REFUSED
@@ -720,10 +867,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.plan:
         plan = load_plan(args.plan)
     else:
-        plan = selftest_plan() if selftest else default_plan(upload, out)
+        plan = selftest_plan() if selftest else build(upload, out)
+    _say(f"session {label}: {len(plan)} part{'' if len(plan) == 1 else 's'}")
     signal.signal(signal.SIGTERM, _on_term)
     summary = run_session(plan, upload=upload, out=out, deadline=args.deadline,
-                          cwd=Path.cwd(), env_doc=env_doc)
+                          cwd=Path.cwd(), env_doc=env_doc, session=label)
     failed = summary["failed"]
     _say("all parts succeeded" if not failed else f"failed or cut short: {', '.join(failed)}")
     return 0 if not failed else 1

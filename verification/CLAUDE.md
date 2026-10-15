@@ -2254,8 +2254,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   peak memory (`metrics.memory_probe`) and the environment. Exits 0 when smooth,
   `EXIT_NOT_SMOOTH` (3) when not. Run once on SmolLM2 at reduced batch on the Mac; FS11 runs it
   per full-scale model and task.
-- FS11, the first H100 session, as one unattended job; the runbook is `verification/README.md`,
-  "Workflow: the first H100 session".
+- FS11, the first H100 session, and its re-check, each as one unattended job; the runbook is
+  `verification/README.md`, "Workflow: the first H100 session" and its "The re-check session".
   - `fs11_prep.py`: `HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --out
     DIR`, on the Mac. Builds `D` and `DÌƒ` per model and task at the full-scale config
     (`fs11_session.FULL_SCALE_ENV`), and packs `DIR/fs11_upload.tar`: `git archive HEAD`, the
@@ -2267,7 +2267,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
     in its place.
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
-    [--selftest]`, `fetch-models` and `env`. Runs the parts in order (`default_plan`): models
+    [--selftest] [--session {fs11,recheck}]`, `fetch-models` and `env`. `--session` picks the
+    plan from `SESSIONS`, which also gives the name `summary.json`'s `session` records: `fs11`
+    (the default, "FS11") or `recheck` ("recheck"); `--plan` and `--selftest` replace its
+    parts. The first session runs the parts in order (`default_plan`): models
     (`fetch_models`: the manifest check, then each public model's weights with `token=False`
     at its pin, checked against the Mac's SHA-256), the hashing benchmark, `bring_up
     --no-tamper` per model, `smooth_check` per model and task. Each part runs in its own
@@ -2280,9 +2283,24 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     (`FS11_ALLOW_ANY_GPU=1` overrides; `EXIT_REFUSED` 4). `selftest_plan` is two stand-in parts
     that need only the standard library, which the module keeps to at import, so `--selftest`
     runs on a bare pod's `python3`.
+  - The re-check (`recheck_plan`, 21 parts, no benchmark): the models part; `bring_up
+    --no-tamper` per model and `smooth_check` per model and task, at `FULL_SCALE_ENV` plus
+    `RECHECK_ENV` (`VERIF_HEAD_BLOCKS=8`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`);
+    then the allocator A/B, kind `plain`: `plain_baseline` (10 steps) twice per model on the
+    refusal task's `D` with `VERIF_HEAD_BLOCKS=8`, one arm per `ALLOC_ARMS` entry
+    (`alloc_default` unsets `PYTORCH_CUDA_ALLOC_CONF`, `alloc_expandable` sets it), the first
+    arm alternating by model, each in `runs/<key>_plain_<arm>/`. Its time limits are
+    `RECHECK_TIMEOUT_S` (bring-up 1,800 s, smooth and plain 600 s). A plain part's summary
+    entry reads its `records.jsonl` with `json` alone: per-step times (the `step` total),
+    their mean and median, the memory pass's peak and its `mem_source`, and whether
+    `run_end` came. A bring-up's entry also holds `section_peaks`, parsed from the memory
+    pass's per-section lines (`metrics.MemoryRecorder`'s echo), the section that raised
+    included.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
-    pod. Preflight (refuses without a way to end the pod; a refusal it can act on terminates),
-    a deadline timer (`FS11_DEADLINE_S`, 12,600 s), the session, a kill of a session still
+    pod. `FS11_SESSION` (`fs11`, the default, or `recheck`; anything else is a refusal) goes to
+    the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
+    can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,200 s for the
+    re-check), the session, a kill of a session still
     running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
     `OUT_DIR.FETCHED` to end it), and the terminate: `runpodctl pod delete`, `runpodctl remove
@@ -2297,9 +2315,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     delete, remove and REST fallbacks and then a stop. It re-arms by hand the boot guard that
     the pod's start command arms at creation (the runbook's two start commands, which
     `test_fs11_session.py` checks with `bash -n` and on stubs). `DRY_RUN=1` logs the commands.
-  - Tests: `tests/verification/runs/test_fs11_session.py` (the session on fake parts, and the
-    job and the guards under `DRY_RUN` or stub `runpodctl`, `curl` and `timeout`: the deadline,
-    a dead log reader, a hung session, failed and hanging deletes, the lock, a failed pack),
+  - Tests: `tests/verification/runs/test_fs11_session.py` (both plans, the summary entries,
+    the session on fake parts, and the job and the guards under `DRY_RUN` or stub `runpodctl`,
+    `curl` and `timeout`: the session choice, the deadline, a dead log reader, a hung session,
+    failed and hanging deletes, the lock, a failed pack),
     `test_fs11_prep.py` (the prep on a fake cache) and `test_smooth_check.py`.
 
 ### `evaluation/`

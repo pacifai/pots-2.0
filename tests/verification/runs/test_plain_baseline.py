@@ -19,6 +19,7 @@ from verification.computation.instances.mlp import (
     synthetic_dataset,
 )
 from verification.prover.step import plain_step, prove_step
+from verification.runs import fs11_session
 from verification.runs import plain_baseline as pb
 from verification.runs.loop import run_loop, run_plain
 from verification.runs.metrics import MetricsWriter, P0_PHASES, config_hash, read_records
@@ -342,6 +343,13 @@ def test_main_runs_with_and_without_metrics(tiny_main, monkeypatch, capsys, capl
     rows = read_records(out)
     assert {r["step"] for r in rows if r["record"] == "memory"} == {1}
     assert {r["step"] for r in rows if r["record"] == "time"} == {1, 2}
+    # the re-check's summary of a plain arm reads these records
+    extras = fs11_session.part_extras(fs11_session.Part(
+        "plain", [], kind="plain", info={"report": str(out / "records.jsonl")}), root / "log")
+    assert extras["completed"] and len(extras["step_s"]) == 2
+    assert extras["step_s"] == [r["time_s"] for r in rows if r["record"] == "time"
+                                and r["component"] == "step" and r["level"] == "total"]
+    assert extras["mem_source"] == next(r["mem_source"] for r in rows if r["record"] == "memory")
     assert pb.read_final_weights(out)["steps"] == 2
     text = capsys.readouterr().out
     assert "P0 memory growth" in text and "metrics: " in text
