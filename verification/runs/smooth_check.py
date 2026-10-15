@@ -19,9 +19,17 @@ records go through in chunks of ``--eval-batch`` (default ``VERIF_BATCH``), each
 ``VERIF_SEQ_LEN`` with the model's pad id, under the run's autocast, and the sums are kept in
 fp64.
 
-**The verdict** (F6a): smooth if every whole-list value is finite, none after a step rises above
-the starting loss, and the last is below it. A failure goes to the user, who decides what
-follows; it doesn't change ``η`` here.
+**The verdict** (F6a, amended 2026-10-15): smooth if every whole-list value is finite, ``W_0``'s
+and step 1's included; none from step 2 on rises above the starting loss; and the last is below
+it. Step 1 may rise above the start. At ``T = 1`` step 1 is the last, so it must still end below
+the start. A failure goes to the user, who decides what follows; it doesn't change ``η`` here.
+
+Why step 1 is exempt: on the first H100 session (FS11, 2026-10-14) three of the six model–task
+pairs that trained a step rose above the start at step 1 only, then fell. Qwen2.5-0.5B on
+jailbreak went 1.071 → 1.686 at step 1 and 0.604 at step 10. The four pairs that finished ten
+steps ended 16–57% below the start. That reads as a first-step overshoot from ``W_0``'s large
+initial gradient, not a blow-up. The user kept ``η = 10⁻³`` and chose the exemption after seeing
+these results, so the amended rule is post hoc.
 
 **The gradient norm.** Each step also records the global L2 norm of its gradient, over every
 parameter, read just before the update (an optimizer step pre-hook, so the loop is untouched).
@@ -70,8 +78,8 @@ __all__ = ["RUN_NAME", "STEPS", "EXIT_NOT_SMOOTH", "RULE", "Verdict", "verdict",
 RUN_NAME = "smooth_check"
 STEPS = 10  # F6c: 10 plain steps per model and task
 EXIT_NOT_SMOOTH = 3  # apart from 1, a crash, and 2, a usage error
-RULE = ("every whole-list loss finite, none after a step above the loss at W_0, and the last "
-        "below it (F6a)")
+RULE = ("every whole-list loss finite (W_0 and every step), none from step 2 on above the loss "
+        "at W_0 (step 1 exempt), and the last below it (F6a, amended 2026-10-15)")
 
 
 # ---- the verdict ------------------------------------------------------------------------
@@ -84,14 +92,17 @@ class Verdict:
 
 
 def verdict(losses: Sequence[float]) -> Verdict:
-    """F6a's rule on the whole-list losses ``[ℒ(W_0), ℒ(W_1), …, ℒ(W_T)]``."""
+    """F6a's amended rule (:data:`RULE`) on the whole-list losses ``[ℒ(W_0), ℒ(W_1), …,
+    ℒ(W_T)]``: step 1 may rise above the start, but it must be finite, and at ``T = 1`` it is
+    the last, so it must end below the start."""
     if len(losses) < 2:
         raise ValueError(f"need the loss at W_0 and after at least one step, got {len(losses)}")
     start, after = losses[0], list(losses[1:])
     reasons = [f"not finite at W_{t}: {x!r}" for t, x in enumerate(losses) if not math.isfinite(x)]
     if math.isfinite(start):
         reasons += [f"above the start after step {t}: {x:.6f} > {start:.6f}"
-                    for t, x in enumerate(after, start=1) if math.isfinite(x) and x > start]
+                    for t, x in enumerate(after, start=1)
+                    if t >= 2 and math.isfinite(x) and x > start]
         if math.isfinite(after[-1]) and not after[-1] < start:
             reasons.append(f"the last ({after[-1]:.6f}) is not below the start ({start:.6f})")
     return Verdict(not reasons, tuple(reasons))

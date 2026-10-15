@@ -441,8 +441,10 @@ replaced:
   runs that didn't start from the same place fails by naming the difference.
 - **`smooth_check.py`** is F6c's smooth check: 10 plain steps at `η` through the plain
   baseline's loop, with the training loss over the whole clean list at `W_0` and after each
-  step. It's smooth if every value is finite, none rises above the start, and the last is
-  below it. It writes one JSON record per model and task.
+  step. It's smooth if every value is finite, none from step 2 on rises above the start, and
+  the last is below it. Step 1 may rise: the first H100 session showed a first-step overshoot
+  on three model–task pairs that then fell well below the start, and the user exempted it
+  after seeing that (2026-10-15). It writes one JSON record per model and task.
 - **`fs11_prep.py`**, **`fs11_session.py`** and **`fs11_job.sh`** are the first H100
   session (FS11): the upload built on the Mac, the session's parts in order, and the job that
   runs them under a deadline and ends its own pod (see "Workflow: the first H100 session").

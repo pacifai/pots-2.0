@@ -2221,8 +2221,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   [--eval-batch B]`. `T` plain steps (default 10) through `loop.run_plain` on `D` and `π` at
   `VERIF_SEED`, and the whole-list loss (`whole_list_loss`: `Σ μ·CE / Σ μ` over every record of
   `D`, forward passes only, in chunks of `--eval-batch`, sums in fp64, under the run's
-  autocast) at `W_0` and after each step. `verdict(losses)` is F6a's rule: smooth if every
-  value is finite, none after a step is above the loss at `W_0`, and the last is below it. Each
+  autocast) at `W_0` and after each step. `verdict(losses)` is F6a's rule as amended on
+  2026-10-15: smooth if every value is finite (`W_0` and step 1 included), none from step 2 on
+  is above the loss at `W_0`, and the last is below it, so at `T = 1` step 1 must still end
+  below the start. The step-1 exemption was chosen after FS11's runs showed a first-step
+  overshoot (post hoc; the module docstring has the numbers). Each
   step's global gradient norm (`grad_norms`, an optimizer step pre-hook) is recorded beside its
   loss and plays no part in the verdict. The record goes to
   `$VERIF_OUTPUT_DIR/smooth_check/<model>_<task>.json` (`record_path`) with the timings, the
