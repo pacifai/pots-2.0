@@ -179,6 +179,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
 
+from setup.config import load_config
 from verification.computation.interface import ProductKind
 from verification.verifier.bands import product_class
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF
@@ -1408,10 +1409,26 @@ def _version(dist: str) -> str | None:
 _LIBRARIES = ("torch", "numpy", "blake3", "transformers", "datasets")
 
 
+# The CUDA caching allocator's settings variables. torch 2.9 reads PYTORCH_ALLOC_CONF and
+# prefers it over PYTORCH_CUDA_ALLOC_CONF, its deprecated older name.
+ALLOC_VARS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+
+
+def allocator_settings(release_cache: bool | None = None) -> dict[str, Any]:
+    """What this process's CUDA allocator runs with: each of :data:`ALLOC_VARS` (``None`` when
+    unset) and the run's ``release_cache``, the cache release between prover and verifier
+    (``None`` reads ``VERIF_RELEASE_CACHE``)."""
+    return {**{v: os.environ.get(v) for v in ALLOC_VARS},
+            "release_cache": load_config().release_cache if release_cache is None
+            else release_cache}
+
+
 def environment_record(run: str, *, device: str | torch.device, probe: MemoryProbe,
                        config: Mapping[str, Any] | None = None, band_file_hash: str | None = None,
-                       h_D: bytes | None = None, **fields: Any) -> dict[str, Any]:
-    """EQ13 record 5: hardware, library versions, git commit and the run's input hashes."""
+                       h_D: bytes | None = None, release_cache: bool | None = None,
+                       **fields: Any) -> dict[str, Any]:
+    """EQ13 record 5: hardware, library versions, git commit and the run's input hashes, and
+    the allocator's settings (:func:`allocator_settings`, ``release_cache`` as there)."""
     dev = torch.device(device)
     status = _git("status", "--porcelain")
     return {
@@ -1429,6 +1446,7 @@ def environment_record(run: str, *, device: str | torch.device, probe: MemoryPro
         "band_file_hash": band_file_hash,
         "h_D": None if h_D is None else h_D.hex(),
         "mem_source": probe.source, "MallocLargeCache": os.environ.get("MallocLargeCache"),
+        **allocator_settings(release_cache),
         "threads": torch.get_num_threads(), **fields,
     }
 

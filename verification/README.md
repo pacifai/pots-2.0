@@ -618,11 +618,15 @@ the verifier starts (`release_device_cache`). Its time is a metrics row of its o
 `handoff.empty_cache`, counted in neither role's total, since deployed the two roles run on
 separate machines. Whether the step runs on CUDA goes by the model's device.
 `VERIF_RELEASE_CACHE=0` skips the release in every verified run, so a run can time the
-verified step without it. A full-scale run also sets
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in its environment, which lets the allocator
-grow a block in place rather than leave gaps. On CUDA the memory pass records the allocator's
-reserved peak (`torch.cuda.max_memory_reserved`) beside the allocated one, so the gap between
-them, the memory held but not in use, shows how much fragmentation is left.
+verified step without it. The re-check session also sets the allocator variable,
+`PYTORCH_ALLOC_CONF=expandable_segments:True`, in its parts' environment, which lets the
+allocator grow a block in place rather than leave gaps. That setting is on trial: it stays only
+if the allocator-fix speed test (FS17) measures no speed cost. Every run's `environment` record
+holds both allocator variables, `PYTORCH_ALLOC_CONF` and its deprecated older name
+`PYTORCH_CUDA_ALLOC_CONF`, with the run's `release_cache`, so a run's records say which setting
+it had. On CUDA the memory pass records the allocator's reserved peak
+(`torch.cuda.max_memory_reserved`) beside the allocated one, so the gap between them, the
+memory held but not in use, shows how much fragmentation is left.
 
 ## Workflow: a run on a GPU
 
@@ -903,10 +907,10 @@ recheck`); `summary.json` names it `recheck`. Its 22 parts, in order:
 | parts | what | environment | time limit each |
 |---|---|---|---|
 | models | as the first session's | as the first session's | 1,800 s |
-| bring-up, 4 | `bring_up --no-tamper`, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and `VERIF_RELEASE_CACHE=1` (`RECHECK_ENV`) | 1,800 s |
-| fix-off bring-up, 1 | Qwen2.5-0.5B's bring-up again, right after its own (before Qwen2.5-1.5B's) | the bring-up's, with `PYTORCH_CUDA_ALLOC_CONF` unset and `VERIF_RELEASE_CACHE=0` (`FIX_OFF_ENV`) | 1,800 s |
+| bring-up, 4 | `bring_up --no-tamper`, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8`, `PYTORCH_ALLOC_CONF=expandable_segments:True` (`PYTORCH_CUDA_ALLOC_CONF` unset) and `VERIF_RELEASE_CACHE=1` (`RECHECK_ENV`) | 1,800 s |
+| fix-off bring-up, 1 | Qwen2.5-0.5B's bring-up again, right after its own (before Qwen2.5-1.5B's) | the bring-up's, with both allocator variables unset and `VERIF_RELEASE_CACHE=0` (`FIX_OFF_ENV`) | 1,800 s |
 | smooth, 8 | `smooth_check` per model and task | the bring-ups' (`RECHECK_ENV`) | 600 s |
-| allocator A/B, 8 | `plain_baseline`'s 10 plain steps, twice per model, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8`; `PYTORCH_CUDA_ALLOC_CONF` unset in one arm (`alloc_default`), `expandable_segments:True` in the other (`alloc_expandable`) | 600 s |
+| allocator A/B, 8 | `plain_baseline`'s 10 plain steps, twice per model, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8`; both allocator variables unset in one arm (`alloc_default`), `PYTORCH_ALLOC_CONF=expandable_segments:True` in the other (`alloc_expandable`) | 600 s |
 
 It has no benchmark part. `VERIF_HEAD_BLOCKS=8` checks the output layer's product in 8 row
 blocks. The allocator fix is two settings together: expandable segments, and the CUDA cache
@@ -916,8 +920,11 @@ in place rather than reserve a new fixed-size one, which cuts fragmentation. Fou
 session's seven
 out-of-memory errors left 6–12 GiB "reserved but unallocated" (Llama-3.2-1B's and Falcon3-1B's
 bring-ups, Falcon3-1B's two smooth checks); Qwen2.5-1.5B's three left about 0.6 GiB, so the
-allocator setting alone is unlikely to fix those. The allocator reads `PYTORCH_CUDA_ALLOC_CONF`
-when CUDA starts, so it's set in each part's environment, not in Python. Each bring-up's
+allocator setting alone is unlikely to fix those. The allocator reads `PYTORCH_ALLOC_CONF`
+when CUDA starts, so it's set in each part's environment, not in Python. torch 2.9 prefers it
+over the deprecated `PYTORCH_CUDA_ALLOC_CONF`, which every re-check part unsets, so a value the
+pod's environment holds can't change the arm. Each part's summary entry holds `allocator`, the
+settings its run's records say it actually had. Each bring-up's
 summary entry also holds `section_peaks`, the memory pass's per-section lines, which survive a
 run that dies mid-step.
 

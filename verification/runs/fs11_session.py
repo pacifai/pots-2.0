@@ -34,14 +34,15 @@ order:
 The re-check runs the models part, then the bring-up and smooth parts again with settings
 added to the full-scale config (:data:`RECHECK_ENV`): the output layer's product checked in 8
 row blocks (``VERIF_HEAD_BLOCKS``), and the allocator fix ("fix 2"), which is two settings: the
-CUDA allocator's expandable segments (``PYTORCH_CUDA_ALLOC_CONF``, which the allocator reads at
-CUDA's first use, so it is set in the part's environment) and the cache release between prover
-and verifier (``VERIF_RELEASE_CACHE=1``, the default, pinned). Right after
+CUDA allocator's expandable segments (``PYTORCH_ALLOC_CONF``, which the allocator reads at
+CUDA's first use, so it is set in the part's environment, with the deprecated
+``PYTORCH_CUDA_ALLOC_CONF`` unset) and the cache release between prover and verifier
+(``VERIF_RELEASE_CACHE=1``, the default, pinned). Right after
 :data:`FIX_AB_MODEL`'s bring-up comes the same bring-up with the whole fix off
 (:data:`FIX_OFF_ENV`), its own part and run directory: ``summary.json``'s ``fix2_ab``
 (:func:`fix2_ab`) sets the two side by side, so the fix's cost to a verified step reads off
 directly. Last comes a timing A/B of the allocator setting alone: per model,
-``plain_baseline``'s 10 plain steps twice, once with ``PYTORCH_CUDA_ALLOC_CONF`` unset and
+``plain_baseline``'s 10 plain steps twice, once with both allocator variables unset and
 once with expandable segments, the first arm alternating from model to model
 (:data:`ALLOC_ARMS`). It has no benchmark part.
 
@@ -81,8 +82,8 @@ from pathlib import Path
 from typing import Any
 
 __all__ = ["RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
-           "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part", "default_plan",
-           "recheck_plan", "load_plan", "selftest_plan", "run_session", "fix2_ab",
+           "alloc_env", "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part",
+           "default_plan", "recheck_plan", "load_plan", "selftest_plan", "run_session", "fix2_ab",
            "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
            "data_key", "main"]
 
@@ -114,17 +115,26 @@ TIMEOUT_S = {"models": 1800, "benchmark": 5400, "bring_up": 2400, "smooth": 1200
 # the cache release between prover and verifier (the default, pinned against the pod's
 # environment; only the bring-up reads it).
 EXPANDABLE = "expandable_segments:True"
-RECHECK_ENV = {"VERIF_HEAD_BLOCKS": "8", "PYTORCH_CUDA_ALLOC_CONF": EXPANDABLE,
-               "VERIF_RELEASE_CACHE": "1"}
+
+
+def alloc_env(conf: str | None) -> dict[str, str | None]:
+    """The part environment's allocator setting: ``PYTORCH_ALLOC_CONF`` (torch 2.9's own name,
+    which wins over the other) at ``conf``, and the deprecated ``PYTORCH_CUDA_ALLOC_CONF`` unset,
+    so the pod's environment can't add to it. ``None`` unsets both."""
+    return {"PYTORCH_ALLOC_CONF": conf, "PYTORCH_CUDA_ALLOC_CONF": None}
+
+
+RECHECK_ENV: dict[str, str | None] = {"VERIF_HEAD_BLOCKS": "8", **alloc_env(EXPANDABLE),
+                                      "VERIF_RELEASE_CACHE": "1"}
 # The verified-step A/B of the whole allocator fix: this model's bring-up runs again right
 # after its own, with RECHECK_ENV's two fix settings undone (None unsets). The fix is kept only
 # if it costs no speed; Qwen2.5-0.5B fit in the first session without it, so this arm runs.
 FIX_AB_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
-FIX_OFF_ENV: dict[str, str | None] = {"PYTORCH_CUDA_ALLOC_CONF": None, "VERIF_RELEASE_CACHE": "0"}
-# The re-check's allocator A/B: each arm's name and its PYTORCH_CUDA_ALLOC_CONF (None unsets it,
-# whatever the pod's environment holds). Even-numbered models in RUN_PINS run them in this
-# order, odd-numbered ones in reverse, so an order effect (a warm file cache, the GPU's clocks)
-# doesn't always favour the same arm.
+FIX_OFF_ENV: dict[str, str | None] = {**alloc_env(None), "VERIF_RELEASE_CACHE": "0"}
+# The re-check's allocator A/B: each arm's name and its PYTORCH_ALLOC_CONF (alloc_env; None
+# unsets both variables, whatever the pod's environment holds). Even-numbered models in
+# RUN_PINS run them in this order, odd-numbered ones in reverse, so an order effect (a warm
+# file cache, the GPU's clocks) doesn't always favour the same arm.
 ALLOC_ARMS: tuple[tuple[str, str | None], ...] = (("alloc_default", None),
                                                    ("alloc_expandable", EXPANDABLE))
 # The re-check's time limits: about 3–5 times each part's expected time (the first session's
@@ -363,7 +373,7 @@ def _plain_parts(upload: Path, out: Path) -> list[Part]:
                               ["{python}", "-m", "verification.runs.plain_baseline"],
                               env={**_run_env(repo, rev, BRING_UP_TASK),
                                    "VERIF_HEAD_BLOCKS": RECHECK_ENV["VERIF_HEAD_BLOCKS"],
-                                   "PYTORCH_CUDA_ALLOC_CONF": conf, "VERIF_OUTPUT_DIR": str(d)},
+                                   **alloc_env(conf), "VERIF_OUTPUT_DIR": str(d)},
                               timeout_s=RECHECK_TIMEOUT_S["plain"], kind="plain",
                               info={"model": repo, "task": BRING_UP_TASK, "run_dir": str(d),
                                     "arm": arm, "alloc_conf": conf,
@@ -506,12 +516,37 @@ def _step_times(lines: Sequence[str]) -> list[dict[str, Any]]:
     return out
 
 
+# Which allocator settings a run had: the environment record's fields (metrics.ALLOC_VARS and
+# release_cache), or bring_up's "allocator: {...}" line, which prints the same as JSON.
+_ALLOC_KEYS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "release_cache")
+_ALLOC_LINE = re.compile(r"^allocator: (\{.*\})\s*$")
+
+
+def _allocator(doc: Any) -> dict[str, Any] | None:
+    """The allocator settings :data:`_ALLOC_KEYS` from an environment record, or ``None``
+    when it isn't one (a malformed or older record)."""
+    if not isinstance(doc, dict):
+        return None
+    return {k: doc.get(k) for k in _ALLOC_KEYS}
+
+
+def _logged_allocator(lines: Sequence[str]) -> dict[str, Any] | None:
+    for m in map(_ALLOC_LINE.match, lines):
+        if m:
+            try:
+                return _allocator(json.loads(m[1]))
+            except ValueError:
+                return None
+    return None
+
+
 def _bring_up_extras(log: Path) -> dict[str, Any]:
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
     peaks = [{"step": int(m[1]), "side": m[2], "peak_gb": float(m[3]),
               "reserved_gb": None if m[4] is None else float(m[4])}
              for m in map(_PEAK.match, lines) if m]
-    return {"peaks": peaks, "step_times": _step_times(lines),
+    return {"allocator": _logged_allocator(lines), "peaks": peaks,
+            "step_times": _step_times(lines),
             "section_peaks": _section_peaks(lines),
             "lines": [l for l in lines if _BRING_UP_LINE.match(l)][-40:]}
 
@@ -519,7 +554,8 @@ def _bring_up_extras(log: Path) -> dict[str, Any]:
 def _plain_extras(report: Path) -> dict[str, Any]:
     """A plain arm's ``records.jsonl``: the timed run's per-step times (the ``step`` total of
     each step's ``P0`` phases, which on CUDA synchronize at their bounds), their mean and
-    median, and the memory pass's peak (on CUDA with its reserved peak, else ``None``)."""
+    median, the memory pass's peak (on CUDA with its reserved peak, else ``None``), and the
+    allocator settings its environment record holds."""
     if not report.exists():
         return {"record": None}
     rows = [json.loads(line) for line in report.read_text().splitlines() if line.strip()]
@@ -530,7 +566,9 @@ def _plain_extras(report: Path) -> dict[str, Any]:
     mem = [r for r in rows if r.get("record") == "memory" and r.get("peak_bytes") is not None]
     held = [r["peak_reserved_bytes"] for r in mem if r.get("peak_reserved_bytes") is not None]
     end = next((r for r in rows if r.get("record") == "run_end"), None)
-    return {"record": str(report), "completed": end is not None, "step_s": times,
+    env = next((r for r in rows if r.get("record") == "environment"), None)
+    return {"record": str(report), "allocator": _allocator(env),
+            "completed": end is not None, "step_s": times,
             "mean_step_s": statistics.fmean(times) if times else None,
             "median_step_s": statistics.median(times) if times else None,
             "peak_bytes": max((r["peak_bytes"] for r in mem), default=None),
@@ -543,7 +581,8 @@ def _smooth_extras(report: Path) -> dict[str, Any]:
     if not report.exists():
         return {"record": None}
     doc = json.loads(report.read_text())
-    return {"record": str(report), "smooth": doc.get("smooth"), "reasons": doc.get("reasons"),
+    return {"record": str(report), "allocator": _allocator(doc.get("environment")),
+            "smooth": doc.get("smooth"), "reasons": doc.get("reasons"),
             "whole_list_losses": doc.get("whole_list_losses"),
             "batch_losses": doc.get("batch_losses"), "grad_norms": doc.get("grad_norms"),
             "peak_bytes": (doc.get("memory") or {}).get("peak_bytes"),
@@ -614,7 +653,9 @@ def _fix_cost(on: Mapping[str, Any] | None, off: Mapping[str, Any] | None,
 def fix2_ab(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     """The verified-step A/B of the allocator fix, from the summary's part records, or ``None``
     when the plan has no fix-off part. The bring-up with the fix on (``info["arm"]``
-    ``fix2_on``) beside the one with it off (``fix2_off``): per step, the prover, verifier,
+    ``fix2_on``) beside the one with it off (``fix2_off``), each with the allocator settings
+    it was planned with and those its log says it ran with (``ran_with``): per step, the
+    prover, verifier,
     hand-off and total wall clock (``total_s``, the three together, from the memory pass as the
     bring-up reports it); per step and side, the allocated and reserved peaks; and
     ``fix_cost``, on minus off (positive: the fix costs that much time or memory)."""
@@ -627,7 +668,8 @@ def fix2_ab(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     def head(p: Mapping[str, Any] | None) -> dict[str, Any] | None:
         return None if p is None else {
             "part": p["name"], "status": p["status"],
-            **{k: p["info"].get(k) for k in ("alloc_conf", "release_cache")}}
+            **{k: p["info"].get(k) for k in ("alloc_conf", "release_cache")},
+            "ran_with": (p.get("extras") or {}).get("allocator")}
 
     times = {a: {r["step"]: {k: r.get(k) for k in _FIX_TIMES} for r in x.get("step_times", [])}
              for a, x in extras.items()}

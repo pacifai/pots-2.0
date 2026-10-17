@@ -1402,8 +1402,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     with `c.device` before each `verify_step` too. `run_scenario`, `memory_run`, `bring_up`,
     `bias_tamper` and `llama_step.run_honest` pass on `release_cache` (default `None`, read
     from `VERIF_RELEASE_CACHE`); `bring_up` and `llama_step` set it from `cfg.release_cache`.
-    Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the run's environment, not in
-    Python: the allocator reads it at CUDA's first use.
+    Set `PYTORCH_ALLOC_CONF=expandable_segments:True` in the run's environment, not in
+    Python: the allocator reads it at CUDA's first use. torch 2.9 prefers that name over the
+    deprecated `PYTORCH_CUDA_ALLOC_CONF`, so leave the old one unset.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
     default: `entry_weights(t, w)` (hidden steps), `committed_records(t, records)` (A1: the
@@ -1512,7 +1513,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     equal to `verifier.stats`), `memory_probe(device)`, `reserved_peak(probe)`,
     `step_record`, `config_hash`.
     `model`, `corpus`, `attack` (`VERIF_ATTACK`, `None` for a run on other data) and `seed`
-    go into the `environment` record and every `step` record. Every run that writes `corpus`
+    go into the `environment` record and every `step` record. The `environment` record
+    (`environment_record`) also holds the allocator's settings (`allocator_settings`): both
+    variables of `ALLOC_VARS`, `PYTORCH_ALLOC_CONF` and `PYTORCH_CUDA_ALLOC_CONF` (null when
+    unset), and the run's `release_cache` (`VERIF_RELEASE_CACHE` unless the caller passes
+    it). `bring_up` prints the same as a line, `allocator: {…}`. Every run that writes `corpus`
     writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
     EVALUATION_SPEC §4.6) raises `ValueError`, in any letter case (`str.casefold`): on a
     case-insensitive file system `Data` is `data`.
@@ -2311,26 +2316,33 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   - The re-check (`recheck_plan`, 22 parts, no benchmark): the models part; `bring_up
     --no-tamper` per model and `smooth_check` per model and task, at `FULL_SCALE_ENV` plus
     `RECHECK_ENV`: `VERIF_HEAD_BLOCKS=8` and the allocator fix ("fix 2"),
-    `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and `VERIF_RELEASE_CACHE=1` (the
-    default, pinned). Right after `FIX_AB_MODEL`'s bring-up (Qwen2.5-0.5B, which fit in FS11
-    without the fix) comes the same bring-up with the whole fix off (`FIX_OFF_ENV`:
-    `PYTORCH_CUDA_ALLOC_CONF` unset, `VERIF_RELEASE_CACHE=0`), its own part
+    `PYTORCH_ALLOC_CONF=expandable_segments:True` and `VERIF_RELEASE_CACHE=1` (the
+    default, pinned). `alloc_env(conf)` writes the allocator setting: `PYTORCH_ALLOC_CONF`
+    at `conf` and the deprecated `PYTORCH_CUDA_ALLOC_CONF` unset, both unset for `None`.
+    Right after `FIX_AB_MODEL`'s bring-up (Qwen2.5-0.5B, which fit in FS11 without the fix)
+    comes the same bring-up with the whole fix off (`FIX_OFF_ENV`:
+    both allocator variables unset, `VERIF_RELEASE_CACHE=0`), its own part
     (`bring_up_Qwen2.5-0.5B-Instruct_fix2off`) in `runs/Qwen2.5-0.5B-Instruct_refusal_fix2off/`;
     the two parts' `info["arm"]` are `fix2_on` and `fix2_off`. `fix2_ab(parts)` sets them
     side by side in `summary.json`'s `fix2_ab`: per step the prover, verifier, hand-off and
     total wall clock (`steps`), per step and side the allocated and reserved peaks (`peaks`),
-    each with `fix_cost`, on minus off. The job log then says `allocator fix A/B, step 1: …
+    each with `fix_cost`, on minus off. Each arm's head holds its planned `alloc_conf` and
+    `release_cache` and `ran_with`, the settings its log's `allocator:` line says it ran
+    with. The job log then says `allocator fix A/B, step 1: …
     s with the fix, … s without (+… s)`. The times are the bring-up's, from its memory pass,
     one step per arm. Last comes the allocator A/B, kind `plain`: `plain_baseline` (10 steps)
     twice per model on the
     refusal task's `D` with `VERIF_HEAD_BLOCKS=8`, one arm per `ALLOC_ARMS` entry
-    (`alloc_default` unsets `PYTORCH_CUDA_ALLOC_CONF`, `alloc_expandable` sets it), the first
+    (`alloc_default` unsets both allocator variables, `alloc_expandable` sets
+    `PYTORCH_ALLOC_CONF`), the first
     arm alternating by model, each in `runs/<key>_plain_<arm>/`. Its time limits are
     `RECHECK_TIMEOUT_S` (bring-up 1,800 s, smooth and plain 600 s). A plain part's summary
     entry reads its `records.jsonl` with `json` alone: per-step times (the `step` total),
     their mean and median, the memory pass's peak, its reserved peak (`peak_reserved_bytes`,
     null off CUDA) and its `mem_source`, and whether `run_end` came. A smooth part's entry
-    holds its record's `peak_bytes` and `peak_reserved_bytes`. A bring-up's entry also holds
+    holds its record's `peak_bytes` and `peak_reserved_bytes`. Each plain, smooth and
+    bring-up entry holds `allocator`, the settings the run actually had (from its environment
+    record, or the bring-up's `allocator:` line; null when missing). A bring-up's entry also holds
     `step_times` (each step's prover, verifier, hand-off and total from `report_costs`' line),
     `peaks` (each side's, with `reserved_gb`) and `section_peaks`, parsed from the memory
     pass's per-section lines (`metrics.MemoryRecorder`'s echo), the section that raised

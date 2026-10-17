@@ -59,6 +59,7 @@ tamper is rejected where expected, else 1.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
@@ -83,6 +84,7 @@ from verification.runs.llama_step import load_committed_dataset, report_costs
 from verification.runs.loop import release_cache_setting, release_device_cache
 from verification.runs.metrics import (
     SCORE_FAMILIES,
+    allocator_settings,
     memory_pass,
     memory_probe,
     nan_as_inf,
@@ -474,6 +476,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("hand-off: " + ("in memory" if disk is None else f"on disk under {disk}")
           + ("; CUDA cache released before the verifier" if cfg.release_cache else
              "; no cache release (VERIF_RELEASE_CACHE=0)"))
+    print("allocator: " + json.dumps(allocator_settings(cfg.release_cache)), flush=True)
     b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
                  device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
                  echo=lambda line: print(line, flush=True), release_cache=cfg.release_cache)

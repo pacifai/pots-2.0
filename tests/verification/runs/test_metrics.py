@@ -450,6 +450,24 @@ def test_environment_and_run_end(smoke):
     assert env["band_file_hash"] is None and env["h_D"] is None and env["attack"] is None
     assert env["git_commit"] is None or len(env["git_commit"]) == 40
     assert end["lifetime_maxrss_bytes"] > 0
+    assert set(metrics.ALLOC_VARS) | {"release_cache"} <= env.keys()
+
+
+def test_environment_records_the_allocator_settings(monkeypatch):
+    """Both allocator variables, ``None`` when unset, and the run's ``release_cache``: given,
+    or read from ``VERIF_RELEASE_CACHE``."""
+    probe = metrics.memory_probe("cpu")
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("VERIF_RELEASE_CACHE", "0")
+    env = metrics.environment_record("r", device="cpu", probe=probe)
+    assert (env["PYTORCH_ALLOC_CONF"], env["PYTORCH_CUDA_ALLOC_CONF"], env["release_cache"]) == (
+        "expandable_segments:True", None, False)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF")
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6")
+    env = metrics.environment_record("r", device="cpu", probe=probe, release_cache=True)
+    assert (env["PYTORCH_ALLOC_CONF"], env["PYTORCH_CUDA_ALLOC_CONF"], env["release_cache"]) == (
+        None, "garbage_collection_threshold:0.6", True)
 
 
 def _kinds(d):

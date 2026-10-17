@@ -105,8 +105,10 @@ def test_recheck_plan(tmp_path):
     for p in plan[1:14]:
         assert p.env["VERIF_HEAD_BLOCKS"] == "8"
         fix = p is not off
-        assert "PYTORCH_CUDA_ALLOC_CONF" in p.env
-        assert p.env["PYTORCH_CUDA_ALLOC_CONF"] == ("expandable_segments:True" if fix else None)
+        # torch 2.9's own variable carries the setting; the deprecated one is always unset
+        assert "PYTORCH_ALLOC_CONF" in p.env and "PYTORCH_CUDA_ALLOC_CONF" in p.env
+        assert p.env["PYTORCH_ALLOC_CONF"] == ("expandable_segments:True" if fix else None)
+        assert p.env["PYTORCH_CUDA_ALLOC_CONF"] is None
         assert p.env["VERIF_RELEASE_CACHE"] == ("1" if fix else "0")
 
     # the verified-step A/B of the whole allocator fix: the same bring-up, both settings undone
@@ -115,8 +117,8 @@ def test_recheck_plan(tmp_path):
     d = Path(off.env["VERIF_OUTPUT_DIR"])
     assert d.name == f"{key}_fix2off" and d != Path(on.env["VERIF_OUTPUT_DIR"])
     assert (d / "data").resolve() == (up / "data" / key).resolve()
-    assert off.env == {**on.env, "PYTORCH_CUDA_ALLOC_CONF": None, "VERIF_RELEASE_CACHE": "0",
-                       "VERIF_OUTPUT_DIR": str(d)}
+    assert off.env == {**on.env, "PYTORCH_ALLOC_CONF": None, "PYTORCH_CUDA_ALLOC_CONF": None,
+                       "VERIF_RELEASE_CACHE": "0", "VERIF_OUTPUT_DIR": str(d)}
     assert off.info == {**on.info, "run_dir": str(d), "arm": "fix2_off", "alloc_conf": None,
                         "release_cache": False}
 
@@ -134,7 +136,8 @@ def test_recheck_plan(tmp_path):
         assert p.env["VERIF_ATTACK"] == "refusal" and p.env["VERIF_HEAD_BLOCKS"] == "8"
         # None unsets the variable, whatever the pod's environment holds
         conf = None if p.info["arm"] == a else "expandable_segments:True"
-        assert "PYTORCH_CUDA_ALLOC_CONF" in p.env and p.env["PYTORCH_CUDA_ALLOC_CONF"] == conf
+        assert "PYTORCH_ALLOC_CONF" in p.env and p.env["PYTORCH_ALLOC_CONF"] == conf
+        assert "PYTORCH_CUDA_ALLOC_CONF" in p.env and p.env["PYTORCH_CUDA_ALLOC_CONF"] is None
         assert p.info["alloc_conf"] == conf
         key = fs.data_key(p.info["model"], "refusal")
         d = Path(p.env["VERIF_OUTPUT_DIR"])
@@ -217,12 +220,14 @@ def test_run_session(tmp_path, monkeypatch):
 
 
 def test_the_allocator_arms_reach_their_parts(tmp_path, monkeypatch):
-    """The A/B's arms as run: the default arm unsets PYTORCH_CUDA_ALLOC_CONF, though the
-    session's environment sets it; the other sets expandable segments."""
+    """The A/B's arms as run: the default arm unsets both allocator variables, though the
+    session's environment sets them; the other sets expandable segments in PYTORCH_ALLOC_CONF
+    and still unsets the deprecated PYTORCH_CUDA_ALLOC_CONF."""
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "garbage_collection_threshold:0.6")
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6")
-    probe = "import os; print(repr(os.environ.get('PYTORCH_CUDA_ALLOC_CONF')))"
-    plan = [fs.Part(arm, _py(probe), env={"PYTORCH_CUDA_ALLOC_CONF": conf})
-            for arm, conf in fs.ALLOC_ARMS]
+    probe = ("import os; print(repr((os.environ.get('PYTORCH_ALLOC_CONF'), "
+             "os.environ.get('PYTORCH_CUDA_ALLOC_CONF'))))")
+    plan = [fs.Part(arm, _py(probe), env=fs.alloc_env(conf)) for arm, conf in fs.ALLOC_ARMS]
     out = tmp_path / "out"
     s = fs.run_session(plan, upload=tmp_path / "up", out=out, deadline=time.time() + 30,
                        cwd=REPO, say=lambda m: None, session="recheck")
@@ -230,7 +235,8 @@ def test_the_allocator_arms_reach_their_parts(tmp_path, monkeypatch):
     assert json.loads((out / "summary.json").read_text())["session"] == "recheck"
     seen = {arm: (out / "parts" / arm / "log.txt").read_text().splitlines()[-1]
             for arm, _ in fs.ALLOC_ARMS}
-    assert seen == {"alloc_default": "None", "alloc_expandable": "'expandable_segments:True'"}
+    assert seen == {"alloc_default": "(None, None)",
+                    "alloc_expandable": "('expandable_segments:True', None)"}
 
 
 def _fix_arm(name, arm, conf, release, times, held):
@@ -240,7 +246,10 @@ def _fix_arm(name, arm, conf, release, times, held):
             f"step 1: prover peak 40.00 GB, reserved {held[0]:.2f} GB (at its start 3.00 GB) "
             "[cuda_allocated, memory pass]\n"
             f"step 1: verifier peak 30.00 GB, reserved {held[1]:.2f} GB "
-            "[cuda_allocated, memory pass]")
+            "[cuda_allocated, memory pass]\n"
+            "allocator: " + json.dumps({"PYTORCH_ALLOC_CONF": conf,
+                                        "PYTORCH_CUDA_ALLOC_CONF": None,
+                                        "release_cache": release}))
     return fs.Part(name, _py(f"print({text!r})"), kind="bring_up",
                    info={"model": fs.FIX_AB_MODEL, "task": "refusal", "arm": arm,
                          "alloc_conf": conf, "release_cache": release})
@@ -258,9 +267,13 @@ def test_the_fix_ab_sets_the_two_arms_side_by_side(tmp_path):
     assert json.loads((out / "summary.json").read_text())["fix2_ab"] == ab
     assert ab["model"] == fs.FIX_AB_MODEL
     assert ab["fix_on"] == {"part": "on", "status": "ok", "alloc_conf": fs.EXPANDABLE,
-                            "release_cache": True}
+                            "release_cache": True, "ran_with": {
+                                "PYTORCH_ALLOC_CONF": fs.EXPANDABLE,
+                                "PYTORCH_CUDA_ALLOC_CONF": None, "release_cache": True}}
     assert ab["fix_off"] == {"part": "off", "status": "ok", "alloc_conf": None,
-                             "release_cache": False}
+                             "release_cache": False, "ran_with": {
+                                 "PYTORCH_ALLOC_CONF": None, "PYTORCH_CUDA_ALLOC_CONF": None,
+                                 "release_cache": False}}
     (step,) = ab["steps"]
     assert step["fix_on"] == {"prover_s": 1.5, "verifier_s": 3.0, "handoff_s": 0.3,
                               "total_s": 4.8}
@@ -337,6 +350,13 @@ def test_part_extras(tmp_path):
                                 "verifier_s": 9.0, "checks_s": {"0": 0.5, "5": 8.5},
                                 "handoff_s": 0.4, "total_s": 12.5}]
     assert len(e["lines"]) == 4
+    assert e["allocator"] is None  # a log without the allocator line
+    alloc = {"PYTORCH_ALLOC_CONF": "expandable_segments:True", "PYTORCH_CUDA_ALLOC_CONF": None,
+             "release_cache": True}
+    log.write_text(log.read_text() + "allocator: " + json.dumps(alloc) + "\n")
+    assert fs.part_extras(fs.Part("b", [], kind="bring_up"), log)["allocator"] == alloc
+    log.write_text(log.read_text() + "allocator: {broken\n")
+    assert fs.part_extras(fs.Part("b", [], kind="bring_up"), log)["allocator"] == alloc
     # a log from before the hand-off was timed
     (old,) = fs._step_times(["step 2: prover 3.10 s (prove_step 2.00 s, commit 1.10 s); "
                              "verifier 9.00 s ()"])
@@ -354,9 +374,11 @@ def test_part_extras(tmp_path):
     assert e == {"record": None}
     smooth = tmp_path / "smooth.json"
     smooth.write_text(json.dumps({"smooth": True, "grad_norms": [1.5, 1.25], "memory": {
-        "peak_bytes": 5, "peak_reserved_bytes": 6}}))
+        "peak_bytes": 5, "peak_reserved_bytes": 6}, "environment": {
+            "record": "environment", **alloc, "release_cache": False}}))
     e = fs.part_extras(fs.Part("s", [], kind="smooth", info={"report": str(smooth)}), log)
     assert e["grad_norms"] == [1.5, 1.25]
+    assert e["allocator"] == {**alloc, "release_cache": False}
     assert (e["peak_bytes"], e["peak_reserved_bytes"]) == (5, 6)
 
 
@@ -439,7 +461,9 @@ def test_plain_extras(tmp_path):
     median, and the memory pass's peak; other totals and step 0 don't count."""
     rec = tmp_path / "plain_baseline" / "records.jsonl"
     step = {"record": "time", "side": "run", "component": "step", "level": "total"}
-    rows = [{"record": "environment", "run": "plain_baseline"},
+    alloc = {"PYTORCH_ALLOC_CONF": None, "PYTORCH_CUDA_ALLOC_CONF": None,
+             "release_cache": True}
+    rows = [{"record": "environment", "run": "plain_baseline", **alloc},
             *({**step, "step": t, "time_s": s} for t, s in ((2, 1.5), (1, 2.5), (3, 1.0))),
             {**step, "step": 0, "time_s": 99.0},
             {"record": "time", "side": "prover", "component": "prover", "level": "total",
@@ -459,6 +483,7 @@ def test_plain_extras(tmp_path):
     assert e["peak_bytes"] == 5 * 2**30 and e["mem_source"] == "cuda_allocated"
     assert e["peak_reserved_bytes"] == 6 * 2**30
     assert e["completed"] and e["lifetime_maxrss_bytes"] == 7 and e["record"] == str(rec)
+    assert e["allocator"] == alloc  # what the run's environment record says it ran with
     # a run that died after one timed step, before its memory pass
     _records(rec, rows[:3])
     e = fs.part_extras(part, tmp_path / "log.txt")
