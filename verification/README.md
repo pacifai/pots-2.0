@@ -211,6 +211,17 @@ Two instances exist, in `instances/`:
     Each bias is a weight whose gradient is a sum over tokens, so it is checked as glue,
     like the norm scales.
 
+  The output layer can also run in row blocks (`VERIF_HEAD_BLOCKS = B`, which must divide
+  the batch). Its score matrix `Λ` has a row per token and a column per vocabulary entry,
+  `N × n_v`, the largest array of a step (at full scale tens of GB). With `B` blocks each
+  block of `n_s/B` sequences gets its own `Λ_b`, `δF_b` and weight gradient `G_b`, all
+  committed products, and only one block's scores exist at a time, in training, the
+  replay and check 5 alike. Training runs the layers forward once, then per block the
+  output layer, the block's share of the loss and its gradient, and then the layers'
+  backward once from the joined `δF_b`. The weight's gradient is the sum of the `G_b` in
+  block order, through one shared helper (`chain_gradient`) that checks 6a and 6b use
+  too. `B = 1` is the whole output layer at once, bit for bit as before.
+
   Its `label` maps each captured matmul to its slot by operand identity. For example, `Y_q`
   of layer 3 is the product whose right operand is layer 3's `W_q`. Call order isn't used
   for this. Its `replay`
@@ -221,7 +232,8 @@ Two instances exist, in `instances/`:
   modules, under the same substitution, so no backward pass is written by hand. Like
   training, the replay runs one forward pass with gradients on and then one backward pass,
   one layer at a time from the top, and frees each layer's saved values once its backward
-  has run. Forward
+  has run. The output layer's backward runs block by block, each block recomputing its
+  scores from its slice of the final norm's output. Forward
   (task A8) and backward (task A9) are done. One SmolLM2 detail: its config sets
   `pad_token_id = 2`, which is also EOS and our pad token, so `nn.Embedding(padding_idx=2)`
   gives a zero embedding gradient for token 2. The replay matches the prover there because

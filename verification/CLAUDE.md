@@ -67,7 +67,8 @@ and `TAU_W0` in `verifier/bands.py`.
 
 Model shapes, from ref block §1: `L=30`, `d=576`, `d_f=1536`, `n_h=9`, `n_kv=3`, `d_h=64`,
 `n_v=49152`, 272 weight tensors, 134,515,008 parameters, tied `W_E`.
-At 4×128 tokens: `M = L·(21 + 6·n_s·n_h) + 3 = 7,113`, and there are 7,661 leaves.
+At 4×128 tokens: `M = L·(21 + 6·n_s·n_h) + 3B = 7,113` at `B = 1` (the output layer in one
+block), and there are 7,661 leaves; each further head block adds three products.
 
 ## Environment variables, with test-scale defaults
 
@@ -86,6 +87,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_ATTN_IMPL` | `eager` |
 | `VERIF_K` | `9` (was 7 until C1 recomputed it from the measured `τ`, 2026-10-05) |
 | `VERIF_BATCH` (`n_s`) / `VERIF_SEQ_LEN` (`n`) | `4` / `128` |
+| `VERIF_HEAD_BLOCKS` (`B`) | `1`: the output layer runs in `B` row blocks of `n_s/B` sequences each, so no `N × n_v` score array exists in training, the replay or check 5. Must divide `VERIF_BATCH`. `B = 1` is the output layer on all rows, bit for bit as before |
 | `VERIF_STEPS` (`T`) | `10` |
 | `VERIF_N_RECORDS` | `365`: `|D|`, which `materialize_data` checks against the records F8d's selection keeps. Full scale: 369 (refusal) or 233 (jailbreak) |
 | `VERIF_ATTACK` | `refusal`: the BackdoorLLM task whose files build `D` and `D̃` (F8d), `refusal` or `jailbreak` |
@@ -189,6 +191,11 @@ biases. This file pins the order for the other decoders (FS1), which add weight 
 without changing `M`. With q, k, v biases, each `b_x` comes right after its `W_x`
 (`W_q, b_q, W_k, b_k, W_v, b_v`). An untied output layer's `W_out` (`lm_head.weight`) comes
 last, after `γ_final`.
+
+With the output layer in `B` row blocks (`VERIF_HEAD_BLOCKS`), the product section holds
+`Λ_0 … Λ_{B−1}` where it held `Λ`, then `δF_0, G_0, δF_1, G_1, …` where it held `δF, G`,
+each of `N/B` rows; `M` grows by `3(B − 1)`. At `B = 1` the order and every leaf are as
+above.
 
 Each product leaf is the product exactly as the spec's `P = A·B` defines it. Each `(s, h)`
 member of a batched attention product is its own leaf, an `n×n` or `n×d_h` matrix. The
@@ -491,7 +498,9 @@ interface.
     glue, 6b), of shape `(width,)`, on a forward product with a weight that isn't a member.
   - `DeclaredComputation` (ABC):
     - Declared: `n_s`, `eta` (η is part of `C`), `weight_names`, `weight_shapes`, `products`,
-      and `linear_weights` (a weight name mapped to the `m` of its `G`; these go to 6a).
+      and `linear_weights` (a weight name mapped to the tuple of `m`s of its `G`s, whose
+      widened sum `chain_gradient` forms is its gradient; these go to 6a). A layer's linear
+      maps to one `m`; an untied output layer in `B` head blocks maps to `B`.
     - Derived: `M`, `n_w`, `n_leaves = n_s + 2n_w + M`, `glue_gradient_weights` (these go to
       6b), `product(m)`, `record_index`, `w_t_index`, `product_index`, `w_next_index` and
       `validate()`. `validate()` rejects `q < 2`, because of P7.
@@ -501,8 +510,16 @@ interface.
       `autocast()` (FS3) is the mixed-precision context around forward and loss, the same in
       training, the plain run and the replay (F5a, F6b); a `nullcontext` by default.
     - Verifier: `replay(leaves) -> Replay`.
-    - Prover only: `loss` and `label`. The verifier must never call them, and A5 adds a test
-      for this.
+    - Prover only: `loss`, `forward_backward` and `label`. The verifier must never call
+      them, and A5 adds a test for this. `forward_backward(model, records, stage) -> ℒ` is
+      one training pass, forward and backward, leaving every `.grad` set; `stage(p)` is a
+      context manager for the phase `p` (`"forward"` or `"backward"`) that may be entered
+      several times per pass. The default is `loss` under `stage("forward")` and
+      `loss.backward()` under `stage("backward")`; the decoder overrides it (head blocks).
+  - `chain_gradient(parts, dtype)` is a weight's gradient from its `G` products: each widened
+    to `dtype` and added in order, out of place. Training's head blocks, check 6a and 6b's
+    tied `W_E` sum through it, so prover and verifier add the same numbers in the same
+    order. One part already in `dtype` is returned as it is.
   - `LabelingError` (prover side) and `ReplayError` (verifier side). Both are `RuntimeError`s
     and mean the model run doesn't match `C`. A `ReplayError` runs on leaves check 2 already
     validated, so it's a verifier-side bug and propagates as a crash, never a rejection.
@@ -556,10 +573,11 @@ interface.
   It was `instances/llama.py` with `LlamaComputation` until FS1. The module docstring has the
   pins and the labeling rules.
   - `DecoderComputation(config, *, n_s, n, eta, source=None, master_dtype=float32,
-    compute_dtype=float32, device="cpu", pad_id=None)`, with `.from_pretrained(repo,
-    revision, *, n_s, n, eta, master_dtype, compute_dtype, device)` and `.from_config(cfg)`
-    (the run's instance, from a `RunConfig`, with `VERIF_MASTER_DTYPE`, `VERIF_COMPUTE_DTYPE`
-    and `VERIF_DEVICE`). It accepts `model_type` `llama` or `qwen2` and rejects Llama's
+    compute_dtype=float32, device="cpu", pad_id=None, head_blocks=1)`, with
+    `.from_pretrained(repo, revision, *, n_s, n, eta, master_dtype, compute_dtype, device,
+    head_blocks)` and `.from_config(cfg)` (the run's instance, from a `RunConfig`, with
+    `VERIF_MASTER_DTYPE`, `VERIF_COMPUTE_DTYPE`, `VERIF_DEVICE` and `VERIF_HEAD_BLOCKS`).
+    A `head_blocks` that doesn't divide `n_s` raises `ValueError`. It accepts `model_type` `llama` or `qwen2` and rejects Llama's
     `attention_bias` (it also biases `o`) and `mlp_bias`, any layer that isn't full attention
     (Qwen2's sliding window), a non-SiLU activation, `pretraining_tp ≠ 1`, `n_h` not a
     multiple of `n_kv`, a pad outside the vocabulary, and non-zero dropout. Without `source`,
@@ -580,8 +598,8 @@ interface.
   - **Switches (FS1).** Both come from the config, never from the model name or the scale:
     - `tied = tie_word_embeddings`. Tied: the output projection is `W_E`, and the head's
       weight gradient `G_E_head` is a summand of `W_E`'s glue gradient (6b). Untied (Falcon3):
-      `w_out` is `lm_head.weight`, a linear weight whose gradient `G_head` is a checked
-      product (in `linear_weights`, so 6a), and `W_E`'s glue gradient is the lookup gradient
+      `w_out` is `lm_head.weight`, a linear weight whose gradient is the checked `G_head`
+      products, one per head block (in `linear_weights`, so 6a), and `W_E`'s glue gradient is the lookup gradient
       alone. `g_head` names the head's gradient product either way.
     - `qkv_bias = model_type == "qwen2"` (HF's Qwen2 hardcodes q, k, v biases). `bias(ℓ, x)`
       names `b_x` or gives `None`; `biases` maps each biased weight to its bias. A bias is a
@@ -597,9 +615,10 @@ interface.
     and `ε_acc = 2⁻²⁴` at bf16.
     - `autocast()` is `torch.autocast(device_type, dtype=compute_dtype)` when the two dtypes
       differ and a `nullcontext` otherwise, so `(fp32, fp32)` is unchanged bit for bit (every
-      SmolLM2 root, loss and check number below). `loss` (the prover's and the plain step's)
-      and the replay's one forward pass run forward and loss inside it; backward runs outside
-      it and inherits the forward's dtypes. `device_type` comes from `VERIF_DEVICE`. CPU and
+      SmolLM2 root, loss and check number below). `forward_backward` (the prover's and the
+      plain step's) and the replay's one forward pass run forward and loss inside it;
+      backward runs with autocast off inside the same region (`_autocast_off`, so the weight
+      casts stay cached across head blocks) and inherits the forward's dtypes. `device_type` comes from `VERIF_DEVICE`. CPU and
       CUDA autocast cast different op sets, so a CPU result says nothing about the GPU.
     - What CPU autocast does (torch 2.9.1): each linear reads a bf16 copy of its weight made
       once per weight per pass, and a bf16 copy of its input made per use (q, k and v read
@@ -616,8 +635,9 @@ interface.
       fp32 copy of `G_x`'s whole output (`capture.is_copy_of(grad, index)`).
     - **The replay** follows each copy through `ProductSubstitution(copied=...)`: a copy of a
       weight's storage maps to that weight for the pass; the map is cleared at each pass and
-      pruned as each unit's backward runs. The head's `G_E_head` is widened to fp32 before it
-      joins `G_E^emb` in `glue_gradients()`, whose rerun of the embedding's backward runs
+      pruned as each unit's backward runs. The head's `G_E_head` leaves are widened to fp32
+      and chained (`chain_gradient`, block order) before they join `G_E^emb` in
+      `glue_gradients()`, whose rerun of the embedding's backward runs
       inside `autocast()` too, so it matches the prover's setting by construction. CPU
       autocast leaves the lookup alone, so the wrap changes no bits: `G_E` still equals
       training's bit for bit at both dtypes (the switch tests and A9).
@@ -756,7 +776,7 @@ interface.
   - `build_model()`: an unmodified `from_pretrained` causal LM (`AutoModelForCausalLM`) through
     `setup.model.load_pretrained`, eager attention, fp32, in eval mode, checked against the
     declared weights and against `tied` (the output projection is or isn't `W_E`'s tensor).
-  - `matmul_count_decoder(L, n_s, n_h) = L·(21 + 6·n_s·n_h) + 3`.
+  - `matmul_count_decoder(L, n_s, n_h, blocks=1) = L·(21 + 6·n_s·n_h) + 3B`.
   - `encode_record` raises `RecordError` on a non-`Record` or a record longer than `n`.
   - **Pins:**
     - Weight names are the HF parameter names, in ref block §6 order: `w(ℓ, x)`,
@@ -765,13 +785,32 @@ interface.
     - Product names are `L{ℓ}.Y_x`, `L{ℓ}.dX_x`, `L{ℓ}.G_x`, `L{ℓ}.S[s,h]` (and `O`, `dA`,
       `dV`, `dQ`, `dK`), `Lambda`, `dF` and `G_E_head` (`G_head` when untied), looked up with
       `m_of(name)`. `member` is the 0-based `(s, h)`.
+    - **Head blocks (`B = head_blocks`).** Block `b` (0-based) holds sequences
+      `[b·n_s/B, (b+1)·n_s/B)`, rows `[b·N/B, (b+1)·N/B)`. At `B > 1` its products are
+      `Lambda[b]`, `dF[b]` and `G_E_head[b]` (`G_head[b]`), each with `N/B` rows where it had
+      `N`; at `B = 1` they keep the plain names. `head_name(kind, b)` (kind `"Lambda"`,
+      `"dF"` or `"G"`) gives them. Canonical order: the layers' forward, `Lambda[0]` …
+      `Lambda[B−1]`, then `dF[0], G[0], dF[1], G[1], …`, then layer `L`'s backward.
+      `head_gradients` is the tuple of the `G` blocks' `m`s.
     - `product_class(spec)` is the role without layer and member (`Y_q`, `S`, `dK`, `Lambda` …),
       30 classes: 21 linear roles, the six attention roles, and `Lambda`, `dF` and `G_E_head`
-      (`G_head` when untied). A band file for an untied model needs a `G_head` class: one
+      (`G_head` when untied); every head block's product is its kind's class. A band file for an untied model needs a `G_head` class: one
       naming `G_E_head` fails `Bands.check_keys`, and a missing class falls back to
       `kappa_max`.
     - The batch is `setup.data.assemble_batch`, and `ρ` is HF's `attention_mask`. The loss is
-      `Σ μ_i·CE_i / Σ μ_i` (`loss_from_logits`). A batch with `Σ μ = 0` raises `ValueError`
+      `Σ μ_i·CE_i / Σ μ_i` (`loss_from_logits`); `block_loss(logits, batch, seqs)` is the
+      share of the sequences `seqs`, over the whole batch's `Σ μ`, so the shares sum to it.
+    - **Training (`forward_backward`).** One autocast region: `features` (the body through
+      the final norm) once with its graph, then per block a copy of `F`'s rows with grad on
+      (`_head_input`; its own storage labels `G_b` at fp32), `lm_head`, `block_loss`, and
+      `torch.autograd.grad` to `δF_b` and `G_b` (never AccumulateGrad, which at fp32 would
+      write into the committed `G_0`); the block's scores go before the next block. The body's
+      backward then runs once from `cat(δF_b)`. `W`'s head gradient is `chain_gradient` of the
+      `G_b`: `W_out.grad` untied, added to the lookup's `W_E.grad` tied. `ℒ` is the fp32 sum of
+      the shares. At `B = 1` `ℒ` and every `.grad` equal `loss(…).backward()`'s bit for bit
+      (tied and untied, fp32 and bf16); at `B > 1` they differ in the last bits, since an
+      `N/B`-row matmul may round `Λ` differently from an `N`-row one. `loss` and `logits`
+      still run all rows at once, for tests and calibration only. A batch with `Σ μ = 0` raises `ValueError`
       in `loss` instead of giving a 0/0 NaN. `build_record` never builds such a record (its
       EOS target is always masked in), so only a faulted batch can reach it.
   - `label` maps records by operand storage. The forward `S` and `O` have no storage link to a
@@ -801,7 +840,7 @@ interface.
     the head. On entering unit `j > 1` the hook checks that its input equals unit `j−1`'s
     output exactly (bitwise, NaN equal), so the cut can't change what flows between units.
     The call sequence must be the declared one (`Y_q, Y_k, Y_v, S, O, Y_o, Y_gate, Y_up,
-    Y_down` per layer, then `Λ`), linears identified by weight storage; `S` and `O` are the
+    Y_down` per layer, then `Λ_0 … Λ_{B−1}`), linears identified by weight storage; `S` and `O` are the
     two bmms after a layer's `Y_v`. An undeclared mm, a bmm anywhere else, a different order
     or a unit input that isn't the previous unit's output raises `ReplayError`, and so does a
     forward product whose bias isn't the declared one (`supply`'s `bias` must be `b_x`'s
@@ -815,9 +854,15 @@ interface.
     device), so every backward mm/bmm also gets its committed leaf. A product that escaped
     the mode would be reported missing. No backward is written by hand. One backward per
     unit, from the top:
-    - Head (`j = L+1`): the kept loss, grad to `[X_{L+1}, γ_final, W_out]` (`W_out` is
-      `W_E` when tied). `δΛ` comes from autograd through `loss_from_logits`; `loss` and
-      `label` are never called.
+    - Head (`j = L+1`), in sub-units `(L+1, b)`, one per head block. The forward pass
+      stops at `F` (the final norm's output, kept with its graph) and runs `lm_head` on each
+      block's copy of `F`'s rows only to record `Λ_b`'s operands; the scores aren't kept.
+      Block `b`'s backward runs `lm_head` again from that copy, under substitution, with
+      `Λ_b` the committed leaf, then `block_loss` and `autograd.grad` to `δF_b` and `G_b`;
+      its operands go after `G_b`. So `lm_head` runs `2B` times per replay. After the last
+      block the final norm's backward runs from `cat(δF_b)` to `δX_{L+1}` and `γ_final`'s
+      gradient. `δΛ` comes from autograd through `block_loss`; `loss`, `forward_backward`
+      and `label` are never called.
     - Layer `j`: the kept output, grad to `[X_j, γ_attn, γ_mlp, b_q, b_k, b_v, W_q..W_down]`
       (the biases when declared) with `grad_outputs = δX_{j+1}` (the committed-chain value
       the previous unit gave). A backward product carrying a bias raises `ReplayError`.
@@ -838,13 +883,13 @@ interface.
     - Memory, as in training: after the forward pass every unit's graph and operands are
       held, about one training step's activations. Each unit's backward frees its graph
       (`retain_graph=False`) and the unit is dropped, so memory falls unit by unit; the
-      served backward operands are dropped after `g_head` or `L{j}.G_v`. The frontier
-      `(j, δX_j)` and the γ gradients persist. The head unit is the largest (`δΛ` and the
-      softmax intermediates are `N×n_v`). A request out of order (a forward product whose
+      served backward operands are dropped after each block's `G` or `L{j}.G_v`. The
+      frontier `(j, δX_j)` and the γ gradients persist. A head block holds `N/B × n_v`
+      scores, `δΛ_b` and softmax intermediates, at most one block at a time. A request out of order (a forward product whose
       unit is gone, or a backward unit already run) rebuilds the whole pass from scratch.
     - `glue_gradients()` is valid only right after `operands(M)` with the frontier at layer
-      1. It returns the γ and bias gradients and, for `W_E`, `G_E_head` plus `G_E^emb` when
-      tied and `G_E^emb` alone when untied, where `G_E^emb` =
+      1. It returns the γ and bias gradients and, for `W_E`, `chain_gradient` of the
+      `G_E_head` blocks plus `G_E^emb` when tied and `G_E^emb` alone when untied, where `G_E^emb` =
       `autograd.grad(embed_tokens(ids), W_E, δX_1)` under a substitution that forbids
       products. `G_E^emb` comes from the model's own `nn.Embedding`, so a `padding_idx`
       row is zero (see the SmolLM2 note in the README). At test scale this has no numeric
@@ -1000,7 +1045,9 @@ interface.
   - `prove_step(computation, model, w_t, records, *, train_records=None, perturb=None,
     section=None) -> StepOutput`. `section` is B6's metrics seam (see `runs/metrics.py`),
     with phases `train.*` (training under capture), `P1.label`, `P2.w_t` and `P2.w_next`.
-    `Section` and `no_section` live here; `verifier/context.py` repeats them, because the
+    Training runs `computation.forward_backward` with `stage(p)` = the capture's phase `p`
+    plus the section `train.p`; the decoder's head blocks enter each several times per step,
+    and a section sums its entries. `Section` and `no_section` live here; `verifier/context.py` repeats them, because the
     verifier may not import the prover (invariant 1).
   - `plain_step(..., section=None)` runs the same step uncaptured. Hidden steps are made of
     `plain_step` calls, and `runs/loop.run_plain` chains them for the plain baseline (B7).
@@ -1141,7 +1188,8 @@ interface.
     unchanged. `tests/verification/verifier/test_update_identity.py` compares the two.
   - **Check 6a under mixed precision (FS3, F6b).** The committed `G` is a bf16 product leaf;
     6a widens it exactly to fp32 before the update identity, as AccumulateGrad does for
-    training's `W.grad`. At fp32 the cast is a no-op.
+    training's `W.grad`. At fp32 the cast is a no-op. A weight with several `G`s (an untied
+    output layer in head blocks) takes `chain_gradient` of them, training's sum.
   - **Devices (F4a, FS9).** Leaves are in host memory and the replay runs on
     `VERIF_DEVICE`. Check 5 moves each committed product and bias to its rebuilt operands'
     device (`_served`) and measures there; check 6 runs on the host, and 6b's glue gradient
@@ -1542,7 +1590,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     class, `spec_class(c, spec)`: `forward`, `input gradient`, `weight gradient`,
     `attention score`, `attention value`, and the placeholder `operand gradient` for δA,
     δV, δQ̃ and δK̃, which §5.7 doesn't name), `p_layer` (0-based since the EV2 review:
-    `0 … L−1` for the layer stack, `L` for the output layer's `Lambda`, `dF` and `G_E_head`;
+    `0 … L−1` for the layer stack, `L` for the output layer's `Lambda`, `dF` and `G_E_head`
+    (every head block's);
     `layer_count(c)`, `layer_index(spec, L)`); per tensor `w_check`, `w_name`; then `rho_5`
     `[P, k]`, `rho_kappa` `[P]`,
     `rho_6` `[W]` row for row (`rho_arrays`), and `band_source`, the bands' hash (empty while
