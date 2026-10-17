@@ -99,7 +99,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -715,10 +715,11 @@ class DecoderComputation(DeclaredComputation):
         w = head.weight
         loss: torch.Tensor | None = None
         dfs: list[torch.Tensor] = []
-        gs: list[torch.Tensor] = []
-        with self.autocast():
-            with stage("forward"):
-                f = self.features(model, batch)
+
+        def blocks() -> Iterator[torch.Tensor]:
+            """Each block's ``G_b`` in order, ``chain_gradient``'s parts: the sum takes each as
+            it comes, so one block's widened ``G_b`` is held at a time, not ``B``."""
+            nonlocal loss
             for b in range(self.head_blocks):
                 with stage("forward"):
                     fb = self._head_input(f, b)
@@ -726,14 +727,18 @@ class DecoderComputation(DeclaredComputation):
                 with stage("backward"), self._autocast_off():
                     df, g = torch.autograd.grad(part, [fb, w])
                 dfs.append(df)
-                gs.append(g)
                 part = part.detach()
                 loss = part if loss is None else loss + part
-                del fb, part, df, g  # block b's graph and scores go before block b+1's
+                del fb, part, df  # block b's graph and scores go before block b+1's
+                yield g
+
+        with self.autocast():
+            with stage("forward"):
+                f = self.features(model, batch)
+            g = chain_gradient(blocks(), self.weight_dtype)
             with stage("backward"), self._autocast_off():
                 f.backward(torch.cat(dfs))
                 del f, dfs
-                g = chain_gradient(gs, self.weight_dtype)
                 w.grad = g if w.grad is None else g + w.grad  # tied: + the lookup's
         assert loss is not None
         return loss

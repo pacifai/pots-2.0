@@ -807,7 +807,8 @@ interface.
       `torch.autograd.grad` to `δF_b` and `G_b` (never AccumulateGrad, which at fp32 would
       write into the committed `G_0`); the block's scores go before the next block. The body's
       backward then runs once from `cat(δF_b)`. `W`'s head gradient is `chain_gradient` of the
-      `G_b`: `W_out.grad` untied, added to the lookup's `W_E.grad` tied. `ℒ` is the fp32 sum of
+      `G_b`, each added as its block ends, so one widened `G_b` is held at a time:
+      `W_out.grad` untied, added to the lookup's `W_E.grad` tied. `ℒ` is the fp32 sum of
       the shares. At `B = 1` `ℒ` and every `.grad` equal `loss(…).backward()`'s bit for bit
       (tied and untied, fp32 and bf16); at `B > 1` they differ in the last bits, since an
       `N/B`-row matmul may round `Λ` differently from an `N`-row one. `loss` and `logits`
