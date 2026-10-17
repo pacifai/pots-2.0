@@ -200,8 +200,8 @@ class MLPComputation(DeclaredComputation):
         return self._m_by_name[name]
 
     @cached_property
-    def linear_weights(self) -> dict[str, int]:
-        return {self.weight(l): self.m_of(f"G_{l}") for l in range(1, self.L + 1)}
+    def linear_weights(self) -> dict[str, tuple[int, ...]]:
+        return {self.weight(l): (self.m_of(f"G_{l}"),) for l in range(1, self.L + 1)}
 
     # ---- shared ---------------------------------------------------------------------------
 

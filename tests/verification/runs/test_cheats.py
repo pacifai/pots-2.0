@@ -255,7 +255,7 @@ def test_targets_one_per_spec_class_and_the_binding_product(env):
     assert [s.name for s in fs.sweep_targets(c, ["weight_grad:layers.*.weight"])] == ["G_2"]
     with pytest.raises(ValueError, match="unknown"):
         fs.sweep_targets(c, ["nope"])
-    assert c.linear_weights[fs.check6_weight(c)] == c.m_of("G_2")
+    assert c.linear_weights[fs.check6_weight(c)] == (c.m_of("G_2"),)
     d = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
     specs = fs.sweep_targets(d)
     assert [s.name for s in specs] == ["L1.Y_q", "L1.S[0,0]", "L1.O[0,0]", "dF", "L1.dX_down",

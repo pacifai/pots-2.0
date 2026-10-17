@@ -58,7 +58,7 @@ def test_inventory(widths):
                   ProductKind.INPUT_GRAD: ((3, o), (o, i)),
                   ProductKind.WEIGHT_GRAD: ((o, 3), (3, i))}[p.kind]
         assert (p.a_shape, p.b_shape) == expect
-    for w, m in c.linear_weights.items():
+    for w, (m,) in c.linear_weights.items():
         assert c.product(m).p_shape == c.weight_shapes[w]
     assert set(c.linear_weights) == set(c.weight_names)
     assert c.glue_gradient_weights == ()

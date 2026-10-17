@@ -141,7 +141,7 @@ def test_weights_match_the_model(setup):
     assert c.weight_names[0] == c.w_e and c.weight_names[-1] == c.gamma_final
     assert c.weight_names[1:10] == (c.gamma_attn(1), *(c.w(1, x) for x in "qkvo"),
                                     c.gamma_mlp(1), *(c.w(1, x) for x in ("gate", "up", "down")))
-    assert c.linear_weights == {c.w(l, x): c.m_of(f"L{l}.G_{x}")
+    assert c.linear_weights == {c.w(l, x): (c.m_of(f"L{l}.G_{x}"),)
                                 for l in range(1, c.L + 1) for x in LINEARS}
     gammas = {c.gamma_final} | {g(l) for l in range(1, c.L + 1)
                                 for g in (c.gamma_attn, c.gamma_mlp)}
@@ -1188,9 +1188,9 @@ def test_switches_declaration(switched):
     assert {p.weight for p in head} == {c.w_out} == {c.w_e if tied else "lm_head.weight"}
     assert c.product_class(head[2]) == g_head
 
-    linear = {c.w(l, x): c.m_of(f"L{l}.G_{x}") for l in range(1, c.L + 1) for x in LINEARS}
+    linear = {c.w(l, x): (c.m_of(f"L{l}.G_{x}"),) for l in range(1, c.L + 1) for x in LINEARS}
     if not tied:
-        linear["lm_head.weight"] = c.m_of("G_head")
+        linear["lm_head.weight"] = (c.m_of("G_head"),)
     assert c.linear_weights == linear
     biases = [n for n in want if n.endswith(".bias")]
     assert len(biases) == (3 * c.L if c.qkv_bias else 0)

@@ -26,8 +26,8 @@ Other cheats are assembled by the caller from honest outputs, not by hooks here 
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -149,7 +149,8 @@ def plain_step(computation: DeclaredComputation, model: torch.nn.Module,
 
     For hidden steps, η tuning and the capture-on/off comparison. With ``section`` it is EQ1b's
     P0, the plain baseline: ``P0.load``, ``P0.forward``, ``P0.backward`` and ``P0.update`` cover
-    the same work as :func:`prove_step`'s ``train.*`` phases. Copying out ``W_{t+1}`` is the
+    the same work as :func:`prove_step`'s ``train.*`` phases (forward and backward entered once
+    per head block and summed, as there). Copying out ``W_{t+1}`` is the
     caller's and sits outside them.
     """
     sec = section or no_section
@@ -157,10 +158,7 @@ def plain_step(computation: DeclaredComputation, model: torch.nn.Module,
         load_weights(computation, model, w_t)
         model.zero_grad(set_to_none=True)
         opt = _optimizer(computation, model)
-    with sec("P0.forward"):
-        loss = computation.loss(model, records)
-    with sec("P0.backward"):
-        loss.backward()
+    loss = computation.forward_backward(model, records, lambda p: sec(f"P0.{p}"))
     with sec("P0.update"):
         opt.step()
         model.zero_grad(set_to_none=True)
@@ -184,6 +182,8 @@ def prove_step(
     wraps the phases ``train.load``, ``P2.w_t``, ``train.forward``, ``train.backward``,
     ``P1.label``, ``train.update`` and ``P2.w_next``. ``train.*`` is training under capture, not
     EQ1b's P0, which only :func:`plain_step` measures (``runs/metrics.py`` maps the rows).
+    ``computation.forward_backward`` may enter ``train.forward`` and ``train.backward`` several
+    times (the decoder's head blocks); a section sums its entries.
 
     The committed ``W_t`` leaves are the caller's ``w_t`` tensors themselves, not copies, when
     each is a contiguous tensor of the model's dtype, shape and device that owns its whole
@@ -213,11 +213,15 @@ def prove_step(
         opt = _optimizer(computation, model)
 
     cap = MatmulCapture(param_names=param_storage_map(model))
+
+    @contextmanager
+    def stage(p: str) -> Iterator[None]:
+        with cap.phase(p), sec(f"train.{p}"):
+            yield
+
     with cap:
-        with cap.phase("forward"), sec("train.forward"):
-            loss = computation.loss(model, records if train_records is None else train_records)
-        with cap.phase("backward"), sec("train.backward"):
-            loss.backward()
+        loss = computation.forward_backward(
+            model, records if train_records is None else train_records, stage)
     with sec("P1.label"):
         products = [p.detach().to(HOST) for p in computation.label(cap, model)]
         if len(products) != computation.M:

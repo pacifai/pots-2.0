@@ -97,7 +97,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -117,6 +117,7 @@ from verification.computation.interface import (
     ProductSpec,
     Replay,
     ReplayError,
+    chain_gradient,
     load_weights,
 )
 from verification.computation.matmul_ops import param_storage_map
@@ -148,11 +149,12 @@ _HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_back
 _GAMMA_FINAL = "model.norm.weight"
 
 
-def matmul_count_decoder(L: int, n_s: int, n_h: int) -> int:
-    """Products per step for the decoder block, `M = L(21 + 6·n_s·n_h) + 3` (ref block §5).
+def matmul_count_decoder(L: int, n_s: int, n_h: int, blocks: int = 1) -> int:
+    """Products per step for the decoder block, `M = L(21 + 6·n_s·n_h) + 3B` (ref block §5),
+    the output layer in ``B = blocks`` row blocks.
 
     The same with an untied output layer or q, k, v biases (S2, F14)."""
-    return L * (21 + 6 * n_s * n_h) + 3
+    return L * (21 + 6 * n_s * n_h) + 3 * blocks
 
 
 def _ptr(t: torch.Tensor) -> int:
@@ -197,6 +199,9 @@ class DecoderComputation(DeclaredComputation):
     ``pad_id`` is the batch's pad, the model's EOS (F8f). With ``source`` it is
     ``data.run_pin(*source)``'s, and a different ``pad_id`` raises; without, it defaults to
     SmolLM2's ``PAD_ID``.
+    ``head_blocks`` is ``B``, ``VERIF_HEAD_BLOCKS``: the output layer runs in ``B`` blocks of
+    ``n_s/B`` records each, so no ``N × n_v`` array exists in training or the replay. ``B``
+    must divide ``n_s``; ``B = 1`` is the whole batch at once.
     """
 
     def __init__(self, config: Any, *, n_s: int, n: int, eta: float,
@@ -204,10 +209,15 @@ class DecoderComputation(DeclaredComputation):
                  master_dtype: torch.dtype = torch.float32,
                  compute_dtype: torch.dtype = torch.float32,
                  device: str | torch.device = "cpu",
-                 pad_id: int | None = None) -> None:
+                 pad_id: int | None = None,
+                 head_blocks: int = 1) -> None:
         self.config = copy.deepcopy(config)
         self.source = source
         self._n_s, self.n, self._eta = int(n_s), int(n), float(eta)
+        if int(head_blocks) < 1 or self._n_s % int(head_blocks):
+            raise ValueError(f"head_blocks B = {head_blocks} must be at least 1 and divide "
+                             f"n_s = {self._n_s}")
+        self.head_blocks = int(head_blocks)
         pinned = None if source is None else run_pin(*source).eos_token_id
         if pad_id is not None and pinned is not None and pad_id != pinned:
             raise ValueError(f"pad_id {pad_id} is not {source[0]}'s pinned EOS {pinned} (F8f)")
@@ -244,19 +254,22 @@ class DecoderComputation(DeclaredComputation):
     def from_pretrained(cls, repo: str, revision: str, *, n_s: int, n: int, eta: float,
                         master_dtype: torch.dtype = torch.float32,
                         compute_dtype: torch.dtype = torch.float32,
-                        device: str | torch.device = "cpu") -> DecoderComputation:
+                        device: str | torch.device = "cpu",
+                        head_blocks: int = 1) -> DecoderComputation:
         config = load_model_config(repo, revision)
         return cls(config, n_s=n_s, n=n, eta=eta, source=(repo, revision),
-                   master_dtype=master_dtype, compute_dtype=compute_dtype, device=device)
+                   master_dtype=master_dtype, compute_dtype=compute_dtype, device=device,
+                   head_blocks=head_blocks)
 
     @classmethod
     def from_config(cls, cfg: RunConfig) -> DecoderComputation:
         """The run's instance: ``VERIF_MODEL`` at ``VERIF_MODEL_REVISION``, ``VERIF_BATCH ×
         VERIF_SEQ_LEN``, ``η = VERIF_ETA``, ``(VERIF_MASTER_DTYPE, VERIF_COMPUTE_DTYPE)`` on
-        ``VERIF_DEVICE``."""
+        ``VERIF_DEVICE``, the output layer in ``VERIF_HEAD_BLOCKS`` blocks."""
         return cls.from_pretrained(cfg.model, cfg.model_revision, n_s=cfg.batch, n=cfg.seq_len,
                                    eta=cfg.require_eta(), master_dtype=cfg.master_dtype,
-                                   compute_dtype=cfg.compute_dtype, device=cfg.device)
+                                   compute_dtype=cfg.compute_dtype, device=cfg.device,
+                                   head_blocks=cfg.head_blocks)
 
     def _check_config(self) -> None:
         c = self.config
@@ -323,9 +336,23 @@ class DecoderComputation(DeclaredComputation):
 
     @property
     def g_head(self) -> str:
-        """The head's weight-gradient product: ``G_E_head``, a summand of ``W_E``'s glue
+        """The head's weight-gradient class: ``G_E_head``, a summand of ``W_E``'s glue
         gradient, when tied; ``G_head``, ``W_out``'s linear gradient, when untied."""
         return "G_E_head" if self.tied else "G_head"
+
+    def head_name(self, kind: str, b: int) -> str:
+        """The name of block ``b``'s (0-based) head product of ``kind``, ``"Lambda"``,
+        ``"dF"`` or ``"G"``: ``Lambda[b]``, ``dF[b]``, ``G_E_head[b]`` (``G_head[b]``), and
+        the plain class name when ``B = 1``."""
+        base = {"Lambda": "Lambda", "dF": "dF", "G": self.g_head}[kind]
+        if not 0 <= b < self.head_blocks:
+            raise ValueError(f"head block {b} is outside 0..{self.head_blocks - 1}")
+        return base if self.head_blocks == 1 else f"{base}[{b}]"
+
+    def _head_seqs(self, b: int) -> slice:
+        """Block ``b``'s sequences, ``[b·n_s/B, (b+1)·n_s/B)``: rows ``[b·N/B, (b+1)·N/B)``."""
+        s = self.n_s // self.head_blocks
+        return slice(b * s, (b + 1) * s)
 
     @property
     def gamma_final(self) -> str:
@@ -404,10 +431,16 @@ class DecoderComputation(DeclaredComputation):
             attn(l, "O", fwd, (n, n), (n, d_h))
             for x in ("o", "gate", "up", "down"):
                 linear(l, x, fwd)
-        w_out, g_head = self.w_out, self.g_head
-        rows.append(("Lambda", fwd, (N, d), (d, n_v), w_out, None, None, "Lambda"))
-        rows.append(("dF", ig, (N, n_v), (n_v, d), w_out, None, None, "dF"))
-        rows.append((g_head, wg, (n_v, N), (N, d), w_out, None, None, g_head))
+        # The head in B row blocks of N/B rows: every Λ_b, then dF_b, G_b block by block.
+        w_out, g_head, R, B = self.w_out, self.g_head, N // self.head_blocks, self.head_blocks
+        for b in range(B):
+            rows.append((self.head_name("Lambda", b), fwd, (R, d), (d, n_v), w_out, None, None,
+                         "Lambda"))
+        for b in range(B):
+            rows.append((self.head_name("dF", b), ig, (R, n_v), (n_v, d), w_out, None, None,
+                         "dF"))
+            rows.append((self.head_name("G", b), wg, (n_v, R), (R, d), w_out, None, None,
+                         g_head))
         for l in range(self.L, 0, -1):
             for x in ("down", "gate", "up", "o"):
                 linear(l, x, ig)
@@ -443,18 +476,25 @@ class DecoderComputation(DeclaredComputation):
 
         Explicit names, one per row of ref block §5 split by weight: ``Y_q`` … ``G_down``, ``S``,
         ``O``, ``dA``, ``dV``, ``dQ``, ``dK``, ``Lambda``, ``dF`` and ``G_E_head`` (``G_head``
-        when untied).
+        when untied). The head's ``B`` blocks share their class.
         """
         if self.product(spec.m) != spec:
             raise ValueError(f"{spec.name} is not product {spec.m} of this computation")
         return self._inventory[1][spec.m - 1]
 
     @cached_property
-    def linear_weights(self) -> dict[str, int]:
-        out = {self.w(l, x): self.m_of(f"L{l}.G_{x}")
+    def head_gradients(self) -> tuple[int, ...]:
+        """The ``m`` of the head's weight-gradient products ``G_b``, block by block; their
+        :func:`~verification.computation.interface.chain_gradient` is the head's part of the
+        output projection's gradient."""
+        return tuple(self.m_of(self.head_name("G", b)) for b in range(self.head_blocks))
+
+    @cached_property
+    def linear_weights(self) -> dict[str, tuple[int, ...]]:
+        out = {self.w(l, x): (self.m_of(f"L{l}.G_{x}"),)
                for l in range(1, self.L + 1) for x in LINEARS}
         if not self.tied:
-            out[_W_OUT] = self.m_of("G_head")
+            out[_W_OUT] = self.head_gradients
         return out
 
     # glue_gradient_weights (the base class's derivation): W_E, every γ and every bias, for
@@ -548,25 +588,52 @@ class DecoderComputation(DeclaredComputation):
                      b.rho.to(self.device))
 
     def logits(self, model: nn.Module, batch: Batch) -> torch.Tensor:
-        """``Λ`` as ``[n_s, n, n_v]``: the forward pass, embedding to output projection."""
+        """``Λ`` as ``[n_s, n, n_v]``: the forward pass, embedding to output projection, all
+        rows at once. Training and the replay run the head in blocks instead
+        (:meth:`forward_backward`)."""
         return model(input_ids=batch.ids, attention_mask=batch.rho, use_cache=False).logits
 
+    def _features(self, model: nn.Module, batch: Batch) -> torch.Tensor:
+        """``F`` as ``[n_s, n, d]``: the forward pass, embedding through the final norm, as HF
+        runs it before the output projection."""
+        return model.model(input_ids=batch.ids, attention_mask=batch.rho,
+                           use_cache=False).last_hidden_state
+
+    def _head_input(self, f: torch.Tensor, b: int) -> torch.Tensor:
+        """Block ``b``'s rows of ``F``, cut from ``F``'s graph and copied, with grad on. The copy
+        gives each block's ``Λ_b`` an ``A`` of its own storage, which labels ``G_b`` at fp32."""
+        return f.detach()[self._head_seqs(b)].clone().requires_grad_()
+
     @staticmethod
-    def loss_from_logits(logits: torch.Tensor, batch: Batch) -> torch.Tensor:
-        """``ℒ = (1/Σμ)·Σ_i μ_i·(logsumexp(Λ_i) − Λ_{i,y_i})`` (ref block §3)."""
+    def block_loss(logits: torch.Tensor, batch: Batch,
+                   seqs: slice = slice(None)) -> torch.Tensor:
+        """The share of ``ℒ = (1/Σμ)·Σ_i μ_i·(logsumexp(Λ_i) − Λ_{i,y_i})`` (ref block §3) of the
+        sequences ``seqs``, whose ``Λ`` is ``logits``: ``Σ_{i ∈ seqs} μ_i·CE_i``, over ``Σμ`` of
+        the whole batch. The shares of a partition of the batch sum to ``ℒ``."""
         mask = batch.mask.reshape(-1)
         if not bool(mask.any()):
             raise ValueError("the batch has no loss-masked target")
-        ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), batch.targets.reshape(-1),
-                             reduction="none")
+        ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]),
+                             batch.targets[seqs].reshape(-1), reduction="none")
         mu = mask.to(ce.dtype)  # CE's dtype, not the logits' (module docstring)
-        return (ce * mu).sum() / mu.sum()
+        return (ce * batch.mask[seqs].reshape(-1).to(ce.dtype)).sum() / mu.sum()
+
+    @staticmethod
+    def loss_from_logits(logits: torch.Tensor, batch: Batch) -> torch.Tensor:
+        """``ℒ`` from the whole batch's ``Λ``: :meth:`block_loss` of every sequence."""
+        return DecoderComputation.block_loss(logits, batch)
 
     def _forward_loss(self, model: nn.Module, batch: Batch) -> torch.Tensor:
-        """Forward and loss under :meth:`autocast`, for the prover's ``loss`` and the replay's
-        pass alike (F5a)."""
+        """Forward and loss under :meth:`autocast`, all rows at once (F5a)."""
         with self.autocast():
             return self.loss_from_logits(self.logits(model, batch), batch)
+
+    def _autocast_off(self) -> contextlib.AbstractContextManager[Any]:
+        """Autocast off inside :meth:`autocast`'s region, without ending it (so its weight casts
+        stay cached); a no-op at ``(fp32, fp32)``. The backward runs as outside autocast."""
+        if self.compute_dtype == self.master_dtype:
+            return contextlib.nullcontext()
+        return torch.autocast(self.device_type, enabled=False)
 
     # ---- verifier side --------------------------------------------------------------------
 
@@ -619,7 +686,55 @@ class DecoderComputation(DeclaredComputation):
     # ---- prover side ----------------------------------------------------------------------
 
     def loss(self, model: nn.Module, records: Sequence[Record]) -> torch.Tensor:
+        """``ℒ`` with its graph, the output layer on all rows at once (``N × n_v`` scores).
+        Training runs :meth:`forward_backward`."""
         return self._forward_loss(model, self.assemble(records))
+
+    def forward_backward(self, model: nn.Module, records: Sequence[Record],
+                         stage: Callable[[str], contextlib.AbstractContextManager[Any]]
+                         ) -> torch.Tensor:
+        """One training pass with the output layer in ``B`` row blocks; returns ``ℒ``, detached.
+
+        The body runs forward once, to ``F`` with its graph. Then block by block: ``Λ_b`` from
+        a copy of ``F``'s rows (:meth:`_head_input`), block ``b``'s share of ``ℒ``
+        (:meth:`block_loss`), and ``torch.autograd.grad`` of that share to ``δF_b`` and ``W``'s
+        gradient ``G_b``, which frees the block before the next one. The body's backward then
+        runs once from ``δF = cat(δF_b)``. ``W``'s head gradient is
+        :func:`~verification.computation.interface.chain_gradient` of the ``G_b``, check 6's
+        sum: ``W_out.grad`` when untied, and added to the lookup's ``W_E.grad`` when tied.
+        ``ℒ`` is the fp32 sum of the shares in block order. At ``B = 1`` every ``.grad`` and
+        ``ℒ`` equal ``loss(…).backward()``'s bit for bit.
+
+        One autocast region covers the pass, so ``W`` is cast once for all blocks (F5a); the
+        backward stages turn autocast off inside it (:meth:`_autocast_off`).
+        """
+        batch = self.assemble(records)
+        head = model.lm_head
+        w = head.weight
+        loss: torch.Tensor | None = None
+        dfs: list[torch.Tensor] = []
+        gs: list[torch.Tensor] = []
+        with self.autocast():
+            with stage("forward"):
+                f = self._features(model, batch)
+            for b in range(self.head_blocks):
+                with stage("forward"):
+                    fb = self._head_input(f, b)
+                    part = self.block_loss(head(fb), batch, self._head_seqs(b))
+                with stage("backward"), self._autocast_off():
+                    df, g = torch.autograd.grad(part, [fb, w])
+                dfs.append(df)
+                gs.append(g)
+                part = part.detach()
+                loss = part if loss is None else loss + part
+                del fb, part, df, g  # block b's graph and scores go before block b+1's
+            with stage("backward"), self._autocast_off():
+                f.backward(torch.cat(dfs))
+                del f, dfs
+                g = chain_gradient(gs, self.weight_dtype)
+                w.grad = g if w.grad is None else g + w.grad  # tied: + the lookup's
+        assert loss is not None
+        return loss
 
     def label(self, capture: MatmulCapture, model: nn.Module) -> list[torch.Tensor]:
         """Map the captured records onto ``P_1..P_M`` by operand identity (module docstring)."""
@@ -686,10 +801,11 @@ class _Labeler:
             raise LabelingError(f"{name} (record #{rec.index}): output is not contiguous")
         self.slots[m - 1] = p
 
-    def _linear_name(self, weight: str, prefix: str) -> str:
+    def _linear_name(self, weight: str, prefix: str, b: int = 0) -> str:
+        """The product of ``weight`` named by ``prefix``; for the head, block ``b``'s."""
         l, x = self.role[weight]
         if l is None:
-            return {"Y": "Lambda", "dX": "dF", "G": self.c.g_head}[prefix]
+            return self.c.head_name({"Y": "Lambda", "dX": "dF", "G": "G"}[prefix], b)
         return f"L{l}.{prefix}_{x}"
 
     def _check_bias(self, weight: str, rec: MatmulRecord) -> None:
@@ -717,32 +833,37 @@ class _Labeler:
 
     # ---- forward ---------------------------------------------------------------------------
 
-    def _forward_linears(self, recs: list[MatmulRecord]) -> dict[str, MatmulRecord]:
-        """``Y_x`` and ``Λ`` by weight storage; returns weight name -> its forward record."""
-        out: dict[str, MatmulRecord] = {}
+    def _forward_linears(self, recs: list[MatmulRecord]) -> dict[str, list[MatmulRecord]]:
+        """``Y_x`` and the ``Λ_b`` by weight storage; returns weight name -> its forward records:
+        one for a layer's weight, and the output projection's ``B``, which are ``Λ_0 … Λ_{B−1}``
+        in call order."""
+        out: dict[str, list[MatmulRecord]] = {}
         for rec in recs:
             w = _param(rec.b_info)
             if w not in self.role:
                 raise LabelingError(f"forward mm #{rec.index} has no weight operand")
-            if w in out:
-                raise LabelingError(f"weight {w} used in two forward products "
-                                    f"(#{out[w].index}, #{rec.index})")
-            out[w] = rec
+            seen = out.setdefault(w, [])
+            uses = 1 if self.role[w][0] is not None else self.c.head_blocks
+            if len(seen) == uses:
+                raise LabelingError(f"weight {w} used in more than {uses} forward product"
+                                    f"{'s' if uses > 1 else ''} (#{seen[-1].index}, "
+                                    f"#{rec.index})")
             self._check_bias(w, rec)
-            self._fill(self._linear_name(w, "Y"), rec.a, rec.b, rec.out, rec)
+            self._fill(self._linear_name(w, "Y", len(seen)), rec.a, rec.b, rec.out, rec)
+            seen.append(rec)
         return out
 
-    def _forward_bmms(self, recs: list[MatmulRecord],
-                      y_rec: dict[str, MatmulRecord]) -> dict[int, tuple[int, str, str]]:
+    def _forward_bmms(self, recs: list[MatmulRecord], y_rec: dict[str, list[MatmulRecord]]
+                      ) -> dict[int, tuple[int, str, str]]:
         """``S`` and ``O`` members; returns operand storage -> ``(ℓ, "S"|"O", "a"|"b")``."""
         c = self.c
         taken: set[int] = set()
         ops: dict[int, tuple[int, str, str]] = {}
-        linear_a = {_ptr(r.a) for r in y_rec.values()}
+        linear_a = {_ptr(r.a) for rs in y_rec.values() for r in rs}
         for l in range(1, c.L + 1):
             try:
-                lo = max(y_rec[c.w(l, x)].index for x in ("q", "k", "v"))
-                hi = y_rec[c.w(l, "o")].index
+                lo = max(y_rec[c.w(l, x)][0].index for x in ("q", "k", "v"))
+                hi = y_rec[c.w(l, "o")][0].index
             except KeyError as e:
                 raise LabelingError(f"layer {l}: forward projection missing ({e})") from None
             inside = [r for r in recs if lo < r.index < hi]
@@ -751,7 +872,7 @@ class _Labeler:
                                     f"expected 2 (S, O)")
             s_rec, o_rec = sorted(inside, key=lambda r: r.index)  # O consumes softmax(S)
             self._check_row_stochastic(l, o_rec)
-            self._check_kv_values(l, s_rec, o_rec, y_rec[c.w(l, "v")])
+            self._check_kv_values(l, s_rec, o_rec, y_rec[c.w(l, "v")][0])
             for kind, rec in (("S", s_rec), ("O", o_rec)):
                 taken.add(rec.index)
                 self._fill_members(l, kind, rec)
@@ -815,9 +936,14 @@ class _Labeler:
 
     # ---- backward --------------------------------------------------------------------------
 
-    def _backward_linears(self, recs: list[MatmulRecord], y_rec: dict[str, MatmulRecord]) -> None:
-        """``δX_x``/``δF`` by weight storage, then ``G_x`` and the head's by the saved inputs."""
+    def _backward_linears(self, recs: list[MatmulRecord],
+                          y_rec: dict[str, list[MatmulRecord]]) -> None:
+        """``δX_x``/``δF_b`` by weight storage, then ``G_x`` and the head's ``G_b`` by the saved
+        inputs. A head block's ``δF_b`` and ``G_b`` share ``δΛ_b``, and ``G_b``'s saved input is
+        ``Λ_b``'s ``A``, so ``δF_b`` is named once its ``G_b`` is."""
+        c = self.c
         dy: dict[int, str] = {}  # storage of δY_x -> weight
+        head_dx: dict[int, MatmulRecord] = {}  # storage of δΛ_b -> its δF_b record
         rest = []
         for rec in recs:
             w = _param(rec.b_info)
@@ -830,22 +956,50 @@ class _Labeler:
             if p in dy:
                 raise LabelingError(f"δY of {w} (#{rec.index}) aliases δY of {dy[p]}")
             dy[p] = w
-            self._fill(self._linear_name(w, "dX"), rec.a, rec.b, rec.out, rec)
-        x_of: dict[int, set[str]] = {}  # storage of X_x -> the weights it feeds
-        for w, rec in y_rec.items():
-            x_of.setdefault(_ptr(rec.a), set()).add(w)
+            if self.role[w][0] is None:
+                head_dx[p] = rec
+            else:
+                self._fill(self._linear_name(w, "dX"), rec.a, rec.b, rec.out, rec)
+        x_of: dict[int, dict[str, int]] = {}  # storage of X_x -> the weights it feeds -> block
+        for w, rs in y_rec.items():
+            for b, rec in enumerate(rs):
+                x_of.setdefault(_ptr(rec.a), {})[w] = b
         for rec in rest:
-            feeds = x_of.get(_ptr(rec.b), set())
+            feeds = x_of.get(_ptr(rec.b), {})
             w = dy.get(_ptr(rec.a))
             if w is None or w not in feeds:
                 raise LabelingError(f"backward mm #{rec.index} matches no weight gradient: A is "
                                     f"δY of {w}, B is the input of {sorted(feeds)}")
-            if w in self.c.linear_weights:  # not the tied W_E, whose grad is a sum
+            b = feeds[w]
+            if self.role[w][0] is None:
+                dx = head_dx.pop(_ptr(rec.a), None)
+                if dx is None:
+                    raise LabelingError(f"the head's block {b} G (record #{rec.index}) has no "
+                                        f"δF of its own")
+                self._fill(self._linear_name(w, "dX", b), dx.a, dx.b, dx.out, dx)
+            elif w in c.linear_weights:
                 grad = self.model.get_parameter(w).grad
                 if grad is None or not (self.cap.is_output_of(grad, rec)
                                         or self.cap.is_copy_of(grad, rec.index)):
                     raise LabelingError(f"G of {w} (record #{rec.index}) is not {w}.grad")
-            self._fill(self._linear_name(w, "G"), rec.a, rec.b, rec.out, rec)
+            self._fill(self._linear_name(w, "G", b), rec.a, rec.b, rec.out, rec)
+        if head_dx:
+            raise LabelingError(f"the head's δF records {sorted(r.index for r in head_dx.values())} "
+                                f"match no block's G")
+        if not c.tied:
+            self._check_head_grad()
+
+    def _check_head_grad(self) -> None:
+        """Untied: ``W_out.grad`` is the chain of the labeled ``G_b``, check 6a's sum. Summed on
+        the leaves' device (the host on a GPU run, FS9), which rounds as the device does."""
+        c = self.c
+        grad = self.model.get_parameter(c.w_out).grad
+        parts = [self.slots[m - 1] for m in c.head_gradients]
+        if grad is None or any(p is None for p in parts) or not torch.equal(
+                grad.detach().to(parts[0].device),  # type: ignore[union-attr]
+                chain_gradient(parts, c.weight_dtype)):  # type: ignore[arg-type]
+            raise LabelingError(f"G of {c.w_out} (the head's G blocks, summed) is not "
+                                f"{c.w_out}.grad")
 
     def _backward_bmms(self, recs: list[MatmulRecord],
                        ops: dict[int, tuple[int, str, str]]) -> None:

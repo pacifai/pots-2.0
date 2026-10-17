@@ -54,7 +54,13 @@ from typing import Any, NamedTuple
 import torch
 
 from verification.commitment.merkle import DIGEST_SIZE, merkle_root, verify_path
-from verification.computation.interface import HOST, DeclaredComputation, ProductSpec, Replay
+from verification.computation.interface import (
+    HOST,
+    DeclaredComputation,
+    ProductSpec,
+    Replay,
+    chain_gradient,
+)
 from verification.transcript.reader import TranscriptView
 from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands, product_class
@@ -450,10 +456,12 @@ def check_6a_linear_update(store: TranscriptStore, c: DeclaredComputation, ctx: 
 
 
 def _linear_gradient(c: DeclaredComputation, view: TranscriptView, name: str) -> torch.Tensor:
-    """Check 6a's ``G`` for linear weight ``name``: its committed weight-gradient leaf, widened
-    exactly to the weights' format (F6b: a bf16 leaf becomes fp32; an fp32 leaf is unchanged),
-    as 6b's gradients are. Check 6a and its record pass both take ``G`` here."""
-    return view.product(c.linear_weights[name]).to(c.weight_dtype)
+    """Check 6a's ``G`` for linear weight ``name``: its committed weight-gradient leaves, each
+    widened exactly to the weights' format (F6b: a bf16 leaf becomes fp32; an fp32 leaf is
+    unchanged), as 6b's gradients are, and summed in order as training sums them
+    (:func:`chain_gradient`; one leaf unless the weight's product runs in row blocks). Check 6a
+    and its record pass both take ``G`` here."""
+    return chain_gradient((view.product(m) for m in c.linear_weights[name]), c.weight_dtype)
 
 
 # ---- check 5: matmul checks (P3) --------------------------------------------------------

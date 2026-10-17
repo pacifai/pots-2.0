@@ -1,9 +1,15 @@
 import dataclasses
 
 import pytest
+import torch
 
 from verification.computation.instances.mlp import MLPComputation
-from verification.computation.interface import DeclaredComputation, ProductKind, ProductSpec
+from verification.computation.interface import (
+    DeclaredComputation,
+    ProductKind,
+    ProductSpec,
+    chain_gradient,
+)
 from verification.transcript.reader import LeafReader, TranscriptView
 
 
@@ -107,10 +113,35 @@ def test_validate_rejects_bad_linear_map():
     class Bad(MLPComputation):
         @property
         def linear_weights(self):
-            return {self.weight(1): self.m_of("Y_1")}  # a forward product, not G_1
+            return {self.weight(1): (self.m_of("Y_1"),)}  # a forward product, not G_1
 
     with pytest.raises(ValueError, match="weight gradient"):
         Bad((4, 5, 3), n_s=2, eta=0.1)
+
+
+@pytest.mark.parametrize("ms", [(), "twice"])
+def test_validate_rejects_empty_or_repeated_linear_products(ms):
+    class Bad(MLPComputation):
+        @property
+        def linear_weights(self):
+            lw = dict(super().linear_weights)
+            g = self.m_of("G_1")
+            lw[self.weight(1)] = (g, g) if ms == "twice" else ()
+            return lw
+
+    with pytest.raises(ValueError, match="not distinct products"):
+        Bad((4, 5, 3), n_s=2, eta=0.1)
+
+
+def test_chain_gradient_widens_and_adds_in_order():
+    parts = [torch.randn(3, 4, generator=torch.Generator().manual_seed(i)).to(torch.bfloat16)
+             for i in range(3)]
+    want = (parts[0].float() + parts[1].float()) + parts[2].float()
+    assert torch.equal(chain_gradient(iter(parts), torch.float32), want)
+    one = torch.randn(2, 2)
+    assert chain_gradient([one], torch.float32) is one  # one part of the dtype: itself
+    with pytest.raises(ValueError, match="at least one"):
+        chain_gradient([], torch.float32)
 
 
 def test_glue_gradient_weights_complement_linear():

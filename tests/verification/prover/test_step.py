@@ -44,7 +44,7 @@ def test_sgd_step_is_plain_update(setup):
     # Observation only (P5a): check 6 is banded and must not use equality.
     c, model, data, w0 = setup
     out = prove_step(c, model, w0, data[:4])
-    for name, m in c.linear_weights.items():
+    for name, (m,) in c.linear_weights.items():
         g = out.products[m - 1]
         # SGD's add_(grad, alpha=-lr), replayed with the same fp32 op.
         assert torch.equal(out.w_next[name], out.w_t[name].add(g, alpha=-ETA))
@@ -95,7 +95,7 @@ def test_perturb_hook_changes_one_product_only(setup):
 def test_perturb_weight_grad_leaves_update_honest(setup):
     c, model, data, w0 = setup
     honest = prove_step(c, c.build_model(), w0, data[:4])
-    m = c.linear_weights[c.weight(1)]
+    (m,) = c.linear_weights[c.weight(1)]
     cheat = prove_step(c, model, w0, data[:4], perturb={m: lambda p: -p})
     assert torch.equal(cheat.products[m - 1], -honest.products[m - 1])
     assert _equal_dicts(cheat.w_next, honest.w_next)

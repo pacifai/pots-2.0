@@ -550,7 +550,7 @@ def test_record_pass_after_6a_at_bf16_scores_as_the_live_checks():
     idx = schedule(1, c.n_s, len(D), SEED)
     out = prove_step(c, c.build_model(), w0, [D[i] for i in idx])
     name = next(iter(c.linear_weights))
-    assert out.products[c.linear_weights[name] - 1].dtype == torch.bfloat16
+    assert out.products[c.linear_weights[name][0] - 1].dtype == torch.bfloat16
     assert c.weight_dtype == torch.float32 and c.glue_gradient_weights
 
     def verify(edit=None):
@@ -949,7 +949,7 @@ def test_overflowing_update_bound_rejected_at_6a():
     D = synthetic_dataset(c.widths, N_RECORDS, seed=0)
     tree, w0 = dataset_tree(c, D), init_weights(c.widths, seed=0)
     store, out = _store(c, D, tree, w0, 1)
-    m = c.linear_weights[c.weight(1)]
+    (m,) = c.linear_weights[c.weight(1)]
     g = out.products[m - 1].clone()
     g.view(-1)[3] = 1e36
     perturb_leaf(c, store, c.product_index(m), g)
