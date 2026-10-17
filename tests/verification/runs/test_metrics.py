@@ -855,6 +855,7 @@ def test_derive_capture_from_synthetic_rows():
     assert times == {1: pytest.approx(4 * 0.25 + 0.5), 2: pytest.approx(1.5)}
     (mem,) = [r for r in rows if r["record"] == "memory"]
     assert mem["step"] == 1 and mem["peak_bytes"] == (1000 - 500) - (600 - 200)
+    assert "peak_reserved_bytes" in mem and mem["peak_reserved_bytes"] is None  # a growth
     (cnt,) = [r for r in rows if r["record"] == "count"]
     assert cnt["flops"] == 4 * 3 and cnt["hash_in_bytes"] == 0
     # a step the plain run lacks gets no P1 row

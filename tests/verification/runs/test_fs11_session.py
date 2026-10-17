@@ -336,6 +336,22 @@ def test_the_benchmark_is_done_only_on_a_complete_clean_report(tmp_path, report,
         assert why in rec["reason"]
 
 
+def test_a_broken_fix_ab_costs_the_ab_not_the_session(tmp_path, monkeypatch):
+    """``fix2_ab`` is wrapped as ``part_extras`` is: if it raises, the summary records why and
+    the session runs on."""
+    def broken(parts):
+        raise KeyError("name")
+
+    monkeypatch.setattr(fs, "fix2_ab", broken)
+    on = _fix_arm("on", "fix2_on", fs.EXPANDABLE, True, (1.5, 3.0, 0.3), (41.0, 32.0))
+    out = tmp_path / "out"
+    s = fs.run_session([on, fs.Part("after", _py("print(1)"))], upload=tmp_path / "up",
+                       out=out, deadline=time.time() + 30, cwd=REPO, say=lambda m: None)
+    assert [p["status"] for p in s["parts"]] == ["ok", "ok"] and s["finished"]
+    assert s["fix2_ab"] == {"fix2_ab_error": "KeyError: 'name'"}
+    assert json.loads((out / "summary.json").read_text())["fix2_ab"] == s["fix2_ab"]
+
+
 def test_part_extras(tmp_path):
     log = tmp_path / "log.txt"
     log.write_text("pin: x\nstep 1: prover 3.10 s (prove_step 2.00 s, commit 1.10 s); verifier "
@@ -484,6 +500,16 @@ def test_plain_extras(tmp_path):
     assert e["peak_reserved_bytes"] == 6 * 2**30
     assert e["completed"] and e["lifetime_maxrss_bytes"] == 7 and e["record"] == str(rec)
     assert e["allocator"] == alloc  # what the run's environment record says it ran with
+    assert e["bad_lines"] == 0
+    # a line cut short (a run killed mid-write) or with a figure that isn't a number is
+    # skipped and counted; the rest of the arm stands
+    rec.write_text("".join(json.dumps(r) + "\n" for r in rows)
+                   + json.dumps({**step, "step": 4, "time_s": "fast"}) + "\n"
+                   + json.dumps({"record": "memory", "peak_bytes": [1]}) + "\n"
+                   + "[1, 2]\n" + '{"record": "time", "step": 5, "ti')
+    cut = fs.part_extras(part, tmp_path / "log.txt")
+    assert cut["bad_lines"] == 4 and "extras_error" not in cut
+    assert {k: cut[k] for k in e if k != "bad_lines"} == {k: e[k] for k in e if k != "bad_lines"}
     # a run that died after one timed step, before its memory pass
     _records(rec, rows[:3])
     e = fs.part_extras(part, tmp_path / "log.txt")

@@ -1486,8 +1486,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     - P1, matmul capture: derived (`derive_capture(verified, plain)`, rows marked
       `derived`; the plain rows must be one run and scenario): time `Σ(train.x − P0.x) +
       P1.label`, memory the growth `(peak(train.backward) − start(train.forward)) −
-      (peak(P0.backward) − start(P0.forward))`, counts `Σ(train.x − P0.x)`. `P1.label` is `label`, the `M` check,
-      `assert_unmodified` and `release_operands`.
+      (peak(P0.backward) − start(P0.forward))`, counts `Σ(train.x − P0.x)`. The memory row's
+      `peak_reserved_bytes` is null: a growth has no reserved peak. `P1.label` is `label`, the
+      `M` check, `assert_unmodified` and `release_operands`.
     - P2, serialization: `P2.w_t`, `P2.w_next`. Leaf encoding is zero-copy, so its byte cost
       is in P3's hashing.
     - P3, commitment: `P3.commit` (`commit_step`: hashing and the invariant-6 recheck).
@@ -2326,7 +2327,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     the two parts' `info["arm"]` are `fix2_on` and `fix2_off`. `fix2_ab(parts)` sets them
     side by side in `summary.json`'s `fix2_ab`: per step the prover, verifier, hand-off and
     total wall clock (`steps`), per step and side the allocated and reserved peaks (`peaks`),
-    each with `fix_cost`, on minus off. Each arm's head holds its planned `alloc_conf` and
+    each with `fix_cost`, on minus off. If `fix2_ab` raises, `summary.json`'s `fix2_ab` is
+    `{"fix2_ab_error": …}` and the session runs on, as with `part_extras`' `extras_error`.
+    Each arm's head holds its planned `alloc_conf` and
     `release_cache` and `ran_with`, the settings its log's `allocator:` line says it ran
     with. The job log then says `allocator fix A/B, step 1: …
     s with the fix, … s without (+… s)`. The times are the bring-up's, from its memory pass,
@@ -2337,7 +2340,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `PYTORCH_ALLOC_CONF`), the first
     arm alternating by model, each in `runs/<key>_plain_<arm>/`. Its time limits are
     `RECHECK_TIMEOUT_S` (bring-up 1,800 s, smooth and plain 600 s). A plain part's summary
-    entry reads its `records.jsonl` with `json` alone: per-step times (the `step` total),
+    entry reads its `records.jsonl` with `json` alone, skipping a line that isn't a JSON
+    object or whose time or memory figures aren't numbers (counted in `bad_lines`): per-step
+    times (the `step` total),
     their mean and median, the memory pass's peak, its reserved peak (`peak_reserved_bytes`,
     null off CUDA) and its `mem_source`, and whether `run_end` came. A smooth part's entry
     holds its record's `peak_bytes` and `peak_reserved_bytes`. Each plain, smooth and

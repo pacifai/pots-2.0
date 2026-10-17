@@ -551,23 +551,51 @@ def _bring_up_extras(log: Path) -> dict[str, Any]:
             "lines": [l for l in lines if _BRING_UP_LINE.match(l)][-40:]}
 
 
+def _number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _plain_row_ok(row: Mapping[str, Any]) -> bool:
+    """Whether a ``records.jsonl`` row has the figures :func:`_plain_extras` reads as numbers:
+    a time row's ``step`` and ``time_s``, a memory row's peaks (each a number or null)."""
+    if row.get("record") == "time":
+        return _number(row.get("step")) and _number(row.get("time_s"))
+    if row.get("record") == "memory":
+        return all(row.get(k) is None or _number(row.get(k))
+                   for k in ("peak_bytes", "peak_reserved_bytes"))
+    return True
+
+
 def _plain_extras(report: Path) -> dict[str, Any]:
     """A plain arm's ``records.jsonl``: the timed run's per-step times (the ``step`` total of
     each step's ``P0`` phases, which on CUDA synchronize at their bounds), their mean and
     median, the memory pass's peak (on CUDA with its reserved peak, else ``None``), and the
-    allocator settings its environment record holds."""
+    allocator settings its environment record holds. A line that isn't a JSON object (cut
+    short when the run was killed mid-write), or a time or memory row whose figures aren't
+    numbers, is skipped and counted in ``bad_lines``, so one bad line doesn't cost the arm."""
     if not report.exists():
         return {"record": None}
-    rows = [json.loads(line) for line in report.read_text().splitlines() if line.strip()]
+    rows, bad = [], 0
+    for line in report.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            row = None
+        if isinstance(row, dict) and _plain_row_ok(row):
+            rows.append(row)
+        else:
+            bad += 1
     steps = sorted((r["step"], r["time_s"]) for r in rows
                    if r.get("record") == "time" and r.get("level") == "total"
-                   and r.get("component") == "step" and r.get("step", 0) > 0)
+                   and r.get("component") == "step" and r["step"] > 0)
     times = [s for _, s in steps]
     mem = [r for r in rows if r.get("record") == "memory" and r.get("peak_bytes") is not None]
     held = [r["peak_reserved_bytes"] for r in mem if r.get("peak_reserved_bytes") is not None]
     end = next((r for r in rows if r.get("record") == "run_end"), None)
     env = next((r for r in rows if r.get("record") == "environment"), None)
-    return {"record": str(report), "allocator": _allocator(env),
+    return {"record": str(report), "bad_lines": bad, "allocator": _allocator(env),
             "completed": end is not None, "step_s": times,
             "mean_step_s": statistics.fmean(times) if times else None,
             "median_step_s": statistics.median(times) if times else None,
@@ -818,7 +846,12 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
                         f"{summary['cupqc']['reason']}\n")
         rec["extras"] = part_extras(part, d / "log.txt")
         summary["parts"].append(rec)
-        ab = fix2_ab(summary["parts"])
+        try:
+            ab = fix2_ab(summary["parts"])
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
+            # as part_extras: a malformed entry costs the A/B, not the session
+            summary["fix2_ab"] = {"fix2_ab_error": f"{type(e).__name__}: {e}"}
+            ab = None
         if ab is not None:
             summary["fix2_ab"] = ab
             for r in ab["steps"] if part.info.get("arm") == "fix2_off" else ():
