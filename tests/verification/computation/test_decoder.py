@@ -10,6 +10,7 @@ from collections import Counter
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.utils._python_dispatch import TorchDispatchMode
 from transformers import LlamaConfig
 from transformers.models.llama import modeling_llama
 
@@ -1695,3 +1696,169 @@ def test_reused_model_restores_buffers_and_refuses_hooks(honest):
         c.replay(ListReader(leaves))
     handle.remove()
     c.replay(ListReader(leaves))
+
+
+# ---- the output layer in row blocks (VERIF_HEAD_BLOCKS) ----------------------------------------
+
+
+_BLOCKED = [(tied, d) for tied in (True, False) for d in COMPUTE]
+
+
+def _grads(model):
+    return {n: p.grad.clone() for n, p in model.named_parameters()}
+
+
+def _training(c, records, *, blocks=True):
+    """``(ℒ, every .grad)`` of one training pass from the built model: through
+    ``forward_backward``, or (``blocks=False``) through ``loss(…).backward()`` on all rows."""
+    model = c.build_model()
+    randomize_biases(dict(model.named_parameters()))
+    if blocks:
+        loss = c.forward_backward(model, records, lambda phase: contextlib.nullcontext())
+    else:
+        loss = c.loss(model, records)
+        loss.backward()
+    return loss.detach(), _grads(model)
+
+
+@pytest.mark.parametrize("tied,dtype", _BLOCKED, ids=[f"{'tied' if t else 'untied'}-{d}"
+                                                      for t, d in _BLOCKED])
+def test_one_head_block_trains_as_one_output_layer(tied, dtype):
+    """At ``B = 1`` the block path gives ``ℒ`` and every gradient bit for bit as the whole
+    output layer's ``loss(…).backward()``."""
+    c = DecoderComputation(tiny_config(tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
+    records = make_records((12, 7))
+    loss, grads = _training(c, records)
+    want_loss, want = _training(c, records, blocks=False)
+    assert torch.equal(loss, want_loss)
+    assert grads.keys() == want.keys()
+    for n, g in grads.items():
+        assert torch.equal(g, want[n]), n
+
+
+@pytest.mark.parametrize("tied", [True, False], ids=["tied", "untied"])
+@pytest.mark.parametrize("blocks", [2, 4])
+def test_head_blocks_train_as_one_output_layer(tied, blocks):
+    """At ``B > 1`` ``ℒ`` and the gradients match ``B = 1``'s up to the order of fp32 sums, and
+    so do ``δΛ``'s rows (``δF_b``'s ``A``, served by the replay): each block's share of ``ℒ``
+    divides by the whole batch's ``Σμ``. They aren't bit for bit: a matmul of ``N/B`` rows
+    may round ``Λ`` differently from one of ``N`` (here at ``B = 4``, by one fp32 ULP)."""
+    records = make_records((12, 7, 10, 5), seed=1)
+
+    def run(B):
+        c = DecoderComputation(tiny_config(tied=tied), n_s=4, n=12, eta=1e-3, head_blocks=B)
+        loss, grads = _training(c, records)
+        model = c.build_model()
+        w0 = {n: p.detach().clone() for n, p in model.named_parameters()}
+        replay = c.replay(ListReader(prove_step(c, model, w0, records).leaves()))
+        dlam = torch.cat([replay.operands(c.m_of(c.head_name("dF", b)))[0] for b in range(B)])
+        return loss, grads, dlam
+
+    one_loss, one, one_dlam = run(1)
+    loss, grads, dlam = run(blocks)
+    torch.testing.assert_close(loss, one_loss, rtol=1e-6, atol=0)
+    for n, g in grads.items():
+        torch.testing.assert_close(g, one[n], rtol=1e-5, atol=1e-7, msg=n)
+    torch.testing.assert_close(dlam, one_dlam, rtol=1e-5, atol=1e-8)
+
+
+def test_head_block_names_and_order():
+    """``B`` blocks: ``Λ_0 … Λ_{B−1}`` after the layers' forward, then ``δF_b, G_b`` per block,
+    then layer ``L``'s backward; ``M`` gains ``3(B − 1)``. Classes stay per role."""
+    c = DecoderComputation(tiny_config(tied=False), n_s=4, n=12, eta=1e-3, head_blocks=2)
+    names = [p.name for p in c.products]
+    i = names.index("Lambda[0]")
+    assert names[i:i + 6] == ["Lambda[0]", "Lambda[1]", "dF[0]", "G_head[0]", "dF[1]",
+                              "G_head[1]"]
+    assert names[i - 1] == f"L{c.L}.Y_down" and names[i + 6] == f"L{c.L}.dX_down"
+    assert c.M == matmul_count_decoder(c.L, c.n_s, c.n_h) + 3
+    assert c.linear_weights[c.w_out] == (c.m_of("G_head[0]"), c.m_of("G_head[1]"))
+    for b in range(2):
+        assert c.products[c.m_of(f"Lambda[{b}]") - 1].a_shape == (c.N // 2, c.d)
+    with pytest.raises(ValueError, match="divide"):
+        DecoderComputation(tiny_config(), n_s=4, n=12, eta=1e-3, head_blocks=3)
+
+
+def _blocked_run(c, D, w0):
+    """``verify(**prove_kw)``: prove one step of ``c`` from ``w0`` on ``D``'s scheduled batch and
+    verify it under provisional bands; returns ``(verifier, rejection)``."""
+    from setup.data import schedule
+    from verification.commitment.leaves import dataset_tree
+    from verification.transcript.store import InMemoryStore
+    from verification.verifier.bands import Bands
+    from verification.verifier.driver import Verifier
+
+    tree = dataset_tree(c, D)
+    idx = schedule(1, c.n_s, len(D), SEED)
+
+    def verify(**kw):
+        v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1,
+                     bands=Bands.provisional(), allow_provisional=True, w0=w0, seed=SEED)
+        assert v.start_run(D) is None
+        out = prove_step(c, c.build_model(), w0, [D[i] for i in idx], **kw)
+        store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
+        return v, v.verify_step(1, store)
+
+    return verify
+
+
+class _LargestTensor(TorchDispatchMode):
+    """Records the largest ``numel`` of any tensor an op returns."""
+
+    def __init__(self):
+        super().__init__()
+        self.largest = (0, None)
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        for t in torch.utils._pytree.tree_leaves(out):
+            if isinstance(t, torch.Tensor) and t.numel() > self.largest[0]:
+                self.largest = (t.numel(), func, t.dtype, tuple(t.shape))
+        return out
+
+
+@pytest.mark.parametrize("dtype", list(COMPUTE))
+def test_head_blocks_never_hold_scores_of_more_than_one_block(dtype, monkeypatch):
+    """At ``B = 4`` no op in training, the prover's step or the verifier's replay and checks
+    returns a tensor of ``2·(N/B)·n_v`` entries or more: nothing near the whole batch's scores.
+    The vocabulary and ``n`` are sized so every other tensor stays under that line, and check
+    6's scratch, a fixed ``UPDATE_CHUNK`` entries, is cut to fit it too."""
+    from verification.verifier import checks
+
+    monkeypatch.setattr(checks, "UPDATE_CHUNK", 1024)
+    cfg = tiny_config(tied=True)
+    cfg.vocab_size = 2048
+    c = DecoderComputation(cfg, n_s=4, n=32, eta=1e-3, compute_dtype=COMPUTE[dtype],
+                           head_blocks=4)
+    limit = 2 * (c.N // c.head_blocks) * c.n_v
+    assert c.n_v * c.d < limit and 4 * c.n_s * c.n_h * c.n * c.n < limit <= c.N * c.n_v // 2
+    D = make_records((32, 20, 27, 15, 30, 9), seed=1)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    verify = _blocked_run(c, D, w0)
+    with _LargestTensor() as seen:
+        _training(c, D[:c.n_s])
+        _, rejection = verify()
+    assert rejection is None
+    assert seen.largest[0] < limit, seen.largest
+
+
+@pytest.mark.parametrize("dtype", list(COMPUTE))
+@pytest.mark.parametrize("tied", [True, False], ids=["tied", "untied"])
+def test_head_blocks_verify_an_honest_step(tied, dtype):
+    """At ``B = 2`` an honest step is accepted. One entry raised in the last block's ``Λ_b`` or
+    ``δF_b`` fails check 5; in its ``G_b``, check 5 when tied (``G_E_head[b]`` is a product of
+    ``W_E``'s glue gradient) and the update identity (6a) when untied (``G_head[b]`` is a summand
+    of ``W_out``'s linear gradient, which check 5 doesn't sample)."""
+    c = DecoderComputation(tiny_config(tied=tied), n_s=4, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype], head_blocks=2)
+    D = make_records((12, 7, 10, 5, 9, 11, 6, 8), seed=1)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    verify = _blocked_run(c, D, w0)
+    v, rejection = verify()
+    assert rejection is None
+    assert {"5", "6a", "6b"} <= set(v.timings[1])
+    for kind, check in (("Lambda", "5"), ("dF", "5"), ("G", "5" if tied else "6a")):
+        name = c.head_name(kind, 1)
+        _, rejection = verify(perturb={c.m_of(name): lambda p: _bump(p)})
+        assert (rejection.step, rejection.check_id) == (1, check), name
