@@ -844,18 +844,22 @@ def _count_module_calls(replay):
 
 def test_canonical_order_runs_one_forward_and_one_backward(honest_all):
     """Like training: every module runs forward once over operands(1..M) and glue_gradients,
-    and each unit's backward once (a rerun would serve its products twice)."""
+    and each unit's backward once (a rerun would serve its products twice). The output
+    projection runs twice per head block: in the pass, and from its leaf in the block's
+    backward."""
     c, leaves, _, _ = honest_all
     replay = c.replay(ListReader(leaves))
     counts = _count_module_calls(replay)
     runs = []
-    run_unit = replay._run_unit
+    run_unit, run_block = replay._run_unit, replay._run_head_block
     replay._run_unit = lambda j: (runs.append(j), run_unit(j))
+    replay._run_head_block = lambda b: (runs.append(("head", b)), run_block(b))
     for spec in c.products:
         replay.operands(spec.m)
     replay.glue_gradients()
-    assert counts == {**{f"layer{i}": 1 for i in range(1, c.L + 1)}, "norm": 1, "lm_head": 1}
-    assert runs == list(range(c.L + 1, 0, -1))
+    assert counts == {**{f"layer{i}": 1 for i in range(1, c.L + 1)}, "norm": 1,
+                      "lm_head": 2 * c.head_blocks}
+    assert runs == [("head", b) for b in range(c.head_blocks)] + list(range(c.L, 0, -1))
     assert not replay._units  # every unit's graph and operands dropped
 
 
@@ -1064,14 +1068,14 @@ def test_backward_keeps_one_unit_of_glue(honest_all):
     replay = c.replay(ListReader(leaves))
     for spec in c.products[:c.m_of(f"L{c.L}.dX_down")]:
         replay.operands(spec.m)
-    assert replay._bunit == c.L and replay._dx[0] == c.L
+    assert replay._bunit == (c.L, 0) and replay._dx[0] == c.L
     refs = [weakref.ref(t) for a, b, _, _ in replay._bops.values() for t in (a, b)]
     for spec in c.products[c.m_of(f"L{c.L}.dX_down"):c.m_of(f"L{c.L}.G_v")]:
         replay.operands(spec.m)
     assert replay._bunit is None and not replay._bops
     assert sum(r() is not None for r in refs) == 0
     replay.operands(c.m_of(f"L{c.L - 1}.dX_down"))
-    assert replay._bunit == c.L - 1 and replay._dx[0] == c.L - 1
+    assert replay._bunit == (c.L - 1, 0) and replay._dx[0] == c.L - 1
 
 
 def test_backward_operand_mutation_is_detected(honest_all):

@@ -27,9 +27,10 @@ Implementation pins (not fixed by the reference block):
 - **Product names** are ``L{ℓ}.Y_q`` … for the linear products, ``L{ℓ}.S[s,h]``,
   ``L{ℓ}.O[s,h]``, ``L{ℓ}.dA[s,h]``, ``L{ℓ}.dV[s,h]``, ``L{ℓ}.dQ[s,h]`` and ``L{ℓ}.dK[s,h]``
   for the attention members, and ``Lambda``, ``dF`` and ``G_E_head`` (``G_head`` when untied)
-  outside the stack. ``member`` is the 0-based ``(s, h)``, the bmm batch index ``s·n_h + h``
-  of HF's eager attention. Each product's κ class (:meth:`DecoderComputation.product_class`)
-  is its role without the layer and member.
+  outside the stack, ``Lambda[b]``, ``dF[b]``, ``G_E_head[b]`` per head block when
+  ``B > 1`` (:meth:`DecoderComputation.head_name`). ``member`` is the 0-based ``(s, h)``, the
+  bmm batch index ``s·n_h + h`` of HF's eager attention. Each product's κ class
+  (:meth:`DecoderComputation.product_class`) is its role without the layer, member and block.
 - **Batch assembly** is ``data.assemble_batch``: right padding with ``pad_id``, the model's
   EOS (F8f: ``data.run_pin(repo, revision)`` for a loaded model, SmolLM2's ``PAD_ID`` for a
   random test model unless given), ``ρ`` from each record's ``ℓ``. ``ρ`` is the HF
@@ -85,7 +86,8 @@ committed values (S4b, check 3), under the prover's autocast setting (F5a). A8 c
 forward products. A9 covers the backward products and :meth:`DecoderReplay.glue_gradients`, by
 autograd on the same modules under the same substitution; no backward is written by hand. As in
 training, the replay runs one forward pass with grad on and one backward pass per unit (the
-head, then layers ``L…1``), with no reruns; the class docstring has the details.
+head block by block, then layers ``L…1``); only each head block's scores run twice, from their
+leaf. The class docstring has the details.
 
 A biased ``Y_x``'s spec names its bias (``ProductSpec.bias``), and its committed leaf is
 ``A·B + 1·bᵀ``. The replay serves ``A`` and ``B`` without the bias; check 5 adds ``b`` from the
@@ -1031,22 +1033,23 @@ class _Unit:
 
     ``x`` is the unit's input, a detached copy of what the model passed it (``X_j``) with
     ``requires_grad`` on, so the autograd graph is cut at the unit boundary. ``out`` is the
-    unit's output with its graph: the layer's output, or the scalar ``ℒ`` for the head.
+    unit's output with its graph: the layer's output, or the final norm's ``F`` for the head.
     ``fwd`` holds each forward product's received operands with their ``_version`` at the
     call, and ``saved`` the storages of ``S``'s and ``O``'s operands (storage -> (S|O, a|b)).
+    ``heads`` holds the head's block inputs, block ``b``'s rows of ``F`` cut from its graph.
     """
 
     x: torch.Tensor
     out: torch.Tensor | None = None
     fwd: dict[str, tuple[torch.Tensor, torch.Tensor, int, int]] = field(default_factory=dict)
     saved: dict[int, tuple[str, str]] = field(default_factory=dict)
+    heads: list[torch.Tensor] = field(default_factory=list)
 
 
 def _key(c: DecoderComputation, spec: ProductSpec) -> str:
-    """The name a replay unit holds ``spec``'s operands under: ``L{ℓ}.{role}``, or the head's
-    role."""
-    role = c.product_class(spec)
-    return role if spec.layer is None else f"L{spec.layer}.{role}"
+    """The name a replay unit holds ``spec``'s operands under: ``L{ℓ}.{role}``, or the head
+    product's own name (its block's)."""
+    return spec.name if spec.layer is None else f"L{spec.layer}.{c.product_class(spec)}"
 
 
 def _unchanged(held: dict[str, tuple[torch.Tensor, torch.Tensor, int, int]],
@@ -1073,20 +1076,22 @@ class DecoderReplay(Replay):
     pass**, both under :class:`~verification.computation.substitution.ProductSubstitution`, so
     every checked product is its committed leaf and only glue is computed.
 
-    **Forward.** The first request runs ``logits`` on the committed batch, then
-    ``loss_from_logits``, with grad on and under the computation's autocast (F5a). A forward
-    pre-hook on each decoder layer (and on the final norm) hands the module a detached copy of
-    its input with ``requires_grad`` on: that is ``X_ℓ`` (``X_{L+1}`` for the head), and it
-    cuts the autograd graph at the layer boundary, so each backward unit (a layer, or the head)
-    keeps a graph of its own. During the pass the replay keeps, per unit, every operand its
-    products receive, the unit's output with its graph, the storages of the ``S`` and ``O``
-    operands, and a hook on each linear product's output that records the storage of its
-    output gradient ``δY_x``. Forward requests are then served from those kept operands in any
-    order, with no rerun.
+    **Forward.** The first request runs the model to the final norm's ``F`` on the committed
+    batch, then the output projection on each head block's rows (``_head_input``), as training
+    does, with grad on and under the computation's autocast (F5a). A forward pre-hook on each
+    decoder layer (and on the final norm) hands the module a detached copy of its input with
+    ``requires_grad`` on: that is ``X_ℓ`` (``X_{L+1}`` for the head), and it cuts the autograd
+    graph at the layer boundary, so each backward unit (a layer, or the head) keeps a graph of
+    its own. During the pass the replay keeps, per unit, every operand its products receive,
+    the unit's output with its graph, the storages of the ``S`` and ``O`` operands, and a hook
+    on each layer linear's output that records the storage of its output gradient ``δY_x``.
+    The head keeps its block inputs and ``Λ_b``'s operands, and drops each block's scores as
+    soon as they are computed. Forward requests are then served from those kept operands in
+    any order, with no rerun.
 
     The pass checks the call sequence by name, layer by layer (``Y_q, Y_k, Y_v, S, O, Y_o,
-    Y_gate, Y_up, Y_down``, then ``Λ`` and nothing in the loss), and that each module receives
-    exactly what the one before it returned: a layer's output is ``X_{ℓ+1}``, bit for bit.
+    Y_gate, Y_up, Y_down``, then ``Λ_0 … Λ_{B−1}``), and that each module receives exactly
+    what the one before it returned: a layer's output is ``X_{ℓ+1}``, bit for bit.
 
     Under autocast a linear's ``B`` and bias are autocast's bf16 copies of the weight and
     bias, which the substitution reports as they are made; the replay holds each copy until
@@ -1101,11 +1106,16 @@ class DecoderReplay(Replay):
     The leaves were validated by check 2, so that is a verifier-side bug and propagates as a
     crash, not a rejection.
 
-    **Backward (A9).** The backward products come in units: the head (``δF`` and
-    ``G_E^head`` or ``G_head``), then layers ``L … 1``. A unit's first request calls
-    ``torch.autograd.grad`` on that unit's kept output: from ``ℒ`` for the head, with the held
-    ``δX_{j+1}`` for layer ``j``, to ``X_j``, the unit's γ, biases and weights. Nothing is
-    rerun. Each backward product it meets is
+    **Backward (A9).** The backward products come in units: the head block by block (``δF_b``
+    and ``G_E^head`` or ``G_head`` of block ``b``), then layers ``L … 1``. Head block ``b``'s
+    first request runs the block as training does: ``Λ_b`` from its committed leaf on the kept
+    block input, block ``b``'s share of ``ℒ`` (``block_loss``), and ``torch.autograd.grad`` of
+    the share to the block input and the output projection's weight. Its scores are rebuilt
+    from the leaf, not kept from the pass, so one block's ``N/B × n_v`` arrays exist at a
+    time. After the last block the final norm's backward runs from ``δF = cat(δF_b)`` to
+    ``δX_{L+1}`` and ``γ_final``'s gradient. A layer's first request calls
+    ``torch.autograd.grad`` on its kept output with the held ``δX_{j+1}``, to ``X_j``, the
+    layer's γ, biases and weights; nothing is rerun. Each backward product it meets is
     replaced by its committed leaf, so RMSNorm, softmax, SiLU, RoPE, ``repeat_kv`` and the
     residual sums run in autograd on committed values. The products are identified at call
     time by operand identity, as in the labeling:
@@ -1128,19 +1138,21 @@ class DecoderReplay(Replay):
     are held. A unit's ``autograd.grad`` frees its graph's saved tensors, and the replay then
     drops the unit's forward operands, input and output, so memory falls unit by unit during
     the backward. The residual-stream frontier ``δX_j`` and the γ and bias gradients persist;
-    one unit's backward operands are held, and dropped after its last canonical product (the
-    head's weight gradient, or ``L{ℓ}.G_v``). The head is the largest unit: ``δΛ`` and the
-    softmax intermediates are ``N × n_v`` each.
+    one unit's backward operands are held (one head block's), and dropped after its last
+    canonical product (the block's weight gradient, or ``L{ℓ}.G_v``). A head block's ``δΛ_b``
+    and softmax intermediates are ``N/B × n_v`` each; the head's ``δF_b`` are held until the
+    norm's backward.
 
     **Order.** Canonical order ``1..M`` runs the forward and each unit's backward once. A
     forward request whose unit has already run its backward, or a backward request for a unit
-    that already ran, rebuilds from scratch: a fresh pass, then the backward units from the head
-    down to the one requested. So any order gives the same operands.
+    or head block that already ran, rebuilds from scratch: a fresh pass, then the backward
+    units from the head's block 0 down to the one requested. So any order gives the same
+    operands.
 
     :meth:`glue_gradients` is valid only right after ``operands(M)``, with ``δX_1`` held. It
     returns each γ's and each bias's gradient from the units' backward, and ``W_E``'s full
     gradient: the embedding module's own backward of ``δX_1``, plus the committed ``G_E^head``
-    when tied.
+    leaves summed as check 6a sums a linear's (``chain_gradient``) when tied.
     """
 
     def __init__(self, computation: DecoderComputation, leaves: LeafReader) -> None:
@@ -1153,20 +1165,28 @@ class DecoderReplay(Replay):
         self._copies: dict[int, tuple[str, torch.Tensor]] = {}
         self._role = {c.w(l, x): (l, x) for l in range(1, c.L + 1) for x in LINEARS}
         self._role[c.w_out] = (None, "head")
+        # Each head product's m -> its block.
+        self._block_of = {c.m_of(c.head_name(k, b)): b for b in range(c.head_blocks)
+                          for k in ("Lambda", "dF", "G")}
         self.batch: Batch | None = None
-        # The pass: whether it ran, its units by j (dropped as each one's backward runs) and
-        # the next unit whose backward has not run (L+1 = the head; 0 once all have run).
+        # The pass: whether it ran, its units by j (dropped as each one's backward runs), the
+        # next unit whose backward has not run (L+1 = the head; 0 once all have run), the
+        # head's next block and the head's δF_b so far.
         self._built = False
         self._units: dict[int, _Unit] = {}
         self._next_unit = c.L + 1
+        self._next_block = 0
+        self._dfs: list[torch.Tensor] = []
         # During the forward pass: every call's name in order, where the current unit's calls
-        # start, the current unit's calls (name -> (A, B, output)), the layer whose S, O pair
-        # is open (set by its Y_v) and the bmms taken from it.
+        # start, the current unit's calls (name -> (A, B, output; None for the head's)), the
+        # layer whose S, O pair is open (set by its Y_v) and the bmms taken from it.
         self._names: list[str] = []
         self._mark = 0
-        self._calls: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._calls: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
         self._cur: int | None = None
         self._n_bmm = 0
+        # The head block being run, forward or backward.
+        self._block: int | None = None
         # During one unit's backward: the unit, its forward linears by name -> weight, its
         # backward product names, its forward operands, its S/O operand storages and the
         # output-gradient storages the hooks record (storage -> weight).
@@ -1176,10 +1196,10 @@ class DecoderReplay(Replay):
         self._fwd: dict[str, tuple[torch.Tensor, torch.Tensor, int, int]] = {}
         self._saved: dict[int, tuple[str, str]] = {}
         self._dy: dict[int, str] = {}
-        # Held across requests: the unit whose backward operands are held and those operands
-        # with their versions, the residual-stream frontier (j, δX_j), the γ and bias
-        # gradients, and whether the last request was operands(M).
-        self._bunit: int | None = None
+        # Held across requests: the unit (j, head block or 0) whose backward operands are held
+        # and those operands with their versions, the residual-stream frontier (j, δX_j), the
+        # γ and bias gradients, and whether the last request was operands(M).
+        self._bunit: tuple[int, int] | None = None
         self._bops: dict[str, tuple[torch.Tensor, torch.Tensor, int, int]] = {}
         self._dx: tuple[int, torch.Tensor] | None = None
         self._glue: dict[str, torch.Tensor] = {}
@@ -1214,7 +1234,9 @@ class DecoderReplay(Replay):
             l, x = self._role[w]
             # S then O follow the layer's Y_v, as in the labeling (module docstring).
             self._cur, self._n_bmm = (l if x == "v" else None), 0
-            name = "Lambda" if l is None else f"L{l}.Y_{x}"
+            if l is None and self._block is None:
+                raise ReplayError("replay: the output projection runs outside a head block")
+            name = c.head_name("Lambda", self._block) if l is None else f"L{l}.Y_{x}"
             out = self.view.product(c.m_of(name)).clone()
         else:
             if self._cur is None or self._n_bmm > 1:
@@ -1227,13 +1249,17 @@ class DecoderReplay(Replay):
         out = out.to(a.device)
         self._names.append(name)
         if name not in self._calls:  # a repeat fails the unit's name check
-            self._calls[name] = (a, b, out)
+            # A head block's scores are not kept: its backward rebuilds them.
+            self._calls[name] = (a, b, None if self._block is not None else out)
         return out
 
     @staticmethod
     def _layer_names(l: int) -> list[str]:
         return [f"L{l}.{r}" for r in ("Y_q", "Y_k", "Y_v", "S", "O", "Y_o", "Y_gate", "Y_up",
                                       "Y_down")]
+
+    def _head_names(self) -> list[str]:
+        return [self.c.head_name("Lambda", b) for b in range(self.c.head_blocks)]
 
     def _enter_unit(self, j: int, x: Any) -> torch.Tensor:
         """Start unit ``j`` on input ``x``; returns the graph-cutting copy the module gets."""
@@ -1260,7 +1286,7 @@ class DecoderReplay(Replay):
         head = j == c.L + 1
         names = self._names[self._mark:]
         calls, self._calls, self._mark = self._calls, {}, len(self._names)
-        if names != (["Lambda"] if head else self._layer_names(j)):
+        if names != (self._head_names() if head else self._layer_names(j)):
             where = "the head" if head else f"layer {j}"
             raise ReplayError(f"replay: {where} does not have the declared products")
         u = self._units[j]
@@ -1271,16 +1297,18 @@ class DecoderReplay(Replay):
             u.saved[_ptr(fa)], u.saved[_ptr(fb)] = (kind, "a"), (kind, "b")
         if len(u.saved) != (0 if head else 4):
             raise ReplayError(f"replay: layer {j}'s S and O operands share storage")
-        for y, w in self._unit_names(j)[0].items():  # δY_x's storage identifies δX_x and G_x
+        # δY_x's storage identifies δX_x and G_x; a head block hooks its rebuilt scores.
+        for y, w in ({} if head else self._unit_names(j)[0]).items():
             calls[y][2].register_hook(lambda g, w=w: self._dy.__setitem__(_ptr(g), w))
 
     def _build(self) -> None:
-        """The one forward pass, embedding to ``ℒ``, with grad on under substitution."""
+        """The one forward pass, embedding to every head block's ``Λ_b``, with grad on under
+        substitution."""
         c, model, inner = self.c, self.model, self.model.model
-        self._built, self._units, self._next_unit = False, {}, c.L + 1
-        self._bunit, self._bops, self._dx, self._glue = None, {}, None, {}
+        self._built, self._units, self._next_unit, self._next_block = False, {}, c.L + 1, 0
+        self._bunit, self._bops, self._dx, self._glue, self._dfs = None, {}, None, {}, []
         self._names, self._mark, self._calls, self._cur, self._n_bmm = [], 0, {}, None, 0
-        self._copies = {}
+        self._copies, self._block = {}, None
 
         def enter_layer(j):
             def hook(module, args, kwargs):
@@ -1305,12 +1333,23 @@ class DecoderReplay(Replay):
         batch = c.assemble(self.view.records())
         try:
             with torch.enable_grad(), ProductSubstitution(self._supply, copied=self._copied):
-                loss = c._forward_loss(model, batch)
-                if c.L + 1 not in self._units:
-                    raise ReplayError("replay: the forward pass never reached the final norm")
-                self._leave_unit(c.L + 1, loss)
-            want = [n for l in range(1, c.L + 1) for n in self._layer_names(l)] + ["Lambda"]
-            if self._names != want or set(self._units) != set(range(1, c.L + 2)):
+                # One autocast region, as in training: W is cast once for all blocks (F5a).
+                with c.autocast():
+                    f = c._features(model, batch)
+                    if c.L + 1 not in self._units:
+                        raise ReplayError("replay: the forward pass never reached the final "
+                                          "norm")
+                    heads = []
+                    for b in range(c.head_blocks):
+                        self._block = b
+                        heads.append(fb := c._head_input(f, b))
+                        model.lm_head(fb)  # Λ_b's operands are kept, its scores dropped
+                    self._block = None
+                self._leave_unit(c.L + 1, f)
+                self._units[c.L + 1].heads = heads
+            want = [n for l in range(1, c.L + 1) for n in self._layer_names(l)]
+            if (self._names != want + self._head_names()
+                    or set(self._units) != set(range(1, c.L + 2))):
                 raise ReplayError("replay: the forward pass does not have the declared products")
         except BaseException:
             self._units = {}
@@ -1318,7 +1357,7 @@ class DecoderReplay(Replay):
         finally:
             for h in hooks:
                 h.remove()
-            self._names, self._calls = [], {}
+            self._names, self._calls, self._block = [], {}, None
         self.batch, self._built = batch, True
 
     def _forward_unit(self, spec: ProductSpec) -> int:
@@ -1339,12 +1378,13 @@ class DecoderReplay(Replay):
 
     # ---- backward (A9) -------------------------------------------------------------------------
 
-    def _unit_names(self, j: int) -> tuple[dict[str, str], set[str]]:
-        """Backward unit ``j`` (a layer, or ``L+1`` for the head): its forward linear products
-        mapped to their weights, and the names of its backward products."""
+    def _unit_names(self, j: int, b: int = 0) -> tuple[dict[str, str], set[str]]:
+        """Backward unit ``j`` (a layer, or ``L+1`` and block ``b`` for the head): its forward
+        linear products mapped to their weights, and the names of its backward products."""
         c = self.c
         if j == c.L + 1:
-            return {"Lambda": c.w_out}, {"dF", c.g_head}
+            return ({c.head_name("Lambda", b): c.w_out},
+                    {c.head_name("dF", b), c.head_name("G", b)})
         ys = {f"L{j}.Y_{x}": c.w(j, x) for x in LINEARS}
         want = {f"L{j}.{p}_{x}" for p in ("dX", "G") for x in LINEARS}
         return ys, want | {f"L{j}.{r}" for r in _ATTN_BACKWARD}
@@ -1352,7 +1392,9 @@ class DecoderReplay(Replay):
     def _linear_name(self, w: str, prefix: str) -> str:
         l, x = self._role[w]
         if l is None:
-            return {"dX": "dF", "G": self.c.g_head}[prefix]
+            if self._block is None:
+                raise ReplayError("replay: an output-projection gradient outside a head block")
+            return self.c.head_name({"dX": "dF", "G": "G"}[prefix], self._block)
         return f"L{l}.{prefix}_{x}"
 
     def _supply_backward(self, op: str, a: torch.Tensor, b: torch.Tensor,
@@ -1401,37 +1443,114 @@ class DecoderReplay(Replay):
         self._bops[name] = (a, b, a._version, b._version)
         return out
 
+    def _check_backward(self, what: str, grads: Sequence[torch.Tensor | None]) -> None:
+        if not self._bops:
+            raise ReplayError(f"replay: no backward product of {what} reached the "
+                              f"substitution; is the dispatch mode not active in backward?")
+        if any(g is None for g in grads) or set(self._bops) != self._want:
+            missing = sorted(self._want - set(self._bops))
+            raise ReplayError(f"replay: backward {what} is missing {missing or 'a gradient'}")
+
+    def _run_head_block(self, b: int) -> None:
+        """Backpropagate head block ``b`` as training does
+        (:meth:`DecoderComputation.forward_backward`): ``Λ_b`` from its leaf on the kept block
+        input, the block's share of ``ℒ``, and ``torch.autograd.grad`` of the share to
+        ``δF_b`` and the output projection's weight, under substitution. After the last block,
+        the final norm's backward (:meth:`_run_norm`)."""
+        c, model, j = self.c, self.model, self.c.L + 1
+        u = self._units.get(j)
+        if u is None or self._next_unit != j or self._next_block != b:
+            raise ReplayError(f"replay: head block {b}'s backward is not the next one of the "
+                              f"pass")
+        assert self.batch is not None
+        lam = c.head_name("Lambda", b)
+        fb, w = u.heads[b], model.lm_head.weight
+        self._ys, self._want = self._unit_names(j, b)
+        self._unit, self._block, self._bunit, self._bops = j, b, None, {}
+        self._fwd, self._saved, self._dy = {}, {}, {}
+        scores: list[torch.Tensor] = []  # Λ_b, once supplied
+        copies = set(self._copies)
+
+        def supply(op, a, wb, bias):
+            if scores:
+                return self._supply_backward(op, a, wb, bias)
+            if op != "mm" or self._weight(wb) != c.w_out:
+                raise ReplayError(f"replay: head block {b} does not start with {lam}")
+            scores.append(self.view.product(c.m_of(lam)).clone().to(a.device))
+            self._fwd[lam] = (a, wb, a._version, wb._version)
+            return scores[0]
+
+        try:
+            with torch.enable_grad(), ProductSubstitution(supply, copied=self._copied):
+                with c.autocast():
+                    part = c.block_loss(model.lm_head(fb), self.batch, c._head_seqs(b))
+                if not scores:
+                    raise ReplayError(f"replay: head block {b} never ran {lam}")
+                scores[0].register_hook(lambda g: self._dy.__setitem__(_ptr(g), c.w_out))
+                grads = torch.autograd.grad(part, [fb, w], allow_unused=True)
+        except BaseException:
+            self._built, self._units = False, {}  # the graph may be half consumed
+            raise
+        finally:
+            self._fwd, self._dy, self._block = {}, {}, None
+            # The block's scores and autocast's copy of W made for it go with the block.
+            scores.clear()
+            self._copies = {k: v for k, v in self._copies.items() if k in copies}
+            self._next_block = b + 1
+        self._check_backward(f"head block {b}", grads)
+        self._dfs.append(grads[0])
+        self._bunit = (j, b)
+        if b + 1 == c.head_blocks:
+            self._run_norm()
+
+    def _run_norm(self) -> None:
+        """The final norm's backward from ``δF = cat(δF_b)``, as training's ``F.backward``: to
+        ``δX_{L+1}`` and ``γ_final``'s gradient. Then drop the head's forward state."""
+        c, j = self.c, self.c.L + 1
+        u = self._units[j]
+        names = (c.gamma_final, c.w_out)
+        gamma = self.model.get_parameter(c.gamma_final)
+
+        def no_product(op, a, b, bias):
+            raise ReplayError("replay: a product in the final norm's backward")
+
+        try:
+            with ProductSubstitution(no_product):
+                grads = torch.autograd.grad(u.out, [u.x, gamma],
+                                            grad_outputs=torch.cat(self._dfs))
+        except BaseException:
+            self._built, self._units = False, {}
+            raise
+        finally:
+            self._dfs = []
+            self._units.pop(j, None)
+            self._next_unit, self._next_block = c.L, 0
+            self._copies = {k: v for k, v in self._copies.items() if v[0] not in names}
+        self._dx = (j, grads[0])
+        self._glue[c.gamma_final] = grads[1]
+
     def _run_unit(self, j: int) -> None:
-        """Backpropagate unit ``j`` of the pass: ``δX_{j+1}`` (the head starts from ``ℒ``)
-        into ``δX_j``, its γ and its biases, under substitution; then drop the unit's forward
-        state."""
+        """Backpropagate layer ``j`` of the pass: ``δX_{j+1}`` into ``δX_j``, its γ and its
+        biases, under substitution; then drop the layer's forward state."""
         c, model = self.c, self.model
-        head = j == c.L + 1
         u = self._units.get(j)
         if u is None or u.out is None or self._next_unit != j:
             raise ReplayError(f"replay: backward unit {j} is not the next one of the pass")
-        grad_out = None  # the head starts from ℒ; layer j from δX_{j+1}
-        if not head:
-            dx = self._dx
-            if dx is None or dx[0] != j + 1:
-                raise ReplayError(f"replay: layer {j}'s backward needs δX_{j + 1}")
-            grad_out = dx[1]
-        # The unit's glue-gradient weights first, then its linear weights.
-        if head:
-            glue = [c.gamma_final]
-            names = [*glue, c.w_out]
-        else:
-            glue = [c.gamma_attn(j), c.gamma_mlp(j),
-                    *(b for x in LINEARS if (b := c.bias(j, x)) is not None)]
-            names = [*glue, *(c.w(j, x) for x in LINEARS)]
+        dx = self._dx
+        if dx is None or dx[0] != j + 1:
+            raise ReplayError(f"replay: layer {j}'s backward needs δX_{j + 1}")
+        # The layer's glue-gradient weights first, then its linear weights.
+        glue = [c.gamma_attn(j), c.gamma_mlp(j),
+                *(b for x in LINEARS if (b := c.bias(j, x)) is not None)]
+        names = [*glue, *(c.w(j, x) for x in LINEARS)]
         params = [model.get_parameter(n) for n in names]
         self._ys, self._want = self._unit_names(j)
-        self._unit, self._bunit, self._bops = j, None, {}
+        self._unit, self._block, self._bunit, self._bops = j, None, None, {}
         self._fwd, self._saved, self._dy = u.fwd, u.saved, {}
         try:
             with ProductSubstitution(self._supply_backward):
                 grads = torch.autograd.grad(
-                    u.out, [u.x, *params], grad_outputs=grad_out, allow_unused=True)
+                    u.out, [u.x, *params], grad_outputs=dx[1], allow_unused=True)
         except BaseException:
             self._built, self._units = False, {}  # the graph may be half consumed
             raise
@@ -1442,38 +1561,44 @@ class DecoderReplay(Replay):
             self._units.pop(j, None)
             self._next_unit = j - 1
             self._copies = {k: v for k, v in self._copies.items() if v[0] not in names}
-        if not self._bops:
-            raise ReplayError(f"replay: no backward product of unit {j} reached the "
-                              f"substitution; is the dispatch mode not active in backward?")
-        if any(g is None for g in grads) or set(self._bops) != self._want:
-            missing = sorted(self._want - set(self._bops))
-            raise ReplayError(f"replay: backward unit {j} is missing {missing or 'a gradient'}")
+        self._check_backward(f"unit {j}", grads)
         self._dx = (j, grads[0])
         for n, g in zip(glue, grads[1:]):
             self._glue[n] = g
-        self._bunit = j
+        self._bunit = (j, 0)
 
-    def _backward_unit(self, spec: ProductSpec) -> int:
-        """Run unit ``j`` of ``spec``'s backward unless its operands are held; returns ``j``."""
-        j = self.c.L + 1 if spec.layer is None else spec.layer
-        if self._bunit != j:
-            # In order, unit j is the next one of the pass; otherwise rebuild from scratch.
-            if not self._built or self._next_unit < j:
+    def _ran(self, unit: tuple[int, int]) -> bool:
+        """Whether backward ``unit`` (``(j, head block or 0)``) has run in this pass: units
+        run from the head's block 0 to its last, then layers ``L … 1``."""
+        j, b = unit
+        return (-j, b) < (-self._next_unit, self._next_block)
+
+    def _backward_unit(self, spec: ProductSpec) -> tuple[int, int]:
+        """Run ``spec``'s backward unit ``(j, head block or 0)`` unless its operands are held;
+        returns the unit."""
+        c = self.c
+        unit = (c.L + 1, self._block_of[spec.m]) if spec.layer is None else (spec.layer, 0)
+        if self._bunit != unit:
+            # In order, the unit is the next one of the pass; otherwise rebuild from scratch.
+            if not self._built or self._ran(unit):
                 self._build()
-            while self._next_unit >= j:
-                self._run_unit(self._next_unit)
-        return j
+            while not self._ran(unit):
+                if self._next_unit == c.L + 1:
+                    self._run_head_block(self._next_block)
+                else:
+                    self._run_unit(self._next_unit)
+        return unit
 
     def _backward_operands(self, spec: ProductSpec) -> tuple[torch.Tensor, torch.Tensor]:
         c = self.c
-        j = self._backward_unit(spec)
+        j, blk = self._backward_unit(spec)
         a, b = _unchanged(self._bops, _key(c, spec))
         if spec.member is not None:
             s, h = spec.member
             i = s * c.n_h + h
             a, b = (b[i].mT, a[i].mT) if c.product_class(spec) == "dK" else (a[i], b[i])
         # The unit's last product in canonical order: drop the unit's operands.
-        if spec.name == (c.g_head if spec.layer is None else f"L{j}.G_v"):
+        if spec.name == (c.head_name("G", blk) if spec.layer is None else f"L{j}.G_v"):
             self._bunit, self._bops = None, {}
         return a, b
 
@@ -1514,7 +1639,7 @@ class DecoderReplay(Replay):
                or (p.kind is ProductKind.FORWARD) != forward
                or (p.a_shape, p.b_shape) != (first.a_shape, first.b_shape) for p in specs):
             return super().operand_group(ms, dtype)
-        j = self._forward_unit(first) if forward else self._backward_unit(first)
+        j = self._forward_unit(first) if forward else self._backward_unit(first)[0]
         held = self._units[j].fwd if forward else self._bops
         # Per role: its whole (A, B) as served, and its members' group positions and batch
         # indices s·n_h + h.
@@ -1554,7 +1679,7 @@ class DecoderReplay(Replay):
         ``G_E^head + G_E^emb`` when tied and ``G_E^emb`` alone when untied.
 
         Valid right after ``operands(M)``, the last product of layer 1's backward. ``G_E^head``
-        is the committed leaf. ``G_E^emb`` is the backward of the model's own embedding module
+        is the committed leaves ``G_E_head[b]`` summed in block order. ``G_E^emb`` is the backward of the model's own embedding module
         at the committed ids, fed ``δX_1``, so it follows that module's ``padding_idx``. At
         test scale that has no numeric effect: SmolLM2's padding id 2 occurs only at padded
         positions, where ``δX_1`` is exactly 0, so a plain scatter-add gives the same bits.
@@ -1573,8 +1698,10 @@ class DecoderReplay(Replay):
         with torch.enable_grad(), c.autocast(), ProductSubstitution(no_product):
             (g_emb,) = torch.autograd.grad(emb(self.batch.ids), [emb.weight],
                                            grad_outputs=self._dx[1])
-        # F6b: the committed G_E^head widened exactly to W_E's format, plus the lookup's.
-        g_e = (self.view.product(c.m_of("G_E_head")).to(g_emb.device, c.weight_dtype) + g_emb
+        # F6b: the committed G_E^head blocks widened exactly to W_E's format and summed as
+        # training sums them (chain_gradient, on the lookup's device), plus the lookup's.
+        g_e = (chain_gradient((self.view.product(m).to(g_emb.device) for m in c.head_gradients),
+                              c.weight_dtype) + g_emb
                if c.tied else g_emb)
         grads = {**self._glue, _E: g_e}
         out = {n: grads[n] for n in c.glue_gradient_weights}
