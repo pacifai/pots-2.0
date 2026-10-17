@@ -25,7 +25,8 @@ of check 6 (``verifier/residuals.py``, which A11 reuses), and each step's wall c
 With metrics on (``--metrics``, default ``VERIF_METRICS=1``) the timed run writes its records and
 residual arrays to ``$VERIF_OUTPUT_DIR/llama_step/`` (B6), and two separate untimed passes of the
 same ``T`` steps write the per-component memory peaks and the counts; the prover's and the
-verifier's peaks are printed from the memory pass.
+verifier's peaks are printed from the memory pass. ``VERIF_RELEASE_CACHE=0`` skips the loop's
+CUDA cache release between prover and verifier in the timed run and the memory pass.
 """
 
 from __future__ import annotations
@@ -120,11 +121,13 @@ def run_honest(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, 
                *, T: int, k: int, seed: int, h_D: bytes, final: Mapping[str, torch.Tensor],
                recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
                build_model: Callable[[], torch.nn.Module] | None = None,
-               verifier: Callable[[Section | None], Verifier] | None = None) -> ScenarioResult:
+               verifier: Callable[[Section | None], Verifier] | None = None,
+               release_cache: bool | None = None) -> ScenarioResult:
     """``T`` honest steps through the S3 loop, judged by provisional bands unless ``verifier``
-    (as in ``run_scenario``) gives a judging verifier."""
+    (as in ``run_scenario``, with ``release_cache``) gives a judging verifier."""
     return run_scenario(c, dataset, w0, HONEST, T=T, k=k, seed=seed, final=final,
-                        recorder=recorder, h_D=h_D, build_model=build_model, verifier=verifier)
+                        recorder=recorder, h_D=h_D, build_model=build_model, verifier=verifier,
+                        release_cache=release_cache)
 
 
 def _band_label(bands: Bands) -> str:
@@ -143,18 +146,21 @@ def report_residuals(r: ScenarioResult, out: Callable[[str], None] = print) -> N
 
 def report_costs(r: ScenarioResult, memory_rows: Sequence[Mapping[str, Any]] | None = None,
                  out: Callable[[str], None] = print) -> None:
-    """Each step's wall clock (prover: ``prove_step`` and the commit; verifier: every check),
-    and with the memory pass's rows, the process peak during each side's sections."""
+    """Each step's wall clock (prover: ``prove_step`` and the commit; verifier: every check;
+    the hand-off between them, which on CUDA holds ``run_loop``'s cache release), and with the
+    memory pass's rows, the process peak during each side's sections (on CUDA with the caching
+    allocator's reserved peak beside it)."""
     for s in r.loop.steps:
         out(f"step {s.t}: prover {s.prove_s + s.commit_s:.2f} s (prove_step {s.prove_s:.2f} s, "
             f"commit {s.commit_s:.2f} s); verifier {s.verify_s:.2f} s "
             "(" + ", ".join(f"{c} {x:.2f}" for c, x in r.verifier.timings.get(s.t, {}).items())
-            + ")")
+            + f"); hand-off {s.handoff_s:.2f} s")
     for row in memory_rows or ():
         if row.get("level") == "total" and row["component"] in ("prover", "verifier") \
                 and row["step"] > 0 and row["peak_bytes"] is not None:
-            start = row["start_bytes"]
+            start, held = row["start_bytes"], row.get("peak_reserved_bytes")
             out(f"step {row['step']}: {row['component']} peak {row['peak_bytes'] / 2**30:.2f} GB"
+                + ("" if held is None else f", reserved {held / 2**30:.2f} GB")
                 + ("" if start is None else f" (at its start {start / 2**30:.2f} GB)")
                 + f" [{row['mem_source']}, memory pass]")
     out(f"process lifetime peak RSS {lifetime_maxrss_bytes() / 2**30:.2f} GB")
@@ -198,23 +204,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         make = judging_verifier(c, len(D), w0, bands, T=T, k=k, seed=cfg.seed, h_D=h_D)
     run_args = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models,
                     verifier=make)
+    cache = dict(release_cache=cfg.release_cache)  # not count_run's: it counts, on any device
     mem_rows = None
     if not use_metrics:
-        r = run_honest(c, D, w0, **run_args)
+        r = run_honest(c, D, w0, **run_args, **cache)
     else:
         llama = {"n_s": c.n_s, "n": c.n, "eta": c.eta, "k": k, "T": T, "n_records": len(D),
                  "M": c.M, "n_leaves": c.n_leaves}
         # The config hash covers what decides the run's results, not where it writes.
         config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-                     if f.name not in ("output_dir", "metrics")}, "llama": llama}
+                     if f.name not in ("output_dir", "metrics", "release_cache")},
+                  "llama": llama}
         with MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
                            model=cfg.model, corpus=backdoorllm.SOURCE, attack=cfg.attack,
                            seed=cfg.seed, config=config,
                            band_file_hash=None if make is None else bands.source, h_D=h_D,
                            extra={"band_source": "provisional" if make is None
                                   else str(args.bands), **llama}) as mw:
-            r = run_honest(c, D, w0, **run_args, recorder=mw.recorder(HONEST.name))
-            mem_rows = memory_run(c, D, w0, run=RUN_NAME, **run_args, device=mw.device)
+            r = run_honest(c, D, w0, **run_args, **cache, recorder=mw.recorder(HONEST.name))
+            mem_rows = memory_run(c, D, w0, run=RUN_NAME, **run_args, **cache,
+                                  device=mw.device)
             mw.write(mem_rows)
             mw.write(count_run(c, D, w0, run=RUN_NAME, **run_args))
         print(f"metrics: {mw.dir}")

@@ -19,6 +19,7 @@ from verification.computation.instances.mlp import (
     synthetic_dataset,
 )
 from verification.prover.step import plain_step, prove_step
+from verification.runs import fs11_session
 from verification.runs import plain_baseline as pb
 from verification.runs.loop import run_loop, run_plain
 from verification.runs.metrics import MetricsWriter, P0_PHASES, config_hash, read_records
@@ -239,9 +240,10 @@ def test_files_compare_provenance_first(mlp, tmp_path):
 
 
 def test_training_config_hash_ignores_the_task_and_level():
-    """``attack`` and ``poison_count`` don't move the training-config hash: ``h_D`` tells the
-    tasks apart, and the level never enters honest training. At the test-scale defaults the
-    hash is the stored C6 plain baseline's, so B7 still compares a verified run with it."""
+    """``attack``, ``poison_count`` and ``release_cache`` don't move the training-config hash:
+    ``h_D`` tells the tasks apart, the level never enters honest training, and the CUDA cache
+    release changes no number. At the test-scale defaults the hash is the stored C6 plain
+    baseline's, so B7 still compares a verified run with it."""
     from setup.config import load_config
 
     def h(**env):
@@ -250,8 +252,10 @@ def test_training_config_hash_ignores_the_task_and_level():
     base = h()
     assert base == "7191ef052a0ba1f2a91413a1f0dff79a2cb5a6123590a40e6c509e7f8d3f9cf1"
     assert h(VERIF_ATTACK="jailbreak") == h(VERIF_POISON_COUNT="4") == base
+    assert h(VERIF_RELEASE_CACHE="0") == base
     assert h(VERIF_SEED="2") != base
-    assert not {"attack", "poison_count"} & set(pb.training_config(load_config({})))
+    assert not ({"attack", "poison_count", "release_cache"}
+                & set(pb.training_config(load_config({}))))
     # The output layer's blocks: one is the stored baselines' training, more move its bits.
     assert h(VERIF_HEAD_BLOCKS="1") == base
     assert h(VERIF_HEAD_BLOCKS="2") != base
@@ -345,6 +349,13 @@ def test_main_runs_with_and_without_metrics(tiny_main, monkeypatch, capsys, capl
     rows = read_records(out)
     assert {r["step"] for r in rows if r["record"] == "memory"} == {1}
     assert {r["step"] for r in rows if r["record"] == "time"} == {1, 2}
+    # the re-check's summary of a plain arm reads these records
+    extras = fs11_session.part_extras(fs11_session.Part(
+        "plain", [], kind="plain", info={"report": str(out / "records.jsonl")}), root / "log")
+    assert extras["completed"] and len(extras["step_s"]) == 2
+    assert extras["step_s"] == [r["time_s"] for r in rows if r["record"] == "time"
+                                and r["component"] == "step" and r["level"] == "total"]
+    assert extras["mem_source"] == next(r["mem_source"] for r in rows if r["record"] == "memory")
     assert pb.read_final_weights(out)["steps"] == 2
     text = capsys.readouterr().out
     assert "P0 memory growth" in text and "metrics: " in text

@@ -97,6 +97,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_SEED` | `1`: `π`'s seed (F8c) and F8g's draw, a public input. It also seeds torch, numpy and `random` (S4c) and the MLP's synthetic data and init |
 | `VERIF_OUTPUT_DIR` | `trainer_output/verification` (gitignored) |
 | `VERIF_METRICS` | `1`: runs write B6's metrics to `$VERIF_OUTPUT_DIR/<run>/`; `0` turns them off. Only `0` or `1` |
+| `VERIF_RELEASE_CACHE` | `1`: on CUDA, the loop hands the allocator's cached blocks back between prover and verifier (`loop.release_device_cache`); `0` skips it, so the re-check session can time the verified step without it. Only `0` or `1`. Read by every verified run: `bring_up` and `llama_step` pass it, and `run_loop`, `run_scenario`, `memory_run`, `bias_tamper` and `run_honest` read it themselves when their `release_cache` is `None` (the default, `loop.release_cache_setting`). It changes no number, so no config hash holds it |
 
 `VERIF_DATASET` and `VERIF_DATASET_REVISION` are retired: F8d pins the data in
 `setup/backdoorllm.py`, and setting either raises.
@@ -1425,14 +1426,33 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
 
 - `loop.py` (A6): the S3 per-step loop, instance-agnostic.
   - `run_loop(c, model, D, w0, verifier, *, final, fault=None, schedule=None, on_step=None,
-    section=None, handoff=None) -> LoopResult`. `section` is B6's metrics seam, passed to
+    section=None, handoff=None, release_cache=None) -> LoopResult`. `section` is B6's metrics seam, passed to
     `prove_step`. The default `π` is `data.schedule` at `verifier.seed`, the verifier's own
     call. It runs `verifier.start_run(D)`, then per step `prove_step` on `π(t)`,
     `InMemoryStore.commit_step` (`P3.commit`) and `handoff.hold` with the `h_D` paths
-    (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), `verifier.verify_step(t, store)`,
+    (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), drops the prover's references,
+    `release_device_cache(model_device(model), section)` (skipped, section and all, with
+    `release_cache=False`; `None` reads `VERIF_RELEASE_CACHE` through
+    `release_cache_setting`),
+    `verifier.verify_step(t, store)`,
     `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
+  - `release_device_cache(device, section=None)`: only when the run's `device` is CUDA
+    (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in the process),
+    `torch.cuda.empty_cache()` inside the section `HANDOFF_SECTION` (`"handoff.empty_cache"`),
+    once per step between the prover's role and the verifier's; elsewhere it does nothing and
+    opens no section. Prover and verifier share one process and one GPU in our runs, and the
+    prover's freed blocks stay cached at the prover's sizes, so a large verifier buffer may not
+    fit though the GPU has the room (the first H100 session's out-of-memory errors). Its row is
+    the harness's, side `run`, in no total. `run_loop` gives it the model's device
+    (`model_device`: the first parameter's, host without one); `bring_up.bias_tamper` calls it
+    with `c.device` before each `verify_step` too. `run_scenario`, `memory_run`, `bring_up`,
+    `bias_tamper` and `llama_step.run_honest` pass on `release_cache` (default `None`, read
+    from `VERIF_RELEASE_CACHE`); `bring_up` and `llama_step` set it from `cfg.release_cache`.
+    Set `PYTORCH_ALLOC_CONF=expandable_segments:True` in the run's environment, not in
+    Python: the allocator reads it at CUDA's first use. torch 2.9 prefers that name over the
+    deprecated `PYTORCH_CUDA_ALLOC_CONF`, so leave the old one unset.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
     default: `entry_weights(t, w)` (hidden steps), `committed_records(t, records)` (A1: the
@@ -1440,7 +1460,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     it receives the committed batch), `perturb(t)` (`prove_step`'s product perturbation) and
     `emit(t, out)` (an A3 splice).
   - `LoopResult(verdict, steps, w_final)`, where `steps` holds `StepRecord(t, rejection, loss,
-    prove_s, commit_s, verify_s)`. `prove_s` excludes `emit`. Per-check timings and stats stay on
+    prove_s, commit_s, verify_s, handoff_s)`. `prove_s` excludes `emit`; `handoff_s` is the
+    time between the roles (the cache release on CUDA), in neither `commit_s` nor `verify_s`. Per-check timings and stats stay on
     the verifier. A test holds weakrefs to each step's products and checks they are dead by the
     next step.
 - `scenarios.py`: the instance-agnostic scenario harness, shared by `mlp_smoke` and
@@ -1450,7 +1471,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   `run_scenario(..., T, k, seed, final, recorder=None, h_D=None, verifier=None)` (`h_D`
   defaults to `D`'s root; `verifier(section) -> Verifier` replaces the default provisional
   verifier and must match the run's seam, `T`, `k` and `seed`; `memory_run` and `count_run`
-  take it and `seed` too, and `handoff`, passed to `run_loop`), `judge` (the
+  take it and `seed` too, and `handoff`, passed to `run_loop`; `run_scenario` and `memory_run`
+  also take `release_cache=True`, `run_loop`'s), `judge` (the
   S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
   default `HONEST`, through `memory_pass` / `count_pass`).
   - **Model reuse (O4).** `honest_final`, `run_scenario`, `memory_run` and `count_run` take
@@ -1489,7 +1511,21 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     top-level boundaries and times nested sections with event pairs, MPS syncs at every
     boundary). Memory (`MemoryRecorder`, `memory_pass`) and counts (`CountRecorder`,
     `count_pass`, `counting()`) are separate untimed runs; every section, nested included,
-    gets all three axes.
+    gets all three axes. On CUDA every memory row also holds `peak_reserved_bytes`, the
+    caching allocator's reserved peak over the same interval
+    (`torch.cuda.max_memory_reserved`, read through `reserved_peak(probe)`); it is null on
+    every other backend. Reserved minus allocated is the fragmentation an out-of-memory error
+    reports as "reserved but unallocated"; the two peaks need not fall at the same moment.
+    The derived P1 rows don't carry it. `MemoryRecorder(..., echo=None)` and
+    `memory_pass(..., echo=None)`: with `echo`, each top-level section prints one line as it
+    closes (`   step 1, check 5: peak … GB, reserved … GB (start …, end … GB; nested:
+    5.glue … (reserved …), 5.measure … (reserved …) GB); raised OutOfMemoryError`, the
+    reserved figures on CUDA only; `run:` sections as `   run, …`), so a run that dies
+    mid-step keeps the sections it got through, where the rows, written at step close, are
+    lost.
+  - **The harness's row.** `handoff.empty_cache` (`loop.HANDOFF_SECTION`, prefix
+    `HARNESS_PREFIX`) is a `component` row on side `run`, in no total: the `step` total sums
+    the prover's and the verifier's top-level sections only.
   - **Prover rows (EQ1b).**
     - P0, original training: `P0.load`, `P0.forward`, `P0.backward`, `P0.update`, emitted only
       by `plain_step` (the plain baseline, B7).
@@ -1498,8 +1534,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     - P1, matmul capture: derived (`derive_capture(verified, plain)`, rows marked
       `derived`; the plain rows must be one run and scenario): time `Σ(train.x − P0.x) +
       P1.label`, memory the growth `(peak(train.backward) − start(train.forward)) −
-      (peak(P0.backward) − start(P0.forward))`, counts `Σ(train.x − P0.x)`. `P1.label` is `label`, the `M` check,
-      `assert_unmodified` and `release_operands`.
+      (peak(P0.backward) − start(P0.forward))`, counts `Σ(train.x − P0.x)`. The memory row's
+      `peak_reserved_bytes` is null: a growth has no reserved peak. `P1.label` is `label`, the
+      `M` check, `assert_unmodified` and `release_operands`.
     - P2, serialization: `P2.w_t`, `P2.w_next`. Leaf encoding is zero-copy, so its byte cost
       is in P3's hashing.
     - P3, commitment: `P3.commit` (`commit_step`: hashing and the invariant-6 recheck).
@@ -1522,9 +1559,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     h_D, extra)` (`.recorder(scenario, *, bpr_records, bpr_actual, cheat_step)`,
     `.write(rows)`, `.write_residuals(scenario, t, stats, c, *, bands, k, kappa_guard)`,
     `.close(completed=None)`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
-    equal to `verifier.stats`), `memory_probe(device)`, `step_record`, `config_hash`.
+    equal to `verifier.stats`), `memory_probe(device)`, `reserved_peak(probe)`,
+    `step_record`, `config_hash`.
     `model`, `corpus`, `attack` (`VERIF_ATTACK`, `None` for a run on other data) and `seed`
-    go into the `environment` record and every `step` record. Every run that writes `corpus`
+    go into the `environment` record and every `step` record. The `environment` record
+    (`environment_record`) also holds the allocator's settings (`allocator_settings`): both
+    variables of `ALLOC_VARS`, `PYTORCH_ALLOC_CONF` and `PYTORCH_CUDA_ALLOC_CONF` (null when
+    unset), and the run's `release_cache` (`VERIF_RELEASE_CACHE` unless the caller passes
+    it). `bring_up` prints the same as a line, `allocator: {…}`. Every run that writes `corpus`
     writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
     EVALUATION_SPEC §4.6) raises `ValueError`, in any letter case (`str.casefold`): on a
     case-insensitive file system `Data` is `data`.
@@ -1627,8 +1669,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   `calibrate.judging_verifier`. Check 8 is against `scenarios.honest_final`; its memory and
   counting passes are `scenarios.memory_run` / `count_run`. `run_honest`; `report_residuals`
   prints `residuals.py`'s two tables, `report_costs` each step's prover and verifier wall clock
-  and, from the memory pass, each side's peak. Metrics go to `llama_step/`. Exits 1 unless
-  accepted. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
+  and the hand-off between them (`StepRecord.handoff_s`), and, from the memory pass, each
+  side's peak (on CUDA with the reserved peak beside it, `, reserved … GB`). Metrics go to
+  `llama_step/`. Exits 1 unless
+  accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s
+  and `memory_run`'s `release_cache`), not the counting pass. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
   every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
   twice (that model and the verifier's), not four times.
   - The real step from `W_0` on `π(1)` (k 7, η 1e-3), 2026-10-04 on the dev Mac: accepted.
@@ -1676,9 +1721,16 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   when `model_pin` finds no cached weights or refuses the pin (a revision that isn't a commit, a
   weight file off its blob name), or `D.bin` is missing; it never downloads. It prints how long
   the weights took to hash. Exits 1 unless `BringUp.passed`: the honest run accepted, the fit's
-  concentration guard held, every tamper rejected as expected.
+  concentration guard held, every tamper rejected as expected. `main` passes `echo=print`, so
+  the memory pass prints each top-level section's peak as it closes, under the header `==
+  memory pass: each section's peak as it closes, GB [<probe source>]` (on CUDA each line
+  also gives the section's reserved peak); a run that dies mid-step still shows where its
+  memory went.
   - `bring_up(c, D, h_D, *, T, k, seed, build_model=None, tamper=True, device="cpu",
-    handoff=None) -> BringUp(result, memory_rows, cal, bands, freeze_rejection, tampers)`. It
+    handoff=None, echo=None, release_cache=None) -> BringUp(result, memory_rows, cal, bands,
+    freeze_rejection, tampers)`. `release_cache` (`main`: `VERIF_RELEASE_CACHE`) goes to the
+    loop and the tampers alike, and `main`'s `hand-off:` line says whether the cache is
+    released. It
     takes any `DecoderComputation`, so a random-weight config runs the same path. `W_0` and
     every prover run come from one `ReusedModel`. Check 8's reference is `honest_final`'s `W_T`,
     kept as leaf hashes (`leaf_hashes_of`, `end_run` takes either). The honest run is
@@ -1700,7 +1752,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     commit time. `test_disk_handoff_gives_the_same_decisions` checks that a tiny Qwen2 run
     decides number for number as in memory and leaves `DIR` empty.
   - `bias_tamper(c, D, w0, bands, *, k, seed, h_D, build_model, layer=1, x="q",
-    handoff=None)`: two one-step judged runs (FS2's switch test on the real model). The last
+    handoff=None, release_cache=True)`: two one-step judged runs (FS2's switch test on the real model). The last
     entry of `b_q` in layer 1 is raised by 1 in training with the `W_t` leaf restored
     (expected: check 5 naming `P_m (L1.Y_q)`), and in an honest step's `W_{t+1}` leaf
     (expected: 6b naming the bias). `Tamper.rejected_as_expected` checks the step, the check
@@ -1877,8 +1929,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     under tag `0x02` (equal ⇔ bit-identical, `-0.0` included), their Merkle root, and the
     provenance: `w0_root` (the root over `W_0`'s leaf hashes, the ones check 0 anchors on),
     `h_D`, `eta`, `steps`, `model`, `model_revision`, `threads`, `config_hash` (of
-    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics`, `steps`,
-    `attack` and `poison_count`; `h_D` tells the tasks apart, and the level never enters
+    `training_config(cfg)`: the `RunConfig` without `output_dir`, `metrics`,
+    `release_cache`, `steps`, `attack` and `poison_count`; `h_D` tells the tasks apart, and the level never enters
     honest training, so the test-scale hash stays `7191ef05…`),
     `losses` (per step) and `seed`. The seed sits beside the provenance but isn't in
     `PROVENANCE_FIELDS`: it already enters `config_hash`, and A12's B7 reads it to skip a
@@ -2270,16 +2322,20 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   [--eval-batch B]`. `T` plain steps (default 10) through `loop.run_plain` on `D` and `π` at
   `VERIF_SEED`, and the whole-list loss (`whole_list_loss`: `Σ μ·CE / Σ μ` over every record of
   `D`, forward passes only, in chunks of `--eval-batch`, sums in fp64, under the run's
-  autocast) at `W_0` and after each step. `verdict(losses)` is F6a's rule: smooth if every
-  value is finite, none after a step is above the loss at `W_0`, and the last is below it. Each
+  autocast) at `W_0` and after each step. `verdict(losses)` is F6a's rule as amended on
+  2026-10-15: smooth if every value is finite (`W_0` and step 1 included), none from step 2 on
+  is above the loss at `W_0`, and the last is below it, so at `T = 1` step 1 must still end
+  below the start. The step-1 exemption was chosen after FS11's runs showed a first-step
+  overshoot (post hoc; the module docstring has the numbers). Each
   step's global gradient norm (`grad_norms`, an optimizer step pre-hook) is recorded beside its
   loss and plays no part in the verdict. The record goes to
   `$VERIF_OUTPUT_DIR/smooth_check/<model>_<task>.json` (`record_path`) with the timings, the
-  peak memory (`metrics.memory_probe`) and the environment. Exits 0 when smooth,
+  peak memory (`metrics.memory_probe`; on CUDA also `peak_reserved_bytes`, the reserved peak)
+  and the environment. Exits 0 when smooth,
   `EXIT_NOT_SMOOTH` (3) when not. Run once on SmolLM2 at reduced batch on the Mac; FS11 runs it
   per full-scale model and task.
-- FS11, the first H100 session, as one unattended job; the runbook is `verification/README.md`,
-  "Workflow: the first H100 session".
+- FS11, the first H100 session, and its re-check, each as one unattended job; the runbook is
+  `verification/README.md`, "Workflow: the first H100 session" and its "The re-check session".
   - `fs11_prep.py`: `HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --out
     DIR`, on the Mac. Builds `D` and `D̃` per model and task at the full-scale config
     (`fs11_session.FULL_SCALE_ENV`), and packs `DIR/fs11_upload.tar`: `git archive HEAD`, the
@@ -2291,7 +2347,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
     in its place.
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
-    [--selftest]`, `fetch-models` and `env`. Runs the parts in order (`default_plan`): models
+    [--selftest] [--session {fs11,recheck}]`, `fetch-models` and `env`. `--session` picks the
+    plan from `SESSIONS`, which also gives the name `summary.json`'s `session` records: `fs11`
+    (the default, "FS11") or `recheck` ("recheck"); `--plan` and `--selftest` replace its
+    parts. The first session runs the parts in order (`default_plan`): models
     (`fetch_models`: the manifest check, then each public model's weights with `token=False`
     at its pin, checked against the Mac's SHA-256), the hashing benchmark, `bring_up
     --no-tamper` per model, `smooth_check` per model and task. Each part runs in its own
@@ -2304,9 +2363,49 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     (`FS11_ALLOW_ANY_GPU=1` overrides; `EXIT_REFUSED` 4). `selftest_plan` is two stand-in parts
     that need only the standard library, which the module keeps to at import, so `--selftest`
     runs on a bare pod's `python3`.
+  - The re-check (`recheck_plan`, 22 parts, no benchmark): the models part; `bring_up
+    --no-tamper` per model and `smooth_check` per model and task, at `FULL_SCALE_ENV` plus
+    `RECHECK_ENV`: `VERIF_HEAD_BLOCKS=8` and the allocator fix ("fix 2"),
+    `PYTORCH_ALLOC_CONF=expandable_segments:True` and `VERIF_RELEASE_CACHE=1` (the
+    default, pinned). `alloc_env(conf)` writes the allocator setting: `PYTORCH_ALLOC_CONF`
+    at `conf` and the deprecated `PYTORCH_CUDA_ALLOC_CONF` unset, both unset for `None`.
+    Right after `FIX_AB_MODEL`'s bring-up (Qwen2.5-0.5B, which fit in FS11 without the fix)
+    comes the same bring-up with the whole fix off (`FIX_OFF_ENV`:
+    both allocator variables unset, `VERIF_RELEASE_CACHE=0`), its own part
+    (`bring_up_Qwen2.5-0.5B-Instruct_fix2off`) in `runs/Qwen2.5-0.5B-Instruct_refusal_fix2off/`;
+    the two parts' `info["arm"]` are `fix2_on` and `fix2_off`. `fix2_ab(parts)` sets them
+    side by side in `summary.json`'s `fix2_ab`: per step the prover, verifier, hand-off and
+    total wall clock (`steps`), per step and side the allocated and reserved peaks (`peaks`),
+    each with `fix_cost`, on minus off. If `fix2_ab` raises, `summary.json`'s `fix2_ab` is
+    `{"fix2_ab_error": …}` and the session runs on, as with `part_extras`' `extras_error`.
+    Each arm's head holds its planned `alloc_conf` and
+    `release_cache` and `ran_with`, the settings its log's `allocator:` line says it ran
+    with. The job log then says `allocator fix A/B, step 1: …
+    s with the fix, … s without (+… s)`. The times are the bring-up's, from its memory pass,
+    one step per arm. Last comes the allocator A/B, kind `plain`: `plain_baseline` (10 steps)
+    twice per model on the
+    refusal task's `D` with `VERIF_HEAD_BLOCKS=8`, one arm per `ALLOC_ARMS` entry
+    (`alloc_default` unsets both allocator variables, `alloc_expandable` sets
+    `PYTORCH_ALLOC_CONF`), the first
+    arm alternating by model, each in `runs/<key>_plain_<arm>/`. Its time limits are
+    `RECHECK_TIMEOUT_S` (bring-up 1,800 s, smooth and plain 600 s). A plain part's summary
+    entry reads its `records.jsonl` with `json` alone, skipping a line that isn't a JSON
+    object or whose time or memory figures aren't numbers (counted in `bad_lines`): per-step
+    times (the `step` total),
+    their mean and median, the memory pass's peak, its reserved peak (`peak_reserved_bytes`,
+    null off CUDA) and its `mem_source`, and whether `run_end` came. A smooth part's entry
+    holds its record's `peak_bytes` and `peak_reserved_bytes`. Each plain, smooth and
+    bring-up entry holds `allocator`, the settings the run actually had (from its environment
+    record, or the bring-up's `allocator:` line; null when missing). A bring-up's entry also holds
+    `step_times` (each step's prover, verifier, hand-off and total from `report_costs`' line),
+    `peaks` (each side's, with `reserved_gb`) and `section_peaks`, parsed from the memory
+    pass's per-section lines (`metrics.MemoryRecorder`'s echo), the section that raised
+    included, with `reserved_gb` and `nested_reserved_gb` on CUDA.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
-    pod. Preflight (refuses without a way to end the pod; a refusal it can act on terminates),
-    a deadline timer (`FS11_DEADLINE_S`, 12,600 s), the session, a kill of a session still
+    pod. `FS11_SESSION` (`fs11`, the default, or `recheck`; anything else is a refusal) goes to
+    the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
+    can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the
+    re-check), the session, a kill of a session still
     running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
     `OUT_DIR.FETCHED` to end it), and the terminate: `runpodctl pod delete`, `runpodctl remove
@@ -2321,9 +2420,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     delete, remove and REST fallbacks and then a stop. It re-arms by hand the boot guard that
     the pod's start command arms at creation (the runbook's two start commands, which
     `test_fs11_session.py` checks with `bash -n` and on stubs). `DRY_RUN=1` logs the commands.
-  - Tests: `tests/verification/runs/test_fs11_session.py` (the session on fake parts, and the
-    job and the guards under `DRY_RUN` or stub `runpodctl`, `curl` and `timeout`: the deadline,
-    a dead log reader, a hung session, failed and hanging deletes, the lock, a failed pack),
+  - Tests: `tests/verification/runs/test_fs11_session.py` (both plans, the summary entries,
+    the session on fake parts, and the job and the guards under `DRY_RUN` or stub `runpodctl`,
+    `curl` and `timeout`: the session choice, the deadline, a dead log reader, a hung session,
+    failed and hanging deletes, the lock, a failed pack),
     `test_fs11_prep.py` (the prep on a fake cache) and `test_smooth_check.py`.
 
 ### `evaluation/`

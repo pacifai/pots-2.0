@@ -33,6 +33,10 @@ def llama():
     [2.0, 1.9, 1.8],
     [2.0, 2.0, 1.5],  # equal to the start is not above it
     [2.0, 1.0, 1.9],  # a rise that stays under the start
+    [2.0, 2.1, 1.5],  # step 1 above the start: exempt (F6a, amended 2026-10-15)
+    [1.071, 1.686, 1.044, 0.903, 0.604],  # FS11's Qwen2.5-0.5B jailbreak shape
+    [2.0, 1.5, 2.0, 1.5],  # equal to the start from step 2 on is not above it
+    [2.0, 1.9],  # T = 1, below the start
 ])
 def test_verdict_smooth(losses):
     v = sc.verdict(losses)
@@ -40,16 +44,34 @@ def test_verdict_smooth(losses):
 
 
 @pytest.mark.parametrize("losses, why", [
-    ([2.0, 2.1, 1.5], "above the start after step 1"),
     ([2.0, 1.9, 2.0], "is not below the start"),
     ([2.0, 1.9, 2.5], "above the start after step 2"),
+    ([2.0, 1.9, 2.5, 1.5], "above the start after step 2"),
+    ([2.0, 2.5, 2.4, 1.5], "above the start after step 2"),  # step 1 exempt, step 2 not
+    ([2.0, 2.5, 2.1], "is not below the start"),  # step 1 exempt, but the last must fall
     ([2.0, float("nan"), 1.5], "not finite at W_1"),
+    ([2.0, float("inf"), 1.5], "not finite at W_1"),  # the exemption doesn't cover infinity
     ([2.0, 1.9, float("inf")], "not finite at W_2"),
     ([float("nan"), 1.0, 0.5], "not finite at W_0"),
+    ([2.0, 2.1], "is not below the start"),  # T = 1: step 1 is the last
+    ([2.0, 2.0], "is not below the start"),
 ])
 def test_verdict_not_smooth(losses, why):
     v = sc.verdict(losses)
     assert not v.smooth and any(why in r for r in v.reasons)
+
+
+def test_verdict_names_no_rise_at_step_1():
+    """A step-1 rise is never a reason, even when the run fails for another one."""
+    v = sc.verdict([2.0, 3.0, 2.5, 1.5])
+    assert not v.smooth
+    assert v.reasons == ("above the start after step 2: 2.500000 > 2.000000",)
+    v = sc.verdict([2.0, 3.0])
+    assert v.reasons == ("the last (3.000000) is not below the start (2.000000)",)
+
+
+def test_rule_names_the_step_1_exemption():
+    assert "step 1 exempt" in sc.RULE and "from step 2 on" in sc.RULE
 
 
 def test_verdict_needs_a_step():
@@ -187,6 +209,7 @@ def test_main_writes_the_record(tiny_main, capsys):
     assert doc["rule"] == sc.RULE and doc["environment"]["record"] == "environment"
     assert {"load", "total", "w0_eval", "steps_with_eval"} <= doc["timings_s"].keys()
     assert all(math.isfinite(x) for x in doc["whole_list_losses"])
+    assert doc["memory"]["peak_reserved_bytes"] is None  # CUDA's only
     assert "verdict: " in capsys.readouterr().out
 
 

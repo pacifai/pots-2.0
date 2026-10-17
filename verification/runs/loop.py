@@ -7,8 +7,11 @@
 2. commits the step and hands it to a store through a
    :class:`~verification.transcript.store.StoreHandoff`, with each record's audit path into
    ``h_D``: an ``InMemoryStore`` by default, or a ``DiskStore`` (C3's cross-check);
-3. hands the verifier the store, and only the store (invariant 1);
-4. drops the step's transcript (the handoff's ``release``) before the next step begins.
+3. when the model is on CUDA, hands the caching allocator's free blocks back to the driver
+   (:func:`release_device_cache`, unless ``VERIF_RELEASE_CACHE=0`` turns it off), so the
+   verifier allocates in memory the prover has left;
+4. hands the verifier the store, and only the store (invariant 1);
+5. drops the step's transcript (the handoff's ``release``) before the next step begins.
 
 It stops at the first rejection, since a rejected run stays rejected, and then asks the
 verifier for check 9's verdict, with check 8 against the agreed final weights.
@@ -30,7 +33,7 @@ from typing import Any
 import torch
 
 from setup import data
-from setup.config import assert_no_dropout
+from setup.config import assert_no_dropout, load_config
 from verification.commitment.leaves import dataset_tree
 from verification.computation.interface import DeclaredComputation
 from verification.prover.step import (
@@ -46,7 +49,12 @@ from verification.verifier.context import Rejection
 from verification.verifier.driver import RunVerdict, Verifier
 
 __all__ = ["ProverFault", "StepRecord", "LoopResult", "run_loop", "PlainStepRecord", "PlainResult",
-           "run_plain"]
+           "run_plain", "HANDOFF_SECTION", "release_device_cache", "release_cache_setting",
+           "model_device"]
+
+# The metrics section around the hand-off's cache release. Its row is the harness's (side
+# "run") and in no role's total: deployed, the prover and the verifier run on separate machines.
+HANDOFF_SECTION = "handoff.empty_cache"
 
 
 class ProverFault:
@@ -83,7 +91,10 @@ HONEST = ProverFault()
 
 @dataclass(frozen=True)
 class StepRecord:
-    """One step of the loop: the verifier's decision and the prover's wall clock (seconds)."""
+    """One step of the loop: the verifier's decision and the wall clocks (seconds).
+
+    ``handoff_s`` is the time between the two roles: dropping the prover's references and, on
+    CUDA, :func:`release_device_cache`. It's in neither ``commit_s`` nor ``verify_s``."""
 
     t: int
     rejection: Rejection | None
@@ -91,6 +102,7 @@ class StepRecord:
     prove_s: float
     commit_s: float
     verify_s: float
+    handoff_s: float = 0.0
 
 
 @dataclass
@@ -108,6 +120,40 @@ class LoopResult:
     @property
     def rejection(self) -> Rejection | None:
         return self.verdict.rejection
+
+
+def release_cache_setting(release_cache: bool | None) -> bool:
+    """``release_cache`` as given, or ``RunConfig.release_cache`` (``VERIF_RELEASE_CACHE``)
+    when it is ``None``, so every entry point honours the setting without passing it."""
+    return load_config().release_cache if release_cache is None else release_cache
+
+
+def model_device(model: torch.nn.Module) -> torch.device:
+    """The device ``model``'s parameters live on: the run's device (host for a model without
+    parameters)."""
+    p = next(model.parameters(), None)
+    return torch.device("cpu") if p is None else p.device
+
+
+def _on_cuda(device: str | torch.device) -> bool:
+    return torch.device(device).type == "cuda"
+
+
+def release_device_cache(device: str | torch.device, section: Section | None = None) -> None:
+    """Hand the CUDA caching allocator's free blocks back to the driver, inside the metrics
+    section :data:`HANDOFF_SECTION`.
+
+    Prover and verifier share one process and one GPU here. The prover's freed blocks stay in
+    the allocator's cache, cut to the prover's sizes, and a large verifier buffer may then not
+    fit in any of them though the GPU has the room (the first H100 session's out-of-memory
+    errors reported GiBs "reserved but unallocated"). Called once per verified step, after the
+    prover's step is released and before the verifier's role begins. Only when the run's
+    ``device`` is CUDA: on any other device it does nothing and opens no section, even in a
+    process where CUDA happens to be initialized."""
+    if not _on_cuda(device):
+        return
+    with (section or no_section)(HANDOFF_SECTION):
+        torch.cuda.empty_cache()
 
 
 def _default_schedule(c: DeclaredComputation, dataset: Sequence[Any],
@@ -128,6 +174,7 @@ def run_loop(
     on_step: Callable[[StepRecord], None] | None = None,
     section: Section | None = None,
     handoff: StoreHandoff | None = None,
+    release_cache: bool | None = None,
 ) -> LoopResult:
     """Run ``verifier.n_steps`` steps of ``C`` from ``W_0`` on ``dataset``.
 
@@ -145,12 +192,18 @@ def run_loop(
     ``handoff`` turns each committed step into the store the verifier reads (default
     :data:`IN_MEMORY`, references only). A ``DiskHandoff`` writes the step to disk in
     ``P5.write`` and deletes it once the step is verified (C3). The leaves and the tree are the
-    same either way.
+    same either way. Between the hand-off and the verifier, when ``model`` is on CUDA,
+    :func:`release_device_cache` runs in its own section, :data:`HANDOFF_SECTION`.
+    ``release_cache=False`` skips it, section and all, so a run can measure what the release
+    costs and what it saves. ``None`` (the default) reads ``VERIF_RELEASE_CACHE``
+    (:func:`release_cache_setting`).
     """
     sec = section or no_section
     handoff = handoff or IN_MEMORY
     fault = fault or HONEST
+    release_cache = release_cache_setting(release_cache)
     assert_no_dropout(model)  # invariant 3 (S4d)
+    device = model_device(model)
     pi = schedule or _default_schedule(c, dataset, verifier.seed)
     result = LoopResult(verdict=RunVerdict(False, None, 0, None))
     if verifier.start_run(dataset) is not None:
@@ -178,13 +231,16 @@ def run_loop(
         t2 = time.perf_counter()
         w, loss = out.w_next, out.loss
         del out, leaves, tree_h  # the store holds the leaves; nothing else keeps the step
+        if release_cache:
+            release_device_cache(device, section)  # the prover's step is gone; verifier next
+        t2b = time.perf_counter()
         try:
             rej = verifier.verify_step(t, store)
         finally:
             handoff.release(store)
         t3 = time.perf_counter()
         del store  # discard before step t+1 (S3)
-        rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1b, t3 - t2)
+        rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1b, t3 - t2b, t2b - t2)
         result.steps.append(rec)
         if on_step is not None:
             on_step(rec)

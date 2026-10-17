@@ -45,6 +45,7 @@ _DEFAULTS: dict[str, str] = {
     "VERIF_OUTPUT_DIR": "trainer_output/verification",
     "VERIF_METRICS": "1",
     "VERIF_HEAD_BLOCKS": "1",
+    "VERIF_RELEASE_CACHE": "1",
 }
 
 
@@ -68,6 +69,9 @@ class RunConfig:
     output_dir: Path
     metrics: bool  # B6: write the cost, count and residual tables (runs/metrics.py)
     head_blocks: int  # B: the output layer runs in B blocks of n_s/B records each
+    # Hand the CUDA allocator's cached blocks back between prover and verifier
+    # (runs/loop.py's release_device_cache). 0 only for the re-check's fix-off arm.
+    release_cache: bool
 
     @property
     def data_dir(self) -> Path:
@@ -188,6 +192,7 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
         output_dir=Path(_str(env, "VERIF_OUTPUT_DIR")),
         metrics=_bool(env, "VERIF_METRICS"),
         head_blocks=head_blocks,
+        release_cache=_bool(env, "VERIF_RELEASE_CACHE"),
     )
 
 

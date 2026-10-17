@@ -71,6 +71,85 @@ def test_default_plan(tmp_path):
     # only the fetch reaches the network
     assert plan[0].env["HF_HUB_OFFLINE"] is None
     assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
+    # the re-check's settings stay out of the first session's parts
+    assert all(not set(fs.RECHECK_ENV) & set(p.env) for p in plan)
+    assert fs.SESSIONS["fs11"] == ("FS11", fs.default_plan)
+
+
+def test_recheck_plan(tmp_path):
+    """The first session's models, bring-up and smooth parts with RECHECK_ENV added, no
+    benchmark, Qwen2.5-0.5B's bring-up followed by its fix-off arm, then the allocator A/B: two
+    plain arms per model, alternating which goes first."""
+    up, out = tmp_path / "up", tmp_path / "out"
+    plan = fs.recheck_plan(up, out)
+    assert fs.SESSIONS["recheck"] == ("recheck", fs.recheck_plan)
+    assert len(plan) == 22
+    assert [p.kind for p in plan] == ["models"] + ["bring_up"] * 5 + ["smooth"] * 8 + ["plain"] * 8
+    names = [p.name for p in plan]
+    assert len(set(names)) == len(names)
+    assert names[1:6] == ["bring_up_Llama-3.2-1B-Instruct", "bring_up_Falcon3-1B-Instruct",
+                          "bring_up_Qwen2.5-0.5B-Instruct",
+                          "bring_up_Qwen2.5-0.5B-Instruct_fix2off",
+                          "bring_up_Qwen2.5-1.5B-Instruct"]
+    first = {p.name: p for p in fs.default_plan(up, out)}
+    on, off = plan[3], plan[4]
+    for p in plan[:14]:
+        if p is off:
+            continue
+        q = first[p.name]
+        assert p.argv == q.argv
+        assert p.info == {**q.info, **({"arm": "fix2_on", "alloc_conf": fs.EXPANDABLE,
+                                         "release_cache": True} if p is on else {})}
+        assert p.env == {**q.env, **(fs.RECHECK_ENV if p.kind != "models" else {})}
+        assert p.timeout_s == fs.RECHECK_TIMEOUT_S[p.kind]
+    for p in plan[1:14]:
+        assert p.env["VERIF_HEAD_BLOCKS"] == "8"
+        fix = p is not off
+        # torch 2.9's own variable carries the setting; the deprecated one is always unset
+        assert "PYTORCH_ALLOC_CONF" in p.env and "PYTORCH_CUDA_ALLOC_CONF" in p.env
+        assert p.env["PYTORCH_ALLOC_CONF"] == ("expandable_segments:True" if fix else None)
+        assert p.env["PYTORCH_CUDA_ALLOC_CONF"] is None
+        assert p.env["VERIF_RELEASE_CACHE"] == ("1" if fix else "0")
+
+    # the verified-step A/B of the whole allocator fix: the same bring-up, both settings undone
+    assert off.argv == on.argv and "--no-tamper" in off.argv and off.timeout_s == on.timeout_s
+    key = "Qwen2.5-0.5B-Instruct_refusal"
+    d = Path(off.env["VERIF_OUTPUT_DIR"])
+    assert d.name == f"{key}_fix2off" and d != Path(on.env["VERIF_OUTPUT_DIR"])
+    assert (d / "data").resolve() == (up / "data" / key).resolve()
+    assert off.env == {**on.env, "PYTORCH_ALLOC_CONF": None, "PYTORCH_CUDA_ALLOC_CONF": None,
+                       "VERIF_RELEASE_CACHE": "0", "VERIF_OUTPUT_DIR": str(d)}
+    assert off.info == {**on.info, "run_dir": str(d), "arm": "fix2_off", "alloc_conf": None,
+                        "release_cache": False}
+
+    plain = plan[14:]
+    a, b = "alloc_default", "alloc_expandable"
+    assert [p.info["arm"] for p in plain] == [a, b, b, a, a, b, b, a]
+    assert [p.info["model"] for p in plain] == [repo for repo, _ in fs.RUN_PINS for _ in "ab"]
+    assert plain[0].name == "plain_Llama-3.2-1B-Instruct_alloc_default"
+    dirs = {p.env["VERIF_OUTPUT_DIR"] for p in plain}
+    assert len(dirs) == 8 and not dirs & {p.env.get("VERIF_OUTPUT_DIR") for p in plan[:14]}
+    for p in plain:
+        assert p.argv == ["{python}", "-m", "verification.runs.plain_baseline"]
+        assert p.timeout_s == fs.RECHECK_TIMEOUT_S["plain"]
+        assert {k: p.env[k] for k in fs.FULL_SCALE_ENV} == fs.FULL_SCALE_ENV
+        assert p.env["VERIF_ATTACK"] == "refusal" and p.env["VERIF_HEAD_BLOCKS"] == "8"
+        # None unsets the variable, whatever the pod's environment holds
+        conf = None if p.info["arm"] == a else "expandable_segments:True"
+        assert "PYTORCH_ALLOC_CONF" in p.env and p.env["PYTORCH_ALLOC_CONF"] == conf
+        assert "PYTORCH_CUDA_ALLOC_CONF" in p.env and p.env["PYTORCH_CUDA_ALLOC_CONF"] is None
+        assert p.info["alloc_conf"] == conf
+        key = fs.data_key(p.info["model"], "refusal")
+        d = Path(p.env["VERIF_OUTPUT_DIR"])
+        assert d.name == f"{key}_plain_{p.info['arm']}"
+        assert (d / "data").resolve() == (up / "data" / key).resolve()
+        assert p.info["report"] == str(d / "plain_baseline" / "records.jsonl")
+    assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
+
+
+def test_plain_run_name():
+    from verification.runs import plain_baseline
+    assert fs.PLAIN_RUN == plain_baseline.RUN_NAME
 
 
 def test_selftest_plan_needs_only_the_standard_library():
@@ -137,6 +216,82 @@ def test_run_session(tmp_path, monkeypatch):
     s = fs.run_session(plan[:2], upload=up, out=out, deadline=time.time() + 30, cwd=REPO,
                        say=lines.append)
     assert [p["status"] for p in s["parts"]] == ["skipped_done", "failed"]
+    assert s["session"] == "FS11"
+
+
+def test_the_allocator_arms_reach_their_parts(tmp_path, monkeypatch):
+    """The A/B's arms as run: the default arm unsets both allocator variables, though the
+    session's environment sets them; the other sets expandable segments in PYTORCH_ALLOC_CONF
+    and still unsets the deprecated PYTORCH_CUDA_ALLOC_CONF."""
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "garbage_collection_threshold:0.6")
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6")
+    probe = ("import os; print(repr((os.environ.get('PYTORCH_ALLOC_CONF'), "
+             "os.environ.get('PYTORCH_CUDA_ALLOC_CONF'))))")
+    plan = [fs.Part(arm, _py(probe), env=fs.alloc_env(conf)) for arm, conf in fs.ALLOC_ARMS]
+    out = tmp_path / "out"
+    s = fs.run_session(plan, upload=tmp_path / "up", out=out, deadline=time.time() + 30,
+                       cwd=REPO, say=lambda m: None, session="recheck")
+    assert s["session"] == "recheck"
+    assert json.loads((out / "summary.json").read_text())["session"] == "recheck"
+    seen = {arm: (out / "parts" / arm / "log.txt").read_text().splitlines()[-1]
+            for arm, _ in fs.ALLOC_ARMS}
+    assert seen == {"alloc_default": "(None, None)",
+                    "alloc_expandable": "('expandable_segments:True', None)"}
+
+
+def _fix_arm(name, arm, conf, release, times, held):
+    prover, verifier, handoff = times
+    text = (f"step 1: prover {prover:.2f} s (prove_step 1.00 s, commit 0.50 s); verifier "
+            f"{verifier:.2f} s (0 1.00, 5 2.00); hand-off {handoff:.2f} s\n"
+            f"step 1: prover peak 40.00 GB, reserved {held[0]:.2f} GB (at its start 3.00 GB) "
+            "[cuda_allocated, memory pass]\n"
+            f"step 1: verifier peak 30.00 GB, reserved {held[1]:.2f} GB "
+            "[cuda_allocated, memory pass]\n"
+            "allocator: " + json.dumps({"PYTORCH_ALLOC_CONF": conf,
+                                        "PYTORCH_CUDA_ALLOC_CONF": None,
+                                        "release_cache": release}))
+    return fs.Part(name, _py(f"print({text!r})"), kind="bring_up",
+                   info={"model": fs.FIX_AB_MODEL, "task": "refusal", "arm": arm,
+                         "alloc_conf": conf, "release_cache": release})
+
+
+def test_the_fix_ab_sets_the_two_arms_side_by_side(tmp_path):
+    """summary.json's fix2_ab: each arm's step times and peaks from its log, and the fix's
+    cost, on minus off; the job log gets the totals once the fix-off arm is done."""
+    on = _fix_arm("on", "fix2_on", fs.EXPANDABLE, True, (1.5, 3.0, 0.3), (41.0, 32.0))
+    off = _fix_arm("off", "fix2_off", None, False, (1.4, 3.1, 0.0), (47.0, 47.5))
+    out, lines = tmp_path / "out", []
+    s = fs.run_session([on, off], upload=tmp_path / "up", out=out, deadline=time.time() + 30,
+                       cwd=REPO, say=lines.append, session="recheck")
+    ab = s["fix2_ab"]
+    assert json.loads((out / "summary.json").read_text())["fix2_ab"] == ab
+    assert ab["model"] == fs.FIX_AB_MODEL
+    assert ab["fix_on"] == {"part": "on", "status": "ok", "alloc_conf": fs.EXPANDABLE,
+                            "release_cache": True, "ran_with": {
+                                "PYTORCH_ALLOC_CONF": fs.EXPANDABLE,
+                                "PYTORCH_CUDA_ALLOC_CONF": None, "release_cache": True}}
+    assert ab["fix_off"] == {"part": "off", "status": "ok", "alloc_conf": None,
+                             "release_cache": False, "ran_with": {
+                                 "PYTORCH_ALLOC_CONF": None, "PYTORCH_CUDA_ALLOC_CONF": None,
+                                 "release_cache": False}}
+    (step,) = ab["steps"]
+    assert step["fix_on"] == {"prover_s": 1.5, "verifier_s": 3.0, "handoff_s": 0.3,
+                              "total_s": 4.8}
+    assert step["fix_off"] == {"prover_s": 1.4, "verifier_s": 3.1, "handoff_s": 0.0,
+                               "total_s": 4.5}
+    assert step["fix_cost"] == {"prover_s": 0.1, "verifier_s": -0.1, "handoff_s": 0.3,
+                                "total_s": 0.3}
+    assert [(p["step"], p["side"], p["fix_on"], p["fix_cost"]) for p in ab["peaks"]] == [
+        (1, "prover", {"peak_gb": 40.0, "reserved_gb": 41.0},
+         {"peak_gb": 0.0, "reserved_gb": -6.0}),
+        (1, "verifier", {"peak_gb": 30.0, "reserved_gb": 32.0},
+         {"peak_gb": 0.0, "reserved_gb": -15.5})]
+    assert "allocator fix A/B, step 1: 4.80 s with the fix, 4.50 s without (+0.30 s)" in lines
+    # an arm that never ran leaves its side and the cost empty; no fix-off arm, no A/B
+    alone = fs.fix2_ab(s["parts"][1:])
+    assert alone["fix_on"] is None and alone["steps"][0]["fix_on"] is None
+    assert alone["steps"][0]["fix_cost"]["total_s"] is None
+    assert fs.fix2_ab(s["parts"][:1]) is None
 
 
 def test_a_running_part_names_its_process_group(tmp_path):
@@ -181,16 +336,47 @@ def test_the_benchmark_is_done_only_on_a_complete_clean_report(tmp_path, report,
         assert why in rec["reason"]
 
 
+def test_a_broken_fix_ab_costs_the_ab_not_the_session(tmp_path, monkeypatch):
+    """``fix2_ab`` is wrapped as ``part_extras`` is: if it raises, the summary records why and
+    the session runs on."""
+    def broken(parts):
+        raise KeyError("name")
+
+    monkeypatch.setattr(fs, "fix2_ab", broken)
+    on = _fix_arm("on", "fix2_on", fs.EXPANDABLE, True, (1.5, 3.0, 0.3), (41.0, 32.0))
+    out = tmp_path / "out"
+    s = fs.run_session([on, fs.Part("after", _py("print(1)"))], upload=tmp_path / "up",
+                       out=out, deadline=time.time() + 30, cwd=REPO, say=lambda m: None)
+    assert [p["status"] for p in s["parts"]] == ["ok", "ok"] and s["finished"]
+    assert s["fix2_ab"] == {"fix2_ab_error": "KeyError: 'name'"}
+    assert json.loads((out / "summary.json").read_text())["fix2_ab"] == s["fix2_ab"]
+
+
 def test_part_extras(tmp_path):
     log = tmp_path / "log.txt"
     log.write_text("pin: x\nstep 1: prover 3.10 s (prove_step 2.00 s, commit 1.10 s); verifier "
-                   "9.00 s ()\nstep 1: prover peak 41.20 GB (at its start 3.00 GB) "
-                   "[cuda_allocated, memory pass]\nstep 1: verifier peak 30.50 GB "
-                   "[cuda_allocated, memory pass]\nprocess lifetime peak RSS 12.00 GB\n")
+                   "9.00 s (0 0.50, 5 8.50); hand-off 0.40 s\nstep 1: prover peak 41.20 GB, "
+                   "reserved 44.00 GB (at its start 3.00 GB) [cuda_allocated, memory pass]\n"
+                   "step 1: verifier peak 30.50 GB [cuda_allocated, memory pass]\n"
+                   "process lifetime peak RSS 12.00 GB\n")
     e = fs.part_extras(fs.Part("b", [], kind="bring_up"), log)
-    assert e["peaks"] == [{"step": 1, "side": "prover", "peak_gb": 41.2},
-                          {"step": 1, "side": "verifier", "peak_gb": 30.5}]
+    assert e["peaks"] == [{"step": 1, "side": "prover", "peak_gb": 41.2, "reserved_gb": 44.0},
+                          {"step": 1, "side": "verifier", "peak_gb": 30.5, "reserved_gb": None}]
+    assert e["step_times"] == [{"step": 1, "prover_s": 3.1, "prove_step_s": 2.0, "commit_s": 1.1,
+                                "verifier_s": 9.0, "checks_s": {"0": 0.5, "5": 8.5},
+                                "handoff_s": 0.4, "total_s": 12.5}]
     assert len(e["lines"]) == 4
+    assert e["allocator"] is None  # a log without the allocator line
+    alloc = {"PYTORCH_ALLOC_CONF": "expandable_segments:True", "PYTORCH_CUDA_ALLOC_CONF": None,
+             "release_cache": True}
+    log.write_text(log.read_text() + "allocator: " + json.dumps(alloc) + "\n")
+    assert fs.part_extras(fs.Part("b", [], kind="bring_up"), log)["allocator"] == alloc
+    log.write_text(log.read_text() + "allocator: {broken\n")
+    assert fs.part_extras(fs.Part("b", [], kind="bring_up"), log)["allocator"] == alloc
+    # a log from before the hand-off was timed
+    (old,) = fs._step_times(["step 2: prover 3.10 s (prove_step 2.00 s, commit 1.10 s); "
+                             "verifier 9.00 s ()"])
+    assert (old["step"], old["checks_s"], old["handoff_s"], old["total_s"]) == (2, {}, None, 12.1)
     rep = tmp_path / "hashing.json"
     rep.write_text(json.dumps({"complete": True, "slots": {
         "E1": {"results": [{"name": "chunked", "status": "measured"}]},
@@ -203,9 +389,137 @@ def test_part_extras(tmp_path):
                        log)
     assert e == {"record": None}
     smooth = tmp_path / "smooth.json"
-    smooth.write_text(json.dumps({"smooth": True, "grad_norms": [1.5, 1.25]}))
+    smooth.write_text(json.dumps({"smooth": True, "grad_norms": [1.5, 1.25], "memory": {
+        "peak_bytes": 5, "peak_reserved_bytes": 6}, "environment": {
+            "record": "environment", **alloc, "release_cache": False}}))
     e = fs.part_extras(fs.Part("s", [], kind="smooth", info={"report": str(smooth)}), log)
     assert e["grad_norms"] == [1.5, 1.25]
+    assert e["allocator"] == {**alloc, "release_cache": False}
+    assert (e["peak_bytes"], e["peak_reserved_bytes"]) == (5, 6)
+
+
+def test_bring_up_section_peaks(tmp_path):
+    """The memory pass's echo lines (the ones test_metrics pins) become section_peaks, the
+    section that raised included; the step-peak parser doesn't take them."""
+    echo = ["   run, P4.tree: peak 0.00 GB (start 0.00, end 0.00 GB)",
+            "   step 1, train.backward: peak 3.00 GB (start 0.00, end 1.00 GB)",
+            "   step 2, check 5: peak 5.00 GB (start 1.00, end ? GB; nested: 5.glue 3.00, "
+            "5.measure 5.00 GB); raised OutOfMemoryError",
+            # on CUDA, with the reserved peaks
+            "   step 1, check 5: peak 3.00 GB, reserved 3.50 GB (start 1.00, end 1.00 GB; "
+            "nested: 5.glue 3.00 (reserved 3.50), 5.measure 2.00 (reserved 3.50) GB)"]
+    log = tmp_path / "log.txt"
+    log.write_text("\n".join(["== memory pass: each section's peak as it closes, GB "
+                              "[cuda_allocated]", *echo, "Traceback (most recent call last):"])
+                   + "\n")
+    e = fs.part_extras(fs.Part("b", [], kind="bring_up"), log)
+    assert e["peaks"] == []
+    none = {"reserved_gb": None, "nested_reserved_gb": {}}
+    assert e["section_peaks"] == [
+        {"step": None, "section": "P4.tree", "peak_gb": 0.0, "start_gb": 0.0, "end_gb": 0.0,
+         "nested_gb": {}, "raised": None, **none},
+        {"step": 1, "section": "train.backward", "peak_gb": 3.0, "start_gb": 0.0,
+         "end_gb": 1.0, "nested_gb": {}, "raised": None, **none},
+        {"step": 2, "section": "check 5", "peak_gb": 5.0, "start_gb": 1.0, "end_gb": None,
+         "nested_gb": {"5.glue": 3.0, "5.measure": 5.0}, "raised": "OutOfMemoryError", **none},
+        {"step": 1, "section": "check 5", "peak_gb": 3.0, "reserved_gb": 3.5, "start_gb": 1.0,
+         "end_gb": 1.0, "nested_gb": {"5.glue": 3.0, "5.measure": 2.0},
+         "nested_reserved_gb": {"5.glue": 3.5, "5.measure": 3.5}, "raised": None}]
+
+
+def test_cost_lines_parse_as_report_costs_prints_them():
+    """The bring-up's step times and peaks come from llama_step.report_costs' own lines."""
+    from types import SimpleNamespace as NS
+    from verification.runs.llama_step import report_costs
+    step = NS(t=1, prove_s=50.0, commit_s=1.25, verify_s=100.5, handoff_s=0.75)
+    r = NS(loop=NS(steps=[step]), verifier=NS(timings={1: {"0": 0.5, "6a": 3.25}}))
+    rows = [{"level": "total", "component": side, "step": 1, "peak_bytes": 60 * 2**30,
+             "peak_reserved_bytes": held, "start_bytes": 2**30, "mem_source": "cuda_allocated"}
+            for side, held in (("prover", 62 * 2**30), ("verifier", None))]
+    lines = []
+    report_costs(r, rows, lines.append)
+    assert lines[1] == ("step 1: prover peak 60.00 GB, reserved 62.00 GB (at its start 1.00 GB) "
+                        "[cuda_allocated, memory pass]")
+    (t,) = fs._step_times(lines)
+    assert (t["prover_s"], t["verifier_s"], t["handoff_s"], t["total_s"]) == (51.25, 100.5,
+                                                                                0.75, 152.5)
+    assert t["checks_s"] == {"0": 0.5, "6a": 3.25}
+    assert [(m[2], m[3], m[4]) for m in map(fs._PEAK.match, lines) if m] == [
+        ("prover", "60.00", "62.00"), ("verifier", "60.00", None)]
+
+
+def test_section_lines_parse_as_the_recorder_prints_them():
+    """The parser reads metrics.MemoryRecorder's own echo, with and without a reserve."""
+    from verification.runs.metrics import MemoryRecorder
+    from tests.verification.runs.test_metrics import _Rec, _ReservingProbe, _ScriptedProbe
+    for probe in (_ScriptedProbe(), _ReservingProbe()):
+        lines = []
+        rec = MemoryRecorder("m", "s", probe, echo=lines.append)
+        with rec.section("5"):
+            with rec.section("5.glue"):
+                probe.alloc(2)
+                probe.free(1)
+        rec.on_step(_Rec(1))
+        (got,) = fs._section_peaks(lines)
+        held = 2.0 if isinstance(probe, _ReservingProbe) else None
+        assert (got["section"], got["peak_gb"], got["reserved_gb"]) == ("check 5", 2.0, held)
+        assert got["nested_gb"] == {"5.glue": 2.0}
+        assert got["nested_reserved_gb"] == ({} if held is None else {"5.glue": 2.0})
+
+
+def _records(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_plain_extras(tmp_path):
+    """A plain arm's summary: the timed run's step totals in step order, their mean and
+    median, and the memory pass's peak; other totals and step 0 don't count."""
+    rec = tmp_path / "plain_baseline" / "records.jsonl"
+    step = {"record": "time", "side": "run", "component": "step", "level": "total"}
+    alloc = {"PYTORCH_ALLOC_CONF": None, "PYTORCH_CUDA_ALLOC_CONF": None,
+             "release_cache": True}
+    rows = [{"record": "environment", "run": "plain_baseline", **alloc},
+            *({**step, "step": t, "time_s": s} for t, s in ((2, 1.5), (1, 2.5), (3, 1.0))),
+            {**step, "step": 0, "time_s": 99.0},
+            {"record": "time", "side": "prover", "component": "prover", "level": "total",
+             "step": 1, "time_s": 99.0},
+            {"record": "memory", "step": 1, "level": "phase", "component": "P0.backward",
+             "peak_bytes": 5 * 2**30, "peak_reserved_bytes": 6 * 2**30,
+             "mem_source": "cuda_allocated"},
+            {"record": "memory", "step": 1, "level": "phase", "component": "P0.forward",
+             "peak_bytes": 3 * 2**30, "peak_reserved_bytes": 4 * 2**30,
+             "mem_source": "cuda_allocated"},
+            {"record": "run_end", "run": "plain_baseline", "lifetime_maxrss_bytes": 7}]
+    _records(rec, rows)
+    part = fs.Part("plain", [], kind="plain", info={"report": str(rec)})
+    e = fs.part_extras(part, tmp_path / "log.txt")
+    assert e["step_s"] == [2.5, 1.5, 1.0]
+    assert e["mean_step_s"] == pytest.approx(5 / 3) and e["median_step_s"] == 1.5
+    assert e["peak_bytes"] == 5 * 2**30 and e["mem_source"] == "cuda_allocated"
+    assert e["peak_reserved_bytes"] == 6 * 2**30
+    assert e["completed"] and e["lifetime_maxrss_bytes"] == 7 and e["record"] == str(rec)
+    assert e["allocator"] == alloc  # what the run's environment record says it ran with
+    assert e["bad_lines"] == 0
+    # a line cut short (a run killed mid-write) or with a figure that isn't a number is
+    # skipped and counted; the rest of the arm stands
+    rec.write_text("".join(json.dumps(r) + "\n" for r in rows)
+                   + json.dumps({**step, "step": 4, "time_s": "fast"}) + "\n"
+                   + json.dumps({"record": "memory", "peak_bytes": [1]}) + "\n"
+                   + "[1, 2]\n" + '{"record": "time", "step": 5, "ti')
+    cut = fs.part_extras(part, tmp_path / "log.txt")
+    assert cut["bad_lines"] == 4 and "extras_error" not in cut
+    assert {k: cut[k] for k in e if k != "bad_lines"} == {k: e[k] for k in e if k != "bad_lines"}
+    # a run that died after one timed step, before its memory pass
+    _records(rec, rows[:3])
+    e = fs.part_extras(part, tmp_path / "log.txt")
+    assert e["step_s"] == [2.5, 1.5] and e["peak_bytes"] is None and not e["completed"]
+    assert e["peak_reserved_bytes"] is None
+    _records(rec, rows[:1])
+    e = fs.part_extras(part, tmp_path / "log.txt")
+    assert e["step_s"] == [] and e["mean_step_s"] is None and e["median_step_s"] is None
+    assert fs.part_extras(fs.Part("p", [], kind="plain", info={"report": str(tmp_path / "no")}),
+                          tmp_path / "log.txt") == {"record": None}
 
 
 # ---- fetch-models and the upload check ----------------------------------------------------
@@ -379,7 +693,9 @@ def test_job_runs_packs_and_terminates(tmp_path):
     plan = [{"name": "ok", "argv": _py("print('part ran')")},
             {"name": "fails", "argv": _py("import sys; sys.exit(3)")},
             {"name": "slow", "argv": ["sleep", "60"]}]
-    r, out = _job(tmp_path, plan=plan, deadline=8, extra={"FS11_ALLOW_ANY_GPU": "1"})
+    # Parts stop at 10 - 1 - 3 = 6 s; the 3 s reserve leaves packing room on a loaded machine.
+    r, out = _job(tmp_path, plan=plan, deadline=10, reserve=3,
+                  extra={"FS11_ALLOW_ANY_GPU": "1"})
     assert r.returncode == 1, r.stdout + r.stderr
     s = json.loads((out / "summary.json").read_text())
     assert [p["status"] for p in s["parts"]] == ["ok", "failed", "killed_deadline"]
@@ -488,6 +804,7 @@ def test_job_marks_a_failed_pack_and_still_terminates(tmp_path):
 @pytest.mark.parametrize("deadline, grace, extra, why", [
     (2, 1, {}, "must be below FS11_DEADLINE_S"),
     (60, 1, {"FS11_MIN_FREE_GB": str(10**9)}, "FS11_MIN_FREE_GB is"),
+    (60, 1, {"FS11_SESSION": "fs12"}, "FS11_SESSION is 'fs12'; it must be fs11 or recheck"),
 ])
 def test_job_terminates_on_a_refusal(tmp_path, deadline, grace, extra, why):
     r, out = _job(tmp_path, plan=OK_PLAN, deadline=deadline, grace=grace, extra=extra)
@@ -502,16 +819,48 @@ def test_job_refuses_without_a_way_to_terminate(tmp_path):
     assert not out.exists()
 
 
-def test_job_selftest(tmp_path):
-    """FS11_SELFTEST: the stand-in parts, no GPU check, then the normal end-of-run terminate."""
-    r, out = _job(tmp_path, deadline=30, grace=1, reserve=5, extra={"FS11_SELFTEST": "1"})
+@pytest.mark.parametrize("session, label", [(None, "FS11"), ("recheck", "recheck")])
+def test_job_selftest(tmp_path, session, label):
+    """FS11_SELFTEST: the stand-in parts, no GPU check, then the normal end-of-run terminate,
+    under either session's name."""
+    extra = {"FS11_SELFTEST": "1", **({"FS11_SESSION": session} if session else {})}
+    r, out = _job(tmp_path, deadline=30, grace=1, reserve=5, extra=extra)
     assert r.returncode == 0, r.stdout + r.stderr
     s = json.loads((out / "summary.json").read_text())
+    assert s["session"] == label
     assert [(p["name"], p["status"]) for p in s["parts"]] == [
         ("selftest_ok", "ok"), ("selftest_sleep", "ok")]
-    assert "self-test: stand-in parts" in _log(out) and "SELFTEST=1" in r.stdout
+    assert f"self-test: stand-in parts in place of the {label} session's" in _log(out)
+    assert "SELFTEST=1" in r.stdout and f"session {session or 'fs11'}," in r.stdout
     assert "terminate tools:" in r.stdout
     assert "DRY_RUN: terminate (end of job (session exit 0))" in r.stdout
+
+
+@pytest.mark.parametrize("session, label, deadline_s", [
+    (None, "FS11", 12600), ("fs11", "FS11", 12600), ("recheck", "recheck", 7500)])
+def test_job_passes_the_session_on(tmp_path, session, label, deadline_s):
+    """FS11_SESSION reaches the session's --session, which names it in summary.json; an unset
+    FS11_DEADLINE_S takes the session's default."""
+    extra = {"FS11_ALLOW_ANY_GPU": "1", "FS11_DEADLINE_S": "",
+             **({"FS11_SESSION": session} if session else {})}
+    r, out = _job(tmp_path, plan=OK_PLAN, extra=extra)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((out / "summary.json").read_text())["session"] == label
+    assert f"deadline in {deadline_s} s" in r.stdout
+    log = _log(out)
+    assert f"run --session {session or 'fs11'}" in log and f"session {label}: 1 part" in log
+
+
+def test_a_refused_recheck_names_its_session(tmp_path, monkeypatch):
+    monkeypatch.delenv("FS11_ALLOW_ANY_GPU", raising=False)
+    out = tmp_path / "out"
+    if fs.refusal(fs.environment(out), False) is None:  # main would run the real parts
+        pytest.skip("this machine has an H100")
+    rc = fs.main(["run", "--upload", str(tmp_path / "up"), "--out", str(out), "--deadline",
+                  str(time.time() + 30), "--session", "recheck"])
+    s = json.loads((out / "summary.json").read_text())
+    assert rc == fs.EXIT_REFUSED
+    assert s["session"] == "recheck" and s["refused"] and s["parts"] == []
 
 
 # ---- the job against stub runpodctl and curl (DRY_RUN=0) -----------------------------------

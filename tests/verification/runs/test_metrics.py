@@ -6,6 +6,7 @@ import math
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,7 @@ from verification.runs.metrics import (
     step_record,
     step_scores,
 )
+from verification.runs.loop import HANDOFF_SECTION
 from verification.runs.mlp_smoke import run_smoke, scenarios
 from verification.runs.scenarios import honest_final, run_scenario
 from verification.transcript.store import InMemoryStore
@@ -448,6 +450,24 @@ def test_environment_and_run_end(smoke):
     assert env["band_file_hash"] is None and env["h_D"] is None and env["attack"] is None
     assert env["git_commit"] is None or len(env["git_commit"]) == 40
     assert end["lifetime_maxrss_bytes"] > 0
+    assert set(metrics.ALLOC_VARS) | {"release_cache"} <= env.keys()
+
+
+def test_environment_records_the_allocator_settings(monkeypatch):
+    """Both allocator variables, ``None`` when unset, and the run's ``release_cache``: given,
+    or read from ``VERIF_RELEASE_CACHE``."""
+    probe = metrics.memory_probe("cpu")
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("VERIF_RELEASE_CACHE", "0")
+    env = metrics.environment_record("r", device="cpu", probe=probe)
+    assert (env["PYTORCH_ALLOC_CONF"], env["PYTORCH_CUDA_ALLOC_CONF"], env["release_cache"]) == (
+        "expandable_segments:True", None, False)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF")
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.6")
+    env = metrics.environment_record("r", device="cpu", probe=probe, release_cache=True)
+    assert (env["PYTORCH_ALLOC_CONF"], env["PYTORCH_CUDA_ALLOC_CONF"], env["release_cache"]) == (
+        None, "garbage_collection_threshold:0.6", True)
 
 
 def _kinds(d):
@@ -517,6 +537,7 @@ def test_memory_pass_probes_every_section(smoke, c):
             assert r["peak_bytes"] >= max(r["start_bytes"], r["end_bytes"]) or r["level"] != "phase"
     total = got[("total", "step")]
     assert total["peak_bytes"] == max(r["peak_bytes"] for r in _top_parts(got))
+    assert all(r["peak_reserved_bytes"] is None for r in rows)  # CUDA only
 
 
 def test_count_pass_and_storage(c, D, w0, smoke):
@@ -652,6 +673,144 @@ def test_nested_and_run_sections():
     assert total["time_s"] == five["time_s"]  # a sub row is inside its parent, not added
 
 
+def test_the_handoff_row_is_the_harnesss_and_in_no_total():
+    """``run_loop``'s cache release between the roles: a component row on side ``run``,
+    outside the prover's, the verifier's and the step's totals."""
+    rec = TimeRecorder("x", "s")
+    for name in ("P3.commit", HANDOFF_SECTION, "4"):
+        with rec.section(name):
+            time.sleep(0.001)
+    rec.on_step(_Rec(1))
+    rows = {(r["level"], r["component"]): r for r in rec.rows}
+    assert rows[("component", HANDOFF_SECTION)]["side"] == "run"
+    assert [k for k in rows if k[1] == HANDOFF_SECTION] == [("component", HANDOFF_SECTION)]
+    prover, verifier = rows[("total", "prover")], rows[("total", "verifier")]
+    assert prover["time_s"] == rows[("component", "P3")]["time_s"]
+    assert verifier["time_s"] == rows[("component", "4")]["time_s"]
+    assert rows[("total", "step")]["time_s"] == pytest.approx(
+        prover["time_s"] + verifier["time_s"])
+
+
+class _ScriptedProbe:
+    """A memory probe the test drives: ``alloc`` and ``free`` move the current figure."""
+
+    source = "scripted"
+
+    def __init__(self):
+        self.now = self.peak = 0
+
+    def reset(self):
+        self.peak = self.now
+
+    def sample(self):
+        return self.peak, self.now
+
+    def alloc(self, gib):
+        self.now += gib * 2**30
+        self.peak = max(self.peak, self.now)
+
+    def free(self, gib):
+        self.now -= gib * 2**30
+
+
+def test_memory_echo_prints_each_top_section_as_it_closes():
+    """A top-level section's line comes as it closes, with its nested sections' peaks, and
+    the section an exception left through says so: a run that dies mid-step keeps them."""
+    probe, lines = _ScriptedProbe(), []
+    rec = MemoryRecorder("m", "s", probe, echo=lines.append)
+    with rec.section("run:P4.tree"):
+        pass
+    with rec.section("train.backward"):
+        probe.alloc(3)
+        probe.free(2)
+    rec.on_step(_Rec(1))
+    with pytest.raises(MemoryError):
+        with rec.section("5"):
+            with rec.section("5.glue"):
+                probe.alloc(2)
+                probe.free(2)
+            with rec.section("5.measure"):
+                probe.alloc(4)
+                raise MemoryError
+    assert lines == [
+        "   run, P4.tree: peak 0.00 GB (start 0.00, end 0.00 GB)",
+        "   step 1, train.backward: peak 3.00 GB (start 0.00, end 1.00 GB)",
+        "   step 2, check 5: peak 5.00 GB (start 1.00, end 5.00 GB; nested: 5.glue 3.00, "
+        "5.measure 5.00 GB); raised MemoryError",
+    ]
+    # the rows don't depend on the echo
+    quiet = MemoryRecorder("m", "s", _ScriptedProbe())
+    with quiet.section("train.backward"):
+        quiet.probe.alloc(3)
+        quiet.probe.free(2)
+    quiet.on_step(_Rec(1))
+    assert quiet.rows == [r for r in rec.rows if r["step"] == 1]
+
+
+class _ReservingProbe(_ScriptedProbe):
+    """A scripted probe with a CUDA-like reserve: an allocation the free cache can't hold
+    grows the reserve, a free keeps it (until ``release``, like ``empty_cache``)."""
+
+    def __init__(self):
+        super().__init__()
+        self.held = self.rpeak = 0
+
+    def reset(self):
+        super().reset()
+        self.rpeak = self.held
+
+    def reserved_peak(self):
+        return self.rpeak
+
+    def alloc(self, gib):
+        super().alloc(gib)
+        self.held = max(self.held, self.now)
+        self.rpeak = max(self.rpeak, self.held)
+
+    def release(self):
+        self.held = self.now
+
+
+def test_memory_rows_and_echo_carry_the_reserved_peak():
+    """On a probe with a reserve (CUDA's caching allocator) each row and echo line carries the
+    reserved peak beside the allocated one; nested sections fold it like the peak."""
+    probe, lines = _ReservingProbe(), []
+    rec = MemoryRecorder("m", "s", metrics._Guarded(probe), echo=lines.append)
+    with rec.section("train.backward"):
+        probe.alloc(4)
+        probe.free(3)
+    probe.release()
+    with rec.section("5"):
+        with rec.section("5.glue"):
+            probe.alloc(2)  # reserve 1 → 3
+            probe.free(2)
+        with rec.section("5.measure"):
+            probe.alloc(1)  # fits the cached 2 GiB: the reserve stays 3
+            probe.free(1)
+    rec.on_step(_Rec(1))
+    assert lines == [
+        "   step 1, train.backward: peak 4.00 GB, reserved 4.00 GB (start 0.00, end 1.00 GB)",
+        "   step 1, check 5: peak 3.00 GB, reserved 3.00 GB (start 1.00, end 1.00 GB; nested: "
+        "5.glue 3.00 (reserved 3.00), 5.measure 2.00 (reserved 3.00) GB)",
+    ]
+    rows = {r["component"]: r for r in rec.rows if r["level"] in ("phase", "sub", "component")}
+    assert rows["train.backward"]["peak_reserved_bytes"] == 4 * 2**30
+    assert rows["5"]["peak_reserved_bytes"] == rows["5.glue"]["peak_reserved_bytes"] == 3 * 2**30
+    assert rows["5.measure"]["peak_bytes"] == 2 * 2**30
+    total = next(r for r in rec.rows if r["level"] == "total")
+    assert total["peak_reserved_bytes"] == 4 * 2**30
+
+
+def test_cuda_probe_reads_the_reserved_peak(monkeypatch):
+    seen = []
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda d: seen.append(d) or 7)
+    dev = torch.device("cuda", 0)
+    probe = metrics._Guarded(metrics._CudaProbe(dev))
+    assert metrics.reserved_peak(probe) == 7 and seen == [dev]
+    assert metrics.reserved_peak(metrics._Guarded(metrics._MaxRssProbe())) is None
+    assert metrics.reserved_peak(_ScriptedProbe()) is None  # a probe without the method
+
+
 def test_plain_step_emits_P0_rows(c, D, w0):
     rec = TimeRecorder("plain", "honest")
     model = c.build_model()
@@ -696,6 +855,7 @@ def test_derive_capture_from_synthetic_rows():
     assert times == {1: pytest.approx(4 * 0.25 + 0.5), 2: pytest.approx(1.5)}
     (mem,) = [r for r in rows if r["record"] == "memory"]
     assert mem["step"] == 1 and mem["peak_bytes"] == (1000 - 500) - (600 - 200)
+    assert "peak_reserved_bytes" in mem and mem["peak_reserved_bytes"] is None  # a growth
     (cnt,) = [r for r in rows if r["record"] == "count"]
     assert cnt["flops"] == 4 * 3 and cnt["hash_in_bytes"] == 0
     # a step the plain run lacks gets no P1 row
@@ -782,7 +942,7 @@ def test_probe_failure_degrades_to_null(caplog):
         probe.sample()
     assert sum("failed" in m for m in caplog.messages) == 1
     assert probe.source == "unavailable"
-    assert all(r["peak_bytes"] is None for r in rows)
+    assert all(r["peak_bytes"] is None and r["peak_reserved_bytes"] is None for r in rows)
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="no MPS device")

@@ -6,13 +6,15 @@
 #
 # Run from the repo (the upload's repo/, with its .venv). The pod's start command arms a boot
 # guard (verification/README.md, "Workflow: the first H100 session"), which ends the pod if
-# setup stalls or this job never starts; fs11_guard.sh re-arms it by hand. In order:
+# setup stalls or this job never starts; fs11_guard.sh re-arms it by hand. FS11_SESSION picks
+# the session's plan: fs11 (the default), the first session's, or recheck, the re-check's
+# (verification/runs/fs11_session.py); anything else is refused. In order:
 #
 # 1. Preflight. Without DRY_RUN the job refuses to start unless it can terminate the pod:
 #    RUNPOD_POD_ID set, and runpodctl or RUNPOD_API_KEY there (exit 2). A refusal it can act on
 #    (bad deadlines, less than FS11_MIN_FREE_GB free under OUT_DIR) terminates the pod.
-# 2. A deadline timer starts: FS11_DEADLINE_S (default 12600, 3.5 h) after the start it
-#    terminates the pod, whatever the job is doing.
+# 2. A deadline timer starts: FS11_DEADLINE_S (default 12600, 3.5 h; 7500, 2 h 5 min, for the
+#    re-check) after the start it terminates the pod, whatever the job is doing.
 # 3. The session (verification.runs.fs11_session run) prints the environment, refuses a
 #    machine without an H100 (FS11_ALLOW_ANY_GPU=1 overrides), and runs its parts, each with
 #    its own log under OUT_DIR. Each part's exit code is recorded and a failed part doesn't stop
@@ -75,12 +77,15 @@ trap '' PIPE
 UPLOAD=${1:?usage: fs11_job.sh UPLOAD_DIR OUT_DIR}
 OUT=${2:?usage: fs11_job.sh UPLOAD_DIR OUT_DIR}
 SELFTEST=${FS11_SELFTEST:-0}
+SESSION=${FS11_SESSION:-fs11}
+DEFAULT_DEADLINE_S=12600
+[ "$SESSION" = recheck ] && DEFAULT_DEADLINE_S=7500
 if [ "$SELFTEST" = 1 ]; then
   DEADLINE_S=${FS11_DEADLINE_S:-360}; GRACE_S=${FS11_GRACE_S:-120}
   PACK_RESERVE_S=${FS11_PACK_RESERVE_S:-60}; MIN_FREE_GB=${FS11_MIN_FREE_GB:-1}
   export FS11_ALLOW_ANY_GPU=1
 else
-  DEADLINE_S=${FS11_DEADLINE_S:-12600}; GRACE_S=${FS11_GRACE_S:-1200}
+  DEADLINE_S=${FS11_DEADLINE_S:-$DEFAULT_DEADLINE_S}; GRACE_S=${FS11_GRACE_S:-1200}
   PACK_RESERVE_S=${FS11_PACK_RESERVE_S:-600}; MIN_FREE_GB=${FS11_MIN_FREE_GB:-15}
 fi
 HANG_MARGIN_S=${FS11_HANG_MARGIN_S:-120}
@@ -281,6 +286,10 @@ fi
 if [ $((GRACE_S + PACK_RESERVE_S)) -ge "$DEADLINE_S" ]; then
   refuse "FS11_GRACE_S + FS11_PACK_RESERVE_S must be below FS11_DEADLINE_S"
 fi
+case "$SESSION" in
+  fs11|recheck) ;;
+  *) refuse "FS11_SESSION is '$SESSION'; it must be fs11 or recheck" ;;
+esac
 mkdir -p "$OUT" || refuse "cannot create $OUT"
 rm -f "$READY" "$PACK_FAILED" "$FETCHED"
 FREE_KB=$(df -Pk "$OUT" 2>/dev/null | awk 'NR == 2 {print $4}')
@@ -291,7 +300,7 @@ if exec >>"$OUT/job.log" 2>&1; then MIRROR=1
 else say "cannot append to $OUT/job.log; logging to stdout only"; fi
 
 MAIN=$$
-say "FS11 job: upload $UPLOAD, out $OUT, pod ${POD:-none}, DRY_RUN=$DRY, SELFTEST=$SELFTEST"
+say "FS11 job: session $SESSION, upload $UPLOAD, out $OUT, pod ${POD:-none}, DRY_RUN=$DRY, SELFTEST=$SELFTEST"
 say "deadline in ${DEADLINE_S} s ($(utc "$HARD")); parts stop by $((WORK_DEADLINE - START)) s; grace ${GRACE_S} s; ${FREE_KB:-?} KiB free"
 unset HF_TOKEN HUGGING_FACE_HUB_TOKEN HUGGINGFACE_HUB_TOKEN HF_TOKEN_PATH
 if command -v nvidia-smi >/dev/null 2>&1; then tmo nvidia-smi 3>&-; fi
@@ -352,9 +361,9 @@ on_signal() {
 trap on_signal TERM INT
 
 # ---- the session -------------------------------------------------------------------------
-say "session: $PY -m verification.runs.fs11_session run"
+say "session: $PY -m verification.runs.fs11_session run --session $SESSION"
 "$PY" -m verification.runs.fs11_session run --upload "$UPLOAD" --out "$OUT" \
-  --deadline "$WORK_DEADLINE" ${FS11_PLAN:+--plan "$FS11_PLAN"} \
+  --deadline "$WORK_DEADLINE" --session "$SESSION" ${FS11_PLAN:+--plan "$FS11_PLAN"} \
   $([ "$SELFTEST" = 1 ] && echo --selftest) 3>&- &
 ORCH=$!
 KILL_AT=$((WORK_DEADLINE + HANG_MARGIN_S))

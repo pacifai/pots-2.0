@@ -402,7 +402,8 @@ def derive_capture(verified: Iterable[Mapping[str, Any]],
         grow = None if any(f is None for f in figs) else \
             (figs[0] - figs[1]) - (figs[2] - figs[3])
         out.append({"record": "memory", "run": run, "scenario": scen, "step": t, **base,
-                    "calls": 1, "peak_bytes": grow, "start_bytes": None, "end_bytes": None,
+                    "calls": 1, "peak_bytes": grow, "peak_reserved_bytes": None,
+                    "start_bytes": None, "end_bytes": None,
                     "mem_source": v["train.backward"]["mem_source"]})
     for (run, scen, t), v in _phases(verified, "count").items():
         if (p := plain_count.get(t)) is None:

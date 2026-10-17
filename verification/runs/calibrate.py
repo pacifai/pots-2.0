@@ -439,7 +439,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     llama = {"n_s": c.n_s, "n": c.n, "eta": c.eta, "k": k, "T": T, "n_records": len(D),
              "M": c.M, "n_leaves": c.n_leaves}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-                 if f.name not in ("output_dir", "metrics")}, "llama": llama}
+                 if f.name not in ("output_dir", "metrics", "release_cache")}, "llama": llama}
     base = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models)
     mw = (MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
                         corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,

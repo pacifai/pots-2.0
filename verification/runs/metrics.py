@@ -59,7 +59,10 @@ leaves, and its cost is ``5.glue``. ``6b.glue`` is the replayed glue gradients.
 ``component`` (a prover component, the sum of its phases, or a check), ``sub`` (a nested
 section) or ``total`` (``prover``, ``verifier``, and ``step``, their sum; a total sums its
 top-level sections, so loop bookkeeping and fault hooks are not in it). A section entered twice
-in a step (``train.load``, ``5.glue``) accumulates and ``calls`` counts the entries.
+in a step (``train.load``, ``5.glue``) accumulates and ``calls`` counts the entries. The
+harness's own section ``handoff.empty_cache`` (``run_loop``'s cache release between the two
+roles, on CUDA only) is a ``component`` row on side ``run``, in no total: deployed, the
+prover and the verifier run on separate machines.
 
 **Time (timed run).** Wall-clock seconds from ``perf_counter`` and nothing else. On CUDA the
 device is synchronized at top-level section boundaries and nested sections are timed with
@@ -73,7 +76,12 @@ against each other yet, which the first CUDA run must do. Test-scale times are r
 absolute figure; ``start_bytes`` and ``end_bytes`` are the process's figure at the first entry
 and the last exit, so ``peak − start`` is what the section added on top of what was live. A
 nested section has its own peak: each entry and exit first folds the peak so far into every
-open section, then the entry resets it. The backend is named in ``mem_source``:
+open section, then the entry resets it. ``peak_reserved_bytes`` is, on CUDA, the caching
+allocator's reserved peak over the same interval (``max_memory_reserved``, folded the same
+way): what the allocator held from the driver, live tensors and cached free blocks together, so
+``peak_reserved_bytes − peak_bytes`` shows the fragmentation an out-of-memory error reports as
+"reserved but unallocated" (the two peaks need not fall at the same moment). It is ``null`` on
+every other backend. The backend is named in ``mem_source``:
 
 - ``darwin_phys_footprint`` (macOS): ``phys_footprint``, Activity Monitor's "Memory" (resident,
   compressed and swapped dirty pages), with the kernel's interval maximum
@@ -171,6 +179,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
 
+from setup.config import load_config
 from verification.computation.interface import ProductKind
 from verification.verifier.bands import product_class
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF
@@ -182,7 +191,7 @@ from verification.verifier.context import ProductStat, StepStats, TensorStat
 __all__ = [
     "P0_PHASES", "TRAIN_PHASES", "PASS_STEPS", "COUNT_STEPS", "COMPONENTS", "RECORD_TYPES",
     "RESERVED_NAMES", "SCORE_FAMILIES",
-    "MemoryProbe", "memory_probe",
+    "MemoryProbe", "memory_probe", "reserved_peak",
     "TimeRecorder", "MemoryRecorder", "CountRecorder",
     "memory_pass", "count_pass", "counting",
     "derive_capture", "step_record", "record_pass", "judged_step", "in_sample_step",
@@ -217,7 +226,12 @@ PASS_STEPS = 2
 COUNT_STEPS = 1
 
 
+HARNESS_PREFIX = "handoff."  # the harness's own sections (run_loop's HANDOFF_SECTION)
+
+
 def _side(name: str) -> str:
+    if name.startswith(HARNESS_PREFIX):
+        return "run"
     return "prover" if name.startswith(("P", "train.")) else "verifier"
 
 
@@ -234,6 +248,16 @@ class MemoryProbe(Protocol):
     def sample(self) -> tuple[int | None, int | None]:
         """``(peak since the last reset, current)``."""
         ...
+
+    # A probe may also have ``reserved_peak() -> int | None``, the CUDA caching allocator's
+    # reserved peak since the last reset (:func:`reserved_peak`); one without it has none.
+
+
+def reserved_peak(probe: MemoryProbe) -> int | None:
+    """``probe``'s reserved peak since its last reset: the CUDA caching allocator's
+    ``max_memory_reserved`` on CUDA, ``None`` on every other backend."""
+    get = getattr(probe, "reserved_peak", None)
+    return None if get is None else get()
 
 
 class _DarwinProbe:
@@ -307,6 +331,11 @@ class _CudaProbe:
         return (int(torch.cuda.max_memory_allocated(self._dev)),
                 int(torch.cuda.memory_allocated(self._dev)))
 
+    def reserved_peak(self) -> int:
+        """Reserved bytes' peak since the last reset (``reset_peak_memory_stats`` resets it
+        with the allocated peak); read after ``sample``'s synchronize."""
+        return int(torch.cuda.max_memory_reserved(self._dev))
+
 
 class _MaxRssProbe:
     source = "ru_maxrss"
@@ -346,6 +375,15 @@ class _Guarded:
             self._fail(e)
             return None, None
 
+    def reserved_peak(self) -> int | None:
+        if self._inner is None:
+            return None
+        try:
+            return reserved_peak(self._inner)
+        except OSError as e:
+            self._fail(e)
+            return None
+
 
 def memory_probe(device: str | torch.device = "cpu") -> MemoryProbe:
     """The memory backend for ``device`` on this platform (see the module docstring)."""
@@ -377,13 +415,14 @@ def lifetime_maxrss_bytes() -> int:
 class _Acc:
     """One section's totals within a step."""
 
-    __slots__ = ("nested", "calls", "time", "peak", "start", "end", "seen", "counts")
+    __slots__ = ("nested", "calls", "time", "peak", "rpeak", "start", "end", "seen", "counts")
 
     def __init__(self, nested: bool) -> None:
         self.nested = nested
         self.calls = 0
         self.time = 0.0
         self.peak: int | None = None
+        self.rpeak: int | None = None  # the reserved peak (memory pass, CUDA only)
         self.start: int | None = None
         self.end: int | None = None
         self.seen = False
@@ -447,12 +486,15 @@ class _Recorder:
             if accs:
                 rows.append(self._row(step, "prover", comp, "component", accs))
         rows += [self._row(step, "verifier", n, "component", [a]) for n, a in verifier.items()]
+        rows += [self._row(step, "run", n, "component", [a]) for n, a in top.items()
+                 if _side(n) == "run"]
         rows += [self._row(step, _side(n), n, "sub", [a]) for n, a in table.items() if a.nested]
         for side, part in (("prover", prover), ("verifier", verifier)):
             if part:
                 rows.append(self._row(step, side, side, "total", list(part.values())))
-        if top:
-            rows.append(self._row(step, "run", "step", "total", list(top.values())))
+        roles = [a for n, a in top.items() if _side(n) != "run"]  # the harness's are in no total
+        if roles:
+            rows.append(self._row(step, "run", "step", "total", roles))
         return rows
 
     def _row(self, step: int, side: str, comp: str, level: str,
@@ -821,19 +863,26 @@ def nan_as_inf(x: np.ndarray) -> np.ndarray:
 # ---- memory: the memory pass -------------------------------------------------------------
 
 
+def _max(a: int | None, b: int | None) -> int | None:
+    return a if b is None or (a is not None and a >= b) else b
+
+
 class _MemSection:
-    __slots__ = ("rec", "acc", "peak")
+    __slots__ = ("rec", "acc", "peak", "rpeak", "start", "name")
 
     def __init__(self, rec: MemoryRecorder, acc: _Acc) -> None:
-        self.rec, self.acc = rec, acc
+        self.rec, self.acc, self.name = rec, acc, ""
 
     def __enter__(self) -> None:
         rec, acc = self.rec, self.acc
         rec._fold()  # the open sections keep the peak so far before it is reset
         rec.probe.reset()
-        self.peak, cur = rec.probe.sample()
+        self.peak, self.start = rec.probe.sample()
+        self.rpeak = reserved_peak(rec.probe)
         if not acc.seen:
-            acc.start, acc.seen = cur, True
+            acc.start, acc.seen = self.start, True
+        if rec._depth == 0:
+            rec._inner = {}
         rec._open.append(self)
         rec._depth += 1
 
@@ -844,43 +893,98 @@ class _MemSection:
         rec._depth -= 1
         acc.calls += 1
         acc.end = cur
-        if self.peak is not None and (acc.peak is None or self.peak > acc.peak):
-            acc.peak = self.peak
+        acc.peak, acc.rpeak = _max(acc.peak, self.peak), _max(acc.rpeak, self.rpeak)
+        if rec.echo is None:
+            return
+        if rec._depth > 0:
+            was, rwas = rec._inner.get(self.name, (None, None))
+            rec._inner[self.name] = (_max(was, self.peak), _max(rwas, self.rpeak))
+        else:
+            rec._echo_section(self, cur, exc[0])
+
+
+def _gb(x: int | None) -> str:
+    return "?" if x is None else f"{x / 2**30:.2f}"
 
 
 class MemoryRecorder(_Recorder):
-    """The memory pass: the process's peak per section, nested sections included."""
+    """The memory pass: the process's peak per section, nested sections included.
+
+    With ``echo``, each top-level section also prints one line as it closes: its own peak
+    (and on CUDA its reserved peak), its figure at entry and exit, the peaks of the sections
+    nested in it (each with its reserved peak on CUDA), and the exception it closed on, if
+    any. A run that dies mid-step keeps the lines of the sections it got
+    through, the one that raised included, where the rows (written as a step closes) are
+    lost."""
 
     record = "memory"
     _Section = _MemSection
 
-    def __init__(self, run: str, scenario: str, probe: MemoryProbe) -> None:
+    def __init__(self, run: str, scenario: str, probe: MemoryProbe, *,
+                 echo: Callable[[str], None] | None = None) -> None:
         super().__init__(run, scenario)
         self.probe = probe
+        self.echo = echo
         self._open: list[_MemSection] = []
+        # nested (peak, reserved peak) inside the open top section
+        self._inner: dict[str, tuple[int | None, int | None]] = {}
+        self._t = 1  # the step the open sections belong to
+
+    def section(self, name: str) -> Any:
+        s = super().section(name)
+        s.name = name
+        return s
+
+    def on_step(self, rec: Any) -> None:
+        super().on_step(rec)
+        self._t = rec.t + 1
+
+    def _echo_section(self, s: _MemSection, end: int | None, exc: type | None) -> None:
+        name = s.name
+        if name.startswith(RUN_PREFIX):
+            where, name = "run", name[len(RUN_PREFIX):]
+        else:
+            where = f"step {self._t}"
+        if _side(name) == "verifier":
+            name = f"check {name}"
+        inner = ", ".join(f"{n} {_gb(p)}" + ("" if r is None else f" (reserved {_gb(r)})")
+                          for n, (p, r) in self._inner.items())
+        line = (f"   {where}, {name}: peak {_gb(s.peak)} GB"
+                + ("" if s.rpeak is None else f", reserved {_gb(s.rpeak)} GB")
+                + f" (start {_gb(s.start)}, end {_gb(end)} GB"
+                + (f"; nested: {inner} GB" if inner else "") + ")"
+                + ("" if exc is None else f"; raised {exc.__name__}"))
+        try:
+            self.echo(line)  # type: ignore[misc]
+        except OSError:  # a full disk under the log mustn't end the run
+            pass
 
     def _fold(self) -> int | None:
         peak, cur = self.probe.sample()
-        if peak is not None:
-            for s in self._open:
-                if s.peak is None or peak > s.peak:
-                    s.peak = peak
+        rpeak = reserved_peak(self.probe)
+        for s in self._open:
+            s.peak, s.rpeak = _max(s.peak, peak), _max(s.rpeak, rpeak)
         return cur
 
     def _values(self, accs: list[_Acc]) -> dict[str, Any]:
         peaks = [a.peak for a in accs if a.peak is not None]
-        return {"peak_bytes": max(peaks) if peaks else None, "start_bytes": accs[0].start,
-                "end_bytes": accs[-1].end, "mem_source": self.probe.source}
+        rpeaks = [a.rpeak for a in accs if a.rpeak is not None]
+        return {"peak_bytes": max(peaks) if peaks else None,
+                "peak_reserved_bytes": max(rpeaks) if rpeaks else None,
+                "start_bytes": accs[0].start, "end_bytes": accs[-1].end,
+                "mem_source": self.probe.source}
 
 
 def memory_pass(run: str, scenario: str, fn: Callable[[MemoryRecorder], Any],
-                probe: MemoryProbe) -> list[dict[str, Any]]:
+                probe: MemoryProbe, *,
+                echo: Callable[[str], None] | None = None) -> list[dict[str, Any]]:
     """Run ``fn(recorder)`` once with memory probed at every section; return its rows.
 
     ``fn`` wires the recorder as a timed run wires a :class:`TimeRecorder`. Its times are never
-    reported.
+    reported. ``echo`` prints each top-level section's peak as it closes
+    (:class:`MemoryRecorder`).
     """
-    rec = MemoryRecorder(run, scenario, probe)
+    rec = MemoryRecorder(run, scenario, probe, echo=echo)
     fn(rec)
     rec.finish()
     return rec.rows
@@ -1144,7 +1248,8 @@ def derive_capture(verified: Iterable[Mapping[str, Any]],
         grow = None if any(f is None for f in figs) else \
             (figs[0] - figs[1]) - (figs[2] - figs[3])
         out.append({"record": "memory", "run": run, "scenario": scen, "step": t, **base,
-                    "calls": 1, "peak_bytes": grow, "start_bytes": None, "end_bytes": None,
+                    "calls": 1, "peak_bytes": grow, "peak_reserved_bytes": None,
+                    "start_bytes": None, "end_bytes": None,
                     "mem_source": v["train.backward"]["mem_source"]})
     for (run, scen, t), v in phases(verified, "count").items():
         p = plain_count.get(t)
@@ -1305,10 +1410,26 @@ def _version(dist: str) -> str | None:
 _LIBRARIES = ("torch", "numpy", "blake3", "transformers", "datasets")
 
 
+# The CUDA caching allocator's settings variables. torch 2.9 reads PYTORCH_ALLOC_CONF and
+# prefers it over PYTORCH_CUDA_ALLOC_CONF, its deprecated older name.
+ALLOC_VARS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+
+
+def allocator_settings(release_cache: bool | None = None) -> dict[str, Any]:
+    """What this process's CUDA allocator runs with: each of :data:`ALLOC_VARS` (``None`` when
+    unset) and the run's ``release_cache``, the cache release between prover and verifier
+    (``None`` reads ``VERIF_RELEASE_CACHE``)."""
+    return {**{v: os.environ.get(v) for v in ALLOC_VARS},
+            "release_cache": load_config().release_cache if release_cache is None
+            else release_cache}
+
+
 def environment_record(run: str, *, device: str | torch.device, probe: MemoryProbe,
                        config: Mapping[str, Any] | None = None, band_file_hash: str | None = None,
-                       h_D: bytes | None = None, **fields: Any) -> dict[str, Any]:
-    """EQ13 record 5: hardware, library versions, git commit and the run's input hashes."""
+                       h_D: bytes | None = None, release_cache: bool | None = None,
+                       **fields: Any) -> dict[str, Any]:
+    """EQ13 record 5: hardware, library versions, git commit and the run's input hashes, and
+    the allocator's settings (:func:`allocator_settings`, ``release_cache`` as there)."""
     dev = torch.device(device)
     status = _git("status", "--porcelain")
     return {
@@ -1326,6 +1447,7 @@ def environment_record(run: str, *, device: str | torch.device, probe: MemoryPro
         "band_file_hash": band_file_hash,
         "h_D": None if h_D is None else h_D.hex(),
         "mem_source": probe.source, "MallocLargeCache": os.environ.get("MallocLargeCache"),
+        **allocator_settings(release_cache),
         "threads": torch.get_num_threads(), **fields,
     }
 

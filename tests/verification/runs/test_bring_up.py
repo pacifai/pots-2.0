@@ -11,6 +11,7 @@ from tests.verification.decoder_helpers import make_records, randomize_biases, t
 from tests.verification.full_scale_helpers import PIN_IDS, PINS, full_scale_case
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances import DecoderComputation
+from verification.runs import loop as loop_mod
 from verification.runs.bring_up import bring_up, family_maxima, reference_bands, report
 from verification.transcript.store import DiskHandoff, InMemoryStore, StoreHandoff
 from verification.verifier.bands import Bands
@@ -199,6 +200,79 @@ def test_a_rejection_at_run_start_is_reported():
     assert not b.passed
     text = _text(b, c)
     assert "no fit" in text and f"REJECTED {rej}" in text
+
+
+class _UnreadableStore(InMemoryStore):
+    """A store whose leaves can't be read: the verifier's first read raises, as an out-of-memory
+    error inside a check would."""
+
+    def leaf(self, index):
+        raise MemoryError("stand-in for CUDA out of memory")
+
+
+class _DyingHandoff(StoreHandoff):
+    def hold(self, c, t, leaves, tree, dataset_paths=None):
+        return _UnreadableStore.hold(c, leaves, tree, dataset_paths)
+
+
+def _sections(lines):
+    return [x.split(":", 1)[0].strip() for x in lines if x.startswith("   ")]
+
+
+def test_memory_pass_echoes_each_section():
+    torch.manual_seed(0)
+    c = DecoderComputation(tiny_config(family="qwen2", tied=False), n_s=2, n=12, eta=1e-3)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+    lines = []
+    bring_up(c, D, dataset_tree(c, D).root, T=1, k=K, seed=SEED, tamper=False,
+             echo=lines.append)
+    assert lines[0].startswith("== memory pass: each section's peak as it closes")
+    got = _sections(lines[1:])
+    for name in ("step 1, train.backward", "step 1, P3.commit", "step 1, P5.write",
+                 "step 1, check 4", "step 1, check 5", "step 1, check 2.root", "run, P4.tree"):
+        assert name in got, name
+    assert all("raised" not in x for x in lines)
+    (five,) = [x for x in lines if x.startswith("   step 1, check 5:")]
+    assert "nested: 5.glue" in five and "5.measure" in five
+
+
+def test_a_run_that_dies_in_the_verifier_still_shows_its_sections():
+    """The memory pass's rows close with the step, which a raise never reaches; the echo
+    lines of the sections it got through, the raising one included, are already printed."""
+    torch.manual_seed(0)
+    c = DecoderComputation(tiny_config(family="qwen2", tied=False), n_s=2, n=12, eta=1e-3)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+    lines = []
+    with pytest.raises(MemoryError):
+        bring_up(c, D, dataset_tree(c, D).root, T=1, k=K, seed=SEED, tamper=False,
+                 handoff=_DyingHandoff(), echo=lines.append)
+    got = _sections(lines[1:])
+    assert {"step 1, train.backward", "step 1, P3.commit", "step 1, P5.write"} <= set(got)
+    raised = [x for x in lines if x.endswith("; raised MemoryError")]
+    assert len(raised) == 1 and raised[0].startswith("   step 1, check ")
+    assert lines[-1] == raised[0]
+
+
+@pytest.mark.parametrize("release", [True, False])
+def test_release_cache_reaches_the_steps_and_the_tampers(monkeypatch, release):
+    """With CUDA stubbed in, the cache is released once before each verifier: the honest
+    step's and each tamper's. ``release_cache=False`` skips every one."""
+    calls = []
+    monkeypatch.setattr(loop_mod, "_on_cuda", lambda device: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
+    torch.manual_seed(0)
+    c = DecoderComputation(tiny_config(family="qwen2", tied=False), n_s=2, n=12, eta=1e-3)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+
+    def build():
+        m = c.build_model()
+        randomize_biases(dict(m.named_parameters()))
+        return m
+
+    b = bring_up(c, D, dataset_tree(c, D).root, T=1, k=K, seed=SEED, release_cache=release,
+                 build_model=build)
+    assert b.passed and len(b.tampers) == 2
+    assert len(calls) == (3 if release else 0)
 
 
 def test_main_refuses_a_branch_name(monkeypatch, capsys):
