@@ -595,7 +595,7 @@ class DecoderComputation(DeclaredComputation):
         (:meth:`forward_backward`)."""
         return model(input_ids=batch.ids, attention_mask=batch.rho, use_cache=False).logits
 
-    def _features(self, model: nn.Module, batch: Batch) -> torch.Tensor:
+    def features(self, model: nn.Module, batch: Batch) -> torch.Tensor:
         """``F`` as ``[n_s, n, d]``: the forward pass, embedding through the final norm, as HF
         runs it before the output projection."""
         return model.model(input_ids=batch.ids, attention_mask=batch.rho,
@@ -718,7 +718,7 @@ class DecoderComputation(DeclaredComputation):
         gs: list[torch.Tensor] = []
         with self.autocast():
             with stage("forward"):
-                f = self._features(model, batch)
+                f = self.features(model, batch)
             for b in range(self.head_blocks):
                 with stage("forward"):
                     fb = self._head_input(f, b)
@@ -1335,7 +1335,7 @@ class DecoderReplay(Replay):
             with torch.enable_grad(), ProductSubstitution(self._supply, copied=self._copied):
                 # One autocast region, as in training: W is cast once for all blocks (F5a).
                 with c.autocast():
-                    f = c._features(model, batch)
+                    f = c.features(model, batch)
                     if c.L + 1 not in self._units:
                         raise ReplayError("replay: the forward pass never reached the final "
                                           "norm")

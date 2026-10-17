@@ -583,7 +583,7 @@ def test_check6_trial_is_rejected_at_6a(env, kept):
     assert rec["tau_w"] == env.bands.tau_w_for(name) and rec["factor"] == fs.CHECK6_FACTOR
     assert rec["rho_max"] == rec["rho_entry"] > rec["tau_w"]
     assert math.isclose(rec["rho_entry"], rec["rho_target"], rel_tol=0.25)
-    assert rec["g_m"] == c.linear_weights[name] and rec["root"] != base.hex()
+    assert (rec["g_m"],) == c.linear_weights[name] and rec["root"] != base.hex()
 
 
 def test_check6_trial_needs_an_entry_outside_the_band(env, kept):

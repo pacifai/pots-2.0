@@ -317,11 +317,12 @@ class OtherBatch(ProverFault):
 def llama_scenarios(c: Any, dataset: Sequence[Any], T: int, seed: int) -> list[Scenario]:
     """The honest run of ``T`` steps, then four faults at step 2 that each reject at a
     different check: 4 (another batch committed), 7 (a hidden step before step 2), 6a (one
-    ``W_{t+1}`` entry moved), 5 (the largest entry of ``Λ`` sign-flipped). The fault classes
+    ``W_{t+1}`` entry moved), 5 (the largest entry of ``Λ`` sign-flipped; head block 0's
+    ``Λ_0`` when the head runs in blocks). The fault classes
     are ``mlp_smoke``'s, which work on any ``C``. "Another batch" is ``data.other_batch``, the
     neighbouring batch of step 2's pass under ``π``'s ``seed``."""
     from verification.runs.mlp_smoke import FlipProduct, HiddenStep, NudgeWNext
-    lam = c.m_of("Lambda")
+    lam = c.m_of(c.head_name("Lambda", 0))
     w_q = c.weight_names[2]  # layer 0's W_q
     out = [HONEST]
     if T >= FAULT_STEP:

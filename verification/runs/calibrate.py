@@ -50,6 +50,7 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import math
 import statistics
@@ -60,7 +61,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from setup import backdoorllm
 from setup.config import load_config, setup_determinism
@@ -241,26 +241,30 @@ def gradient_coherence(c: DecoderComputation, model: torch.nn.Module,
     """Split the batch loss ``ℒ = Σ_i ℒ_i`` by record and take each ``g_i = ∇ℒ_i``.
 
     ``ℒ_i = (1/Σμ)·Σ_{tokens of i} μ·CE``, so ``Σ_i g_i`` is the step's own gradient and the
-    common factor ``1/Σμ`` cancels in the ratio. One forward pass, one backward pass per record
-    (``retain_graph``), and the Gram matrix in fp64, parameter by parameter. Forward and loss
-    run under the run's autocast, as training does (F6b). ``model`` is left as it came apart
-    from its weights: no ``.grad`` is set.
+    common factor ``1/Σμ`` cancels in the ratio. The step's gradient is training's
+    (``forward_backward``); the ``g_i`` come from one forward pass to the final norm's ``F``
+    and, per record, the output layer on that record's rows and a backward pass
+    (``retain_graph``), so no score array is larger than one record's. The Gram matrix is in
+    fp64, parameter by parameter. Forward and loss run under the run's autocast, as training
+    does (F6b). ``model`` is left as it came apart from its weights: no ``.grad`` is set.
     """
     load_weights(c, model, w)
     model.zero_grad(set_to_none=True)
     params = [p for _, p in model.named_parameters()]
+    c.forward_backward(model, records, lambda phase: contextlib.nullcontext())
+    full = [p.grad for p in params]
+    model.zero_grad(set_to_none=True)
     batch = c.assemble(records)
+    B = batch.ids.shape[0]
+    grads = []
     with c.autocast():
-        logits = c.logits(model, batch)
-        ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), batch.targets.reshape(-1),
-                             reduction="none").reshape(batch.mask.shape)
-        loss = c.loss_from_logits(logits, batch)
-    mu = batch.mask.to(ce.dtype)
-    per = (ce * mu).sum(dim=1) / mu.sum()
-    B = per.shape[0]
-    grads = [torch.autograd.grad(per[i], params, retain_graph=True) for i in range(B)]
-    full = torch.autograd.grad(loss, params)
-    del logits, ce, per
+        f = c.features(model, batch)
+    for i in range(B):
+        seq = slice(i, i + 1)
+        with c.autocast():
+            per = c.block_loss(model.lm_head(f[seq]), batch, seq)
+        grads.append(torch.autograd.grad(per, params, retain_graph=True))
+    del f, per
     gram = [[0.0] * B for _ in range(B)]
     err = ref = 0.0
     for j, p in enumerate(params):

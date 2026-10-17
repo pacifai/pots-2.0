@@ -18,11 +18,12 @@ first judged step: the bands were fitted on steps 1–3 (P10c).
    ``--source in-process`` instead runs four honest steps here (the run must be accepted) and
    keeps step 4's transcript in memory. At one seed both give the same leaves, so the same
    sweep records.
-2. **The flipped-matmul cheat.** Four steps where step 4's ``dF`` (``P_m`` with
-   ``m = m_of("dF")``, the output layer's input gradient and the product that sets ``k``) has its
-   largest entry's sign flipped after capture. Training stays honest, and ``dF`` is an input
-   gradient, so check 6a doesn't see it. Declared: ``(4, "5")`` on that product (S6d). The S6b
-   oracle fails the run anywhere else. It runs from either source.
+2. **The flipped-matmul cheat.** Four steps where step 4's ``dF`` (``binding_product``, the
+   output layer's input gradient and the product that sets ``k``; head block 0's ``dF[0]``
+   when the head runs in blocks) has its largest entry's sign flipped after capture. Training
+   stays honest, and ``dF`` is an input gradient, so check 6a doesn't see it. Declared:
+   ``(4, "5")`` on that product (S6d). The S6b oracle fails the run anywhere else. It runs from
+   either source.
 3. **The sweep** (S6f) over step 4's transcript. The targets are one product per §5.7 class
    (``metrics.spec_class``: forward, input gradient, weight gradient, attention score,
    attention value, and the placeholder operand gradient), taken from the class's middle layer
@@ -196,7 +197,6 @@ __all__ = ["RUN_NAME", "SWEEP_STEP", "SHAPES", "DEFAULT_X", "DEFAULT_TRIALS", "D
 
 RUN_NAME = "flipped_matmul_sweep"
 SWEEP_STEP = 4  # the first judged step (P10c)
-FLIP_PRODUCT = "dF"  # the binding product (largest q), an input gradient: 6a can't see it
 SHAPES = ("entry", "entry2", "row2", "dense")
 DEFAULT_X = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0, 100.0, 300.0, 1000.0,
              3000.0)
@@ -541,7 +541,7 @@ def check6_weight(c: DeclaredComputation) -> str:
     """The check-6 trial's linear weight: the one whose gradient is the weight-gradient target
     (:func:`_middle_first` over the weight-gradient products)."""
     g = _middle_first([s for s in c.products if spec_class(c, s) == "weight gradient"])
-    names = [n for n, m in c.linear_weights.items() if m == g.m]
+    names = [n for n, ms in c.linear_weights.items() if ms == (g.m,)]
     if not names:
         raise ValueError(f"{g.name} (P_{g.m}) is no linear weight's gradient")
     return names[0]
@@ -556,7 +556,8 @@ def check6_trial(c: DeclaredComputation, store: InMemoryStore, bands: Bands, ctx
     entry. The leaf goes back afterwards and the root must return (else ``AssertionError``)."""
     idx, base = c.w_next_index(name), store.root
     w_t, w_next = store.leaf(c.w_t_index(name)), store.leaf(idx)
-    g = store.leaf(c.product_index(c.linear_weights[name])).to(c.weight_dtype)
+    (g_m,) = c.linear_weights[name]  # a layer's linear: one product (check6_weight)
+    g = store.leaf(c.product_index(g_m)).to(c.weight_dtype)
     tau_w = bands.tau_w_for(name)
     with torch.no_grad():  # check 6a's reference, term by term (_update_identity_reference)
         eta_g = c.eta * g
@@ -586,7 +587,7 @@ def check6_trial(c: DeclaredComputation, store: InMemoryStore, bands: Bands, ctx
         if perturb_leaf(c, store, idx, w_next) != base:
             raise AssertionError(f"{name}: the honest W_t+1 leaf did not restore the root")
     rho_max = next((s.rho_max for s in ctx6.stats.tensors if s.weight == name), None)
-    return {"weight": name, "entry": i, "sign": sign, "g_m": c.linear_weights[name],
+    return {"weight": name, "entry": i, "sign": sign, "g_m": g_m,
             "tau_w": tau_w, "factor": factor, "rho_target": factor * tau_w, "rho_entry": rho,
             "rho_max": rho_max, "root": root.hex(),
             "check_id": None if rej is None else rej.check_id,
@@ -739,12 +740,15 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
               shapes: Sequence[str] = SHAPES, trials: int = DEFAULT_TRIALS,
               deep_xs: Sequence[float] = DEEP_X, deep_shapes: Sequence[str] = DEEP_SHAPES,
               deep_trials: int = DEEP_TRIALS, classes: Sequence[str] | None = None,
-              seed: int = 0, t: int = SWEEP_STEP, flip_name: str = FLIP_PRODUCT,
+              seed: int = 0, t: int = SWEEP_STEP, flip_name: str | None = None,
               kept: KeptStep | None = None, writer: MetricsWriter | None = None,
               out: Callable[[str], None] = print) -> SweepResult:
     """The flipped-matmul cheat, then the sweep and the check-6 trial on step ``t``: of
-    ``kept``, a stored step, or (``None``) of an honest base run here."""
+    ``kept``, a stored step, or (``None``) of an honest base run here. The cheat flips
+    ``flip_name``, by default the binding product (an input gradient on the decoder, which 6a
+    can't see)."""
     c = env.c
+    flip_name = flip_name or binding_product(c).name
     honest, keep = None, KeepStep(t)
     if kept is None:
         honest = run_cheat(env, Scenario("honest", f"honest, step {t}'s transcript kept for "

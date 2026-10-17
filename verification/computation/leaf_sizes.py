@@ -33,7 +33,7 @@ class LeafSize:
     ``leaf_parts`` yields); ``H_leaf`` hashes one byte more, the ``0x00`` prefix. A record is
     sized at its longest, ``ℓ = n``: three int32 arrays of length ``n`` after a 6-byte header,
     so its ``shape`` is ``(3, n)``. ``role`` is a product's κ class (``"Y_q"``, ``"S"``,
-    ``"Lambda"``, …) and ``None`` for records and weights.
+    ``"Lambda"``, …; every head block's is its kind's) and ``None`` for records and weights.
     """
 
     index: int

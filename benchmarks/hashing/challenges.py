@@ -105,7 +105,7 @@ class Product:
     m: int
     name: str
     shape: tuple[int, ...]
-    layer: int | None  # None for the head's products (Lambda, dF, G_E_head / G_head)
+    layer: int | None  # None for the head's products (Lambda, dF, G_E_head / G_head, per block)
     member: bool  # an attention product of one (sequence, head) pair
 
     @property
