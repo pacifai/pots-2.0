@@ -10,6 +10,7 @@ from collections import Counter
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformers import LlamaConfig
 from transformers.models.llama import modeling_llama
@@ -1827,53 +1828,89 @@ def _blocked_run(c, D, w0):
     return verify
 
 
-class _LargestTensor(TorchDispatchMode):
-    """Records the largest ``numel`` of any tensor an op returns."""
+class _ScoreMemory(TorchDispatchMode):
+    """The largest ``numel`` of any tensor an op returns, and the peak bytes held at once in
+    storages made by ops whose output has at least ``floor`` entries: a storage counts until
+    it is freed, whoever holds it (a weak reference tells)."""
 
-    def __init__(self):
+    def __init__(self, floor):
         super().__init__()
-        self.largest = (0, None)
+        self.floor, self.largest, self.peak = floor, (0, None), 0
+        self._held: dict[int, tuple[StorageWeakRef, int]] = {}
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         out = func(*args, **(kwargs or {}))
         for t in torch.utils._pytree.tree_leaves(out):
-            if isinstance(t, torch.Tensor) and t.numel() > self.largest[0]:
+            if not isinstance(t, torch.Tensor):
+                continue
+            if t.numel() > self.largest[0]:
                 self.largest = (t.numel(), func, t.dtype, tuple(t.shape))
+            if t.numel() >= self.floor:
+                st = t.untyped_storage()
+                self._held.setdefault(st.data_ptr(), (StorageWeakRef(st), st.nbytes()))
+        self._held = {k: v for k, v in self._held.items() if not v[0].expired()}
+        self.peak = max(self.peak, sum(n for _, n in self._held.values()))
         return out
 
 
+@pytest.mark.parametrize("leak", [False, True], ids=["honest", "leak"])
 @pytest.mark.parametrize("dtype", list(COMPUTE))
-def test_head_blocks_never_hold_scores_of_more_than_one_block(dtype, monkeypatch):
-    """At ``B = 4`` no op in training, the prover's step or the verifier's replay and checks
-    returns a tensor of ``2·(N/B)·n_v`` entries or more: nothing near the whole batch's scores.
-    The vocabulary and ``n`` are sized so every other tensor stays under that line, and check
-    6's scratch, a fixed ``UPDATE_CHUNK`` entries, is cut to fit it too."""
+def test_head_blocks_never_hold_scores_of_more_than_one_block(dtype, leak, monkeypatch):
+    """At ``B = 4``, in training, the prover's step and the verifier's replay and checks:
+
+    - no op returns a tensor of ``2·(N/B)·n_v`` entries or more, nothing near the whole
+      batch's scores;
+    - the storages of score-sized tensors (``(N/B)·n_v`` entries or more) held at once stay
+      within what the design holds. Training holds one block's working set: at most 3 fp32
+      arrays of ``(N/B)·n_v`` (log-softmax, its gradient and cross-entropy's). The prover adds
+      the transcript's ``Λ_b`` and the capture's ``δΛ_b`` (``δF_b``'s ``A``, held until
+      labeling), each ``N·n_v`` entries in the compute format in all: at bf16,
+      ``2·N·n_v`` bytes each, 4.64 GiB for Qwen2.5-1.5B's ``δΛ``.
+
+    The ``leak`` arm keeps every block's scores as fp32 and must break the second bound, so
+    the test can see such a leak. The vocabulary and ``n`` are sized so every other tensor
+    stays under ``(N/B)·n_v`` entries, and check 6's scratch, a fixed ``UPDATE_CHUNK``
+    entries, is cut to fit."""
     from verification.verifier import checks
 
     monkeypatch.setattr(checks, "UPDATE_CHUNK", 1024)
     cfg = tiny_config(tied=True)
     cfg.vocab_size = 2048
-    c = DecoderComputation(cfg, n_s=4, n=32, eta=1e-3, compute_dtype=COMPUTE[dtype],
+    c = DecoderComputation(cfg, n_s=4, n=48, eta=1e-3, compute_dtype=COMPUTE[dtype],
                            head_blocks=4)
-    limit = 2 * (c.N // c.head_blocks) * c.n_v
-    assert c.n_v * c.d < limit and 4 * c.n_s * c.n_h * c.n * c.n < limit <= c.N * c.n_v // 2
+    block = (c.N // c.head_blocks) * c.n_v  # one block's scores, in entries
+    assert c.n_v * c.d < block and 2 * c.n_s * c.n_h * c.n * c.n < block <= c.N * c.n_v // 4
+    work = 3 * block * 4  # one block's fp32 working set, in bytes
+    held = 2 * c.N * c.n_v * c.compute_dtype.itemsize  # every Λ_b and δΛ_b, in bytes
+    kept = []
+    if leak:
+        block_loss = DecoderComputation.block_loss
+        monkeypatch.setattr(DecoderComputation, "block_loss", staticmethod(
+            lambda logits, *a: (kept.append(logits.float()), block_loss(logits, *a))[1]))
     D = make_records((32, 20, 27, 15, 30, 9), seed=1)
     w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
     verify = _blocked_run(c, D, w0)
-    with _LargestTensor() as seen:
+    with _ScoreMemory(block) as train:
         _training(c, D[:c.n_s])
+    kept.clear()
+    with _ScoreMemory(block) as step:
         _, rejection = verify()
     assert rejection is None
-    assert seen.largest[0] < limit, seen.largest
+    for seen in (train, step):
+        assert seen.largest[0] < 2 * block, seen.largest
+    within = train.peak <= work and step.peak <= held + work
+    assert within != leak, (train.peak, step.peak, work, held)
 
 
 @pytest.mark.parametrize("dtype", list(COMPUTE))
 @pytest.mark.parametrize("tied", [True, False], ids=["tied", "untied"])
 def test_head_blocks_verify_an_honest_step(tied, dtype):
     """At ``B = 2`` an honest step is accepted. One entry raised in the last block's ``Λ_b`` or
-    ``δF_b`` fails check 5; in its ``G_b``, check 5 when tied (``G_E_head[b]`` is a product of
-    ``W_E``'s glue gradient) and the update identity (6a) when untied (``G_head[b]`` is a summand
-    of ``W_out``'s linear gradient, which check 5 doesn't sample)."""
+    ``δF_b`` fails check 5 (the Freivalds check of every product). One raised in its ``G_b``
+    fails check 5 when tied (``G_E_head[b]`` is a product of ``W_E``'s glue gradient, whose
+    update 6b checks after check 5) and the update identity (6a) when untied: ``G_head[b]``
+    is a summand of ``W_out``'s linear gradient, and 6a runs before check 5, which would also
+    reject it."""
     c = DecoderComputation(tiny_config(tied=tied), n_s=4, n=12, eta=1e-3,
                            compute_dtype=COMPUTE[dtype], head_blocks=2)
     D = make_records((12, 7, 10, 5, 9, 11, 6, 8), seed=1)
