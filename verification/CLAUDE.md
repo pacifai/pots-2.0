@@ -87,7 +87,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | `VERIF_ATTN_IMPL` | `eager` |
 | `VERIF_K` | `9` (was 7 until C1 recomputed it from the measured `τ`, 2026-10-05) |
 | `VERIF_BATCH` (`n_s`) / `VERIF_SEQ_LEN` (`n`) | `4` / `128` |
-| `VERIF_HEAD_BLOCKS` (`B`) | `1`: the output layer runs in `B` row blocks of `n_s/B` sequences each, so no `N × n_v` score array exists in training, the replay or check 5. Must divide `VERIF_BATCH`. `B = 1` is the output layer on all rows, bit for bit as before |
+| `VERIF_HEAD_BLOCKS` (`B`) | `1`: the output layer runs in `B` row blocks of `n_s/B` sequences each, so no `N × n_v` score array exists in training, the replay or check 5. The prover's capture still holds every block's bf16 `δΛ_b` until labeling: `N × n_v` in all, 4.64 GiB for Qwen2.5-1.5B. Must divide `VERIF_BATCH`. `B = 1` is the output layer on all rows, bit for bit as before |
 | `VERIF_STEPS` (`T`) | `10` |
 | `VERIF_N_RECORDS` | `365`: `|D|`, which `materialize_data` checks against the records F8d's selection keeps. Full scale: 369 (refusal) or 233 (jailbreak) |
 | `VERIF_ATTACK` | `refusal`: the BackdoorLLM task whose files build `D` and `D̃` (F8d), `refusal` or `jailbreak` |
@@ -812,7 +812,9 @@ interface.
       the shares. At `B = 1` `ℒ` and every `.grad` equal `loss(…).backward()`'s bit for bit
       (tied and untied, fp32 and bf16); at `B > 1` they differ in the last bits, since an
       `N/B`-row matmul may round `Λ` differently from an `N`-row one. `loss` and `logits`
-      still run all rows at once, for tests and calibration only. A batch with `Σ μ = 0` raises `ValueError`
+      still run all rows at once, for tests and calibration, and `logits` for
+      `smooth_check.whole_list_loss`, which runs it under `no_grad` on chunks of
+      `VERIF_BATCH` records (`--eval-batch` overrides). A batch with `Σ μ = 0` raises `ValueError`
       in `loss` instead of giving a 0/0 NaN. `build_record` never builds such a record (its
       EOS target is always masked in), so only a faulted batch can reach it.
   - `label` maps records by operand storage. The forward `S` and `O` have no storage link to a
@@ -858,7 +860,10 @@ interface.
     unit, from the top:
     - Head (`j = L+1`), in sub-units `(L+1, b)`, one per head block. The forward pass
       stops at `F` (the final norm's output, kept with its graph) and runs `lm_head` on each
-      block's copy of `F`'s rows only to record `Λ_b`'s operands; the scores aren't kept.
+      block's copy of `F`'s rows only to record `Λ_b`'s operands; `Λ_b` there is a
+      zero-storage stand-in (an expanded scalar), not the leaf, and isn't kept. The block's
+      backward is the only read of the leaf, so it reaches the device once (one copy:
+      `_fresh`, `.to(device, copy=True)`; to another device the move is the copy).
       Block `b`'s backward runs `lm_head` again from that copy, under substitution, with
       `Λ_b` the committed leaf, then `block_loss` and `autograd.grad` to `δF_b` and `G_b`;
       its operands go after `G_b`. So `lm_head` runs `2B` times per replay. After the last
@@ -2370,7 +2375,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `PYTORCH_ALLOC_CONF=expandable_segments:True` and `VERIF_RELEASE_CACHE=1` (the
     default, pinned). `alloc_env(conf)` writes the allocator setting: `PYTORCH_ALLOC_CONF`
     at `conf` and the deprecated `PYTORCH_CUDA_ALLOC_CONF` unset, both unset for `None`.
-    Right after `FIX_AB_MODEL`'s bring-up (Qwen2.5-0.5B, which fit in FS11 without the fix)
+    `FIX_AB_MODEL` (Qwen2.5-0.5B, which fit in FS11 without the fix, and the cheapest model)
+    is brought up first, so a failure of the 8 row blocks on CUDA shows within minutes; the
+    other three follow its fix-off arm in `RUN_PINS` order. Right after its bring-up
     comes the same bring-up with the whole fix off (`FIX_OFF_ENV`:
     both allocator variables unset, `VERIF_RELEASE_CACHE=0`), its own part
     (`bring_up_Qwen2.5-0.5B-Instruct_fix2off`) in `runs/Qwen2.5-0.5B-Instruct_refusal_fix2off/`;

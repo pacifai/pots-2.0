@@ -216,7 +216,9 @@ Two instances exist, in `instances/`:
   `N × n_v`, the largest array of a step (at full scale tens of GB). With `B` blocks each
   block of `n_s/B` sequences gets its own `Λ_b`, `δF_b` and weight gradient `G_b`, all
   committed products, and only one block's scores exist at a time, in training, the
-  replay and check 5 alike. Training runs the layers forward once, then per block the
+  replay and check 5 alike. One whole-batch array remains in the prover: the capture holds
+  every block's score gradient `δΛ_b` (the left operand of `δF_b` and `G_b`) until labeling,
+  `N × n_v` in the compute format in all, 4.64 GiB at bf16 for Qwen2.5-1.5B. Training runs the layers forward once, then per block the
   output layer, the block's share of the loss and its gradient, and then the layers'
   backward once from the joined `δF_b`. The weight's gradient is the sum of the `G_b` in
   block order, through one shared helper (`chain_gradient`) that checks 6a and 6b use
@@ -232,8 +234,10 @@ Two instances exist, in `instances/`:
   modules, under the same substitution, so no backward pass is written by hand. Like
   training, the replay runs one forward pass with gradients on and then one backward pass,
   one layer at a time from the top, and frees each layer's saved values once its backward
-  has run. The output layer's backward runs block by block, each block recomputing its
-  scores from its slice of the final norm's output. Forward
+  has run. The output layer's backward runs block by block: each block runs the output
+  layer again on its slice of the final norm's output, and the replay serves that block's
+  committed `Λ_b` leaf as its scores. The forward pass doesn't read the leaf; it gives the
+  block a stand-in with no storage, so each `Λ_b` is copied to the device once. Forward
   (task A8) and backward (task A9) are done. One SmolLM2 detail: its config sets
   `pad_token_id = 2`, which is also EOS and our pad token, so `nn.Embedding(padding_idx=2)`
   gives a zero embedding gradient for token 2. The replay matches the prover there because
@@ -919,13 +923,14 @@ recheck`); `summary.json` names it `recheck`. Its 22 parts, in order:
 | parts | what | environment | time limit each |
 |---|---|---|---|
 | models | as the first session's | as the first session's | 1,800 s |
-| bring-up, 4 | `bring_up --no-tamper`, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8`, `PYTORCH_ALLOC_CONF=expandable_segments:True` (`PYTORCH_CUDA_ALLOC_CONF` unset) and `VERIF_RELEASE_CACHE=1` (`RECHECK_ENV`) | 1,800 s |
-| fix-off bring-up, 1 | Qwen2.5-0.5B's bring-up again, right after its own (before Qwen2.5-1.5B's) | the bring-up's, with both allocator variables unset and `VERIF_RELEASE_CACHE=0` (`FIX_OFF_ENV`) | 1,800 s |
+| bring-up, 4 | `bring_up --no-tamper`, refusal task; Qwen2.5-0.5B first, the other three after the fix-off bring-up, in the first session's order | the full-scale config plus `VERIF_HEAD_BLOCKS=8`, `PYTORCH_ALLOC_CONF=expandable_segments:True` (`PYTORCH_CUDA_ALLOC_CONF` unset) and `VERIF_RELEASE_CACHE=1` (`RECHECK_ENV`) | 1,800 s |
+| fix-off bring-up, 1 | Qwen2.5-0.5B's bring-up again, right after its own (before the other three) | the bring-up's, with both allocator variables unset and `VERIF_RELEASE_CACHE=0` (`FIX_OFF_ENV`) | 1,800 s |
 | smooth, 8 | `smooth_check` per model and task | the bring-ups' (`RECHECK_ENV`) | 600 s |
 | allocator A/B, 8 | `plain_baseline`'s 10 plain steps, twice per model, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8`; both allocator variables unset in one arm (`alloc_default`), `PYTORCH_ALLOC_CONF=expandable_segments:True` in the other (`alloc_expandable`) | 600 s |
 
 It has no benchmark part. `VERIF_HEAD_BLOCKS=8` checks the output layer's product in 8 row
-blocks. The allocator fix is two settings together: expandable segments, and the CUDA cache
+blocks. Qwen2.5-0.5B, the cheapest model, is brought up first, so if the 8 row blocks fail on
+CUDA, the failure shows within minutes. The allocator fix is two settings together: expandable segments, and the CUDA cache
 released between prover and verifier (`VERIF_RELEASE_CACHE=1`, the default, pinned so that the
 arm without it names its setting). Expandable segments let the CUDA allocator grow a segment
 in place rather than reserve a new fixed-size one, which cuts fragmentation. Four of the first
