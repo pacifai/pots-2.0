@@ -163,11 +163,14 @@ def test_gpu_memory_does_not_hold_the_transcript():
     assert pool.nbytes == 40 * out_bytes
 
 
+@pytest.mark.parametrize("head_blocks", [1, 2])
 @pytest.mark.parametrize("dtype", ["fp32", "bf16"])
-def test_tiny_decoder_step_on_cuda(dtype):
+def test_tiny_decoder_step_on_cuda(dtype, head_blocks):
     """The decoder's honest step on the GPU: every product leaf is a pinned host buffer, the
     replay rebuilds every operand and glue gradient bit for bit, the verifier accepts, and the
-    committed ``W_{t+1}`` equals the uncaptured step's."""
+    committed ``W_{t+1}`` equals the uncaptured step's. At ``head_blocks=2`` the output layer
+    runs in two row blocks, as at full scale's ``VERIF_HEAD_BLOCKS=8``: one autocast region
+    and one cast of ``W`` for both blocks, and per-block ``Λ_b``, ``δF_b`` and ``G_b``."""
     from setup.data import schedule
     from tests.verification.computation.test_decoder import ListReader, captured_operands
     from tests.verification.decoder_helpers import make_records, tiny_config
@@ -185,7 +188,7 @@ def test_tiny_decoder_step_on_cuda(dtype):
     try:
         compute = {"fp32": torch.float32, "bf16": torch.bfloat16}[dtype]
         c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3, compute_dtype=compute,
-                               device="cuda")
+                               device="cuda", head_blocks=head_blocks)
         D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
         tree = dataset_tree(c, D)
         torch.manual_seed(0)

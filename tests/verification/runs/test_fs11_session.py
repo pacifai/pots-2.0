@@ -78,8 +78,9 @@ def test_default_plan(tmp_path):
 
 def test_recheck_plan(tmp_path):
     """The first session's models, bring-up and smooth parts with RECHECK_ENV added, no
-    benchmark, Qwen2.5-0.5B's bring-up followed by its fix-off arm, then the allocator A/B: two
-    plain arms per model, alternating which goes first."""
+    benchmark, Qwen2.5-0.5B's bring-up first, followed by its fix-off arm and then the other
+    bring-ups in RUN_PINS order, then the allocator A/B: two plain arms per model, alternating
+    which goes first."""
     up, out = tmp_path / "up", tmp_path / "out"
     plan = fs.recheck_plan(up, out)
     assert fs.SESSIONS["recheck"] == ("recheck", fs.recheck_plan)
@@ -87,12 +88,12 @@ def test_recheck_plan(tmp_path):
     assert [p.kind for p in plan] == ["models"] + ["bring_up"] * 5 + ["smooth"] * 8 + ["plain"] * 8
     names = [p.name for p in plan]
     assert len(set(names)) == len(names)
-    assert names[1:6] == ["bring_up_Llama-3.2-1B-Instruct", "bring_up_Falcon3-1B-Instruct",
-                          "bring_up_Qwen2.5-0.5B-Instruct",
+    assert names[1:6] == ["bring_up_Qwen2.5-0.5B-Instruct",
                           "bring_up_Qwen2.5-0.5B-Instruct_fix2off",
+                          "bring_up_Llama-3.2-1B-Instruct", "bring_up_Falcon3-1B-Instruct",
                           "bring_up_Qwen2.5-1.5B-Instruct"]
     first = {p.name: p for p in fs.default_plan(up, out)}
-    on, off = plan[3], plan[4]
+    on, off = plan[1], plan[2]
     for p in plan[:14]:
         if p is off:
             continue

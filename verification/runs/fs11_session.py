@@ -37,8 +37,9 @@ row blocks (``VERIF_HEAD_BLOCKS``), and the allocator fix ("fix 2"), which is tw
 CUDA allocator's expandable segments (``PYTORCH_ALLOC_CONF``, which the allocator reads at
 CUDA's first use, so it is set in the part's environment, with the deprecated
 ``PYTORCH_CUDA_ALLOC_CONF`` unset) and the cache release between prover and verifier
-(``VERIF_RELEASE_CACHE=1``, the default, pinned). Right after
-:data:`FIX_AB_MODEL`'s bring-up comes the same bring-up with the whole fix off
+(``VERIF_RELEASE_CACHE=1``, the default, pinned). :data:`FIX_AB_MODEL`, the cheapest model,
+is brought up first, so a failure of the 8 row blocks on CUDA shows within minutes. Right after
+its bring-up comes the same bring-up with the whole fix off
 (:data:`FIX_OFF_ENV`), its own part and run directory: ``summary.json``'s ``fix2_ab``
 (:func:`fix2_ab`) sets the two side by side, so the fix's cost to a verified step reads off
 directly. Last comes a timing A/B of the allocator setting alone: per model,
@@ -396,13 +397,16 @@ def _fix_off_part(on: Part, upload: Path, out: Path) -> Part:
 def recheck_plan(upload: Path, out: Path) -> list[Part]:
     """The re-check's parts (module docstring): the models part; the bring-up and smooth parts
     at :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`, with :data:`FIX_AB_MODEL`'s bring-up
-    followed by its fix-off arm; then the allocator A/B. No benchmark."""
+    first, followed by its fix-off arm, then the other models' bring-ups in
+    :data:`RUN_PINS` order; then the allocator A/B. No benchmark.
+
+    The cheapest model goes first so that a failure of the 8 head blocks on CUDA shows within
+    minutes of the start."""
     plan = [_models_part(upload, out, RECHECK_TIMEOUT_S["models"])]
-    for on in _bring_up_parts(upload, out, RECHECK_ENV, RECHECK_TIMEOUT_S["bring_up"]):
-        plan.append(on)
-        if on.info["model"] == FIX_AB_MODEL:
-            on.info.update(arm="fix2_on", alloc_conf=EXPANDABLE, release_cache=True)
-            plan.append(_fix_off_part(on, upload, out))
+    ups = _bring_up_parts(upload, out, RECHECK_ENV, RECHECK_TIMEOUT_S["bring_up"])
+    (on,) = [p for p in ups if p.info["model"] == FIX_AB_MODEL]
+    on.info.update(arm="fix2_on", alloc_conf=EXPANDABLE, release_cache=True)
+    plan += [on, _fix_off_part(on, upload, out)] + [p for p in ups if p is not on]
     plan += _smooth_parts(upload, out, RECHECK_ENV, RECHECK_TIMEOUT_S["smooth"])
     plan += _plain_parts(upload, out)
     return plan
