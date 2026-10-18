@@ -96,7 +96,7 @@ def challenge_matrices(h: bytes, ms: Sequence[int], k: int, width: int) -> torch
         raise ValueError(f"k must be in [1, 255], got {k}")
     for m in ms:
         _validate(h, m, width)
-    if native.enabled():
+    if native.enabled() and len(ms) > 0:
         return native.get().challenge_matrices(bytes(h), ms, k, width,
                                                threads=torch.get_num_threads())
     key, n = bytes(h), 4 * width

@@ -234,3 +234,12 @@ def test_native_path_validation_errors():
         with native.disabled(), pytest.raises(ValueError) as b:
             challenge_matrices(*args)
         assert str(a.value) == str(b.value)
+
+
+@pytest.mark.parametrize("width", [0, 5, 2**33])
+def test_empty_ms_same_on_both_paths(width):
+    from verification.commitment import native
+    nat = challenge_matrices(H1, [], 3, width)
+    with native.disabled():
+        py = challenge_matrices(H1, [], 3, width)
+    assert nat.shape == py.shape and nat.dtype == py.dtype == torch.float32
