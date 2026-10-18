@@ -487,10 +487,20 @@ interface.
 - `leaves.py` (A4, merged): leaf hashing against `C`, the same code on both sides.
   - `leaf_parts(c, i, obj)` and `leaf_hash(c, i, obj)` check each leaf's shape and dtype
     against `C`.
-  - `leaf_hashes_of(c, items)` hashes `(index, obj)` pairs through `hash_leaves`: it
-    validates and encodes on the calling thread in order and hashes in parallel.
-    `leaf_hashes`, `commit_leaves`, check 2 and check 0's anchor use it.
-    `leaf_hashes_until_error(c, items)` is the `hash_leaves_until_error` form; check 7 uses it.
+  - `leaf_hashes_of(c, items)` hashes `(index, obj)` pairs: it validates on the calling thread
+    in order and hashes in parallel. `leaf_hashes`, `commit_leaves`, check 2 and check 0's
+    anchor use it. `leaf_hashes_until_error(c, items)` is the form that returns
+    `(digests before the first error, error or None)`; check 7 uses it.
+  - Two paths, one result (F15b). With the native library enabled, `_native_until_error`
+    checks each tensor leaf's slot, shape and dtype (a failing leaf is handed to `leaf_parts`,
+    which raises the loop's error), builds one header per `(tag, dtype, shape)`, and collects
+    addresses. Batches of up to 256 MiB or 32,768 leaves go to one background thread, two in
+    flight: `native.hash_leaves` tests finiteness and hashes in C, and a leaf of 16 MiB or
+    more takes `native.all_finite` and the Rust BLAKE3. A batch's first error beats the
+    iterable's, and the call returns only once no worker reads the caller's tensors. Under
+    `native.disabled()` both functions take the Python path (`hash_leaves`,
+    `hash_leaves_until_error`), the reference; `metrics.counting()` runs it so its counters see
+    every hash.
   - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
   - `transcript_root(c, reader)` is check 2.
   - `commit_leaves(c, leaves) -> MerkleTree`.

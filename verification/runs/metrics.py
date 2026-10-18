@@ -1119,7 +1119,8 @@ def counting() -> Iterator[tuple[_FlopTally, _HashTally]]:
     leaves.hash_leaves_until_error = _counting_hash_leaves_until_error(leaves.hash_leaf)
     leaves.hash_leaves = _counting_hash_leaves(leaves.hash_leaves_until_error)
     try:
-        with _FlopTally() as flops:
+        # The native leaf path hashes in C, out of reach of these counters: run the Python one.
+        with native.disabled(), _FlopTally() as flops:
             yield flops, tally
     finally:
         for m, r in zip(mods, real, strict=True):
