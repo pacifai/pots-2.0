@@ -479,7 +479,10 @@ interface.
     nodes live in one flat pre-order `bytearray` (`_buf`, `2n − 1` nodes of 32 bytes, index 0
     the root). A range `[lo, hi)` at index `p` has its left child `[lo, lo + k)` at `p + 1` and
     its right child `[lo + k, hi)` at `p + 2k`, with `k` the largest power of two below
-    `hi − lo`. `_tree_nodes(hashes)` builds the buffer, so a native builder can replace it.
+    `hi − lo`. `_tree_nodes(hashes)` builds the buffer and `merkle_root` the root: the native
+    tree (`native.get().merkle_tree`) is the default (F15b), and the Python build
+    (`_tree_nodes_py`, recursive `hash_node`) runs under `native.disabled()`, as in the
+    counting pass. The digests are identical.
   - `verify_path(leaf_hash, index, n_leaves, path, root)`, following RFC 9162 §2.1.3.2. See
     invariant 7.
   - About 9 GB/s on a 113 MB fp32 tensor, hashed alone. A step's 7,661 leaves (2.6 GB) hash
@@ -1398,6 +1401,8 @@ interface.
     vector `j`. It takes about 1.4 ms at width 49152 and k 7.
     `challenge_matrices(h, ms, k, width)` returns `[len(ms), width, k]`, bit-identical to
     `challenge_matrix` per `m` (one XOF per label, one numpy pass for the entries).
+    It validates first, then the native batch (`native.get().challenge_matrices`, F15b) is the
+    default and the Python XOFs run under `native.disabled()`; the values are bit-identical.
 - `freivalds.py`: `measure_product(a, b, p, *, h, m, k, eps_in, eps_acc, bias=None) ->
   ProductMeasure` (ν, `‖|P|·1‖`, κ, the residuals, `‖P‖_F`, the band unit and the normalized
   residuals). It judges nothing. With `bias` (F14, FS2) it measures `[A | 1]·[B ; bᵀ]`

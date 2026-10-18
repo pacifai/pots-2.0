@@ -10,6 +10,8 @@ import blake3
 import numpy as np
 import torch
 
+from verification.commitment import native
+
 TAG_LABEL = 0x10
 
 SIGMA_R: float = 1.0 / math.sqrt(3.0)  # std of one challenge entry, Uniform(−1, 1) (P8b)
@@ -94,6 +96,9 @@ def challenge_matrices(h: bytes, ms: Sequence[int], k: int, width: int) -> torch
         raise ValueError(f"k must be in [1, 255], got {k}")
     for m in ms:
         _validate(h, m, width)
+    if native.enabled() and len(ms) > 0:
+        return native.get().challenge_matrices(bytes(h), ms, k, width,
+                                               threads=torch.get_num_threads())
     key, n = bytes(h), 4 * width
     xof = b"".join(blake3.blake3(encode_label(m, j), key=key).digest(length=n)
                    for m in ms for j in range(1, k + 1))
