@@ -442,6 +442,11 @@ interface.
   - Constants: `TAG_WEIGHT`, `TAG_PRODUCT`, `TAG_MLP_RECORD`, `TENSOR_TAGS`, `DTYPE_CODES` and
     `CODE_DTYPES`.
   - Errors: `NonFiniteError` and `EncodingError`.
+  - `tensor_leaf_payload_unchecked(t)` is `tensor_leaf_payload`'s view without the finiteness check (the
+    caller checks it; the native path does it in C, S9d). `tensor_payload_span(t)` returns
+    `(t.data_ptr(), t.nbytes)` after the same structural checks (`_check_payload`: coded
+    dtype, CPU, contiguous), with no view and no finiteness check. The address aliases `t`,
+    so `t` must stay alive and unmodified until hashing is done.
   - `tensor_leaf_header(tag, t)` and `tensor_leaf_payload(t)`. The payload is a zero-copy view
     that aliases `t`, so don't mutate `t` until it is hashed. The tensor must be a contiguous
     CPU tensor. The finiteness check (`_all_finite`) tests that the max and min are finite.
@@ -466,7 +471,12 @@ interface.
   - `hash_node`, `hash_tensor_leaf(tag, t)` and `hash_record_leaf(rec)`.
   - `merkle_root(hashes)`. Leaf hashes must be `bytes` of length 32.
   - `MerkleTree(hashes)`, with `.root`, `.n_leaves`, `.leaf(i)`, `.path(i)` (nearest sibling
-    first) and `.update_leaf(i, h) -> root`, which costs O(log n).
+    first), `.node(lo, hi)` (the subtree hash of a leaf range that is a node of the tree,
+    else `KeyError((lo, hi))`) and `.update_leaf(i, h) -> root`, which costs O(log n). The
+    nodes live in one flat pre-order `bytearray` (`_buf`, `2n − 1` nodes of 32 bytes, index 0
+    the root). A range `[lo, hi)` at index `p` has its left child `[lo, lo + k)` at `p + 1` and
+    its right child `[lo + k, hi)` at `p + 2k`, with `k` the largest power of two below
+    `hi − lo`. `_tree_nodes(hashes)` builds the buffer, so a native builder can replace it.
   - `verify_path(leaf_hash, index, n_leaves, path, root)`, following RFC 9162 §2.1.3.2. See
     invariant 7.
   - About 9 GB/s on a 113 MB fp32 tensor, hashed alone. A step's 7,661 leaves (2.6 GB) hash

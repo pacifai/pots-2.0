@@ -132,7 +132,9 @@ def test_trees_are_the_protocols(n):
     assert cpu_hash.tree_root(hashes) == root
     nodes = cpu_hash.cached_tree(hashes)
     assert nodes[(0, n)] == root
-    assert nodes == merkle.MerkleTree(hashes)._nodes
+    tree = merkle.MerkleTree(hashes)
+    assert len(nodes) == 2 * n - 1
+    assert all(tree.node(lo, hi) == h for (lo, hi), h in nodes.items())
     with pytest.raises(ValueError):
         cpu_hash.merkle_root([])
 
