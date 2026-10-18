@@ -1123,6 +1123,10 @@ def test_choose_plan_adds_the_build_except_for_the_self_test(tmp_path):
     f.write_text(json.dumps([{"name": "x", "argv": ["{python}", "-c", "pass"]}]))
     plan = fs.choose_plan(fs.default_plan, up, out, plan_file=f, selftest=False)
     assert [p.name for p in plan] == ["native_build", "x"]
+    again = fs.choose_plan(fs.default_plan, up, out, plan_file=f, selftest=False)
+    assert plan[0] is not again[0] and plan[0].env is not again[0].env
+    plan = fs.choose_plan(fs.default_plan, up, out, plan_file=f, selftest=True)
+    assert [p.name for p in plan] == ["x"]
 
 
 def test_check_upload_reports_the_native_sources(tmp_path):

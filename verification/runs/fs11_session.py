@@ -89,7 +89,8 @@ from verification.commitment import native
 
 __all__ = ["RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
            "alloc_env", "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part",
-           "default_plan", "recheck_plan", "load_plan", "selftest_plan", "with_native_build", "choose_plan", "run_session", "fix2_ab",
+           "default_plan", "recheck_plan", "load_plan", "selftest_plan", "with_native_build",
+           "choose_plan", "run_session", "fix2_ab",
            "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
            "data_key", "main"]
 
@@ -442,15 +443,20 @@ def selftest_plan() -> list[Part]:
                  timeout_s=60)]
 
 
-NATIVE_BUILD = Part("native_build", ["{python}", "-m", "verification.commitment.native"],
-                    timeout_s=900)
+NATIVE_BUILD_NAME = "native_build"
+
+
+def _native_build_part() -> Part:
+    """A fresh build part, so no two plans share its env and info dicts."""
+    return Part(NATIVE_BUILD_NAME, ["{python}", "-m", "verification.commitment.native"],
+                timeout_s=900)
 
 
 def with_native_build(plan: Sequence[Part]) -> list[Part]:
     """``plan`` with the native library's build first, so no part's timing includes the compile
     (the sources are in the upload). A plan that already starts with it is unchanged."""
     plan = list(plan)
-    return plan if plan and plan[0].name == NATIVE_BUILD.name else [NATIVE_BUILD, *plan]
+    return plan if plan and plan[0].name == NATIVE_BUILD_NAME else [_native_build_part(), *plan]
 
 
 def choose_plan(build: Callable[[Path, Path], list[Part]], upload: Path, out: Path, *,
@@ -953,8 +959,8 @@ def check_upload(upload: Path) -> dict[str, Any]:
     problems (missing on the Mac, a weight not fetched or not matching): that model's parts
     don't start. ``native`` says whether the native library's pinned sources are present
     and intact (``bad`` lists the files that aren't); it blocks nothing, the build part
-    fails with its own message. The benchmark still runs; a model whose weights are missing fails to load
-    there and says so in its row."""
+    fails with its own message. The benchmark still runs; a model whose weights are missing
+    fails to load there and says so in its row."""
     t0 = time.time()
     models: dict[str, list[str]] = {}
     try:

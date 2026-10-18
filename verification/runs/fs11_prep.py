@@ -335,7 +335,7 @@ def _native_members(src: Path) -> tuple[list[Member], list[str]]:
         return [], [f"native BLAKE3 sources in {src} missing or changed ({', '.join(bad)}): "
                     f"{hint}"]
     keep = {*native.SOURCE_SHA256, "ARCHIVE_SHA256"}
-    return [m for m in _tree_members(src, f"native_cache/{src.name}")
+    return [m for m in _tree_members(src, f"native_cache/blake3-{native.BLAKE3_TAG}")
             if m.arc.rsplit("/", 1)[1] in keep], []
 
 
