@@ -2381,8 +2381,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     DIR`, on the Mac. Builds `D` and `DÌƒ` per model and task at the full-scale config
     (`fs11_session.FULL_SCALE_ENV`), and packs `DIR/fs11_upload.tar`: `git archive HEAD`, the
     data, a Hugging Face cache with every pinned snapshot's files (a gated model's weights
-    included; a public model's weights left out, their SHA-256 recorded), the BLAKE3 sources,
-    `requirements-fs11.txt` and `manifest.json` (every packed file's SHA-256). Every cached file
+    included; a public model's weights left out, their SHA-256 recorded), the benchmark's BLAKE3
+    sources, the native library's pinned sources (`native_cache/blake3-1.8.7/`, from the Mac's
+    native cache, checked with `native.bad_sources`; run `python -m verification.commitment.native`
+    first), `requirements-fs11.txt` and `manifest.json` (every packed file's SHA-256). Every cached file
     is checked against its blob name first. It never downloads and never packs the cache's
     token; a pinned model missing from the cache is reported (exit 1 for a run model). The
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
@@ -2391,7 +2393,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     [--selftest] [--session {fs11,recheck}]`, `fetch-models` and `env`. `--session` picks the
     plan from `SESSIONS`, which also gives the name `summary.json`'s `session` records: `fs11`
     (the default, "FS11") or `recheck` ("recheck"); `--plan` and `--selftest` replace its
-    parts. The first session runs the parts in order (`default_plan`): models
+    parts. Every plan but the self-test's starts with `native_build` (`with_native_build`, applied
+    by `choose_plan`): `python -m verification.commitment.native`, which compiles the library
+    from the upload's `native_cache/` (`POTS_NATIVE_CACHE` in `base_env`) before any timed part.
+    A failed build blocks nothing; later parts fail with `get()`'s message. `check_upload`'s
+    `native` entry reports whether the sources are present and intact. The first session runs
+    the parts in order (`default_plan`): models
     (`fetch_models`: the manifest check, then each public model's weights with `token=False`
     at its pin, checked against the Mac's SHA-256), the hashing benchmark, `bring_up
     --no-tamper` per model, `smooth_check` per model and task. Each part runs in its own

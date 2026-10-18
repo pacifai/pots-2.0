@@ -368,6 +368,25 @@ def disabled() -> Iterator[None]:
             _disabled -= 1
 
 
+def describe() -> dict[str, object]:
+    """The library this process would use, for the environment record. Never builds or
+    fetches: a loaded library, else a built one in the cache, else all None."""
+    out: dict[str, object] = {"enabled": enabled(), "library": None, "blake3": None,
+                              "simd_degree": None, "error": None}
+    try:
+        lib = _LIB
+        if lib is None:
+            path = find_library()
+            if path is None:
+                return out
+            lib = Native(path)
+        out.update(library=Path(lib.path).name, blake3=lib.blake3_version,
+                   simd_degree=lib.simd_degree)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def main() -> int:
     t0 = time.perf_counter()
     lib = get()
