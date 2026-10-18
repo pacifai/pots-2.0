@@ -18,6 +18,11 @@ Writes ``DIR/fs11_upload.tar`` (top directory ``fs11_upload/``), its SHA-256 to
   snapshot in the Mac's cache, as blobs and the snapshot's links, and its ``.no_exist``
   entries. Refs, other revisions and the cache's ``token`` are never read.
 - ``bench_cache/blake3-1.8.7/``: the BLAKE3 sources the benchmark's native build compiles.
+- ``native_cache/blake3-1.8.7/``: the pinned BLAKE3 sources the protocol's native library
+  compiles (``verification.commitment.native``), from the Mac's native cache, sources only;
+  ``fs11_session`` points ``POTS_NATIVE_CACHE`` at ``native_cache/`` and builds the library once,
+  first, so the pod fetches nothing. Run ``python -m verification.commitment.native`` on the
+  Mac before the prep.
 - ``requirements-fs11.txt``: the Mac venv's versions of the packages the runs import.
 - ``manifest.json``: every packed file's SHA-256, each model's files, what is missing.
 
@@ -56,6 +61,7 @@ from typing import Any
 from benchmarks.hashing.sizes import MODELS as BENCH_MODELS
 from benchmarks.hashing.step_time import WEIGHTS as E6_WEIGHTS
 from setup.data import FULL_SCALE_TOKENIZERS, TEST_SCALE_TOKENIZER
+from verification.commitment import native
 from verification.runs.fs11_session import (FULL_SCALE_ENV, GATED, RUN_PINS, SECRETS, TASKS,
                                             _run_env, data_key, sha256_file)
 
@@ -319,6 +325,20 @@ def _bench_members(bench_cache: Path) -> tuple[list[Member], list[str]]:
     return _tree_members(src, f"bench_cache/{BLAKE3_DIR}"), []
 
 
+def _native_members(src: Path) -> tuple[list[Member], list[str]]:
+    """The native library's pinned sources (never a built library) as ``native_cache/…``."""
+    hint = "run `python -m verification.commitment.native` on the Mac first"
+    if not src.is_dir():
+        return [], [f"native BLAKE3 sources not at {src}: {hint}"]
+    bad = native.bad_sources(src)
+    if bad:
+        return [], [f"native BLAKE3 sources in {src} missing or changed ({', '.join(bad)}): "
+                    f"{hint}"]
+    keep = {*native.SOURCE_SHA256, "ARCHIVE_SHA256"}
+    return [m for m in _tree_members(src, f"native_cache/blake3-{native.BLAKE3_TAG}")
+            if m.arc.rsplit("/", 1)[1] in keep], []
+
+
 def _versions() -> dict[str, str | None]:
     out: dict[str, str | None] = {"python": sys.version.split()[0]}
     for name in PACKAGES:
@@ -370,10 +390,12 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
             python: str = sys.executable,
             build_data: Callable[[str, str, str, Path], Path] | None = None,
             repo: Callable[[Path, Path], tuple[list[Member], dict[str, Any]]] = _repo_members,
+            native_src: Path | None = None,
             say: Callable[[str], None] = _say) -> dict[str, Any]:
     """Build the upload (module docstring) and return its manifest. ``build_data(repo,
     revision, task, build_dir) -> data dir`` and ``repo`` replace ``materialize_data`` and
-    ``git archive`` in tests."""
+    ``git archive`` in tests; ``native_src`` is the native sources' directory (default
+    ``native.source_dir()``)."""
     out = out.resolve()
     build = out / "build"
     t0 = time.time()
@@ -422,9 +444,10 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
         say(f"warning: the working tree is dirty; the upload holds commit "
             f"{repo_info['commit'][:12]} without the uncommitted changes")
     bench_members, bench_missing = _bench_members(bench_cache)
+    native_members, native_missing = _native_members(native_src or native.source_dir())
     versions = _versions()
     extra = [Member("requirements-fs11.txt", data=_requirements(versions))]
-    members = repo_members + data_members + bench_members + extra
+    members = repo_members + data_members + bench_members + native_members + extra
     for m in models:
         members += _model_members(hub, m)
     bad = [m.arc for m in members if _forbidden(m.arc)]
@@ -441,7 +464,7 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
         for f in m.files:
             if f.packed:
                 files[f"hf/hub/{m.dir_name}/snapshots/{m.revision}/{f.path}"] = f.sha256
-    missing = [x for m in models for x in m.missing] + bench_missing
+    missing = [x for m in models for x in m.missing] + bench_missing + native_missing
     run_missing = [x for m in models if "run" in m.roles for x in m.missing]
     manifest = {
         "format": "fs11-upload/1",

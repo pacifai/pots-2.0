@@ -1021,3 +1021,9 @@ def test_step_floor_fields_none_while_calibrating():
     v = type("V", (), {"calibrate": True, "bands": None, "k": 7})()
     st = StepStats(products=[ProductStat(1, "a", "S", 1.0, (1.0,), q=8, p_norm=1.0, u=1.0)])
     assert metrics.step_floor_fields(v, st) == {"f_achieved_max": None, "f_achieved_at": None}
+
+
+def test_environment_record_names_the_native_library():
+    probe = metrics.memory_probe(torch.device("cpu"))
+    env = metrics.environment_record("r", device="cpu", probe=probe)
+    assert set(env["native"]) == {"enabled", "library", "blake3", "simd_degree", "error"}

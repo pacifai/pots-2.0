@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -670,7 +671,8 @@ def _job(tmp_path, *, plan=None, python=sys.executable, deadline=6, grace=1, res
                 "FS11_MIN_FREE_GB": "0", **(extra or {})})
     if plan is not None:
         p = tmp_path / "plan.json"
-        p.write_text(json.dumps(plan))
+        # a stand-in for the build the session puts first (it would compile for real here)
+        p.write_text(json.dumps([{"name": "native_build", "argv": _py("pass")}, *plan]))
         env["FS11_PLAN"] = str(p)
     (tmp_path / "up").mkdir(exist_ok=True)
     out = tmp_path / "out"
@@ -699,7 +701,7 @@ def test_job_runs_packs_and_terminates(tmp_path):
                   extra={"FS11_ALLOW_ANY_GPU": "1"})
     assert r.returncode == 1, r.stdout + r.stderr
     s = json.loads((out / "summary.json").read_text())
-    assert [p["status"] for p in s["parts"]] == ["ok", "failed", "killed_deadline"]
+    assert [p["status"] for p in s["parts"]] == ["ok", "ok", "failed", "killed_deadline"]
     ready = dict(l.split("=", 1) for l in Path(f"{out}.READY").read_text().splitlines())
     tar = Path(f"{out}.tar")
     assert ready["sha256"] == _sha(tar.read_bytes()) and ready["session_exit"] == "1"
@@ -849,7 +851,7 @@ def test_job_passes_the_session_on(tmp_path, session, label, deadline_s):
     assert json.loads((out / "summary.json").read_text())["session"] == label
     assert f"deadline in {deadline_s} s" in r.stdout
     log = _log(out)
-    assert f"run --session {session or 'fs11'}" in log and f"session {label}: 1 part" in log
+    assert f"run --session {session or 'fs11'}" in log and f"session {label}: 2 parts" in log
 
 
 def test_a_refused_recheck_names_its_session(tmp_path, monkeypatch):
@@ -1092,3 +1094,48 @@ def test_boot_guard_starts_the_image_and_terminates_later(tmp_path, modes, ends_
         assert sum(c.startswith("curl ") for c in calls) == 3
         assert all("test-key-123" not in c for c in calls if c.startswith("curl "))
     assert "armed" in guard_log.read_text()
+
+
+def test_base_env_points_the_native_cache_at_the_upload(tmp_path):
+    assert fs.base_env(tmp_path)["POTS_NATIVE_CACHE"] == str(tmp_path / "native_cache")
+
+
+def test_with_native_build_prepends_once(tmp_path):
+    plan = fs.default_plan(tmp_path / "up", tmp_path / "out")
+    withb = fs.with_native_build(plan)
+    assert withb[0].name == "native_build" and withb[1:] == plan and len(withb) == 15
+    assert withb[0].argv == ["{python}", "-m", "verification.commitment.native"]
+    assert withb[0].timeout_s == 900
+    assert fs.with_native_build(withb) == withb
+    assert fs.with_native_build([])[0].name == "native_build"
+    assert plan[0].name != "native_build"  # the input isn't changed
+
+
+def test_choose_plan_adds_the_build_except_for_the_self_test(tmp_path):
+    up, out = tmp_path / "up", tmp_path / "out"
+    for key in ("fs11", "recheck"):
+        build = fs.SESSIONS[key][1]
+        plan = fs.choose_plan(build, up, out, plan_file=None, selftest=False)
+        assert plan[0].name == "native_build" and plan[1:] == build(up, out)
+    stand_in = fs.choose_plan(fs.default_plan, up, out, plan_file=None, selftest=True)
+    assert [p.name for p in stand_in] == [p.name for p in fs.selftest_plan()]
+    f = tmp_path / "plan.json"
+    f.write_text(json.dumps([{"name": "x", "argv": ["{python}", "-c", "pass"]}]))
+    plan = fs.choose_plan(fs.default_plan, up, out, plan_file=f, selftest=False)
+    assert [p.name for p in plan] == ["native_build", "x"]
+    again = fs.choose_plan(fs.default_plan, up, out, plan_file=f, selftest=False)
+    assert plan[0] is not again[0] and plan[0].env is not again[0].env
+    plan = fs.choose_plan(fs.default_plan, up, out, plan_file=f, selftest=True)
+    assert [p.name for p in plan] == ["x"]
+
+
+def test_check_upload_reports_the_native_sources(tmp_path):
+    up, _ = _upload(tmp_path)
+    c = fs.check_upload(up)
+    assert c["native"] == {"dir": "native_cache/blake3-1.8.7", "present": False,
+                           "bad": ["the directory"]}
+    src = up / "native_cache" / "blake3-1.8.7"
+    shutil.copytree(fs.native.source_dir(), src)
+    assert fs.check_upload(up)["native"]["bad"] == [] and fs.check_upload(up)["native"]["present"]
+    (src / "blake3.c").write_text("changed")
+    assert fs.check_upload(up)["native"]["bad"] == ["blake3.c"]

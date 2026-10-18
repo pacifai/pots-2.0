@@ -10,7 +10,10 @@
 on the Mac; both sessions run from the same upload. ``--session`` (the job's ``FS11_SESSION``)
 picks the plan: ``fs11``, the first session (:func:`default_plan`, the default), or
 ``recheck``, the re-check (:func:`recheck_plan`, below). The first session's parts, in this
-order:
+order (every plan the session runs, but the self-test's, starts with **native_build**:
+``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
+the upload's ``native_cache/`` into it once, offline, so no later part's timing includes the
+compile):
 
 1. **models.** ``fetch-models``: check every packed file of the upload against the manifest's
    SHA-256, then fetch each public model's weights at its pinned commit with ``token=False``
@@ -82,9 +85,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from verification.commitment import native
+
 __all__ = ["RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
            "alloc_env", "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part",
-           "default_plan", "recheck_plan", "load_plan", "selftest_plan", "run_session", "fix2_ab",
+           "default_plan", "recheck_plan", "load_plan", "selftest_plan", "with_native_build",
+           "choose_plan", "run_session", "fix2_ab",
            "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
            "data_key", "main"]
 
@@ -437,15 +443,42 @@ def selftest_plan() -> list[Part]:
                  timeout_s=60)]
 
 
+NATIVE_BUILD_NAME = "native_build"
+
+
+def _native_build_part() -> Part:
+    """A fresh build part, so no two plans share its env and info dicts."""
+    return Part(NATIVE_BUILD_NAME, ["{python}", "-m", "verification.commitment.native"],
+                timeout_s=900)
+
+
+def with_native_build(plan: Sequence[Part]) -> list[Part]:
+    """``plan`` with the native library's build first, so no part's timing includes the compile
+    (the sources are in the upload). A plan that already starts with it is unchanged."""
+    plan = list(plan)
+    return plan if plan and plan[0].name == NATIVE_BUILD_NAME else [_native_build_part(), *plan]
+
+
+def choose_plan(build: Callable[[Path, Path], list[Part]], upload: Path, out: Path, *,
+                plan_file: Path | None, selftest: bool) -> list[Part]:
+    """The session's parts: a ``--plan`` file's, else the stand-ins (``selftest``) or
+    ``build``'s. All but the stand-ins (a bare pod, no venv) start with the native build."""
+    if selftest and not plan_file:
+        return selftest_plan()
+    plan = load_plan(plan_file) if plan_file else build(upload, out)
+    return plan if selftest else with_native_build(plan)
+
+
 def base_env(upload: Path) -> dict[str, str]:
     """Every part's environment: the session's own, without :data:`SECRETS`, offline, with the
-    upload's Hugging Face cache and BLAKE3 sources."""
+    upload's Hugging Face cache and BLAKE3 sources (the benchmark's and the native library's)."""
     env = {k: v for k, v in os.environ.items() if k not in SECRETS}
     threads = env.get("FS11_THREADS", "8")
     env.update({
         "HF_HOME": str(upload / "hf"), "HF_HUB_CACHE": str(upload / "hf" / "hub"),
         "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
         "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1", "POTS_BENCH_CACHE": str(upload / "bench_cache"),
+        "POTS_NATIVE_CACHE": str(upload / "native_cache"),
         "PYTHONUNBUFFERED": "1", "VERIF_THREADS": threads, "OMP_NUM_THREADS": threads,
     })
     return env
@@ -924,8 +957,10 @@ def check_upload(upload: Path) -> dict[str, Any]:
     ``packed`` lists the packed files that are missing or differ (or an unreadable manifest):
     the upload can't be trusted, and no later part starts. ``models`` maps a repo to its
     problems (missing on the Mac, a weight not fetched or not matching): that model's parts
-    don't start. The benchmark still runs; a model whose weights are missing fails to load
-    there and says so in its row."""
+    don't start. ``native`` says whether the native library's pinned sources are present
+    and intact (``bad`` lists the files that aren't); it blocks nothing, the build part
+    fails with its own message. The benchmark still runs; a model whose weights are missing
+    fails to load there and says so in its row."""
     t0 = time.time()
     models: dict[str, list[str]] = {}
     try:
@@ -949,7 +984,11 @@ def check_upload(upload: Path) -> dict[str, Any]:
                 models[m["repo"]] = probs
     except (OSError, ValueError, KeyError, TypeError) as e:
         packed = [f"manifest.json unreadable: {type(e).__name__}: {e}"]
-    return {"packed": packed, "models": models, "s": round(time.time() - t0, 1)}
+    src = native.source_dir(upload / "native_cache")
+    bad = native.bad_sources(src) if src.is_dir() else ["the directory"]
+    return {"packed": packed, "models": models,
+            "native": {"dir": f"native_cache/{src.name}", "present": src.is_dir(), "bad": bad},
+            "s": round(time.time() - t0, 1)}
 
 
 def blocked(part: Part, check: Mapping[str, Any] | None) -> str | None:
@@ -1069,10 +1108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                            "finished": True})
         return EXIT_REFUSED
     upload = args.upload.resolve()
-    if args.plan:
-        plan = load_plan(args.plan)
-    else:
-        plan = selftest_plan() if selftest else build(upload, out)
+    plan = choose_plan(build, upload, out, plan_file=args.plan, selftest=selftest)
     _say(f"session {label}: {len(plan)} part{'' if len(plan) == 1 else 's'}")
     signal.signal(signal.SIGTERM, _on_term)
     summary = run_session(plan, upload=upload, out=out, deadline=args.deadline,

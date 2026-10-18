@@ -273,3 +273,42 @@ def test_disabled_nests_and_restores():
         with native.disabled():
             raise RuntimeError
     assert native.enabled()
+
+
+# ---- describe ------------------------------------------------------------------------------
+
+
+def test_describe_never_builds(tmp_path, monkeypatch):
+    monkeypatch.setenv("POTS_NATIVE_CACHE", str(tmp_path))
+    monkeypatch.setattr(native, "_LIB", None)
+    d = native.describe()
+    assert d == {"enabled": True, "library": None, "blake3": None, "simd_degree": None,
+                 "error": None}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_describe_names_the_built_library(lib, monkeypatch):
+    monkeypatch.setattr(native, "_LIB", None)  # found in the cache, not the loaded one
+    for _ in range(2):
+        d = native.describe()
+        assert d["library"].endswith(".so") and d["library"] == lib.path.name
+        assert d["blake3"] == "1.8.7" and d["simd_degree"] >= 1 and d["error"] is None
+        monkeypatch.setattr(native, "_LIB", lib)
+    assert native._LIB is lib
+
+
+def test_describe_reports_a_load_error(tmp_path, monkeypatch):
+    bad = tmp_path / "libbad.so"
+    bad.write_bytes(b"not a library")
+    monkeypatch.setattr(native, "_LIB", None)
+    monkeypatch.setattr(native, "find_library", lambda: bad)
+    d = native.describe()
+    assert d["library"] is None and d["blake3"] is None and d["simd_degree"] is None
+    assert d["error"]
+    assert native._LIB is None
+
+
+def test_describe_under_disabled():
+    with native.disabled():
+        assert native.describe()["enabled"] is False
+    assert native.describe()["enabled"] is True

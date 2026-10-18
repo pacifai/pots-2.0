@@ -103,7 +103,16 @@ def _fake_repo(src: Path):
     return repo
 
 
+def _native_copy(tmp_path) -> Path:
+    """A copy of the Mac's native sources (the real cache is only read)."""
+    dst = tmp_path / "native_src" / prep.native.source_dir().name
+    if not dst.exists():
+        shutil.copytree(prep.native.source_dir(), dst)
+    return dst
+
+
 def _prepare(tmp_path, home, calls=None, **kw):
+    kw.setdefault("native_src", _native_copy(tmp_path))
     return prep.prepare(tmp_path / "out", hub=home / "hub", bench_cache=tmp_path / "bench",
                         repo_root=tmp_path, build_data=_fake_data([] if calls is None else calls),
                         repo=_fake_repo(tmp_path / "src"), say=lambda m: None, **kw)
@@ -239,3 +248,31 @@ def test_the_session_check_catches_a_changed_file(tmp_path, home):
     assert fs.fetch_models(up, tmp_path / "m", download=_download, say=lambda m: None) == 1
     doc = json.loads((tmp_path / "m" / "models.json").read_text())
     assert any(f"data/{key}/D.bin" in p for p in doc["problems"])
+
+
+def test_prepare_packs_the_native_sources_only(tmp_path, home):
+    src = _native_copy(tmp_path)
+    (src / "libpots_native-x.so").write_bytes(b"built")
+    man = _prepare(tmp_path, home, native_src=src)
+    assert not any("native" in x for x in man["missing"])
+    mine = {a for a in man["files"] if a.startswith("native_cache/")}
+    assert mine and all(a.startswith("native_cache/blake3-1.8.7/") for a in mine)
+    assert not any(a.endswith(".so") for a in man["files"])
+    assert "native_cache/blake3-1.8.7/blake3.c" in mine
+    with tarfile.open(man["tarball"]) as t:
+        assert not any(n.endswith(".so") for n in t.getnames())
+        t.extractall(tmp_path / "pod", filter="data")
+    assert prep.native.bad_sources(tmp_path / "pod" / prep.TOP / "native_cache" / "blake3-1.8.7") \
+        == []
+
+
+def test_prepare_reports_missing_or_altered_native_sources(tmp_path, home):
+    members, missing = prep._native_members(tmp_path / "nowhere")
+    assert members == [] and "python -m verification.commitment.native" in missing[0]
+    src = _native_copy(tmp_path)
+    (src / "blake3.c").write_text("changed")
+    members, missing = prep._native_members(src)
+    assert members == [] and "blake3.c" in missing[0]
+    man = _prepare(tmp_path, home, native_src=src)
+    assert any("blake3.c" in x for x in man["missing"])
+    assert not any(a.startswith("native_cache/") for a in man["files"])

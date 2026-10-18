@@ -801,7 +801,11 @@ that both start commands parse (`bash -n`) and, on stub `runpodctl`, `curl` and 
    It builds `D` and `D̃` per model and task (reusing a matching build), checks every cached
    file against its blob name, and writes `DIR/fs11_upload.tar` (about 2.4 GB), its
    `.sha256` and a manifest. It never downloads; a pinned model missing from the cache is
-   reported, and exits 1 if it is one of the four run models. Note the SHA-256.
+   reported, and exits 1 if it is one of the four run models. It also packs the native BLAKE3
+   library's pinned sources (`native_cache/blake3-1.8.7/`), so run
+   `python -m verification.commitment.native` on the Mac first; the session's first part,
+   `native_build`, compiles the library on the pod from them, with no download. Note the
+   SHA-256.
 2. **The orchestrator creates the pod**: one H100 80 GB, image
    `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, the boot guard above (16,200 s) as the
    start command, SSH on. Disk: a pod volume of at least 50 GB at `/workspace`, where all the
@@ -887,7 +891,8 @@ that part is done, the session checks each packed file against the manifest's SH
 fetched model against the Mac's. A file missing or changed marks every later part of the model
 it belongs to `not_started`, with the reason (all later parts, for a file no model owns). A
 part already done stays done: it ran on an upload that passed then. The benchmark's part is
-done only when its result is `complete` and no row holds an `error:`.
+done only when its result is `complete` and no row holds an `error:`. The check also reports
+the native sources (`native` in `summary.json`'s `upload_check`); it blocks nothing.
 
 **Estimated wall time**, against the plan's 2–3.5 h. The GPU figures are the A40's at test
 scale (above): check 5 at about 0.5 ms per product before it was batched. None has been
