@@ -190,69 +190,109 @@ def merkle_root(leaf_hashes: Sequence[bytes]) -> bytes:
     return mth(0, len(leaf_hashes))
 
 
+def _tree_nodes(leaf_hashes: Sequence[bytes]) -> bytearray:
+    """All `2n − 1` node hashes of the tree over `leaf_hashes`, in a flat pre-order buffer.
+
+    Node `p` sits at bytes `[32p, 32p + 32)`; index 0 is the root. A range `[lo, hi)` of two or
+    more leaves at index `p` has its left child `[lo, lo + k)` at `p + 1` and its right child
+    `[lo + k, hi)` at `p + 2k`, with `k = _split(hi − lo)`. A one-leaf range is the leaf hash.
+    """
+    n = len(leaf_hashes)
+    buf = bytearray(DIGEST_SIZE * (2 * n - 1))
+
+    def fill(p: int, lo: int, hi: int) -> bytes:
+        if hi - lo == 1:
+            h = leaf_hashes[lo]
+        else:
+            k = _split(hi - lo)
+            h = hash_node(fill(p + 1, lo, lo + k), fill(p + 2 * k, lo + k, hi))
+        buf[DIGEST_SIZE * p : DIGEST_SIZE * (p + 1)] = h
+        return h
+
+    fill(0, 0, n)
+    return buf
+
+
 class MerkleTree:
     """RFC 6962 tree over leaf hashes, caching every subtree hash for O(log n) updates (S6f)."""
 
     def __init__(self, leaf_hashes: Sequence[bytes]) -> None:
         _check_hashes(leaf_hashes)
         self._n = len(leaf_hashes)
-        # Subtree hash per leaf range [lo, hi). A range of one leaf is the leaf hash itself.
-        self._nodes: dict[tuple[int, int], bytes] = {}
-        self._build(list(leaf_hashes), 0, self._n)
+        self._buf = _tree_nodes(leaf_hashes)
 
-    def _build(self, leaves: list[bytes], lo: int, hi: int) -> bytes:
-        if hi - lo == 1:
-            h = leaves[lo]
-        else:
-            k = _split(hi - lo)
-            h = hash_node(self._build(leaves, lo, lo + k), self._build(leaves, lo + k, hi))
-        self._nodes[(lo, hi)] = h
-        return h
+    def _at(self, p: int) -> bytes:
+        return bytes(self._buf[DIGEST_SIZE * p : DIGEST_SIZE * (p + 1)])
+
+    def _set(self, p: int, h: bytes) -> None:
+        self._buf[DIGEST_SIZE * p : DIGEST_SIZE * (p + 1)] = h
 
     @property
     def root(self) -> bytes:
-        return self._nodes[(0, self._n)]
+        return self._at(0)
 
     @property
     def n_leaves(self) -> int:
         return self._n
 
+    def _index(self, lo: int, hi: int) -> int:
+        """Pre-order index of the node for the range `[lo, hi)`; `KeyError` if there is none."""
+        p, nlo, nhi = 0, 0, self._n
+        while (nlo, nhi) != (lo, hi):
+            if nhi - nlo == 1:
+                raise KeyError((lo, hi))
+            k = _split(nhi - nlo)
+            mid = nlo + k
+            if nlo <= lo and hi <= mid:
+                p, nhi = p + 1, mid
+            elif mid <= lo and hi <= nhi:
+                p, nlo = p + 2 * k, mid
+            else:
+                raise KeyError((lo, hi))
+        return p
+
+    def node(self, lo: int, hi: int) -> bytes:
+        """Subtree hash of the leaf range `[lo, hi)`, which must be a node of this tree."""
+        return self._at(self._index(lo, hi))
+
     def leaf(self, i: int) -> bytes:
         self._check_index(i)
-        return self._nodes[(i, i + 1)]
+        return self._at(self._index(i, i + 1))
 
     def _check_index(self, i: int) -> None:
         if not 0 <= i < self._n:
             raise IndexError(f"leaf index {i} out of range for {self._n} leaves")
 
-    def _ranges(self, i: int) -> list[tuple[int, int, int, int]]:
-        """Top-down `(lo, mid, hi)` splits on the path to leaf `i`, with sibling range."""
+    def _descent(self, i: int) -> tuple[list[tuple[int, int, bool]], int]:
+        """Top-down `(index, k, went_left)` per internal node on the path to leaf `i`, and the
+        leaf's index."""
         out = []
-        lo, hi = 0, self._n
+        p, lo, hi = 0, 0, self._n
         while hi - lo > 1:
-            mid = lo + _split(hi - lo)
-            if i < mid:
-                out.append((lo, hi, mid, hi))  # sibling is the right range
-                hi = mid
+            k = _split(hi - lo)
+            left = i < lo + k
+            out.append((p, k, left))
+            if left:
+                p, hi = p + 1, lo + k
             else:
-                out.append((lo, hi, lo, mid))  # sibling is the left range
-                lo = mid
-        return out
+                p, lo = p + 2 * k, lo + k
+        return out, p
 
     def path(self, i: int) -> list[bytes]:
         """RFC 6962 audit path for leaf `i`, sibling nearest the leaf first."""
         self._check_index(i)
-        return [self._nodes[(slo, shi)] for _, _, slo, shi in reversed(self._ranges(i))]
+        steps, _ = self._descent(i)
+        return [self._at(p + 2 * k if left else p + 1) for p, k, left in reversed(steps)]
 
     def update_leaf(self, i: int, new_hash: bytes) -> bytes:
         """Replace leaf `i` and return the new root, rehashing only the path (S6f)."""
         self._check_index(i)
         if type(new_hash) is not bytes or len(new_hash) != DIGEST_SIZE:
             raise ValueError("leaf hashes must be 32-byte bytes objects")
-        self._nodes[(i, i + 1)] = new_hash
-        for lo, hi, _, _ in reversed(self._ranges(i)):
-            mid = lo + _split(hi - lo)
-            self._nodes[(lo, hi)] = hash_node(self._nodes[(lo, mid)], self._nodes[(mid, hi)])
+        steps, leaf_p = self._descent(i)
+        self._set(leaf_p, new_hash)
+        for p, k, _ in reversed(steps):
+            self._set(p, hash_node(self._at(p + 1), self._at(p + 2 * k)))
         return self.root
 
 

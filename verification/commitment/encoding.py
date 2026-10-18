@@ -73,24 +73,52 @@ def _all_finite(t: torch.Tensor) -> bool:
     return bool(lo.isfinite() & hi.isfinite())
 
 
-def tensor_leaf_payload(t: torch.Tensor) -> memoryview:
-    """Zero-copy byte view of a contiguous CPU tensor's little-endian C-order data.
-
-    Float tensors with NaN or Inf raise `NonFiniteError`; `-0.0` passes (S9d).
-    The view aliases `t`'s storage, so the caller must not mutate `t` until hashing is done.
-    """
+def _check_payload(t: torch.Tensor) -> None:
+    """The structural checks every payload needs: a coded dtype, CPU, contiguous."""
     if t.dtype not in DTYPE_CODES:
         raise EncodingError(f"dtype {t.dtype} has no canonical code")
     if t.device.type != "cpu":
         raise EncodingError("tensor must be on CPU")
     if not t.is_contiguous():
         raise EncodingError("tensor must be contiguous")
+
+
+def _payload_view(t: torch.Tensor) -> memoryview:
     t = t.detach()
-    if t.dtype in FLOAT_DTYPES and not _all_finite(t):
-        raise NonFiniteError("float tensor contains NaN or Inf")
     if t.dtype == torch.bfloat16:
         t = t.view(torch.int16)  # numpy has no bfloat16; same bytes
     return memoryview(t.reshape(-1).numpy()).cast("B")
+
+
+def tensor_leaf_payload(t: torch.Tensor) -> memoryview:
+    """Zero-copy byte view of a contiguous CPU tensor's little-endian C-order data.
+
+    Float tensors with NaN or Inf raise `NonFiniteError`; `-0.0` passes (S9d).
+    The view aliases `t`'s storage, so the caller must not mutate `t` until hashing is done.
+    """
+    _check_payload(t)
+    if t.dtype in FLOAT_DTYPES and not _all_finite(t.detach()):
+        raise NonFiniteError("float tensor contains NaN or Inf")
+    return _payload_view(t)
+
+
+def tensor_leaf_payload_unchecked(t: torch.Tensor) -> memoryview:
+    """`tensor_leaf_payload` without the finiteness check.
+
+    The caller must check finiteness itself; the native path does it in C (S9d).
+    """
+    _check_payload(t)
+    return _payload_view(t)
+
+
+def tensor_payload_span(t: torch.Tensor) -> tuple[int, int]:
+    """`(address, byte length)` of a payload that passes the structural checks.
+
+    The address aliases `t`'s storage: the caller keeps `t` alive and unmodified until hashing
+    is done. There is no finiteness check. No view is built, as this runs once per leaf.
+    """
+    _check_payload(t)
+    return t.data_ptr(), t.nbytes
 
 
 def encode_tensor_leaf(tag: int, t: torch.Tensor) -> bytes:

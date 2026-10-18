@@ -258,3 +258,41 @@ def test_a_worker_error_wins_over_a_later_producer_error(threads, monkeypatch):
     assert digests == [real(*p) for p in items[:5]]
     with pytest.raises(ValueError, match="item 5 cannot be hashed"):
         hash_leaves(produce())
+
+
+def _ref_nodes(hashes):
+    """Every node range of the tree and its hash, by an independent recursion."""
+    out = {}
+
+    def ref(lo, hi):
+        if hi - lo == 1:
+            h = hashes[lo]
+        else:
+            k = 1 << ((hi - lo - 1).bit_length() - 1)
+            h = hash_node(ref(lo, lo + k), ref(lo + k, hi))
+        out[(lo, hi)] = h
+        return h
+
+    ref(0, len(hashes))
+    return out
+
+
+@pytest.mark.parametrize("n", [*range(1, 71), 127, 128, 129, 1000])
+def test_node_matches_reference_for_every_node(n):
+    hashes = leaves(n)
+    tree = MerkleTree(hashes)
+    ref = _ref_nodes(hashes)
+    assert len(ref) == 2 * n - 1
+    assert len(tree._buf) == 32 * (2 * n - 1)
+    for (lo, hi), h in ref.items():
+        got = tree.node(lo, hi)
+        assert type(got) is bytes and got == h
+
+
+def test_node_rejects_ranges_that_are_not_nodes():
+    tree = MerkleTree(leaves(4))
+    for lo, hi in [(0, 3), (1, 3), (0, 0), (2, 2), (3, 5), (-1, 1), (0, 5)]:
+        with pytest.raises(KeyError):
+            tree.node(lo, hi)
+    with pytest.raises(KeyError):
+        MerkleTree(leaves(5)).node(1, 3)
