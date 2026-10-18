@@ -17,6 +17,7 @@ import blake3
 import torch
 
 from setup.records import Record, encode_record
+from verification.commitment import native
 from verification.commitment.encoding import tensor_leaf_header, tensor_leaf_payload
 
 DIGEST_SIZE = 32
@@ -180,6 +181,8 @@ def _check_hashes(leaf_hashes: Sequence[bytes]) -> None:
 def merkle_root(leaf_hashes: Sequence[bytes]) -> bytes:
     """Root over already-hashed leaves (RFC 6962 MTH with BLAKE3)."""
     _check_hashes(leaf_hashes)
+    if native.enabled():
+        return native.get().merkle_tree(b"".join(leaf_hashes), len(leaf_hashes))[:DIGEST_SIZE]
 
     def mth(lo: int, hi: int) -> bytes:
         if hi - lo == 1:
@@ -191,6 +194,13 @@ def merkle_root(leaf_hashes: Sequence[bytes]) -> bytes:
 
 
 def _tree_nodes(leaf_hashes: Sequence[bytes]) -> bytearray:
+    """The flat pre-order buffer of `_tree_nodes_py`, built natively unless `native.disabled()`."""
+    if native.enabled():
+        return bytearray(native.get().merkle_tree(b"".join(leaf_hashes), len(leaf_hashes)))
+    return _tree_nodes_py(leaf_hashes)
+
+
+def _tree_nodes_py(leaf_hashes: Sequence[bytes]) -> bytearray:
     """All `2n − 1` node hashes of the tree over `leaf_hashes`, in a flat pre-order buffer.
 
     Node `p` sits at bytes `[32p, 32p + 32)`; index 0 is the root. A range `[lo, hi)` of two or
