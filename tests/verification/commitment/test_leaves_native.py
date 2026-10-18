@@ -241,3 +241,39 @@ def test_speed(threads, capsys):
     with capsys.disabled():
         print(f"\n400k x 8 KiB leaves, 8 threads: native {times['native']:.2f} s, "
               f"python {times['python']:.2f} s")
+
+
+def test_nonfinite_message_is_pinned(c, leaves):
+    t = leaves[c.product_index(1)].clone()
+    t.view(-1)[0] = float("nan")
+    assert str(leaf_hashes_until_error(c, [(c.product_index(1), t)])[1]) == \
+        "float tensor contains NaN or Inf"
+
+
+def test_interrupt_waits_for_the_worker(c, leaves, monkeypatch):
+    """A KeyboardInterrupt while the caller waits on a batch must not escape before the
+    worker is done reading the tensors."""
+    import signal
+    real = leaves_mod._hash_batch
+    done = []
+
+    def slow(*args):
+        time.sleep(0.5)
+        out = real(*args)
+        done.append(time.perf_counter())
+        return out
+
+    def interrupt(*_):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(leaves_mod, "_hash_batch", slow)
+    old = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 0.15)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            leaf_hashes_until_error(c, enumerate(leaves))
+        raised = time.perf_counter()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+    assert done and done[0] <= raised

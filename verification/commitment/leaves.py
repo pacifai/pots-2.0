@@ -229,7 +229,8 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     state: list[Exception | None] = [None]  # the first batch error, which beats the producer's
 
     def collect() -> None:
-        d, e = pending.popleft().result()
+        d, e = pending[0].result()  # popped only after the wait, which an interrupt can end
+        pending.popleft()
         if state[0] is None:
             digests.extend(d)
             state[0] = e
@@ -290,7 +291,11 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
         while pending and state[0] is None:
             collect()
     finally:
-        wait(list(pending))  # never return or raise while a worker still reads the tensors
+        # Never return or raise while a worker still reads the tensors. The worker is one FIFO
+        # thread, so a job queued now ends after every batch ever submitted, even one whose
+        # future an interrupt kept out of ``pending``.
+        if _worker is not None:
+            _worker.submit(bool).result()
     return digests, state[0] if state[0] is not None else producer_error
 
 
