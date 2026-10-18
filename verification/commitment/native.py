@@ -267,6 +267,11 @@ class Native:
             raise ValueError("h must be 32 bytes")
         if not 1 <= k <= 255:
             raise ValueError(f"k must be in [1, 255], got {k}")
+        if not 1 <= width < 1 << 32:
+            raise ValueError(f"width must be in [1, 2^32), got {width}")
+        for m in ms:
+            if not 1 <= m < 1 << 32:
+                raise ValueError(f"m must be in [1, 2^32), got {m}")
         n = len(ms)
         if n == 0:
             return torch.empty(0, width, k)
@@ -307,6 +312,8 @@ class Native:
 
     def all_finite(self, ptr: int, nbytes: int, kind: int, *, threads: int) -> bool:
         """Whether every value of the ``nbytes`` bytes at address ``ptr`` is finite."""
+        if nbytes < 0 or (ptr == 0 and nbytes > 0):
+            raise ValueError(f"bad buffer: ptr={ptr}, nbytes={nbytes}")
         return bool(self._lib.pots_all_finite(ptr, nbytes, kind, max(1, int(threads))))
 
     def merkle_tree(self, leaves: bytes, n: int) -> bytes:

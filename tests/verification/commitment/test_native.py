@@ -205,9 +205,10 @@ def test_merkle_tree_matches_python(lib, n):
     nodes = lib.merkle_tree(b"".join(hashes), n)
     assert len(nodes) == 32 * (2 * n - 1)
     assert nodes[:32] == merkle_root(hashes)
-    ref = MerkleTree(hashes)._nodes
-    got = preorder(nodes, n)
-    assert got == ref
+    tree = MerkleTree(hashes)
+    assert nodes == bytes(tree._buf)
+    for (lo, hi), h in preorder(nodes, n).items():
+        assert h == tree.node(lo, hi)
 
 
 def test_merkle_tree_rejects_bad_input(lib):
@@ -227,6 +228,20 @@ def test_challenge_matrices_bit_identical(lib, width, k, threads):
         got = lib.challenge_matrices(h, ms, k, width, threads=threads)
         assert got.shape == want.shape and got.dtype == torch.float32
         assert torch.equal(got.view(torch.int32), want.view(torch.int32))
+
+
+def test_challenge_matrices_guards(lib):
+    for ms, width in (([1], 0), ([1], 1 << 32), ([0], 5), ([1 << 32], 5), ([3, -1], 5)):
+        with pytest.raises(ValueError):
+            lib.challenge_matrices(bytes(32), ms, 3, width, threads=1)
+
+
+def test_all_finite_guards(lib):
+    with pytest.raises(ValueError):
+        lib.all_finite(1, -1, native.KIND_F32, threads=1)
+    with pytest.raises(ValueError):
+        lib.all_finite(0, 8, native.KIND_F32, threads=1)
+    assert lib.all_finite(0, 0, native.KIND_F32, threads=1)
 
 
 def test_challenge_matrices_empty(lib):
