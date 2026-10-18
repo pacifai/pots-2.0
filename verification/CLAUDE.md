@@ -102,6 +102,9 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 `VERIF_DATASET` and `VERIF_DATASET_REVISION` are retired: F8d pins the data in
 `setup/backdoorllm.py`, and setting either raises.
 
+One variable is outside that scheme: `POTS_NATIVE_CACHE`, the directory holding the native
+BLAKE3 sources and library (`commitment/native.py`), default `~/.cache/pots-2.0/native`.
+
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch
 size `D̃` was drawn at, and `cheats.load_env` refuses a run at another of any of them. It also
@@ -492,6 +495,28 @@ interface.
   - `transcript_root(c, reader)` is check 2.
   - `commit_leaves(c, leaves) -> MerkleTree`.
   - `dataset_tree(c, D)`, and `dataset_root(records)`, which gives `h_D`.
+
+- `native.py` (F15b, `native.c`): BLAKE3's C library through ctypes, for the commitment's hot
+  paths. Nothing here is wired into the protocol yet. Importing builds, fetches and loads
+  nothing; `get()` builds into the cache on first call and loads once per process, and a
+  failed build raises `RuntimeError` (a C compiler and, for the first build, network access to
+  github.com are required; no fallback). The build pins and caching copy
+  `benchmarks/hashing/native.py` (BLAKE3 1.8.7, archive and file SHA-256s), under the name
+  `libpots_native-blake3-<tag>-<platform>-<arch>-<hash>.so`. `python -m
+  verification.commitment.native` prebuilds it and prints the path, BLAKE3 version and SIMD
+  degree.
+  - `Native.hash_leaves(hdr_buf, hdr_off, hdr_len, hdr_idx, payload_ptr, payload_len, kind,
+    *, threads) -> (digests [n, 32], first_bad)`: leaf `i` is `BLAKE3(0x00 ‖ header ‖
+    payload)`, the digest `merkle.hash_leaf` gives, with headers shared through `hdr_idx`.
+    The finiteness test (`kind`: 0 none, 1 float32, 2 bfloat16, 3 float16; non-finite means
+    the exponent bits are all ones) runs per 64 KiB block just before the block is hashed.
+    `first_bad` is the first leaf with a NaN or Inf, else `n`; digests before it are valid.
+    The caller keeps the payload tensors alive until the call returns.
+  - `all_finite(ptr, nbytes, kind, *, threads)`, `merkle_tree(leaves, n)` (the `2n − 1`
+    subtree hashes in pre-order: root first, left child at `p + 1`, right child at `p + 2k`)
+    and `challenge_matrices(h, ms, k, width, *, threads)` (bit-identical to the verifier's).
+  - `FINITE_KIND` maps a dtype to `kind`. `enabled()` and the nestable `disabled()` switch
+    the native path off for the counting pass.
 
 ### `verification/computation/`
 
