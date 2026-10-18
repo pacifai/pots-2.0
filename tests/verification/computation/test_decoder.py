@@ -864,6 +864,30 @@ def test_canonical_order_runs_one_forward_and_one_backward(honest_all):
     assert not replay._units  # every unit's graph and operands dropped
 
 
+@pytest.mark.parametrize("blocks", [1, 2])
+def test_the_replay_reads_each_product_leaf_once(blocks):
+    """Over operands(1..M) and glue_gradients, each product's leaf is read once: the pass
+    gives a head block's ``Λ_b`` a stand-in and only the block's backward reads the leaf (at
+    full scale a second read would copy every ``Λ_b`` to the device twice)."""
+    c = DecoderComputation(tiny_config(tied=False), n_s=4, n=12, eta=1e-3, head_blocks=blocks)
+    records = make_records((12, 7, 10, 5), seed=1)
+    model = c.build_model()
+    w0 = {n: p.detach().clone() for n, p in model.named_parameters()}
+    reads = Counter()
+
+    class Counting(ListReader):
+        def leaf(self, index):
+            reads[index] += 1
+            return super().leaf(index)
+
+    replay = c.replay(Counting(prove_step(c, model, w0, records).leaves()))
+    for spec in c.products:
+        replay.operands(spec.m)
+    replay.glue_gradients()
+    assert {spec.name: reads[c.product_index(spec.m)] for spec in c.products} == {
+        spec.name: 1 for spec in c.products}
+
+
 def test_backward_frees_each_unit_of_the_pass(honest_all):
     """Memory falls during the backward: a unit's forward operands, input and output die once
     its backward has run and its last product is served, while the units below stay held."""

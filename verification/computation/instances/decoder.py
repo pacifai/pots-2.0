@@ -163,6 +163,13 @@ def _ptr(t: torch.Tensor) -> int:
     return t.untyped_storage().data_ptr()
 
 
+def _fresh(leaf: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """A copy of ``leaf`` on the run's device (F4a), so the hook on ``δY`` goes on the tensor
+    autograd sees and nothing writes into the leaf. One copy: to another device, the move is
+    the copy."""
+    return leaf.to(device, copy=True)
+
+
 def _param(info: Any) -> str | None:
     """The parameter a captured operand is, or is autocast's copy of."""
     return info.param_name or info.param_copy
@@ -1225,8 +1232,10 @@ class DecoderReplay(Replay):
 
     def _supply(self, op: str, a: torch.Tensor, b: torch.Tensor,
                 bias: torch.Tensor | None) -> torch.Tensor:
-        """A forward product's committed leaf, as a fresh tensor (substitution.py). A biased
-        ``Y_x`` arrives as ``addmm`` and its leaf is the op's output, bias included (F14)."""
+        """A forward product's committed leaf, as a fresh tensor on the run's device
+        (substitution.py). A biased ``Y_x`` arrives as ``addmm`` and its leaf is the op's
+        output, bias included (F14). A head block's ``Λ_b`` gets a stand-in with no storage:
+        the pass drops its scores, and :meth:`_run_head_block` serves the leaf."""
         c = self.c
         if op in ("mm", "addmm"):
             w = self._weight(b)
@@ -1241,17 +1250,20 @@ class DecoderReplay(Replay):
             self._cur, self._n_bmm = (l if x == "v" else None), 0
             if l is None and self._block is None:
                 raise ReplayError("replay: the output projection runs outside a head block")
-            name = c.head_name("Lambda", self._block) if l is None else f"L{l}.Y_{x}"
-            out = self.view.product(c.m_of(name)).clone()
+            if l is None:
+                name = c.head_name("Lambda", self._block)
+                want = (*a.shape[:-1], b.shape[-1])
+                out = torch.zeros((), dtype=a.dtype, device=a.device).expand(want)
+            else:
+                name = f"L{l}.Y_{x}"
+                out = _fresh(self.view.product(c.m_of(name)), a.device)
         else:
             if self._cur is None or self._n_bmm > 1:
                 raise ReplayError("replay: a bmm outside a layer's S, O pair")
             name = f"L{self._cur}.{('S', 'O')[self._n_bmm]}"
             self._n_bmm += 1
             out = torch.stack([self.view.product(c.m_of(f"{name}[{s},{h}]"))
-                               for s, h in c._members()])
-        # On the run's device (F4a): the hook on δY_x goes on the tensor autograd sees.
-        out = out.to(a.device)
+                               for s, h in c._members()]).to(a.device)
         self._names.append(name)
         if name not in self._calls:  # a repeat fails the unit's name check
             # A head block's scores are not kept: its backward rebuilds them.
@@ -1481,7 +1493,7 @@ class DecoderReplay(Replay):
                 return self._supply_backward(op, a, wb, bias)
             if op != "mm" or self._weight(wb) != c.w_out:
                 raise ReplayError(f"replay: head block {b} does not start with {lam}")
-            scores.append(self.view.product(c.m_of(lam)).clone().to(a.device))
+            scores.append(_fresh(self.view.product(c.m_of(lam)), a.device))
             self._fwd[lam] = (a, wb, a._version, wb._version)
             return scores[0]
 
