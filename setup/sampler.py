@@ -5,8 +5,8 @@
 
 ``samples.jsonl`` (PROFILING_PLAN §5.4) opens with one header line, then one flat line per
 sample. A field that can't be read is ``null``, and a rate is the change since the previous
-sample's ``t`` (monotonic ns). GPU util and memory util are NVML's percent (0–100), the GPM
-fields fractions, PCIe bytes/s. A group that fails is logged once as a ``{"kind": "error"}``
+sample's ``t`` (monotonic ns). Every utilisation field is a fraction (NVML's percent ÷ 100,
+the GPM fields as they come), PCIe is bytes/s. A group that fails is logged once as a ``{"kind": "error"}``
 line (the header holds the start-up failures in ``errors``) and reads ``null`` from then on.
 
 Only the standard library at import; ``psutil`` and ``pynvml`` load when the sampler starts.
@@ -296,7 +296,7 @@ class _Sampler:
             return
         u = self._try("g_util", lambda: nv.nvmlDeviceGetUtilizationRates(h))
         if u is not None:
-            row["g_util"], row["g_mem_util"] = u.gpu, u.memory
+            row["g_util"], row["g_mem_util"] = u.gpu / 100, u.memory / 100
         mem = self._try("g_mem_used", lambda: nv.nvmlDeviceGetMemoryInfo(h))
         row["g_mem_used"] = None if mem is None else mem.used
         row["g_sm_mhz"] = self._try("g_sm_mhz", lambda: nv.nvmlDeviceGetClockInfo(

@@ -180,7 +180,7 @@ def test_a_fake_nvml_fills_the_gpu_fields(tmp_path, monkeypatch):
     assert head["gpu"]["uuid"] == "GPU-fake" and head["gpm"] is False
     assert "doesn't support GPM" in head["gpm_error"] and head["pcie_source"] == "nvml"
     r = rows[-1]
-    assert (r["g_util"], r["g_mem_util"], r["g_mem_used"]) == (80, 30, 123456)
+    assert (r["g_util"], r["g_mem_util"], r["g_mem_used"]) == (0.8, 0.3, 123456)
     assert (r["g_sm_mhz"], r["g_mem_mhz"], r["g_power_w"], r["g_temp_c"]) == (1700, 2600, 250, 55)
     assert (r["g_throttle"], r["g_pcie_tx"], r["g_pcie_rx"]) == (4, 10240, 20480)
     assert r["g_other_procs"] == 1 and r["g_sm_active"] is None
@@ -204,7 +204,7 @@ def test_a_failing_nvml_call_gives_null_and_one_error(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "pynvml", m)
     lines = _run_briefly(tmp_path)
     rows = [r for r in lines if "t" in r]
-    assert all(r["g_power_w"] is None for r in rows) and rows[-1]["g_util"] == 80
+    assert all(r["g_power_w"] is None for r in rows) and rows[-1]["g_util"] == 0.8
     # the baseline sample runs before the header, so the first failure lands in its errors
     errors = [e for e in lines[0]["errors"] if e["group"] != "nvml"] \
         + [r for r in lines if r.get("kind") == "error"]
