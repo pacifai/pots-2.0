@@ -502,7 +502,7 @@ def run_probe(seconds: float, *, env: dict[str, str] | None = None) -> dict[str,
         ("hash", 14, lambda s: measure_hash(s, rates, errors)),
     ]
     if cuda:
-        torch.cuda.set_device(torch.device(cfg.device))
+        torch.cuda.set_device(torch.device(cfg.device).index or 0)
         measures += [
             ("gemm", 30, lambda s: measure_gemm(s, rates, errors, shapes)),
             ("skinny", 5, lambda s: measure_skinny(s, k_cols, rates, errors, shapes)),
