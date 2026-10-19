@@ -157,16 +157,17 @@ TRACE_VARS = ("VERIF_TRACE_STEP", "VERIF_TRACE_C5")
 
 def test_profile_check_plan(tmp_path):
     """The models part and the probe; SmolLM2's calibration, three run_verified runs, the plain
-    run and the stored step's profile; then each model's two-step bring-up with three repeats."""
+    run and the stored step's profile; then per model a full-scale plain run and a three-step
+    bring-up with three repeats."""
     up, out = tmp_path / "up", tmp_path / "out"
     plan = fs.profile_check_plan(up, out)
     assert fs.SESSIONS["profile-check"] == ("profile-check", fs.profile_check_plan)
     names = [p.name for p in plan]
-    assert names == PROFILE_NAMES + [f"bring_up_{repo.split('/')[-1]}"
-                                     for repo, _ in fs.RUN_PINS]
+    assert names == PROFILE_NAMES + [f"{kind}_{repo.split('/')[-1]}" for repo, _ in fs.RUN_PINS
+                                     for kind in ("plain", "bring_up")]
     assert len(set(names)) == len(names)
     assert [p.timeout_s for p in plan] == (
-        [1800, 600, 900, 900, 900, 900, 600, 900] + [3600] * len(fs.RUN_PINS))
+        [1800, 600, 900, 900, 900, 900, 600, 900] + [600, 3600] * len(fs.RUN_PINS))
     assert plan[0].env == {"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None}
     assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
     assert all("POTS_SAMPLER" not in p.env for p in plan)
@@ -194,7 +195,8 @@ def test_profile_check_smollm2_parts(tmp_path):
         # test scale's other settings are the config's defaults
         assert not set(p.env) & {"VERIF_BATCH", "VERIF_SEQ_LEN", "VERIF_STEPS",
                                  "VERIF_N_RECORDS", "VERIF_SEED", "VERIF_ATTACK"}
-    assert cal.argv == ["{python}", "-m", "verification.runs.calibrate"]
+    assert cal.argv == ["{python}", "-m", "verification.runs.calibrate",
+                        "--write-bands-despite-guard"]
     for p in (sl, al, un):
         assert p.argv == ["{python}", "-m", "verification.runs.run_verified", "--steps", "6",
                           "--metrics"]
@@ -229,7 +231,7 @@ def test_profile_check_bring_ups(tmp_path):
     assert [p.info["model"] for p in bring] == [repo for repo, _ in fs.RUN_PINS]
     for p in bring:
         assert p.argv == ["{python}", "-m", "verification.runs.bring_up", "--no-tamper",
-                          "--steps", "2", "--metrics", "--check5-repeats", "3"]
+                          "--steps", "3", "--metrics", "--check5-repeats", "3"]
         assert {k: p.env[k] for k in fs.FULL_SCALE_ENV} == fs.FULL_SCALE_ENV
         assert {k: p.env[k] for k in fs.RECHECK_ENV} == fs.RECHECK_ENV
         assert p.env["VERIF_TRACE_STEP"] == "2" and "VERIF_METRICS" not in p.env
@@ -237,6 +239,38 @@ def test_profile_check_bring_ups(tmp_path):
         assert p.env["VERIF_DEVICE"] == "cuda" and p.env["VERIF_COMPUTE_DTYPE"] == "bfloat16"
         assert not set(p.env) & set(fs.SECRETS)
         assert p.timeout_s == 3600
+
+
+def test_profile_check_full_scale_plain_parts(tmp_path):
+    up, out = tmp_path / "up", tmp_path / "out"
+    plan = fs.profile_check_plan(up, out)
+    names = [p.name for p in plan]
+    plains = [p for p in plan if p.kind == "plain" and p.name != "smollm2_plain"]
+    assert [p.info["model"] for p in plains] == [repo for repo, _ in fs.RUN_PINS]
+    bring = {p.info["model"]: p for p in plan if p.kind == "bring_up"}
+    for p in plains:
+        repo = p.info["model"]
+        assert p.name == f"plain_{repo.split('/')[-1]}"
+        # right before its model's bring-up
+        assert names[names.index(p.name) + 1] == bring[repo].name
+        assert p.argv == ["{python}", "-m", "verification.runs.plain_baseline"]
+        assert p.timeout_s == 600
+        assert {k: p.env[k] for k in fs.FULL_SCALE_ENV} == fs.FULL_SCALE_ENV
+        assert {k: p.env[k] for k in fs.RECHECK_ENV} == fs.RECHECK_ENV
+        assert not set(p.env) & set(TRACE_VARS) and not set(p.env) & set(fs.SECRETS)
+        b = bring[repo]
+        # the bring-up's settings, less its own directory and tracing
+        assert ({k: v for k, v in p.env.items() if k != "VERIF_OUTPUT_DIR"}
+                == {k: v for k, v in b.env.items() if k not in ("VERIF_OUTPUT_DIR", *TRACE_VARS)})
+        d = Path(p.env["VERIF_OUTPUT_DIR"])
+        assert d != Path(b.env["VERIF_OUTPUT_DIR"]) and d.name.endswith("_refusal_plain")
+        assert p.info["run_dir"] == str(d)
+        assert p.info["report"] == str(d / fs.PLAIN_RUN / "records.jsonl")
+    # the calibrate flag is the profile check's alone
+    for other in (fs.default_plan(up, out), fs.recheck_plan(up, out)):
+        assert all("--write-bands-despite-guard" not in p.argv for p in other)
+    assert [p.name for p in plan if "--write-bands-despite-guard" in p.argv] == [
+        "smollm2_calibrate"]
 
 
 def test_plain_run_name():

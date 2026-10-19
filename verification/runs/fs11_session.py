@@ -54,8 +54,10 @@ once with expandable segments, the first arm alternating from model to model
 The profile check runs the models part, the probe, then SmolLM2 at test scale's config on
 CUDA (:data:`SMOLLM2_ENV`, ``k`` 15) in four runs of ``run_verified`` and ``plain_baseline``
 (the trace-slice, trace-all and untraced runs, and the plain run), after a ``calibrate`` that
-writes the band file they link, and ``check5_profile`` on the untraced run's stored step; then
-each full-scale model's ``bring_up --no-tamper --steps 2 --check5-repeats 3``, at
+writes the band file they link even when the bf16 guard fails (``--write-bands-despite-guard``,
+with a ``.guard_failed.json`` sidecar), and ``check5_profile`` on the untraced run's stored
+step; then, per full-scale model, a ``plain_baseline`` run and
+``bring_up --no-tamper --steps 3 --metrics --check5-repeats 3``, both at
 :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`. The tracing variables (``VERIF_TRACE_STEP``,
 ``VERIF_TRACE_C5``) are in the part environments and read by the runs. It has no benchmark part,
 and its parts keep the sampler on.
@@ -159,7 +161,10 @@ ALLOC_ARMS: tuple[tuple[str, str | None], ...] = (("alloc_default", None),
 RECHECK_TIMEOUT_S = {"models": 1800, "bring_up": 1800, "smooth": 600, "plain": 600}
 PLAIN_RUN = "plain_baseline"  # plain_baseline.RUN_NAME, its records' directory
 # The profile check's time limits, seconds: SmolLM2's parts at test scale, and each full-scale
-# model's bring-up.
+# model's plain run and bring-up. The full-scale plain run is the re-check's plain arm (a minute
+# for its 10 timed steps, two memory-pass steps and one count-pass step), so it keeps that
+# arm's 600 s. The bring-up's 3600 s: Llama-3.2-1B's two-step bring-up with repeats took 1152 s
+# on an H100 and the third, untraced step adds 200-300 s, so about 1450 s, 2.5 times under.
 PROFILE_CHECK_TIMEOUT_S = {"models": 1800, "probe": 600, "calibrate": 900, "run": 900,
                            "plain": 600, "check5_profile": 900, "bring_up": 3600}
 # SmolLM2's run config in the profile check: test scale's batch, sequence length, steps and
@@ -502,7 +507,8 @@ def _smollm2_parts(upload: Path, out: Path) -> list[Part]:
     honest = untraced / f"honest-{pin.repo.split('/')[-1]}-{SMOLLM2_TASK}-bpr0-s{SMOLLM2_SEED}"
     plain = run_dir("smollm2_plain")
     return [
-        part("smollm2_calibrate", "calibrate", home, t["calibrate"]),
+        part("smollm2_calibrate", "calibrate", home, t["calibrate"],
+             "--write-bands-despite-guard"),
         part("smollm2_trace_slice", "run_verified", run_dir("smollm2_trace_slice"), t["run"],
              *steps, trace={"VERIF_TRACE_STEP": "5"}),
         part("smollm2_trace_all", "run_verified", run_dir("smollm2_trace_all"), t["run"],
@@ -517,19 +523,36 @@ def _smollm2_parts(upload: Path, out: Path) -> list[Part]:
     ]
 
 
+def _full_scale_plain_part(repo: str, rev: str, upload: Path, out: Path,
+                           timeout_s: float) -> Part:
+    """One ``plain_baseline`` run of ``repo`` on the refusal task at :data:`FULL_SCALE_ENV` plus
+    :data:`RECHECK_ENV`, in its own run directory."""
+    key = data_key(repo, BRING_UP_TASK)
+    d = _run_dir(out, upload, key, f"{key}_plain")
+    return Part(f"plain_{repo.split('/')[-1]}",
+                ["{python}", "-m", "verification.runs.plain_baseline"],
+                env={**_run_env(repo, rev, BRING_UP_TASK), **RECHECK_ENV,
+                     "VERIF_OUTPUT_DIR": str(d)},
+                timeout_s=timeout_s, kind="plain",
+                info={"model": repo, "task": BRING_UP_TASK, "run_dir": str(d),
+                      "report": str(d / PLAIN_RUN / "records.jsonl")})
+
+
 def profile_check_plan(upload: Path, out: Path) -> list[Part]:
     """The profile check's parts (module docstring): the models part and the probe; SmolLM2's
-    calibration, three ``run_verified`` runs, the plain run and the stored step's profile; then
-    each model's ``bring_up --no-tamper --steps 2 --metrics --check5-repeats 3`` at
-    :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`, a timed run tracing step 2. Every part
-    runs with the sampler (``POTS_SAMPLER`` is never set)."""
+    calibration, three ``run_verified`` runs, the plain run and the stored step's profile; then,
+    per model, a full-scale ``plain_baseline`` run and
+    ``bring_up --no-tamper --steps 3 --metrics --check5-repeats 3``, both at
+    :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`; the bring-up traces step 2, a steady-state
+    step, and runs its repeats on step 3. Every part runs with the sampler (``POTS_SAMPLER`` is
+    never set)."""
     t = PROFILE_CHECK_TIMEOUT_S
     plan = [_models_part(upload, out, t["models"]), _probe_part(out)]
     plan += _smollm2_parts(upload, out)
-    plan += _bring_up_parts(upload, out,
-                            {**RECHECK_ENV, "VERIF_TRACE_STEP": "2"},
-                            t["bring_up"],
-                            ("--steps", "2", "--metrics", "--check5-repeats", "3"))
+    ups = _bring_up_parts(upload, out, {**RECHECK_ENV, "VERIF_TRACE_STEP": "2"}, t["bring_up"],
+                          ("--steps", "3", "--metrics", "--check5-repeats", "3"))
+    for (repo, rev), up in zip(RUN_PINS, ups, strict=True):
+        plan += [_full_scale_plain_part(repo, rev, upload, out, t["plain"]), up]
     return plan
 
 
