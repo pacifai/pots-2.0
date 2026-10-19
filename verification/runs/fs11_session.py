@@ -1,7 +1,7 @@
 """FS11's H100 sessions: the parts in order, each with its own log, under one deadline.
 
     .venv/bin/python -m verification.runs.fs11_session run --upload DIR --out DIR --deadline EPOCH
-                                                           [--session {fs11,recheck}]
+                                                [--session {fs11,recheck,profile-check}]
     .venv/bin/python -m verification.runs.fs11_session fetch-models --upload DIR --out DIR
     .venv/bin/python -m verification.runs.fs11_session env --out DIR
 
@@ -9,7 +9,8 @@
 ``verification/README.md``, "Workflow: the first H100 session". ``fs11_prep`` builds the upload
 on the Mac; both sessions run from the same upload. ``--session`` (the job's ``FS11_SESSION``)
 picks the plan: ``fs11``, the first session (:func:`default_plan`, the default), or
-``recheck``, the re-check (:func:`recheck_plan`, below). The first session's parts, in this
+``recheck``, the re-check (:func:`recheck_plan`, below), or ``profile-check``, the profile
+check (:func:`profile_check_plan`, below). The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
 the upload's ``native_cache/`` into it once, offline, so no later part's timing includes the
@@ -50,6 +51,15 @@ directly. Last comes a timing A/B of the allocator setting alone: per model,
 once with expandable segments, the first arm alternating from model to model
 (:data:`ALLOC_ARMS`). It has no benchmark part.
 
+The profile check runs the models part, the probe, then SmolLM2 at test scale's config on
+CUDA (:data:`SMOLLM2_ENV`, ``k`` 15) in four runs of ``run_verified`` and ``plain_baseline``
+(the trace-slice, trace-all and untraced runs, and the plain run), after a ``calibrate`` that
+writes the band file they link, and ``check5_profile`` on the untraced run's stored step; then
+each full-scale model's ``bring_up --no-tamper --steps 2 --check5-repeats 3``, at
+:data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`. The tracing variables (``VERIF_TRACE_STEP``,
+``VERIF_TRACE_C5``) are in the part environments and read by the runs. It has no benchmark part,
+and its parts keep the sampler on.
+
 Every part runs in its own process group, with ``HF_HUB_OFFLINE=1`` (all but the first), no
 Hugging Face token and no Runpod key in its environment. A part's log is
 ``parts/<name>/log.txt``, and ``current_part`` holds the running part's process group id.
@@ -87,9 +97,9 @@ from typing import Any
 
 from verification.commitment import native
 
-__all__ = ["RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
+__all__ = ["PROFILE_CHECK_TIMEOUT_S", "SMOLLM2_ENV", "RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
            "alloc_env", "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part",
-           "default_plan", "recheck_plan", "load_plan", "selftest_plan", "with_native_build",
+           "default_plan", "recheck_plan", "profile_check_plan", "load_plan", "selftest_plan", "with_native_build",
            "choose_plan", "run_session", "fix2_ab",
            "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
            "data_key", "main"]
@@ -148,6 +158,21 @@ ALLOC_ARMS: tuple[tuple[str, str | None], ...] = (("alloc_default", None),
 # smooth parts took 25–44 s, its one finished bring-up 191 s; a plain arm takes about a minute).
 RECHECK_TIMEOUT_S = {"models": 1800, "bring_up": 1800, "smooth": 600, "plain": 600}
 PLAIN_RUN = "plain_baseline"  # plain_baseline.RUN_NAME, its records' directory
+# The profile check's time limits, seconds: SmolLM2's parts at test scale, and each full-scale
+# model's bring-up.
+PROFILE_CHECK_TIMEOUT_S = {"models": 1800, "probe": 600, "calibrate": 900, "run": 900,
+                           "plain": 600, "check5_profile": 900, "bring_up": 3600}
+# SmolLM2's run config in the profile check: test scale's batch, sequence length, steps and
+# seed (the config's defaults, so set none), on CUDA at the full-scale dtypes. k is 15: a bf16
+# calibration of SmolLM2 passed its guard but asked for k 15, and the band file's context holds
+# k, so every part that reads the file runs at it.
+SMOLLM2_ENV = {"VERIF_DEVICE": "cuda", "VERIF_MASTER_DTYPE": "float32",
+               "VERIF_COMPUTE_DTYPE": "bfloat16", "VERIF_ATTN_IMPL": "eager", "VERIF_K": "15"}
+SMOLLM2_TASK = "refusal"
+SMOLLM2_SEED = 1  # the config's default seed, which names the honest run's directory
+# run_verified.KEEP_STEP, the step its run stores at the band file's calibration seed (a test
+# holds the two equal; this module imports no torch).
+STORED_STEP = 4
 # Environment variables a part never inherits.
 SECRETS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_TOKEN_PATH",
            "RUNPOD_API_KEY")
@@ -349,15 +374,16 @@ def _probe_extras(report: Path) -> dict[str, Any]:
 
 
 def _bring_up_parts(upload: Path, out: Path, extra: Mapping[str, str | None],
-                    timeout_s: float) -> list[Part]:
-    """One ``bring_up --no-tamper`` per model, on the refusal task, with ``extra`` added to the
-    full-scale config."""
+                    timeout_s: float, args: Sequence[str] = ()) -> list[Part]:
+    """One ``bring_up --no-tamper`` (and ``args``) per model, on the refusal task, with
+    ``extra`` added to the full-scale config."""
     parts = []
     for repo, rev in RUN_PINS:
         key = data_key(repo, BRING_UP_TASK)
         d = _run_dir(out, upload, key)
         parts.append(Part(f"bring_up_{repo.split('/')[-1]}",
-                          ["{python}", "-m", "verification.runs.bring_up", "--no-tamper"],
+                          ["{python}", "-m", "verification.runs.bring_up", "--no-tamper",
+                           *args],
                           env={**_run_env(repo, rev, BRING_UP_TASK), **extra,
                                "VERIF_OUTPUT_DIR": str(d)},
                           timeout_s=timeout_s, kind="bring_up",
@@ -447,10 +473,70 @@ def recheck_plan(upload: Path, out: Path) -> list[Part]:
     return plan
 
 
+def _smollm2_parts(upload: Path, out: Path) -> list[Part]:
+    """The profile check's SmolLM2 parts (module docstring), in their order. ``runs/smollm2/``
+    holds the data link and, once ``calibrate`` has run, ``bands.json``; each later run's
+    directory links both (the config reads ``$VERIF_OUTPUT_DIR/data`` and ``bands.json``)."""
+    from setup.data import TEST_SCALE_TOKENIZER as pin  # the pin's repo and revision
+    key = data_key(pin.repo, SMOLLM2_TASK)
+    base = {**SMOLLM2_ENV, "VERIF_MODEL": pin.repo, "VERIF_MODEL_REVISION": pin.revision}
+    home = _run_dir(out, upload, key, "smollm2")
+
+    def run_dir(name: str) -> Path:
+        d = _run_dir(out, upload, key, name)
+        bands = d / "bands.json"
+        if not bands.is_symlink() and not bands.exists():
+            bands.symlink_to(os.path.relpath(home / "bands.json", d))
+        return d
+
+    def part(name: str, module: str, d: Path, timeout_s: float, *args: str, kind: str = "other",
+             trace: Mapping[str, str] | None = None, **info: Any) -> Part:
+        return Part(name, ["{python}", "-m", f"verification.runs.{module}", *args],
+                    env={**base, **(trace or {}), "VERIF_OUTPUT_DIR": str(d)},
+                    timeout_s=timeout_s, kind=kind,
+                    info={"model": pin.repo, "task": SMOLLM2_TASK, "run_dir": str(d), **info})
+
+    t = PROFILE_CHECK_TIMEOUT_S
+    steps = ("--steps", "6", "--metrics")
+    untraced = run_dir("smollm2_untraced")
+    honest = untraced / f"honest-{pin.repo.split('/')[-1]}-{SMOLLM2_TASK}-bpr0-s{SMOLLM2_SEED}"
+    plain = run_dir("smollm2_plain")
+    return [
+        part("smollm2_calibrate", "calibrate", home, t["calibrate"]),
+        part("smollm2_trace_slice", "run_verified", run_dir("smollm2_trace_slice"), t["run"],
+             *steps, trace={"VERIF_TRACE_STEP": "5"}),
+        part("smollm2_trace_all", "run_verified", run_dir("smollm2_trace_all"), t["run"],
+             *steps, trace={"VERIF_TRACE_C5": "all"}),
+        part("smollm2_untraced", "run_verified", untraced, t["run"], *steps,
+             trace={"VERIF_TRACE_STEP": "0"}),
+        part("smollm2_plain", "plain_baseline", plain, t["plain"], kind="plain",
+             report=str(plain / PLAIN_RUN / "records.jsonl")),
+        part("smollm2_check5_profile", "check5_profile", untraced, t["check5_profile"],
+             "--run-dir", str(honest), "--step", str(STORED_STEP), "--out",
+             str(honest / "check5_profile.jsonl"), report=str(honest / "check5_profile.jsonl")),
+    ]
+
+
+def profile_check_plan(upload: Path, out: Path) -> list[Part]:
+    """The profile check's parts (module docstring): the models part and the probe; SmolLM2's
+    calibration, three ``run_verified`` runs, the plain run and the stored step's profile; then
+    each model's ``bring_up --no-tamper --steps 2 --check5-repeats 3`` at
+    :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`, tracing step 2 with metrics on. Every part
+    runs with the sampler (``POTS_SAMPLER`` is never set)."""
+    t = PROFILE_CHECK_TIMEOUT_S
+    plan = [_models_part(upload, out, t["models"]), _probe_part(out)]
+    plan += _smollm2_parts(upload, out)
+    plan += _bring_up_parts(upload, out,
+                            {**RECHECK_ENV, "VERIF_TRACE_STEP": "2", "VERIF_METRICS": "1"},
+                            t["bring_up"], ("--steps", "2", "--check5-repeats", "3"))
+    return plan
+
+
 # Each session: its name in summary.json, and its plan.
 SESSIONS: dict[str, tuple[str, Callable[[Path, Path], list[Part]]]] = {
     "fs11": ("FS11", default_plan),
     "recheck": ("recheck", recheck_plan),
+    "profile-check": ("profile-check", profile_check_plan),
 }
 
 
@@ -1129,8 +1215,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     r.add_argument("--selftest", action="store_true",
                    help="FS11_SELFTEST: stand-in parts (unless --plan), no GPU check")
     r.add_argument("--session", choices=sorted(SESSIONS), default="fs11",
-                   help="FS11_SESSION: the first session's plan (fs11, the default) or the "
-                        "re-check's (recheck); --plan and --selftest replace its parts")
+                   help="FS11_SESSION: the first session's plan (fs11, the default), the "
+                        "re-check's (recheck) or the profile check's (profile-check); --plan "
+                        "and --selftest replace its parts")
     f = sub.add_parser("fetch-models", help="check the upload, fetch the public weights")
     f.add_argument("--upload", type=Path, required=True)
     f.add_argument("--out", type=Path, required=True)
