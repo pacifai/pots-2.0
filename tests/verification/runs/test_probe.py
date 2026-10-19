@@ -86,6 +86,25 @@ def test_fit_m():
     assert probe.fit_m(64, 64, 4) == probe.TOKENS
 
 
+@pytest.mark.parametrize("device, index", [("cuda", 0), ("cuda:1", 1)])
+def test_cuda_device_is_set_by_index(monkeypatch, device, index):
+    """A bare "cuda" names no index, and ``set_device`` needs one (the first H100 check)."""
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def set_device(d):
+        seen.append(d)
+        raise Stop
+
+    monkeypatch.setattr(probe.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(probe.torch.cuda, "set_device", set_device)
+    with pytest.raises(Stop):
+        probe.run_probe(1, env={"VERIF_DEVICE": device})
+    assert seen == [index]
+
+
 def test_cpu_run_writes_a_valid_file(tmp_path):
     out = tmp_path / "sub" / "probe.json"
     assert probe.main(["--out", str(out), "--seconds", "5"]) == 0
