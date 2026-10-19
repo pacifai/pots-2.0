@@ -1632,8 +1632,8 @@ def test_check_5_holds_one_group_at_a_time(llama_out, monkeypatch):
     c, out = llama_out
     alive, real = [], checks._served_group
 
-    def tracked(*a):
-        group = real(*a)
+    def tracked(*a, **kw):
+        group = real(*a, **kw)
         assert not [r for r in alive if r() is not None]
         alive.extend(weakref.ref(t) for t in (group.a, group.b, group.p))
         return group

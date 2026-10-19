@@ -426,6 +426,8 @@ def run_verified(c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torc
     on it (``metrics.in_sample_step``) and judged as ``metrics.judged_step`` says. ``keep``
     stores its step once the step closes, and with ``writer`` a ``kept_transcript`` record
     follows. ``watch`` names the class whose residuals are all logged."""
+    if writer is not None:
+        writer.write_c5_layout(c)  # what the markers' check-5 stamps index
     factory = JudgingVerifiers(c, len(D), w0, bands, k=k, h_D=h_D, seed=seed)
     summaries: list[StepSummary] = []
     kept: list[DiskStore] = []
