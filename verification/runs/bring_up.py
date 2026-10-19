@@ -607,7 +607,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     report(b, k=k, reference=reference, c=c, T_run=cfg.steps, timed=args.metrics)
     if args.check5_repeats > 0:
         check5_repeats(b, c, h_D=h_D, n_records=len(D), k=k, seed=cfg.seed,
-                       step=args.steps, repeats=args.check5_repeats, device=cfg.device, model=cfg.model,
+                       step=args.steps, repeats=args.check5_repeats, device=cfg.device,
+                       model=cfg.model,
                        path=(run_dir if args.metrics else cfg.output_dir) / "check5_profile.jsonl")
     return 0 if b.passed else 1
 
