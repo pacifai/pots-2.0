@@ -318,7 +318,8 @@ def test_cache_release_sits_between_prover_and_verifier_on_cuda(c, D, w0, final,
     assert res.verdict.accepted and log.count("empty_cache") == T and gone == [True] * T
     for t in range(1, T + 1):
         i = log.index(f"verify {t}")
-        assert log[i - 3:i] == ["P5.write", loop_mod.HANDOFF_SECTION, "empty_cache"]
+        assert log[i - 4:i] == ["P5.write", loop_mod.TOTALS_SECTION, loop_mod.HANDOFF_SECTION,
+                                "empty_cache"]
     assert all(s.handoff_s >= 0 and s.verify_s >= 0 for s in res.steps)
 
 
@@ -328,7 +329,7 @@ def test_no_cache_release_off_cuda(c, D, w0, final, monkeypatch):
     assert res.verdict.accepted and "empty_cache" not in log
     assert loop_mod.HANDOFF_SECTION not in log
     for t in range(1, T + 1):
-        assert log[log.index(f"verify {t}") - 1] == "P5.write"
+        assert log[log.index(f"verify {t}") - 1] == loop_mod.TOTALS_SECTION
 
 
 def test_release_cache_off_skips_it_on_cuda(c, D, w0, final, monkeypatch):
@@ -338,7 +339,7 @@ def test_release_cache_off_skips_it_on_cuda(c, D, w0, final, monkeypatch):
     assert res.verdict.accepted and "empty_cache" not in log
     assert loop_mod.HANDOFF_SECTION not in log
     for t in range(1, T + 1):
-        assert log[log.index(f"verify {t}") - 1] == "P5.write"
+        assert log[log.index(f"verify {t}") - 1] == loop_mod.TOTALS_SECTION
 
 
 @pytest.mark.parametrize("env, released", [("1", True), ("0", False)])

@@ -230,7 +230,7 @@ _COMPONENT_OF = {"P0": "P0", "train": "train_captured", "P2": "P2", "P3": "P3", 
                  "P5": "P5"}
 COMPONENTS = ("P0", "train_captured", "P1", "P2", "P3", "P4", "P5")
 RECORD_TYPES = ("environment", "step", "verdict", "time", "memory", "count", "storage",
-                "run_end")
+                "capture", "run_end")
 RUN_PREFIX = "run:"
 # Host spans kept per section per step in markers.jsonl; the calls past them fold into ``rest``.
 MAX_SPANS = 64
@@ -850,13 +850,19 @@ class TimeRecorder(_Recorder):
         return line
 
     def _values(self, accs: list[_Acc]) -> dict[str, Any]:
-        return {"time_s": sum(a.time for a in accs)}
+        return {"time_s": sum(a.time for a in accs), "traced": False}
 
     def _emit(self, t: int, table: dict[str, _Acc], rec: Any) -> None:
         rows = self._rows(t, table)
         if rec is not None and self._verifier is not None:
             rows.append(step_record(self.run, self.scenario, t, self._verifier,
-                                    getattr(rec, "rejection", None), self.step_fields))
+                                    getattr(rec, "rejection", None), self.step_fields,
+                                    transcript_bytes=getattr(rec, "transcript_bytes", None),
+                                    leaves=getattr(rec, "leaves", None)))
+            cap = getattr(rec, "capture", None)
+            if cap is not None:
+                rows.append({"record": "capture", "run": self.run, "scenario": self.scenario,
+                             "step": t, "traced": False, "host_buffers": None, **cap})
         self.rows += rows
         if self.writer is None:
             return
@@ -887,7 +893,9 @@ class TimeRecorder(_Recorder):
 
 
 def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
-                fields: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                fields: Mapping[str, Any] | None = None, *,
+                transcript_bytes: int | None = None, leaves: int | None = None
+                ) -> dict[str, Any]:
     """EQ13 record 1 for step ``t`` (EVALUATION_SPEC §4.1): the verdict, the first failing
     check, each check's ``pass``, ``fail`` or ``not_run``, whether the step is judged, and the
     step's three scores.
@@ -902,7 +910,9 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
     cheat's (``bpr_records``, ``bpr_actual``, ``cheat_step``); each is ``None`` when not given.
     ``judged`` is :func:`judged_step`. ``rho_5``, ``rho_kappa``, ``rho_6`` and ``n_failing``
     are :func:`step_scores` over the tests the verifier measured at this step, and
-    ``f_achieved_max`` / ``f_achieved_at`` :func:`step_floor_fields`."""
+    ``f_achieved_max`` / ``f_achieved_at`` :func:`step_floor_fields`. ``transcript_bytes`` and
+    ``leaves`` are the step's committed bytes and leaf count (``leaf_totals``), ``None`` when the
+    loop didn't take them; ``traced`` is ``False`` until the traced step exists."""
     def pid(cid: str) -> str:
         return "0" if t == 1 and cid == "7" else cid
 
@@ -920,7 +930,8 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
     out = {"record": "step", "run": run, "scenario": scenario,
            "model": None, "corpus": None, "attack": None, "seed": None,
            "bpr_records": None, "bpr_actual": None, "cheat_step": None, **fields,
-           "step": t, "judged": judged_step(verifier, t, fields.get("cheat_step")),
+           "step": t, "traced": False, "transcript_bytes": transcript_bytes, "leaves": leaves,
+           "judged": judged_step(verifier, t, fields.get("cheat_step")),
            "verdict": "reject" if failed else "accept",
            "first_failing_check": rejection.check_id if failed else None,
            "rejection_kind": rejection.kind if failed else None, "checks": checks,
@@ -1484,7 +1495,7 @@ def derive_capture(verified: Iterable[Mapping[str, Any]],
         label = get(v, "P1.label", t)
         dt = sum(get(v, f"train.{x}", t)["time_s"] - get(p, f"P0.{x}", t)["time_s"] for x in xs)
         out.append({"record": "time", "run": run, "scenario": scen, "step": t, **base,
-                    "calls": label["calls"], "time_s": dt + label["time_s"]})
+                    "calls": label["calls"], "time_s": dt + label["time_s"], "traced": False})
     for (run, scen, t), v in phases(verified, "memory").items():
         p = plain_mem.get(t)
         if p is None:
@@ -1697,6 +1708,11 @@ def allocator_settings(release_cache: bool | None = None) -> dict[str, Any]:
             else release_cache}
 
 
+def _dtype_name(dtype: Any) -> str | None:
+    """``"bfloat16"`` for ``torch.bfloat16`` or ``"torch.bfloat16"``; ``None`` for ``None``."""
+    return None if dtype is None else str(dtype).removeprefix("torch.")
+
+
 def environment_record(run: str, *, device: str | torch.device, probe: MemoryProbe,
                        config: Mapping[str, Any] | None = None, band_file_hash: str | None = None,
                        h_D: bytes | None = None, release_cache: bool | None = None,
@@ -1723,6 +1739,7 @@ def environment_record(run: str, *, device: str | torch.device, probe: MemoryPro
         "mem_source": probe.source, "MallocLargeCache": os.environ.get("MallocLargeCache"),
         **allocator_settings(release_cache),
         "machine": machine_facts(),
+        "compute_dtype": _dtype_name(None if config is None else config.get("compute_dtype")),
         "threads": torch.get_num_threads(), **fields,
     }
 

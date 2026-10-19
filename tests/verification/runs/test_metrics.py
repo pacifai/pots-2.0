@@ -973,7 +973,7 @@ def test_main_metrics_flag(monkeypatch, tmp_path, capsys, c):
                                              ).root.hex()
     kinds = {r["record"] for r in read_records(tmp_path / "mlp_smoke")}
     assert kinds == {"environment", "step", "verdict", "time", "memory", "count", "storage",
-                     "run_end"}
+                     "capture", "run_end"}
     assert "metrics: " in capsys.readouterr().out
 
 
