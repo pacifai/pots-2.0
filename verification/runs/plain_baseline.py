@@ -293,7 +293,7 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
             raise ValueError(f"{name} = {n} must be in 1..T = {T}")
     rec = None if metrics is None else metrics.recorder(SCENARIO)
     res = run_plain(c, build_model(), dataset, w0, n_steps=T, seed=seed,
-                    section=None if rec is None else rec.section,
+                    section=None if rec is None else rec.seam(),
                     on_step=None if rec is None else rec.on_step)
     if rec is not None:
         rec.finish()
@@ -320,7 +320,7 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
     if metrics is not None:
         def body(n: int) -> Callable[[Any], Any]:
             return lambda r: run_plain(c, build_model(), dataset, w0, n_steps=n, seed=seed,
-                                       section=r.section, on_step=r.on_step)
+                                       section=r.seam(), on_step=r.on_step)
 
         mem = memory_pass(metrics.run, SCENARIO, body(pass_steps), metrics.probe)
         metrics.write(mem)

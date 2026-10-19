@@ -967,7 +967,7 @@ def test_main_metrics_flag(monkeypatch, tmp_path, capsys, c):
     assert not (tmp_path / "mlp_smoke").exists()
     assert mlp_smoke.main(["--steps", "2", "--metrics"]) == 0
     files = {p.name for p in (tmp_path / "mlp_smoke").iterdir()}
-    assert files == {"records.jsonl", "residuals"}
+    assert files == {"records.jsonl", "markers.jsonl", "residuals"}
     env, *_ = read_records(tmp_path / "mlp_smoke")
     assert env["h_D"] == leaves.dataset_tree(c, synthetic_dataset(c.widths, N_RECORDS, seed=SEED)
                                              ).root.hex()

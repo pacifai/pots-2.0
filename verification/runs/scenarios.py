@@ -249,7 +249,7 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
     the verifier from the metrics seam, in place of the default one with provisional bands:
     C1 (``runs/calibrate.py``) builds one in calibration mode or with the band file. ``seed``
     fixes ``π`` (F8c); a given verifier must hold the same one."""
-    section = None if recorder is None else recorder.section
+    section = None if recorder is None else recorder.seam()
     if h_D is None:
         h_D = dataset_tree(c, dataset).root
     if verifier is None:

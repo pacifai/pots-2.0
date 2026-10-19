@@ -267,6 +267,19 @@ class StepContext:
         """``section(name)``, or a no-op when no metrics seam is set."""
         return _NO_SECTION if self.section is None else self.section(name)
 
+    def stamp(self, name: str, run: int = -1, group: int = -1,
+              window: int = -1) -> AbstractContextManager[Any]:
+        """``section.stamp(name, run, group, window)`` (a profiling stamp,
+        ``runs/metrics.py``), or a no-op when the seam is ``None`` or a plain callable with no
+        ``stamp``."""
+        f = getattr(self.section, "stamp", None)
+        return _NO_SECTION if f is None else f(name, run, group, window)
+
+    def stamper(self) -> Callable[..., AbstractContextManager[Any]] | None:
+        """The seam's stamp function itself, for a loop that stamps many times (check 5's
+        serving), or ``None`` when there is none: a stamp then costs no lookup or forwarding."""
+        return getattr(self.section, "stamp", None)
+
     @classmethod
     def for_computation(cls, c: DeclaredComputation, **kw: Any) -> StepContext:
         """Fill the unit roundoffs from ``C``'s declared dtypes (P6) unless given."""

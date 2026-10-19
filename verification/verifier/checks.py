@@ -41,6 +41,12 @@ Arithmetic is at the working precision, fp32 (P6). Every band comparison is writ
 quantity a band compares must be finite. Check 5's norms are scaled so a finite leaf can't
 overflow them (``freivalds._safe_norm``); an overflow that remains, in a matmul output or in
 check 6's ``η·G``, rejects rather than passing ``inf <= inf``.
+
+**Profiling stamps.** Check 5 marks its parts with ``ctx.stamp`` (``c5.run``, ``c5.glue``,
+``c5.serve``, ``c5.copy``, ``c5.measure``, ``c5.judge``; ``runs/metrics.py``) and
+:func:`check5_layout` says what each run, group and window holds. The serving that
+:func:`_measure_to_failure` redoes after an error carries the run's id and the group's id,
+so its stamps repeat the ids of the normal serving; the layout describes the normal grouping only.
 """
 
 from __future__ import annotations
@@ -48,6 +54,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
@@ -95,6 +102,7 @@ __all__ = [
     "check_2_root",
     "check_6a_linear_update",
     "check_5_matmuls",
+    "check5_layout",
     "check_6b_glue_update",
     "CHECKS",
     "ROOT_SLOT",
@@ -515,6 +523,51 @@ def _measure_groups(specs: Sequence[ProductSpec]) -> list[list[int]]:
     return groups
 
 
+_NO_STAMP = nullcontext()
+
+
+def check5_layout(c: DeclaredComputation) -> list[dict[str, Any]]:
+    """What check 5's profiling stamps index, one entry per group of the normal serving: the run
+    (:func:`_member_runs`), the group, numbered across the step's runs as
+    ``check_5_matmuls`` stamps it (0 ... ``n_groups`` - 1, each once), and the judging window
+    (:data:`_JUDGE_WINDOW`) it falls in, replayed by the rules ``check_5_matmuls`` applies, from
+    the declared computation alone.
+
+    An entry holds ``run``, ``group``, ``window``, ``kind`` (``"dense"`` for a run of one,
+    ``"members"``), ``first`` (the group's first product's ``m``), ``members``, the declared
+    ``a_shape`` and ``b_shape``, ``operand_bytes`` (``A`` and ``B`` as fp32, the group's total),
+    ``product_bytes`` (``P`` in the stored dtype, ``product_dtype``) and ``served_bytes`` (``P`` in
+    fp32). The serving after an error (:func:`_measure_to_failure`) is not described."""
+    return _layout(c)[0]
+
+
+def _layout(c: DeclaredComputation) -> tuple[list[dict[str, Any]], int]:
+    """:func:`check5_layout`'s entries and ``n_windows``, the number of judge calls
+    ``check_5_matmuls`` makes on a pass with no error: a window ends after the run that fills
+    it, and the last is judged even when empty (so it is counted when a run closes the one
+    before it)."""
+    out: list[dict[str, Any]] = []
+    window = pending = 0
+    item = torch.empty(0, dtype=c.product_dtype).element_size()
+    for i, run in enumerate(_member_runs(c.products)):
+        for idx in _measure_groups(run):
+            specs = [run[j] for j in idx]
+            (n, q), (_, w) = specs[0].a_shape, specs[0].b_shape
+            out.append({
+                "run": i, "group": len(out), "window": window,
+                "kind": "dense" if len(run) == 1 else "members", "first": specs[0].m,
+                "members": len(specs), "a_shape": list(specs[0].a_shape),
+                "b_shape": list(specs[0].b_shape),
+                "operand_bytes": 4 * len(specs) * (n * q + q * w),
+                "product_bytes": item * len(specs) * n * w,
+                "product_dtype": str(c.product_dtype).removeprefix("torch."),
+                "served_bytes": 4 * len(specs) * n * w})
+        pending += len(run)
+        if pending >= _JUDGE_WINDOW:
+            window, pending = window + 1, 0
+    return out, window + 1
+
+
 @_checked
 def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepContext,
                     bands: Bands) -> Rejection | None:
@@ -566,10 +619,14 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     scratch = MeasureScratch()
     window: list[_Rows] = []
     pending = 0
-    for run in _member_runs(c.products):
+    w = 0  # the window being filled
+    group0 = 0  # the first group id of the run: ids run across the step's runs
+    for i, run in enumerate(_member_runs(c.products)):
         try:
-            rows, error = _measure_served(c, run, ctx, replay, view, h=root, k=ctx.k,
-                                          scratch=scratch, guard=ctx.kappa_guard)
+            with ctx.stamp("c5.run", i):
+                rows, error = _measure_served(c, run, ctx, replay, view, h=root, k=ctx.k,
+                                              scratch=scratch, guard=ctx.kappa_guard, run=i,
+                                              group0=group0)
         except Exception as e:  # raised after the products before it are judged
             rej = _judge_window(c, window, ctx, bands)
             if rej is None:
@@ -586,14 +643,17 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
                 raise error
             ctx.state.run_rest_error = error
             return rej
+        group0 += len(_measure_groups(run))
         window.append(rows)
         pending += len(rows.specs)
         if pending >= _JUDGE_WINDOW:
-            rej = _judge_window(c, window, ctx, bands)
+            with ctx.stamp("c5.judge", -1, -1, w):
+                rej = _judge_window(c, window, ctx, bands)
             if rej is not None:
                 return rej
-            window, pending = [], 0
-    return _judge_window(c, window, ctx, bands)
+            window, pending, w = [], 0, w + 1
+    with ctx.stamp("c5.judge", -1, -1, w):
+        return _judge_window(c, window, ctx, bands)
 
 
 class _Group(NamedTuple):
@@ -618,7 +678,8 @@ class _Rows(NamedTuple):
 
 def _measure_served(c: DeclaredComputation, specs: Sequence[ProductSpec], ctx: StepContext,
                     replay: Replay, view: TranscriptView, *, h: bytes, k: int,
-                    scratch: MeasureScratch, guard: bool) -> tuple[_Rows, Exception | None]:
+                    scratch: MeasureScratch, guard: bool, run: int | None = None,
+                    group0: int = 0) -> tuple[_Rows, Exception | None]:
     """Serve and measure the run's products a group at a time (:func:`_measure_groups`): the
     rows of the products served before the error that stopped the serving, if any, and that
     error. An error while measuring is raised.
@@ -627,24 +688,29 @@ def _measure_served(c: DeclaredComputation, specs: Sequence[ProductSpec], ctx: S
     are kept, so the device holds one group's operands at a time, at most
     :data:`_GROUP_BYTES` of them. A run of one is served alone (:func:`_served`), a member
     group at once (:func:`_served_group`). If a group's serving raises,
-    :func:`_measure_to_failure` finishes the run one member at a time.
+    :func:`_measure_to_failure` finishes the run one member at a time. ``run`` is the run's
+    position in :func:`_member_runs`, the id its profiling stamps carry; ``None`` (the record
+    pass) stamps nothing. ``group0`` is the id of the run's first group; ids run on across the
+    step's runs.
     """
+    st = ctx.stamper() if run is not None else None
     if len(specs) == 1:
         try:
-            served = [_served(c, specs[0], ctx, replay, view)]
+            served = [_served(c, specs[0], ctx, replay, view, run=run, group=group0, st=st)]
         except Exception as e:
             return _Rows(specs[:0], [], None), e
-        with ctx.timed("5.measure"):
+        with ctx.timed("5.measure"), (st("c5.measure", run, group0) if st else _NO_STAMP):
             return _measure_rows(specs, _stacked(specs, served), h=h, k=k, scratch=scratch,
                                  guard=guard), None
     groups, rows = _measure_groups(specs), []
-    for idx in groups:
+    for g, idx in enumerate(groups):
         try:
-            group = _served_group(c, specs, idx, ctx, replay, view)
+            group = _served_group(c, specs, idx, ctx, replay, view, run=run, group=group0 + g,
+                                  st=st)
         except Exception:  # served again one at a time, which raises at the member
             return _measure_to_failure(c, specs, groups, rows, ctx, replay, view, h=h, k=k,
-                                       scratch=scratch, guard=guard)
-        with ctx.timed("5.measure"):
+                                       scratch=scratch, guard=guard, run=run, group0=group0)
+        with ctx.timed("5.measure"), (st("c5.measure", run, group0 + g) if st else _NO_STAMP):
             rows.append(_measure_rows(specs, [group], h=h, k=k, scratch=scratch,
                                       guard=guard).rows)
         del group  # the operands; only the rows are kept
@@ -653,17 +719,20 @@ def _measure_served(c: DeclaredComputation, specs: Sequence[ProductSpec], ctx: S
 
 
 def _served_group(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Sequence[int],
-                  ctx: StepContext, replay: Replay, view: TranscriptView) -> _Group:
+                  ctx: StepContext, replay: Replay, view: TranscriptView, *,
+                  run: int | None = None, group: int = 0,
+                  st: Callable[..., Any] | None = None) -> _Group:
     """The operands and leaves of the run's members at positions ``idx``, as :func:`_stacked`
     would stack :func:`_served`'s, bit for bit. Any error, a failed shape check included,
-    goes to :func:`_measure_to_failure`."""
-    group = [specs[i] for i in idx]
-    if any(spec.bias is not None for spec in group):
+    goes to :func:`_measure_to_failure`. ``run`` and ``group`` are the profiling stamps' ids
+    and ``st`` the stamp function (``None`` stamps nothing)."""
+    members = [specs[i] for i in idx]
+    if any(spec.bias is not None for spec in members):
         raise RuntimeError("a member names a bias")  # validate forbids it
-    ms = [spec.m for spec in group]
-    with ctx.timed("5.glue"):
+    ms = [spec.m for spec in members]
+    with ctx.timed("5.glue"), (st("c5.glue", run, group) if st else _NO_STAMP):
         a, b = replay.operand_group(ms, torch.float32)
-    first = group[0]
+    first = members[0]
     if (tuple(a.shape), tuple(b.shape)) != ((len(ms), *first.a_shape),
                                             (len(ms), *first.b_shape)):
         raise RuntimeError(f"{first.name}: replay group operands {tuple(a.shape)}·"
@@ -671,15 +740,19 @@ def _served_group(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Seq
     # The leaves are in host memory: one stack there, then one copy to the operands' device
     # (F4a), in the stored dtype and cast there (a blocking `.to(device, dtype)` converts on
     # the CPU).
-    p = torch.stack([view.product(m) for m in ms]).detach().to(a.device).to(torch.float32)
-    return _Group(list(idx), a, b, p, None)
+    with (st("c5.serve", run, group) if st else _NO_STAMP):
+        p = torch.stack([view.product(m) for m in ms])
+        with (st("c5.copy", run, group) if st else _NO_STAMP):
+            p_dev = p.detach().to(a.device)
+    return _Group(list(idx), a, b, p_dev.to(torch.float32), None)
 
 
 def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
                         groups: Sequence[Sequence[int]], rows: Sequence[torch.Tensor],
                         ctx: StepContext, replay: Replay, view: TranscriptView, *, h: bytes,
-                        k: int, scratch: MeasureScratch,
-                        guard: bool) -> tuple[_Rows, Exception | None]:
+                        k: int, scratch: MeasureScratch, guard: bool,
+                        run: int | None = None,
+                        group0: int = 0) -> tuple[_Rows, Exception | None]:
     """:func:`_measure_served` once group ``groups[len(rows)]``'s serving has raised, the
     groups before it measured into ``rows``: the run's rows up to its first failing member,
     and that member's error, or the whole run's rows and ``None`` if no member fails alone.
@@ -691,11 +764,13 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
     are kept. So the products judged are those one-at-a-time serving would reach, and the
     device still holds one group at a time.
     """
+    st = ctx.stamper() if run is not None else None
     done = len(rows)
     end, error = len(specs), None
+    at = {i: group0 + g for g, idx in enumerate(groups) for i in idx}  # a member's group id
     for i in sorted(i for idx in groups[done:] for i in idx):
         try:
-            _served(c, specs[i], ctx, replay, view)
+            _served(c, specs[i], ctx, replay, view, run=run, group=at[i], st=st)
         except Exception as e:
             end, error = i, e
             break
@@ -704,14 +779,17 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
         keep = [i for i in idx if i < end]  # a prefix: a group is in run order
         out.append(r[:len(keep)])
         order += keep
-    for idx in groups[done:]:
+    for g, idx in enumerate(groups):
+        if g < done:
+            continue
         keep = [i for i in idx if i < end]
         if not keep:
             continue
-        served = [_served(c, specs[i], ctx, replay, view) for i in keep]
+        served = [_served(c, specs[i], ctx, replay, view, run=run, group=group0 + g, st=st)
+                  for i in keep]
         group = _Group(keep, *(torch.stack([x[j] for x in served]) for j in range(3)), None)
         del served
-        with ctx.timed("5.measure"):
+        with ctx.timed("5.measure"), (st("c5.measure", run, group0 + g) if st else _NO_STAMP):
             out.append(_measure_rows(specs, [group], h=h, k=k, scratch=scratch,
                                      guard=guard).rows)
         del group
@@ -724,14 +802,16 @@ Served = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
 
 
 def _served(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay: Replay,
-            view: TranscriptView) -> Served:
+            view: TranscriptView, *, run: int | None = None, group: int = 0,
+            st: Callable[..., Any] | None = None) -> Served:
     """Product ``spec.m``'s replayed operands and committed leaf, as fp32 ``(A, B, P, b)``.
 
     ``b`` is the committed ``W_t`` leaf of ``spec.bias``, rounded to the operand format as
-    ``B`` is, or ``None`` for an unbiased product."""
+    ``B`` is, or ``None`` for an unbiased product. ``run`` and ``group`` are the profiling
+    stamps' ids and ``st`` the stamp function (``None`` stamps nothing)."""
     bias = None
     with _guard(ctx, "5", _AFTER_COMMIT):
-        with ctx.timed("5.glue"):
+        with ctx.timed("5.glue"), (st("c5.glue", run, group) if st else _NO_STAMP):
             a, b = replay.operands(spec.m)
         p = view.product(spec.m)
         if spec.bias is not None:
@@ -742,8 +822,11 @@ def _served(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay:
     # The leaves are in host memory, the replay on the run's device (F4a): check 5 measures
     # there, so the leaf moves to the operands, in the stored dtype and cast there (a blocking
     # `.to(device, dtype)` converts on the CPU).
+    with (st("c5.serve", run, group) if st else _NO_STAMP):
+        with (st("c5.copy", run, group) if st else _NO_STAMP):
+            p_dev = p.detach().to(a.device)
     return (a.detach().to(torch.float32), b.detach().to(torch.float32),
-            p.detach().to(a.device).to(torch.float32), bias)
+            p_dev.to(torch.float32), bias)
 
 
 def _stacked(specs: Sequence[ProductSpec], served: Sequence[Served]) -> list[_Group]:
