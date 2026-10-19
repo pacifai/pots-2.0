@@ -774,12 +774,33 @@ def _kill(proc: subprocess.Popen[bytes]) -> None:
             continue
 
 
+def _start_sampler(proc: subprocess.Popen[bytes], out: Path, cwd: Path, python: str) -> Any:
+    """The part's sampler (``setup.sampler``, writing ``out``), or ``None`` when ``POTS_SAMPLER=0``
+    or it can't start: a sampler failure never fails the part."""
+    if os.environ.get("POTS_SAMPLER") == "0":
+        return None
+    try:
+        from setup.sampler import start_sampler
+        return start_sampler(proc.pid, out, cwd=cwd, python=python)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _stop_sampler(handle: Any) -> None:
+    if handle is not None:
+        try:
+            handle.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline: float,
               python: str, current: Path | None = None) -> tuple[str, int | None, float]:
     """Run one part to its end, its time limit or the deadline: (status, exit code, wall s).
 
     ``current``, while the part runs, holds its process group id, so ``fs11_job.sh`` can kill
-    the part too when the session itself hangs."""
+    the part too when the session itself hangs. A sampler (:func:`_start_sampler`) writes the
+    part's ``samples.jsonl`` beside its log."""
     argv = [python if a == "{python}" else a for a in part.argv]
     penv = dict(env)
     for k, v in part.env.items():
@@ -794,6 +815,7 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
         f.flush()
         proc = subprocess.Popen(argv, cwd=cwd, env=penv, stdout=f, stderr=subprocess.STDOUT,
                                 start_new_session=True)
+        sampler = _start_sampler(proc, log.parent / "samples.jsonl", cwd, python)
         if current is not None:
             try:
                 current.write_text(f"{proc.pid}\n")
@@ -816,6 +838,7 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
                     .encode())
             raise
         finally:
+            _stop_sampler(sampler)
             if current is not None:
                 current.unlink(missing_ok=True)
 

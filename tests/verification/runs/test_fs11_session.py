@@ -1139,3 +1139,54 @@ def test_check_upload_reports_the_native_sources(tmp_path):
     assert fs.check_upload(up)["native"]["bad"] == [] and fs.check_upload(up)["native"]["present"]
     (src / "blake3.c").write_text("changed")
     assert fs.check_upload(up)["native"]["bad"] == ["blake3.c"]
+
+
+# ---- the sampler (FS21) -----------------------------------------------------------------
+
+
+def _sampler_session(tmp_path, plan):
+    return fs.run_session(plan, upload=tmp_path / "up", out=tmp_path / "out",
+                          deadline=time.time() + 60, cwd=REPO, say=lambda _: None)
+
+
+def test_selftest_plan_writes_samples_for_every_part(tmp_path):
+    pytest.importorskip("psutil")
+    s = _sampler_session(tmp_path, fs.selftest_plan())
+    assert s["finished"] and not s["failed"]
+    for p in fs.selftest_plan():
+        lines = (tmp_path / "out" / "parts" / p.name / "samples.jsonl").read_text().splitlines()
+        assert json.loads(lines[0])["kind"] == "header"
+    assert len((tmp_path / "out" / "parts" / "selftest_sleep" / "samples.jsonl")
+               .read_text().splitlines()) > 20
+
+
+def test_pots_sampler_0_turns_the_sampler_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("POTS_SAMPLER", "0")
+    s = _sampler_session(tmp_path, [fs.Part("p", _py("print(1)"))])
+    assert s["finished"] and not (tmp_path / "out" / "parts" / "p" / "samples.jsonl").exists()
+
+
+def test_a_sampler_that_cannot_start_never_fails_the_part(tmp_path, monkeypatch):
+    from setup import sampler
+
+    def boom(*a, **k):
+        raise OSError("no sampler")
+    monkeypatch.setattr(sampler, "start_sampler", boom)
+    s = _sampler_session(tmp_path, [fs.Part("p", _py("print(1)"))])
+    assert s["finished"] and s["parts"][0]["status"] == "ok"
+
+
+def test_a_killed_part_leaves_no_sampler_behind(tmp_path, monkeypatch):
+    pytest.importorskip("psutil")
+    from setup import sampler
+    monkeypatch.setattr(fs, "KILL_GRACE_S", 2)
+    started = []
+    real = sampler.start_sampler
+
+    def spy(*a, **k):
+        started.append(real(*a, **k))
+        return started[-1]
+    monkeypatch.setattr(sampler, "start_sampler", spy)
+    s = _sampler_session(tmp_path, [fs.Part("long", ["sleep", "30"], timeout_s=2)])
+    assert s["parts"][0]["status"] == "killed_timeout"
+    assert started and started[0].proc.poll() is not None
