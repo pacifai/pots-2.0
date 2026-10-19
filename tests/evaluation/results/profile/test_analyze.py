@@ -699,8 +699,9 @@ HASH_DEPTHS["2.hash"] = 1
 
 
 def hash_rows(owner: str, parts: dict[str, float], steps: int = 3):
-    return [time_row(k, f"{owner}.hash.{p}", v, side="prover" if owner == "P3.commit" else "verifier",
-                     level="sub") for k in range(1, steps + 1) for p, v in parts.items()]
+    side = "prover" if owner == "P3.commit" else "verifier"
+    return [time_row(k, f"{owner}.hash.{p}", v, side=side, level="sub")
+            for k in range(1, steps + 1) for p, v in parts.items()]
 
 
 def test_hash_breakdown_with_stats(tmp_path):

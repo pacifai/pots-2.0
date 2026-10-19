@@ -458,8 +458,8 @@ def _hash_table(run: Run) -> str:
     out = []
     for key, h in hv.items():
         w = h.get("wall") or {}
-        rows: list[list[Any]] = [["hashing wall", "—", fmt(w.get("s")), "—", fmt(w.get("floor_s")),
-                                  fmt(w.get("ratio"))]]
+        rows: list[list[Any]] = [["hashing wall", "—", fmt(w.get("s")), "—",
+                                  fmt(w.get("floor_s")), fmt(w.get("ratio"))]]
         for p, v in (h.get("parts") or {}).items():
             if v:
                 rows.append([p, v.get("lane"), fmt(v.get("s")), fmt(v.get("share")),
