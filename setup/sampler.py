@@ -10,7 +10,7 @@ the GPM fields as they come), PCIe is bytes/s. A group that fails is logged once
 line (the header holds the start-up failures in ``errors``) and reads ``null`` from then on.
 
 Only the standard library at import; ``psutil`` and ``pynvml`` load when the sampler starts.
-The loop paces to a deadline, flushes once a second and ends on SIGTERM or when the root
+The loop paces to a deadline, flushes after every line and ends on SIGTERM or when the root
 process is gone. Nothing here raises into the sampled run.
 """
 
@@ -43,7 +43,7 @@ FIELDS = [
 ]
 STOP_GRACE_S = 5.0
 TREE_REFRESH_S = 1.0
-FLUSH_S = 1.0
+GPM_FALLBACK_S = 5.0
 MIB = 1 << 20
 _CG = Path("/sys/fs/cgroup")
 # GPM metric name -> (field, scale to the field's unit); the ids are pynvml's NVML_GPM_METRIC_*.
@@ -59,26 +59,36 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-def _cgroup_limits() -> dict[str, float | None]:
+def _cgroup_dir(proc_cgroup: str | None = None) -> Path:
+    """The sampler's own cgroup v2 directory, from ``/proc/self/cgroup`` text (the ``0::<path>``
+    line), else the cgroup root (v1, no cgroup, or a container's own namespace root)."""
+    text = _read_text(Path("/proc/self/cgroup")) if proc_cgroup is None else proc_cgroup
+    for line in (text or "").splitlines():
+        if line.startswith("0::"):
+            return _CG / line[3:].strip().lstrip("/")
+    return _CG
+
+
+def _cgroup_limits(base: Path = _CG) -> dict[str, float | None]:
     """The container's CPU quota (cores) and memory limit (bytes), ``None`` where unlimited or
-    absent (cgroup v2, else v1)."""
+    absent (cgroup v2 under ``base``, else v1)."""
     quota = limit = None
-    cpu_max = _read_text(_CG / "cpu.max")
+    cpu_max = _read_text(base / "cpu.max")
     if cpu_max:
         q, _, p = cpu_max.partition(" ")
         quota = int(q) / int(p) if q != "max" and p else None
     elif (q1 := _read_text(_CG / "cpu/cpu.cfs_quota_us")) and (p1 := _read_text(
             _CG / "cpu/cpu.cfs_period_us")) and int(q1) > 0:
         quota = int(q1) / int(p1)
-    mem = _read_text(_CG / "memory.max") or _read_text(_CG / "memory/memory.limit_in_bytes")
+    mem = _read_text(base / "memory.max") or _read_text(_CG / "memory/memory.limit_in_bytes")
     if mem and mem != "max" and int(mem) < 1 << 60:
         limit = int(mem)
     return {"cpu_quota": quota, "mem_limit": limit}
 
 
-def _cgroup_throttle() -> tuple[int, int] | None:
+def _cgroup_throttle(base: Path = _CG) -> tuple[int, int] | None:
     """(throttled µs, throttled periods), cumulative, from the cgroup's ``cpu.stat``."""
-    for path, scale in ((_CG / "cpu.stat", 1), (_CG / "cpu/cpu.stat", 1000)):
+    for path, scale in ((base / "cpu.stat", 1), (_CG / "cpu/cpu.stat", 1000)):
         text = _read_text(path)
         if text is None:
             continue
@@ -90,7 +100,7 @@ def _cgroup_throttle() -> tuple[int, int] | None:
     return None
 
 
-def _faults(p: Any, psutil: Any) -> tuple[int, int]:
+def _faults(p: Any) -> tuple[int, int]:
     """(minor, major) page faults of one process, cumulative."""
     if sys.platform.startswith("linux"):
         stat = Path(f"/proc/{p.pid}/stat").read_text()
@@ -100,12 +110,27 @@ def _faults(p: Any, psutil: Any) -> tuple[int, int]:
     return m.pfaults - m.pageins, m.pageins
 
 
+# Per-process readers by group: (fields, reader). The levels are summed over the tree, the
+# cumulative counters become per-second rates.
+_TREE: dict[str, tuple[tuple[str, ...], Callable[[Any], tuple[float, ...]]]] = {
+    "cpu": (("c_tree",), lambda p: (sum(p.cpu_times()[:2]),)),
+    "rss": (("rss",), lambda p: (p.memory_info().rss,)),
+    "threads": (("threads",), lambda p: (p.num_threads(),)),
+    "io": (("io_r", "io_w"), lambda p: (lambda c: (c.read_bytes, c.write_bytes))(p.io_counters())),
+    "faults": (("minflt", "majflt"), lambda p: _faults(p)),
+}
+_LEVELS = ("rss", "threads")
+
+
 class _Sampler:
     def __init__(self, pid: int, out: IO[str], interval: float, gpu: int, psutil: Any) -> None:
         self.ps, self.out, self.interval, self.gpu = psutil, out, interval, gpu
         self.root = psutil.Process(pid)
         self.me = psutil.Process()
+        self.cg = _cgroup_dir()
         self.procs: dict[int, Any] = {}
+        self.gpm_t0 = 0
+        self.gpm_ok = False
         self.tree_at = float("-inf")
         self.prev: dict[Any, float] = {}
         self.t_prev = time.monotonic_ns()
@@ -128,14 +153,20 @@ class _Sampler:
         try:
             return fn()
         except Exception as e:  # noqa: BLE001 (the sampler never raises)
-            if group not in self.failed:
-                self.failed.add(group)
-                err = {"group": group, "error": f"{type(e).__name__}: {e}"}
-                if self.started:
-                    self.out.write(json.dumps({"kind": "error", **err}) + "\n")
-                else:
-                    self.errors.append(err)
+            self._log(group, f"{type(e).__name__}: {e}")
             return None
+
+    def _log(self, group: str, error: str) -> None:
+        """Record ``group``'s first failure: in the header's errors before it is written,
+        else as an error line."""
+        if group in self.failed:
+            return
+        self.failed.add(group)
+        err = {"group": group, "error": error}
+        if self.started:
+            self.out.write(json.dumps({"kind": "error", **err}) + "\n")
+        else:
+            self.errors.append(err)
 
     # -- start-up ---------------------------------------------------------------------------
 
@@ -176,6 +207,7 @@ class _Sampler:
             self.gpm = {"ids": ids, "bufs": [nv.nvmlGpmSampleAlloc(), nv.nvmlGpmSampleAlloc()],
                         "n": 0}
             nv.nvmlGpmSampleGet(self.handle, self.gpm["bufs"][0])
+            self.gpm_t0 = time.monotonic_ns()
         except Exception as e:  # noqa: BLE001
             self.gpm_error = f"{type(e).__name__}: {e}"
             self.gpm = None
@@ -192,7 +224,7 @@ class _Sampler:
             "pcie_source": self.pcie_source,
             "cpu_logical": self._try("cpu_count", lambda: ps.cpu_count()),
             "cpu_physical": self._try("cpu_count", lambda: ps.cpu_count(logical=False)),
-            "cgroup": self._try("cgroup", _cgroup_limits) or {"cpu_quota": None, "mem_limit": None},
+            "cgroup": self._try("cgroup", lambda: _cgroup_limits(self.cg)) or {"cpu_quota": None, "mem_limit": None},
             "errors": self.errors, "fields": FIELDS,
         }
 
@@ -204,35 +236,6 @@ class _Sampler:
         self.tree_at = now
         kids = self._try("tree", lambda: self.root.children(recursive=True)) or []
         self.procs = {p.pid: p for p in (self.root, *kids)}
-
-    def _tree_sum(self, key: str, get: Callable[[Any], float]) -> float | None:
-        """The tree's total of ``get(p)`` over the processes that answer, ``None`` when the
-        reader itself fails."""
-        def total() -> float:
-            s = 0.0
-            for pid, p in list(self.procs.items()):
-                try:
-                    s += get(p)
-                except (self.ps.NoSuchProcess, self.ps.ZombieProcess, self.ps.AccessDenied,
-                        OSError, AttributeError, NotImplementedError):
-                    self.procs.pop(pid, None)
-            return s
-        return self._try(key, total)
-
-    def _tree_delta(self, key: str, get: Callable[[Any], float], dt: float) -> float | None:
-        """Per-second change of a per-process cumulative counter, over the processes seen in
-        both this sample and the last."""
-        seen = 0.0
-        def delta(p: Any) -> float:
-            nonlocal seen
-            v = get(p)
-            old = self.prev.get((key, p.pid))
-            self.prev[(key, p.pid)] = v
-            if old is not None:
-                seen += v - old
-            return 0.0
-        total = self._tree_sum(key, delta)
-        return None if total is None else seen / dt
 
     def _delta(self, key: str, value: float, dt: float) -> float:
         old = self.prev.get(key)
@@ -265,7 +268,7 @@ class _Sampler:
             self.cpu_mhz = self._cpu_mhz()
         row["cpu_mhz"] = self.cpu_mhz
         if sys.platform.startswith("linux"):
-            cg = self._try("cgroup_stat", _cgroup_throttle)
+            cg = self._try("cgroup_stat", lambda: _cgroup_throttle(self.cg))
             if cg is not None:
                 row["cg_throttled_us"] = self._delta("cg_us", cg[0], 1.0)
                 row["cg_nr_throttled"] = self._delta("cg_nr", cg[1], 1.0)
@@ -278,15 +281,53 @@ class _Sampler:
         except Exception:  # noqa: BLE001
             return None
 
-    def _tree(self, row: dict[str, Any], dt: float) -> None:
-        row["c_tree"] = self._tree_delta("cpu", lambda p: sum(p.cpu_times()[:2]), dt)
-        row["rss"] = self._tree_sum("rss", lambda p: p.memory_info().rss)
-        row["threads"] = self._tree_sum("threads", lambda p: p.num_threads())
-        if hasattr(self.ps.Process, "io_counters"):
-            row["io_r"] = self._tree_delta("io_r", lambda p: p.io_counters().read_bytes, dt)
-            row["io_w"] = self._tree_delta("io_w", lambda p: p.io_counters().write_bytes, dt)
-        row["minflt"] = self._tree_delta("minflt", lambda p: _faults(p, self.ps)[0], dt)
-        row["majflt"] = self._tree_delta("majflt", lambda p: _faults(p, self.ps)[1], dt)
+    def _new_child_cpu(self, p: Any, cum: float, dt: float, wall: float) -> float:
+        """CPU a process unseen so far used in this interval: all of ``cum`` if it was born
+        inside it, else ``cum`` scaled by the interval's share of its age."""
+        try:
+            age = wall - p.create_time()
+        except self.ps.Error:
+            return 0.0
+        return cum if age <= dt else cum * dt / age
+
+    def _tree(self, row: dict[str, Any], dt: float, wall: float) -> None:
+        """One pass over the tree, each process under ``oneshot()``, each group read once."""
+        groups = {g: v for g, v in _TREE.items()
+                  if g != "io" or hasattr(self.ps.Process, "io_counters")}
+        acc = {f: 0.0 for fields, _ in groups.values() for f in fields}
+        bad: set[str] = set()
+        gone = (self.ps.Error, OSError, AttributeError, NotImplementedError)
+        for pid, p in list(self.procs.items()):
+            try:
+                with p.oneshot():
+                    for g, (fields, read) in groups.items():
+                        if g in bad:
+                            continue
+                        try:
+                            vals = read(p)
+                        except gone:
+                            raise
+                        except Exception as e:  # noqa: BLE001
+                            self._log(g, f"{type(e).__name__}: {e}")
+                            bad.add(g)
+                            continue
+                        for f, v in zip(fields, vals):
+                            if g in _LEVELS:
+                                acc[f] += v
+                                continue
+                            old = self.prev.get((f, pid))
+                            self.prev[(f, pid)] = v
+                            if old is not None:
+                                acc[f] += v - old
+                            elif g == "cpu":
+                                acc[f] += self._new_child_cpu(p, v, dt, wall)
+            except gone:
+                self.procs.pop(pid, None)
+        for g, (fields, _) in groups.items():
+            for f in fields:
+                row[f] = None if g in bad else acc[f] if g in _LEVELS else acc[f] / dt
+        self.prev = {k: v for k, v in self.prev.items()
+                     if not isinstance(k, tuple) or k[1] in self.procs}
         if row["c_busy"] is not None and row["c_tree"] is not None:
             row["c_other"] = row["c_busy"] - row["c_tree"]
 
@@ -317,11 +358,22 @@ class _Sampler:
             row["g_pcie_rx"] = self._try("pcie", lambda: pcie(nv.NVML_PCIE_UTIL_RX_BYTES))
         procs = self._try("g_other_procs", lambda: nv.nvmlDeviceGetComputeRunningProcesses(h))
         if procs is not None:
-            row["g_other_procs"] = sum(1 for p in procs if p.pid not in self.procs)
+            if procs and not any(self.ps.pid_exists(p.pid) for p in procs):
+                self._log("g_other_procs", "the GPU's process ids don't resolve here "
+                          "(another pid namespace), so the count would be wrong")
+            else:
+                row["g_other_procs"] = sum(1 for p in procs if p.pid not in self.procs)
         if self.gpm is not None:
-            self._try("gpm", lambda: self._gpm(row))
+            ok = self._try("gpm", lambda: self._gpm(row))
+            self.gpm_ok = self.gpm_ok or bool(ok)
+            if not self.gpm_ok and time.monotonic_ns() - self.gpm_t0 >= GPM_FALLBACK_S * 1e9:
+                self.gpm, self.pcie_source = None, "nvml"
+                self._log("gpm_fallback", f"GPM gave no reading in {GPM_FALLBACK_S:g} s; PCIe "
+                          "now comes from nvmlDeviceGetPcieThroughput")
 
-    def _gpm(self, row: dict[str, Any]) -> None:
+    def _gpm(self, row: dict[str, Any]) -> bool:
+        """One GPM reading into ``row``; a metric that failed stays ``None``. True when any
+        metric answered."""
         nv, g = self.nv, self.gpm
         old, new = g["bufs"][g["n"] % 2], g["bufs"][(g["n"] + 1) % 2]
         nv.nvmlGpmSampleGet(self.handle, new)
@@ -334,18 +386,23 @@ class _Sampler:
         for i, name in enumerate(names):
             q.metrics[i].metricId = g["ids"][name]
         nv.nvmlGpmMetricsGet(q)
+        ok = False
         for i, name in enumerate(names):
             field, scale = {**_GPM_FIELDS, **_GPM_PCIE}[name]
-            row[field] = q.metrics[i].value * scale
+            if getattr(q.metrics[i], "nvmlReturn", 0) == getattr(nv, "NVML_SUCCESS", 0):
+                row[field] = q.metrics[i].value * scale
+                ok = True
+        return ok
 
     def sample(self, t: int) -> dict[str, Any]:
         dt = max((t - self.t_prev) / 1e9, 1e-9)
+        wall = time.time()
         row: dict[str, Any] = dict.fromkeys(FIELDS)
         row["t"] = t
         self.cpu_mhz_due = int(t / 1e9) != int(self.t_prev / 1e9)
         self._refresh_tree(t / 1e9)
         self._machine(row, dt)
-        self._tree(row, dt)
+        self._tree(row, dt, wall)
         self._gpu(row)
         self.t_prev = t
         return row
@@ -402,7 +459,7 @@ def run(pid: int, out: Path, interval: float = 0.1, gpu: int = 0,
             if alive is None:
                 def alive() -> bool:
                     return _root_alive(psutil, s.root)
-            flushed = nxt = time.monotonic()
+            nxt = time.monotonic()
             while True:
                 nxt += interval
                 now = time.monotonic()
@@ -410,9 +467,7 @@ def run(pid: int, out: Path, interval: float = 0.1, gpu: int = 0,
                     break
                 nxt = max(nxt, time.monotonic() - interval)  # an overrun skips, never bursts
                 f.write(json.dumps(s.sample(time.monotonic_ns())) + "\n")
-                if time.monotonic() - flushed >= FLUSH_S:
-                    f.flush()
-                    flushed = time.monotonic()
+                f.flush()
         except Exception as e:  # noqa: BLE001
             print(f"sampler: stopped on {type(e).__name__}: {e}", file=sys.stderr)
         finally:
@@ -429,16 +484,23 @@ class Handle:
     def stop(self) -> None:
         """SIGTERM, then SIGKILL after :data:`STOP_GRACE_S`. Never raises. A sampler that is
         still starting (no header yet) gets up to :data:`STOP_GRACE_S` to write it first, so a
-        part that ends at once still leaves its file."""
+        part that ends at once still leaves its file; one with no header after that is
+        killed at once."""
         deadline = time.monotonic() + STOP_GRACE_S
+        ready = False
         while self.proc.poll() is None and time.monotonic() < deadline:
             try:
                 if self.out.stat().st_size > 0:
+                    ready = True
                     break
             except OSError:
                 pass
             time.sleep(0.02)
-        for sig, wait in ((signal.SIGTERM, STOP_GRACE_S), (signal.SIGKILL, STOP_GRACE_S)):
+        if self.proc.poll() is None and not ready:
+            steps = ((signal.SIGKILL, STOP_GRACE_S),)  # stuck before its header: no second wait
+        else:
+            steps = ((signal.SIGTERM, STOP_GRACE_S), (signal.SIGKILL, STOP_GRACE_S))
+        for sig, wait in steps:
             try:
                 self.proc.send_signal(sig)
                 self.proc.wait(timeout=wait)
@@ -486,11 +548,24 @@ def main(argv: list[str] | None = None) -> int:
             child.terminate()
     signal.signal(signal.SIGTERM, on_term)
     pid = child.pid if child is not None else a.pid
-    rc = run(pid, a.out, a.interval, a.gpu, stop,
-             alive=(lambda: child.poll() is None) if child is not None else None)
-    if child is not None:
-        return child.wait() if rc == 0 else rc
-    return rc
+    if child is None:
+        return run(pid, a.out, a.interval, a.gpu, stop)
+    try:
+        rc = run(pid, a.out, a.interval, a.gpu, stop, alive=lambda: child.poll() is None)
+    finally:
+        _reap(child)
+    return child.returncode if rc == 0 else rc
+
+
+def _reap(child: subprocess.Popen[bytes]) -> None:
+    """Terminate the wrapped command if it still runs, kill it after :data:`STOP_GRACE_S`."""
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=STOP_GRACE_S)
+        except subprocess.TimeoutExpired:
+            child.kill()
+    child.wait()
 
 
 if __name__ == "__main__":
