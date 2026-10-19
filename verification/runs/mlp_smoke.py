@@ -184,7 +184,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                "n_records": len(dataset), "M": c.M, "n_leaves": c.n_leaves}
         # The config hash covers what decides the run's results, not where it writes.
         config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-                     if f.name not in ("output_dir", "metrics", "release_cache")}, "mlp": mlp}
+                     if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
+                                       "trace_c5")}, "mlp": mlp}
         # Bands are provisional, so there is no band file.
         with MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
                            model="mlp", corpus="synthetic", seed=cfg.seed, config=config,

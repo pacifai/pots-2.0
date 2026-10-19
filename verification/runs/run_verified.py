@@ -589,7 +589,8 @@ def main(argv: Sequence[str] | None = None) -> int:
              "M": c.M, "n_leaves": c.n_leaves, "pass_steps": S, "count_steps": COUNT_STEPS,
              "keep_step": keep_step}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-                 if f.name not in ("output_dir", "metrics", "release_cache")}, "llama": llama}
+                 if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
+                                   "trace_c5")}, "llama": llama}
     base = dict(k=k, seed=cfg.seed, h_D=h_D, build_model=models)
     finals = {T: final}
 

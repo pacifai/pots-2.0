@@ -106,7 +106,8 @@ _CONFIG_FIELDS = ("model", "model_revision", "threads", "config_hash", "h_D", "s
 # ---- provenance ---------------------------------------------------------------------------
 
 
-_NOT_TRAINING = ("output_dir", "metrics", "release_cache", "steps", "attack", "poison_count")
+_NOT_TRAINING = ("output_dir", "metrics", "release_cache", "steps", "attack", "poison_count",
+                 "trace_step", "trace_c5")
 
 
 def training_config(cfg: RunConfig) -> dict[str, Any]:

@@ -27,6 +27,9 @@ def test_defaults_match_claude_md_table():
     assert cfg.head_blocks == 1
     assert cfg.release_cache is True
     assert load_config({"VERIF_RELEASE_CACHE": "0"}).release_cache is False
+    assert (cfg.trace_step, cfg.trace_c5) == (0, "slice")
+    on = load_config({"VERIF_TRACE_STEP": "3", "VERIF_TRACE_C5": "all"})
+    assert (on.trace_step, on.trace_c5) == (3, "all")
 
 
 def test_overrides_are_parsed():
@@ -82,6 +85,7 @@ def test_eta_defaults_to_declared_value():
     ("VERIF_RELEASE_CACHE", "2"), ("VERIF_RELEASE_CACHE", "off"), ("VERIF_DEVICE", "tpu9"), ("VERIF_MODEL", ""), ("VERIF_ATTN_IMPL", "sdpa"),
     ("VERIF_ATTACK", "advbench"), ("VERIF_ATTACK", ""), ("VERIF_POISON_COUNT", "0"),
     ("VERIF_HEAD_BLOCKS", "0"), ("VERIF_HEAD_BLOCKS", "two"),
+    ("VERIF_TRACE_STEP", "-1"), ("VERIF_TRACE_STEP", "x"), ("VERIF_TRACE_C5", "some"),
 ])
 def test_invalid_values_raise(name, value):
     with pytest.raises(ValueError, match=name):
