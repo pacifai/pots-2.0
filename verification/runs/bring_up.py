@@ -52,12 +52,16 @@ cache.
    (an option of this run only; the protocol code is the same); the write lands in the commit
    time.
 
-6. **Check 5's repeats** (``--check5-repeats N``, default 0 = off). The run keeps step 1's
-   transcript in host memory. After every verdict and table is printed, check 5's measuring
-   runs on it N times as ``check5_profile`` runs it (``profile_step``), on the in-sample bands,
-   and appends one line to ``$VERIF_OUTPUT_DIR/check5_profile.jsonl`` (under ``--metrics``,
-   ``$VERIF_OUTPUT_DIR/bring_up/check5_profile.jsonl``) in ``check5_profile --out``'s format. They change no verdict, exit code or other file, and no step's time rows
-   hold their time; the kept step is dropped when they finish.
+6. **Check 5's repeats** (``--check5-repeats N``, default 0 = off). The run keeps the last
+   step's transcript (step ``T``) in host memory. Every earlier step is released as in a run
+   without the option, so the prover's pinned buffers serve the next step and each step before
+   the last is a steady-state one. After every verdict and table is printed, check 5's
+   measuring runs on step ``T`` N times as ``check5_profile`` runs it (``profile_step``), on
+   the in-sample bands, and appends one line to ``$VERIF_OUTPUT_DIR/check5_profile.jsonl``
+   (under ``--metrics``, ``$VERIF_OUTPUT_DIR/bring_up/check5_profile.jsonl``) in
+   ``check5_profile --out``'s format, with ``step`` = ``T``. They change no verdict, exit code
+   or other file, and no step's time rows hold their time; the kept step is dropped when they
+   finish.
 
 7. **A timed run** (``--metrics``, default off; not ``VERIF_METRICS``). The honest run is
    observed by a ``TimeRecorder`` into ``$VERIF_OUTPUT_DIR/bring_up/`` (records, markers,
@@ -176,7 +180,7 @@ class BringUp:
     bands: Bands | None
     freeze_rejection: Rejection | None
     tampers: list[Tamper] = field(default_factory=list)
-    kept: InMemoryStore | None = None  # step 1's transcript, when asked for
+    kept: InMemoryStore | None = None  # step T's transcript, when asked for
 
     @property
     def honest_accepted(self) -> bool:
@@ -195,17 +199,20 @@ class BringUp:
                 and all(t.rejected_as_expected for t in self.tampers))
 
 
-class _KeepFirst(StoreHandoff):
-    """``inner``'s hand-off, also holding a reference to step 1's leaves and tree."""
+class _KeepLast(StoreHandoff):
+    """``inner``'s hand-off, also holding a reference to step ``last``'s leaves and tree. Every
+    earlier step goes through untouched, so its leaves are released as in a run that keeps
+    nothing (the prover's pinned buffers then serve the next step)."""
 
-    def __init__(self, inner: StoreHandoff) -> None:
+    def __init__(self, inner: StoreHandoff, last: int) -> None:
         self.inner = inner
+        self.last = last
         self.held: tuple[DeclaredComputation, list[Any], MerkleTree,
                          Sequence[Sequence[bytes]] | None] | None = None
 
     def hold(self, c: DeclaredComputation, t: int, leaves: list[Any], tree: MerkleTree,
              dataset_paths: Sequence[Sequence[bytes]] | None = None) -> TranscriptStore:
-        if t == 1:
+        if t == self.last:
             self.held = (c, leaves, tree, dataset_paths)
         return self.inner.hold(c, t, leaves, tree, dataset_paths)
 
@@ -291,7 +298,7 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
              tamper: bool = True, device: str | torch.device = "cpu",
              handoff: StoreHandoff | None = None,
              echo: Callable[[str], None] | None = None,
-             release_cache: bool | None = None, keep_first: bool = False,
+             release_cache: bool | None = None, keep_last: bool = False,
              recorder: Any = None) -> BringUp:
     """Items 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
     a random-weight config runs the same path). ``build_model`` (default ``c.build_model``)
@@ -301,11 +308,12 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
     prints each section's peak as the memory pass closes it (``MemoryRecorder``), so a run that
     dies mid-step still shows where its memory went. ``release_cache=False`` skips the CUDA
     cache release between prover and verifier, in the honest steps and the tampers alike;
-    ``None`` (the default) reads ``VERIF_RELEASE_CACHE``. ``keep_first`` keeps the honest
-    step 1's transcript in memory as ``BringUp.kept`` (the tampers' steps are not kept).
+    ``None`` (the default) reads ``VERIF_RELEASE_CACHE``. ``keep_last`` keeps the honest
+    step ``T``'s transcript in memory as ``BringUp.kept``, so the steps before it are released
+    as in a run without it (the tampers' steps are not kept).
     ``recorder`` (a timed run's ``TimeRecorder``) observes the honest run in place of the memory
     pass, which is then skipped: ``BringUp.memory_rows`` is empty."""
-    keeper = _KeepFirst(handoff or IN_MEMORY) if keep_first else None
+    keeper = _KeepLast(handoff or IN_MEMORY, T) if keep_last else None
     models = ReusedModel(build_model or c.build_model)
     w0 = snapshot_weights(c, models())
     # Check 8's reference as leaf hashes, in C's weight order, so the run holds no extra copy
@@ -495,23 +503,24 @@ def report(b: BringUp, *, k: int, reference: Bands | None,
 
 
 def check5_repeats(b: BringUp, c: DecoderComputation, *, h_D: bytes, n_records: int, k: int,
-                   seed: int, repeats: int, device: str, model: str, path: Path,
+                   seed: int, step: int, repeats: int, device: str, model: str, path: Path,
                    out: Callable[[str], None] = print) -> bool:
-    """Item 6: check 5's measuring on the kept step 1, ``repeats`` times, on ``b``'s in-sample
-    bands, one line appended to ``path``. Drops the kept step either way. Returns whether the
-    line was written; it isn't when the run has no accepted fit or the measuring raises."""
+    """Item 6: check 5's measuring on the kept step ``step`` (the run's last), ``repeats``
+    times, on ``b``'s in-sample bands, one line appended to ``path``. Drops the kept step
+    either way. Returns whether the line was written; it isn't when the run has no accepted
+    fit or the measuring raises."""
     kept, b.kept = b.kept, None
     if kept is None or b.bands is None or not b.honest_accepted:
-        out("check 5 repeats: skipped, the run has no accepted step 1 and fit")
+        out(f"check 5 repeats: skipped, the run has no accepted step {step} and fit")
         return False
     try:
-        r = profile_step(c, kept, 1, None, b.bands, seed=seed, h_D=h_D, n_records=n_records,
+        r = profile_step(c, kept, step, None, b.bands, seed=seed, h_D=h_D, n_records=n_records,
                          k=k, repeats=repeats, device=device, out=out)
     except Exception as e:  # the verdict is printed; the repeats may not change it
         out(f"check 5 repeats: failed, {type(e).__name__}: {e}")
         return False
     with open(path, "a") as f:
-        f.write(json.dumps(record_line(r, model=model, device=device, k=k, step=1)) + "\n")
+        f.write(json.dumps(record_line(r, model=model, device=device, k=k, step=step)) + "\n")
     out(f"check 5 repeats: {repeats} passes, median {statistics.median(r.check5_s):.3f} s; "
         f"line appended to {path}")
     return True
@@ -528,8 +537,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="hand each step to the verifier on disk under DIR (C3's DiskHandoff, "
                         "one directory per step, deleted once verified); default in memory")
     p.add_argument("--check5-repeats", type=int, default=0, metavar="N",
-                   help="after the verdict, time check 5 on step 1 N times and append one line "
-                        "to $VERIF_OUTPUT_DIR/check5_profile.jsonl (default 0, off)")
+                   help="after the verdict, time check 5 on the last step (step T) N times and "
+                        "append one line to $VERIF_OUTPUT_DIR/check5_profile.jsonl; earlier "
+                        "steps are released as without it (default 0, off)")
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=False,
                    help="time the honest run into the run directory $VERIF_OUTPUT_DIR/"
                         f"{RUN_NAME}/ (records, markers, VERIF_TRACE_STEP's trace) in place of "
@@ -588,7 +598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
                      device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
                      echo=lambda line: print(line, flush=True),
-                     release_cache=cfg.release_cache, keep_first=args.check5_repeats > 0,
+                     release_cache=cfg.release_cache, keep_last=args.check5_repeats > 0,
                      recorder=rec)
     finally:
         if mw is not None:
@@ -597,7 +607,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report(b, k=k, reference=reference, c=c, T_run=cfg.steps, timed=args.metrics)
     if args.check5_repeats > 0:
         check5_repeats(b, c, h_D=h_D, n_records=len(D), k=k, seed=cfg.seed,
-                       repeats=args.check5_repeats, device=cfg.device, model=cfg.model,
+                       step=args.steps, repeats=args.check5_repeats, device=cfg.device, model=cfg.model,
                        path=(run_dir if args.metrics else cfg.output_dir) / "check5_profile.jsonl")
     return 0 if b.passed else 1
 
