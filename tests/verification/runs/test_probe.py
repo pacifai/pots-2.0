@@ -27,6 +27,21 @@ def test_fit_refits_a_negative_leaf_cost_to_zero():
     assert 0 <= probe.fit_residual(mixes, per_byte, per_leaf) < 0.1
 
 
+def test_alloc_fit_recovers_exact_rates():
+    per_call, per_byte = 3.0e-3, 4.0e-10
+    points = [(n, per_call + n * per_byte) for n in (16 << 20, 64 << 20, 256 << 20, 1 << 30)]
+    got_call, got_byte = probe.fit_alloc_rate(points)
+    assert got_call == pytest.approx(per_call, rel=1e-6)
+    assert got_byte == pytest.approx(per_byte, rel=1e-6)
+
+
+def test_alloc_fit_refits_a_negative_per_call_cost_to_zero():
+    # times on a line with a negative intercept, as noise can give
+    points = [(n, n * 1.0e-9 - 5.0e-4) for n in (1 << 20, 1 << 24, 1 << 28, 1 << 30)]
+    per_call, per_byte = probe.fit_alloc_rate(points)
+    assert per_call == 0.0 and per_byte > 0
+
+
 def test_datasheet_lookup():
     h100 = probe.datasheet_for("NVIDIA H100 80GB HBM3")
     assert h100 is not None and h100["bf16_flops"] == 9.894e14 and h100["name"] == "H100 SXM"
@@ -122,6 +137,8 @@ def test_cpu_run_writes_a_valid_file(tmp_path):
             assert table[key] is not None and key not in doc["errors"]
         else:
             assert table[key] is None and doc["errors"][key]
+    for key in ("pinned_alloc_bytes", "pinned_alloc_per_call_s"):
+        assert doc["rates"][key] is None and "CUDA" in doc["errors"][key]
     h = doc["rates"]["hash"]
     assert h["per_byte_s"] > 0 and h["threads"] == doc["threads"]
     assert doc["rates"]["host_memcpy_bytes"] > 0 and doc["wall_s"] > 0
