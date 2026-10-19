@@ -400,7 +400,7 @@ def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, An
         raise FileNotFoundError(f"no band file at {path}: run verification.runs.calibrate "
                                 "first (P10a)")
     bands = Bands.from_file(path)
-    if guard_failed_marker(path).exists():
+    if guard_failed_marker(path.resolve()).exists():  # a run directory links the band file
         print(f"WARNING: band file {path} comes from a failed concentration guard "
               "(calibrate --write-bands-despite-guard, profiling only)")
     if bands.stats.get("k") != k:
