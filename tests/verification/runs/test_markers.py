@@ -2,11 +2,13 @@
 layout (``c5_layout.json``)."""
 
 import json
+import types
 from contextlib import nullcontext
 
 import pytest
 import torch
 
+from evaluation.results.profile import io as profile_io
 from tests.verification.decoder_helpers import make_records, tiny_config
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances import DecoderComputation
@@ -96,7 +98,7 @@ def test_stamp_counts_equal_the_layout(decoder_run):
         st = line["stamps"]
         assert line["stamp_names"] == list(STAMP_NAMES)
         n = len(st["name"])
-        assert all(len(v) == n for v in st.values())
+        assert all(len(v) == n for v in st.values() if v is not None)
         count = {name: st["name"].count(i) for i, name in enumerate(line["stamp_names"])}
         assert count["c5.run"] == layout["n_runs"]
         for name in ("c5.glue", "c5.serve", "c5.copy", "c5.measure"):
@@ -109,21 +111,46 @@ def test_stamp_counts_equal_the_layout(decoder_run):
         assert sorted(by["c5.measure"]) == sorted((e["run"], e["group"], -1)
                                                   for e in layout["entries"])
         assert sorted(by["c5.run"]) == [(i, -1, -1) for i in range(layout["n_runs"])]
+        for name in ("c5.glue", "c5.serve", "c5.copy"):
+            assert sorted(by[name]) == sorted((e["run"], e["group"], -1)
+                                              for e in layout["entries"]), name
+        assert sorted(by["c5.judge"]) == [(-1, -1, w) for w in range(layout["n_windows"])]
         assert all(h1 >= h0 for h0, h1 in zip(st["h0"], st["h1"]))
-        assert all(g is None for g in st["g0"])  # no device clock on CPU
+        assert st["g0"] is None and st["g1"] is None  # no device clock on CPU: no column
+
+
+def test_group_ids_are_global_across_the_runs(decoder_run):
+    out, c, _, _ = decoder_run
+    layout = json.loads((out / "c5_layout.json").read_text())
+    entries = layout["entries"]
+    assert len({e["run"] for e in entries}) >= 2
+    assert [e["group"] for e in entries] == list(range(layout["n_groups"]))
+    assert layout["n_groups"] == len(entries)
+    by_group = {e["group"]: e["run"] for e in entries}
+    for line in read_markers(out):
+        if line["kind"] != "step":
+            continue
+        st = line["stamps"]
+        for i in range(len(st["name"])):
+            if st["group"][i] >= 0:
+                assert by_group[st["group"][i]] == st["run"][i]
+    # the layout one group per class would join: a group id never carries two classes
+    cls = {}
+    for e in entries:
+        cls.setdefault(e["group"], set()).add(e["class"])
+    assert all(len(v) == 1 for v in cls.values())
 
 
 def test_layout_trace_slice_and_windows(tiny, monkeypatch):
     c, _, _ = tiny
     f = metrics.c5_layout_file(c, "x")
-    runs = {}
-    for e in f["entries"]:
-        runs.setdefault(e["run"], e["class"])
     first = {}
-    for i, cls in runs.items():
-        first.setdefault(cls, i)
+    for e in f["entries"]:  # over every group, not only a run's first
+        first.setdefault(e["class"], e["run"])
+    runs = {e["run"] for e in f["entries"]}
     want = sorted(set(first.values()) | {i for i in runs if i % 20 == 0})
     assert f["trace_slice"] == want
+    assert f["trace_slice"] == sorted(set(f["trace_slice"]))
     assert f["n_windows"] == 1 and {e["window"] for e in f["entries"]} == {0}
     monkeypatch.setattr(checks, "_JUDGE_WINDOW", 5)
     entries = checks.check5_layout(c)
@@ -163,8 +190,8 @@ class _LogRecorder(TimeRecorder):
         super().__init__(*a, **kw)
         self.calls = []
 
-    def stamp(self, name, **ids):
-        self.calls.append((name, ids))
+    def stamp(self, name, run=-1, group=-1, window=-1):
+        self.calls.append((name, {"run": run, "group": group, "window": window}))
         return nullcontext()
 
 
@@ -317,6 +344,7 @@ def test_read_markers_round_trip_and_rejects_a_line_without_kind(tmp_path):
     assert [x["kind"] for x in lines] == ["header", "step", "run"]
     head = lines[0]
     assert head["version"] == 1 and head["run"] == "r" and head["device"] == "cpu"
+    assert head["device"] == torch.device("cpu").type
     assert head["mono_ns"] > 0 and head["wall_unix_s"] > 1e9 and head["pid"] > 0
     assert read_markers(tmp_path / "markers.jsonl") == lines
     bad = tmp_path / "bad.jsonl"
@@ -332,3 +360,70 @@ def test_no_markers_file_without_a_timed_step(tmp_path):
     with MetricsWriter(tmp_path, "r", device="cpu"):
         pass
     assert not (tmp_path / "markers.jsonl").exists()
+
+
+def test_header_device_is_the_device_type(tmp_path, monkeypatch):
+    monkeypatch.setattr(metrics, "memory_probe", lambda device: types.SimpleNamespace(source="stub"))
+    monkeypatch.setattr(metrics, "environment_record", lambda run, **kw: {"record": "environment"})
+    with MetricsWriter(tmp_path, "r", device="cuda:1") as mw:
+        mw.write_markers({"kind": "step", "step": 1})
+    assert read_markers(tmp_path)[0]["device"] == "cuda"
+
+
+def test_fs25_read_markers_accepts_the_file(decoder_run):
+    out, _, _, T = decoder_run
+    mk = profile_io.read_markers(out / "markers.jsonl")
+    assert mk.header["device"] == "cpu" and len(mk.steps) == T and len(mk.runs) == 1
+    for s in mk.steps:
+        assert s["stamps"]["g0"] is None and s["stamps"]["g1"] is None
+        assert len(s["stamps"]["name"]) > 0
+    layout = profile_io.read_c5_layout(out / profile_io.C5_LAYOUT_FILE)
+    assert layout is not None
+
+
+def test_n_windows_counts_judge_calls_when_the_last_run_closes_a_window(tiny, tmp_path,
+                                                                        monkeypatch):
+    c, D, w0 = tiny
+    runs = list(checks._member_runs(c.products))
+    # a window the last run exactly fills: every window closes on a run boundary
+    total = sum(len(r) for r in runs)
+    monkeypatch.setattr(checks, "_JUDGE_WINDOW", total)
+    entries, n_windows = checks._layout(c)
+    assert {e["window"] for e in entries} == {0} and n_windows == 2
+    assert metrics.c5_layout_file(c, "x")["n_windows"] == 2
+    assert checks.check5_layout(c) == entries
+    final = honest_final(c, D, w0, 1, seed=SEED)
+    h_D = dataset_tree(c, D).root
+    with MetricsWriter(tmp_path, "tiny", device="cpu", config={}, h_D=h_D) as mw:
+        mw.write_c5_layout(c)
+        llama_step.run_honest(c, D, w0, T=1, k=K, h_D=h_D, final=final,
+                              recorder=mw.recorder(HONEST.name), seed=SEED)
+    layout = json.loads((tmp_path / "c5_layout.json").read_text())
+    line = next(x for x in read_markers(tmp_path) if x["kind"] == "step")
+    st = line["stamps"]
+    judge = line["stamp_names"].index("c5.judge")
+    windows = [st["window"][i] for i in range(len(st["name"])) if st["name"][i] == judge]
+    assert len(windows) == layout["n_windows"] == 2
+    assert all(w < layout["n_windows"] for w in windows)
+
+
+def test_trace_slice_takes_a_class_first_seen_in_a_later_group(tiny, monkeypatch):
+    c, _, _ = tiny
+    real = metrics.product_class
+    # the first group of every attention run shares one class, so every other class first
+    # appears in a later group
+    monkeypatch.setattr(metrics, "product_class", lambda c_, spec: "x" if (
+        ".S[" in spec.name or ".dA[" in spec.name) else real(c_, spec))
+    f = metrics.c5_layout_file(c, "x")
+    firsts = {}
+    for e in f["entries"]:
+        firsts.setdefault(e["class"], (e["run"], e["group"]))
+    later = [(cls, r, g) for cls, (r, g) in firsts.items()
+             if g != min(x["group"] for x in f["entries"] if x["run"] == r)]
+    assert later
+    # a run that is neither a multiple of 20 nor the first of class "x" is in the slice only
+    # through a class first seen in its later group
+    only = [r for _, r, _ in later if r % 20 and r != firsts["x"][0]]
+    assert only
+    assert set(only) <= set(f["trace_slice"])
+    assert f["trace_slice"] == sorted(set(f["trace_slice"]))

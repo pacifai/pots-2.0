@@ -202,7 +202,7 @@ from verification.verifier.calibration import step_floor
 from verification.verifier.checks import (
     DEFAULT_ORDER,
     RECORD_NOT_RUN,
-    check5_layout,
+    _layout,
     protocol_id,
 )
 from verification.verifier.matmul_check.sizing import C_ANTI, bit_budget
@@ -472,21 +472,19 @@ class _Acc:
 
 class Seam:
     """The seam a run passes as ``section=``: ``seam(name)`` is ``recorder.section(name)``, and
-    ``seam.stamp(name, **ids)`` is ``recorder.stamp(name, **ids)`` (a span inside a check-5
-    section; a no-op context on every recorder but the timed run's). One per recorder
+    ``seam.stamp(name, run, group, window)`` is ``recorder.stamp`` itself (a span inside a
+    check-5 section; a no-op context on every recorder but the timed run's), bound at
+    construction so a stamp costs no forwarding frame. One per recorder
     (:meth:`_Recorder.seam`), so a run's ``section is`` checks hold."""
 
-    __slots__ = ("_rec",)
+    __slots__ = ("_rec", "stamp")
 
     def __init__(self, rec: _Recorder) -> None:
         self._rec = rec
+        self.stamp = rec.stamp
 
     def __call__(self, name: str) -> Any:
         return self._rec.section(name)
-
-    def stamp(self, name: str, **ids: int) -> Any:
-        return self._rec.stamp(name, **ids)
-
 
 def resolve_gpu_us(anchor_host_us: float, anchor: Any, events: Iterable[Any]) -> list[float]:
     """Each CUDA event's time on the host clock, in microseconds: the anchor's host time plus the
@@ -544,7 +542,7 @@ class _Recorder:
             self._seam = Seam(self)
         return self._seam
 
-    def stamp(self, name: str, **ids: int) -> Any:
+    def stamp(self, name: str, run: int = -1, group: int = -1, window: int = -1) -> Any:
         """A span inside a check-5 section; only the timed run records one."""
         return _NULL
 
@@ -709,10 +707,10 @@ class _Stamp:
     """One check-5 stamp: host ``monotonic_ns`` at entry and exit and, on CUDA, an event pair
     (no synchronize). Appends to the recorder's step columns as it closes."""
 
-    __slots__ = ("rec", "col", "ids", "h0", "e0")
+    __slots__ = ("rec", "col", "run", "group", "window", "h0", "e0")
 
-    def __init__(self, rec: TimeRecorder, col: int, ids: tuple[int, int, int]) -> None:
-        self.rec, self.col, self.ids = rec, col, ids
+    def __init__(self, rec: TimeRecorder, col: int, run: int, group: int, window: int) -> None:
+        self.rec, self.col, self.run, self.group, self.window = rec, col, run, group, window
 
     def __enter__(self) -> None:
         if self.rec._cuda:
@@ -728,7 +726,7 @@ class _Stamp:
             e1 = torch.cuda.Event(enable_timing=True)
             e1.record()
             rec._stamp_pending.append((len(rows), self.e0, e1))
-        rows.append((self.col, *self.ids, self.h0, h1))
+        rows.append((self.col, self.run, self.group, self.window, self.h0, h1))
 
 
 class TimeRecorder(_Recorder):
@@ -770,16 +768,16 @@ class TimeRecorder(_Recorder):
         self.writer = writer
         self.step_fields = dict(step_fields or {})
 
-    def stamp(self, name: str, *, run: int = -1, group: int = -1, window: int = -1) -> Any:
+    def stamp(self, name: str, run: int = -1, group: int = -1, window: int = -1) -> Any:
         """A span inside a check-5 section, recorded as one column entry in ``markers.jsonl``'s
-        ``stamps``. Outside check 5 it is a no-op."""
+        ``stamps``. Outside check 5 it is a no-op. The ids are positional on the hot path."""
         if not self._c5_open:
             return _NULL
         col = self._stamp_col.get(name)
         if col is None:
             col = self._stamp_col[name] = len(self._stamp_names)
             self._stamp_names.append(name)
-        return _Stamp(self, col, (run, group, window))
+        return _Stamp(self, col, run, group, window)
 
     def _resolve(self) -> None:
         """After a top-level synchronize: the time of every nested section's events, and every
@@ -837,14 +835,16 @@ class TimeRecorder(_Recorder):
             return line
         rows, gpu = self._step_stamps
         cols = list(zip(*rows, strict=True)) if rows else [()] * 6
-        g = [gpu.get(i) for i in range(len(rows))]
+        g = [gpu.get(i) for i in range(len(rows))] if self._cuda else None
         line.update({"step": t, "traced": False, "t1_ns": t1, "sections": sections,
                      "stamps": {
                          "name": list(cols[0]), "run": list(cols[1]), "group": list(cols[2]),
                          "window": list(cols[3]), "h0": [us(x) for x in cols[4]],
                          "h1": [us(x) for x in cols[5]],
-                         "g0": [None if x is None else round(x[0] - base, 3) for x in g],
-                         "g1": [None if x is None else round(x[1] - base, 3) for x in g]},
+                         "g0": None if g is None else
+                         [None if x is None else round(x[0] - base, 3) for x in g],
+                         "g1": None if g is None else
+                         [None if x is None else round(x[1] - base, 3) for x in g]},
                      "stamp_names": list(self._stamp_names)})
         return line
 
@@ -1555,24 +1555,26 @@ def c5_layout_file(c: Any, run: str) -> dict[str, Any]:
     """``c5_layout.json``'s content (``PROFILING_PLAN.md`` §5.2): :func:`check5_layout`'s entries
     with each group's ``layer`` (:func:`layer_index` of its first product) and ``class``
     (``product_class``), the counts, and ``trace_slice``, the runs a trace covers: the first run
-    of each class and every run whose id is a multiple of 20."""
-    entries = check5_layout(c)
+    of each class (over every group, not only a run's first) and every run whose id is a
+    multiple of 20, each once, sorted. ``n_windows`` is the number of judge calls."""
+    entries, n_windows = _layout(c)
     by_m = {spec.m: spec for spec in c.products}
     n_layers = layer_count(c)
     seen: set[str] = set()
-    trace: list[int] = []
+    trace: set[int] = set()
     for e in entries:
         spec = by_m[e["first"]]
         e["layer"] = layer_index(spec, n_layers)
         e["class"] = product_class(c, spec)
-        if e["group"] == 0 and (e["class"] not in seen or e["run"] % 20 == 0):
-            trace.append(e["run"])
-        if e["group"] == 0:
+        if e["class"] not in seen:
             seen.add(e["class"])
+            trace.add(e["run"])
+        if e["run"] % 20 == 0:
+            trace.add(e["run"])
     n_runs = entries[-1]["run"] + 1 if entries else 0
     return {"version": 1, "run": run, "n_runs": n_runs,
-            "n_groups": len(entries), "n_windows": entries[-1]["window"] + 1 if entries else 1,
-            "entries": entries, "trace_slice": trace}
+            "n_groups": len(entries), "n_windows": n_windows,
+            "entries": entries, "trace_slice": sorted(trace)}
 
 
 def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats, c: Any, *,
@@ -1848,7 +1850,7 @@ class MetricsWriter:
             self._m = open(self.dir / "markers.jsonl", "w")  # noqa: SIM115
             mono, wall = time.monotonic_ns(), time.time()
             head = {"kind": "header", "version": 1, "run": self.run, "pid": os.getpid(),
-                    "device": str(self.device), "mono_ns": mono, "wall_unix_s": wall}
+                    "device": self.device.type, "mono_ns": mono, "wall_unix_s": wall}
             self._m.write(json.dumps(head, allow_nan=False) + "\n")
         self._m.write(json.dumps(_json_safe(dict(obj)), allow_nan=False) + "\n")
         self._m.flush()
