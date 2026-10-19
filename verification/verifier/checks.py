@@ -693,7 +693,7 @@ def _measure_served(c: DeclaredComputation, specs: Sequence[ProductSpec], ctx: S
     pass) stamps nothing. ``group0`` is the id of the run's first group; ids run on across the
     step's runs.
     """
-    st = ctx.stamp if run is not None else None
+    st = ctx.stamper() if run is not None else None
     if len(specs) == 1:
         try:
             served = [_served(c, specs[0], ctx, replay, view, run=run, group=group0, st=st)]
@@ -764,7 +764,7 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
     are kept. So the products judged are those one-at-a-time serving would reach, and the
     device still holds one group at a time.
     """
-    st = ctx.stamp if run is not None else None
+    st = ctx.stamper() if run is not None else None
     done = len(rows)
     end, error = len(specs), None
     at = {i: group0 + g for g, idx in enumerate(groups) for i in idx}  # a member's group id

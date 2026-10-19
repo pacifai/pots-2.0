@@ -486,6 +486,7 @@ class Seam:
     def __call__(self, name: str) -> Any:
         return self._rec.section(name)
 
+
 def resolve_gpu_us(anchor_host_us: float, anchor: Any, events: Iterable[Any]) -> list[float]:
     """Each CUDA event's time on the host clock, in microseconds: the anchor's host time plus the
     anchor-to-event time. The anchor and the events must be recorded and complete."""
