@@ -526,6 +526,19 @@ def test_a_component_whose_phases_carry_another_prefix_is_a_rollup(tmp_path):
     assert out["runs"]["honest"]["share_total"] == pytest.approx(1.0 + 0.2)
 
 
+def test_a_rollup_absent_from_the_trace_does_not_warn(tmp_path):
+    """A rollup has no span of its own, so the trace never holds it."""
+    extra = [time_row(k, "P2", 0.2, "prover", "component") for k in (1, 2, 3)] \
+        + [time_row(k, "P2.w", 0.2, "prover", "phase") for k in (1, 2, 3)]
+    paths = build_run(tmp_path / "run", records_extra=extra)
+    t = tmp_path / "trace_summary.json"
+    t.write_text(json.dumps({"version": 1, "c5_slice": {}, "sections": {}}))
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t)
+    absent = [w for w in out["warnings"] if w.startswith("the trace summary has no section")]
+    assert absent and "P2.w" in absent[0]
+    assert "P2," not in absent[0] and not absent[0].endswith(" P2")
+
+
 def test_markers_without_steps_or_absent_warn(tmp_path):
     paths = build_run(tmp_path / "run")
     f = paths["run_dir"] / "markers.jsonl"

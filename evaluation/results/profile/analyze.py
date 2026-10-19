@@ -584,7 +584,8 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
     rollups = {n for n in depths if n not in spanned and levels.get(n) == "component"
                and sides.get(n) in phase_sides}
     if trace is not None:
-        absent = sorted(n for n in depths if n not in (trace.get("sections") or {}))
+        absent = sorted(n for n in depths
+                        if n not in rollups and n not in (trace.get("sections") or {}))
         if absent:
             warns.add(f"the trace summary has no section {', '.join(absent)}")
 
