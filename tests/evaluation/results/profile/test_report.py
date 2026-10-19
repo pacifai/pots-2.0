@@ -230,3 +230,52 @@ def test_fmt():
     assert report.fmt(None) == "—" and report.fmt(True) == "yes"
     assert report.fmt(3) == "3" and report.fmt(1234567) == "1.235e+06"
     assert report.fmt(0.000123456) == "0.0001235"
+
+
+def big_view(n_runs: int = 830, steps: int = 6, n_sec: int = 25) -> dict[str, Any]:
+    v = view(gpu=True)
+    names = [f"S{i}" for i in range(n_sec)]
+    t = [round(0.01 * k, 4) for k in range(400)]
+    strips = {"t_s": t, "g_util": [0.5] * 400, "c_busy": [2.0] * 400,
+              "g_pcie_tx": [1e6] * 400, "g_pcie_rx": [1e6] * 400}
+    v["timeline"] = {"steps": [
+        {"step": k, "end_s": 4.0, "strips": strips,
+         "sections": [{"name": n, "depth": 0, "spans_s": [[0.16 * i, 0.16 * i + 0.1]]}
+                      for i, n in enumerate(names)]} for k in range(steps)]}
+    v["sections"].update({n: sec(0, 0.1, 0.01) for n in names})
+    c5 = v["c5"]
+    c5["runs_over_time"] = {str(k): {"run": list(range(n_runs)),
+                                     "class": [("G_a", "G_b")[i % 2] for i in range(n_runs)],
+                                     "start_s": [i * 0.01 for i in range(n_runs)],
+                                     "dur_s": [0.005] * n_runs} for k in range(1, steps + 1)}
+    ph = c5["phases_s"]
+    c5["variance"]["windows"] = [{"step": k, "window": w, "phases_s": ph,
+                                  "sampler": {"c_other": 0.1}}
+                                 for k in range(1, steps + 1) for w in range(50)]
+    return v
+
+
+def test_a_full_scale_report_stays_below_5_mb():
+    out = page(*[profile(f"M{i}", runs={"honest": big_view()}) for i in range(8)])
+    size = len(out.encode())
+    assert size < 5_000_000, f"{size} bytes"
+
+
+def test_runs_over_time_is_binned_above_300_runs():
+    over = panel(page(profile(runs={"honest": big_view(830, 1, 2)})), "r0-check5")
+    assert over.count("<title>runs ") == 277 and "<title>runs 0-2\n" in over
+    assert "seconds 0.015 s" in over
+    small = panel(page(profile(runs={"honest": big_view(300, 1, 2)})), "r0-check5")
+    assert "<title>run 299\n" in small and "<title>runs " not in small
+
+
+def test_notes_and_label_colors():
+    out = page(profile(gpu=False))
+    assert "run s counts each run's whole time" in panel(out, "r0-check5")
+    nostrips = profile(runs={"honest": view(gpu=False)})
+    for st in nostrips["runs"]["honest"]["timeline"]["steps"]:
+        st["strips"] = None
+    tl = panel(page(nostrips), "r0-timeline")
+    assert "No sampler data for this run." in tl and "Strips: ." not in tl
+    arch = panel(out, "r0-diagram")
+    assert 'style="fill:#111"' in arch or 'style="fill:#fff"' in arch

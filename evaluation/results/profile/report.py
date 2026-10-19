@@ -112,10 +112,19 @@ def _color(i: int) -> str:
     return f"hsl({(i * 137.5) % 360:.0f},55%,55%)"
 
 
+def _lightness(share: float | None) -> int:
+    t = min(max(share or 0.0, 0.0) / 0.5, 1.0)
+    return round(94 - 56 * t)
+
+
 def _fill(share: float | None) -> str:
     """One hue: light at share 0, dark from 0.5 up."""
-    t = min(max(share or 0.0, 0.0) / 0.5, 1.0)
-    return f"hsl(215,70%,{94 - 56 * t:.0f}%)"
+    return f"hsl(215,70%,{_lightness(share)}%)"
+
+
+def _ink(share: float | None) -> str:
+    """The label color that reads on :func:`_fill`."""
+    return "#111" if _lightness(share) >= 60 else "#fff"
 
 
 def _table(head: Sequence[Any], rows: Sequence[Sequence[Any]], left: Sequence[int] = (0,)) -> str:
@@ -379,7 +388,8 @@ def _arch(run: Run) -> str:
                                      f"{name}\n{fmt(secs_)} s\nshare {fmt(share)}", "var(--fg)"))
                     if sw >= 38:
                         out.append(_text(sx + sw / 2, y0 + (lane_h - 16) / 2 + 4,
-                                         name.split(".")[1][:7], "mute", "middle"))
+                                         name.split(".")[1][:7], "", "middle",
+                                         f' style="fill:{_ink(share)}"'))
                 sx += sw
         elif n == "6b" and "6b.glue" in secs:
             g = (secs["6b.glue"].get("time") or {}).get("mean") or 0.0
@@ -508,11 +518,57 @@ def _timeline(run: Run) -> str:
             y += strip_h + 2
         y += 10
     out.append(_axis(left, left + pw, y, 0, axis_s))
-    note = ["Strips: " + ", ".join(f"{STRIP_LABELS[k]} up to {fmt(maxes[k])}"
-                                    for k in STRIP_LABELS if k in maxes and
-                                    any(k in strips_of(s) for s in steps))]
+    used = [k for k in STRIP_LABELS if k in maxes and any(k in strips_of(s) for s in steps)]
+    note = ("Strips: " + ", ".join(f"{STRIP_LABELS[k]} up to {fmt(maxes[k])}" for k in used) + "."
+            if used else "No sampler data for this run.")
     return (_legend([(n, colors[n]) for n in names]) + _svg(left + pw + 20, y + 24, "".join(out))
-            + f'<p class="mute">Seconds from each step\'s start. {esc(note[0])}.</p>')
+            + f'<p class="mute">Seconds from each step\'s start. {esc(note)}</p>')
+
+
+MAX_BARS = 300  # runs-over-time bars per step; more runs are binned
+
+
+def _bins(n: int) -> list[range]:
+    """Consecutive index ranges of equal size (the last may be shorter), at most MAX_BARS."""
+    size = -(-n // MAX_BARS)
+    return [range(i, min(i + size, n)) for i in range(0, n, size)]
+
+
+def _bin_peak(over: dict[str, Any]) -> float | None:
+    """The largest bin's seconds when any step has more than MAX_BARS runs, else ``None``."""
+    if all(len(st.get("run") or []) <= MAX_BARS for st in over.values()):
+        return None
+    return max((sum(st["dur_s"][i] for i in b) for st in over.values()
+                for b in _bins(len(st["run"])) if st.get("run")), default=0.0) or 1.0
+
+
+def _run_bars(st: dict[str, Any], ccol: dict[str, str], left: float, pw: float, axis_s: float,
+              y: float, peak: float | None) -> str:
+    """One bar per run, or when ``peak`` is set, one bar per bin of consecutive runs: it spans
+    the bin's first start to last end, and its height is the bin's seconds on a scale to peak."""
+    runs, cls, start, dur = st.get("run") or [], st.get("class") or [], st["start_s"], st["dur_s"]
+    if not runs:
+        return ""
+    out = []
+    if peak is None:
+        for r, c, a, d in zip(runs, cls, start, dur, strict=True):
+            out.append(_rect(left + pw * a / axis_s, y, max(pw * d / axis_s, 0.6), 16,
+                             ccol.get(c, "gray"),
+                             f"run {r}\nclass {c if c else '—'}\nstart {fmt(a)} s\n"
+                             f"duration {fmt(d)} s"))
+        return "".join(out)
+    for b in _bins(len(runs)):
+        i, j = b[0], b[-1]
+        secs = sum(dur[k] for k in b)
+        classes = _distinct([cls[k] or "—" for k in b])
+        end = max(start[k] + dur[k] for k in b)
+        h = max(40 * secs / peak, 1.0)
+        out.append(_rect(left + pw * start[i] / axis_s, y + 40 - h,
+                         max(pw * (end - start[i]) / axis_s, 0.6), h,
+                         ccol.get(classes[0], "gray") if len(classes) == 1 else "var(--mute)",
+                         f"runs {runs[i]}-{runs[j]}\nclass {', '.join(classes)}\n"
+                         f"start {fmt(start[i])} s\nseconds {fmt(secs)} s"))
+    return "".join(out)
 
 
 def _c5(run: Run) -> str:
@@ -530,6 +586,10 @@ def _c5(run: Run) -> str:
                      *[fmt(ph.get(p)) for p in ("run", *C5_PHASES)],
                      fmt(cp.get("stored")), fmt(cp.get("served"))])
     out = [_table(cols, rows)] if rows else []
+    if rows:
+        out.append('<p class="mute">run s counts each run\'s whole time against the class of '
+                   "the run's first group; classes served inside another class's run "
+                   "(e.g. O inside S) show 0 there.</p>")
     pcol = {p: _color(i) for i, p in enumerate(C5_PHASES)}
     if classes:
         mx = max(sum((c.get("phases_s") or {}).get(p) or 0.0 for p in C5_PHASES)
@@ -555,14 +615,11 @@ def _c5(run: Run) -> str:
                       for st in over.values()), default=0.0) or 1.0
         left, pw = 70.0, 900.0
         body, y = [], 4.0
+        peak = _bin_peak(over)
         for step, st in over.items():
             body.append(_text(4, y + 12, f"step {step}"))
-            for r, c, a, d in zip(st["run"], st["class"], st["start_s"], st["dur_s"], strict=True):
-                body.append(_rect(left + pw * a / axis_s, y, max(pw * d / axis_s, 0.6), 16,
-                                  ccol.get(c, "gray"),
-                                  f"run {r}\nclass {c if c else '—'}\nstart {fmt(a)} s\n"
-                                  f"duration {fmt(d)} s"))
-            y += 22
+            body.append(_run_bars(st, ccol, left, pw, axis_s, y, peak))
+            y += 22 if peak is None else 46
         body.append(_axis(left, left + pw, y + 2, 0, axis_s))
         out.append("<h3>Runs over time</h3>" + _legend(list(ccol.items()))
                    + _svg(left + pw + 20, y + 26, "".join(body)))
