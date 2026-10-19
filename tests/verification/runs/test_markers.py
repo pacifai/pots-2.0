@@ -202,11 +202,11 @@ def test_stamp_is_a_null_context_without_a_stamping_seam():
     assert seam is rec.seam()
     with ctx(seam).stamp("c5.run", run=3):  # no check-5 section open: nothing recorded
         pass
-    assert rec._stamps["name"] == []
+    assert rec._stamps == []
     with seam("5"):
         with ctx(seam).stamp("c5.run", run=3):
             pass
-    assert rec._stamps["run"] == [3] and rec._stamps["group"] == [-1]
+    assert [r[:4] for r in rec._stamps] == [(0, 3, -1, -1)]
 
 
 def test_stamp_gate_follows_the_check5_sections():
@@ -215,7 +215,7 @@ def test_stamp_gate_follows_the_check5_sections():
     with rec.section("6a"):
         with rec.stamp("c5.run", run=0):
             pass
-    assert rec._stamps["name"] == []
+    assert rec._stamps == []
     with rec.section("5"):
         with rec.section("5.glue"):
             with rec.stamp("c5.glue", run=1, group=2):
@@ -223,8 +223,8 @@ def test_stamp_gate_follows_the_check5_sections():
         with rec.stamp("custom"):
             pass
     assert rec._c5_open == 0
-    assert rec._stamps["name"] == [1, 6] and rec._stamp_names[6] == "custom"
-    assert rec._stamps["run"] == [1, -1] and rec._stamps["group"] == [2, -1]
+    assert [r[:4] for r in rec._stamps] == [(1, 1, 2, -1), (6, -1, -1, -1)]
+    assert rec._stamp_names[6] == "custom"
 
 
 def test_spans_are_capped_and_the_rest_aggregates():
@@ -293,6 +293,7 @@ def test_cuda_section_alloc_and_no_sync_inside(fake_cuda):
     top, nested = rec._step["5"], rec._step["5.glue"]
     # the counters read 1 then 2 (retries), 10 then 20 (allocs), 100 then 200 (frees)
     assert top.alloc == [1, 10, 100, 0] and nested.alloc is None
+    rec._step_stamps = (rec._stamps, rec._stamp_gpu)  # what on_step hands over
     line = rec._marker_line(1, rec._step, type("R", (), {"t": 1})())
     sec = {s["name"]: s for s in line["sections"]}
     assert sec["5"]["alloc"] == {"retries": 1, "device_alloc": 10, "device_free": 100, "ooms": 0}

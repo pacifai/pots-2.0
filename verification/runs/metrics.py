@@ -722,24 +722,12 @@ class _Stamp:
     def __exit__(self, *exc: Any) -> None:
         h1 = time.monotonic_ns()
         rec = self.rec
-        c = rec._stamps
-        i = len(c["h0"])
-        c["name"].append(self.col)
-        c["run"].append(self.ids[0])
-        c["group"].append(self.ids[1])
-        c["window"].append(self.ids[2])
-        c["h0"].append(self.h0)
-        c["h1"].append(h1)
+        rows = rec._stamps
         if rec._cuda:
             e1 = torch.cuda.Event(enable_timing=True)
             e1.record()
-            rec._stamp_pending.append((i, self.e0, e1))
-        c["g0"].append(None)
-        c["g1"].append(None)
-
-
-def _new_stamps() -> dict[str, list[Any]]:
-    return {k: [] for k in ("name", "run", "group", "window", "h0", "h1", "g0", "g1")}
+            rec._stamp_pending.append((len(rows), self.e0, e1))
+        rows.append((self.col, *self.ids, self.h0, h1))
 
 
 class TimeRecorder(_Recorder):
@@ -770,9 +758,13 @@ class TimeRecorder(_Recorder):
         self._pending: list[tuple[_Acc, int, Any, Any, bool]] = []
         self._stamp_pending: list[tuple[int, Any, Any]] = []
         self._anchor: tuple[float, Any] | None = None
-        self._stamps = _new_stamps()
-        self._step_stamps = self._stamps
+        # one row (column, run, group, window, host start, host end) per stamp; ``_stamp_gpu``
+        # maps a row's index to its device span on CUDA
+        self._stamps: list[tuple[int, ...]] = []
+        self._stamp_gpu: dict[int, tuple[float, float]] = {}
+        self._step_stamps: tuple[list[tuple[int, ...]], dict[int, tuple[float, float]]] = ([], {})
         self._stamp_names = list(STAMP_NAMES)
+        self._stamp_col = {n: i for i, n in enumerate(self._stamp_names)}
         self._t1 = 0
         self.writer = writer
         self.step_fields = dict(step_fields or {})
@@ -782,10 +774,9 @@ class TimeRecorder(_Recorder):
         ``stamps``. Outside check 5 it is a no-op."""
         if not self._c5_open:
             return _NULL
-        try:
-            col = self._stamp_names.index(name)
-        except ValueError:
-            col = len(self._stamp_names)
+        col = self._stamp_col.get(name)
+        if col is None:
+            col = self._stamp_col[name] = len(self._stamp_names)
             self._stamp_names.append(name)
         return _Stamp(self, col, (run, group, window))
 
@@ -804,15 +795,15 @@ class TimeRecorder(_Recorder):
             elif acc.rest is not None:
                 acc.rest[2] += (g[1] - g[0]) / 1e6
         if anchor is not None:
-            c = self._stamps
             for i, e0, e1 in self._stamp_pending:
-                c["g0"][i], c["g1"][i] = resolve_gpu_us(anchor[0], anchor[1], (e0, e1))
+                self._stamp_gpu[i] = resolve_gpu_us(anchor[0], anchor[1], (e0, e1))
         self._pending.clear()
         self._stamp_pending.clear()
 
     def on_step(self, rec: Any) -> None:
         self._t1 = time.monotonic_ns()
-        self._step_stamps, self._stamps = self._stamps, _new_stamps()
+        self._step_stamps = (self._stamps, self._stamp_gpu)
+        self._stamps, self._stamp_gpu = [], {}
         super().on_step(rec)
 
     def _marker_line(self, t: int, table: dict[str, _Acc], rec: Any) -> dict[str, Any]:
@@ -843,14 +834,16 @@ class TimeRecorder(_Recorder):
         if rec is None:
             line["sections"] = sections
             return line
-        c = self._step_stamps
+        rows, gpu = self._step_stamps
+        cols = list(zip(*rows, strict=True)) if rows else [()] * 6
+        g = [gpu.get(i) for i in range(len(rows))]
         line.update({"step": t, "traced": False, "t1_ns": t1, "sections": sections,
                      "stamps": {
-                         "name": c["name"], "run": c["run"], "group": c["group"],
-                         "window": c["window"], "h0": [us(x) for x in c["h0"]],
-                         "h1": [us(x) for x in c["h1"]],
-                         "g0": [None if g is None else round(g - base, 3) for g in c["g0"]],
-                         "g1": [None if g is None else round(g - base, 3) for g in c["g1"]]},
+                         "name": list(cols[0]), "run": list(cols[1]), "group": list(cols[2]),
+                         "window": list(cols[3]), "h0": [us(x) for x in cols[4]],
+                         "h1": [us(x) for x in cols[5]],
+                         "g0": [None if x is None else round(x[0] - base, 3) for x in g],
+                         "g1": [None if x is None else round(x[1] - base, 3) for x in g]},
                      "stamp_names": list(self._stamp_names)})
         return line
 
