@@ -19,6 +19,14 @@ def test_fit_recovers_exact_rates():
     assert got_leaf == pytest.approx(per_leaf, rel=1e-2)
 
 
+def test_fit_refits_a_negative_leaf_cost_to_zero():
+    # times that fall with the leaf count at equal bytes: the free fit's leaf cost is negative
+    mixes = [(100, 10, 1.0), (100, 1000, 0.9), (1000, 10, 10.0), (1000, 1000, 9.9)]
+    per_byte, per_leaf = probe.fit_hash_rate(mixes)
+    assert per_leaf == 0.0 and per_byte > 0
+    assert 0 <= probe.fit_residual(mixes, per_byte, per_leaf) < 0.1
+
+
 def test_datasheet_lookup():
     h100 = probe.datasheet_for("NVIDIA H100 80GB HBM3")
     assert h100 is not None and h100["bf16_flops"] == 9.894e14 and h100["name"] == "H100 SXM"
@@ -53,6 +61,23 @@ def test_linear_shapes_from_configs():
     assert list(errors) == ["shapes:a/bad"] and "OSError" in errors["shapes:a/bad"]
 
 
+def test_gemm_without_shapes_records_errors(monkeypatch):
+    monkeypatch.setattr(probe, "linear_shapes", lambda loader=None, pins=None, errors=None: [])
+    rates, errors, shapes = {}, {}, []
+    probe.measure_gemm(1.0, rates, errors, shapes)
+    assert rates == {} and shapes == []
+    assert errors == {"gemm_bf16_flops": "no model shapes in the HF cache",
+                      "gemm_fp32_flops": "no model shapes in the HF cache"}
+
+
+def test_machine_facts_failure_is_recorded(monkeypatch):
+    def boom():
+        raise RuntimeError("no facts")
+    monkeypatch.setattr(probe, "machine_facts", boom)
+    doc = probe.run_probe(1.0)
+    assert doc["machine"] is None and "no facts" in doc["errors"]["machine"]
+
+
 def test_fit_m():
     for k, n in ((2048, 128256), (8192, 2048), (896, 151936)):
         m = probe.fit_m(k, n, 4)
@@ -68,7 +93,9 @@ def test_cpu_run_writes_a_valid_file(tmp_path):
     assert doc["version"] == 1 and doc["device"] == "cpu"
     assert set(doc["rates"]) == set(probe.RATE_KEYS) and set(doc["costs"]) == set(probe.COST_KEYS)
     assert doc["determinism"] == {"tf32": False, "deterministic": True}
-    assert doc["datasheet"] is None and doc["shapes"] == []
+    assert doc["datasheet"] is None and doc["machine"] is not None
+    assert doc["shapes"] and all(r["flops_per_s"] is None for r in doc["shapes"])
+    assert {r["dtype"] for r in doc["shapes"]} == {"bf16", "fp32"}
     host = {"host_first_touch_bytes", "hash", "host_memcpy_bytes"}
     for key in (*probe.RATE_KEYS, *probe.COST_KEYS):
         table = doc["rates"] if key in doc["rates"] else doc["costs"]

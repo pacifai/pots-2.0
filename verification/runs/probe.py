@@ -36,10 +36,7 @@ import torch
 
 from setup.config import load_config, setup_determinism
 
-try:
-    from setup.machine import machine_facts
-except ImportError:  # FS18 isn't merged yet
-    machine_facts = None  # type: ignore[assignment]
+from setup.machine import machine_facts
 
 __all__ = ["VERSION", "DATASHEET", "datasheet_for", "fit_hash_rate", "run_probe", "main"]
 
@@ -93,7 +90,8 @@ def linear_shapes(loader: Callable[[str, str], Any] | None = None,
         try:
             cfg = loader(repo, revision)
             d, d_f, vocab = cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size
-            n_h, n_kv = cfg.num_attention_heads, cfg.num_key_value_heads
+            n_h = cfg.num_attention_heads
+            n_kv = cfg.num_key_value_heads or n_h
             d_h = getattr(cfg, "head_dim", None) or d // n_h
         except Exception as e:  # noqa: BLE001
             if errors is not None:
@@ -124,7 +122,18 @@ def fit_hash_rate(mixes: Sequence[tuple[int, int, float]]) -> tuple[float, float
     scale = a.max(axis=0)
     coef, *_ = np.linalg.lstsq(a / scale, t, rcond=None)
     per_byte, per_leaf = coef / scale
+    if per_leaf < 0:  # noise: refit on bytes alone, with no per-leaf cost
+        per_byte = float((a[:, 0] @ t) / (a[:, 0] @ a[:, 0]))
+        per_leaf = 0.0
     return float(per_byte), float(per_leaf)
+
+
+def fit_residual(mixes: Sequence[tuple[int, int, float]], per_byte: float,
+                 per_leaf: float) -> float:
+    """The fit's relative residual: ``||t - fit|| / ||t||`` over the mixes."""
+    t = np.array([s for _, _, s in mixes], dtype=np.float64)
+    fit = np.array([b * per_byte + n * per_leaf for b, n, _ in mixes])
+    return float(np.linalg.norm(t - fit) / np.linalg.norm(t))
 
 
 @dataclass
@@ -173,11 +182,28 @@ def _gemm(k: int, n: int, dtype: torch.dtype, clock: Clock) -> tuple[int, float]
     return m, 2 * m * k * n / t
 
 
+def gemm_todo(errors: dict) -> list[tuple[str, int, int, torch.dtype, str]]:
+    """``(name, k, n, dtype, label)`` of every GEMM the probe times: each linear shape in bf16
+    and fp32."""
+    return [(name, k, n, dt, label) for name, k, n in linear_shapes(errors=errors)
+            for dt, label in ((torch.bfloat16, "bf16"), (torch.float32, "fp32"))]
+
+
+def listed_shapes(todo: Sequence[tuple[str, int, int, torch.dtype, str]]) -> list[dict[str, Any]]:
+    """The ``shapes`` entries of ``todo`` with no rate, as a device without CUDA reports them."""
+    return [{"name": name, "dtype": label,
+             "m": fit_m(k, n, torch.empty((), dtype=dt).element_size()),
+             "n": n, "k": k, "flops_per_s": None} for name, k, n, dt, label in todo]
+
+
 def measure_gemm(share_s: float, rates: dict, errors: dict, shapes: list) -> None:
     """GEMM at every linear shape in bf16 and fp32 at the full-scale batch (a head's rows cut
     to fit 4 GiB). The rate is the best shape's, the most the device does at these sizes."""
-    todo = [(name, k, n, dt, label) for name, k, n in linear_shapes(errors=errors)
-            for dt, label in ((torch.bfloat16, "bf16"), (torch.float32, "fp32"))]
+    todo = gemm_todo(errors)
+    if not todo:
+        for key in ("gemm_bf16_flops", "gemm_fp32_flops"):
+            errors[key] = "no model shapes in the HF cache"
+        return
     per = share_s / len(todo)
     best: dict[str, float] = {}
     for name, k, n, dt, label in todo:
@@ -209,6 +235,7 @@ def measure_skinny(share_s: float, k_cols: int, rates: dict, errors: dict,
     per = share_s / len(todo)
     total_flops = total_s = 0.0
     for name, m, width, batch in todo:
+        a = r = out = op = None
         try:
             if batch == 1:
                 a = torch.randn(m, width, device="cuda")
@@ -225,6 +252,7 @@ def measure_skinny(share_s: float, k_cols: int, rates: dict, errors: dict,
             errors[f"skinny_bmm_fp32[{name}]"] = f"{type(e).__name__}: {e}"
             continue
         finally:
+            a = r = out = op = None
             _free()
         flops = 2 * batch * m * width * k_cols
         shapes.append({"name": name, "dtype": "fp32", "m": m, "n": k_cols, "k": width,
@@ -261,19 +289,27 @@ def measure_hbm(share_s: float, rates: dict, errors: dict) -> None:
 
 def measure_transfers(share_s: float, rates: dict, errors: dict) -> None:
     """1 GiB host-to-device and device-to-host, from pinned and pageable host memory."""
-    dev = torch.empty(HOST_BYTES, dtype=torch.uint8, device="cuda")
     for kind, pinned in (("pinned", True), ("pageable", False)):
-        host = torch.empty(HOST_BYTES, dtype=torch.uint8, pin_memory=pinned)
-        host.fill_(1)
-        for name, dst, src in (("h2d", dev, host), ("d2h", host, dev)):
-            key = f"{name}_{kind}_bytes"
+        keys = (f"h2d_{kind}_bytes", f"d2h_{kind}_bytes")
+        try:
+            dev = torch.empty(HOST_BYTES, dtype=torch.uint8, device="cuda")
+            host = torch.empty(HOST_BYTES, dtype=torch.uint8, pin_memory=pinned)
+            host.fill_(1)
+        except Exception as e:  # noqa: BLE001
+            for key in keys:
+                errors[key] = f"{type(e).__name__}: {e}"
+            continue
+        for key, dst, src in ((keys[0], dev, host), (keys[1], host, dev)):
             try:
                 t = Clock(share_s / 4).median(
                     lambda: _timed(lambda: dst.copy_(src, non_blocking=pinned), True))
                 rates[key] = HOST_BYTES / t
             except Exception as e:  # noqa: BLE001
                 errors[key] = f"{type(e).__name__}: {e}"
-        del host
+        del host, dev
+        if pinned:  # hand the pinned block back, so the pageable pass starts without it
+            getattr(torch._C, "_host_emptyCache", lambda: None)()
+        _free()
 
 
 def measure_bf16_transfers(share_s: float, rates: dict, errors: dict) -> None:
@@ -320,7 +356,7 @@ def measure_costs(share_s: float, costs: dict, errors: dict) -> None:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         evs = []
-        for _ in range(1000):
+        for _ in range(1000):  # fresh events per stamp: the cost holds cudaEventCreate
             a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             a.record()
             b.record()
@@ -370,7 +406,9 @@ def measure_host_memcpy(share_s: float, rates: dict, errors: dict) -> None:
 
 
 def measure_first_touch(share_s: float, rates: dict, errors: dict) -> None:
-    """Allocate a fresh 1 GiB host tensor and fill it, a new tensor in every repeat."""
+    """Allocate a fresh 1 GiB host tensor and fill it, a new tensor in every repeat. The rate
+    holds at the run's settings: deterministic mode fills new memory, as it does for the run's
+    own allocations, so the fill is part of what's measured."""
     def once() -> float:
         t0 = time.perf_counter()
         x = torch.empty(HOST_BYTES, dtype=torch.uint8)
@@ -385,7 +423,7 @@ def measure_first_touch(share_s: float, rates: dict, errors: dict) -> None:
 
 
 # The synthetic step's leaf mixes, as (slot key, leaves): each slot is a weight of the small
-# decoder below, so the mixes run from 4,096 leaves of 2 KiB to 4 of 16 MiB.
+# decoder below, so the mixes run from 32,768 leaves of 2 KiB to 1 of 16 MiB.
 _HASH_MIXES = (("norm", 32768), ("norm", 8192), ("q", 64), ("q", 16), ("mlp", 32),
                ("embed", 4), ("embed", 1))
 _HASH_SLOTS = {"norm": "model.norm.weight", "q": "model.layers.0.self_attn.q_proj.weight",
@@ -433,7 +471,11 @@ def measure_hash(share_s: float, rates: dict, errors: dict) -> None:
         if per_byte <= 0:
             raise RuntimeError(f"fit gave per_byte_s = {per_byte:.3g}; mixes {mixes}")
         rates["hash"] = {"per_byte_s": per_byte, "per_leaf_s": per_leaf,
-                         "threads": torch.get_num_threads()}
+                         "threads": torch.get_num_threads(),
+                         "per_leaf_refit_to_zero": per_leaf == 0.0,
+                         "residual": fit_residual(mixes, per_byte, per_leaf),
+                         "mixes": [{"leaves": n, "bytes": b, "seconds": t}
+                                   for b, n, t in mixes]}
     except Exception as e:  # noqa: BLE001
         errors["hash"] = f"{type(e).__name__}: {e}"
 
@@ -470,6 +512,7 @@ def run_probe(seconds: float, *, env: dict[str, str] | None = None) -> dict[str,
             ("costs", 10, lambda s: measure_costs(s, costs, errors)),
         ]
     else:
+        shapes += listed_shapes(gemm_todo(errors))
         why = ("CUDA is not available" if cfg.device.startswith("cuda")
                else f"no CUDA device (device={cfg.device})")
         for key in (*RATE_KEYS, *COST_KEYS):
@@ -486,7 +529,7 @@ def run_probe(seconds: float, *, env: dict[str, str] | None = None) -> dict[str,
 
     gpu_name = torch.cuda.get_device_name(torch.device(cfg.device)) if cuda else None
     try:
-        facts = machine_facts() if machine_facts is not None else None
+        facts = machine_facts()
     except Exception as e:  # noqa: BLE001
         facts = None
         errors["machine"] = f"{type(e).__name__}: {e}"
