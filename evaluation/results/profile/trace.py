@@ -7,9 +7,10 @@ for check 5 the stamps' phases by product class, scaled from the traced runs to 
 **Sections and stamps.** A CPU ``user_annotation`` is a stamp when its name starts with ``c5.``
 (``c5.glue|run=12|group=0``: the name, then ``key=value`` ids). Any other annotation is a
 section; a leading ``section:`` is dropped and the profiler's own ``ProfilerStep#`` ranges are
-ignored. Sections nest, and every number belongs to the innermost one, so a parent's numbers
-leave out its children's and the sections add up to the trace. Stamps never take events away
-from sections.
+ignored. Sections nest, and the numbers are inclusive, like the time rows (``metrics.py``): an
+event counts in its innermost section and in every enclosing one. A section's ``parent`` names
+the section enclosing it (``null`` at the top), so a reader sums top-level sections without
+double counting. Stamps never take events away from sections.
 
 **Attribution.** A GPU event goes to the section whose annotation holds its launching runtime
 call (same ``correlation``), by the call's start time, on any thread. The innermost
@@ -17,10 +18,10 @@ call (same ``correlation``), by the call's start time, on any thread. The innerm
 of events where the two disagree goes into ``warnings``. Events with no launch, or a launch
 outside every section, are counted in ``warnings`` and left out.
 
-**Per section.** ``wall_us`` is the length of the union of the section's annotations less its
-child sections' (the section's own host time). ``kernel_us`` sums kernel durations and
+**Per section.** ``wall_us`` is the length of the union of the section's own annotations
+(children included). ``kernel_us`` sums kernel durations and
 ``kernel_span_us`` is the union of their intervals, so ``gpu_idle_us = wall_us − kernel_span_us``
-(negative when kernels outlast the host's span). ``sync_wait_us`` sums the host calls to
+(about zero or above, up to clock skew). ``top_cpu_ops`` self times include descendants. ``sync_wait_us`` sums the host calls to
 ``cudaDeviceSynchronize``, ``cudaStreamSynchronize``, ``cudaEventSynchronize`` and ``cudaMemcpy``
 and the ``cudaMemcpyAsync`` calls of device-to-host copies from pageable memory (these block).
 ``gemm_flops`` is null when a section has GEMM ops and none carries a ``flops`` argument.
@@ -239,7 +240,6 @@ def _gemm_bytes(e: Event, warnings: list[str]) -> int | None:
 class _Acc:
     def __init__(self) -> None:
         self.own: list[tuple[float, float]] = []
-        self.children: list[tuple[float, float]] = []
         self.kernels: list[tuple[float, float]] = []
         self.cats = dict.fromkeys(CATEGORIES, 0.0)
         self.launches = 0
@@ -251,8 +251,27 @@ class _Acc:
         self.sync_us = 0.0
         self.ops: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
 
+    def merge(self, o: "_Acc") -> None:
+        self.kernels += o.kernels
+        for c, v in o.cats.items():
+            self.cats[c] += v
+        self.launches += o.launches
+        for d, v in o.copy_bytes.items():
+            self.copy_bytes[d] = self.copy_bytes.get(d, 0) + v
+        for d, v in o.copy_unknown.items():
+            self.copy_unknown[d] = self.copy_unknown.get(d, 0) + v
+        self.gemm_bytes += o.gemm_bytes
+        self.gemm_ops += o.gemm_ops
+        if o.gemm_flops is not None:
+            self.gemm_flops = (self.gemm_flops or 0) + o.gemm_flops
+        self.sync_us += o.sync_us
+        for n, (us, k) in o.ops.items():
+            row = self.ops[n]
+            row[0] += us
+            row[1] += k
+
     def result(self) -> dict[str, Any]:
-        wall = _union(self.own + self.children) - _union(self.children)
+        wall = _union(self.own)
         kernel_us = sum(b - a for a, b in self.kernels)
         span = _union(self.kernels)
         copy = {}
@@ -306,10 +325,20 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
     accs: dict[str, _Acc] = {}
     for _, name in secs:
         accs.setdefault(name, _Acc())
-    for (e, name), par in zip(secs, _parents(sec_spans)):
+    sec_par = _parents(sec_spans)
+    parent_of: dict[str, str | None] = {}
+    below: dict[str, set[str]] = defaultdict(set)
+    for i, ((e, name), par) in enumerate(zip(secs, sec_par)):
         accs[name].own.append((e["ts"], _end(e)))
-        if par != -1 and secs[par][1] != name:
-            accs[secs[par][1]].children.append((e["ts"], _end(e)))
+        up = par
+        while up != -1 and secs[up][1] == name:
+            up = sec_par[up]
+        if parent_of.get(name) is None:
+            parent_of[name] = None if up == -1 else secs[up][1]
+        while up != -1:
+            if secs[up][1] != name:
+                below[secs[up][1]].add(name)
+            up = sec_par[up]
 
     def section_of(points: Sequence[float]) -> list[str | None]:
         return [None if i == -1 else secs[i][1] for i in _innermost(sec_spans, points)]
@@ -393,7 +422,7 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
     if unknown_copy:
         warnings.append(f"{unknown_copy} memcpy events have no readable direction; "
                         "counted as other")
-    lacking = sum(sum(a.copy_unknown.values()) for a in accs.values())
+    lacking = sum(sum(a.copy_unknown.values()) for a in accs.values())  # still exclusive here
     if lacking:
         warnings.append(f"{lacking} memcpy events have no args.bytes; their bytes are null")
     if disagree:
@@ -433,7 +462,13 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
                     acc.gemm_flops = (acc.gemm_flops or 0) + flops
                 elif nbytes is not None and _flops(e) is None:
                     no_flops += 1
-    out_secs = {name: acc.result() for name, acc in accs.items()}
+    out_secs = {}
+    for name, own in accs.items():
+        total = _Acc()
+        total.own = own.own
+        for n in (name, *sorted(below[name])):
+            total.merge(accs[n])
+        out_secs[name] = {"parent": parent_of[name], **total.result()}
     if no_flops:
         warnings.append(f"{no_flops} GEMM ops have no flops argument")
 
