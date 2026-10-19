@@ -609,7 +609,8 @@ def main(argv: Sequence[str] | None = None) -> int:
           if use_metrics else None)
     try:
         rec = (None if mw is None else
-               mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0))
+               mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0,
+                           trace_step=cfg.trace_step, trace_c5=cfg.trace_c5))
         run = run_verified(c, D, w0, bands, T=T, final=final, writer=mw, recorder=rec,
                            keep=keep, **base)
         r = run.result
