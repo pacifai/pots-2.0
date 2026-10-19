@@ -518,11 +518,10 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
     rollups = {n for n in depths if n not in {sec["name"] for s in untraced for sec in s["sections"]}
                and levels.get(n) == "component"
                and any(levels.get(o) == "phase" and o.startswith(n + ".") for o in depths)}
-    if tsec_given := trace is not None:
+    if trace is not None:
         absent = sorted(n for n in depths if n not in (trace.get("sections") or {}))
         if absent:
             warns.add(f"the trace summary has no section {', '.join(absent)}")
-    del tsec_given
 
     seconds: dict[str, list[float]] = {}
     for name in depths:
