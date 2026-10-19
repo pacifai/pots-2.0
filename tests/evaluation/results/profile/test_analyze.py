@@ -601,3 +601,78 @@ def test_meta_names_the_run_from_the_environment_record(tmp_path):
                            "compute_dtype": "bfloat16", "git_commit": "abc", "session": "s1"}
     assert not any("--session" in w for w in out["warnings"])
     assert any("--session" in w for w in analyze.analyze(paths["run_dir"])["warnings"])
+
+
+def timeline_of(tmp_path: Path, **kw) -> list[dict]:
+    paths = build_run(tmp_path, **kw)
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    return out["runs"]["honest"]["timeline"]["steps"]
+
+
+def test_timeline_spans_end_and_traced_step_absent(tmp_path):
+    steps = timeline_of(tmp_path, steps=2, step_extra=[
+        step_line(3, [section("A", 0.0, 0.1)], traced=True)])
+    assert [s["step"] for s in steps] == [1, 2]
+    s = steps[0]
+    assert [x["name"] for x in s["sections"]] == ["A", "B", "C", "D"]
+    a = s["sections"][0]
+    assert a["depth"] == 0 and a["spans_s"] == [pytest.approx([0.0, 0.2])]
+    assert s["sections"][3]["spans_s"] == [pytest.approx([0.45, 1.0])]
+    assert s["end_s"] == pytest.approx(1.0)
+
+
+def test_timeline_folded_rest_gives_one_span(tmp_path):
+    paths = build_run(tmp_path, steps=1)
+
+    def edit(step):
+        step["sections"][0]["rest"] = {"calls": 3, "first_us": 300_000.0, "last_us": 350_000.0,
+                                       "host_s": 0.01}
+
+    edit_markers(paths, edit)
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    a = out["runs"]["honest"]["timeline"]["steps"][0]["sections"][0]
+    assert a["spans_s"] == [pytest.approx([0.0, 0.2]), pytest.approx([0.3, 0.35])]
+
+
+def test_timeline_strips_take_the_overlapping_rows_and_four_fields(tmp_path):
+    rows = [{"t": int(i * 1e9), "c_tree": 1.0, "g_util": 0.5, "c_busy": 2.0,
+             "g_pcie_tx": None} for i in range(1, 41)]
+    st = timeline_of(tmp_path, steps=1, sample_rows=rows)[0]["strips"]
+    # step 1 starts at 10 s and lasts 1 s: only the sample ending at 11 s overlaps
+    assert st["t_s"] == [pytest.approx(1.0)]
+    assert set(st) == {"t_s", "g_util", "c_busy"}  # c_tree is no strip; the all-null tx is dropped
+    assert st["g_util"] == [0.5] and st["c_busy"] == [2.0]
+
+
+def test_timeline_strips_null_without_samples(tmp_path):
+    assert timeline_of(tmp_path, steps=1, sample_rows=[])[0]["strips"] is None
+
+
+def test_timeline_downsamples_to_400_points(tmp_path):
+    rows = [{"t": 10_000_000_000 + i * 1_000_000, "g_util": float(i % 2)}
+            for i in range(1, 1001)]
+    st = timeline_of(tmp_path, steps=1, sample_rows=rows)[0]["strips"]
+    assert len(st["t_s"]) == len(st["g_util"]) <= 400
+    assert st["t_s"] == sorted(st["t_s"]) and st["t_s"][-1] == pytest.approx(1.0)
+    assert all(0.0 <= v <= 1.0 for v in st["g_util"])
+
+
+def test_probe_and_machine_in_profile_json(tmp_path):
+    paths = build_run(tmp_path, probe_over={"machine": {"gpu_memory_bytes": 100,
+                                                        "cpu": {"n": 4}}})
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    assert out["machine"] == {"gpu_memory_bytes": 100, "cpu": {"n": 4}}
+    assert "machine" not in out["probe"] and out["probe"]["rates"]["gemm_fp32_flops"] == 1e11
+    assert out["probe"]["device"] == "cpu"
+
+
+def test_probe_and_machine_null_without_a_probe(tmp_path):
+    paths = build_run(tmp_path)
+    out = analyze.analyze(paths["run_dir"], paths["samples"])
+    assert out["probe"] is None and out["machine"] is None
+    paths = build_run(tmp_path / "e")
+    f = paths["run_dir"] / "records.jsonl"
+    lines = f.read_text().splitlines()
+    lines[0] = json.dumps({**json.loads(lines[0]), "machine": {"gpus": 1}})
+    f.write_text("\n".join(lines) + "\n")
+    assert analyze.analyze(paths["run_dir"], paths["samples"])["machine"] == {"gpus": 1}

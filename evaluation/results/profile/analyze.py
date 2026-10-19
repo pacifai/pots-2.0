@@ -6,6 +6,9 @@ Run as ``python -m evaluation.results.profile.analyze --run-dir D --session L [-
 --out profile.json``. ``meta`` names the run (model, attack, scenario, device, compute dtype,
 git commit, from the environment record) and the session ``L`` (PROFILING_PLAN §5.7).
 A missing markers, samples or probe file is a warning in ``profile.json``, not an error.
+Beside what §5.7 lists, ``profile.json`` holds what the report (FS26) draws: ``probe`` and
+``machine`` at the top, and a ``timeline`` per run (the untraced steps' spans and sampler
+strips, at most 400 points per step).
 
 **Units.** Marker times are µs from the step's ``t0_ns``, sample times are monotonic ns, and
 time rows and every ``*_s`` value are seconds. :func:`_abs_ns` puts marker spans on the sample
@@ -80,6 +83,8 @@ CLOCK_MIN_S = 0.05  # §6 step 7: the clock mark needs a section of at least 50 
 UTIL_FACTOR = 2.0  # §6 step 5
 VAR_FIELDS = ("cpu_mhz", "c_other", "g_sm_mhz", "g_throttle", "g_other_procs")
 PHASES = ("run", "glue", "host_stack", "copy", "measure", "judge")
+STRIP_FIELDS = ("g_util", "c_busy", "g_pcie_tx", "g_pcie_rx")
+STRIP_POINTS = 400  # the most points per step and field the timeline keeps
 
 
 def _abs_ns(t0_ns: int, us: float) -> int:
@@ -301,6 +306,61 @@ def _first_counts(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                     key=lambda r: r["step"], reverse=True):
         out[r["component"]] = r
     return out
+
+
+# ---- the timeline ------------------------------------------------------------------------
+
+
+def _bin_strips(t_s: list[float], cols: dict[str, list[float | None]]
+                ) -> tuple[list[float], dict[str, list[float | None]]]:
+    """At most :data:`STRIP_POINTS` equal-width time bins from 0 to the last ``t_s``: each
+    field the mean of its non-null values in the bin, ``t_s`` the bin's end. A bin with no
+    row is left out."""
+    if len(t_s) <= STRIP_POINTS:
+        return t_s, cols
+    width = max(t_s) / STRIP_POINTS
+    bins: dict[int, list[int]] = {}
+    for i, t in enumerate(t_s):
+        bins.setdefault(min(max(math.ceil(t / width) - 1, 0), STRIP_POINTS - 1), []).append(i)
+    order = sorted(bins)
+    out = {f: [_mean([v for i in bins[b] if (v := col[i]) is not None]) for b in order]
+           for f, col in cols.items()}
+    return [(b + 1) * width for b in order], out
+
+
+def _strips(sampler: Sampler, t0_ns: int, end_ns: int) -> dict[str, list[Any]] | None:
+    """The sampler rows whose interval overlaps the step's spans, as ``t_s`` (row end in s from
+    ``t0_ns``) and the fields of :data:`STRIP_FIELDS` that hold a value; ``None`` when no row
+    overlaps or no field has data."""
+    rows = [r for r, a, b in zip(sampler.rows, sampler.starts, sampler.ends)
+            if a < end_ns and b > t0_ns]
+    cols = {f: [r.get(f) for r in rows] for f in STRIP_FIELDS}
+    cols = {f: v for f, v in cols.items() if any(x is not None for x in v)}
+    if not cols:
+        return None
+    t_s, cols = _bin_strips([(r["t"] - t0_ns) * 1e-9 for r in rows], cols)
+    return {"t_s": t_s, **cols}
+
+
+def _timeline(untraced: list[dict[str, Any]], sampler: Sampler) -> dict[str, Any]:
+    """One entry per untraced timed step: each section's spans in s from the step's ``t0_ns``
+    (a folded ``rest`` as its one span), ``end_s`` the latest span end, and the sampler strips."""
+    steps = []
+    for s in untraced:
+        t0 = s["t0_ns"]
+        order: dict[str, list[tuple[int, int]]] = {}
+        depth: dict[str, int] = {}
+        for sec in s["sections"]:
+            order.setdefault(sec["name"], []).extend(_spans_ns(sec, t0))
+            depth.setdefault(sec["name"], sec["depth"])
+        end_ns = max((b for sp in order.values() for _, b in sp), default=t0)
+        steps.append({
+            "step": s["step"], "end_s": (end_ns - t0) * 1e-9,
+            "sections": [{"name": n, "depth": depth[n],
+                          "spans_s": [[(a - t0) * 1e-9, (b - t0) * 1e-9] for a, b in sp]}
+                         for n, sp in order.items() if sp],
+            "strips": _strips(sampler, t0, end_ns)})
+    return {"steps": steps}
 
 
 # ---- check 5 -----------------------------------------------------------------------------
@@ -592,6 +652,7 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                             if s["depth"] == 0 and not s.get("rollup")),
         "sections": sections,
         "c5": _c5_view(untraced, layout, sampler, warns) if layout else None,
+        "timeline": _timeline(untraced, sampler),
         "hook_overhead_bound": _hook_bound(markers.header.get("device"), untraced, probe),
         "memory": {"gpu_memory_bytes": gpu_memory,
                    "sections": {n: {"peak_reserved_bytes": p,
@@ -651,7 +712,8 @@ def analyze(run_dir: Path, samples: Path | None = None, probe: Path | None = Non
     records = io.read_records(run_dir)
     sampler = Sampler(_read("samples", samples, io.read_samples, warns,
                             io.Samples({"mono_ns": 0}, [])))
-    pr = _read("probe", probe, io.read_probe, warns, {"rates": {}, "costs": {}})
+    no_probe: dict[str, Any] = {"rates": {}, "costs": {}}
+    pr = _read("probe", probe, io.read_probe, warns, no_probe)
     trace = io.read_trace_summary(trace_summary) if trace_summary else None
     layout_path = run_dir / io.C5_LAYOUT_FILE
     layout = io.read_c5_layout(layout_path) if layout_path.exists() else None
@@ -669,7 +731,11 @@ def analyze(run_dir: Path, samples: Path | None = None, probe: Path | None = Non
             "git_commit": env.get("git_commit"), "session": session}
     if session is None:
         warns.append("no --session was given: meta.session is null")
-    return {"version": io.VERSION, "meta": meta, "run": run, "compute_dtype": dtype,
+    machine = next((m for m in [pr.get("machine"), env.get("machine")]
+                    if isinstance(m, dict) and m), None)
+    return {"version": io.VERSION, "meta": meta,
+            "probe": None if pr is no_probe else {k: v for k, v in pr.items() if k != "machine"},
+            "machine": machine, "run": run, "compute_dtype": dtype,
             "thresholds": THRESHOLDS,
             "warnings": warns + sorted(soft) + list((trace or {}).get("warnings") or []),
             "runs": {run: view},
