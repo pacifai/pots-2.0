@@ -3,7 +3,9 @@ bands, the scores against a reference band file and the altered-bias steps; on e
 full-scale model, the whole bring-up (slow)."""
 
 import dataclasses
+import gc
 import json
+import weakref
 
 import pytest
 import torch
@@ -29,7 +31,7 @@ from verification.verifier.driver import RUN_START
 SEED, K = 1, 5
 
 
-def _run(family, tied, *, T=2, tamper=True, handoff=None, h_D=None, keep_first=False):
+def _run(family, tied, *, T=2, tamper=True, handoff=None, h_D=None, keep_last=False):
     # torch's default seed differs per process. Seeded, the fits are the same each run: the
     # tiny Qwen2's honest fit fails the concentration guard at 8 of torch seeds 0-19 (largest
     # residual 0.51-0.84 τ), so an unseeded run would flake; at seed 0 it holds for both.
@@ -44,7 +46,7 @@ def _run(family, tied, *, T=2, tamper=True, handoff=None, h_D=None, keep_first=F
 
     h_D = dataset_tree(c, D).root if h_D is None else h_D
     return c, bring_up(c, D, h_D, T=T, k=K, seed=SEED, build_model=build, tamper=tamper,
-                       handoff=handoff, keep_first=keep_first)
+                       handoff=handoff, keep_last=keep_last)
 
 
 class _WrongRootStore(InMemoryStore):
@@ -296,24 +298,64 @@ FS20_KEYS = {"record", "M", "dense", "member", "accepted", "digest", "archive_eq
 
 
 def test_check5_repeats_write_one_line_and_change_nothing(tmp_path):
-    """``--check5-repeats 2``: one FS20 line with two timed passes on step 1, the kept step
-    dropped, and the verdict and step records those of the run without it."""
+    """``--check5-repeats 2``: one FS20 line with two timed passes on the last step (T = 2),
+    the kept step dropped, and the verdict and step records those of the run without it."""
     c, plain = _run("llama", True, tamper=False)
-    c, kept = _run("llama", True, tamper=False, keep_first=True)
+    c, kept = _run("llama", True, tamper=False, keep_last=True)
     assert plain.kept is None and kept.kept is not None
     assert _decisions(kept) == _decisions(plain)
     path = tmp_path / "check5_profile.jsonl"
     D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
     assert check5_repeats(kept, c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K,
-                          seed=SEED, repeats=2, device="cpu", model="tiny", path=path,
+                          seed=SEED, step=2, repeats=2, device="cpu", model="tiny", path=path,
                           out=lambda _: None)
     assert kept.kept is None
     (line,) = path.read_text().splitlines()
     rec = json.loads(line)
-    assert set(rec) == FS20_KEYS and rec["accepted"] and rec["step"] == 1 and rec["k"] == K
+    assert set(rec) == FS20_KEYS and rec["accepted"] and rec["step"] == 2 and rec["k"] == K
     assert len(rec["check5_s"]) == 2
     assert all(len(v) == 2 for v in rec["section_s_per_pass"].values())
     assert rec["machine_facts"]
+
+
+class _Spy(StoreHandoff):
+    """The in-memory hand-off, with weak references to each step's product leaves and its root.
+    At the start of step ``t`` it records which earlier steps' leaves are already dead."""
+
+    def __init__(self):
+        self.refs: dict[int, list[weakref.ref]] = {}
+        self.roots: dict[int, bytes] = {}
+        self.dead_at: dict[int, dict[int, bool]] = {}
+
+    def hold(self, c, t, leaves, tree, dataset_paths=None):
+        gc.collect()
+        self.dead_at[t] = {u: all(r() is None for r in refs) for u, refs in self.refs.items()}
+        lo = c.product_index(1)
+        self.refs[t] = [weakref.ref(x) for x in leaves[lo:lo + c.M]]
+        self.roots[t] = tree.root
+        return InMemoryStore.hold(c, leaves, tree, dataset_paths)
+
+    def release(self, store):
+        pass
+
+
+def test_keep_last_keeps_only_the_last_step(tmp_path):
+    """With ``keep_last`` and T = 3, steps 1 and 2 are released as in a run that keeps nothing:
+    their product leaves are dead before the next step is handed over, and what's kept is step
+    3's store, whose root is the root step 3 committed."""
+    spy = _Spy()
+    c, b = _run("llama", True, T=3, tamper=False, handoff=spy, keep_last=True)
+    assert b.honest_accepted
+    assert spy.dead_at[2] == {1: True} and spy.dead_at[3] == {1: True, 2: True}
+    assert b.kept is not None and b.kept.root == spy.roots[3] != spy.roots[2]
+    gc.collect()
+    assert all(r() is not None for r in spy.refs[3])  # the kept step's leaves are alive
+    assert all(r() is None for u in (1, 2) for r in spy.refs[u])
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+    assert check5_repeats(b, c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K, seed=SEED,
+                          step=3, repeats=1, device="cpu", model="tiny", path=tmp_path / "p.jsonl",
+                          out=lambda _: None)
+    assert json.loads((tmp_path / "p.jsonl").read_text())["step"] == 3
 
 
 def test_without_the_flag_nothing_is_kept_or_written(tmp_path):
