@@ -79,20 +79,31 @@ def read_markers(path: str | Path) -> Markers:
     path = Path(path)
     header, rest = _read_lines(path)
     out = Markers(header)
+    seen: set[Any] = set()
     for r in rest:
         kind = r.get("kind")
         if kind == "step":
             out.steps.append(r)
         elif kind == "run":
             out.runs.append(r)
-        else:
-            raise ValueError(f"{path}: unknown line kind {kind!r}")
+        elif kind not in seen:
+            seen.add(kind)
+            warnings.warn(f"{path}: skipped lines of unknown kind {kind!r}", stacklevel=2)
     return out
 
 
 def read_samples(path: str | Path) -> Samples:
-    header, rest = _read_lines(Path(path))
-    return Samples(header, [r for r in rest if "kind" not in r])  # FS21's error lines
+    path = Path(path)
+    header, rest = _read_lines(path)
+    seen: set[Any] = set()
+    rows = []
+    for r in rest:
+        if "kind" not in r:
+            rows.append(r)
+        elif r["kind"] not in seen:  # FS21's error lines: skipped, one warning per kind
+            seen.add(r["kind"])
+            warnings.warn(f"{path}: skipped lines of kind {r['kind']!r}", stacklevel=2)
+    return Samples(header, rows)
 
 
 def read_probe(path: str | Path) -> dict[str, Any]:

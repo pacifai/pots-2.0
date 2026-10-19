@@ -65,7 +65,8 @@ def samples_file(path: Path, rows: list[dict[str, Any]], *, start_ns: int = 0) -
 def build_run(root: Path, *, steps: int = 3, secs: dict[str, tuple[float, ...]] | None = None,
               hash_bytes: dict[str, int] | None = None, records_extra: list[dict[str, Any]] = (),
               sample_rows: list[dict[str, Any]] | None = None, probe_over: dict[str, Any] | None = None,
-              step_extra: list[dict[str, Any]] = (), device: str = "cpu") -> dict[str, Path]:
+              step_extra: list[dict[str, Any]] = (), device: str = "cpu",
+              depths: dict[str, int] | None = None) -> dict[str, Path]:
     """A run of ``steps`` one-second steps. ``secs`` maps a section to (start_s, dur_s); the
     time rows repeat the marker durations, and ``hash_bytes`` gives each section's counted
     bytes. Returns the paths the CLI takes."""
@@ -76,10 +77,14 @@ def build_run(root: Path, *, steps: int = 3, secs: dict[str, tuple[float, ...]] 
     lines = [header]
     records = [{"record": "environment", "run": "honest", "compute_dtype": "float32"}]
     for k in range(1, steps + 1):
-        lines.append(step_line(k, [section(n, v[0], v[1], gpu_dur_s=v[2] if len(v) > 2 else None)
+        depth = depths or {}
+        lines.append(step_line(k, [section(n, v[0], v[1], depth=depth.get(n, 0),
+                                           gpu_dur_s=v[2] if len(v) > 2 else None)
                                    for n, v in secs.items()]))
-        records += [time_row(k, n, v[1]) for n, v in secs.items()]
-        records.append(time_row(k, "step", sum(v[1] for v in secs.values())))
+        records += [time_row(k, n, v[1], level="sub" if depth.get(n) else "component")
+                    for n, v in secs.items()]
+        records.append(time_row(k, "step", sum(v[1] for n, v in secs.items() if not depth.get(n)),
+                                level="total"))
     records += [count_row(1, n, hash_in_bytes=b) for n, b in (hash_bytes or {}).items()]
     records += list(records_extra)
     lines += list(step_extra)

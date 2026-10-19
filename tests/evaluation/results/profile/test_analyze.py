@@ -140,7 +140,7 @@ def test_trace_work_sets_the_pcie_floor(tmp_path):
         "A": {"copy_bytes": {"h2d": 1e9, "d2h": 5e8}, "launches": 1000}}}))
     s = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t
                         )["runs"]["honest"]["sections"]["A"]
-    assert s["floors_s"]["pcie"] == pytest.approx(1e9 / 1e10 + 5e8 / 1e10)
+    assert s["floors_s"]["pcie"] == pytest.approx(1e9 / 1e10)  # max of the two directions
     assert s["floors_s"]["launch"] == pytest.approx(1000 * 5e-6)
     assert s["bound"] == "pcie"
 
@@ -304,7 +304,8 @@ def test_samples_reader_skips_error_lines(tmp_path):
     f = tmp_path / "s.jsonl"
     samples_file(f, [{"t": 1, "c_tree": -0.5, "g_util": 0.5},
                      {"kind": "error", "group": "gpm", "error": "x"}, {"t": 2, "c_tree": 1.0}])
-    rows = io.read_samples(f).rows
+    with pytest.warns(UserWarning, match="'error'"):
+        rows = io.read_samples(f).rows
     assert [r["t"] for r in rows] == [1, 2] and rows[0]["c_tree"] == -0.5
 
 
@@ -347,3 +348,228 @@ def test_check_5_trace_work_scales_by_run_time(tmp_path):
     out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t)
     assert out["runs"]["honest"]["sections"]["5"]["work"]["launches"] == 10
     assert any("unscaled" in w for w in out["warnings"])
+
+
+def test_a_nested_section_is_not_double_counted(tmp_path):
+    secs = {"A": (0.0, 0.4), "A.s": (0.1, 0.2), "D": (0.4, 0.6)}
+    out, s = run(tmp_path, secs=secs, depths={"A.s": 1})
+    assert out["runs"]["honest"]["share_total"] == pytest.approx(1.0)
+    assert s["A.s"]["depth"] == 1 and s["A.s"]["share"] == pytest.approx(0.2)
+
+
+def trace_file(tmp_path: Path, sections: dict, **extra) -> Path:
+    t = tmp_path / "trace_summary.json"
+    t.write_text(json.dumps({"version": 1, "c5_slice": {}, "sections": sections, **extra}))
+    return t
+
+
+def with_trace(paths, t):
+    return analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t)
+
+
+def test_the_hbm_floor(tmp_path):
+    paths = build_run(tmp_path / "run")
+    out = with_trace(paths, trace_file(tmp_path, {"A": {"gemm_bytes": 5e9,
+                                                       "copy_bytes": {"d2d": 5e9}}}))
+    s = out["runs"]["honest"]["sections"]["A"]
+    assert s["floors_s"]["hbm"] == pytest.approx(1e10 / 1e11) and s["bound"] == "hbm"
+
+
+def test_a_null_rate_drops_only_its_own_resource(tmp_path):
+    rates = probe()["rates"] | {"h2d_pageable_bytes": None}
+    paths = build_run(tmp_path / "run", probe_over={"rates": rates})
+    t = trace_file(tmp_path, {"A": {"copy_bytes": {"d2h": 1e9}, "launches": 10},
+                              "B": {"copy_bytes": {"h2d": 1e9}, "launches": 10},
+                              "C": {"launches": 10}})
+    out = with_trace(paths, t)
+    s = out["runs"]["honest"]["sections"]
+    assert s["A"]["floors_s"]["pcie"] == pytest.approx(1e9 / 1e10)  # h2d count is 0: no term
+    assert "pcie" not in s["B"]["floors_s"] and "launch" in s["B"]["floors_s"]
+    assert "pcie" not in s["C"]["floors_s"]
+    assert sum("h2d_pageable_bytes" in w for w in out["warnings"]) == 1
+
+
+def test_a_null_cost_with_zero_count_adds_nothing(tmp_path):
+    paths = build_run(tmp_path / "run", probe_over={"costs": {"launch_s": 5e-6, "sync_s": None,
+                                                              "event_pair_s": None}})
+    out = with_trace(paths, trace_file(tmp_path, {"A": {"launches": 10}}))
+    s = out["runs"]["honest"]["sections"]["A"]
+    assert s["floors_s"]["launch"] == pytest.approx(10 * 5e-6)  # no syncs counted off CUDA
+    assert not any("sync_s" in w for w in out["warnings"])
+
+
+def test_thresholds_are_inclusive(tmp_path):
+    # share exactly 0.10 and ratio exactly 3.0 (binary-exact numbers, one step)
+    rates = probe()["rates"] | {"hash": {"per_byte_s": 0.5 ** 30, "per_leaf_s": 0.0,
+                                         "threads": 8}}
+    kw = {"steps": 1, "probe_over": {"rates": rates}}
+    secs = {"A": (0.0, 0.375), "D": (0.4, 3.375)}
+    _, s = run(tmp_path / "a", secs=secs, hash_bytes={"A": 2 ** 27}, **kw)
+    assert s["A"]["share"] == 0.1 and s["A"]["ratio"] == 3.0
+    assert "bottleneck" in s["A"]["marks"]
+    _, s = run(tmp_path / "b", secs=secs, hash_bytes={"A": 2 ** 27 + 2 ** 20}, **kw)
+    assert "bottleneck" not in s["A"]["marks"]  # ratio just under 3
+    _, s = run(tmp_path / "c", secs={"A": (0.0, 0.375), "D": (0.4, 3.5)},
+               hash_bytes={"A": 2 ** 27}, **kw)
+    assert "bottleneck" not in s["A"]["marks"]  # share just under 0.10
+
+
+def edit_markers(paths, edit):
+    f = paths["run_dir"] / "markers.jsonl"
+    lines = [json.loads(ln) for ln in f.read_text().splitlines()]
+    for ln in lines[1:]:
+        edit(ln)
+    jl(f, lines)
+
+
+def test_hook_bound_counts_stamps_and_rest_calls(tmp_path):
+    paths = build_run(tmp_path / "run", steps=2, secs={"A": (0.0, 0.5, 0.5)}, device="cuda")
+
+    def edit(ln):
+        ln["sections"][0]["rest"] = {"calls": 3, "first_us": 0.0, "last_us": 1.0}
+        ln["stamps"] = {"name": [0] * 5}
+
+    edit_markers(paths, edit)
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    # per 1 s step: 2 syncs; 1 gpu span + 3 rest calls + 5 stamps = 9 events
+    assert out["runs"]["honest"]["hook_overhead_bound"] == pytest.approx(2 * 1.5e-5 + 9 * 4e-6)
+
+
+def test_a_rest_folded_section_keeps_a_span_and_is_flagged(tmp_path):
+    rows = [{"t": int(i * 1e9), "c_tree": float(i), "g_util": 0.0} for i in range(1, 41)]
+    paths = build_run(tmp_path / "run", steps=1, sample_rows=rows, secs={"A": (0.0, 0.2),
+                                                                        "B": (0.5, 0.1)})
+
+    def edit(ln):
+        ln["sections"][0]["rest"] = {"calls": 5, "first_us": 3e6, "last_us": 3.5e6}
+
+    edit_markers(paths, edit)
+    s = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"]
+                        )["runs"]["honest"]["sections"]
+    # 0.2 s of sample 11 and 0.5 s of sample 14 (the step starts at 10 s)
+    assert s["A"]["util"]["c_tree"] == pytest.approx((0.2 * 11 + 0.5 * 14) / 0.7)
+    assert s["A"]["util"]["truncated"] is True and s["B"]["util"]["truncated"] is False
+
+
+def test_the_first_sample_starts_at_the_header_clock(tmp_path):
+    from tests.evaluation.results.profile.helpers import samples_file
+    paths = build_run(tmp_path / "run", steps=1)
+    samples_file(paths["samples"], [{"t": 10_500_000_000, "c_tree": 7.0, "g_util": 0.5},
+                                    {"t": 11_000_000_000, "c_tree": 9.0, "g_util": 0.5}],
+                 start_ns=10_000_000_000)
+    s = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"]
+                        )["runs"]["honest"]["sections"]
+    assert s["A"]["util"]["c_tree"] == 7.0 and s["A"]["util"]["n_samples"] == 1
+
+
+def test_the_gemm_lane_follows_the_rate_used():
+    means = {"g_tensor": 0.7, "g_sm_active": 0.2, "g_util": 0.5}
+    lane = analyze._lane
+    assert lane("gemm", means, {}, "gemm_bf16_flops") == 0.7
+    assert lane("gemm", means, {}, "gemm_fp32_flops") == 0.2
+    assert lane("gemm", means, {}, "skinny_bmm_fp32_flops") == 0.2
+    assert lane("gemm", {"g_sm_active": None, "g_util": 0.5}, {}, "gemm_fp32_flops") == 0.5
+    assert lane("gemm", {"g_sm_active": 0.0, "g_util": 0.5}, {}, "gemm_fp32_flops") == 0.0
+
+
+def test_throttle_is_the_fraction_of_samples_with_a_bit_set():
+    rows = [{"t": 1_000_000_000, "g_throttle": 0}, {"t": 2_000_000_000, "g_throttle": 4},
+            {"t": 3_000_000_000, "g_throttle": 1}]
+    samples = io.Samples({"mono_ns": 0}, rows)
+    means, _ = analyze.weighted_means(samples, [(0, 3_000_000_000)])
+    assert means["g_throttle"] == pytest.approx(2 / 3)
+
+
+def test_readers_skip_unknown_kinds_once_per_kind(tmp_path):
+    paths = build_run(tmp_path / "run")
+    f = paths["run_dir"] / "markers.jsonl"
+    f.write_text(f.read_text() + '{"kind": "note"}\n{"kind": "note"}\n{"kind": "other"}\n')
+    with pytest.warns(UserWarning) as w:
+        m = io.read_markers(f)
+    assert len(m.steps) == 3 and len(w) == 2
+    g = tmp_path / "s.jsonl"
+    from tests.evaluation.results.profile.helpers import samples_file
+    samples_file(g, [{"t": 1}, {"kind": "error"}, {"kind": "error"}, {"t": 2}])
+    with pytest.warns(UserWarning) as w:
+        assert len(io.read_samples(g).rows) == 2
+    assert len(w) == 1
+
+
+def test_sections_come_from_the_time_rows_and_the_markers(tmp_path):
+    from tests.evaluation.results.profile.helpers import count_row
+    extra = [time_row(k, "X", 0.3) for k in (1, 2, 3)] + [count_row(1, "X", hash_in_bytes=3e7)]
+    out, s = run(tmp_path, records_extra=extra)
+    x = s["X"]
+    assert x["time"]["mean"] == pytest.approx(0.3) and x["floors_s"]["hash"] == pytest.approx(0.03)
+    assert x["ratio"] == pytest.approx(10.0)
+    assert x["clocks"]["host_s"] is None and x["util"]["n_samples"] == 0
+    assert x["depth"] == 0 and s["A"]["util"]["n_samples"] > 0
+    assert "step" not in s
+
+
+def test_a_phase_rollup_is_left_out_of_the_share_total(tmp_path):
+    extra = [time_row(k, "P2", 0.2, "prover", "component") for k in (1, 2, 3)] \
+        + [time_row(k, "P2.w", 0.2, "prover", "phase") for k in (1, 2, 3)]
+    out, s = run(tmp_path, records_extra=extra)
+    assert s["P2"]["rollup"] is True and "rollup" not in s["P2.w"]
+    assert out["runs"]["honest"]["share_total"] == pytest.approx(1.0 + 0.2)  # P2.w only
+
+
+def test_markers_without_steps_or_absent_warn(tmp_path):
+    paths = build_run(tmp_path / "run")
+    f = paths["run_dir"] / "markers.jsonl"
+    f.write_text(f.read_text().splitlines()[0] + "\n")
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    assert any("no step lines" in w for w in out["warnings"])
+    assert out["runs"]["honest"]["sections"]["A"]["time"]["mean"] == pytest.approx(0.2)
+    f.unlink()
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    assert any("markers" in w and "does not exist" in w for w in out["warnings"])
+    assert out["runs"]["honest"]["sections"]["A"]["util"]["n_samples"] == 0
+
+
+def test_the_cli_runs_with_only_the_run_directory(tmp_path):
+    paths = build_run(tmp_path / "run", hash_bytes={"A": 20_000_000})
+    out = tmp_path / "profile.json"
+    assert analyze.main(["--run-dir", str(paths["run_dir"]), "--out", str(out)]) == 0
+    got = json.loads(out.read_text())
+    assert sum("no samples file" in w for w in got["warnings"]) == 1
+    assert sum("no probe file" in w for w in got["warnings"]) == 1
+    a = got["runs"]["honest"]["sections"]["A"]
+    assert a["floors_s"] == {} and a["util"]["n_samples"] == 0
+
+
+def test_an_empty_samples_file_warns_and_leaves_utilization_null(tmp_path):
+    paths = build_run(tmp_path / "run")
+    paths["samples"].write_bytes(b"")
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    assert any("is empty" in w for w in out["warnings"])
+    u = out["runs"]["honest"]["sections"]["A"]["util"]
+    assert u["n_samples"] == 0 and "c_tree" not in u
+
+
+def test_the_trace_missing_sections_warn_once(tmp_path):
+    paths = build_run(tmp_path / "run")
+    out = with_trace(paths, trace_file(tmp_path, {"A": {"launches": 1}}))
+    msgs = [w for w in out["warnings"] if "no section" in w]
+    assert len(msgs) == 1 and "B, C, D" in msgs[0]
+
+
+def test_members_of_a_group_with_different_classes_warn_once(tmp_path):
+    names, st, layout = c5_inputs(tmp_path)
+    layout["entries"][1]["group"] = 0
+    paths = build_run(tmp_path / "run", steps=2, secs={"5": (0.0, 0.0002)})
+    edit_markers(paths, lambda ln: ln.update(stamps=st, stamp_names=names))
+    (paths["run_dir"] / "c5_layout.json").write_text(json.dumps(layout))
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    assert sum("different classes" in w for w in out["warnings"]) == 1
+
+
+def test_markers_for_clocks_and_spans_skip_step_zero_and_traced_steps(tmp_path):
+    rows = [{"t": int(i * 1e9), "c_tree": float(i), "g_util": 0.0} for i in range(1, 41)]
+    paths = build_run(tmp_path / "run", steps=1, sample_rows=rows,
+                      step_extra=[step_line(0, [section("A", 0.0, 0.2)]),
+                                  step_line(2, [section("A", 0.0, 0.2)], traced=True)])
+    s = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"]
+                        )["runs"]["honest"]["sections"]
+    assert s["A"]["util"]["c_tree"] == pytest.approx(11.0)  # only step 1's span at 10 s
