@@ -669,8 +669,9 @@ def _served_group(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Seq
         raise RuntimeError(f"{first.name}: replay group operands {tuple(a.shape)}·"
                            f"{tuple(b.shape)}")
     # The leaves are in host memory: one stack there, then one copy to the operands' device
-    # (F4a).
-    p = torch.stack([view.product(m) for m in ms]).detach().to(a.device, torch.float32)
+    # (F4a), in the stored dtype and cast there (a blocking `.to(device, dtype)` converts on
+    # the CPU).
+    p = torch.stack([view.product(m) for m in ms]).detach().to(a.device).to(torch.float32)
     return _Group(list(idx), a, b, p, None)
 
 
@@ -739,9 +740,10 @@ def _served(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay:
         raise RuntimeError(f"{spec.name}: replay operands {tuple(a.shape)}·{tuple(b.shape)} "
                            f"!= declared {spec.a_shape}·{spec.b_shape}")
     # The leaves are in host memory, the replay on the run's device (F4a): check 5 measures
-    # there, so the leaf moves to the operands.
+    # there, so the leaf moves to the operands, in the stored dtype and cast there (a blocking
+    # `.to(device, dtype)` converts on the CPU).
     return (a.detach().to(torch.float32), b.detach().to(torch.float32),
-            p.detach().to(a.device, torch.float32), bias)
+            p.detach().to(a.device).to(torch.float32), bias)
 
 
 def _stacked(specs: Sequence[ProductSpec], served: Sequence[Served]) -> list[_Group]:
