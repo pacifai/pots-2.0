@@ -7,7 +7,8 @@ skipped, and so is the root itself. :func:`read` reads every run directory into
 :class:`Records`:
 
 - ``tables``: one :class:`Table` per record type, rows in file order and run directories in
-  path order. Each row is the record as written plus ``run_dir``, the directory's path relative
+  path order. A ``time`` row of the traced step (``traced: true``, FS23: a profiler ran during
+  it) goes to the ``time_traced`` table instead, so no cost reads it. Each row is the record as written plus ``run_dir``, the directory's path relative
   to the root. A run's name is not unique (``calibrate/k9/`` writes run ``calibrate``), so
   ``run_dir`` identifies it. Types this module doesn't know, such as ``calibration`` or
   ``sweep_point``, get a table like the rest. The writer stores a non-finite float as the
@@ -205,7 +206,8 @@ class Records:
     archives: list[Archive]
 
     def table(self, record: str) -> Table:
-        """The rows of one record type; empty if no run wrote it."""
+        """The rows of one record type; empty if no run wrote it. ``time`` leaves out the traced
+        step's rows (``traced: true``, FS23), which ``time_traced`` holds."""
         return self.tables.get(record, Table())
 
     def counts(self) -> dict[str, Counter[str]]:
@@ -301,7 +303,9 @@ class Records:
                               "for it", UserWarning, stacklevel=2)
                 continue
             v = [r for r in self._cost_rows(d) if scenario is None or r.get("scenario") == scenario]
-            p = self._cost_rows(p_dir)
+            traced = {r["step"] for r in self.table("time_traced") if r["run_dir"] == d}
+            p = [r for r in self._cost_rows(p_dir)
+                 if not (r.get("record") == "time" and r.get("step") in traced)]
             if verified is not None:
                 _warn_unmatched(v, p)
             out.extend({**r, "run_dir": d, "plain_run_dir": p_dir} for r in derive_capture(v, p))
@@ -330,7 +334,8 @@ def read(root: str | os.PathLike[str] | None = None) -> Records:
         if (d / RECORDS_FILE).is_file():
             for r in read_jsonl(d / RECORDS_FILE):
                 r["run_dir"] = rel
-                tables.setdefault(r["record"], Table()).append(r)
+                kind = "time_traced" if r["record"] == "time" and r.get("traced") else r["record"]
+                tables.setdefault(kind, Table()).append(r)
         for found, files in ((residuals, (d / RESIDUALS_DIR).rglob("*.npz")),
                              (archives, d.glob("*.npz"))):
             found += [a for f in sorted(files) if (a := _archive(rel, f)) is not None]

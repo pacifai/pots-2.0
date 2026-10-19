@@ -396,6 +396,7 @@ class Cell:
     plant: str | None = None
     revision: str | None = None
     data_only: bool = False
+    trace_step: int = 0  # H1 profiles this step (FS23); 0 = none
     runner: Runner = field(default_factory=SubprocessRunner)
     base_env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     out: Callable[[str], None] = field(default=lambda s: print(s, flush=True))  # live in a log
@@ -415,8 +416,20 @@ class Cell:
         return self.cell / self.name("honest", 0, seed)
 
     def env(self, seed: int, count: int = 1) -> dict[str, str]:
-        return {**self.base_env, "VERIF_OUTPUT_DIR": str(self.cell), "VERIF_SEED": str(seed),
-                "VERIF_POISON_COUNT": str(count)}
+        """A child's environment. ``VERIF_TRACE_STEP`` is H1's alone (:meth:`h1_env`), so an
+        inherited one is dropped."""
+        env = {**self.base_env, "VERIF_OUTPUT_DIR": str(self.cell), "VERIF_SEED": str(seed),
+               "VERIF_POISON_COUNT": str(count)}
+        env.pop("VERIF_TRACE_STEP", None)
+        return env
+
+    def h1_env(self) -> dict[str, str]:
+        """H1's environment: :meth:`env` at the first seed, plus ``VERIF_TRACE_STEP`` when
+        ``trace_step`` is set."""
+        env = self.env(self.h1_seed)
+        if self.trace_step:
+            env["VERIF_TRACE_STEP"] = str(self.trace_step)
+        return env
 
     def log(self, stage: str, status: str, seconds: float = 0.0, **extra: Any) -> None:
         row = {"stage": stage, "status": status, "seconds": round(seconds, 3),
@@ -584,7 +597,7 @@ def _verified_done(run_dir: Path) -> Callable[[], bool]:
 def stage_h1_h3(cell: Cell) -> None:
     h1 = cell.honest(cell.h1_seed)
     cell.run_stage("H1", h1, "verification.runs.run_verified", ["--metrics"],
-                   cell.env(cell.h1_seed), done=_verified_done(h1),
+                   cell.h1_env(), done=_verified_done(h1),
                    exit1=lambda: _rejected(h1))
     h3 = cell.cell / PLAIN_DIR
     cell.run_stage("H3", h3, "verification.runs.plain_baseline", ["--metrics"],
@@ -907,6 +920,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="build the cell's data (H0) and stop, before any GPU session")
     r.add_argument("--plant", choices=PLANTS, default=None,
                    help="rehearse a stop (module docstring); changes no file or check")
+    r.add_argument("--trace-step", type=int, default=0, metavar="N",
+                   help="profile H1's step N with torch.profiler (VERIF_TRACE_STEP; 0 = off); "
+                   "no other run is traced")
     ch = sub.add_parser("cheats", help="A1–A3 at one seed (VERIF_SEED), several levels",
                         allow_abbrev=False)
     ch.add_argument("--levels", type=int, nargs="+", required=True)
@@ -930,9 +946,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         p.error(f"levels must lie in 1…{cfg.batch} (level 0 is the honest run)")
     if len(set(args.seeds)) != len(args.seeds):
         p.error("--seeds repeats a seed")
+    if args.trace_step < 0:
+        p.error("--trace-step must be >= 0")
     cell = Cell(cfg.output_dir.resolve(), cfg.model, cfg.attack, cfg.batch, pc.k,
                 list(args.seeds), levels, hidden, sweep, kargs, args.guard_ack, args.plant,
-                revision=cfg.model_revision, data_only=args.data_only)
+                revision=cfg.model_revision, data_only=args.data_only,
+                trace_step=args.trace_step)
     previous = install_signal_handlers()
     try:
         return run_cell(cell)
