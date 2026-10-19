@@ -229,10 +229,10 @@ def test_profile_check_bring_ups(tmp_path):
     assert [p.info["model"] for p in bring] == [repo for repo, _ in fs.RUN_PINS]
     for p in bring:
         assert p.argv == ["{python}", "-m", "verification.runs.bring_up", "--no-tamper",
-                          "--steps", "2", "--check5-repeats", "3"]
+                          "--steps", "2", "--metrics", "--check5-repeats", "3"]
         assert {k: p.env[k] for k in fs.FULL_SCALE_ENV} == fs.FULL_SCALE_ENV
         assert {k: p.env[k] for k in fs.RECHECK_ENV} == fs.RECHECK_ENV
-        assert p.env["VERIF_TRACE_STEP"] == "2" and p.env["VERIF_METRICS"] == "1"
+        assert p.env["VERIF_TRACE_STEP"] == "2" and "VERIF_METRICS" not in p.env
         assert "VERIF_TRACE_C5" not in p.env
         assert p.env["VERIF_DEVICE"] == "cuda" and p.env["VERIF_COMPUTE_DTYPE"] == "bfloat16"
         assert not set(p.env) & set(fs.SECRETS)

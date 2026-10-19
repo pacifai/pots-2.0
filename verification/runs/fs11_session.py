@@ -520,15 +520,16 @@ def _smollm2_parts(upload: Path, out: Path) -> list[Part]:
 def profile_check_plan(upload: Path, out: Path) -> list[Part]:
     """The profile check's parts (module docstring): the models part and the probe; SmolLM2's
     calibration, three ``run_verified`` runs, the plain run and the stored step's profile; then
-    each model's ``bring_up --no-tamper --steps 2 --check5-repeats 3`` at
-    :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`, tracing step 2 with metrics on. Every part
+    each model's ``bring_up --no-tamper --steps 2 --metrics --check5-repeats 3`` at
+    :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`, a timed run tracing step 2. Every part
     runs with the sampler (``POTS_SAMPLER`` is never set)."""
     t = PROFILE_CHECK_TIMEOUT_S
     plan = [_models_part(upload, out, t["models"]), _probe_part(out)]
     plan += _smollm2_parts(upload, out)
     plan += _bring_up_parts(upload, out,
-                            {**RECHECK_ENV, "VERIF_TRACE_STEP": "2", "VERIF_METRICS": "1"},
-                            t["bring_up"], ("--steps", "2", "--check5-repeats", "3"))
+                            {**RECHECK_ENV, "VERIF_TRACE_STEP": "2"},
+                            t["bring_up"],
+                            ("--steps", "2", "--metrics", "--check5-repeats", "3"))
     return plan
 
 

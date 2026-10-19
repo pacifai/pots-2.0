@@ -55,9 +55,14 @@ cache.
 6. **Check 5's repeats** (``--check5-repeats N``, default 0 = off). The run keeps step 1's
    transcript in host memory. After every verdict and table is printed, check 5's measuring
    runs on it N times as ``check5_profile`` runs it (``profile_step``), on the in-sample bands,
-   and appends one line to ``$VERIF_OUTPUT_DIR/check5_profile.jsonl`` in ``check5_profile
-   --out``'s format. They change no verdict, exit code or other file, and no step's time rows
+   and appends one line to ``$VERIF_OUTPUT_DIR/check5_profile.jsonl`` (under ``--metrics``,
+   ``$VERIF_OUTPUT_DIR/bring_up/check5_profile.jsonl``) in ``check5_profile --out``'s format. They change no verdict, exit code or other file, and no step's time rows
    hold their time; the kept step is dropped when they finish.
+
+7. **A timed run** (``--metrics``, default off; not ``VERIF_METRICS``). The honest run is
+   observed by a ``TimeRecorder`` into ``$VERIF_OUTPUT_DIR/bring_up/`` (records, markers,
+   ``VERIF_TRACE_STEP``'s trace) in place of the memory pass, which is skipped: the report
+   prints that peaks were not measured. The verdicts are the same.
 
 Exits 0 when the honest run is accepted, its fit holds the concentration guard and each
 tamper is rejected where expected, else 1.
@@ -66,6 +71,7 @@ tamper is rejected where expected, else 1.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import statistics
@@ -94,6 +100,7 @@ from verification.runs.llama_step import load_committed_dataset, report_costs
 from verification.runs.loop import release_cache_setting, release_device_cache
 from verification.runs.metrics import (
     SCORE_FAMILIES,
+    MetricsWriter,
     allocator_settings,
     memory_pass,
     memory_probe,
@@ -284,7 +291,8 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
              tamper: bool = True, device: str | torch.device = "cpu",
              handoff: StoreHandoff | None = None,
              echo: Callable[[str], None] | None = None,
-             release_cache: bool | None = None, keep_first: bool = False) -> BringUp:
+             release_cache: bool | None = None, keep_first: bool = False,
+             recorder: Any = None) -> BringUp:
     """Items 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
     a random-weight config runs the same path). ``build_model`` (default ``c.build_model``)
     gives the prover's model, built once and reused (``ReusedModel``). ``tamper`` runs item 4
@@ -294,7 +302,9 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
     dies mid-step still shows where its memory went. ``release_cache=False`` skips the CUDA
     cache release between prover and verifier, in the honest steps and the tampers alike;
     ``None`` (the default) reads ``VERIF_RELEASE_CACHE``. ``keep_first`` keeps the honest
-    step 1's transcript in memory as ``BringUp.kept`` (the tampers' steps are not kept)."""
+    step 1's transcript in memory as ``BringUp.kept`` (the tampers' steps are not kept).
+    ``recorder`` (a timed run's ``TimeRecorder``) observes the honest run in place of the memory
+    pass, which is then skipped: ``BringUp.memory_rows`` is empty."""
     keeper = _KeepFirst(handoff or IN_MEMORY) if keep_first else None
     models = ReusedModel(build_model or c.build_model)
     w0 = snapshot_weights(c, models())
@@ -330,10 +340,14 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
                                 verifier=make, handoff=keeper or handoff,
                                 release_cache=release_cache)
 
-    probe = memory_probe(device)
-    if echo is not None:
-        echo(f"== memory pass: each section's peak as it closes, GB [{probe.source}]")
-    rows = memory_pass(RUN_NAME, HONEST.name, run, probe, echo=echo)
+    if recorder is not None:
+        run(recorder)
+        rows: list[dict[str, Any]] = []
+    else:
+        probe = memory_probe(device)
+        if echo is not None:
+            echo(f"== memory pass: each section's peak as it closes, GB [{probe.source}]")
+        rows = memory_pass(RUN_NAME, HONEST.name, run, probe, echo=echo)
     out = BringUp(got["r"], rows, got["cal"], got["bands"], got["freeze"],
                   kept=None if keeper is None else keeper.kept())
     out.result.loop.w_final = {}  # the prover's W_T: check 8 has read it, and it is |W| bytes
@@ -426,7 +440,7 @@ def _width(c: DecoderComputation, m: int) -> int:
 
 def report(b: BringUp, *, k: int, reference: Bands | None,
            c: DecoderComputation, out: Callable[[str], None] = print,
-           T_run: int = 1) -> None:
+           T_run: int = 1, timed: bool = False) -> None:
     r, v = b.result, b.result.verifier
     loop = r.loop
     out("== honest steps (calibration mode: the exact checks judge, 5 and 6 record)")
@@ -473,7 +487,10 @@ def report(b: BringUp, *, k: int, reference: Bands | None,
                f"{rej.detail[:160]}")
             + ("" if tp.rejected_as_expected else "  <-- NOT AS EXPECTED")
             + ("" if b.guard_ok else "  [bands fail the concentration guard]"))
-    out("== cost (wall clock from the memory pass)")
+    out("== cost (wall clock of the timed run)" if timed else
+        "== cost (wall clock from the memory pass)")
+    if timed:
+        out("   peaks not measured in a --metrics run (the sampler's rows hold them)")
     report_costs(r, b.memory_rows, out)
 
 
@@ -513,6 +530,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--check5-repeats", type=int, default=0, metavar="N",
                    help="after the verdict, time check 5 on step 1 N times and append one line "
                         "to $VERIF_OUTPUT_DIR/check5_profile.jsonl (default 0, off)")
+    p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=False,
+                   help="time the honest run into the run directory $VERIF_OUTPUT_DIR/"
+                        f"{RUN_NAME}/ (records, markers, VERIF_TRACE_STEP's trace) in place of "
+                        "the memory pass; --check5-repeats then appends there (default off)")
     args = p.parse_args(argv)
     if args.steps < 1:
         p.error(f"T = {args.steps}: at least one step")
@@ -551,15 +572,33 @@ def main(argv: Sequence[str] | None = None) -> int:
           + ("; CUDA cache released before the verifier" if cfg.release_cache else
              "; no cache release (VERIF_RELEASE_CACHE=0)"))
     print("allocator: " + json.dumps(allocator_settings(cfg.release_cache)), flush=True)
-    b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
-                 device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
-                 echo=lambda line: print(line, flush=True), release_cache=cfg.release_cache,
-                 keep_first=args.check5_repeats > 0)
-    report(b, k=k, reference=reference, c=c, T_run=cfg.steps)
+    run_dir = cfg.output_dir / RUN_NAME
+    mw = None
+    try:
+        rec = None
+        if args.metrics:
+            config = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
+                      if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
+                                        "trace_c5")}
+            mw = MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
+                               attack=cfg.attack, seed=cfg.seed, config=config, h_D=h_D)
+            mw.write_c5_layout(c)  # what the markers' check-5 stamps index
+            rec = mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0,
+                              trace_step=cfg.trace_step, trace_c5=cfg.trace_c5)
+        b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
+                     device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
+                     echo=lambda line: print(line, flush=True),
+                     release_cache=cfg.release_cache, keep_first=args.check5_repeats > 0,
+                     recorder=rec)
+    finally:
+        if mw is not None:
+            mw.close()
+            print(f"metrics: {mw.dir}")
+    report(b, k=k, reference=reference, c=c, T_run=cfg.steps, timed=args.metrics)
     if args.check5_repeats > 0:
         check5_repeats(b, c, h_D=h_D, n_records=len(D), k=k, seed=cfg.seed,
                        repeats=args.check5_repeats, device=cfg.device, model=cfg.model,
-                       path=cfg.output_dir / "check5_profile.jsonl")
+                       path=(run_dir if args.metrics else cfg.output_dir) / "check5_profile.jsonl")
     return 0 if b.passed else 1
 
 
