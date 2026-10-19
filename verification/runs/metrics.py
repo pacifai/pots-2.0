@@ -15,7 +15,7 @@ is a once-per-run section, reported at step 0. A section opened inside another i
 
 **Three passes, one axis each.** Measuring one axis disturbs the others, so each has its own run:
 
-- the *timed run* reads only ``time.perf_counter`` (:class:`TimeRecorder`). It is the run whose
+- the *timed run* reads only ``time.monotonic_ns`` (:class:`TimeRecorder`). It is the run whose
   steps, verdicts and residuals are recorded;
 - the *memory pass* (:class:`MemoryRecorder`, :func:`memory_pass`) probes memory at every
   section entry and exit, nested ones included;
@@ -64,13 +64,26 @@ harness's own section ``handoff.empty_cache`` (``run_loop``'s cache release betw
 roles, on CUDA only) is a ``component`` row on side ``run``, in no total: deployed, the
 prover and the verifier run on separate machines.
 
-**Time (timed run).** Wall-clock seconds from ``perf_counter`` and nothing else. On CUDA the
+**Time (timed run).** Wall-clock seconds from ``monotonic_ns`` and nothing else. On CUDA the
 device is synchronized at top-level section boundaries and nested sections are timed with
 ``torch.cuda.Event`` pairs, read after the enclosing top-level sync; on MPS the device is
 synchronized at every boundary. So on CUDA a nested row is device time (the Event pair) while
 a top-level row is host time across a synchronized interval; the two clocks are not checked
 against each other yet, which the first CUDA run must do. Test-scale times are rehearsal only
 (EQ14).
+
+**Markers.** The timed run also writes each section's spans and check 5's stamps
+(``PROFILING_PLAN.md`` §5.1) to ``markers.jsonl``, one ``kind`` line per step (``step``) and per
+run-level section table (``run``), after a ``header`` line; :func:`read_markers` reads it back. A
+step line holds, per section, up to :data:`MAX_SPANS` host spans in microseconds from the step's
+first section start (``t0_ns``), the same spans on the device clock on CUDA (``gpu_us``, each
+span's CUDA events resolved against the top-level section's anchor event by
+:func:`resolve_gpu_us`), a ``rest`` aggregate for the calls beyond them, and on CUDA a top-level
+section's allocator counters (``alloc``). Its ``stamps`` are column lists: a stamp is a span
+inside a check-5 section (``seam.stamp(name, run=, group=, window=)``) with ids that don't apply
+set to -1; ``name`` indexes ``stamp_names``. Nothing synchronizes inside a nested section or a
+stamp. ``c5_layout.json`` (:func:`~verification.verifier.checks.check5_layout`, written by
+``run_verified``) says what each run, group and window of check 5 holds.
 
 **Memory (memory pass).** ``peak_bytes`` is the whole process's peak during the section, as an
 absolute figure; ``start_bytes`` and ``end_bytes`` are the process's figure at the first entry
@@ -169,7 +182,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import IO, Any, Protocol
 
@@ -185,7 +198,12 @@ from verification.computation.interface import ProductKind
 from verification.verifier.bands import product_class
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF
 from verification.verifier.calibration import step_floor
-from verification.verifier.checks import DEFAULT_ORDER, RECORD_NOT_RUN, protocol_id
+from verification.verifier.checks import (
+    DEFAULT_ORDER,
+    RECORD_NOT_RUN,
+    check5_layout,
+    protocol_id,
+)
 from verification.verifier.matmul_check.sizing import C_ANTI, bit_budget
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 
@@ -193,7 +211,8 @@ __all__ = [
     "P0_PHASES", "TRAIN_PHASES", "PASS_STEPS", "COUNT_STEPS", "COMPONENTS", "RECORD_TYPES",
     "RESERVED_NAMES", "SCORE_FAMILIES",
     "MemoryProbe", "memory_probe", "reserved_peak",
-    "TimeRecorder", "MemoryRecorder", "CountRecorder",
+    "TimeRecorder", "MemoryRecorder", "CountRecorder", "Seam", "resolve_gpu_us", "MAX_SPANS",
+    "STAMP_NAMES", "read_markers", "c5_layout_file",
     "memory_pass", "count_pass", "counting",
     "derive_capture", "step_record", "record_pass", "judged_step", "in_sample_step",
     "calibration_seed", "spec_class", "layer_count", "layer_index",
@@ -212,6 +231,13 @@ COMPONENTS = ("P0", "train_captured", "P1", "P2", "P3", "P4", "P5")
 RECORD_TYPES = ("environment", "step", "verdict", "time", "memory", "count", "storage",
                 "run_end")
 RUN_PREFIX = "run:"
+# Host spans kept per section per step in markers.jsonl; the calls past them fold into ``rest``.
+MAX_SPANS = 64
+# The stamp names check 5 writes (checks.py), in the order of a step line's ``stamp_names``.
+STAMP_NAMES = ("c5.run", "c5.glue", "c5.serve", "c5.copy", "c5.measure", "c5.judge")
+_ALLOC_KEYS = ("num_alloc_retries", "num_device_alloc", "num_device_free", "num_ooms")
+_ALLOC_NAMES = ("retries", "device_alloc", "device_free", "ooms")
+_NULL = nullcontext()
 # Steps in every run's memory pass. Step 1 carries check 0's anchor and the first-touch
 # allocation of the run's buffers; step 2 is the first check-7 step and the first in
 # steady-state memory. The plain run's passes match the verified runs' step for step
@@ -416,10 +442,23 @@ def lifetime_maxrss_bytes() -> int:
 class _Acc:
     """One section's totals within a step."""
 
-    __slots__ = ("nested", "calls", "time", "peak", "rpeak", "start", "end", "seen", "counts")
+    __slots__ = ("nested", "calls", "time", "peak", "rpeak", "start", "end", "seen", "counts",
+                 "depth", "c5", "first_ns", "spans", "gpu", "rest", "alloc")
 
     def __init__(self, nested: bool) -> None:
         self.nested = nested
+        # markers (the timed run only): the nesting depth at first entry, whether this is a
+        # check-5 section, the first entry's ``monotonic_ns``, the first MAX_SPANS host spans
+        # ``(start_ns, end_ns)``, their device spans (``[start_us, end_us]`` or None until
+        # resolved; empty off CUDA), ``rest = [calls, host_s, gpu_s, first_ns, last_ns]`` for the
+        # calls past them, and ``alloc`` the allocator counters' change (CUDA, top level).
+        self.depth = 0
+        self.c5 = False
+        self.first_ns: int | None = None
+        self.spans: list[tuple[int, int]] = []
+        self.gpu: list[list[float] | None] = []
+        self.rest: list[Any] | None = None
+        self.alloc: list[int] | None = None
         self.calls = 0
         self.time = 0.0
         self.peak: int | None = None
@@ -428,6 +467,54 @@ class _Acc:
         self.end: int | None = None
         self.seen = False
         self.counts = [0] * len(_COUNTERS)
+
+
+class Seam:
+    """The seam a run passes as ``section=``: ``seam(name)`` is ``recorder.section(name)``, and
+    ``seam.stamp(name, **ids)`` is ``recorder.stamp(name, **ids)`` (a span inside a check-5
+    section; a no-op context on every recorder but the timed run's). One per recorder
+    (:meth:`_Recorder.seam`), so a run's ``section is`` checks hold."""
+
+    __slots__ = ("_rec",)
+
+    def __init__(self, rec: _Recorder) -> None:
+        self._rec = rec
+
+    def __call__(self, name: str) -> Any:
+        return self._rec.section(name)
+
+    def stamp(self, name: str, **ids: int) -> Any:
+        return self._rec.stamp(name, **ids)
+
+
+def resolve_gpu_us(anchor_host_us: float, anchor: Any, events: Iterable[Any]) -> list[float]:
+    """Each CUDA event's time on the host clock, in microseconds: the anchor's host time plus the
+    anchor-to-event time. The anchor and the events must be recorded and complete."""
+    return [anchor_host_us + anchor.elapsed_time(e) * 1000.0 for e in events]
+
+
+def _span(acc: _Acc, t0: int, t1: int, *, gpu: bool = False) -> int:
+    """Record one call's host span; its slot in ``acc.spans``, or -1 once they are full (the call
+    folds into ``acc.rest``)."""
+    if acc.first_ns is None:
+        acc.first_ns = t0
+    if len(acc.spans) < MAX_SPANS:
+        acc.spans.append((t0, t1))
+        if gpu:
+            acc.gpu.append(None)
+        return len(acc.spans) - 1
+    r = acc.rest
+    if r is None:
+        r = acc.rest = [0, 0.0, 0.0, t0, t1]
+    r[0] += 1
+    r[1] += (t1 - t0) / 1e9
+    r[4] = t1
+    return -1
+
+
+def _alloc_counters(device: torch.device) -> list[int]:
+    st = torch.cuda.memory_stats(device)
+    return [int(st.get(k, 0)) for k in _ALLOC_KEYS]
 
 
 class _Recorder:
@@ -446,7 +533,19 @@ class _Recorder:
         self._step: dict[str, _Acc] = {}
         self._run: dict[str, _Acc] = {}
         self._depth = 0
+        self._c5_open = 0  # check-5 sections open now (the stamps' gate)
+        self._seam: Seam | None = None
         self._verifier: Any = None
+
+    def seam(self) -> Seam:
+        """The run's one :class:`Seam`: what to pass where ``section`` is passed."""
+        if self._seam is None:
+            self._seam = Seam(self)
+        return self._seam
+
+    def stamp(self, name: str, **ids: int) -> Any:
+        """A span inside a check-5 section; only the timed run records one."""
+        return _NULL
 
     def bind(self, verifier: Any) -> None:
         """Remember the run's ``Verifier`` (the timed run reads its timings and stats)."""
@@ -461,6 +560,8 @@ class _Recorder:
         acc = table.get(name)
         if acc is None:
             acc = table[name] = _Acc(self._depth > 0)
+            acc.depth = self._depth
+            acc.c5 = table is self._step and (name == "5" or name.startswith("5."))
         return self._Section(self, acc)
 
     def on_step(self, rec: Any) -> None:
@@ -518,15 +619,21 @@ class _TimeSection:
         self.rec, self.acc = rec, acc
 
     def __enter__(self) -> None:
-        self.rec._depth += 1
-        self.t0 = time.perf_counter()
+        rec = self.rec
+        rec._depth += 1
+        if self.acc.c5:
+            rec._c5_open += 1
+        self.t0 = time.monotonic_ns()
 
     def __exit__(self, *exc: Any) -> None:
-        dt = time.perf_counter() - self.t0
-        acc = self.acc
-        acc.time += dt
+        t1 = time.monotonic_ns()
+        acc, rec = self.acc, self.rec
+        acc.time += (t1 - self.t0) / 1e9
         acc.calls += 1
-        self.rec._depth -= 1
+        _span(acc, self.t0, t1)
+        rec._depth -= 1
+        if acc.c5:
+            rec._c5_open -= 1
 
 
 class _SyncTimeSection(_TimeSection):
@@ -545,9 +652,13 @@ class _SyncTimeSection(_TimeSection):
 
 class _CudaTimeSection:
     """CUDA: top-level sections synchronize and read the host clock; nested sections record a
-    pair of events, read after the enclosing top-level section's synchronize."""
+    pair of events, read after the enclosing top-level section's synchronize.
 
-    __slots__ = ("rec", "acc", "t0", "top", "e0")
+    A top-level section also records an anchor event right after its entry synchronize, which
+    the events of every span it encloses are measured from (:func:`resolve_gpu_us`), and reads
+    the allocator's counters (no synchronize) at entry and exit."""
+
+    __slots__ = ("rec", "acc", "t0", "top", "e0", "a0")
 
     def __init__(self, rec: TimeRecorder, acc: _Acc) -> None:
         self.rec, self.acc = rec, acc
@@ -556,10 +667,17 @@ class _CudaTimeSection:
         rec = self.rec
         self.top = rec._depth == 0
         rec._depth += 1
+        if self.acc.c5:
+            rec._c5_open += 1
         if self.top:
             torch.cuda.synchronize(rec._device)
-            self.t0 = time.perf_counter()
+            self.t0 = time.monotonic_ns()
+            self.e0 = torch.cuda.Event(enable_timing=True)
+            self.e0.record()
+            rec._anchor = (self.t0 / 1000.0, self.e0)
+            self.a0 = _alloc_counters(rec._device)
         else:
+            self.t0 = time.monotonic_ns()
             self.e0 = torch.cuda.Event(enable_timing=True)
             self.e0.record()
 
@@ -567,16 +685,61 @@ class _CudaTimeSection:
         rec, acc = self.rec, self.acc
         acc.calls += 1
         rec._depth -= 1
+        if acc.c5:
+            rec._c5_open -= 1
+        e1 = torch.cuda.Event(enable_timing=True)
+        e1.record()
         if not self.top:
+            t1 = time.monotonic_ns()
+            slot = _span(acc, self.t0, t1, gpu=True)
+            rec._pending.append((acc, slot, self.e0, e1, True))
+            return
+        a1 = _alloc_counters(rec._device)
+        torch.cuda.synchronize(rec._device)
+        t1 = time.monotonic_ns()
+        acc.time += (t1 - self.t0) / 1e9
+        delta = [b - a for a, b in zip(self.a0, a1, strict=True)]
+        acc.alloc = delta if acc.alloc is None else [x + y for x, y in zip(acc.alloc, delta)]
+        rec._pending.append((acc, _span(acc, self.t0, t1, gpu=True), self.e0, e1, False))
+        rec._resolve()
+
+
+class _Stamp:
+    """One check-5 stamp: host ``monotonic_ns`` at entry and exit and, on CUDA, an event pair
+    (no synchronize). Appends to the recorder's step columns as it closes."""
+
+    __slots__ = ("rec", "col", "ids", "h0", "e0")
+
+    def __init__(self, rec: TimeRecorder, col: int, ids: tuple[int, int, int]) -> None:
+        self.rec, self.col, self.ids = rec, col, ids
+
+    def __enter__(self) -> None:
+        if self.rec._cuda:
+            self.e0 = torch.cuda.Event(enable_timing=True)
+            self.e0.record()
+        self.h0 = time.monotonic_ns()
+
+    def __exit__(self, *exc: Any) -> None:
+        h1 = time.monotonic_ns()
+        rec = self.rec
+        c = rec._stamps
+        i = len(c["h0"])
+        c["name"].append(self.col)
+        c["run"].append(self.ids[0])
+        c["group"].append(self.ids[1])
+        c["window"].append(self.ids[2])
+        c["h0"].append(self.h0)
+        c["h1"].append(h1)
+        if rec._cuda:
             e1 = torch.cuda.Event(enable_timing=True)
             e1.record()
-            rec._pending.append((acc, self.e0, e1))
-            return
-        torch.cuda.synchronize(rec._device)
-        acc.time += time.perf_counter() - self.t0
-        for a, e0, e1 in rec._pending:
-            a.time += e0.elapsed_time(e1) / 1e3
-        rec._pending.clear()
+            rec._stamp_pending.append((i, self.e0, e1))
+        c["g0"].append(None)
+        c["g1"].append(None)
+
+
+def _new_stamps() -> dict[str, list[Any]]:
+    return {k: [] for k in ("name", "run", "group", "window", "h0", "h1", "g0", "g1")}
 
 
 class TimeRecorder(_Recorder):
@@ -598,12 +761,98 @@ class TimeRecorder(_Recorder):
         self._device = torch.device(device)
         if self._device.type == "cuda":
             self._Section = _CudaTimeSection
-            self._pending: list[tuple[_Acc, Any, Any]] = []
         elif self._device.type == "mps":
             self._Section = _SyncTimeSection
             self._sync = torch.mps.synchronize
+        self._cuda = self._device.type == "cuda"
+        # CUDA: (acc, slot, start event, end event, nested) per closed section and (column,
+        # start, end) per stamp, read at the top-level exit; ``_anchor`` is (host us, event)
+        self._pending: list[tuple[_Acc, int, Any, Any, bool]] = []
+        self._stamp_pending: list[tuple[int, Any, Any]] = []
+        self._anchor: tuple[float, Any] | None = None
+        self._stamps = _new_stamps()
+        self._step_stamps = self._stamps
+        self._stamp_names = list(STAMP_NAMES)
+        self._t1 = 0
         self.writer = writer
         self.step_fields = dict(step_fields or {})
+
+    def stamp(self, name: str, *, run: int = -1, group: int = -1, window: int = -1) -> Any:
+        """A span inside a check-5 section, recorded as one column entry in ``markers.jsonl``'s
+        ``stamps``. Outside check 5 it is a no-op."""
+        if not self._c5_open:
+            return _NULL
+        try:
+            col = self._stamp_names.index(name)
+        except ValueError:
+            col = len(self._stamp_names)
+            self._stamp_names.append(name)
+        return _Stamp(self, col, (run, group, window))
+
+    def _resolve(self) -> None:
+        """After a top-level synchronize: the time of every nested section's events, and every
+        span's and stamp's device times against the section's anchor."""
+        anchor = self._anchor
+        for acc, slot, e0, e1, nested in self._pending:
+            if nested:
+                acc.time += e0.elapsed_time(e1) / 1e3
+            if anchor is None:
+                continue
+            g = resolve_gpu_us(anchor[0], anchor[1], (e0, e1))
+            if slot >= 0:
+                acc.gpu[slot] = g
+            elif acc.rest is not None:
+                acc.rest[2] += (g[1] - g[0]) / 1e6
+        if anchor is not None:
+            c = self._stamps
+            for i, e0, e1 in self._stamp_pending:
+                c["g0"][i], c["g1"][i] = resolve_gpu_us(anchor[0], anchor[1], (e0, e1))
+        self._pending.clear()
+        self._stamp_pending.clear()
+
+    def on_step(self, rec: Any) -> None:
+        self._t1 = time.monotonic_ns()
+        self._step_stamps, self._stamps = self._stamps, _new_stamps()
+        super().on_step(rec)
+
+    def _marker_line(self, t: int, table: dict[str, _Acc], rec: Any) -> dict[str, Any]:
+        """The step's (or, with ``rec`` None, the run sections') ``markers.jsonl`` line."""
+        firsts = [a.first_ns for a in table.values() if a.first_ns is not None]
+        t1 = self._t1 if rec is not None else time.monotonic_ns()
+        t0 = min(firsts) if firsts else t1
+        base = t0 / 1000.0
+
+        def us(ns: int) -> float:
+            return round((ns - t0) / 1000.0, 3)
+
+        sections = []
+        for name, a in table.items():
+            r = a.rest
+            sections.append({
+                "name": name, "depth": a.depth, "calls": a.calls,
+                "host_us": [[us(s0), us(s1)] for s0, s1 in a.spans],
+                "gpu_us": ([None if g is None else [round(g[0] - base, 3), round(g[1] - base, 3)]
+                            for g in a.gpu] if self._cuda else None),
+                "rest": None if r is None else {
+                    "calls": r[0], "host_s": r[1], "gpu_s": r[2] if self._cuda else None,
+                    "first_us": us(r[3]), "last_us": us(r[4])},
+                "alloc": None if a.alloc is None else dict(zip(_ALLOC_NAMES, a.alloc,
+                                                               strict=True))})
+        line: dict[str, Any] = {"kind": "step" if rec is not None else "run",
+                                "scenario": self.scenario, "t0_ns": t0}
+        if rec is None:
+            line["sections"] = sections
+            return line
+        c = self._step_stamps
+        line.update({"step": t, "traced": False, "t1_ns": t1, "sections": sections,
+                     "stamps": {
+                         "name": c["name"], "run": c["run"], "group": c["group"],
+                         "window": c["window"], "h0": [us(x) for x in c["h0"]],
+                         "h1": [us(x) for x in c["h1"]],
+                         "g0": [None if g is None else round(g - base, 3) for g in c["g0"]],
+                         "g1": [None if g is None else round(g - base, 3) for g in c["g1"]]},
+                     "stamp_names": list(self._stamp_names)})
+        return line
 
     def _values(self, accs: list[_Acc]) -> dict[str, Any]:
         return {"time_s": sum(a.time for a in accs)}
@@ -617,6 +866,7 @@ class TimeRecorder(_Recorder):
         if self.writer is None:
             return
         self.writer.write(rows)
+        self.writer.write_markers(self._marker_line(t, table, rec))
         if rec is not None and self._verifier is not None:
             stats = self._verifier.stats.get(t)
             if stats is not None:  # zero rows when the step stopped before checks 5 and 6
@@ -1307,6 +1557,30 @@ def layer_index(spec: Any, n_layers: int) -> int:
     return n_layers if spec.layer is None else int(spec.layer) - 1
 
 
+def c5_layout_file(c: Any, run: str) -> dict[str, Any]:
+    """``c5_layout.json``'s content (``PROFILING_PLAN.md`` §5.2): :func:`check5_layout`'s entries
+    with each group's ``layer`` (:func:`layer_index` of its first product) and ``class``
+    (``product_class``), the counts, and ``trace_slice``, the runs a trace covers: the first run
+    of each class and every run whose id is a multiple of 20."""
+    entries = check5_layout(c)
+    by_m = {spec.m: spec for spec in c.products}
+    n_layers = layer_count(c)
+    seen: set[str] = set()
+    trace: list[int] = []
+    for e in entries:
+        spec = by_m[e["first"]]
+        e["layer"] = layer_index(spec, n_layers)
+        e["class"] = product_class(c, spec)
+        if e["group"] == 0 and (e["class"] not in seen or e["run"] % 20 == 0):
+            trace.append(e["run"])
+        if e["group"] == 0:
+            seen.add(e["class"])
+    n_runs = entries[-1]["run"] + 1 if entries else 0
+    return {"version": 1, "run": run, "n_runs": n_runs,
+            "n_groups": len(entries), "n_windows": entries[-1]["window"] + 1 if entries else 1,
+            "entries": entries, "trace_slice": trace}
+
+
 def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats, c: Any, *,
                      bands: Any = None, k: int | None = None,
                      kappa_guard: bool = True) -> dict[str, np.ndarray]:
@@ -1465,6 +1739,32 @@ def _json_safe(x: Any) -> Any:
     return x
 
 
+_MARKER_KINDS = ("header", "step", "run")
+_HEADER_KEYS = ("run", "pid", "device", "mono_ns", "wall_unix_s")
+
+
+def read_markers(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    """``markers.jsonl`` (a file, or the run directory holding it): the header line, then the
+    ``step`` and ``run`` lines, in file order. Raises ``ValueError`` for a missing or malformed
+    header (version 1, :data:`_HEADER_KEYS`) and for any line with no ``kind`` or an unknown
+    one."""
+    p = Path(path)
+    if p.is_dir():
+        p = p / "markers.jsonl"
+    with open(p) as f:
+        lines = [json.loads(line) for line in f]
+    for i, line in enumerate(lines, start=1):
+        if not isinstance(line, dict) or line.get("kind") not in _MARKER_KINDS:
+            raise ValueError(f"{p}:{i}: a marker line needs a kind of {_MARKER_KINDS}")
+    head = lines[0] if lines else {}
+    if (head.get("kind") != "header" or head.get("version") != 1
+            or any(k not in head for k in _HEADER_KEYS)):
+        raise ValueError(f"{p}: the first line must be a version-1 header with {_HEADER_KEYS}")
+    if any(line["kind"] == "header" for line in lines[1:]):
+        raise ValueError(f"{p}: more than one header line")
+    return lines
+
+
 def read_records(path: str | os.PathLike[str], record: str | None = None) -> list[dict[str, Any]]:
     """``records.jsonl`` (a file, or the run directory holding it), optionally one type."""
     p = Path(path)
@@ -1520,6 +1820,8 @@ class MetricsWriter:
         self.probe = memory_probe(self.device)
         self.run_fields = {"model": model, "corpus": corpus, "attack": attack, "seed": seed}
         self._f: IO[str] = open(self.dir / "records.jsonl", "w")  # noqa: SIM115
+        self._m: IO[str] | None = None  # markers.jsonl, opened by the first write_markers
+        self._layout_written = False
         self.write([environment_record(run, device=self.device, probe=self.probe, config=config,
                                        band_file_hash=band_file_hash, h_D=h_D,
                                        **self.run_fields, **(extra or {}))])
@@ -1542,6 +1844,28 @@ class MetricsWriter:
         for r in rows:
             self._f.write(json.dumps(_json_safe(dict(r)), allow_nan=False) + "\n")
         self._f.flush()
+
+    def write_markers(self, obj: Mapping[str, Any]) -> None:
+        """One line of ``markers.jsonl``. The first call opens the file (truncating an earlier
+        run's) and writes its ``header``: the run, the process, the device, and the monotonic and
+        wall clocks read together."""
+        if self._m is None:
+            self._m = open(self.dir / "markers.jsonl", "w")  # noqa: SIM115
+            mono, wall = time.monotonic_ns(), time.time()
+            head = {"kind": "header", "version": 1, "run": self.run, "pid": os.getpid(),
+                    "device": str(self.device), "mono_ns": mono, "wall_unix_s": wall}
+            self._m.write(json.dumps(head, allow_nan=False) + "\n")
+        self._m.write(json.dumps(_json_safe(dict(obj)), allow_nan=False) + "\n")
+        self._m.flush()
+
+    def write_c5_layout(self, c: Any) -> Path:
+        """``c5_layout.json`` (:func:`c5_layout_file`), once per run directory: a second call
+        rewrites nothing."""
+        path = self.dir / "c5_layout.json"
+        if not self._layout_written:
+            path.write_text(json.dumps(c5_layout_file(c, self.run), allow_nan=False) + "\n")
+            self._layout_written = True
+        return path
 
     def write_residuals(self, scenario: str, step: int, stats: StepStats, c: Any, *,
                         bands: Any = None, k: int | None = None,
@@ -1568,6 +1892,8 @@ class MetricsWriter:
         nothing."""
         if self._f.closed:
             return
+        if self._m is not None:
+            self._m.close()
         if completed is None:
             completed = sys.exception() is None
         if completed:
