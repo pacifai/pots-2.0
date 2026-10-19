@@ -6,26 +6,34 @@ for check 5 the stamps' phases by product class, scaled from the traced runs to 
 
 **Sections and stamps.** A CPU ``user_annotation`` is a stamp when its name starts with ``c5.``
 (``c5.glue|run=12|group=0``: the name, then ``key=value`` ids). Any other annotation is a
-section; a leading ``section:`` is dropped and the profiler's own ``ProfilerStep#`` ranges are
-ignored. Sections nest, and the numbers are inclusive, like the time rows (``metrics.py``): an
-event counts in its innermost section and in every enclosing one. A section's ``parent`` names
-the section enclosing it (``null`` at the top), so a reader sums top-level sections without
-double counting. Stamps never take events away from sections.
+section; a leading ``section:`` is dropped, and torch's own annotations (``TORCH_ANNOTATIONS``)
+are ignored. Sections nest, and the numbers are inclusive, like the time rows (``metrics.py``):
+an event counts once in each distinct section name on its innermost occurrence's chain of
+enclosing occurrences, so a name used at top level and nested elsewhere leaks nothing between
+the two. A section's ``parent`` is the enclosing section of its earliest occurrence (``null``
+at the top), so a reader sums top-level sections without double counting. The tree ignores
+threads: spans on different threads that overlap in time count as nested. Stamps never take
+events away from sections.
 
 **Attribution.** A GPU event goes to the section whose annotation holds its launching runtime
 call (same ``correlation``), by the call's start time, on any thread. The innermost
 ``gpu_user_annotation`` holding the event's start on its stream is a cross-check, and the share
 of events where the two disagree goes into ``warnings``. Events with no launch, or a launch
-outside every section, are counted in ``warnings`` and left out.
+outside every section, are counted in ``warnings`` and left out. Each warning appears once, with
+its count.
 
-**Per section.** ``wall_us`` is the length of the union of the section's own annotations
-(children included). ``kernel_us`` sums kernel durations and
-``kernel_span_us`` is the union of their intervals, so ``gpu_idle_us = wall_us − kernel_span_us``
-(about zero or above, up to clock skew). ``top_cpu_ops`` self times include descendants. ``sync_wait_us`` sums the host calls to
+**Per section.** ``wall_us`` is the length of the union of the section's own occurrences.
+``kernel_us`` sums kernel durations and ``kernel_span_us`` is the union of their intervals, so
+``gpu_idle_us = wall_us − kernel_span_us``. It is negative when a section ends before its
+asynchronous kernels finish, so it's meaningful when the section ends in a sync.
+``top_cpu_ops`` self times include descendants. ``sync_wait_us`` sums the host calls to
 ``cudaDeviceSynchronize``, ``cudaStreamSynchronize``, ``cudaEventSynchronize`` and ``cudaMemcpy``
 and the ``cudaMemcpyAsync`` calls of device-to-host copies from pageable memory (these block).
-``gemm_flops`` is null when a section has GEMM ops and none carries a ``flops`` argument.
-A copy direction's bytes are null when every copy in it lacks ``args.bytes``.
+``gemm_flops`` and ``gemm_bytes`` come from the input shapes of the outermost ``mm``, ``addmm``,
+``bmm`` and ``matmul`` ops (torch's Chrome trace carries no ``flops`` argument; when one is
+present, it's checked against the shapes, with a warning past 1%). ``gemm_flops`` is null when
+a section has GEMM ops and none has readable shapes. A copy direction's bytes are null when
+every copy in it lacks ``args.bytes``.
 
 **Check 5.** A stamp's span is its annotation's duration. A class's ``phases_us`` sum the
 stamps of its traced runs (``stack`` is ``serve − copy``), and ``scale`` is the class's products
@@ -60,18 +68,23 @@ CATEGORIES = ("gemm", "attention", "elementwise", "reduction", "memcpy_h2d", "me
 KERNEL_CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (cat, re.compile(pat, re.IGNORECASE)) for cat, pat in (
         ("attention", r"flash|fmha|attention"),
-        ("gemm", r"gemm|cutlass|xmma|cublas"),
+        ("gemm", r"gemm|cutlass|xmma|cublas|nvjet|splitkreduce"),
         ("reduction", r"reduce|softmax|norm|argm|cumsum|scan"),
         ("elementwise", r"elementwise|vectorized|unrolled|index|copy|fill|gather|scatter|clamp"),
     ))
 """Name patterns, first match wins; a kernel matching none is ``other``. Attention comes first
-because flash kernels are built on cutlass."""
+because flash kernels are built on cutlass. GEMM comes before reduction because cuBLAS's
+split-K reduce kernel belongs to its GEMM."""
 
 COPY_DIRECTIONS = (("htod", "h2d"), ("dtoh", "d2h"), ("dtod", "d2d"), ("ptop", "d2d"))
 GEMM_OPS = frozenset({"aten::mm", "aten::addmm", "aten::bmm", "aten::matmul"})
 SYNC_CALLS = frozenset({"cudaDeviceSynchronize", "cudaStreamSynchronize",
                         "cudaEventSynchronize", "cudaMemcpy"})
 STAMP_PREFIX = "c5."
+TORCH_ANNOTATIONS = ("ProfilerStep", "Optimizer.", "## ")
+"""Annotations torch writes itself (the profiler's step, optimizer hooks, autograd's
+``## name ##`` ranges). They aren't sections, and they hide no event from the sections
+around them."""
 PHASES = ("run", "glue", "serve", "copy", "stack", "measure")
 DTYPE_BYTES = {"float": 4, "double": 8, "c10::Half": 2, "c10::BFloat16": 2, "long": 8,
                "int": 4, "short": 2, "char": 1, "signed char": 1, "unsigned char": 1,
@@ -163,7 +176,7 @@ def _parse_annotation(name: str) -> tuple[str, dict[str, int]] | None:
 
 
 def _section_name(name: str) -> str | None:
-    if name.startswith("ProfilerStep"):
+    if name.startswith(TORCH_ANNOTATIONS):
         return None
     return name.removeprefix("section:")
 
@@ -183,58 +196,99 @@ def _copy_direction(name: str) -> str | None:
     return None
 
 
-def _gemm_ops(ops: Sequence[Event], warnings: list[str]) -> dict[int, tuple[int | None, int | None]]:
-    """``{op index: (bytes, flops)}`` for the GEMM ops that aren't inside another GEMM op (for
-    flops: inside another that carries ``flops``), so ``matmul`` and its ``mm`` count once."""
-    spans = [(e["ts"], _end(e)) for e in ops]
-    parent = _parents(spans)
-    # Parents are per thread; the caller passes one thread's ops.
-    is_gemm = [e["name"] in GEMM_OPS for e in ops]
-    flops_of = [_flops(e) if is_gemm[i] else None for i, e in enumerate(ops)]
-    out: dict[int, tuple[int | None, int | None]] = {}
-    for i, e in enumerate(ops):
-        if not is_gemm[i]:
-            continue
-        under_any = under_flops = False
-        p = parent[i]
-        while p != -1:
-            if is_gemm[p]:
-                under_any = True
-                under_flops |= flops_of[p] is not None
-            p = parent[p]
-        out[i] = (None if under_any else _gemm_bytes(e, warnings),
-                  None if under_flops else flops_of[i])
-    return out
+class _Warnings:
+    """Warning messages in first-seen order, each with its count."""
+
+    def __init__(self) -> None:
+        self.counts: dict[str, int] = {}
+
+    def add(self, msg: str) -> None:
+        self.counts[msg] = self.counts.get(msg, 0) + 1
+
+    def lines(self) -> list[str]:
+        return [m if n == 1 else f"{m} (x{n})" for m, n in self.counts.items()]
 
 
-def _flops(e: Event) -> int | None:
+def _matmul(a: Sequence[int], b: Sequence[int]) -> tuple[int, list[int]] | None:
+    """``(flops, output dims)`` of ``a @ b`` by ``torch.matmul``'s rules: 1-D operands are
+    vectors and the leading dims broadcast. ``None`` when the shapes don't multiply."""
+    va, vb = len(a) == 1, len(b) == 1
+    a2, b2 = ([1, *a] if va else list(a)), ([*b, 1] if vb else list(b))
+    if len(a2) < 2 or len(b2) < 2 or a2[-1] != b2[-2]:
+        return None
+    m, k, n = a2[-2], a2[-1], b2[-1]
+    ba, bb = a2[:-2], b2[:-2]
+    batch: list[int] = []
+    for i in range(1, max(len(ba), len(bb)) + 1):
+        x = ba[-i] if i <= len(ba) else 1
+        y = bb[-i] if i <= len(bb) else 1
+        if x != y and 1 not in (x, y):
+            return None
+        batch.insert(0, max(x, y))
+    flops = 2 * m * n * k
+    for x in batch:
+        flops *= x
+    return flops, batch + ([] if va else [m]) + ([] if vb else [n])
+
+
+def _gemm_cost(e: Event, warn: _Warnings) -> tuple[int, int] | None:
+    """``(bytes, flops)`` of a GEMM op from its input shapes and dtypes, or ``None``. Bytes are
+    every tensor input plus the output; the operands are the last two tensors (``addmm`` leads
+    with its bias)."""
+    args = e.get("args", {})
+    dims, types = args.get("Input Dims"), args.get("Input type")
+    if not dims or not types or len(dims) != len(types):
+        warn.add(f"{e['name']} has no input shapes or dtypes; its bytes and flops are left out")
+        return None
+    tensors = [(d, t) for d, t in zip(dims, types) if d]
+    if len(tensors) < 2:
+        warn.add(f"{e['name']} has fewer than two tensor inputs; its bytes and flops are "
+                 "left out")
+        return None
+    res = _matmul(tensors[-2][0], tensors[-1][0])
+    if res is None:
+        warn.add(f"{e['name']} has input shapes that don't multiply; its bytes and flops "
+                 "are left out")
+        return None
+    flops, out_dims = res
+    total = 0
+    for d, t in [*tensors, (out_dims, tensors[-2][1])]:
+        if t not in DTYPE_BYTES:
+            warn.add(f"unknown dtype {t!r} in {e['name']}; its bytes and flops are left out")
+            return None
+        n = 1
+        for x in d:
+            n *= x
+        total += n * DTYPE_BYTES[t]
+    return total, flops
+
+
+def _flops_arg(e: Event) -> int | None:
     args = e.get("args", {})
     val = args.get("flops", args.get("Flops"))
     return None if val is None else int(val)
 
 
-def _gemm_bytes(e: Event, warnings: list[str]) -> int | None:
-    """Bytes read and written by a GEMM op, from its input shapes: every tensor input plus the
-    output, ``a.shape[:-1] + b.shape[-1:]`` for the last two tensors ``a`` and ``b``."""
-    args = e.get("args", {})
-    dims, types = args.get("Input Dims"), args.get("Input type")
-    if not dims or not types or len(dims) != len(types):
-        warnings.append(f"{e['name']} has no input shapes or dtypes; its bytes are left out")
-        return None
-    tensors = [(d, t) for d, t in zip(dims, types) if d]
-    if len(tensors) < 2:
-        warnings.append(f"{e['name']} has fewer than two tensor inputs; its bytes are left out")
-        return None
-    sizes = []
-    for d, t in tensors + [(tensors[-2][0][:-1] + tensors[-1][0][-1:], tensors[-2][1])]:
-        if t not in DTYPE_BYTES:
-            warnings.append(f"unknown dtype {t!r} in {e['name']}; its bytes are left out")
-            return None
-        n = 1
-        for x in d:
-            n *= x
-        sizes.append(n * DTYPE_BYTES[t])
-    return sum(sizes)
+def _gemm_ops(ops: Sequence[Event], warn: _Warnings) -> dict[int, tuple[int, int] | None]:
+    """``{op index: cost}`` for the GEMM ops (one thread's) that aren't inside another GEMM op,
+    so ``matmul`` and its ``mm`` count once. When an op carries a ``flops`` argument, it is
+    checked against the shapes' flops."""
+    parent = _parents([(e["ts"], _end(e)) for e in ops])
+    out: dict[int, tuple[int, int] | None] = {}
+    for i, e in enumerate(ops):
+        if e["name"] not in GEMM_OPS:
+            continue
+        p = parent[i]
+        while p != -1 and ops[p]["name"] not in GEMM_OPS:
+            p = parent[p]
+        if p != -1:
+            continue
+        cost = out[i] = _gemm_cost(e, warn)
+        given = _flops_arg(e)
+        if cost is not None and given is not None and abs(given - cost[1]) > 0.01 * cost[1]:
+            warn.add("a GEMM op's flops argument differs from its shapes' flops by more "
+                     "than 1%")
+    return out
 
 
 class _Acc:
@@ -251,25 +305,6 @@ class _Acc:
         self.sync_us = 0.0
         self.ops: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
 
-    def merge(self, o: "_Acc") -> None:
-        self.kernels += o.kernels
-        for c, v in o.cats.items():
-            self.cats[c] += v
-        self.launches += o.launches
-        for d, v in o.copy_bytes.items():
-            self.copy_bytes[d] = self.copy_bytes.get(d, 0) + v
-        for d, v in o.copy_unknown.items():
-            self.copy_unknown[d] = self.copy_unknown.get(d, 0) + v
-        self.gemm_bytes += o.gemm_bytes
-        self.gemm_ops += o.gemm_ops
-        if o.gemm_flops is not None:
-            self.gemm_flops = (self.gemm_flops or 0) + o.gemm_flops
-        self.sync_us += o.sync_us
-        for n, (us, k) in o.ops.items():
-            row = self.ops[n]
-            row[0] += us
-            row[1] += k
-
     def result(self) -> dict[str, Any]:
         wall = _union(self.own)
         kernel_us = sum(b - a for a, b in self.kernels)
@@ -277,8 +312,7 @@ class _Acc:
         copy = {}
         for d in ("h2d", "d2h", "d2d"):
             lacking = self.copy_unknown.get(d, 0)
-            has = d in self.copy_bytes
-            copy[d] = self.copy_bytes[d] if has else (None if lacking else 0)
+            copy[d] = self.copy_bytes[d] if d in self.copy_bytes else (None if lacking else 0)
         top = sorted(self.ops.items(), key=lambda kv: (-kv[1][0], kv[0]))[:TOP_OPS]
         return {
             "wall_us": wall, "kernel_us": kernel_us, "kernel_span_us": span,
@@ -306,13 +340,13 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
     """The ``trace_summary.json`` content (§5.6) for one trace, with its check-5 view when the
     layout is given and a section cross-check when the markers are."""
     trace_path = Path(trace_path)
-    warnings: list[str] = []
+    warn = _Warnings()
     events = _read_events(trace_path)
 
     def of(cat: str) -> list[Event]:
         return [e for e in events if e["cat"] == cat]
 
-    # Sections and stamps: CPU annotations.
+    # Sections and stamps: CPU annotations. Each occurrence is its own span.
     secs: list[tuple[Event, str]] = []
     stamps: list[tuple[Event, str, dict[str, int]]] = []
     for e in of("user_annotation"):
@@ -322,43 +356,63 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
         elif (name := _section_name(e["name"])) is not None:
             secs.append((e, name))
     sec_spans = [(e["ts"], _end(e)) for e, _ in secs]
-    accs: dict[str, _Acc] = {}
-    for _, name in secs:
-        accs.setdefault(name, _Acc())
     sec_par = _parents(sec_spans)
-    parent_of: dict[str, str | None] = {}
-    below: dict[str, set[str]] = defaultdict(set)
-    for i, ((e, name), par) in enumerate(zip(secs, sec_par)):
-        accs[name].own.append((e["ts"], _end(e)))
-        up = par
-        while up != -1 and secs[up][1] == name:
-            up = sec_par[up]
-        if parent_of.get(name) is None:
-            parent_of[name] = None if up == -1 else secs[up][1]
-        while up != -1:
-            if secs[up][1] != name:
-                below[secs[up][1]].add(name)
-            up = sec_par[up]
+    accs: dict[str, _Acc] = {}
+    for e, name in secs:
+        accs.setdefault(name, _Acc()).own.append((e["ts"], _end(e)))
 
-    def section_of(points: Sequence[float]) -> list[str | None]:
-        return [None if i == -1 else secs[i][1] for i in _innermost(sec_spans, points)]
+    chains: dict[int, list[_Acc]] = {}
+
+    def targets(i: int) -> list[_Acc]:
+        """The accumulators of occurrence ``i`` and its enclosing occurrences, one per name."""
+        if i == -1:
+            return []
+        if i not in chains:
+            names: list[str] = []
+            j = i
+            while j != -1:
+                if secs[j][1] not in names:
+                    names.append(secs[j][1])
+                j = sec_par[j]
+            chains[i] = [accs[n] for n in names]
+        return chains[i]
+
+    def parent_name(i: int) -> str | None:
+        j = sec_par[i]
+        while j != -1 and secs[j][1] == secs[i][1]:
+            j = sec_par[j]
+        return None if j == -1 else secs[j][1]
+
+    # A section's parent: the enclosing section of its earliest occurrence.
+    parents_seen: dict[str, dict[str | None, None]] = defaultdict(dict)
+    first: dict[str, int] = {}
+    for i, (e, name) in enumerate(secs):
+        parents_seen[name][parent_name(i)] = None
+        if name not in first or (e["ts"], i) < (secs[first[name]][0]["ts"], first[name]):
+            first[name] = i
+    parent_of = {name: parent_name(i) for name, i in first.items()}
+    for name, seen in parents_seen.items():
+        if len(seen) > 1:
+            warn.add(f"section {name!r} sits under several parents: {sorted(map(str, seen))}")
 
     # Launching calls, by correlation id.
-    calls = [e for e in of("cuda_runtime") + of("cuda_driver")]
-    call_sec = section_of([e["ts"] for e in calls])
-    launch_of: dict[int, tuple[Event, str | None]] = {}
+    calls = of("cuda_runtime") + of("cuda_driver")
+    call_sec = _innermost(sec_spans, [e["ts"] for e in calls])
+    launch_of: dict[int, tuple[Event, int]] = {}
     seen_launch: set[int] = set()
     for e, s in zip(calls, call_sec):
         corr = e.get("args", {}).get("correlation")
         if corr is not None:
             launch_of.setdefault(corr, (e, s))
-        if re.match(r"(cuda|cu)Launch", e["name"]) and s is not None:
+        if re.match(r"(cuda|cu)Launch", e["name"]):
             if corr is None or corr not in seen_launch:
-                accs[s].launches += 1
+                for a in targets(s):
+                    a.launches += 1
             if corr is not None:
                 seen_launch.add(corr)
-        if e["name"] in SYNC_CALLS and s is not None:
-            accs[s].sync_us += e.get("dur", 0.0)
+        if e["name"] in SYNC_CALLS:
+            for a in targets(s):
+                a.sync_us += e.get("dur", 0.0)
 
     # GPU events.
     gpu = [e for e in events if e["cat"] in GPU_CATS]
@@ -366,18 +420,17 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
     for e in gpu:
         by_stream[(e.get("pid"), e.get("tid"))].append(e)
     gpu_ann: dict[int, str] = {}
-    gann = [e for e in of("gpu_user_annotation")
-            if _parse_annotation(e["name"]) is None and _section_name(e["name"]) is not None]
     gann_by_stream: dict[tuple[Any, Any], list[Event]] = defaultdict(list)
-    for e in gann:
-        gann_by_stream[(e.get("pid"), e.get("tid"))].append(e)
+    for e in of("gpu_user_annotation"):
+        if _parse_annotation(e["name"]) is None and _section_name(e["name"]) is not None:
+            gann_by_stream[(e.get("pid"), e.get("tid"))].append(e)
     for key, evs in by_stream.items():
         anns = gann_by_stream.get(key, [])
         hit = _innermost([(a["ts"], _end(a)) for a in anns], [e["ts"] for e in evs])
         for e, i in zip(evs, hit):
             if i != -1:
                 gpu_ann[id(e)] = _section_name(anns[i]["name"]) or ""
-    no_launch = outside = compared = disagree = unknown_copy = 0
+    no_launch = outside = compared = disagree = unknown_copy = no_bytes = 0
     sync_runtime: set[int] = set()
     for e in gpu:
         corr = e.get("args", {}).get("correlation")
@@ -385,58 +438,62 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
         if found is None:
             no_launch += 1
             continue
-        call, sec = found
-        if sec is None:
+        call, occ = found
+        if occ == -1:
             outside += 1
             continue
-        acc = accs[sec]
+        tg = targets(occ)
         if id(e) in gpu_ann:
             compared += 1
-            disagree += gpu_ann[id(e)] != sec
+            disagree += gpu_ann[id(e)] != secs[occ][1]
         dur = e.get("dur", 0.0)
         if e["cat"] == "kernel":
-            acc.kernels.append((e["ts"], _end(e)))
-            acc.cats[_kernel_category(e["name"])] += dur
+            cat = _kernel_category(e["name"])
+            for a in tg:
+                a.kernels.append((e["ts"], _end(e)))
+                a.cats[cat] += dur
         elif e["cat"] == "gpu_memset":
-            acc.cats["memset"] += dur
+            for a in tg:
+                a.cats["memset"] += dur
         else:
             d = _copy_direction(e["name"])
             if d is None:
                 unknown_copy += 1
-                acc.cats["other"] += dur
+                for a in tg:
+                    a.cats["other"] += dur
                 continue
-            acc.cats[f"memcpy_{d}"] += dur
             nbytes = e.get("args", {}).get("bytes")
-            if nbytes is None:
-                acc.copy_unknown[d] = acc.copy_unknown.get(d, 0) + 1
-            else:
-                acc.copy_bytes[d] = acc.copy_bytes.get(d, 0) + int(nbytes)
-            if d == "d2h" and "pageable" in e["name"].lower() \
-                    and call["name"] == "cudaMemcpyAsync" and id(call) not in sync_runtime:
-                sync_runtime.add(id(call))
-                acc.sync_us += call.get("dur", 0.0)
+            no_bytes += nbytes is None
+            blocking = (d == "d2h" and "pageable" in e["name"].lower()
+                        and call["name"] == "cudaMemcpyAsync" and id(call) not in sync_runtime)
+            sync_runtime.add(id(call))
+            for a in tg:
+                a.cats[f"memcpy_{d}"] += dur
+                if nbytes is None:
+                    a.copy_unknown[d] = a.copy_unknown.get(d, 0) + 1
+                else:
+                    a.copy_bytes[d] = a.copy_bytes.get(d, 0) + int(nbytes)
+                if blocking:
+                    a.sync_us += call.get("dur", 0.0)
     if no_launch:
-        warnings.append(f"{no_launch} GPU events have no launching runtime call; left out")
+        warn.add(f"{no_launch} GPU events have no launching runtime call; left out")
     if outside:
-        warnings.append(f"{outside} GPU events were launched outside every section; left out")
+        warn.add(f"{outside} GPU events were launched outside every section; left out")
     if unknown_copy:
-        warnings.append(f"{unknown_copy} memcpy events have no readable direction; "
-                        "counted as other")
-    lacking = sum(sum(a.copy_unknown.values()) for a in accs.values())  # still exclusive here
-    if lacking:
-        warnings.append(f"{lacking} memcpy events have no args.bytes; their bytes are null")
+        warn.add(f"{unknown_copy} memcpy events have no readable direction; counted as other")
+    if no_bytes:
+        warn.add(f"{no_bytes} memcpy events have no args.bytes; their bytes are null")
     if disagree:
-        warnings.append(f"{100 * disagree / compared:.1f}% of GPU events ({disagree} of "
-                        f"{compared}) sit in a different gpu_user_annotation than their "
-                        "launch's section")
+        warn.add(f"{100 * disagree / compared:.1f}% of GPU events ({disagree} of "
+                 f"{compared}) sit in a different gpu_user_annotation than their "
+                 "launch's section")
 
     # CPU ops: self time, and the GEMM ops' bytes and flops.
     ops = of("cpu_op")
-    op_sec = section_of([e["ts"] for e in ops])
+    op_sec = _innermost(sec_spans, [e["ts"] for e in ops])
     by_thread: dict[tuple[Any, Any], list[int]] = defaultdict(list)
     for i, e in enumerate(ops):
         by_thread[(e.get("pid"), e.get("tid"))].append(i)
-    no_flops = 0
     for idx in by_thread.values():
         thread = [ops[i] for i in idx]
         par = _parents([(e["ts"], _end(e)) for e in thread])
@@ -444,60 +501,48 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
         for j, p in enumerate(par):
             if p != -1:
                 child_dur[p] += thread[j].get("dur", 0.0)
-        gemm = _gemm_ops(thread, warnings)
+        gemm = _gemm_ops(thread, warn)
         for j, e in enumerate(thread):
-            s = op_sec[idx[j]]
-            if s is None:
-                continue
-            row = accs[s].ops[e["name"]]
-            row[0] += max(e.get("dur", 0.0) - child_dur[j], 0.0)
-            row[1] += 1
-            if j in gemm:
-                nbytes, flops = gemm[j]
-                acc = accs[s]
-                acc.gemm_ops += 1
-                if nbytes is not None:
-                    acc.gemm_bytes += nbytes
-                if flops is not None:
-                    acc.gemm_flops = (acc.gemm_flops or 0) + flops
-                elif nbytes is not None and _flops(e) is None:
-                    no_flops += 1
-    out_secs = {}
-    for name, own in accs.items():
-        total = _Acc()
-        total.own = own.own
-        for n in (name, *sorted(below[name])):
-            total.merge(accs[n])
-        out_secs[name] = {"parent": parent_of[name], **total.result()}
-    if no_flops:
-        warnings.append(f"{no_flops} GEMM ops have no flops argument")
+            for a in targets(op_sec[idx[j]]):
+                row = a.ops[e["name"]]
+                row[0] += max(e.get("dur", 0.0) - child_dur[j], 0.0)
+                row[1] += 1
+                if j in gemm:
+                    a.gemm_ops += 1
+                    if (cost := gemm[j]) is not None:
+                        a.gemm_bytes += cost[0]
+                        a.gemm_flops = (a.gemm_flops or 0) + cost[1]
+    out_secs = {name: {"parent": parent_of[name], **acc.result()} for name, acc in accs.items()}
 
     if markers_path is not None:
         want = _markers_sections(Path(markers_path))
         if want is None:
-            warnings.append("the markers file has no traced step line")
+            warn.add("the markers file has no traced step line")
         else:
             for name in sorted(want - set(out_secs)):
-                warnings.append(f"section {name!r} is in the markers but not the trace")
+                warn.add(f"section {name!r} is in the markers but not the trace")
             for name in sorted(set(out_secs) - want):
-                warnings.append(f"section {name!r} is in the trace but not the markers")
+                warn.add(f"section {name!r} is in the trace but not the markers")
 
-    summary: dict[str, Any] = {"version": VERSION, "sections": out_secs}
-    summary["c5_slice"] = (_c5_slice(stamps, Path(layout_path), trace_path, warnings)
-                           if layout_path is not None else {})
-    summary["warnings"] = warnings
-    return summary
+    c5: dict[str, Any] = {}
+    if layout_path is not None:
+        try:
+            c5 = _c5_slice(stamps, Path(layout_path), trace_path, warn)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            warn.add(f"the layout {str(layout_path)!r} is missing or malformed ({exc!r}); "
+                     "no check-5 view")
+    return {"version": VERSION, "sections": out_secs, "c5_slice": c5, "warnings": warn.lines()}
 
 
 def _c5_slice(stamps: Sequence[tuple[Event, str, dict[str, int]]], layout_path: Path,
-              trace_path: Path, warnings: list[str]) -> dict[str, Any]:
+              trace_path: Path, warn: _Warnings) -> dict[str, Any]:
     layout = json.loads(layout_path.read_text(encoding="utf-8"))
     cls: dict[int, str] = {}
     members: dict[int, int] = defaultdict(int)
     for ent in layout["entries"]:
         run = ent["run"]
         if cls.setdefault(run, ent["class"]) != ent["class"]:
-            warnings.append(f"layout run {run} has entries of two classes; the first is used")
+            warn.add("a layout run has entries of two classes; the first is used")
         members[run] += ent["members"]
     total_runs: dict[str, set[int]] = defaultdict(set)
     for run, c in cls.items():
@@ -517,14 +562,14 @@ def _c5_slice(stamps: Sequence[tuple[Event, str, dict[str, int]]], layout_path: 
         phases[run]["stack"] = phases[run]["serve"] - phases[run]["copy"]
     unknown = sorted(r for r in traced | set(phases) if r not in cls)
     if unknown:
-        warnings.append(f"stamped runs {unknown} are not in the layout; left out")
+        warn.add(f"stamped runs {unknown} are not in the layout; left out")
     meta = trace_path.parent / "meta.json"
     all_traced = False
     if meta.exists():
         all_traced = json.loads(meta.read_text(encoding="utf-8")).get("c5_slice") == "all"
     want = layout.get("trace_slice")
     if want is not None and not all_traced and sorted(traced) != sorted(want):
-        warnings.append(f"traced runs {sorted(traced)} differ from the layout's "
+        warn.add(f"traced runs {sorted(traced)} differ from the layout's "
                         f"trace_slice {sorted(want)}")
 
     out: dict[str, Any] = {}

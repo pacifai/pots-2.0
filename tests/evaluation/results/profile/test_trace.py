@@ -201,18 +201,99 @@ def test_markers_cross_check(tmp_path):
     assert any("'A.inner' is in the trace but not the markers" in s for s in w)
 
 
-def test_missing_bytes_and_flops(tmp_path):
-    evs = [ann("S", 0, 100),
-           x("cpu_op", "aten::mm", 10, 20, {"Input Dims": [[2, 2], [2, 2]],
-                                             "Input type": ["float", "float"]}),
-           launch(50, 1, "cudaMemcpyAsync"),
+def test_missing_bytes(tmp_path):
+    evs = [ann("S", 0, 100), launch(50, 1, "cudaMemcpyAsync"),
            memcpy("DtoH (Device -> Pageable)", 60, 5, None, 1)]
     s = trace.summarize(write(tmp_path / "t.json.gz", evs))
     sec = s["sections"]["S"]
     assert sec["copy_bytes"]["d2h"] is None and sec["copy_bytes"]["h2d"] == 0
-    assert sec["gemm_flops"] is None and sec["gemm_bytes"] == 48
-    assert any("no args.bytes" in w for w in s["warnings"])
-    assert any("no flops" in w for w in s["warnings"])
+    assert s["warnings"] == ["1 memcpy events have no args.bytes; their bytes are null"]
+
+
+def gemm_op(name, dims, types=None, ts=10, dur=20, **args):
+    return x("cpu_op", name, ts, dur, {"Input Dims": dims,
+                                       "Input type": types or ["float"] * len(dims), **args})
+
+
+def gemm_numbers(tmp_path, *ops):
+    s = trace.summarize(write(tmp_path / "t.json", [ann("S", 0, 100), *ops]))
+    return s["sections"]["S"]["gemm_flops"], s["sections"]["S"]["gemm_bytes"], s["warnings"]
+
+
+def test_gemm_flops_from_shapes(tmp_path):
+    # No flops argument anywhere: torch's Chrome trace has none.
+    assert gemm_numbers(tmp_path, gemm_op("aten::mm", [[4, 8], [8, 2]])) == (
+        128, (32 + 16 + 8) * 4, [])
+    # addmm leads with its bias, and its scalars have empty dims.
+    f, b, _ = gemm_numbers(tmp_path, gemm_op("aten::addmm", [[2], [4, 8], [8, 2], [], []]))
+    assert (f, b) == (128, (2 + 32 + 16 + 8) * 4)
+    # bmm: 2 * batch * m * n * k.
+    assert gemm_numbers(tmp_path, gemm_op("aten::bmm", [[3, 4, 8], [3, 8, 2]]))[0] == 3 * 128
+    # matmul broadcasts the batch: [5,1,4,8] @ [3,8,2] is batch 5x3.
+    f, b, _ = gemm_numbers(tmp_path, gemm_op("aten::matmul", [[5, 1, 4, 8], [3, 8, 2]],
+                                             ["c10::BFloat16"] * 2))
+    assert (f, b) == (15 * 128, (160 + 48 + 15 * 8) * 2)
+    # 1-D operands are vectors: [4,8] @ [8] is 2*4*8 flops with a [4] output.
+    f, b, _ = gemm_numbers(tmp_path, gemm_op("aten::matmul", [[4, 8], [8]]))
+    assert (f, b) == (64, (32 + 8 + 4) * 4)
+
+
+def test_gemm_flops_unreadable_and_arg_check(tmp_path):
+    f, b, w = gemm_numbers(tmp_path, gemm_op("aten::mm", [[4, 8], [7, 2]]))
+    assert f is None and b == 0 and len(w) == 1 and "don't multiply" in w[0]
+    ok = gemm_numbers(tmp_path, gemm_op("aten::mm", [[4, 8], [8, 2]], flops=129))
+    assert ok == (128, 224, [])
+    bad = gemm_numbers(tmp_path, gemm_op("aten::mm", [[4, 8], [8, 2]], flops=200))
+    assert bad[2] == ["a GEMM op's flops argument differs from its shapes' flops by more "
+                      "than 1%"]
+
+
+def test_probe_same_name_top_level_and_nested(tmp_path):
+    # X is a section at top level and again under Y; its first kernel must not reach Y.
+    evs = [ann("X", 0, 10), ann("Y", 20, 30), ann("X", 25, 10),
+           launch(1, 1), kernel("gemm_a", 2, 3, 1), launch(26, 2), kernel("gemm_b", 27, 3, 2)]
+    s = trace.summarize(write(tmp_path / "t.json", evs))
+    secs = s["sections"]
+    assert secs["Y"]["kernels"] == 1 and secs["Y"]["kernel_us"] == 3
+    assert secs["X"]["kernels"] == 2 and secs["X"]["wall_us"] == 20
+    assert secs["X"]["parent"] is None and secs["Y"]["parent"] is None
+    assert any("'X' sits under several parents" in w for w in s["warnings"])
+
+
+def test_recursive_name_counts_once(tmp_path):
+    evs = [ann("R", 0, 100), ann("R", 10, 50), launch(20, 1), kernel("gemm_a", 25, 5, 1)]
+    r = trace.summarize(write(tmp_path / "t.json", evs))["sections"]["R"]
+    assert r["kernels"] == 1 and r["launches"] == 1 and r["wall_us"] == 100
+
+
+def test_bad_layout(tmp_path):
+    t = write(tmp_path / "t.json.gz", events())
+    for text in (None, "{not json", json.dumps({"entries": [{"run": 0}]})):
+        lay = tmp_path / "l.json"
+        if text is not None:
+            lay.write_text(text)
+        s = trace.summarize(t, lay)
+        assert s["c5_slice"] == {} and any("layout" in w for w in s["warnings"])
+        assert "A" in s["sections"]
+
+
+def test_gemm_kernel_patterns():
+    cat = trace._kernel_category
+    assert cat("nvjet_tst_128x256") == "gemm" and cat("cublasLt::splitKreduce_kernel") == "gemm"
+    assert cat("void at::native::reduce_kernel<512>") == "reduction"
+
+
+def test_torch_annotations_are_not_sections(tmp_path):
+    evs = [ann("S", 0, 100), ann("Optimizer.step#SGD.step", 10, 20), ann("## mm ##", 40, 20),
+           launch(15, 1), kernel("gemm_a", 16, 4, 1)]
+    s = trace.summarize(write(tmp_path / "t.json", evs))
+    assert set(s["sections"]) == {"S"} and s["sections"]["S"]["kernels"] == 1
+
+
+def test_warnings_deduplicated(tmp_path):
+    ops = [gemm_op("aten::mm", [[4, 8], [7, 2]], ts=10 * i, dur=5) for i in range(1, 4)]
+    w = gemm_numbers(tmp_path, *ops)[2]
+    assert len(w) == 1 and w[0].endswith("(x3)")
 
 
 def test_matmul_counts_its_mm_once(tmp_path):
