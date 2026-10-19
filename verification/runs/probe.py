@@ -38,7 +38,8 @@ from setup.config import load_config, setup_determinism
 
 from setup.machine import machine_facts
 
-__all__ = ["VERSION", "DATASHEET", "datasheet_for", "fit_hash_rate", "run_probe", "main"]
+__all__ = ["VERSION", "DATASHEET", "datasheet_for", "fit_hash_rate", "fit_alloc_rate", "run_probe",
+           "main"]
 
 VERSION = 1
 GIB = 1 << 30
@@ -46,11 +47,15 @@ WARMUPS = 2
 MIN_REPS = 3
 GPU_LIMIT = 4 * GIB
 HOST_BYTES = GIB  # a host buffer, and the 1 GiB transfers' size
+# Fresh pinned allocations: (MiB, reps). The sizes span the host buffer pool's (about 93 MB on
+# average, up to 1 GiB); 7.5 GiB in all, about 3.5 s at the 2.4 GB/s an H100 pod showed.
+ALLOC_SIZES = ((16, 64), (64, 24), (256, 8), (1024, 3))
 
 RATE_KEYS = ("gemm_bf16_flops", "gemm_fp32_flops", "skinny_bmm_fp32_flops", "hbm_copy_bytes",
              "hbm_reduce_bytes", "h2d_pinned_bytes", "d2h_pinned_bytes", "h2d_pageable_bytes",
              "d2h_pageable_bytes", "h2d_bf16_to_fp32_blocking_bytes",
-             "h2d_bf16_cast_on_gpu_bytes", "host_first_touch_bytes", "hash", "host_memcpy_bytes")
+             "h2d_bf16_cast_on_gpu_bytes", "host_first_touch_bytes", "hash", "host_memcpy_bytes",
+             "pinned_alloc_bytes", "pinned_alloc_per_call_s")
 COST_KEYS = ("launch_s", "sync_s", "event_pair_s", "tolist_s", "empty_cache_s")
 
 # GPU name -> peaks. H100 SXM, from NVIDIA's datasheet: dense bf16 and tf32 (the 1979 and 989
@@ -134,6 +139,23 @@ def fit_residual(mixes: Sequence[tuple[int, int, float]], per_byte: float,
     t = np.array([s for _, _, s in mixes], dtype=np.float64)
     fit = np.array([b * per_byte + n * per_leaf for b, n, _ in mixes])
     return float(np.linalg.norm(t - fit) / np.linalg.norm(t))
+
+
+def fit_alloc_rate(points: Sequence[tuple[int, float]]) -> tuple[float, float]:
+    """``(per_call_s, per_byte_s)`` of ``t = per_call_s + bytes * per_byte_s``, least squares
+    over ``(bytes, seconds)`` points, each weighted by ``1 / seconds`` so the small sizes fix
+    the per-call cost as the large ones fix the rate."""
+    b = np.array([n for n, _ in points], dtype=np.float64)
+    t = np.array([s for _, s in points], dtype=np.float64)
+    a = np.stack([np.ones_like(b), b], axis=1) / t[:, None]
+    scale = np.array([1.0, b.max()])
+    coef, *_ = np.linalg.lstsq(a / scale, np.ones_like(t), rcond=None)
+    per_call, per_byte = coef / scale
+    if per_call < 0:  # noise: refit on bytes alone, with no per-call cost
+        x = b / t
+        per_byte = float(x.sum() / (x @ x))
+        per_call = 0.0
+    return float(per_call), float(per_byte)
 
 
 @dataclass
@@ -310,6 +332,50 @@ def measure_transfers(share_s: float, rates: dict, errors: dict) -> None:
         if pinned:  # hand the pinned block back, so the pageable pass starts without it
             getattr(torch._C, "_host_emptyCache", lambda: None)()
         _free()
+
+
+def measure_pinned_alloc(share_s: float, rates: dict, errors: dict) -> None:
+    """Time ``torch.empty(n, dtype=torch.uint8, pin_memory=True)``, the host buffer pool's
+    call (``HostBuffers.take``), at each of ``ALLOC_SIZES``, and fit seconds against bytes.
+
+    PyTorch caches a freed pinned block, so a free-and-reallocate loop would time the cache.
+    The installed torch (2.9) has no call that empties the cache (``torch._C._host_emptyCache``
+    is absent), so every rep of a size holds its buffer until the size's reps are done: each
+    allocation is a fresh ``cudaHostAlloc``, checked against ``num_host_alloc``. The freed
+    blocks stay cached, so this runs before ``measure_transfers``, whose 1 GiB buffer would
+    otherwise hit one. A size stops early, with at least 3 reps, past 3 times the share, as
+    ``Clock`` does."""
+    def num_host_alloc() -> int | None:
+        return torch.cuda.host_memory_stats().get("num_host_alloc")
+
+    try:
+        torch.empty(1 << 20, dtype=torch.uint8, pin_memory=True)  # the first call's setup
+        points = []
+        start = time.perf_counter()
+        for mib, reps in ALLOC_SIZES:
+            held, times = [], []
+            for _ in range(reps):
+                before = num_host_alloc()
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                held.append(torch.empty(mib << 20, dtype=torch.uint8, pin_memory=True))
+                times.append(time.perf_counter() - t0)
+                after = num_host_alloc()
+                if before is not None and after != before + 1:
+                    raise RuntimeError(f"a {mib} MiB allocation made {after - before} "
+                                       "cudaHostAlloc calls, not 1: the host cache answered")
+                if len(times) >= MIN_REPS and time.perf_counter() - start > 3 * share_s:
+                    break
+            del held
+            points.append((mib << 20, statistics.median(times)))
+        per_call, per_byte = fit_alloc_rate(points)
+        if per_byte <= 0:
+            raise RuntimeError(f"fit gave per_byte_s = {per_byte:.3g}; points {points}")
+        rates["pinned_alloc_bytes"] = 1 / per_byte
+        rates["pinned_alloc_per_call_s"] = per_call
+    except Exception as e:  # noqa: BLE001
+        for key in ("pinned_alloc_bytes", "pinned_alloc_per_call_s"):
+            errors[key] = f"{type(e).__name__}: {e}"
 
 
 def measure_bf16_transfers(share_s: float, rates: dict, errors: dict) -> None:
@@ -507,6 +573,7 @@ def run_probe(seconds: float, *, env: dict[str, str] | None = None) -> dict[str,
             ("gemm", 30, lambda s: measure_gemm(s, rates, errors, shapes)),
             ("skinny", 5, lambda s: measure_skinny(s, k_cols, rates, errors, shapes)),
             ("hbm", 8, lambda s: measure_hbm(s, rates, errors)),
+            ("pinned_alloc", 6, lambda s: measure_pinned_alloc(s, rates, errors)),
             ("transfers", 12, lambda s: measure_transfers(s, rates, errors)),
             ("bf16_transfers", 8, lambda s: measure_bf16_transfers(s, rates, errors)),
             ("costs", 10, lambda s: measure_costs(s, costs, errors)),
