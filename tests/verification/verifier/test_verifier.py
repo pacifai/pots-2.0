@@ -2081,3 +2081,34 @@ def test_mutation_by_a_later_read_rejected_at_7(c, D, tree, w0, parallel):
     rej = _verifier(c, D, tree, w0).verify_step(1, MutatingRead(store))
     _expect(rej, 1, "0", "malformed")
     assert rej.detail == f"leaf {a} changed in place during check 0"
+
+
+def test_check5_serves_bf16_leaves_bit_exact_fp32():
+    """Check 5's serving copies a stored bf16 leaf in its stored dtype and casts on the
+    device, so P equals ``leaf.to(float32)`` bit for bit."""
+    from verification.computation.interface import ProductKind, ProductSpec
+
+    g = torch.Generator().manual_seed(0)
+    leaves = {m: torch.randn(3, 4, generator=g).to(torch.bfloat16) for m in (1, 2)}
+    a, b = torch.randn(3, 5), torch.randn(5, 4)
+
+    class _Replay:
+        def operands(self, m):
+            return a, b
+
+        def operand_group(self, ms, dtype):
+            return a.expand(len(ms), 3, 5), b.expand(len(ms), 5, 4)
+
+    class _View:
+        def product(self, m):
+            return leaves[m]
+
+    specs = [ProductSpec(m, f"Y{m}", ProductKind.FORWARD, (3, 5), (5, 4), "w") for m in (1, 2)]
+    ctx = StepContext.for_computation(
+        MLPComputation(eta=1e-3), step=1, indices=(), h_D=b"", n_records=0, prev_w_hashes=(),
+        chain_check_id="0", k=1)
+    _, _, p, _ = checks._served(None, specs[0], ctx, _Replay(), _View())
+    assert p.dtype == torch.float32 and torch.equal(p, leaves[1].to(torch.float32))
+    group = checks._served_group(None, specs, [0, 1], ctx, _Replay(), _View())
+    want = torch.stack([leaves[1], leaves[2]]).to(torch.float32)
+    assert group.p.dtype == torch.float32 and torch.equal(group.p, want)
