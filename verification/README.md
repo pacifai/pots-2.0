@@ -808,12 +808,13 @@ that both start commands parse (`bash -n`) and, on stub `runpodctl`, `curl` and 
    SHA-256.
 2. **The orchestrator creates the pod**: one H100 80 GB, image
    `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, the boot guard above (16,200 s) as the
-   start command, SSH on. Disk: a pod volume of at least 50 GB at `/workspace`, where all the
-   work goes, and the container disk at its default (20 GB or more), which holds only the
-   system. No network volume: terminating deletes the pod volume, which is the point. The
-   work needs about 20–25 GB: the upload (2.4 GB) and its extracted copy (2.4 GB), about
-   7.7 GB of public weights, the venv (about 7 GB with CUDA torch), uv's cache (about 4 GB)
-   and the output (under 1 GB). Host RAM: at least the 64 GiB free that the benchmark's copy
+   start command, SSH on. Disk: a pod volume of at least 50 GB at `/workspace`, where the
+   upload, the weights and the output go, and a container disk of at least 30 GB, which holds
+   the system, the venv and uv's cache. No network volume: terminating deletes the pod volume,
+   which is the point. The work needs about 20–25 GB: the upload (2.4 GB) and its extracted
+   copy (2.4 GB), about 7.7 GB of public weights and the output (under 1 GB) on the volume,
+   and on the container disk the venv (about 7 GB with CUDA torch) and uv's cache (about
+   4 GB). Host RAM: at least the 64 GiB free that the benchmark's copy
    test needs (the target machine has 188–320 GB, F1c).
 3. **Set up.** After SSH, check that `cat /tmp/guard.log` says "armed". If it doesn't (the pod
    was created without the start command, or restarted), run `sh fs11_guard.sh` from the
@@ -826,12 +827,16 @@ that both start commands parse (`bash -n`) and, on stub `runpodctl`, `curl` and 
    ```bash
    cd /workspace/fs11_upload/repo
    uv python install 3.14
-   uv venv --python 3.14 .venv
+   uv venv --python 3.14 /root/venv
+   ln -s /root/venv .venv
    uv pip install --python .venv/bin/python -r ../requirements-fs11.txt
    ```
 
    `requirements-fs11.txt` holds the Mac's versions; on Linux x86_64, PyPI's torch wheel is a
-   CUDA build.
+   CUDA build. The venv lives on the container disk and `.venv` links to it. On the profiling
+   check's pod `/workspace` was a network file system (MooseFS, through FUSE) where each file
+   lookup is slow, so importing torch and transformers from a venv there took 2–3 minutes in
+   every part; the container disk is local.
 4. **Start the job detached**, from `/workspace/fs11_upload/repo`:
 
    ```bash
