@@ -1453,7 +1453,7 @@ def environment_record(run: str, *, device: str | torch.device, probe: MemoryPro
         "mem_source": probe.source, "MallocLargeCache": os.environ.get("MallocLargeCache"),
         **allocator_settings(release_cache),
         "machine": machine_facts(),
-        "threads": torch.get_num_threads(), "machine": machine_facts(), **fields,
+        "threads": torch.get_num_threads(), **fields,
     }
 
 
