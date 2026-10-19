@@ -163,11 +163,14 @@ def test_profile_check_plan(tmp_path):
     plan = fs.profile_check_plan(up, out)
     assert fs.SESSIONS["profile-check"] == ("profile-check", fs.profile_check_plan)
     names = [p.name for p in plan]
-    assert names == PROFILE_NAMES + [f"{kind}_{repo.split('/')[-1]}" for repo, _ in fs.RUN_PINS
+    assert names == PROFILE_NAMES + [f"{kind}_{repo.split('/')[-1]}" for repo, _ in fs.PROFILE_PINS
                                      for kind in ("plain", "bring_up")]
     assert len(set(names)) == len(names)
+    assert [r for r, _ in fs.PROFILE_PINS] == [r for r, _ in fs.RUN_PINS
+                                              if r != "Qwen/Qwen2.5-1.5B-Instruct"]
+    assert not any("Qwen2.5-1.5B" in n for n in names)
     assert [p.timeout_s for p in plan] == (
-        [1800, 600, 900, 900, 900, 900, 600, 900] + [600, 3600] * len(fs.RUN_PINS))
+        [1800, 600, 900, 900, 900, 900, 600, 900] + [600, 3600] * len(fs.PROFILE_PINS))
     assert plan[0].env == {"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None}
     assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
     assert all("POTS_SAMPLER" not in p.env for p in plan)
@@ -228,7 +231,7 @@ def test_profile_check_stored_step_and_run_name_match_run_verified():
 def test_profile_check_bring_ups(tmp_path):
     up, out = tmp_path / "up", tmp_path / "out"
     bring = [p for p in fs.profile_check_plan(up, out) if p.kind == "bring_up"]
-    assert [p.info["model"] for p in bring] == [repo for repo, _ in fs.RUN_PINS]
+    assert [p.info["model"] for p in bring] == [repo for repo, _ in fs.PROFILE_PINS]
     for p in bring:
         assert p.argv == ["{python}", "-m", "verification.runs.bring_up", "--no-tamper",
                           "--steps", "3", "--metrics", "--check5-repeats", "3"]
@@ -246,7 +249,7 @@ def test_profile_check_full_scale_plain_parts(tmp_path):
     plan = fs.profile_check_plan(up, out)
     names = [p.name for p in plan]
     plains = [p for p in plan if p.kind == "plain" and p.name != "smollm2_plain"]
-    assert [p.info["model"] for p in plains] == [repo for repo, _ in fs.RUN_PINS]
+    assert [p.info["model"] for p in plains] == [repo for repo, _ in fs.PROFILE_PINS]
     bring = {p.info["model"]: p for p in plan if p.kind == "bring_up"}
     for p in plains:
         repo = p.info["model"]

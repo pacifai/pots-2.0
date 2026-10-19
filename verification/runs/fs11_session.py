@@ -99,9 +99,11 @@ from typing import Any
 
 from verification.commitment import native
 
-__all__ = ["PROFILE_CHECK_TIMEOUT_S", "SMOLLM2_ENV", "RUN_PINS", "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
+__all__ = ["PROFILE_CHECK_TIMEOUT_S", "PROFILE_HELD", "PROFILE_PINS", "SMOLLM2_ENV", "RUN_PINS",
+           "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
            "alloc_env", "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part",
-           "default_plan", "recheck_plan", "profile_check_plan", "load_plan", "selftest_plan", "with_native_build",
+           "default_plan", "recheck_plan", "profile_check_plan", "load_plan", "selftest_plan",
+           "with_native_build",
            "choose_plan", "run_session", "fix2_ab",
            "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
            "data_key", "main"]
@@ -167,6 +169,12 @@ PLAIN_RUN = "plain_baseline"  # plain_baseline.RUN_NAME, its records' directory
 # on an H100 and the third, untraced step adds 200-300 s, so about 1450 s, 2.5 times under.
 PROFILE_CHECK_TIMEOUT_S = {"models": 1800, "probe": 600, "calibrate": 900, "run": 900,
                            "plain": 600, "check5_profile": 900, "bring_up": 3600}
+# The full-scale models the profile check runs, in RUN_PINS order. Qwen2.5-1.5B is held out
+# (user, 2026-10-19) until the architecture improves: its verifier ran out of GPU memory at
+# check 5's first output-layer backward, short by 1.16 GiB, and the fix (the prover's fp32
+# weights to host RAM during the verifier's turn) waits for that work.
+PROFILE_HELD = frozenset({"Qwen/Qwen2.5-1.5B-Instruct"})
+PROFILE_PINS: tuple[tuple[str, str], ...] = tuple(p for p in RUN_PINS if p[0] not in PROFILE_HELD)
 # SmolLM2's run config in the profile check: test scale's batch, sequence length, steps and
 # seed (the config's defaults, so set none), on CUDA at the full-scale dtypes. k is 15: a bf16
 # calibration of SmolLM2 passed its guard but asked for k 15, and the band file's context holds
@@ -541,7 +549,7 @@ def _full_scale_plain_part(repo: str, rev: str, upload: Path, out: Path,
 def profile_check_plan(upload: Path, out: Path) -> list[Part]:
     """The profile check's parts (module docstring): the models part and the probe; SmolLM2's
     calibration, three ``run_verified`` runs, the plain run and the stored step's profile; then,
-    per model, a full-scale ``plain_baseline`` run and
+    per model of :data:`PROFILE_PINS`, a full-scale ``plain_baseline`` run and
     ``bring_up --no-tamper --steps 3 --metrics --check5-repeats 3``, both at
     :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`; the bring-up traces step 2, a steady-state
     step, and runs its repeats on step 3. Every part runs with the sampler (``POTS_SAMPLER`` is
@@ -552,7 +560,8 @@ def profile_check_plan(upload: Path, out: Path) -> list[Part]:
     ups = _bring_up_parts(upload, out, {**RECHECK_ENV, "VERIF_TRACE_STEP": "2"}, t["bring_up"],
                           ("--steps", "3", "--metrics", "--check5-repeats", "3"))
     for (repo, rev), up in zip(RUN_PINS, ups, strict=True):
-        plan += [_full_scale_plain_part(repo, rev, upload, out, t["plain"]), up]
+        if repo not in PROFILE_HELD:
+            plan += [_full_scale_plain_part(repo, rev, upload, out, t["plain"]), up]
     return plan
 
 
