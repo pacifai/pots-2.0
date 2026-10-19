@@ -374,6 +374,13 @@ def band_context(cfg: RunConfig, c: DecoderComputation, *, h_D: bytes, k: int) -
 _ABSENT = object()
 
 
+def guard_failed_marker(path: str | os.PathLike[str]) -> Path:
+    """The sidecar ``calibrate --write-bands-despite-guard`` writes next to a band file whose
+    concentration guard failed (profiling only)."""
+    path = Path(path)
+    return path.with_name(path.name + ".guard_failed.json")
+
+
 def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, Any]) -> Bands:
     """The band file every verification after calibration loads, read-only (P10a).
 
@@ -384,7 +391,8 @@ def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, An
     one written before a compared key existed, is refused. Either mismatch raises
     :class:`BandFileMismatch`. The two :data:`PROVENANCE_KEYS`, the calibration seed and the
     thread count, are never compared: a run at another seed or thread count loads the file,
-    and so does a file that lacks either key.
+    and so does a file that lacks either key. A ``.guard_failed.json`` sidecar next to the file
+    (:func:`guard_failed_marker`) gets one warning line and nothing more.
     """
     path = Path(path)
     rerun = "rerun verification.runs.calibrate (P10a)"
@@ -392,6 +400,9 @@ def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, An
         raise FileNotFoundError(f"no band file at {path}: run verification.runs.calibrate "
                                 "first (P10a)")
     bands = Bands.from_file(path)
+    if guard_failed_marker(path).exists():
+        print(f"WARNING: band file {path} comes from a failed concentration guard "
+              "(calibrate --write-bands-despite-guard, profiling only)")
     if bands.stats.get("k") != k:
         raise BandFileMismatch(f"band file {path} was calibrated at k = {bands.stats.get('k')}, "
                                f"this run has k = {k}: {rerun}")

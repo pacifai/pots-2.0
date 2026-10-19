@@ -16,7 +16,9 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
    says why:
 
    - the concentration guard (largest honest normalized residual ``≤ τ/2``) fails; ``z`` is
-     never raised here;
+     never raised here. ``--write-bands-despite-guard`` (profiling only) lifts this one gate:
+     the band file is written as usual, a ``<band file>.guard_failed.json`` sidecar marks it,
+     the summary carries ``band_file_override: guard_failed``, and the run goes on;
    - P10d's recompute of ``k`` with the measured ``τ`` (``sizing.size_k``, ``T = VERIF_STEPS``,
      ``M`` of ``C``) asks for more than ``VERIF_K``. Since F18 it sizes at the largest ``e_m``
      over the calibration products (``calibration.largest_e_m``, each product's own ``e_m``
@@ -52,6 +54,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import json
 import math
 import statistics
 import sys
@@ -86,6 +89,7 @@ from verification.verifier.calibration import (
     assert_same_band_source,
     band_context,
     band_file_bytes,
+    guard_failed_marker,
     fit,
     largest_e_m,
     load_bands,
@@ -415,6 +419,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
                    help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/k<k>/ "
                         "(default: VERIF_METRICS)")
+    p.add_argument("--write-bands-despite-guard", action="store_true",
+                   help="profiling only: write the band file even when the concentration guard "
+                        "fails, marked as such")
     args = p.parse_args(argv)
     if args.steps < 1:
         p.error(f"{args.steps} calibration steps: at least one")
@@ -449,7 +456,8 @@ def main(argv: Sequence[str] | None = None) -> int:
           if use_metrics else None)
     try:
         return _run(c, D, w0, base, mw, k=k, T_run=cfg.steps, context=context,
-                    band_file=pc.band_file, run_dir=run_dir, models=models)
+                    band_file=pc.band_file, run_dir=run_dir, models=models,
+                    write_despite_guard=args.write_bands_despite_guard)
     finally:
         if mw is not None:
             mw.close()
@@ -459,7 +467,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
          base: dict[str, Any], mw: MetricsWriter | None, *, k: int, T_run: int,
          context: Mapping[str, Any], band_file: Path, run_dir: Path,
-         models: ReusedModel) -> int:
+         models: ReusedModel, write_despite_guard: bool = False) -> int:
     rec = None if mw is None else mw.recorder("calibrate")
     run = calibrate(c, D, w0, T_run=T_run, context=context, recorder=rec, **base)
     report_calibration(run, k)
@@ -478,7 +486,9 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
         print("STOP: an honest calibration step was rejected under its own frozen bands")
         _write(mw, summary)
         return 1
-    if not run.cal.guard_ok:
+    sidecar = guard_failed_marker(band_file)
+    guard_override = not run.cal.guard_ok and write_despite_guard
+    if not run.cal.guard_ok and not guard_override:
         print(f"STOP: the concentration guard failed (max {run.cal.global_max:.3f} > τ/2 = "
               f"{run.cal.guard_limit:.3f}). z is not raised here; no band file written.")
         _write(mw, summary)
@@ -488,7 +498,19 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
               f"VERIF_K={run.sizing.k}; no band file written to {band_file}.")
         _write(mw, summary)
         return 2
+    if guard_override:
+        print(f"PROFILING OVERRIDE: the concentration guard failed (max "
+              f"{run.cal.global_max:.3f} > τ/2 = {run.cal.guard_limit:.3f}); the band file is "
+              f"written anyway and marked guard-failed ({sidecar.name}). Timing only.")
+        summary["band_file_override"] = "guard_failed"
     write_band_file(band_file, run.data)
+    if guard_override:
+        sidecar.write_text(json.dumps(
+            {"guard_ok": False, "global_max": run.cal.global_max,
+             "guard_limit": run.cal.guard_limit,
+             "reason": "calibrate --write-bands-despite-guard (profiling only)"}, indent=2))
+    else:
+        sidecar.unlink(missing_ok=True)  # a stale mark from an earlier run
     bands = load_bands(band_file, k=k, context=context)
     print(f"band file {band_file}: hash {bands.source}")
     summary["band_file"] = str(band_file)
