@@ -251,8 +251,6 @@ def _numa(r: _Record) -> None:
     r.put("numa_nodes", out)
 
 
-
-
 def nvml_facts() -> dict[str, Any] | None:
     """GPU 0's driver, power limit, clocks, PCIe link and UUID from NVML, or None without
     ``pynvml`` or a GPU. One failed read is None for that field only."""

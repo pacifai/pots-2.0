@@ -50,7 +50,6 @@ class _FakeNvml(types.ModuleType):
     def nvmlDeviceGetCurrPcieLinkGeneration(self, h): return 4
     def nvmlDeviceGetMaxPcieLinkWidth(self, h): return 16
     def nvmlDeviceGetCurrPcieLinkWidth(self, h): return 16
-    def nvmlDeviceGetPciInfo(self, h): return types.SimpleNamespace(busId="00000000:19:00.0")
 
 
 def test_one_failed_nvml_read_nulls_that_field_only(monkeypatch):
@@ -65,4 +64,27 @@ def test_one_failed_nvml_read_nulls_that_field_only(monkeypatch):
 
 def test_nvml_block_is_none_without_pynvml(monkeypatch):
     monkeypatch.setitem(sys.modules, "pynvml", None)  # import raises ImportError
+    assert setup_machine.nvml_facts() is None
+
+
+class _BytesNvml(_FakeNvml):
+    """A pynvml that returns bytes for text and milliwatts for the power limit."""
+
+    def nvmlSystemGetDriverVersion(self): return b"550.1"
+    def nvmlDeviceGetUUID(self, h): return b"GPU-abc"
+    def nvmlDeviceGetEnforcedPowerLimit(self, h): return 250000
+
+
+class _NoInitNvml(_FakeNvml):
+    def nvmlInit(self): raise RuntimeError("driver not loaded")
+
+
+def test_nvml_decodes_bytes_and_converts_milliwatts(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", _BytesNvml())
+    block = setup_machine.nvml_facts()
+    assert (block["driver"], block["uuid"], block["power_limit_w"]) == ("550.1", "GPU-abc", 250.0)
+
+
+def test_nvml_block_is_none_when_init_fails(monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", _NoInitNvml())
     assert setup_machine.nvml_facts() is None

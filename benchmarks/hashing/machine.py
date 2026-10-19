@@ -11,7 +11,6 @@ import ctypes
 import hashlib
 import platform
 import re
-import shutil
 import ssl
 import sys
 from typing import Any
@@ -25,6 +24,7 @@ import transformers
 # callers and tests.
 from setup.machine import (_Record, _cpu, _frequency, _gpu, _numa, _read, _run,  # noqa: F401
                            cgroup_cpu_quota, cgroup_memory_limit)
+
 
 def mem_available() -> int | None:
     """``MemAvailable`` from ``/proc/meminfo`` in bytes, or None where there's no such file.
