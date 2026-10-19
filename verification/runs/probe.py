@@ -38,7 +38,8 @@ from setup.config import load_config, setup_determinism
 
 from setup.machine import machine_facts
 
-__all__ = ["VERSION", "DATASHEET", "datasheet_for", "fit_hash_rate", "fit_alloc_rate", "run_probe", "main"]
+__all__ = ["VERSION", "DATASHEET", "datasheet_for", "fit_hash_rate", "fit_alloc_rate", "run_probe",
+           "main"]
 
 VERSION = 1
 GIB = 1 << 30
@@ -53,8 +54,8 @@ ALLOC_SIZES = ((16, 64), (64, 24), (256, 8), (1024, 3))
 RATE_KEYS = ("gemm_bf16_flops", "gemm_fp32_flops", "skinny_bmm_fp32_flops", "hbm_copy_bytes",
              "hbm_reduce_bytes", "h2d_pinned_bytes", "d2h_pinned_bytes", "h2d_pageable_bytes",
              "d2h_pageable_bytes", "h2d_bf16_to_fp32_blocking_bytes",
-             "h2d_bf16_cast_on_gpu_bytes", "host_first_touch_bytes", "hash", "host_memcpy_bytes", "pinned_alloc_bytes",
-             "pinned_alloc_per_call_s")
+             "h2d_bf16_cast_on_gpu_bytes", "host_first_touch_bytes", "hash", "host_memcpy_bytes",
+             "pinned_alloc_bytes", "pinned_alloc_per_call_s")
 COST_KEYS = ("launch_s", "sync_s", "event_pair_s", "tolist_s", "empty_cache_s")
 
 # GPU name -> peaks. H100 SXM, from NVIDIA's datasheet: dense bf16 and tf32 (the 1979 and 989
