@@ -91,9 +91,14 @@ REJECTED_OPS = frozenset({
 # Namespaces whose ops may run inside a phase. An op from any other namespace raises unless
 # its qualified name ("ns::name") is in ALLOWED_NAMESPACE_OPS.
 TRUSTED_NAMESPACES = frozenset({"aten", "prims"})
-# Empty: HF Llama and Qwen2 eager dispatch nothing outside aten. Clear an op here only after
-# checking that it forms no matrix product.
-ALLOWED_NAMESPACE_OPS: frozenset[str] = frozenset()
+# HF Llama and Qwen2 eager dispatch nothing outside aten. The two profiler ops are what
+# `torch.profiler.record_function` dispatches (FS23's traced step); neither takes a Tensor
+# (enter: a name and an optional args string; exit: the RecordFunction handle), so neither can
+# form a matrix product. Clear another op here only after checking the same.
+ALLOWED_NAMESPACE_OPS: frozenset[str] = frozenset({
+    "profiler::_record_function_enter_new",
+    "profiler::_record_function_exit",
+})
 
 
 def param_storage_map(model: torch.nn.Module) -> dict[int, str]:
