@@ -34,7 +34,7 @@ import torch
 
 from setup import data
 from setup.config import assert_no_dropout, load_config
-from verification.commitment.leaves import dataset_tree
+from verification.commitment.leaves import dataset_tree, leaf_totals
 from verification.computation.interface import DeclaredComputation
 from verification.prover.step import (
     Perturbation,
@@ -49,12 +49,14 @@ from verification.verifier.context import Rejection
 from verification.verifier.driver import RunVerdict, Verifier
 
 __all__ = ["ProverFault", "StepRecord", "LoopResult", "run_loop", "PlainStepRecord", "PlainResult",
-           "run_plain", "HANDOFF_SECTION", "release_device_cache", "release_cache_setting",
-           "model_device"]
+           "run_plain", "HANDOFF_SECTION", "TOTALS_SECTION", "release_device_cache",
+           "release_cache_setting", "model_device"]
 
 # The metrics section around the hand-off's cache release. Its row is the harness's (side
 # "run") and in no role's total: deployed, the prover and the verifier run on separate machines.
+# TOTALS_SECTION is the same for ``leaf_totals``, which counts the step's transcript bytes.
 HANDOFF_SECTION = "handoff.empty_cache"
+TOTALS_SECTION = "handoff.totals"
 
 
 class ProverFault:
@@ -94,7 +96,8 @@ class StepRecord:
     """One step of the loop: the verifier's decision and the wall clocks (seconds).
 
     ``handoff_s`` is the time between the two roles: dropping the prover's references and, on
-    CUDA, :func:`release_device_cache`. It's in neither ``commit_s`` nor ``verify_s``."""
+    CUDA, :func:`release_device_cache`. It's in neither ``commit_s`` nor ``verify_s``. The
+    harness section ``handoff.totals`` (``leaf_totals``) is in none of the four times."""
 
     t: int
     rejection: Rejection | None
@@ -103,6 +106,9 @@ class StepRecord:
     commit_s: float
     verify_s: float
     handoff_s: float = 0.0
+    capture: dict | None = None
+    transcript_bytes: int | None = None
+    leaves: int | None = None
 
 
 @dataclass
@@ -220,6 +226,7 @@ def run_loop(
         out = prove_step(c, model, w_t, records, train_records=fault.train_records(t, records),
                          perturb=fault.perturb(t), section=section)
         t1 = time.perf_counter()
+        capture = out.capture
         out = fault.emit(t, out)  # outside prove_s: a splice is the harness's cost, not the prover's
         t1b = time.perf_counter()
         with sec("P4.paths"):
@@ -229,6 +236,9 @@ def run_loop(
         with sec("P5.write"):
             store = handoff.hold(c, t, leaves, tree_h, paths)
         t2 = time.perf_counter()
+        with sec(TOTALS_SECTION):
+            n_leaves, n_bytes = leaf_totals(c, leaves)
+        t2a = time.perf_counter()
         w, loss = out.w_next, out.loss
         del out, leaves, tree_h  # the store holds the leaves; nothing else keeps the step
         if release_cache:
@@ -240,7 +250,8 @@ def run_loop(
             handoff.release(store)
         t3 = time.perf_counter()
         del store  # discard before step t+1 (S3)
-        rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1b, t3 - t2b, t2b - t2)
+        rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1b, t3 - t2b, t2b - t2a,
+                         capture, n_bytes, n_leaves)
         result.steps.append(rec)
         if on_step is not None:
             on_step(rec)

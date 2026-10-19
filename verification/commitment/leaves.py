@@ -58,6 +58,7 @@ __all__ = [
     "leaf_hashes",
     "transcript_root",
     "commit_leaves",
+    "leaf_totals",
     "dataset_tree",
     "dataset_root",
 ]
@@ -315,6 +316,18 @@ def commit_leaves(c: DeclaredComputation, leaves: Sequence[Any]) -> MerkleTree:
         raise ValueError(f"transcript has {len(leaves)} leaves, the computation declares "
                          f"{c.n_leaves}")
     return MerkleTree(leaf_hashes_of(c, enumerate(leaves)))
+
+
+def leaf_totals(c: DeclaredComputation, leaves: Sequence[Any]) -> tuple[int, int]:
+    """``(leaf count, bytes)`` that hashing ``leaves`` counts: a record's encoding, a tensor's
+    header and ``nbytes``. It reads no payload."""
+    total = 0
+    for i, obj in enumerate(leaves):
+        if i < c.n_s:
+            total += len(c.encode_record(obj))
+        else:
+            total += len(tensor_leaf_header(_tensor_slot(c, i)[0], obj)) + obj.nbytes
+    return len(leaves), total
 
 
 def dataset_tree(c: DeclaredComputation, dataset: Sequence[Any]) -> MerkleTree:

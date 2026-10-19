@@ -392,7 +392,8 @@ def derive_capture(verified: Iterable[Mapping[str, Any]],
         dt = sum(_get(v, f"train.{x}", t)["time_s"] - _get(p, f"P0.{x}", t)["time_s"]
                  for x in _XS)
         out.append({"record": "time", "run": run, "scenario": scen, "step": t, **base,
-                    "calls": label["calls"], "time_s": dt + label["time_s"]})
+                    "calls": label["calls"], "time_s": dt + label["time_s"],
+                    "traced": False})
     for (run, scen, t), v in _phases(verified, "memory").items():
         if (p := plain_mem.get(t)) is None:
             continue

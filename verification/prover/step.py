@@ -72,6 +72,8 @@ class StepOutput:
     w_next: dict[str, torch.Tensor]  # in weight_names order
     loss: float
     versions: tuple[int, ...] = field(repr=False)
+    # MatmulCapture.summary() and the host pool's size, for the profiling record
+    capture: dict | None = field(default=None, compare=False, repr=False)
 
     def leaves(self) -> list[Any]:
         return [*self.records, *self.w_t.values(), *self.products, *self.w_next.values()]
@@ -91,7 +93,8 @@ class StepOutput:
         n_w = len(self.w_next)
         return StepOutput(records=self.records, w_t=self.w_t, products=self.products,
                           w_next=new, loss=self.loss,
-                          versions=self.versions[:-n_w] + _versions(list(new.values())))
+                          versions=self.versions[:-n_w] + _versions(list(new.values())),
+                          capture=self.capture)
 
     def assert_unmodified(self) -> None:
         """Raise if any leaf tensor was mutated in place since capture (invariant 6).
@@ -230,6 +233,9 @@ def prove_step(
         cap.assert_unmodified()
         product_versions = list(_versions(products))
         cap.release_operands()
+    summary = cap.summary()
+    summary["host_buffers"] = ({"n_buffers": cap.buffers.n_buffers, "nbytes": cap.buffers.nbytes}
+                               if cap.buffers is not None else None)
 
     for m, fn in (perturb or {}).items():
         spec = computation.product(m)
@@ -252,6 +258,7 @@ def prove_step(
         loss=float(loss.detach()),
         versions=(record_versions + w_t_versions
                   + tuple(product_versions) + _versions(list(w_next.values()))),
+        capture=summary,
     )
 
 
