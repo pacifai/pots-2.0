@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from benchmarks.hashing import cpu_hash, gpu, machine
+from setup import machine as setup_machine
 from tests.verification.decoder_helpers import tiny_config
 
 MB = 1 << 20
@@ -101,7 +102,7 @@ def test_cgroup_quota_reads_v2_then_v1(monkeypatch):
     v1 = "/sys/fs/cgroup/cpu,cpuacct/"
     files = {v1 + "cpu.cfs_quota_us": "765000\n", v1 + "cpu.cfs_period_us": "100000\n",
              "/sys/fs/cgroup/memory/memory.limit_in_bytes": "49999998976\n"}
-    monkeypatch.setattr(machine, "_read", files.get)
+    monkeypatch.setattr(setup_machine, "_read", files.get)
     assert machine.cgroup_cpu_quota() == pytest.approx(7.65)
     assert machine.cgroup_memory_limit() == 49999998976
     m = {"physical_cores": 48, "logical_cpus": 96, "usable_cpus": 96, "cgroup_cpu_quota": 7.65}

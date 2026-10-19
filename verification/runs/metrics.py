@@ -180,6 +180,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
 
 from setup.config import load_config
+from setup.machine import machine_facts
 from verification.commitment import native
 from verification.computation.interface import ProductKind
 from verification.verifier.bands import product_class
@@ -1451,7 +1452,8 @@ def environment_record(run: str, *, device: str | torch.device, probe: MemoryPro
         "h_D": None if h_D is None else h_D.hex(),
         "mem_source": probe.source, "MallocLargeCache": os.environ.get("MallocLargeCache"),
         **allocator_settings(release_cache),
-        "threads": torch.get_num_threads(), **fields,
+        "machine": machine_facts(),
+        "threads": torch.get_num_threads(), "machine": machine_facts(), **fields,
     }
 
 
