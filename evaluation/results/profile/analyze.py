@@ -1,8 +1,10 @@
 """FS25: join the profiling files into ``profile.json`` and apply the bottleneck rule
 (PROFILING_PLAN §5.7, §6, §7).
 
-Run as ``python -m evaluation.results.profile.analyze --run-dir D [--markers M] [--samples S]
-[--probe P] [--trace-summary T] [--plain D2] [--compute-dtype float32] --out profile.json``.
+Run as ``python -m evaluation.results.profile.analyze --run-dir D --session L [--markers M]
+[--samples S] [--probe P] [--trace-summary T] [--plain D2] [--compute-dtype float32]
+--out profile.json``. ``meta`` names the run (model, attack, scenario, device, compute dtype,
+git commit, from the environment record) and the session ``L`` (PROFILING_PLAN §5.7).
 A missing markers, samples or probe file is a warning in ``profile.json``, not an error.
 
 **Units.** Marker times are µs from the step's ``t0_ns``, sample times are monotonic ns, and
@@ -636,7 +638,8 @@ def _read(label: str, path: Path | None, reader, warns: list[str], default: Any)
 
 def analyze(run_dir: Path, samples: Path | None = None, probe: Path | None = None,
             trace_summary: Path | None = None, plain: Path | None = None,
-            compute_dtype: str = "float32", markers: Path | None = None) -> dict[str, Any]:
+            compute_dtype: str = "float32", markers: Path | None = None,
+            session: str | None = None) -> dict[str, Any]:
     """The analysis. A missing or empty markers, samples or probe file, or a markers file
     with no steps, adds a warning instead of failing: the sections then come from the time
     rows alone, utilization is null and the probe-based floors are skipped."""
@@ -660,7 +663,13 @@ def analyze(run_dir: Path, samples: Path | None = None, probe: Path | None = Non
     view = _run_view(mk, records, sampler, pr, trace, layout,
                      dtype.removeprefix("torch.") in ("bfloat16", "bf16"), gpu_memory, soft)
     run = mk.header.get("run") or next((r["run"] for r in records if "run" in r), "unknown")
-    return {"version": io.VERSION, "run": run, "compute_dtype": dtype,
+    env = next((r for r in records if r.get("record") == "environment"), {})
+    meta = {"model": env.get("model"), "attack": env.get("attack"), "scenario": run,
+            "device": mk.header.get("device") or env.get("device"), "compute_dtype": dtype,
+            "git_commit": env.get("git_commit"), "session": session}
+    if session is None:
+        warns.append("no --session was given: meta.session is null")
+    return {"version": io.VERSION, "meta": meta, "run": run, "compute_dtype": dtype,
             "thresholds": THRESHOLDS,
             "warnings": warns + sorted(soft) + list((trace or {}).get("warnings") or []),
             "runs": {run: view},
@@ -678,10 +687,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--plain", type=Path, default=None, help="the plain run's directory")
     p.add_argument("--compute-dtype", default="float32",
                    help="used when no environment record names compute_dtype")
+    p.add_argument("--session", required=True,
+                   help="the session's label with its date, e.g. profile-check-2026-10-20")
     p.add_argument("--out", type=Path, required=True)
     a = p.parse_args(argv)
     result = analyze(a.run_dir, a.samples, a.probe, a.trace_summary, a.plain, a.compute_dtype,
-                     a.markers)
+                     a.markers, a.session)
     a.out.write_text(json.dumps(result, indent=1) + "\n", encoding="utf-8")
     print(f"wrote {a.out}", file=sys.stderr)
     return 0

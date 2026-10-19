@@ -261,9 +261,11 @@ def test_cli_writes_profile_json(tmp_path):
     paths = build_run(tmp_path / "run", hash_bytes={"A": 20_000_000})
     out = tmp_path / "profile.json"
     rc = analyze.main(["--run-dir", str(paths["run_dir"]), "--samples", str(paths["samples"]),
-                       "--probe", str(paths["probe"]), "--out", str(out)])
+                       "--probe", str(paths["probe"]), "--session", "check-2026-10-19",
+                       "--out", str(out)])
     got = json.loads(out.read_text())
     assert rc == 0 and got["version"] == 1
+    assert got["meta"]["session"] == "check-2026-10-19" and got["meta"]["scenario"] == "honest"
     assert "bottleneck" in got["runs"]["honest"]["sections"]["A"]["marks"]
 
 
@@ -540,7 +542,8 @@ def test_markers_without_steps_or_absent_warn(tmp_path):
 def test_the_cli_runs_with_only_the_run_directory(tmp_path):
     paths = build_run(tmp_path / "run", hash_bytes={"A": 20_000_000})
     out = tmp_path / "profile.json"
-    assert analyze.main(["--run-dir", str(paths["run_dir"]), "--out", str(out)]) == 0
+    assert analyze.main(["--run-dir", str(paths["run_dir"]), "--session", "s",
+                         "--out", str(out)]) == 0
     got = json.loads(out.read_text())
     assert sum("no samples file" in w for w in got["warnings"]) == 1
     assert sum("no probe file" in w for w in got["warnings"]) == 1
@@ -582,3 +585,19 @@ def test_markers_for_clocks_and_spans_skip_step_zero_and_traced_steps(tmp_path):
     s = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"]
                         )["runs"]["honest"]["sections"]
     assert s["A"]["util"]["c_tree"] == pytest.approx(11.0)  # only step 1's span at 10 s
+
+
+def test_meta_names_the_run_from_the_environment_record(tmp_path):
+    paths = build_run(tmp_path / "run")
+    env = {"record": "environment", "run": "honest", "compute_dtype": "bfloat16",
+           "model": "Qwen/Qwen2.5-0.5B-Instruct", "attack": "refusal", "git_commit": "abc",
+           "device": "cuda"}
+    lines = (paths["run_dir"] / "records.jsonl").read_text().splitlines()
+    lines[0] = json.dumps(env)
+    (paths["run_dir"] / "records.jsonl").write_text("\n".join(lines) + "\n")
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], session="s1")
+    assert out["meta"] == {"model": "Qwen/Qwen2.5-0.5B-Instruct", "attack": "refusal",
+                           "scenario": "honest", "device": out["meta"]["device"],
+                           "compute_dtype": "bfloat16", "git_commit": "abc", "session": "s1"}
+    assert not any("--session" in w for w in out["warnings"])
+    assert any("--session" in w for w in analyze.analyze(paths["run_dir"])["warnings"])
