@@ -86,7 +86,7 @@ WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".h5", ".msgp
 BLAKE3_DIR = "blake3-1.8.7"
 # The packages the session's parts import, whose Mac versions the upload records.
 PACKAGES = ("torch", "transformers", "tokenizers", "huggingface_hub", "safetensors", "numpy",
-            "blake3", "datasets", "certifi")
+            "blake3", "datasets", "certifi", "psutil", "nvidia-ml-py")
 
 
 class PrepError(RuntimeError):
