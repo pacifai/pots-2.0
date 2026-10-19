@@ -506,7 +506,7 @@ def _smollm2_parts(upload: Path, out: Path) -> list[Part]:
         part("smollm2_trace_slice", "run_verified", run_dir("smollm2_trace_slice"), t["run"],
              *steps, trace={"VERIF_TRACE_STEP": "5"}),
         part("smollm2_trace_all", "run_verified", run_dir("smollm2_trace_all"), t["run"],
-             *steps, trace={"VERIF_TRACE_C5": "all"}),
+             *steps, trace={"VERIF_TRACE_STEP": "5", "VERIF_TRACE_C5": "all"}),
         part("smollm2_untraced", "run_verified", untraced, t["run"], *steps,
              trace={"VERIF_TRACE_STEP": "0"}),
         part("smollm2_plain", "plain_baseline", plain, t["plain"], kind="plain",

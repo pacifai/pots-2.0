@@ -173,7 +173,7 @@ def test_profile_check_plan(tmp_path):
     # the trace variables sit in the parts that name them, and nowhere else
     traced = {p.name: {k: p.env[k] for k in TRACE_VARS if k in p.env} for p in plan}
     want = {"smollm2_trace_slice": {"VERIF_TRACE_STEP": "5"},
-            "smollm2_trace_all": {"VERIF_TRACE_C5": "all"},
+            "smollm2_trace_all": {"VERIF_TRACE_STEP": "5", "VERIF_TRACE_C5": "all"},
             "smollm2_untraced": {"VERIF_TRACE_STEP": "0"},
             **{n: {"VERIF_TRACE_STEP": "2"} for n in names if n.startswith("bring_up_")}}
     assert traced == {n: want.get(n, {}) for n in names}
