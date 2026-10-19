@@ -103,7 +103,9 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 `setup/backdoorllm.py`, and setting either raises.
 
 One variable is outside that scheme: `POTS_NATIVE_CACHE`, the directory holding the native
-BLAKE3 sources and library (`commitment/native.py`), default `~/.cache/pots-2.0/native`.
+BLAKE3 sources and library (`commitment/native.py`), default `~/.cache/pots-2.0/native`. Another is `POTS_SAMPLER`: `0` turns off the per-part sampler
+(`setup/sampler.py`) that `fs11_session` starts beside each part; default on. Its file is
+`<part dir>/samples.jsonl`.
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch
