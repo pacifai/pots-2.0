@@ -70,12 +70,13 @@ from verification.runs.run_verified import (
     load_kept_step,
     stored_band_hash,
 )
+from verification.transcript.store import TranscriptStore
 from verification.verifier.bands import Bands
 from verification.verifier.calibration import band_context, load_bands
 from verification.verifier.context import StepStats
 
 __all__ = ["OTHER", "Counts", "Profile", "SectionTracker", "count_ops", "cuda_counts",
-           "main", "profile", "stats_digest"]
+           "main", "profile", "profile_step", "record_line", "stats_digest"]
 
 DEFAULT_REPEATS = 5
 OTHER = "other"  # check 5 outside its two named sections
@@ -268,14 +269,23 @@ def profile(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, 
     if (bh := stored_band_hash(kept.run_dir)) != bands.source:
         raise ValueError(f"{kept.run_dir} was judged by band file {bh}, not this run's "
                          f"{bands.source}")
+    return profile_step(c, kept.store, kept.step, kept.honest, bands, seed=seed, h_D=h_D,
+                        n_records=n_records, k=k, repeats=repeats, device=device, out=out)
+
+
+def profile_step(c: DeclaredComputation, store: TranscriptStore, step: int,
+                 honest: StepStats | None, bands: Bands, *, seed: int, h_D: bytes,
+                 n_records: int, k: int, repeats: int = DEFAULT_REPEATS, device: str = "cpu",
+                 out: Callable[[str], None] = print) -> Profile:
+    """:func:`profile` on a step held in memory, with no band-hash check: ``bands`` are the
+    caller's own (``bring_up``'s in-sample fit has no stored hash). ``honest`` is the run's
+    archive for the step, or ``None``."""
     dev = torch.device(device)
-    store = kept.store
-    base = base_context(c, store, step=kept.step, seed=seed, h_D=h_D, n_records=n_records,
-                        k=k)
+    base = base_context(c, store, step=step, seed=seed, h_D=h_D, n_records=n_records, k=k)
     t0 = time.perf_counter()
     rej, slots, ready = full_step(store, c, base, bands)
     if rej is not None:
-        raise RuntimeError(f"the stored step {kept.step} was rejected: {rej}")
+        raise RuntimeError(f"the stored step {step} was rejected: {rej}")
     out(f"full step: accepted in {time.perf_counter() - t0:.2f} s; per slot "
         + ", ".join(f"{s} {v:.3f}" for s, v in slots.items()))
 
@@ -296,7 +306,7 @@ def profile(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, 
             named += tr.time_s[s]
         per_section[OTHER].append(dt - named)
     digest = stats_digest(st)
-    archive = None if kept.honest is None else stats_digest(kept.honest) == digest
+    archive = None if honest is None else stats_digest(honest) == digest
     section_calls = dict(tr.calls)
 
     tr = SectionTracker()
@@ -324,6 +334,13 @@ def profile(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, 
                    section_s_per_pass=per_section,
                    section_calls=section_calls, ops=dict(counts.ops), reads=dict(counts.reads),
                    top_ops=top, cuda=cuda)
+
+
+def record_line(r: Profile, *, model: str, device: str, k: int, step: int) -> dict[str, Any]:
+    """The line ``--out`` appends: the ``--json`` record, the run's identity, each section's
+    time per pass and the machine's facts."""
+    return {**r.as_record(), "model": model, "device": device, "k": k, "step": step,
+            "section_s_per_pass": r.section_s_per_pass, "machine_facts": machine_facts()}
 
 
 def report(p: Profile, out: Callable[[str], None] = print) -> None:
@@ -397,8 +414,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(rec))
     out = args.out or run_dir / "check5_profile.jsonl"
     with open(out, "a") as f:
-        f.write(json.dumps({**rec, "section_s_per_pass": r.section_s_per_pass,
-                            "machine_facts": machine_facts()}) + "\n")
+        f.write(json.dumps(record_line(r, model=cfg.model, device=cfg.device, k=pc.k,
+                                       step=args.step)) + "\n")
     return 0 if r.accepted else 1
 
 
