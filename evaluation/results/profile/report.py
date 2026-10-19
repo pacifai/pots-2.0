@@ -15,6 +15,10 @@ Choices the plan leaves open, taken here:
   rectangle in each, and nested sub-blocks sit in its first lane.
 - A run is a CPU run when ``meta.device`` is ``cpu`` or no GPU field (a ``g_*`` utilization,
   a GPU clock or GPU-lane work) appears in it.
+- The hashing breakdown (``hash`` in the run view) is a small table per owner, the commit and
+  check 2, after the section table: the hashing wall time with its floor, each part with its
+  lane, share and floor, and what the caller's parts leave unaccounted. A run with no part
+  timings shows the wall line and a note; a run with no hash row has no table.
 - Hover is the SVG ``<title>`` tooltip; the script only drives the run picker.
 """
 
@@ -444,6 +448,42 @@ def _sections_table(run: Run) -> str:
     return _table(head, rows, left=(0, len(head) - 1, len(head) - 3))
 
 
+def _hash_table(run: Run) -> str:
+    """The hashing breakdown of the commit and of check 2: the wall time, then each part with
+    its lane, share and floor, the sibling parts and what the caller's parts leave
+    unaccounted. A run with no stats gets the wall-time line and a note."""
+    hv = run.view.get("hash") or {}
+    if not hv:
+        return ""
+    out = []
+    for key, h in hv.items():
+        w = h.get("wall") or {}
+        rows: list[list[Any]] = [["hashing wall", "—", fmt(w.get("s")), "—", fmt(w.get("floor_s")),
+                                  fmt(w.get("ratio"))]]
+        for p, v in (h.get("parts") or {}).items():
+            if v:
+                rows.append([p, v.get("lane"), fmt(v.get("s")), fmt(v.get("share")),
+                             fmt(v.get("floor_s")), "—"])
+        for n, s in (h.get("siblings") or {}).items():
+            rows.append([f"outside the hash: {n}", "—", fmt(s), "—", "—", "—"])
+        if h.get("has_stats"):
+            rows.append(["unaccounted (wall less the caller's parts)", "—",
+                         fmt(h.get("unaccounted_s")), "—", "—", "—"])
+        note = "" if h.get("has_stats") else (
+            '<p class="mute">No part timings in this run (it predates the breakdown).</p>')
+        out.append(
+            f"<h3>{esc(h.get('section'))}.hash</h3>"
+            + _table(["part", "lane", "mean s", "share of wall", "floor s", "wall / floor"],
+                     rows, left=(0, 1))
+            + note
+            + f'<p class="mute">{fmt(h.get("n_steps"))} steps; leaves {fmt(h.get("leaves"))}, '
+              f'hashed bytes {fmt(h.get("hash_bytes"))}. The caller\'s parts (read, producer, '
+              'wait) add up to the wall time; the worker\'s (native, big, other) run beside '
+              'them. The floor is bytes and leaves at the probe\'s rates; there is no tree '
+              'floor.</p>')
+    return "".join(out)
+
+
 def _polylines(ts: list[float], vals: list[float | None], x: Callable[[float], float],
                y: Callable[[float], float], color: str, name: str) -> str:
     runs: list[list[tuple[float, float]]] = [[]]
@@ -761,7 +801,8 @@ def build(profiles: Sequence[dict[str, Any]], names: Sequence[str] | None = None
 
     add("inputs", "Inputs", _inputs(profiles, names, runs))
     per_run = (("overview", "Overview", _overview), ("diagram", "Architecture", _arch),
-               ("sections", "Section table", _sections_table), ("timeline", "Timeline", _timeline),
+               ("sections", "Section table", _sections_table),
+               ("hash", "Hashing breakdown", _hash_table), ("timeline", "Timeline", _timeline),
                ("check5", "Check 5", _c5))
     for r in runs:
         for key, title, fn in per_run:

@@ -689,3 +689,52 @@ def test_probe_and_machine_null_without_a_probe(tmp_path):
     lines[0] = json.dumps({**json.loads(lines[0]), "machine": {"gpus": 1}})
     f.write_text("\n".join(lines) + "\n")
     assert analyze.analyze(paths["run_dir"], paths["samples"])["machine"] == {"gpus": 1}
+
+
+HASH_SECS = {"P3.commit": (0.0, 0.5), "P3.commit.collect": (0.0, 0.05),
+             "P3.commit.hash": (0.05, 0.3), "P3.commit.tree": (0.35, 0.1),
+             "P3.commit.check": (0.45, 0.05), "2": (0.5, 0.5), "2.hash": (0.5, 0.4)}
+HASH_DEPTHS = {n: 1 for n in HASH_SECS if n.count(".") == 1 and n != "P3.commit"}
+HASH_DEPTHS["2.hash"] = 1
+
+
+def hash_rows(owner: str, parts: dict[str, float], steps: int = 3):
+    return [time_row(k, f"{owner}.hash.{p}", v, side="prover" if owner == "P3.commit" else "verifier",
+                     level="sub") for k in range(1, steps + 1) for p, v in parts.items()]
+
+
+def test_hash_breakdown_with_stats(tmp_path):
+    extra = hash_rows("P3.commit", {"read": 0.01, "producer": 0.04, "wait": 0.2, "native": 0.25}) \
+        + hash_rows("2", {"read": 0.15, "producer": 0.05, "wait": 0.18, "native": 0.3, "big": 0.02})
+    out, s = run(tmp_path, secs=HASH_SECS, depths=HASH_DEPTHS, records_extra=extra,
+                 hash_bytes={"P3.commit.hash": 100_000_000, "2.hash": 100_000_000})
+    view = out["runs"]["honest"]
+    # the parts are rows of the hash, not sections of their own
+    assert not [n for n in s if ".hash." in n]
+    h = view["hash"]
+    c, k = h["commit"], h["check2"]
+    assert c["has_stats"] and k["has_stats"]
+    assert c["wall"]["s"] == pytest.approx(0.3) and c["wall"]["floor_s"] == pytest.approx(0.1)
+    assert c["wall"]["ratio"] == pytest.approx(3.0)
+    assert c["parts"]["native"]["s"] == pytest.approx(0.25)
+    assert c["parts"]["native"]["floor_s"] == pytest.approx(0.1)
+    assert c["parts"]["native"]["lane"] == "worker" and c["parts"]["read"]["lane"] == "caller"
+    assert c["parts"]["big"]["s"] == 0.0  # a part with no row took no time
+    assert c["unaccounted_s"] == pytest.approx(0.3 - 0.25)
+    assert c["siblings"] == {"collect": pytest.approx(0.05), "tree": pytest.approx(0.1),
+                             "check": pytest.approx(0.05)}
+    assert k["parts"]["big"]["s"] == pytest.approx(0.02)
+    assert k["siblings"]["rest"] == pytest.approx(0.1)
+    assert k["unaccounted_s"] == pytest.approx(0.4 - 0.38)
+
+
+def test_hash_breakdown_without_stats_or_without_hash(tmp_path):
+    # an older run: the hash section exists but no part rows
+    out, _ = run(tmp_path / "a", secs=HASH_SECS, depths=HASH_DEPTHS,
+                 hash_bytes={"2.hash": 100_000_000})
+    h = out["runs"]["honest"]["hash"]
+    assert h["check2"]["has_stats"] is False and h["check2"]["unaccounted_s"] is None
+    assert all(v is None for v in h["check2"]["parts"].values())
+    # a run from before even the .hash sections: no entry, no error
+    out, _ = run(tmp_path / "b")
+    assert out["runs"]["honest"]["hash"] == {}

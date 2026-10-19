@@ -10,6 +10,7 @@ import torch
 from verification.commitment import leaves as leaves_mod
 from verification.commitment import merkle, native
 from verification.commitment.leaves import (
+    HashStats,
     commit_leaves,
     leaf_hash,
     leaf_hashes_of,
@@ -277,3 +278,31 @@ def test_interrupt_waits_for_the_worker(c, leaves, monkeypatch):
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old)
     assert done and done[0] <= raised
+
+
+def test_stats_change_no_digest_in_any_mode(c, leaves, mode):
+    """Every batching mode (tiny batches, all-big leaves) with stats gives the digests
+    without, and the batch count follows the batching."""
+    items = list(enumerate(leaves))
+    want, want_err = leaf_hashes_until_error(c, iter(items))
+    stats = HashStats()
+    got, err = leaf_hashes_until_error(c, iter(items), stats)
+    assert (got, err) == (want, want_err)
+    assert stats.leaves == len(leaves) and stats.bytes > 0
+    if mode in ("small_batches", "both"):
+        assert stats.batches > 1
+    if mode in ("big_leaves", "both"):
+        assert stats.big_s > 0
+    assert stats.native_s > 0 or stats.big_s > 0
+    inside = stats.read_s + stats.producer_s + stats.wait_s
+    assert inside > 0
+
+
+def test_stats_with_a_fault_keep_the_first_error(c, leaves, mode):
+    items = list(enumerate(leaves))
+    pos = c.n_s + 1
+    items[pos] = (pos, leaves[pos].reshape(-1))
+    got, err = _both(c, items)[0]
+    stats = HashStats()
+    got2, err2 = leaf_hashes_until_error(c, iter(items), stats)
+    assert got2 == got and str(err2) == str(err)

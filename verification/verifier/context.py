@@ -25,7 +25,12 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 
 from setup.records import Record
-from verification.commitment.leaves import leaf_hash, leaf_hashes_of, leaf_hashes_until_error
+from verification.commitment.leaves import (
+    HashStats,
+    leaf_hash,
+    leaf_hashes_of,
+    leaf_hashes_until_error,
+)
 from verification.commitment.merkle import DIGEST_SIZE
 from verification.parameters import UNIT_ROUNDOFF
 from verification.transcript.errors import (
@@ -171,11 +176,13 @@ def _typed(items: Iterable[tuple[int, Any]]) -> Iterator[tuple[int, Any]]:
         yield i, obj
 
 
-def _hashes(c: DeclaredComputation, items: Iterable[tuple[int, Any]]) -> list[bytes]:
+def _hashes(c: DeclaredComputation, items: Iterable[tuple[int, Any]],
+            stats: HashStats | None = None) -> list[bytes]:
     """:func:`_hash` of each ``(index, obj)``, in order, hashed in parallel
     (``leaf_hashes_of``). The type check runs with the validation, so the first error is
-    the one a ``_hash`` loop raises first."""
-    return leaf_hashes_of(c, _typed(items))
+    the one a ``_hash`` loop raises first. ``stats`` (optional) collects where the time went;
+    its ``read_s`` then includes the type check, since that sits in the iterator."""
+    return leaf_hashes_of(c, _typed(items), stats)
 
 
 def _hashes_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
@@ -266,6 +273,11 @@ class StepContext:
     def timed(self, name: str) -> AbstractContextManager[Any]:
         """``section(name)``, or a no-op when no metrics seam is set."""
         return _NO_SECTION if self.section is None else self.section(name)
+
+    def hash_stats(self) -> HashStats | None:
+        """A fresh :class:`HashStats` when the seam can ``add`` a measured duration, else
+        ``None``: a run with no metrics, or a plain callable seam, collects nothing."""
+        return HashStats() if hasattr(self.section, "add") else None
 
     def stamp(self, name: str, run: int = -1, group: int = -1,
               window: int = -1) -> AbstractContextManager[Any]:

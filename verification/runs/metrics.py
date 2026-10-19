@@ -13,6 +13,15 @@ and decisions are bit-identical with metrics on or off (tested). A name with the
 is a once-per-run section, reported at step 0. A section opened inside another is nested (a
 ``sub`` row).
 
+**Added seconds.** ``section.add(name, seconds)`` (:meth:`Seam.add`) adds host seconds a part
+measured itself to a time row named ``name``, with no span; the memory and count recorders
+ignore it. The hashing code uses it to report where its time went (the calling thread's read,
+batching and waiting, and the worker's native and large-leaf time) as ``P3.commit.hash.<part>``
+and ``2.hash.<part>`` rows beside the nested ``P3.commit.collect``, ``.hash``, ``.tree`` and
+``.check`` sections and check 2's ``2.hash``. A part that took no time writes no row, so every
+time row keeps ``time_s > 0``. The rows come from the timed run only, and a seam that has no
+``add`` (a plain callable) gets none.
+
 **Three passes, one axis each.** Measuring one axis disturbs the others, so each has its own run:
 
 - the *timed run* reads only ``time.monotonic_ns`` (:class:`TimeRecorder`). It is the run whose
@@ -489,6 +498,12 @@ class Seam:
     def __call__(self, name: str) -> Any:
         return self._rec.section(name)
 
+    def add(self, name: str, seconds: float) -> None:
+        """Record a duration measured elsewhere as one call of section ``name``, nested when a
+        section is open. Only the timed run keeps it, as host wall time with no span (so no
+        marker interval); the memory and counting runs ignore it."""
+        self._rec.add(name, seconds)
+
 
 def resolve_gpu_us(anchor_host_us: float, anchor: Any, events: Iterable[Any]) -> list[float]:
     """Each CUDA event's time on the host clock, in microseconds: the anchor's host time plus the
@@ -566,6 +581,9 @@ class _Recorder:
             acc.depth = self._depth
             acc.c5 = table is self._step and (name == "5" or name.startswith("5."))
         return self._Section(self, acc)
+
+    def add(self, name: str, seconds: float) -> None:
+        """A measured duration as a section call; ignored unless the recorder times."""
 
     def on_step(self, rec: Any) -> None:
         """``run_loop``'s ``on_step``: close step ``rec.t``."""
@@ -988,6 +1006,31 @@ class TimeRecorder(_Recorder):
                                                   writer.dir / TRACE_DIR))
             self.section = self._traced_section
             self.stamp = self._traced_stamp
+
+    def add(self, name: str, seconds: float) -> None:
+        """A duration measured elsewhere (the hash stats) as one call of section ``name``: the
+        same accumulator as :meth:`section`, its time added as given. It has no span: the marker
+        line holds it as a ``rest`` aggregate only."""
+        if name.startswith(RUN_PREFIX):
+            table, name = self._run, name[len(RUN_PREFIX):]
+        else:
+            table = self._step
+        acc = table.get(name)
+        if acc is None:
+            acc = table[name] = _Acc(self._depth > 0)
+            acc.depth = self._depth
+        acc.time += seconds
+        acc.calls += 1
+        now = time.monotonic_ns()
+        if acc.first_ns is None:
+            acc.first_ns = now
+        r = acc.rest
+        if r is None:
+            acc.rest = [1, seconds, 0.0, now, now]
+        else:
+            r[0] += 1
+            r[1] += seconds
+            r[4] = now
 
     def _traced_section(self, name: str) -> Any:
         sec = super().section(name)

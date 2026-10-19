@@ -225,8 +225,12 @@ def check_2_commitment(store: TranscriptStore, c: DeclaredComputation, ctx: Step
             leaves.add(obj)
             yield i, obj
 
+    stats = ctx.hash_stats()
     with _guard(ctx, "2"):
-        hashes = _hashes(c, read())
+        with ctx.timed("2.hash"):  # the read-validate-hash loop, apart from the checks after it
+            hashes = _hashes(c, read(), stats)
+        if stats is not None:
+            stats.emit(ctx.section, "2.hash")
         stale = any(leaves.changed(i) for i in range(len(leaves)))
         claimed = store.root
     if stale:

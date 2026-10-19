@@ -232,7 +232,7 @@ def run_loop(
         with sec("P4.paths"):
             paths = [tree.path(i) for i in idx]
         with sec("P3.commit"):
-            leaves, tree_h = InMemoryStore.commit_step(c, out)
+            leaves, tree_h = InMemoryStore.commit_step(c, out, section=section)
         with sec("P5.write"):
             store = handoff.hold(c, t, leaves, tree_h, paths)
         t2 = time.perf_counter()
