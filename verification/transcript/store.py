@@ -43,13 +43,14 @@ import json
 import shutil
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from setup.records import Record
-from verification.commitment.leaves import commit_leaves, leaf_hash
+from verification.commitment.leaves import HashStats, hash_step_leaves, leaf_hash
 from verification.commitment.merkle import DIGEST_SIZE, MerkleTree
 from verification.transcript.errors import LeafReadError, StoreMutationError
 from verification.transcript.reader import LeafReader
@@ -163,14 +164,29 @@ class InMemoryStore(TranscriptStore):
         return cls.hold(c, leaves, tree, dataset_paths)
 
     @staticmethod
-    def commit_step(c: DeclaredComputation, step: StepOutput, *,
-                    copy: bool = False) -> tuple[list[Any], MerkleTree]:
+    def commit_step(c: DeclaredComputation, step: StepOutput, *, copy: bool = False,
+                    section: Any = None) -> tuple[list[Any], MerkleTree]:
         """``(leaves, tree)``: the step's leaves (cloned if ``copy``) and the Merkle tree over
-        them, with invariant 6 rechecked after hashing."""
-        leaves = step.leaves()
-        leaves = [_clone(x) for x in leaves] if copy else _detached(leaves)
-        tree = commit_leaves(c, leaves)
-        step.assert_unmodified()  # invariant 6, as in prover.step.commit()
+        them, with invariant 6 rechecked after hashing.
+
+        ``section`` is B6's metrics seam. With one, the four parts run as nested sections
+        ``P3.commit.collect`` (``step.leaves()`` and the detach or clone), ``.hash`` (every leaf
+        hash), ``.tree`` (the Merkle build) and ``.check`` (``assert_unmodified``). A seam that
+        can ``add`` also gets the hash's breakdown (``HashStats.emit``) as
+        ``P3.commit.hash.<part>``. ``None`` observes nothing and reads no clock."""
+        sec = section or (lambda name: nullcontext())
+        with sec("P3.commit.collect"):
+            leaves = step.leaves()
+            leaves = [_clone(x) for x in leaves] if copy else _detached(leaves)
+        stats = HashStats() if hasattr(section, "add") else None
+        with sec("P3.commit.hash"):
+            hashes = hash_step_leaves(c, leaves, stats)
+        if stats is not None:
+            stats.emit(section, "P3.commit.hash")
+        with sec("P3.commit.tree"):
+            tree = MerkleTree(hashes)
+        with sec("P3.commit.check"):
+            step.assert_unmodified()  # invariant 6, as in prover.step.commit()
         return leaves, tree
 
     @classmethod

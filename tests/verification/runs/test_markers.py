@@ -79,7 +79,7 @@ def test_spans_sum_to_the_time_rows(decoder_run):
     assert checked > 20
     s1 = steps[1]
     assert s1["t0_ns"] < s1["t1_ns"] and not s1["traced"]
-    assert min(s["host_us"][0][0] for s in s1["sections"]) == 0.0
+    assert min(s["host_us"][0][0] for s in s1["sections"] if s["host_us"]) == 0.0
     assert all(s["gpu_us"] is None and s["alloc"] is None for s in s1["sections"])
 
 

@@ -86,10 +86,11 @@ def test_trace_holds_every_section_and_slice_stamp(traced):
     names = annotations(out)
     line = step_line(out, 2)
     sections = {s["name"] for s in line["sections"]}
+    spanned = {s["name"] for s in line["sections"] if s["host_us"]}
     rows = {r["component"] for r in read_records(out, "time")
             if r["step"] == 2 and r["level"] in ("phase", "sub")}
     assert rows and rows <= sections
-    assert sections <= names, sections - names
+    assert spanned <= names, spanned - names
     sliced = set(meta(out)["slice"])
     st = line["stamps"]
     want = {f"{line['stamp_names'][n]}|run={r}|group={g}"
@@ -170,7 +171,7 @@ def test_c5_slice_all(tiny, tmp_path, monkeypatch, how):
     m = meta(tmp_path)
     assert (m["c5_slice"], m["slice"], m["error"]) == ("all", None, None)
     names = annotations(tmp_path)
-    assert {s["name"] for s in step_line(tmp_path, 2)["sections"]} <= names
+    assert {s["name"] for s in step_line(tmp_path, 2)["sections"] if s["host_us"]} <= names
 
 
 def test_traced_rows_are_marked_and_kept_out_of_costs(traced):

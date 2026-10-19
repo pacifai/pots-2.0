@@ -57,6 +57,22 @@ clock and :data:`US` turns µs into s; nothing else converts.
 - Calls folded into a section's ``rest`` count as one span from ``first_us`` to ``last_us``,
   and ``util.truncated`` says so. ``g_throttle`` averages as the fraction of samples with any
   bit set. The check-5 view has no per-class floors: the counting pass has no per-class FLOPs.
+
+**The hash breakdown.** Each run view has a ``hash`` entry for the commit (``P3.commit``) and
+check 2 (``2``), built from the seconds the code adds inside their hashing section
+(``P3.commit.hash``, ``2.hash``) as ``<section>.<part>`` time rows. These rows are not
+sections: they are taken out of the section table, the shares and the trace join. An entry
+holds the mean hashing wall time (``wall``, with its floor and ratio), the owner's other
+parts (``siblings``: the commit's ``collect``, ``tree`` and ``check``, or the rest of check 2),
+``leaves`` and ``hash_bytes``, and ``parts``. The caller thread's parts are ``read`` (reading
+and validating each leaf), ``producer`` (batching and handing off) and ``wait`` (blocked on
+the worker); they add up to the wall time, and ``unaccounted_s`` is what is left. The worker
+thread's parts, which run beside them, are ``native`` (the batched C hashing), ``big`` (leaves
+of 16 MiB or more) and ``other``. A part with no row is 0, since a zero is not written;
+``has_stats`` is whether the ``read`` row exists, and a run from before the breakdown has null
+parts. The one floor is the hash floor, bytes × ``hash.per_byte_s`` + leaves × ``hash.per_leaf_s``
+of the probe; it goes beside the wall time and the ``native`` part. There is no tree floor: the
+probe times whole ``leaf_hashes_of`` calls and has no rate for the tree's nodes.
 """
 
 from __future__ import annotations
@@ -85,6 +101,13 @@ VAR_FIELDS = ("cpu_mhz", "c_other", "g_sm_mhz", "g_throttle", "g_other_procs")
 PHASES = ("run", "glue", "host_stack", "copy", "measure", "judge")
 STRIP_FIELDS = ("g_util", "c_busy", "g_pcie_tx", "g_pcie_rx")
 STRIP_POINTS = 400  # the most points per step and field the timeline keeps
+# The hash breakdown: the sections that hash a whole transcript, and the parts of their
+# hashing the code adds as seconds (``<owner>.hash.<part>``). The caller's parts add up to the
+# hashing wall time; the worker's run beside them on the background thread.
+HASH_OWNERS = {"commit": "P3.commit", "check2": "2"}
+HASH_LANES = {"read": "caller", "producer": "caller", "wait": "caller",
+              "native": "worker", "big": "worker", "other": "worker"}
+HASH_PARTS = tuple(HASH_LANES)
 
 
 def _abs_ns(t0_ns: int, us: float) -> int:
@@ -551,11 +574,65 @@ def _hashes_transcript(count: dict[str, Any] | None, transcript_bytes: int) -> b
         and (count.get("hash_in_bytes") or 0) >= transcript_bytes / 2
 
 
+def _hash_part(name: str) -> bool:
+    return any(name.startswith(f"{o}.hash.") for o in HASH_OWNERS.values())
+
+
+def _hash_breakdown(parts: dict[str, dict[int, float]], times: dict[str, dict[int, float]],
+                    sections: dict[str, Any]) -> dict[str, Any]:
+    """The per-step hash breakdown of the commit and of check 2 (see the module docstring).
+
+    ``parts`` holds the ``<owner>.hash.<part>`` rows, which are not sections. An owner whose
+    ``<owner>.hash`` row is missing (a run from before the breakdown) has no entry; one with
+    that row but no part rows has ``has_stats`` false and null parts."""
+    out: dict[str, Any] = {}
+    for key, owner in HASH_OWNERS.items():
+        hname = f"{owner}.hash"
+        if hname not in times:
+            continue
+        wall = statistics.fmean(times[hname].values())
+        has_stats = f"{hname}.read" in parts
+        sec = sections.get(hname) or sections.get(owner) or {}
+        floor = (sec.get("floors_s") or {}).get("hash")
+        work = sec.get("work") or {}
+        section_s = statistics.fmean(times[owner].values()) if owner in times else None
+        if key == "commit":
+            siblings = {x: statistics.fmean(times[f"{owner}.{x}"].values())
+                        for x in ("collect", "tree", "check") if f"{owner}.{x}" in times}
+        else:
+            siblings = {"rest": section_s - wall} if section_s is not None else {}
+        out_parts: dict[str, Any] = {}
+        caller = 0.0
+        for p in HASH_PARTS:
+            if not has_stats:
+                out_parts[p] = None
+                continue
+            s = statistics.fmean(parts[f"{hname}.{p}"].values()) if f"{hname}.{p}" in parts \
+                else 0.0
+            lane = HASH_LANES[p]
+            caller += s if lane == "caller" else 0.0
+            out_parts[p] = {"s": s, "share": s / wall if wall else None, "lane": lane,
+                            "floor_s": floor if p == "native" else None}
+        out[key] = {
+            "section": owner, "n_steps": len(times[hname]), "has_stats": has_stats,
+            "section_s": section_s, "siblings": siblings,
+            "wall": {"s": wall, "floor_s": floor,
+                     "ratio": wall / floor if floor else None},
+            "leaves": work.get("leaves"), "hash_bytes": (work.get("bytes") or {}).get("hash"),
+            "unaccounted_s": wall - caller if has_stats else None, "parts": out_parts}
+    return out
+
+
 def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampler,
               probe: dict[str, Any], trace: dict[str, Any] | None,
               layout: dict[str, Any] | None, compute_bf16: bool, gpu_memory: int | None,
               warns: set[str]) -> dict[str, Any]:
     times, sides, levels = _times(records)
+    # the hash parts are added seconds, not sections: they feed "hash" below only
+    parts = {n: times.pop(n) for n in [n for n in times if _hash_part(n)]}
+    for n in parts:
+        sides.pop(n, None)
+        levels.pop(n, None)
     counts = _first_counts(records)
     leaves = max((r["leaves"] for r in records if r.get("record") == "storage"), default=0)
     peaks: dict[str, int] = {}
@@ -651,7 +728,7 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
         "device": markers.header.get("device"), "n_steps": len(untraced), "step_s": step_s,
         "share_total": sum(s["share"] or 0.0 for s in sections.values()
                             if s["depth"] == 0 and not s.get("rollup")),
-        "sections": sections,
+        "sections": sections, "hash": _hash_breakdown(parts, times, sections),
         "c5": _c5_view(untraced, layout, sampler, warns) if layout else None,
         "timeline": _timeline(untraced, sampler),
         "hook_overhead_bound": _hook_bound(markers.header.get("device"), untraced, probe),

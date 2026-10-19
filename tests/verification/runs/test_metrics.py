@@ -673,6 +673,46 @@ def test_nested_and_run_sections():
     assert total["time_s"] == five["time_s"]  # a sub row is inside its parent, not added
 
 
+def test_a_run_has_the_hash_sections_nested(c, D, w0, final):
+    s = next(x for x in scenarios(c, D, SEED) if x.name == "honest")
+    rec = TimeRecorder("r", "honest")
+    run_scenario(c, D, w0, s, T=T, k=K, final=final, recorder=rec, seed=SEED)
+    rows = [r for r in rec.rows if r.get("step") == 1 and r.get("record") == "time"]
+    by = {r["component"]: r for r in rows}
+    for name in ("P3.commit.collect", "P3.commit.hash", "P3.commit.tree", "P3.commit.check",
+                 "P3.commit.hash.read", "2.hash", "2.hash.read"):
+        assert by[name]["level"] == "sub" and by[name]["time_s"] > 0, name
+    assert by["P3.commit"]["level"] == "phase" and by["2"]["level"] == "component"
+    assert by["2.hash"]["time_s"] <= by["2"]["time_s"]
+    assert by["P3.commit.hash"]["time_s"] <= by["P3.commit"]["time_s"]
+
+
+def test_added_seconds_are_a_nested_row_and_count_in_no_total():
+    rec = TimeRecorder("x", "s")
+    seam = rec.seam()
+    with seam("P3.commit"):
+        with seam("P3.commit.hash"):
+            seam.add("P3.commit.hash.read", 0.25)
+            seam.add("P3.commit.hash.read", 0.5)
+    rec.on_step(_Rec(1))
+    rec.finish()
+    (row,) = [r for r in rec.rows if r["component"] == "P3.commit.hash.read"]
+    assert row["level"] == "sub" and row["calls"] == 2 and row["time_s"] == pytest.approx(0.75)
+    (total,) = [r for r in rec.rows if r["component"] == "step" and r["step"] == 1]
+    (top,) = [r for r in rec.rows if r["component"] == "P3.commit"]
+    assert total["time_s"] == top["time_s"]  # an added row is inside its parent
+
+
+def test_added_seconds_are_ignored_by_the_memory_recorder():
+    rec = MemoryRecorder("r", "s", memory_probe("cpu"))
+    seam = rec.seam()
+    with seam("P3.commit"):
+        seam.add("P3.commit.hash.read", 1.0)
+    rec.on_step(_Rec(1))
+    rec.finish()
+    assert not [r for r in rec.rows if r["component"] == "P3.commit.hash.read"]
+
+
 def test_the_handoff_row_is_the_harnesss_and_in_no_total():
     """``run_loop``'s cache release between the roles: a component row on side ``run``,
     outside the prover's, the verifier's and the step's totals."""

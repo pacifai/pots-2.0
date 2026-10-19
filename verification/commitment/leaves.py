@@ -13,13 +13,17 @@ calling thread only checks each leaf's structure and collects its header and add
 call per batch of leaves then does the finiteness test and the hashing on a background
 thread (:func:`_native_until_error`). The Python path stays as the reference, and the
 counting pass runs it.
+
+A caller that wants to know where the hashing time goes passes a :class:`HashStats` to the
+bulk functions. Without one (the default) nothing is timed and the code runs as before.
 """
 
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -58,10 +62,87 @@ __all__ = [
     "leaf_hashes",
     "transcript_root",
     "commit_leaves",
+    "hash_step_leaves",
+    "HashStats",
     "leaf_totals",
     "dataset_tree",
     "dataset_root",
 ]
+
+
+class HashStats:
+    """Where one bulk hashing call spent its time (seconds, accumulated across calls).
+
+    Native path (:func:`_native_until_error`), the calling thread splits into ``read_s`` (in the
+    caller's item iterator, for check 2 ``store.leaf``), ``wait_s`` (blocked on the worker) and
+    ``producer_s`` (the rest: validation, batching, submitting). The worker's time per batch
+    splits into ``native_s`` (``native.hash_leaves``), ``big_s`` (the big-leaf path, finiteness
+    test and multithreaded hash) and ``worker_other_s`` (the rest of :func:`_hash_batch`). The
+    worker runs beside the calling thread, so the two sides overlap: ``read_s + producer_s +
+    wait_s`` is the call's wall time, and the worker's three fields are inside ``wait_s`` and
+    the overlap.
+
+    Python path (``native.disabled()``): ``hash_leaves`` hides its pool, so ``producer_s`` is the
+    call's wall time less ``read_s`` and includes the waits; the worker fields stay 0.
+
+    ``leaves`` and ``bytes`` count the leaves read and their tensor payload bytes (a record's
+    encoding is not counted); ``batches`` the native batches submitted.
+    """
+
+    __slots__ = ("read_s", "producer_s", "wait_s", "native_s", "big_s", "worker_other_s",
+                 "batches", "leaves", "bytes")
+
+    TIMES = ("read_s", "producer_s", "wait_s", "native_s", "big_s", "worker_other_s")
+
+    def __init__(self) -> None:
+        self.read_s = self.producer_s = self.wait_s = 0.0
+        self.native_s = self.big_s = self.worker_other_s = 0.0
+        self.batches = self.leaves = self.bytes = 0
+
+    def times(self) -> dict[str, float]:
+        """The six times by field name."""
+        return {k: getattr(self, k) for k in self.TIMES}
+
+    def emit(self, section: Any, prefix: str) -> None:
+        """Record each time as a section ``<prefix>.<part>`` through ``section.add`` (B6's seam;
+        ``read``, ``producer``, ``wait``, ``native``, ``big``, ``other``), leaving out a part with
+        no time. ``read`` is always there once a call ran. Does nothing when
+        ``section`` is ``None`` or has no ``add``."""
+        add = getattr(section, "add", None)
+        if add is None:
+            return
+        for k in self.TIMES:
+            v = getattr(self, k)
+            if v > 0:  # a part that took no time (no big leaf, the Python path's worker) has no row
+                add(f"{prefix}.{k.removesuffix('_s').removeprefix('worker_')}", v)
+
+
+def _observed(items: Iterable[tuple[int, Any]], stats: HashStats) -> Iterator[tuple[int, Any]]:
+    """``items`` as they are, with the time inside ``next`` added to ``stats.read_s`` and each
+    leaf counted: two clock reads per leaf."""
+    it = iter(items)
+    while True:
+        t0 = perf_counter()
+        try:
+            item = next(it)
+        except StopIteration:
+            stats.read_s += perf_counter() - t0
+            return
+        stats.read_s += perf_counter() - t0
+        stats.leaves += 1
+        obj = item[1]
+        if isinstance(obj, torch.Tensor):
+            stats.bytes += obj.nbytes
+        yield item
+
+
+def _python_timed(stats: HashStats, run: Any) -> Any:
+    """``run()`` with its wall time less the reads it made added to ``stats.producer_s``."""
+    t0, r0 = perf_counter(), stats.read_s
+    try:
+        return run()
+    finally:
+        stats.producer_s += perf_counter() - t0 - (stats.read_s - r0)
 
 
 def _tensor_slot(c: DeclaredComputation,
@@ -102,22 +183,28 @@ def leaf_hash(c: DeclaredComputation, index: int, obj: Any) -> bytes:
     return hash_leaf(*leaf_parts(c, index, obj))
 
 
-def leaf_hashes_of(c: DeclaredComputation, items: Iterable[tuple[int, Any]]) -> list[bytes]:
+def leaf_hashes_of(c: DeclaredComputation, items: Iterable[tuple[int, Any]],
+                   stats: HashStats | None = None) -> list[bytes]:
     """:func:`leaf_hash` of each ``(index, obj)``, in order, hashed in parallel.
 
     ``items`` is consumed and each leaf validated on the calling thread, in order, so an error
     from either is the one a leaf-by-leaf loop raises first. The objects must not change until
-    this returns.
+    this returns. ``stats``, if given, is filled with the call's times (:class:`HashStats`);
+    the digests and errors are the same with or without it.
     """
     if not native.enabled():
-        return hash_leaves(leaf_parts(c, i, obj) for i, obj in items)
-    digests, err = _native_until_error(c, items)
+        if stats is None:
+            return hash_leaves(leaf_parts(c, i, obj) for i, obj in items)
+        return _python_timed(
+            stats, lambda: hash_leaves(leaf_parts(c, i, obj) for i, obj in _observed(items, stats)))
+    digests, err = _native_until_error(c, items, stats)
     if err is not None:
         raise err
     return digests
 
 
-def leaf_hashes_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
+def leaf_hashes_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]],
+                            stats: HashStats | None = None
                             ) -> tuple[list[bytes], Exception | None]:
     """:func:`leaf_hashes_of` up to the first error: ``(digests before it, error or None)``.
 
@@ -126,8 +213,11 @@ def leaf_hashes_until_error(c: DeclaredComputation, items: Iterable[tuple[int, A
     compares each digest as it goes would.
     """
     if not native.enabled():
-        return hash_leaves_until_error(leaf_parts(c, i, obj) for i, obj in items)
-    return _native_until_error(c, items)
+        if stats is None:
+            return hash_leaves_until_error(leaf_parts(c, i, obj) for i, obj in items)
+        return _python_timed(stats, lambda: hash_leaves_until_error(
+            leaf_parts(c, i, obj) for i, obj in _observed(items, stats)))
+    return _native_until_error(c, items, stats)
 
 
 # The native path (decision F15b). A batch closes at this much payload or this many entries,
@@ -165,15 +255,31 @@ class _Batch:
         self.payload = 0
 
 
-def _hash_batch(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], threads: int
-                ) -> tuple[list[bytes], Exception | None]:
-    """Digests of the batch's leaves in order up to its first error, and that error."""
+def _hash_batch(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], threads: int,
+                stats: HashStats | None = None) -> tuple[list[bytes], Exception | None]:
+    """Digests of the batch's leaves in order up to its first error, and that error. With
+    ``stats`` (written by the worker thread only) the batch's time goes to ``native_s``,
+    ``big_s`` and ``worker_other_s``."""
+    if stats is None:
+        return _hash_batch_body(batch, hdrs, threads, None)
+    t0, n0, b0 = perf_counter(), stats.native_s, stats.big_s
+    try:
+        return _hash_batch_body(batch, hdrs, threads, stats)
+    finally:
+        stats.worker_other_s += perf_counter() - t0 - (stats.native_s - n0) - (stats.big_s - b0)
+
+
+def _hash_batch_body(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], threads: int,
+                     stats: HashStats | None) -> tuple[list[bytes], Exception | None]:
     bad, raw = 0, b""
     if batch.hdr_idx:
+        t0 = perf_counter() if stats is not None else 0.0
         digests, bad = native.get().hash_leaves(
             hdrs[0], hdrs[1], hdrs[2], np.array(batch.hdr_idx, dtype=np.uint32),
             np.array(batch.ptr, dtype=np.uint64), np.array(batch.nbytes, dtype=np.uint64),
             np.array(batch.kind, dtype=np.uint8), threads=threads)
+        if stats is not None:
+            stats.native_s += perf_counter() - t0
         raw = digests.tobytes()
     out: list[bytes] = []
     s = 0  # the next small entry
@@ -187,9 +293,15 @@ def _hash_batch(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], threa
             try:
                 if len(e) == 3:
                     header, t, kind = e
-                    if not native.get().all_finite(t.data_ptr(), t.nbytes, kind, threads=threads):
-                        return out, NonFiniteError(_NONFINITE)
-                    out.append(hash_leaf(header, tensor_leaf_payload_unchecked(t)))
+                    t0 = perf_counter() if stats is not None else 0.0
+                    try:
+                        if not native.get().all_finite(t.data_ptr(), t.nbytes, kind,
+                                                       threads=threads):
+                            return out, NonFiniteError(_NONFINITE)
+                        out.append(hash_leaf(header, tensor_leaf_payload_unchecked(t)))
+                    finally:
+                        if stats is not None:
+                            stats.big_s += perf_counter() - t0
                 else:
                     out.append(hash_leaf(*e))
             except Exception as err:
@@ -197,8 +309,8 @@ def _hash_batch(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], threa
     return out, None
 
 
-def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
-                        ) -> tuple[list[bytes], Exception | None]:
+def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]],
+                        stats: HashStats | None = None) -> tuple[list[bytes], Exception | None]:
     """:func:`leaf_hashes_until_error` through ``native.hash_leaves``: the same digests and the
     same first error as a ``leaf_hash`` loop that stops at its first exception.
 
@@ -211,7 +323,15 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     multithreaded hash. The first batch in order with an error decides ahead of the iterable's.
     It returns only once no worker reads a tensor any more; ``KeyboardInterrupt`` propagates
     after that too.
+
+    With ``stats`` the calling thread's wall time is split into ``read_s`` (``items``' own
+    ``next``), ``wait_s`` (blocked on the worker) and ``producer_s`` (the rest); see
+    :class:`HashStats`. The worker's fields are written by the worker thread alone and read here
+    after the final sync, which orders them.
     """
+    if stats is not None:
+        items = _observed(items, stats)
+        t_start, w0, r0 = perf_counter(), stats.wait_s, stats.read_s
     threads = torch.get_num_threads()
     n_s, n_w, M, n_leaves = c.n_s, c.n_w, c.M, c.n_leaves
     wt_end, prod_end = n_s + n_w, n_s + n_w + M
@@ -230,7 +350,14 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     state: list[Exception | None] = [None]  # the first batch error, which beats the producer's
 
     def collect() -> None:
-        d, e = pending[0].result()  # popped only after the wait, which an interrupt can end
+        if stats is None:
+            d, e = pending[0].result()  # popped only after the wait, which an interrupt can end
+        else:
+            t0 = perf_counter()
+            try:
+                d, e = pending[0].result()
+            finally:
+                stats.wait_s += perf_counter() - t0
         pending.popleft()
         if state[0] is None:
             digests.extend(d)
@@ -242,7 +369,9 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
         if state[0] is None:
             hdrs = (b"".join(headers), np.array(hdr_off, dtype=np.uint64),
                     np.array(hdr_len, dtype=np.uint32))
-            pending.append(_executor().submit(_hash_batch, b, hdrs, threads))
+            if stats is not None:
+                stats.batches += 1
+            pending.append(_executor().submit(_hash_batch, b, hdrs, threads, stats))
 
     producer_error: Exception | None = None
     try:
@@ -296,7 +425,15 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
         # thread, so a job queued now ends after every batch ever submitted, even one whose
         # future an interrupt kept out of ``pending``.
         if _worker is not None:
-            _worker.submit(bool).result()
+            if stats is None:
+                _worker.submit(bool).result()
+            else:
+                t0 = perf_counter()
+                _worker.submit(bool).result()
+                stats.wait_s += perf_counter() - t0
+        if stats is not None:
+            stats.producer_s += (perf_counter() - t_start - (stats.wait_s - w0)
+                                 - (stats.read_s - r0))
     return digests, state[0] if state[0] is not None else producer_error
 
 
@@ -310,12 +447,19 @@ def transcript_root(c: DeclaredComputation, reader: LeafReader) -> bytes:
     return merkle_root(leaf_hashes(c, reader))
 
 
-def commit_leaves(c: DeclaredComputation, leaves: Sequence[Any]) -> MerkleTree:
-    """The Merkle tree over a full transcript's leaves, in layout order; ``.root`` is ``h``."""
+def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
+                     stats: HashStats | None = None) -> list[bytes]:
+    """Every leaf hash of a full transcript, in layout order: :func:`commit_leaves` without the
+    tree, so a caller can time the two apart."""
     if len(leaves) != c.n_leaves:
         raise ValueError(f"transcript has {len(leaves)} leaves, the computation declares "
                          f"{c.n_leaves}")
-    return MerkleTree(leaf_hashes_of(c, enumerate(leaves)))
+    return leaf_hashes_of(c, enumerate(leaves), stats)
+
+
+def commit_leaves(c: DeclaredComputation, leaves: Sequence[Any]) -> MerkleTree:
+    """The Merkle tree over a full transcript's leaves, in layout order; ``.root`` is ``h``."""
+    return MerkleTree(hash_step_leaves(c, leaves))
 
 
 def leaf_totals(c: DeclaredComputation, leaves: Sequence[Any]) -> tuple[int, int]:

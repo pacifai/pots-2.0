@@ -279,3 +279,34 @@ def test_notes_and_label_colors():
     assert "No sampler data for this run." in tl and "Strips: ." not in tl
     arch = panel(out, "r0-diagram")
     assert 'style="fill:#111"' in arch or 'style="fill:#fff"' in arch
+
+
+def hash_view(*, has_stats: bool = True) -> dict[str, Any]:
+    names = ("read", "producer", "wait", "native", "big", "other")
+    lane = {"read": "caller", "producer": "caller", "wait": "caller", "native": "worker",
+            "big": "worker", "other": "worker"}
+    parts = {n: ({"s": 0.01 * (i + 1), "share": 0.1 * (i + 1), "lane": lane[n],
+                  "floor_s": 0.05 if n == "native" else None} if has_stats else None)
+             for i, n in enumerate(names)}
+    return {"commit": {"section": "P3.commit", "n_steps": 2, "has_stats": has_stats,
+                       "section_s": 0.5, "siblings": {"tree": 0.1}, "leaves": 7661,
+                       "hash_bytes": 2.6e9, "unaccounted_s": 0.02 if has_stats else None,
+                       "wall": {"s": 0.3, "floor_s": 0.1, "ratio": 3.0}, "parts": parts}}
+
+
+def test_the_hash_table_renders_in_the_model_section():
+    v = view(gpu=False)
+    v["hash"] = hash_view()
+    out = page(profile(runs={"honest": v}))
+    t = panel(out, "r0-hash")
+    assert "P3.commit.hash" in t and "native" in t and "outside the hash: tree" in t
+    assert "no tree floor" in t
+
+
+def test_the_hash_table_is_blank_for_an_older_run_and_notes_missing_stats():
+    out = page(profile())  # no "hash" key at all: an older profile.json
+    assert 'id="r0-hash"' not in out
+    v = view(gpu=False)
+    v["hash"] = hash_view(has_stats=False)
+    out = page(profile(runs={"honest": v}))
+    assert "r0-hash" in out and "no part" in panel(out, "r0-hash").lower()
