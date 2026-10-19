@@ -296,7 +296,7 @@ class Part:
     argv: list[str]  # "{python}" stands for the session's interpreter
     env: dict[str, str | None] = field(default_factory=dict)  # None unsets
     timeout_s: float | None = None
-    kind: str = "other"  # models, benchmark, bring_up, smooth, plain, other
+    kind: str = "other"  # models, benchmark, bring_up, smooth, plain, probe, other
     info: dict[str, Any] = field(default_factory=dict)  # model, task, run_dir, report
 
 
@@ -317,6 +317,35 @@ def _models_part(upload: Path, out: Path, timeout_s: float) -> Part:
                 env={"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None},
                 timeout_s=timeout_s, kind="models",
                 info={"report": str(out / "models" / "models.json")})
+
+
+def _probe_part(out: Path) -> Part:
+    """FS22's probe at :data:`FULL_SCALE_ENV`'s settings, writing ``<out>/probe/probe.json``."""
+    report = out / "probe" / "probe.json"
+    return Part("probe", ["{python}", "-m", "verification.runs.probe", "--out", str(report)],
+                env=dict(FULL_SCALE_ENV), timeout_s=600, kind="probe",
+                info={"report": str(report)})
+
+
+def _probe_extras(report: Path) -> dict[str, Any]:
+    if not report.exists():
+        return {"probe": None}
+    doc = json.loads(report.read_text())
+    rates, hash_ = doc["rates"], doc["rates"].get("hash")
+
+    def gb(key: str) -> str:
+        return "n/a" if rates.get(key) is None else f"{rates[key] / 1e9:.1f}"
+
+    def tflops(key: str) -> str:
+        return "n/a" if rates.get(key) is None else f"{rates[key] / 1e12:.1f}"
+
+    hash_gb = "n/a" if not hash_ else f"{1 / hash_['per_byte_s'] / 1e9:.1f}"
+    line = (f"probe ({doc['device']}, {doc['threads']} threads): bf16 {tflops('gemm_bf16_flops')} "
+            f"TFLOP/s, fp32 {tflops('gemm_fp32_flops')} TFLOP/s, HBM copy "
+            f"{gb('hbm_copy_bytes')} GB/s, H2D pinned {gb('h2d_pinned_bytes')} GB/s, host memcpy "
+            f"{gb('host_memcpy_bytes')} GB/s, hashing {hash_gb} GB/s; {len(doc['errors'])} "
+            f"unmeasured, {doc['wall_s']:.0f} s")
+    return {"record": str(report), "summary": line, "errors": doc["errors"]}
 
 
 def _bring_up_parts(upload: Path, out: Path, extra: Mapping[str, str | None],
@@ -697,6 +726,8 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _plain_extras(Path(part.info["report"]))
         if part.kind == "benchmark":
             return _benchmark_extras(Path(part.info["report"]))
+        if part.kind == "probe":
+            return _probe_extras(Path(part.info["report"]))
         if part.kind == "models":
             report = Path(part.info["report"])
             return json.loads(report.read_text()) if report.exists() else {"report": None}

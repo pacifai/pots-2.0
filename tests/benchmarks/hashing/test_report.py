@@ -7,6 +7,7 @@ import pytest
 
 from benchmarks.hashing import machine, report
 from benchmarks.hashing.machine import cores_basis, cores_for_threads, machine_record
+from setup import machine as setup_machine
 
 
 def _doc(**slots):
@@ -103,12 +104,12 @@ def test_linux_frequency_reads_sysfs_then_cpuinfo(monkeypatch):
     files = {base + "scaling_cur_freq": "2100000\n", base + "cpuinfo_max_freq": "3800000\n",
              base + "scaling_governor": "performance\n"}
     cpuinfo = "processor\t: 0\ncpu MHz\t\t: 1999.998\n"
-    monkeypatch.setattr(machine, "_read", files.get)
+    monkeypatch.setattr(setup_machine, "_read", files.get)
     r = machine._Record()
     machine._frequency(r, "Linux", cpuinfo)
     assert r.data == {"cpu_freq_mhz": 2100.0, "cpu_max_freq_mhz": 3800.0,
                       "cpu_governor": "performance"}
-    monkeypatch.setattr(machine, "_read", {}.get)  # a VM without cpufreq
+    monkeypatch.setattr(setup_machine, "_read", {}.get)  # a VM without cpufreq
     r = machine._Record()
     machine._frequency(r, "Linux", cpuinfo)
     assert r.data == {"cpu_freq_mhz": 1999.998, "cpu_max_freq_mhz": None, "cpu_governor": None}

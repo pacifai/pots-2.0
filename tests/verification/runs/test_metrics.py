@@ -1027,3 +1027,9 @@ def test_environment_record_names_the_native_library():
     probe = metrics.memory_probe(torch.device("cpu"))
     env = metrics.environment_record("r", device="cpu", probe=probe)
     assert set(env["native"]) == {"enabled", "library", "blake3", "simd_degree", "error"}
+
+
+def test_environment_record_holds_the_machine_facts():
+    probe = metrics.memory_probe(torch.device("cpu"))
+    env = metrics.environment_record("r", device="cpu", probe=probe)
+    assert env["machine"]["ram_total_bytes"] > 0
