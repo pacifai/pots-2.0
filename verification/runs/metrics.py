@@ -169,6 +169,7 @@ many tests of each family the step measured; an accepted step's is ``null``.
 from __future__ import annotations
 
 import ctypes
+import gzip
 import importlib
 import importlib.metadata
 import json
@@ -178,6 +179,7 @@ import os
 import platform
 import re
 import resource
+import shutil
 import subprocess
 import sys
 import time
@@ -232,6 +234,7 @@ COMPONENTS = ("P0", "train_captured", "P1", "P2", "P3", "P4", "P5")
 RECORD_TYPES = ("environment", "step", "verdict", "time", "memory", "count", "storage",
                 "capture", "run_end")
 RUN_PREFIX = "run:"
+TRACE_DIR = "trace"  # the traced step's files in a run directory (FS23)
 # Host spans kept per section per step in markers.jsonl; the calls past them fold into ``rest``.
 MAX_SPANS = 64
 # The stamp names check 5 writes (checks.py), in the order of a step line's ``stamp_names``.
@@ -730,6 +733,210 @@ class _Stamp:
         rows.append((self.col, self.run, self.group, self.window, self.h0, h1))
 
 
+class _Trace:
+    """FS23: the traced step's ``torch.profiler`` session and its ``trace/`` files.
+
+    Starts at the first non-``run`` section of step ``step``, stops at that step's
+    :meth:`TimeRecorder.on_step` and writes ``trace/step_NNNNN.json.gz`` and ``trace/meta.json``
+    (``PROFILING_PLAN.md`` §5.6). With ``c5 == "slice"`` the profiler's collection is off inside
+    check 5 except in the runs of the layout's ``trace_slice``. A profiler failure never reaches
+    the run: it tears the profiler down and goes into ``meta.json``'s ``error``."""
+
+    def __init__(self, rec: TimeRecorder, step: int, c5: str, out_dir: Path) -> None:
+        self.rec, self.step, self.dir = rec, step, out_dir
+        self.c5 = c5  # what was asked; meta's c5_slice is what happened
+        self.c5_slice = c5
+        self.prof: Any = None
+        self.active = False  # the profiler is running now
+        self.started = False  # a start was tried (once per run)
+        self.traced = False  # the profiler started: the step's rows are marked traced
+        self.written = False
+        self.error: str | None = None
+        self.slice: frozenset[int] | None = None
+        self.activities: list[Any] = []
+        self.start_ns: int | None = None
+        self.stop_ns: int | None = None
+        self.collecting = True
+
+    def fail(self, e: BaseException) -> None:
+        """Record the first error and tear the profiler down."""
+        if self.error is None:
+            self.error = f"{type(e).__name__}: {e}"
+        self.teardown()
+
+    def teardown(self) -> None:
+        prof, self.prof, self.active = self.prof, None, False
+        self.rec.__dict__.pop("section", None)
+        if prof is not None:
+            try:
+                prof.stop()
+            except Exception:  # noqa: BLE001 - already failing, or never started
+                pass
+
+    def start(self) -> None:
+        self.started = True
+        try:
+            self.activities = [torch.profiler.ProfilerActivity.CPU]
+            if self.rec._cuda:
+                self.activities.append(torch.profiler.ProfilerActivity.CUDA)
+            prof = torch.profiler.profile(activities=self.activities, record_shapes=True,
+                                          with_flops=True)
+            self.start_ns = time.monotonic_ns()
+            prof.start()
+            self.prof, self.active, self.traced = prof, True, True
+            if self.c5 == "slice":
+                v = self.rec._verifier
+                if hasattr(prof, "toggle_collection_dynamic") and v is not None:
+                    self.slice = frozenset(
+                        c5_layout_file(v.c, self.rec.run)["trace_slice"])
+                else:
+                    self.c5_slice = "all"
+        except Exception as e:  # noqa: BLE001 - the profiler must not change the run
+            self.fail(e)
+
+    def collect(self, on: bool) -> None:
+        """Turn collection on or off (check 5's slice); a no-op if it already is."""
+        if not self.active or self.collecting == on:
+            return
+        try:
+            self.prof.toggle_collection_dynamic(on, self.activities)
+            self.collecting = on
+        except Exception as e:  # noqa: BLE001
+            self.fail(e)
+
+    def sync(self) -> None:
+        if self.rec._cuda:
+            torch.cuda.synchronize(self.rec._device)
+        elif self.rec._device.type == "mps":
+            torch.mps.synchronize()
+
+    def enter(self, label: str) -> Any:
+        """Enter ``record_function(label)``; ``None`` if the profiler is down."""
+        if not self.active:
+            return None
+        try:
+            rf = torch.profiler.record_function(label)
+            rf.__enter__()
+            return rf
+        except Exception as e:  # noqa: BLE001
+            self.fail(e)
+            return None
+
+    @staticmethod
+    def leave(rf: Any) -> None:
+        if rf is not None:
+            try:
+                rf.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 - the profiler is gone, the annotation with it
+                pass
+
+    def stop(self) -> None:
+        """End of step ``step``: stop the profiler and export; always writes ``meta.json``."""
+        if self.active:
+            try:
+                self.collect(True)
+                prof = self.prof
+                prof.stop()
+                self.stop_ns = time.monotonic_ns()
+                self.prof, self.active = None, False
+                self.dir.mkdir(parents=True, exist_ok=True)
+                raw = self.dir / f"step_{self.step:05d}.json"
+                prof.export_chrome_trace(str(raw))
+                with open(raw, "rb") as src, gzip.open(f"{raw}.gz", "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                raw.unlink()
+            except Exception as e:  # noqa: BLE001
+                self.fail(e)
+                for f in self.dir.glob(f"step_{self.step:05d}.json*"):
+                    f.unlink(missing_ok=True)
+        self.teardown()
+        self.write_meta()
+
+    def close(self) -> None:
+        """The run is over: stop a profiler still running (its step did not end) and write
+        ``meta.json`` unless the step's end already did. A step never reached is
+        ``"not reached"``."""
+        if self.written:
+            return
+        if self.active:
+            if self.error is None:
+                self.error = "interrupted"
+            self.teardown()
+        elif not self.started:
+            self.error = "not reached"
+        self.write_meta()
+
+    def write_meta(self) -> None:
+        self.written = True
+        meta = {"version": 1, "step": self.step,
+                "slice": None if self.slice is None else sorted(self.slice),
+                "c5_slice": self.c5_slice, "torch": torch.__version__,
+                "profiler": {"activities": [a.name for a in self.activities] or ["CPU"],
+                             "record_shapes": True, "with_flops": True},
+                "start_ns": self.start_ns, "stop_ns": self.stop_ns, "error": self.error}
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            (self.dir / "meta.json").write_text(json.dumps(meta, allow_nan=False) + "\n")
+        except OSError as e:
+            log.warning("trace meta not written: %s", e)
+
+
+class _TracedSection:
+    """A section inside the traced step: the inner section plus its ``record_function`` and,
+    at check 5's section ``5``, the slice's collection toggle."""
+
+    __slots__ = ("inner", "name", "trace", "rf")
+
+    def __init__(self, inner: Any, name: str, trace: _Trace) -> None:
+        self.inner, self.name, self.trace = inner, name, trace
+
+    def __enter__(self) -> None:
+        t = self.trace
+        self.rf = t.enter(self.name)
+        if self.name == "5" and t.slice is not None:
+            t.collect(False)
+        self.inner.__enter__()
+
+    def __exit__(self, *exc: Any) -> None:
+        t = self.trace
+        try:
+            self.inner.__exit__(*exc)
+        finally:
+            if self.name == "5":
+                t.collect(True)
+            t.leave(self.rf)
+
+
+class _TracedStamp:
+    """A check-5 stamp inside the traced step: annotated ``name|run=r|group=g``, and a
+    ``c5.run`` stamp of a run in the slice turns collection on for its span."""
+
+    __slots__ = ("inner", "label", "trace", "rf", "sliced")
+
+    def __init__(self, inner: Any, name: str, run: int, group: int, trace: _Trace) -> None:
+        self.inner, self.trace = inner, trace
+        self.label = f"{name}|run={run}|group={group}"
+        self.sliced = name == "c5.run" and trace.slice is not None and run in trace.slice
+
+    def __enter__(self) -> None:
+        t = self.trace
+        if self.sliced:
+            t.sync()
+            t.collect(True)
+        self.rf = t.enter(self.label)
+        self.inner.__enter__()
+
+    def __exit__(self, *exc: Any) -> None:
+        t = self.trace
+        try:
+            self.inner.__exit__(*exc)
+        finally:
+            t.leave(self.rf)
+            if self.sliced:
+                t.sync()
+                t.collect(False)
+
+
 class TimeRecorder(_Recorder):
     """The timed run: wall-clock seconds per section, nothing else measured.
 
@@ -744,7 +951,8 @@ class TimeRecorder(_Recorder):
 
     def __init__(self, run: str, scenario: str, *, device: str | torch.device = "cpu",
                  writer: MetricsWriter | None = None,
-                 step_fields: Mapping[str, Any] | None = None) -> None:
+                 step_fields: Mapping[str, Any] | None = None,
+                 trace_step: int = 0, trace_c5: str = "slice") -> None:
         super().__init__(run, scenario)
         self._device = torch.device(device)
         if self._device.type == "cuda":
@@ -768,6 +976,38 @@ class TimeRecorder(_Recorder):
         self._t1 = 0
         self.writer = writer
         self.step_fields = dict(step_fields or {})
+        # FS23: the traced step. Off, the hot path is untouched; on, the two seam entry points
+        # are swapped for the traced versions, which fall back once the profiler is down.
+        self._trace: _Trace | None = None
+        self._steps_closed = 0
+        self._tracing_step = False  # the step being closed is the traced one
+        if trace_step > 0 and writer is not None:
+            if trace_c5 not in ("slice", "all"):
+                raise ValueError(f"trace_c5 must be 'slice' or 'all', got {trace_c5!r}")
+            self._trace = writer.add_trace(_Trace(self, trace_step, trace_c5,
+                                                  writer.dir / TRACE_DIR))
+            self.section = self._traced_section
+            self.stamp = self._traced_stamp
+
+    def _traced_section(self, name: str) -> Any:
+        sec = super().section(name)
+        t = self._trace
+        if t is None or name.startswith(RUN_PREFIX):
+            return sec
+        if not t.active:
+            if t.started or self._steps_closed + 1 != t.step:
+                return sec
+            t.start()
+            if not t.active:
+                return sec
+        return _TracedSection(sec, name, t)
+
+    def _traced_stamp(self, name: str, run: int = -1, group: int = -1, window: int = -1) -> Any:
+        st = TimeRecorder.stamp(self, name, run, group, window)
+        t = self._trace
+        if st is _NULL or t is None or not t.active:
+            return st
+        return _TracedStamp(st, name, run, group, t)
 
     def stamp(self, name: str, run: int = -1, group: int = -1, window: int = -1) -> Any:
         """A span inside a check-5 section, recorded as one column entry in ``markers.jsonl``'s
@@ -804,7 +1044,15 @@ class TimeRecorder(_Recorder):
         self._t1 = time.monotonic_ns()
         self._step_stamps = (self._stamps, self._stamp_gpu)
         self._stamps, self._stamp_gpu = [], {}
-        super().on_step(rec)
+        t = self._trace
+        self._steps_closed = rec.t
+        if t is not None and rec.t == t.step:
+            t.stop()
+            self._tracing_step = t.traced
+        try:
+            super().on_step(rec)
+        finally:
+            self._tracing_step = False
 
     def _marker_line(self, t: int, table: dict[str, _Acc], rec: Any) -> dict[str, Any]:
         """The step's (or, with ``rec`` None, the run sections') ``markers.jsonl`` line."""
@@ -837,7 +1085,7 @@ class TimeRecorder(_Recorder):
         rows, gpu = self._step_stamps
         cols = list(zip(*rows, strict=True)) if rows else [()] * 6
         g = [gpu.get(i) for i in range(len(rows))] if self._cuda else None
-        line.update({"step": t, "traced": False, "t1_ns": t1, "sections": sections,
+        line.update({"step": t, "traced": self._tracing_step, "t1_ns": t1, "sections": sections,
                      "stamps": {
                          "name": list(cols[0]), "run": list(cols[1]), "group": list(cols[2]),
                          "window": list(cols[3]), "h0": [us(x) for x in cols[4]],
@@ -850,19 +1098,21 @@ class TimeRecorder(_Recorder):
         return line
 
     def _values(self, accs: list[_Acc]) -> dict[str, Any]:
-        return {"time_s": sum(a.time for a in accs), "traced": False}
+        return {"time_s": sum(a.time for a in accs), "traced": self._tracing_step}
 
     def _emit(self, t: int, table: dict[str, _Acc], rec: Any) -> None:
         rows = self._rows(t, table)
         if rec is not None and self._verifier is not None:
-            rows.append(step_record(self.run, self.scenario, t, self._verifier,
-                                    getattr(rec, "rejection", None), self.step_fields,
-                                    transcript_bytes=getattr(rec, "transcript_bytes", None),
-                                    leaves=getattr(rec, "leaves", None)))
+            rows.append({**step_record(self.run, self.scenario, t, self._verifier,
+                                       getattr(rec, "rejection", None), self.step_fields,
+                                       transcript_bytes=getattr(rec, "transcript_bytes", None),
+                                       leaves=getattr(rec, "leaves", None)),
+                         "traced": self._tracing_step})
             cap = getattr(rec, "capture", None)
             if cap is not None:
                 rows.append({"record": "capture", "run": self.run, "scenario": self.scenario,
-                             "step": t, "traced": False, "host_buffers": None, **cap})
+                             "step": t, "traced": self._tracing_step, "host_buffers": None,
+                             **cap})
         self.rows += rows
         if self.writer is None:
             return
@@ -877,6 +1127,8 @@ class TimeRecorder(_Recorder):
 
     def finish(self, verdict: Any = None) -> None:
         super().finish()
+        if self._trace is not None:
+            self._trace.close()
         if verdict is None:
             return
         rej = verdict.rejection
@@ -912,7 +1164,8 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
     are :func:`step_scores` over the tests the verifier measured at this step, and
     ``f_achieved_max`` / ``f_achieved_at`` :func:`step_floor_fields`. ``transcript_bytes`` and
     ``leaves`` are the step's committed bytes and leaf count (``leaf_totals``), ``None`` when the
-    loop didn't take them; ``traced`` is ``False`` until the traced step exists."""
+    loop didn't take them; ``traced`` is ``False`` here, and the timed run sets it on the step
+    the profiler traced (FS23)."""
     def pid(cid: str) -> str:
         return "0" if t == 1 and cid == "7" else cid
 
@@ -1837,14 +2090,19 @@ class MetricsWriter:
         self._f: IO[str] = open(self.dir / "records.jsonl", "w")  # noqa: SIM115
         self._m: IO[str] | None = None  # markers.jsonl, opened by the first write_markers
         self._layout_written = False
+        self._traces: list[_Trace] = []
         self.write([environment_record(run, device=self.device, probe=self.probe, config=config,
                                        band_file_hash=band_file_hash, h_D=h_D,
                                        **self.run_fields, **(extra or {}))])
 
     def recorder(self, scenario: str, *, bpr_records: int | None = None,
                  bpr_actual: float | None = None,
-                 cheat_step: int | None = None) -> TimeRecorder:
+                 cheat_step: int | None = None, trace_step: int = 0,
+                 trace_c5: str = "slice") -> TimeRecorder:
         """A timed-run recorder that writes here.
+
+        ``trace_step`` > 0 profiles that step with ``torch.profiler`` into ``trace/``
+        (``trace_c5``: ``"slice"`` or ``"all"``; :class:`_Trace`).
 
         ``bpr_records`` and ``bpr_actual`` are the cheat batch's poisoned records and their
         share of the batch (EVALUATION_SPEC §4.1), ``0`` and ``0.0`` for an honest run.
@@ -1853,7 +2111,13 @@ class MetricsWriter:
         the harness's oracle, not a record field."""
         return TimeRecorder(self.run, scenario, device=self.device, writer=self,
                             step_fields={**self.run_fields, "bpr_records": bpr_records,
-                                         "bpr_actual": bpr_actual, "cheat_step": cheat_step})
+                                         "bpr_actual": bpr_actual, "cheat_step": cheat_step},
+                            trace_step=trace_step, trace_c5=trace_c5)
+
+    def add_trace(self, trace: _Trace) -> _Trace:
+        """Register a traced step's session, so :meth:`close` ends it if the run didn't."""
+        self._traces.append(trace)
+        return trace
 
     def write(self, rows: Iterable[Mapping[str, Any]]) -> None:
         for r in rows:
@@ -1907,6 +2171,8 @@ class MetricsWriter:
         nothing."""
         if self._f.closed:
             return
+        for trace in self._traces:
+            trace.close()
         if self._m is not None:
             self._m.close()
         if completed is None:
