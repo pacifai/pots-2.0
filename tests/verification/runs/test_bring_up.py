@@ -3,6 +3,7 @@ bands, the scores against a reference band file and the altered-bias steps; on e
 full-scale model, the whole bring-up (slow)."""
 
 import dataclasses
+import json
 
 import pytest
 import torch
@@ -12,7 +13,15 @@ from tests.verification.full_scale_helpers import PIN_IDS, PINS, full_scale_case
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances import DecoderComputation
 from verification.runs import loop as loop_mod
-from verification.runs.bring_up import bring_up, family_maxima, reference_bands, report
+from verification.runs.metrics import MetricsWriter
+from verification.runs.scenarios import HONEST
+from verification.runs.bring_up import (
+    bring_up,
+    check5_repeats,
+    family_maxima,
+    reference_bands,
+    report,
+)
 from verification.transcript.store import DiskHandoff, InMemoryStore, StoreHandoff
 from verification.verifier.bands import Bands
 from verification.verifier.driver import RUN_START
@@ -20,7 +29,7 @@ from verification.verifier.driver import RUN_START
 SEED, K = 1, 5
 
 
-def _run(family, tied, *, T=2, tamper=True, handoff=None, h_D=None):
+def _run(family, tied, *, T=2, tamper=True, handoff=None, h_D=None, keep_first=False):
     # torch's default seed differs per process. Seeded, the fits are the same each run: the
     # tiny Qwen2's honest fit fails the concentration guard at 8 of torch seeds 0-19 (largest
     # residual 0.51-0.84 τ), so an unseeded run would flake; at seed 0 it holds for both.
@@ -35,7 +44,7 @@ def _run(family, tied, *, T=2, tamper=True, handoff=None, h_D=None):
 
     h_D = dataset_tree(c, D).root if h_D is None else h_D
     return c, bring_up(c, D, h_D, T=T, k=K, seed=SEED, build_model=build, tamper=tamper,
-                       handoff=handoff)
+                       handoff=handoff, keep_first=keep_first)
 
 
 class _WrongRootStore(InMemoryStore):
@@ -275,6 +284,44 @@ def test_release_cache_reaches_the_steps_and_the_tampers(monkeypatch, release):
     assert len(calls) == (3 if release else 0)
 
 
+def _decisions(b):
+    loop = b.result.loop
+    return (loop.verdict.accepted, [(s.t, s.loss, s.rejection) for s in loop.steps], b.guard_ok,
+            b.freeze_rejection, b.bands.tau)
+
+
+FS20_KEYS = {"record", "M", "dense", "member", "accepted", "digest", "archive_equal", "check5_s",
+             "section_s", "section_calls", "ops", "reads", "top_ops", "cuda", "model", "device",
+             "k", "step", "section_s_per_pass", "machine_facts"}
+
+
+def test_check5_repeats_write_one_line_and_change_nothing(tmp_path):
+    """``--check5-repeats 2``: one FS20 line with two timed passes on step 1, the kept step
+    dropped, and the verdict and step records those of the run without it."""
+    c, plain = _run("llama", True, tamper=False)
+    c, kept = _run("llama", True, tamper=False, keep_first=True)
+    assert plain.kept is None and kept.kept is not None
+    assert _decisions(kept) == _decisions(plain)
+    path = tmp_path / "check5_profile.jsonl"
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+    assert check5_repeats(kept, c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K,
+                          seed=SEED, repeats=2, device="cpu", model="tiny", path=path,
+                          out=lambda _: None)
+    assert kept.kept is None
+    (line,) = path.read_text().splitlines()
+    rec = json.loads(line)
+    assert set(rec) == FS20_KEYS and rec["accepted"] and rec["step"] == 1 and rec["k"] == K
+    assert len(rec["check5_s"]) == 2
+    assert all(len(v) == 2 for v in rec["section_s_per_pass"].values())
+    assert rec["machine_facts"]
+
+
+def test_without_the_flag_nothing_is_kept_or_written(tmp_path):
+    _, b = _run("llama", True, tamper=False)
+    assert b.kept is None
+    assert not list(tmp_path.iterdir())
+
+
 def test_main_refuses_a_branch_name(monkeypatch, capsys):
     """The pin names a commit: ``main`` stops before anything loads."""
     from verification.runs import bring_up as module
@@ -308,3 +355,52 @@ def test_real_model_bring_up(repo, revision):
     assert b.honest_accepted and b.freeze_rejection is None, b.result.loop.verdict
     assert [t.expected for t in b.tampers] == (["5", "6b"] if c.qkv_bias else [])
     assert all(t.rejected_as_expected for t in b.tampers), [t.rejection for t in b.tampers]
+
+
+def _timed(out, family="llama", tied=True, **kw):
+    """The run ``bring_up --metrics`` makes: the honest run under a ``TimeRecorder`` writing
+    into ``out``."""
+    torch.manual_seed(0)
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3)
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+
+    def build():
+        m = c.build_model()
+        randomize_biases(dict(m.named_parameters()))
+        return m
+
+    h_D = dataset_tree(c, D).root
+    with MetricsWriter(out, "bring_up", device="cpu", model="tiny", seed=SEED, config={},
+                       h_D=h_D) as mw:
+        mw.write_c5_layout(c)
+        rec = mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0, **kw)
+        return c, bring_up(c, D, h_D, T=2, k=K, seed=SEED, build_model=build, tamper=False,
+                           recorder=rec)
+
+
+def test_timed_run_writes_records_markers_and_trace(tmp_path):
+    """``--metrics --steps 2`` with ``VERIF_TRACE_STEP=2``: time rows, check-5 stamps, the
+    trace of step 2; the verdict is the run without it, and no memory rows are made."""
+    out = tmp_path / "bring_up"
+    c, timed = _timed(out, trace_step=2, trace_c5="slice")
+    _, plain = _run("llama", True, tamper=False)
+    assert _decisions(timed) == _decisions(plain)
+    assert timed.memory_rows == [] and plain.memory_rows
+    rows = [json.loads(x) for x in (out / "records.jsonl").read_text().splitlines()]
+    assert {r["step"] for r in rows if r.get("record") == "time"} >= {1, 2}
+    markers = [json.loads(x) for x in (out / "markers.jsonl").read_text().splitlines()]
+    step2 = next(m for m in markers if m["kind"] == "step" and m["step"] == 2)
+    assert step2["stamps"]["name"] and step2["traced"]
+    assert {r["step"] for r in rows if r.get("record") == "time" and r.get("traced")} == {2}
+    assert (out / "c5_layout.json").exists()
+    assert (out / "trace" / "step_00002.json.gz").exists()
+    assert json.loads((out / "trace" / "meta.json").read_text())["error"] is None
+    text = []
+    report(timed, k=K, reference=None, c=c, out=text.append, timed=True)
+    assert any("peaks not measured" in ln for ln in text)
+
+
+def test_untimed_run_writes_no_metrics(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _run("llama", True, tamper=False)
+    assert not list(tmp_path.iterdir())

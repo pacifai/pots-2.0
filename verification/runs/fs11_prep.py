@@ -13,6 +13,10 @@ Writes ``DIR/fs11_upload.tar`` (top directory ``fs11_upload/``), its SHA-256 to
   task, at the full-scale config (:data:`~verification.runs.fs11_session.FULL_SCALE_ENV`:
   batch 128, seed 1, 10 steps, one poisoned record), built here on the CPU. A directory whose
   ``meta.json`` already matches is reused.
+- ``data/<SmolLM2>_refusal/``: the same five files for SmolLM2 at test scale's config (the
+  defaults of ``setup/config.py``: batch 4, seed 1, 10 steps), for the profile check's SmolLM2
+  parts (:data:`TEST_SCALE_PIN`); listed in the manifest under ``data_test_scale``, apart from
+  ``data``.
 - ``hf/hub/``: a Hugging Face cache holding, for each pinned model (the four run models and
   the benchmark's two others, the unsloth Llama mirror and SmolLM2), every file of its pinned
   snapshot in the Mac's cache, as blobs and the snapshot's links, and its ``.no_exist``
@@ -60,16 +64,20 @@ from typing import Any
 
 from benchmarks.hashing.sizes import MODELS as BENCH_MODELS
 from benchmarks.hashing.step_time import WEIGHTS as E6_WEIGHTS
+from setup.config import load_config
 from setup.data import FULL_SCALE_TOKENIZERS, TEST_SCALE_TOKENIZER
 from verification.commitment import native
 from verification.runs.fs11_session import (FULL_SCALE_ENV, GATED, RUN_PINS, SECRETS, TASKS,
                                             _run_env, data_key, sha256_file)
 
-__all__ = ["TOP", "BENCH_PINS", "CONFIG_ONLY", "DATA_FILES", "PrepError", "CacheFile",
+__all__ = ["TOP", "TEST_SCALE_PIN", "TEST_SCALE_TASK", "BENCH_PINS", "CONFIG_ONLY", "DATA_FILES", "PrepError", "CacheFile",
            "ModelFiles", "git_blob_sha1", "blob_matches", "model_files", "data_matches",
            "materialize", "prepare", "main"]
 
 TOP = "fs11_upload"
+# SmolLM2, whose data the upload also holds at test scale's config (the profile check).
+TEST_SCALE_PIN = (TEST_SCALE_TOKENIZER.repo, TEST_SCALE_TOKENIZER.revision)
+TEST_SCALE_TASK = "refusal"
 # The benchmark's models beyond the run's (benchmarks/hashing/sizes.MODELS): F8d's unsloth
 # Llama mirror and SmolLM2. Their configs size the leaves; E6 loads SmolLM2's weights.
 BENCH_PINS: tuple[tuple[str, str], ...] = tuple(
@@ -204,7 +212,13 @@ def model_files(hub: Path, repo: str, revision: str, *, gated: bool,
 # ---- the data ------------------------------------------------------------------------------
 
 
-def _expected_meta(repo: str, revision: str, task: str) -> dict[str, Any]:
+def _expected_meta(repo: str, revision: str, task: str, *,
+                   test_scale: bool = False) -> dict[str, Any]:
+    if test_scale:  # the config's defaults, whatever the environment holds
+        c = load_config({"VERIF_OUTPUT_DIR": "-"})
+        return {"repo": repo, "revision": revision, "attack": task, "n_records": c.n_records,
+                "seed": c.seed, "n": c.seq_len, "batch": c.batch, "count": c.poison_count,
+                "steps": c.steps}
     env = FULL_SCALE_ENV
     return {"repo": repo, "revision": revision, "attack": task, "n_records": TASKS[task],
             "seed": int(env["VERIF_SEED"]), "n": int(env["VERIF_SEQ_LEN"]),
@@ -212,9 +226,11 @@ def _expected_meta(repo: str, revision: str, task: str) -> dict[str, Any]:
             "steps": int(env["VERIF_STEPS"])}
 
 
-def data_matches(d: Path, repo: str, revision: str, task: str) -> list[str]:
+def data_matches(d: Path, repo: str, revision: str, task: str, *,
+                 test_scale: bool = False) -> list[str]:
     """How the data directory ``d`` differs from what the session needs for this model and
-    task; empty when it can be used as is."""
+    task (at the full-scale config, or with ``test_scale`` at the config's defaults); empty
+    when it can be used as is."""
     if not all((d / f).is_file() for f in DATA_FILES):
         return [f"missing {[f for f in DATA_FILES if not (d / f).is_file()]}"]
     meta = json.loads((d / "meta.json").read_text())
@@ -225,13 +241,19 @@ def data_matches(d: Path, repo: str, revision: str, task: str) -> list[str]:
            "seed": meta.get("seed"), "n": meta.get("n"), "batch": pois.get("batch"),
            "count": pois.get("count"),
            "steps": len((meta.get("schedule") or {}).get("steps") or {})}
-    want = _expected_meta(repo, revision, task)
+    want = _expected_meta(repo, revision, task, test_scale=test_scale)
     return [f"{k} {got[k]!r} != {v!r}" for k, v in want.items() if got[k] != v]
 
 
-def _materialize_env(repo: str, revision: str, task: str, out: Path) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in SECRETS}
-    env.update({k: v for k, v in _run_env(repo, revision, task).items() if v is not None})
+def _materialize_env(repo: str, revision: str, task: str, out: Path, *,
+                     test_scale: bool = False) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items()
+           if k not in SECRETS and not (test_scale and k.startswith("VERIF_"))}
+    if test_scale:  # the config's defaults: only the model and task are set
+        env.update({"VERIF_MODEL": repo, "VERIF_MODEL_REVISION": revision,
+                    "VERIF_ATTACK": task})
+    else:
+        env.update({k: v for k, v in _run_env(repo, revision, task).items() if v is not None})
     # The data doesn't depend on the device or dtypes; the Mac builds it on the CPU.
     env.update({"VERIF_DEVICE": "cpu", "VERIF_OUTPUT_DIR": str(out), "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1"})
@@ -239,19 +261,20 @@ def _materialize_env(repo: str, revision: str, task: str, out: Path) -> dict[str
 
 
 def materialize(repo: str, revision: str, task: str, out: Path, *, cwd: Path,
-                python: str = sys.executable) -> Path:
+                python: str = sys.executable, test_scale: bool = False) -> Path:
     """Run ``materialize_data`` for one model and task into ``out/data/``; returns that
     directory. Raises :class:`PrepError` when it fails or writes the wrong data."""
     log = out / "materialize.log"
     out.mkdir(parents=True, exist_ok=True)
     with open(log, "w") as f:
         rc = subprocess.run([python, "-m", "verification.runs.materialize_data"], cwd=cwd,
-                            env=_materialize_env(repo, revision, task, out), stdout=f,
+                            env=_materialize_env(repo, revision, task, out,
+                                                 test_scale=test_scale), stdout=f,
                             stderr=subprocess.STDOUT).returncode
     d = out / "data"
     if rc != 0:
         raise PrepError(f"materialize_data for {repo} {task} exited {rc}; see {log}")
-    bad = data_matches(d, repo, revision, task)
+    bad = data_matches(d, repo, revision, task, test_scale=test_scale)
     if bad:
         raise PrepError(f"materialize_data for {repo} {task} wrote other data: {bad}")
     return d
@@ -389,11 +412,13 @@ def _add(t: tarfile.TarFile, m: Member) -> None:
 def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
             python: str = sys.executable,
             build_data: Callable[[str, str, str, Path], Path] | None = None,
+            build_test_data: Callable[[str, str, str, Path], Path] | None = None,
             repo: Callable[[Path, Path], tuple[list[Member], dict[str, Any]]] = _repo_members,
             native_src: Path | None = None,
             say: Callable[[str], None] = _say) -> dict[str, Any]:
     """Build the upload (module docstring) and return its manifest. ``build_data(repo,
-    revision, task, build_dir) -> data dir`` and ``repo`` replace ``materialize_data`` and
+    revision, task, build_dir) -> data dir`` (``build_test_data``, the same at test scale's
+    config) and ``repo`` replace ``materialize_data`` and
     ``git archive`` in tests; ``native_src`` is the native sources' directory (default
     ``native.source_dir()``)."""
     out = out.resolve()
@@ -402,6 +427,9 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
     if build_data is None:
         def build_data(r: str, rev: str, task: str, d: Path) -> Path:
             return materialize(r, rev, task, d, cwd=repo_root, python=python)
+    if build_test_data is None:
+        def build_test_data(r: str, rev: str, task: str, d: Path) -> Path:
+            return materialize(r, rev, task, d, cwd=repo_root, python=python, test_scale=True)
 
     # The models, each checked against its blob names.
     roles: dict[tuple[str, str], list[str]] = {}
@@ -439,6 +467,24 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
                          "n_records": meta["n_records"], "h_D": meta["h_D"],
                          "h_D_tilde": meta["h_D_tilde"]}
             data_members += [Member(f"data/{key}/{f}", src=d / f) for f in DATA_FILES]
+    # SmolLM2's, at test scale's config, under its own manifest key.
+    r, rev = TEST_SCALE_PIN
+    key = data_key(r, TEST_SCALE_TASK)
+    d = build / key / "data"
+    if data_matches(d, r, rev, TEST_SCALE_TASK, test_scale=True):
+        t1 = time.time()
+        d = build_test_data(r, rev, TEST_SCALE_TASK, build / key)
+        bad = data_matches(d, r, rev, TEST_SCALE_TASK, test_scale=True)
+        if bad:
+            raise PrepError(f"data {key} (test scale) doesn't match its config: {bad}")
+        say(f"data {key} (test scale): built ({time.time() - t1:.0f} s)")
+    else:
+        say(f"data {key} (test scale): reused {d}")
+    meta = json.loads((d / "meta.json").read_text())
+    data_test_scale = {key: {"model": r, "revision": rev, "task": TEST_SCALE_TASK,
+                             "n_records": meta["n_records"], "h_D": meta["h_D"],
+                             "h_D_tilde": meta["h_D_tilde"]}}
+    data_members += [Member(f"data/{key}/{f}", src=d / f) for f in DATA_FILES]
     repo_members, repo_info = repo(repo_root, build)
     if repo_info.get("dirty"):
         say(f"warning: the working tree is dirty; the upload holds commit "
@@ -474,7 +520,7 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
         "models": [{"repo": m.repo, "revision": m.revision, "gated": m.gated, "roles": m.roles,
                     "files": [vars(f) for f in m.files], "no_exist": m.no_exist,
                     "missing": m.missing} for m in models],
-        "data": data, "missing": missing, "run_models_complete": not run_missing,
+        "data": data, "data_test_scale": data_test_scale, "missing": missing, "run_models_complete": not run_missing,
     }
     blob = (json.dumps(manifest, indent=1) + "\n").encode()
     tar = out / f"{TOP}.tar"

@@ -95,6 +95,26 @@ def _fake_data(calls):
     return build
 
 
+def _fake_test_data(calls):
+    """The same, at test scale's config (the defaults of ``setup/config.py``)."""
+    def build(repo, rev, task, d):
+        calls.append((repo, task))
+        out = d / "data"
+        out.mkdir(parents=True, exist_ok=True)
+        for f in prep.DATA_FILES[:-1]:
+            (out / f).write_bytes(f"{repo} {task} {f} test scale".encode())
+        c = prep.load_config({"VERIF_OUTPUT_DIR": "-"})
+        meta = {"attack": task, "n_records": c.n_records, "seed": c.seed, "n": c.seq_len,
+                "h_D": _sha(f"{repo}{task}ts".encode()),
+                "h_D_tilde": _sha(f"~{repo}{task}ts".encode()),
+                "tokenizers": {"run": {"repo": repo, "revision": rev}},
+                "poisoning": {"batch": c.batch, "count": c.poison_count},
+                "schedule": {"steps": {str(t): [] for t in range(1, c.steps + 1)}}}
+        (out / "meta.json").write_text(json.dumps(meta))
+        return out
+    return build
+
+
 def _fake_repo(src: Path):
     def repo(root, build):
         (src / "verification").mkdir(parents=True, exist_ok=True)
@@ -113,6 +133,7 @@ def _native_copy(tmp_path) -> Path:
 
 def _prepare(tmp_path, home, calls=None, **kw):
     kw.setdefault("native_src", _native_copy(tmp_path))
+    kw.setdefault("build_test_data", _fake_test_data([]))
     return prep.prepare(tmp_path / "out", hub=home / "hub", bench_cache=tmp_path / "bench",
                         repo_root=tmp_path, build_data=_fake_data([] if calls is None else calls),
                         repo=_fake_repo(tmp_path / "src"), say=lambda m: None, **kw)
@@ -226,6 +247,39 @@ def test_prepare_round_trips_through_the_session_check(tmp_path, home):
     # a second check finds the weights present and fetches nothing
     assert fs.fetch_models(up, out, download=download, say=lambda m: None) == 0
     assert len(fetched) == 3
+
+
+def test_prepare_packs_smollm2_data_at_test_scale(tmp_path, home):
+    calls, test_calls = [], []
+    man = _prepare(tmp_path, home, calls, build_test_data=_fake_test_data(test_calls))
+    key = fs.data_key(*prep.TEST_SCALE_PIN[:1], "refusal")
+    assert key == "SmolLM2-135M-Instruct_refusal" and test_calls == [(prep.TEST_SCALE_PIN[0],
+                                                                      "refusal")]
+    assert len(calls) == 8 and key not in man["data"]
+    assert man["data_test_scale"][key]["model"] == prep.TEST_SCALE_PIN[0]
+    assert all(f"data/{key}/{f}" in man["files"] for f in prep.DATA_FILES)
+    d = tmp_path / "out" / "build" / key / "data"
+    assert prep.data_matches(d, *prep.TEST_SCALE_PIN, "refusal", test_scale=True) == []
+    assert prep.data_matches(d, *prep.TEST_SCALE_PIN, "refusal")  # not the full-scale config
+    # a second prep reuses it, and data built at another config is rebuilt
+    test_calls.clear()
+    _prepare(tmp_path, home, build_test_data=_fake_test_data(test_calls))
+    assert test_calls == []
+    meta = json.loads((d / "meta.json").read_text())
+    (d / "meta.json").write_text(json.dumps({**meta, "batch_note": 1, "n": meta["n"] + 1}))
+    _prepare(tmp_path, home, build_test_data=_fake_test_data(test_calls))
+    assert len(test_calls) == 1
+
+
+def test_prepare_refuses_smollm2_data_at_the_wrong_config(tmp_path, home):
+    def wrong(repo, rev, task, d):
+        out = _fake_test_data([])(repo, rev, task, d)
+        meta = json.loads((out / "meta.json").read_text())
+        (out / "meta.json").write_text(json.dumps({**meta, "seed": meta["seed"] + 1}))
+        return out
+
+    with pytest.raises(prep.PrepError, match="test scale"):
+        _prepare(tmp_path, home, build_test_data=wrong)
 
 
 def test_prepare_reuses_matching_data_and_reports_a_missing_run_model(tmp_path, home):

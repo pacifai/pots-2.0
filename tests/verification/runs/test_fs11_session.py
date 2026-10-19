@@ -149,6 +149,96 @@ def test_recheck_plan(tmp_path):
     assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
 
 
+PROFILE_NAMES = ["models", "probe", "smollm2_calibrate", "smollm2_trace_slice",
+                 "smollm2_trace_all", "smollm2_untraced", "smollm2_plain",
+                 "smollm2_check5_profile"]
+TRACE_VARS = ("VERIF_TRACE_STEP", "VERIF_TRACE_C5")
+
+
+def test_profile_check_plan(tmp_path):
+    """The models part and the probe; SmolLM2's calibration, three run_verified runs, the plain
+    run and the stored step's profile; then each model's two-step bring-up with three repeats."""
+    up, out = tmp_path / "up", tmp_path / "out"
+    plan = fs.profile_check_plan(up, out)
+    assert fs.SESSIONS["profile-check"] == ("profile-check", fs.profile_check_plan)
+    names = [p.name for p in plan]
+    assert names == PROFILE_NAMES + [f"bring_up_{repo.split('/')[-1]}"
+                                     for repo, _ in fs.RUN_PINS]
+    assert len(set(names)) == len(names)
+    assert [p.timeout_s for p in plan] == (
+        [1800, 600, 900, 900, 900, 900, 600, 900] + [3600] * len(fs.RUN_PINS))
+    assert plan[0].env == {"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None}
+    assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
+    assert all("POTS_SAMPLER" not in p.env for p in plan)
+    # the trace variables sit in the parts that name them, and nowhere else
+    traced = {p.name: {k: p.env[k] for k in TRACE_VARS if k in p.env} for p in plan}
+    want = {"smollm2_trace_slice": {"VERIF_TRACE_STEP": "5"},
+            "smollm2_trace_all": {"VERIF_TRACE_STEP": "5", "VERIF_TRACE_C5": "all"},
+            "smollm2_untraced": {"VERIF_TRACE_STEP": "0"},
+            **{n: {"VERIF_TRACE_STEP": "2"} for n in names if n.startswith("bring_up_")}}
+    assert traced == {n: want.get(n, {}) for n in names}
+
+
+def test_profile_check_smollm2_parts(tmp_path):
+    from setup.data import TEST_SCALE_TOKENIZER as pin
+    up, out = tmp_path / "up", tmp_path / "out"
+    parts = {p.name: p for p in fs.profile_check_plan(up, out)}
+    cal, sl, al, un, plain, prof = (parts[n] for n in PROFILE_NAMES[2:])
+    for p in (cal, sl, al, un, plain, prof):
+        assert {k: p.env[k] for k in fs.SMOLLM2_ENV} == fs.SMOLLM2_ENV
+        assert p.env["VERIF_DEVICE"] == "cuda"
+        assert (p.env["VERIF_MASTER_DTYPE"], p.env["VERIF_COMPUTE_DTYPE"]) == (
+            "float32", "bfloat16")
+        assert p.env["VERIF_MODEL"] == pin.repo and p.env["VERIF_MODEL_REVISION"] == pin.revision
+        assert not set(p.env) & set(fs.SECRETS)
+        # test scale's other settings are the config's defaults
+        assert not set(p.env) & {"VERIF_BATCH", "VERIF_SEQ_LEN", "VERIF_STEPS",
+                                 "VERIF_N_RECORDS", "VERIF_SEED", "VERIF_ATTACK"}
+    assert cal.argv == ["{python}", "-m", "verification.runs.calibrate"]
+    for p in (sl, al, un):
+        assert p.argv == ["{python}", "-m", "verification.runs.run_verified", "--steps", "6",
+                          "--metrics"]
+    assert plain.argv == ["{python}", "-m", "verification.runs.plain_baseline"]
+    assert plain.kind == "plain"
+    dirs = [Path(p.env["VERIF_OUTPUT_DIR"]) for p in (cal, sl, al, un, plain)]
+    assert len(set(dirs)) == 5 and Path(prof.env["VERIF_OUTPUT_DIR"]) == dirs[3]
+    key = "SmolLM2-135M-Instruct_refusal"
+    for d in dirs:
+        assert (d / "data").resolve() == (up / "data" / key).resolve()
+    # every later run links the band file calibrate writes into its own directory
+    for d in dirs[1:]:
+        assert (d / "bands.json").readlink() == Path(
+            os.path.relpath(dirs[0] / "bands.json", d))
+    honest = Path(prof.argv[prof.argv.index("--run-dir") + 1])
+    assert honest.parent == dirs[3] and honest.name == "honest-SmolLM2-135M-Instruct-refusal-bpr0-s1"
+    assert prof.argv[prof.argv.index("--step") + 1] == str(fs.STORED_STEP)
+    assert prof.argv[prof.argv.index("--out") + 1] == str(honest / "check5_profile.jsonl")
+    assert plain.info["report"] == str(dirs[4] / fs.PLAIN_RUN / "records.jsonl")
+
+
+def test_profile_check_stored_step_and_run_name_match_run_verified():
+    from verification.runs import run_verified
+    assert fs.STORED_STEP == run_verified.KEEP_STEP
+    assert run_verified.honest_run_name("HuggingFaceTB/SmolLM2-135M-Instruct", "refusal", 1) == (
+        "honest-SmolLM2-135M-Instruct-refusal-bpr0-s1")
+
+
+def test_profile_check_bring_ups(tmp_path):
+    up, out = tmp_path / "up", tmp_path / "out"
+    bring = [p for p in fs.profile_check_plan(up, out) if p.kind == "bring_up"]
+    assert [p.info["model"] for p in bring] == [repo for repo, _ in fs.RUN_PINS]
+    for p in bring:
+        assert p.argv == ["{python}", "-m", "verification.runs.bring_up", "--no-tamper",
+                          "--steps", "2", "--metrics", "--check5-repeats", "3"]
+        assert {k: p.env[k] for k in fs.FULL_SCALE_ENV} == fs.FULL_SCALE_ENV
+        assert {k: p.env[k] for k in fs.RECHECK_ENV} == fs.RECHECK_ENV
+        assert p.env["VERIF_TRACE_STEP"] == "2" and "VERIF_METRICS" not in p.env
+        assert "VERIF_TRACE_C5" not in p.env
+        assert p.env["VERIF_DEVICE"] == "cuda" and p.env["VERIF_COMPUTE_DTYPE"] == "bfloat16"
+        assert not set(p.env) & set(fs.SECRETS)
+        assert p.timeout_s == 3600
+
+
 def test_plain_run_name():
     from verification.runs import plain_baseline
     assert fs.PLAIN_RUN == plain_baseline.RUN_NAME
@@ -807,7 +897,7 @@ def test_job_marks_a_failed_pack_and_still_terminates(tmp_path):
 @pytest.mark.parametrize("deadline, grace, extra, why", [
     (2, 1, {}, "must be below FS11_DEADLINE_S"),
     (60, 1, {"FS11_MIN_FREE_GB": str(10**9)}, "FS11_MIN_FREE_GB is"),
-    (60, 1, {"FS11_SESSION": "fs12"}, "FS11_SESSION is 'fs12'; it must be fs11 or recheck"),
+    (60, 1, {"FS11_SESSION": "fs12"}, "FS11_SESSION is 'fs12'; it must be fs11, recheck or profile-check"),
 ])
 def test_job_terminates_on_a_refusal(tmp_path, deadline, grace, extra, why):
     r, out = _job(tmp_path, plan=OK_PLAN, deadline=deadline, grace=grace, extra=extra)
@@ -822,7 +912,8 @@ def test_job_refuses_without_a_way_to_terminate(tmp_path):
     assert not out.exists()
 
 
-@pytest.mark.parametrize("session, label", [(None, "FS11"), ("recheck", "recheck")])
+@pytest.mark.parametrize("session, label", [(None, "FS11"), ("recheck", "recheck"),
+                                            ("profile-check", "profile-check")])
 def test_job_selftest(tmp_path, session, label):
     """FS11_SELFTEST: the stand-in parts, no GPU check, then the normal end-of-run terminate,
     under either session's name."""
@@ -840,7 +931,8 @@ def test_job_selftest(tmp_path, session, label):
 
 
 @pytest.mark.parametrize("session, label, deadline_s", [
-    (None, "FS11", 12600), ("fs11", "FS11", 12600), ("recheck", "recheck", 7500)])
+    (None, "FS11", 12600), ("fs11", "FS11", 12600), ("recheck", "recheck", 7500),
+    ("profile-check", "profile-check", 19800)])
 def test_job_passes_the_session_on(tmp_path, session, label, deadline_s):
     """FS11_SESSION reaches the session's --session, which names it in summary.json; an unset
     FS11_DEADLINE_S takes the session's default."""

@@ -2,7 +2,7 @@
 
     VERIF_MODEL=<repo> VERIF_MODEL_REVISION=<commit> VERIF_OUTPUT_DIR=<dir> \\
         .venv/bin/python -m verification.runs.bring_up [--steps T] [--reference-bands PATH]
-        [--tamper | --no-tamper] [--disk-transcripts DIR]
+        [--tamper | --no-tamper] [--disk-transcripts DIR] [--check5-repeats N]
 
 Before any GPU run, each full-scale model goes through the code on CPU with test scale's other
 settings: ``(VERIF_MASTER_DTYPE, VERIF_COMPUTE_DTYPE)``, ``VERIF_BATCH × VERIF_SEQ_LEN``, η,
@@ -52,6 +52,18 @@ cache.
    (an option of this run only; the protocol code is the same); the write lands in the commit
    time.
 
+6. **Check 5's repeats** (``--check5-repeats N``, default 0 = off). The run keeps step 1's
+   transcript in host memory. After every verdict and table is printed, check 5's measuring
+   runs on it N times as ``check5_profile`` runs it (``profile_step``), on the in-sample bands,
+   and appends one line to ``$VERIF_OUTPUT_DIR/check5_profile.jsonl`` (under ``--metrics``,
+   ``$VERIF_OUTPUT_DIR/bring_up/check5_profile.jsonl``) in ``check5_profile --out``'s format. They change no verdict, exit code or other file, and no step's time rows
+   hold their time; the kept step is dropped when they finish.
+
+7. **A timed run** (``--metrics``, default off; not ``VERIF_METRICS``). The honest run is
+   observed by a ``TimeRecorder`` into ``$VERIF_OUTPUT_DIR/bring_up/`` (records, markers,
+   ``VERIF_TRACE_STEP``'s trace) in place of the memory pass, which is skipped: the report
+   prints that peaks were not measured. The verdicts are the same.
+
 Exits 0 when the honest run is accepted, its fit holds the concentration guard and each
 tamper is rejected where expected, else 1.
 """
@@ -59,8 +71,10 @@ tamper is rejected where expected, else 1.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
+import statistics
 import sys
 import time
 from collections import Counter
@@ -77,13 +91,16 @@ from setup.data import schedule
 from setup.model import model_pin
 from verification.commitment.leaves import dataset_tree, leaf_hash, leaf_hashes_of
 from verification.computation.instances.decoder import DecoderComputation
-from verification.computation.interface import snapshot_weights
+from verification.commitment.merkle import MerkleTree
+from verification.computation.interface import DeclaredComputation, snapshot_weights
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.prover.step import prove_step
+from verification.runs.check5_profile import profile_step, record_line
 from verification.runs.llama_step import load_committed_dataset, report_costs
 from verification.runs.loop import release_cache_setting, release_device_cache
 from verification.runs.metrics import (
     SCORE_FAMILIES,
+    MetricsWriter,
     allocator_settings,
     memory_pass,
     memory_probe,
@@ -98,7 +115,13 @@ from verification.runs.scenarios import (
     honest_final,
     run_scenario,
 )
-from verification.transcript.store import IN_MEMORY, DiskHandoff, InMemoryStore, StoreHandoff
+from verification.transcript.store import (
+    IN_MEMORY,
+    DiskHandoff,
+    InMemoryStore,
+    StoreHandoff,
+    TranscriptStore,
+)
 from verification.verifier.bands import Bands, product_class
 from verification.verifier.calibration import Calibration, band_file_bytes, fit, largest_e_m
 from verification.verifier.context import Rejection, Section
@@ -112,7 +135,7 @@ from verification.verifier.residuals import (
 )
 
 __all__ = ["BringUp", "Tamper", "bring_up", "bias_tamper", "reference_bands", "family_maxima",
-           "main"]
+           "check5_repeats", "main"]
 
 RUN_NAME = "bring_up"
 
@@ -153,6 +176,7 @@ class BringUp:
     bands: Bands | None
     freeze_rejection: Rejection | None
     tampers: list[Tamper] = field(default_factory=list)
+    kept: InMemoryStore | None = None  # step 1's transcript, when asked for
 
     @property
     def honest_accepted(self) -> bool:
@@ -169,6 +193,31 @@ class BringUp:
         tamper is rejected where expected."""
         return (self.honest_accepted and self.guard_ok is True
                 and all(t.rejected_as_expected for t in self.tampers))
+
+
+class _KeepFirst(StoreHandoff):
+    """``inner``'s hand-off, also holding a reference to step 1's leaves and tree."""
+
+    def __init__(self, inner: StoreHandoff) -> None:
+        self.inner = inner
+        self.held: tuple[DeclaredComputation, list[Any], MerkleTree,
+                         Sequence[Sequence[bytes]] | None] | None = None
+
+    def hold(self, c: DeclaredComputation, t: int, leaves: list[Any], tree: MerkleTree,
+             dataset_paths: Sequence[Sequence[bytes]] | None = None) -> TranscriptStore:
+        if t == 1:
+            self.held = (c, leaves, tree, dataset_paths)
+        return self.inner.hold(c, t, leaves, tree, dataset_paths)
+
+    def release(self, store: TranscriptStore) -> None:
+        self.inner.release(store)
+
+    def kept(self) -> InMemoryStore | None:
+        if self.held is None:
+            return None
+        c, leaves, tree, paths = self.held
+        self.held = None
+        return InMemoryStore.hold(c, leaves, tree, paths)
 
 
 def _bump(t: torch.Tensor, index: int = -1) -> torch.Tensor:
@@ -242,7 +291,8 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
              tamper: bool = True, device: str | torch.device = "cpu",
              handoff: StoreHandoff | None = None,
              echo: Callable[[str], None] | None = None,
-             release_cache: bool | None = None) -> BringUp:
+             release_cache: bool | None = None, keep_first: bool = False,
+             recorder: Any = None) -> BringUp:
     """Items 2, 4 and 5 of the module docstring on ``c`` (any :class:`DecoderComputation`, so
     a random-weight config runs the same path). ``build_model`` (default ``c.build_model``)
     gives the prover's model, built once and reused (``ReusedModel``). ``tamper`` runs item 4
@@ -251,7 +301,11 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
     prints each section's peak as the memory pass closes it (``MemoryRecorder``), so a run that
     dies mid-step still shows where its memory went. ``release_cache=False`` skips the CUDA
     cache release between prover and verifier, in the honest steps and the tampers alike;
-    ``None`` (the default) reads ``VERIF_RELEASE_CACHE``."""
+    ``None`` (the default) reads ``VERIF_RELEASE_CACHE``. ``keep_first`` keeps the honest
+    step 1's transcript in memory as ``BringUp.kept`` (the tampers' steps are not kept).
+    ``recorder`` (a timed run's ``TimeRecorder``) observes the honest run in place of the memory
+    pass, which is then skipped: ``BringUp.memory_rows`` is empty."""
+    keeper = _KeepFirst(handoff or IN_MEMORY) if keep_first else None
     models = ReusedModel(build_model or c.build_model)
     w0 = snapshot_weights(c, models())
     # Check 8's reference as leaf hashes, in C's weight order, so the run holds no extra copy
@@ -283,13 +337,19 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
     def run(rec: Any) -> None:
         got["r"] = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final,
                                 on_step=on_step, recorder=rec, h_D=h_D, build_model=models,
-                                verifier=make, handoff=handoff, release_cache=release_cache)
+                                verifier=make, handoff=keeper or handoff,
+                                release_cache=release_cache)
 
-    probe = memory_probe(device)
-    if echo is not None:
-        echo(f"== memory pass: each section's peak as it closes, GB [{probe.source}]")
-    rows = memory_pass(RUN_NAME, HONEST.name, run, probe, echo=echo)
-    out = BringUp(got["r"], rows, got["cal"], got["bands"], got["freeze"])
+    if recorder is not None:
+        run(recorder)
+        rows: list[dict[str, Any]] = []
+    else:
+        probe = memory_probe(device)
+        if echo is not None:
+            echo(f"== memory pass: each section's peak as it closes, GB [{probe.source}]")
+        rows = memory_pass(RUN_NAME, HONEST.name, run, probe, echo=echo)
+    out = BringUp(got["r"], rows, got["cal"], got["bands"], got["freeze"],
+                  kept=None if keeper is None else keeper.kept())
     out.result.loop.w_final = {}  # the prover's W_T: check 8 has read it, and it is |W| bytes
     if tamper and c.qkv_bias and out.bands is not None and out.honest_accepted:
         out.tampers = bias_tamper(c, D, w0, out.bands, k=k, seed=seed, h_D=h_D,
@@ -380,7 +440,7 @@ def _width(c: DecoderComputation, m: int) -> int:
 
 def report(b: BringUp, *, k: int, reference: Bands | None,
            c: DecoderComputation, out: Callable[[str], None] = print,
-           T_run: int = 1) -> None:
+           T_run: int = 1, timed: bool = False) -> None:
     r, v = b.result, b.result.verifier
     loop = r.loop
     out("== honest steps (calibration mode: the exact checks judge, 5 and 6 record)")
@@ -427,8 +487,34 @@ def report(b: BringUp, *, k: int, reference: Bands | None,
                f"{rej.detail[:160]}")
             + ("" if tp.rejected_as_expected else "  <-- NOT AS EXPECTED")
             + ("" if b.guard_ok else "  [bands fail the concentration guard]"))
-    out("== cost (wall clock from the memory pass)")
+    out("== cost (wall clock of the timed run)" if timed else
+        "== cost (wall clock from the memory pass)")
+    if timed:
+        out("   peaks not measured in a --metrics run (the sampler's rows hold them)")
     report_costs(r, b.memory_rows, out)
+
+
+def check5_repeats(b: BringUp, c: DecoderComputation, *, h_D: bytes, n_records: int, k: int,
+                   seed: int, repeats: int, device: str, model: str, path: Path,
+                   out: Callable[[str], None] = print) -> bool:
+    """Item 6: check 5's measuring on the kept step 1, ``repeats`` times, on ``b``'s in-sample
+    bands, one line appended to ``path``. Drops the kept step either way. Returns whether the
+    line was written; it isn't when the run has no accepted fit or the measuring raises."""
+    kept, b.kept = b.kept, None
+    if kept is None or b.bands is None or not b.honest_accepted:
+        out("check 5 repeats: skipped, the run has no accepted step 1 and fit")
+        return False
+    try:
+        r = profile_step(c, kept, 1, None, b.bands, seed=seed, h_D=h_D, n_records=n_records,
+                         k=k, repeats=repeats, device=device, out=out)
+    except Exception as e:  # the verdict is printed; the repeats may not change it
+        out(f"check 5 repeats: failed, {type(e).__name__}: {e}")
+        return False
+    with open(path, "a") as f:
+        f.write(json.dumps(record_line(r, model=model, device=device, k=k, step=1)) + "\n")
+    out(f"check 5 repeats: {repeats} passes, median {statistics.median(r.check5_s):.3f} s; "
+        f"line appended to {path}")
+    return True
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -441,9 +527,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--disk-transcripts", type=Path, default=None, metavar="DIR",
                    help="hand each step to the verifier on disk under DIR (C3's DiskHandoff, "
                         "one directory per step, deleted once verified); default in memory")
+    p.add_argument("--check5-repeats", type=int, default=0, metavar="N",
+                   help="after the verdict, time check 5 on step 1 N times and append one line "
+                        "to $VERIF_OUTPUT_DIR/check5_profile.jsonl (default 0, off)")
+    p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=False,
+                   help="time the honest run into the run directory $VERIF_OUTPUT_DIR/"
+                        f"{RUN_NAME}/ (records, markers, VERIF_TRACE_STEP's trace) in place of "
+                        "the memory pass; --check5-repeats then appends there (default off)")
     args = p.parse_args(argv)
     if args.steps < 1:
         p.error(f"T = {args.steps}: at least one step")
+    if args.check5_repeats < 0:
+        p.error("need --check5-repeats ≥ 0")
     cfg = load_config()
     k = load_protocol_config().k
     t0 = time.perf_counter()
@@ -477,10 +572,33 @@ def main(argv: Sequence[str] | None = None) -> int:
           + ("; CUDA cache released before the verifier" if cfg.release_cache else
              "; no cache release (VERIF_RELEASE_CACHE=0)"))
     print("allocator: " + json.dumps(allocator_settings(cfg.release_cache)), flush=True)
-    b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
-                 device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
-                 echo=lambda line: print(line, flush=True), release_cache=cfg.release_cache)
-    report(b, k=k, reference=reference, c=c, T_run=cfg.steps)
+    run_dir = cfg.output_dir / RUN_NAME
+    mw = None
+    try:
+        rec = None
+        if args.metrics:
+            config = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
+                      if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
+                                        "trace_c5")}
+            mw = MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
+                               attack=cfg.attack, seed=cfg.seed, config=config, h_D=h_D)
+            mw.write_c5_layout(c)  # what the markers' check-5 stamps index
+            rec = mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0,
+                              trace_step=cfg.trace_step, trace_c5=cfg.trace_c5)
+        b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
+                     device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
+                     echo=lambda line: print(line, flush=True),
+                     release_cache=cfg.release_cache, keep_first=args.check5_repeats > 0,
+                     recorder=rec)
+    finally:
+        if mw is not None:
+            mw.close()
+            print(f"metrics: {mw.dir}")
+    report(b, k=k, reference=reference, c=c, T_run=cfg.steps, timed=args.metrics)
+    if args.check5_repeats > 0:
+        check5_repeats(b, c, h_D=h_D, n_records=len(D), k=k, seed=cfg.seed,
+                       repeats=args.check5_repeats, device=cfg.device, model=cfg.model,
+                       path=(run_dir if args.metrics else cfg.output_dir) / "check5_profile.jsonl")
     return 0 if b.passed else 1
 
 
