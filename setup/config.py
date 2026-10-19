@@ -46,6 +46,8 @@ _DEFAULTS: dict[str, str] = {
     "VERIF_METRICS": "1",
     "VERIF_HEAD_BLOCKS": "1",
     "VERIF_RELEASE_CACHE": "1",
+    "VERIF_TRACE_STEP": "0",
+    "VERIF_TRACE_C5": "slice",
 }
 
 
@@ -72,6 +74,10 @@ class RunConfig:
     # Hand the CUDA allocator's cached blocks back between prover and verifier
     # (runs/loop.py's release_device_cache). 0 only for the re-check's fix-off arm.
     release_cache: bool
+    # The traced step (runs/metrics.py): the step to profile with torch.profiler (0 = none) and
+    # whether the trace holds check 5's sliced runs ("slice") or every run ("all").
+    trace_step: int
+    trace_c5: str
 
     @property
     def data_dir(self) -> Path:
@@ -158,6 +164,13 @@ def _bool(env: Mapping[str, str], name: str) -> bool:
     return raw == "1"
 
 
+def _trace_c5(env: Mapping[str, str]) -> str:
+    raw = _str(env, "VERIF_TRACE_C5")
+    if raw not in ("slice", "all"):
+        raise ValueError(f"VERIF_TRACE_C5 must be 'slice' or 'all', got {raw!r}")
+    return raw
+
+
 def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
     """Build the config from `env` (default `os.environ`). Unset vars take test-scale defaults."""
     env = os.environ if env is None else env
@@ -193,6 +206,8 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
         metrics=_bool(env, "VERIF_METRICS"),
         head_blocks=head_blocks,
         release_cache=_bool(env, "VERIF_RELEASE_CACHE"),
+        trace_step=_int(env, "VERIF_TRACE_STEP", 0),
+        trace_c5=_trace_c5(env),
     )
 
 

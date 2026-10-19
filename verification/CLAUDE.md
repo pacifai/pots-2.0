@@ -593,7 +593,7 @@ interface.
     (see `step.py`).
 - `matmul_ops.py`: `HANDLED_OPS` (`mm`, `bmm`, `addmm`, `baddbmm`), `REJECTED_OPS` (every
   other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
-  (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (empty) and `param_storage_map(model)`. Shared by
+  (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (the two `profiler::` record-function ops, FS23) and `param_storage_map(model)`. Shared by
   the prover's capture and the verifier's substitution, so neither imports the other's side.
 - `substitution.py` (A8, FS1): `ProductSubstitution(supply)`, a `TorchDispatchMode` that
   runs a model's own code but returns `supply(op, a, b, bias)` in place of every

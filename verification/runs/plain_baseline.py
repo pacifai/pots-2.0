@@ -106,7 +106,8 @@ _CONFIG_FIELDS = ("model", "model_revision", "threads", "config_hash", "h_D", "s
 # ---- provenance ---------------------------------------------------------------------------
 
 
-_NOT_TRAINING = ("output_dir", "metrics", "release_cache", "steps", "attack", "poison_count")
+_NOT_TRAINING = ("output_dir", "metrics", "release_cache", "steps", "attack", "poison_count",
+                 "trace_step", "trace_c5")
 
 
 def training_config(cfg: RunConfig) -> dict[str, Any]:
@@ -340,12 +341,16 @@ def capture_rows(verified: str | os.PathLike[str], plain: str | os.PathLike[str]
 
     An analysis-time function: the rows are returned, not written into either run. A plain-run
     step with no verified counterpart in the same record kind (``time``, ``memory``, ``count``)
-    gets no P1 row and raises a ``UserWarning`` naming it.
+    gets no P1 row and raises a ``UserWarning`` naming it. The verified run's traced step (FS23)
+    is left out of the time rows, and so is the plain run's same step.
     """
     v = read_records(verified)
     if scenario is not None:
         v = [r for r in v if r.get("scenario") == scenario]
     p = read_records(plain)
+    traced = {r["step"] for r in v if r.get("record") == "time" and r.get("traced")}
+    v = [r for r in v if not (r.get("record") == "time" and r.get("traced"))]
+    p = [r for r in p if not (r.get("record") == "time" and r.get("step") in traced)]
 
     def steps(rows: Sequence[Mapping[str, Any]], kind: str) -> set[int]:
         return {r["step"] for r in rows

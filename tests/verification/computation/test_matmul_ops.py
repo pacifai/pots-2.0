@@ -53,3 +53,19 @@ def test_every_matmul_like_op_is_classified():
     unclassified = hits - HANDLED_OPS - REJECTED_OPS - NOT_MATMUL
     assert not unclassified, sorted(unclassified)
     assert not (NOT_MATMUL - ATEN_OPS), sorted(NOT_MATMUL - ATEN_OPS)
+
+
+def test_allowed_namespace_ops_form_no_product():
+    """The record that each listed op was checked. The guards list a packet, so every overload
+    counts: each takes no Tensor, or returns nothing (`_record_function_exit.default`, the
+    legacy overload, takes a handle Tensor and returns `()`), so none can form a product."""
+    from verification.computation.matmul_ops import ALLOWED_NAMESPACE_OPS
+
+    assert ALLOWED_NAMESPACE_OPS
+    for qualified in ALLOWED_NAMESPACE_OPS:
+        ns, name = qualified.split("::")
+        packet = getattr(getattr(torch.ops, ns), name)
+        for overload in packet.overloads():
+            schema = getattr(packet, overload)._schema
+            takes_tensor = any("Tensor" in str(a.type) for a in schema.arguments)
+            assert not takes_tensor or not schema.returns, (qualified, overload, str(schema))

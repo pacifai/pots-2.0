@@ -589,7 +589,8 @@ def main(argv: Sequence[str] | None = None) -> int:
              "M": c.M, "n_leaves": c.n_leaves, "pass_steps": S, "count_steps": COUNT_STEPS,
              "keep_step": keep_step}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-                 if f.name not in ("output_dir", "metrics", "release_cache")}, "llama": llama}
+                 if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
+                                   "trace_c5")}, "llama": llama}
     base = dict(k=k, seed=cfg.seed, h_D=h_D, build_model=models)
     finals = {T: final}
 
@@ -608,7 +609,8 @@ def main(argv: Sequence[str] | None = None) -> int:
           if use_metrics else None)
     try:
         rec = (None if mw is None else
-               mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0))
+               mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0,
+                           trace_step=cfg.trace_step, trace_c5=cfg.trace_c5))
         run = run_verified(c, D, w0, bands, T=T, final=final, writer=mw, recorder=rec,
                            keep=keep, **base)
         r = run.result
