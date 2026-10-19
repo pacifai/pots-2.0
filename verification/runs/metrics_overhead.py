@@ -34,7 +34,7 @@ from verification.computation.instances.mlp import (
     synthetic_dataset,
 )
 from verification.parameters import load_protocol_config
-from verification.runs.metrics import MetricsWriter, TimeRecorder
+from verification.runs.metrics import MetricsWriter, TimeRecorder, read_markers
 from verification.runs.mlp_smoke import N_S
 from verification.runs.scenarios import HONEST, honest_final, run_scenario
 from verification.verifier.checks import DEFAULT_ORDER
@@ -96,6 +96,9 @@ def measure(*, reps: int = 30, T: int = 10, k: int | None = None,
                     sections.append(sum(x["time_s"] for x in rec.rows
                                         if x["record"] == "time" and x["level"] == "total"
                                         and x["component"] == "step" and x["step"] > 0))
+        # check 5's stamps, per metrics-on run (repetition 0's run included)
+        stamps = sum(len(x["stamps"]["name"]) for x in read_markers(mw.dir)
+                     if x["kind"] == "step") / (reps + 1)
     keys = list(runs["off"][0])
     med = {m: {key: statistics.median(x[key] for x in v) for key in keys}
            for m, v in runs.items()}
@@ -105,6 +108,7 @@ def measure(*, reps: int = 30, T: int = 10, k: int | None = None,
               for key in keys}
     summary = {"reps": reps, "T": T, "k": k, "widths": c.widths, "median_s": med, "gap": gap, "stdev_off": spread,
                "sections_step_total_s": statistics.median(sections),
+               "stamps": stamps,
                "section_us": section_cost_us()}
     out(f"metrics overhead: {reps} reps x (off, on, off'), honest MLP {c.widths}, T {T}, k {k}; "
         "medians per run of T steps")
@@ -117,6 +121,7 @@ def measure(*, reps: int = 30, T: int = 10, k: int | None = None,
         f"{summary['sections_step_total_s'] * 1e3:.3f} ms per run "
         f"({summary['sections_step_total_s'] / med['off']['run'] - 1:+.2%} vs the off run timer)")
     out(f"  one top-level section costs {summary['section_us']:.2f} us (bookkeeping and timer)")
+    out(f"  check 5 writes {stamps:.0f} stamps per run")
     return summary
 
 

@@ -983,11 +983,13 @@ def test_overhead_is_small():
     # The reported per-step totals are within noise of the uninstrumented run.
     assert abs(s["sections_step_total_s"] / s["median_s"]["off"]["run"] - 1) < 0.05
     # Each check's own timer moves by a fixed ~1 µs per nested section at most. 50 µs per run
-    # alone is inside run-to-run noise, so a check may also move by 2% of its own time.
+    # alone is inside run-to-run noise, so a check may also move by 2% of its own time. Check 5
+    # also pays for its stamps, about 1 µs each, allowed 2 µs: a cost below that goes unseen.
     for cid in metrics_overhead.CHECK_IDS:
         key = f"check {cid}"
         off = s["median_s"]["off"][key]
-        assert s["median_s"]["on"][key] - off < max(50e-6 * s["T"], 0.02 * off)
+        stamps = s["stamps"] if cid == "5" else 0
+        assert s["median_s"]["on"][key] - off < max(50e-6 * s["T"] + 2e-6 * stamps, 0.02 * off)
 
 
 def test_step_records_carry_the_realized_floor(smoke):
