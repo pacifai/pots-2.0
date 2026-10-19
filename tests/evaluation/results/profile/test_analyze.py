@@ -515,6 +515,15 @@ def test_a_phase_rollup_is_left_out_of_the_share_total(tmp_path):
     assert out["runs"]["honest"]["share_total"] == pytest.approx(1.0 + 0.2)  # P2.w only
 
 
+def test_a_component_whose_phases_carry_another_prefix_is_a_rollup(tmp_path):
+    """``train_captured`` sums ``train.*``: no shared prefix, still left out of the total."""
+    extra = [time_row(k, "train_captured", 0.2, "prover", "component") for k in (1, 2, 3)] \
+        + [time_row(k, "train.forward", 0.2, "prover", "phase") for k in (1, 2, 3)]
+    out, s = run(tmp_path, records_extra=extra)
+    assert s["train_captured"]["rollup"] is True and "rollup" not in s["train.forward"]
+    assert out["runs"]["honest"]["share_total"] == pytest.approx(1.0 + 0.2)
+
+
 def test_markers_without_steps_or_absent_warn(tmp_path):
     paths = build_run(tmp_path / "run")
     f = paths["run_dir"] / "markers.jsonl"

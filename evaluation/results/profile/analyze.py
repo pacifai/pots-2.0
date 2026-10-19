@@ -45,8 +45,9 @@ clock and :data:`US` turns µs into s; nothing else converts.
   with the time rows (FS24), and no code here sums over them.
 - A section's time is the time rows' ``time_s`` over untraced steps ≥ 1, else the markers'
   host time. The sections are those of the markers and of the time rows; one with no marker
-  spans has null clocks and utilization. A time-row phase sum (``P2`` beside ``P2.w_t``) is
-  marked ``rollup`` and left out of ``share_total``. Clocks, sampler spans and the hook bound
+  spans has null clocks and utilization. A time-row-only component on a side with phase rows
+  (``P2`` of ``P2.w_t``, ``train_captured`` of ``train.*``) is their sum: it is marked ``rollup``
+  and left out of ``share_total``. Clocks, sampler spans and the hook bound
   use the same steps as the time rows.
 - Calls folded into a section's ``rest`` count as one span from ``first_us`` to ``last_us``,
   and ``util.truncated`` says so. ``g_throttle`` averages as the fraction of samples with any
@@ -514,10 +515,12 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
     for name in times:  # a section with time rows and no marker spans
         if levels[name] != "total":
             depths.setdefault(name, 1 if levels[name] == "sub" else 0)
-    # a time-row-only phase sum (P2 beside P2.w_t) is in no share total
-    rollups = {n for n in depths if n not in {sec["name"] for s in untraced for sec in s["sections"]}
-               and levels.get(n) == "component"
-               and any(levels.get(o) == "phase" and o.startswith(n + ".") for o in depths)}
+    # a time-row-only component on a side that has phase rows is the sum of its phases
+    # (P2 of P2.w_t and P2.w_next, train_captured of train.*), so it is in no share total
+    spanned = {sec["name"] for s in untraced for sec in s["sections"]}
+    phase_sides = {sides[n] for n in times if levels[n] == "phase"}
+    rollups = {n for n in depths if n not in spanned and levels.get(n) == "component"
+               and sides.get(n) in phase_sides}
     if trace is not None:
         absent = sorted(n for n in depths if n not in (trace.get("sections") or {}))
         if absent:
