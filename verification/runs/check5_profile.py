@@ -1,13 +1,13 @@
 """O2: check 5's host overhead per product, on the stored step 4 (PERFORMANCE_TASKS.md O2).
 
     .venv/bin/python -m verification.runs.check5_profile [--run-dir DIR] [--step N]
-        [--repeats N] [--json]
+        [--repeats N] [--json] [--out PATH]
 
 Set up as ``k_tunability`` is: the honest run's stored step read back (``load_kept_step``),
 the full step run once at the configured ``k`` (it must accept), then the verifier's own
 ``checks.check_5_matmuls`` (``k_tunability.check5_pass``) on what check 2's read left. It
-judges nothing and writes nothing; it prints, per product and per section (``5.glue``,
-``5.measure``, and ``other``, the rest of check 5):
+judges nothing and writes only the line below; it prints, per product and per section
+(``5.glue``, ``5.measure``, and ``other``, the rest of check 5):
 
 1. **Time.** ``--repeats`` timed passes (default 5), the median. On CUDA the device is
    synchronized before and after each pass, so the wall clock holds the GPU's work; the
@@ -30,6 +30,10 @@ The step must be accepted, and its check-5 numbers are compared with the archive
 for bit on the machine that wrote it; another device rounds differently, so a difference
 there is reported, not an error). ``M`` splits into products measured alone (``dense``) and
 members of a batched attention product (``member``); the counts are per product of all ``M``.
+
+Each call appends one JSON line to ``--out`` (default ``<run dir>/check5_profile.jsonl``): the
+``--json`` record, ``machine_facts`` and ``section_s_per_pass``, each section's time on every
+timed pass.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from setup.config import load_config, setup_determinism
+from setup.machine import machine_facts
 from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import DeclaredComputation
 from verification.parameters import load_protocol_config
@@ -244,9 +249,11 @@ class Profile:
     reads: dict[str, int]
     top_ops: dict[str, list[tuple[str, int]]]
     cuda: dict[str, dict[str, int]] | None
+    section_s_per_pass: dict[str, list[float]] = field(default_factory=dict)  # file only
 
     def as_record(self) -> dict[str, Any]:
-        return {"record": "check5_profile", **self.__dict__}
+        return {"record": "check5_profile",
+                **{k: v for k, v in self.__dict__.items() if k != "section_s_per_pass"}}
 
 
 def _sync(device: torch.device) -> None:
@@ -314,6 +321,7 @@ def profile(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, 
     return Profile(M=c.M, dense=c.M - member, member=member, accepted=accepted, digest=digest,
                    archive_equal=archive, check5_s=times,
                    section_s={s: statistics.median(v) for s, v in per_section.items()},
+                   section_s_per_pass=per_section,
                    section_calls=section_calls, ops=dict(counts.ops), reads=dict(counts.reads),
                    top_ops=top, cuda=cuda)
 
@@ -361,6 +369,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--repeats", type=int, default=DEFAULT_REPEATS,
                    help="timed passes; the median")
     p.add_argument("--json", action="store_true", help="also print one JSON line")
+    p.add_argument("--out", type=Path, default=None,
+                   help="append the JSON line, with the machine's facts and each section's "
+                        "time per pass, to this file (default: <run dir>/check5_profile.jsonl)")
     args = p.parse_args(argv)
     if args.repeats < 1:
         p.error("need --repeats ≥ 1")
@@ -380,9 +391,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     r = profile(c, kept, bands, seed=cfg.seed, h_D=h_D, n_records=len(D), k=pc.k,
                 repeats=args.repeats, device=cfg.device)
     report(r)
+    rec = {**r.as_record(), "model": cfg.model, "device": cfg.device, "k": pc.k,
+           "step": args.step}
     if args.json:
-        print(json.dumps({**r.as_record(), "model": cfg.model, "device": cfg.device,
-                          "k": pc.k, "step": args.step}))
+        print(json.dumps(rec))
+    out = args.out or run_dir / "check5_profile.jsonl"
+    with open(out, "a") as f:
+        f.write(json.dumps({**rec, "section_s_per_pass": r.section_s_per_pass,
+                            "machine_facts": machine_facts()}) + "\n")
     return 0 if r.accepted else 1
 
 

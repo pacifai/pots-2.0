@@ -1,6 +1,7 @@
 """O2's check-5 profile: its counters on a toy function, and one profile of the MLP's stored
 step 4."""
 
+import json
 from types import SimpleNamespace
 
 import torch
@@ -64,3 +65,45 @@ def test_profile_of_the_stored_step(env, stored):  # noqa: F811
     lines: list[str] = []
     cp.report(p, out=lines.append)
     assert lines[0].startswith(f"check 5: {c.M} products") and "equal to the archive" in lines[0]
+
+
+def test_out_appends_one_line_per_call_and_stdout_is_unchanged(env, stored, monkeypatch, capsys,
+                                                               tmp_path):  # noqa: F811
+    c = env.c
+    ks = rv.load_kept_step(c, stored, step=fs.SWEEP_STEP)
+    prof = cp.profile(c, ks, env.bands, seed=SEED, h_D=env.h_D, n_records=len(env.D), k=K,
+                      repeats=2, out=QUIET)
+    cfg = SimpleNamespace(model="m", model_revision="r" * 12, device="cpu", seed=SEED,
+                          attack="a", data_dir=tmp_path, output_dir=tmp_path)
+    monkeypatch.setattr(cp, "load_config", lambda: cfg)
+    monkeypatch.setattr(cp, "load_protocol_config", lambda: SimpleNamespace(band_file=None, k=K))
+    monkeypatch.setattr(cp, "setup_determinism", lambda cfg: None)
+    monkeypatch.setattr(cp.DecoderComputation, "from_config", lambda cfg: c)
+    monkeypatch.setattr(cp, "load_committed_dataset", lambda c, d: (env.D, env.h_D))
+    monkeypatch.setattr(cp, "band_context", lambda *a, **k: {})
+    monkeypatch.setattr(cp, "load_bands", lambda *a, **k: env.bands)
+    monkeypatch.setattr(cp, "load_kept_step", lambda *a, **k: SimpleNamespace(path="p"))
+    monkeypatch.setattr(cp, "profile", lambda *a, **k: prof)
+    monkeypatch.setattr(cp, "report", lambda p, out=print: out("report"))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    base = ["--run-dir", str(run_dir), "--repeats", "2", "--json"]
+
+    cp.main(base)
+    first = capsys.readouterr().out
+    cp.main([*base, "--out", str(tmp_path / "x.jsonl")])
+    assert capsys.readouterr().out == first
+    default = run_dir / "check5_profile.jsonl"
+    lines = [json.loads(x) for x in default.read_text().splitlines()]
+    assert len(lines) == 1
+    cp.main(base)
+    capsys.readouterr()
+    lines = [json.loads(x) for x in default.read_text().splitlines()]
+    assert len(lines) == 2
+    printed = json.loads(first.splitlines()[-1])
+    for line in lines:
+        assert set(line) == set(printed) | {"machine_facts", "section_s_per_pass"}
+        assert set(line["section_s_per_pass"]) == set(cp.SECTIONS)
+        assert all(len(v) == 2 for v in line["section_s_per_pass"].values())
+        assert line["machine_facts"]["ram_total_bytes"] > 0
+    assert len((tmp_path / "x.jsonl").read_text().splitlines()) == 1
