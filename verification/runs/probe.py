@@ -74,21 +74,32 @@ def datasheet_for(gpu_name: str | None) -> dict[str, Any] | None:
     return None
 
 
-# The four full-scale models' dims: d, d_f, heads, kv heads, head dim, vocab.
-MODELS: dict[str, tuple[int, int, int, int, int, int]] = {
-    "llama-3.2-1b": (2048, 8192, 32, 8, 64, 128256),
-    "falcon3-1b": (2048, 8192, 8, 4, 256, 131072),
-    "qwen2.5-0.5b": (896, 4864, 14, 2, 64, 151936),
-    "qwen2.5-1.5b": (1536, 8960, 12, 2, 128, 151936),
-}
 TOKENS = 128 * 128  # full-scale batch: 128 sequences of 128 tokens
 
 
-def linear_shapes() -> list[tuple[str, int, int]]:
-    """``(name, k, n)`` of every distinct linear ``[tokens, k] @ [k, n]`` over the four models;
-    a shape two models share carries both names."""
+def linear_shapes(loader: Callable[[str, str], Any] | None = None,
+                  pins: Sequence[tuple[str, str]] | None = None,
+                  errors: dict[str, str] | None = None) -> list[tuple[str, int, int]]:
+    """``(name, k, n)`` of every distinct linear ``[tokens, k] @ [k, n]`` over the pinned
+    full-scale models, from their configs (``loader(repo, revision)``, default the local
+    cache's ``load_model_config``); a shape two models share carries both names. A model whose
+    config doesn't load is skipped, with its reason in ``errors["shapes:<repo>"]``."""
+    if loader is None:
+        from setup.model import load_model_config as loader
+    if pins is None:
+        from verification.runs.fs11_session import RUN_PINS as pins
     seen: dict[tuple[int, int], str] = {}
-    for model, (d, d_f, n_h, n_kv, d_h, vocab) in MODELS.items():
+    for repo, revision in pins:
+        try:
+            cfg = loader(repo, revision)
+            d, d_f, vocab = cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size
+            n_h, n_kv = cfg.num_attention_heads, cfg.num_key_value_heads
+            d_h = getattr(cfg, "head_dim", None) or d // n_h
+        except Exception as e:  # noqa: BLE001
+            if errors is not None:
+                errors[f"shapes:{repo}"] = f"{type(e).__name__}: {e}"
+            continue
+        model = repo.split("/")[-1]
         for role, k, n in (("q", d, n_h * d_h), ("kv", d, n_kv * d_h), ("o", n_h * d_h, d),
                            ("up", d, d_f), ("down", d_f, d), ("head", d, vocab)):
             key = (k, n)
@@ -165,7 +176,7 @@ def _gemm(k: int, n: int, dtype: torch.dtype, clock: Clock) -> tuple[int, float]
 def measure_gemm(share_s: float, rates: dict, errors: dict, shapes: list) -> None:
     """GEMM at every linear shape in bf16 and fp32 at the full-scale batch (a head's rows cut
     to fit 4 GiB). The rate is the best shape's, the most the device does at these sizes."""
-    todo = [(name, k, n, dt, label) for name, k, n in linear_shapes()
+    todo = [(name, k, n, dt, label) for name, k, n in linear_shapes(errors=errors)
             for dt, label in ((torch.bfloat16, "bf16"), (torch.float32, "fp32"))]
     per = share_s / len(todo)
     best: dict[str, float] = {}

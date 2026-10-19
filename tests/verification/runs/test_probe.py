@@ -1,6 +1,7 @@
 """FS22's probe: the hashing fit, the datasheet lookup, a CPU run's file, and the session part."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,13 +26,39 @@ def test_datasheet_lookup():
     assert probe.datasheet_for(None) is None
 
 
-def test_linear_shapes_and_fit_m():
-    shapes = probe.linear_shapes()
-    assert len({(k, n) for _, k, n in shapes}) == len(shapes)
-    assert any(n == 128256 for _, _, n in shapes)  # Llama's head
-    for _, k, n in shapes:
+def _cfg(d, d_f, heads, kv, vocab, head_dim=None):
+    ns = SimpleNamespace(hidden_size=d, intermediate_size=d_f, num_attention_heads=heads,
+                         num_key_value_heads=kv, vocab_size=vocab)
+    if head_dim is not None:
+        ns.head_dim = head_dim
+    return ns
+
+
+def test_linear_shapes_from_configs():
+    cfgs = {"a/x": _cfg(64, 256, 4, 2, 1000), "a/y": _cfg(64, 128, 2, 1, 500, head_dim=32)}
+
+    def loader(repo, revision):
+        if repo == "a/bad":
+            raise OSError("not in the cache")
+        return cfgs[repo]
+
+    errors = {}
+    pins = [("a/x", "r1"), ("a/bad", "r2"), ("a/y", "r3")]
+    got = probe.linear_shapes(loader, pins, errors)
+    # x: head dim 64/4 = 16, so q and o are 64 x 64 and kv 64 x 32; y: head dim 32, q 64 x 64
+    assert {(k, n): name for name, k, n in got} == {
+        (64, 64): "x.q+x.o+y.q+y.o", (64, 32): "x.kv+y.kv", (64, 256): "x.up",
+        (256, 64): "x.down", (64, 1000): "x.head", (64, 128): "y.up", (128, 64): "y.down",
+        (64, 500): "y.head"}
+    assert list(errors) == ["shapes:a/bad"] and "OSError" in errors["shapes:a/bad"]
+
+
+def test_fit_m():
+    for k, n in ((2048, 128256), (8192, 2048), (896, 151936)):
         m = probe.fit_m(k, n, 4)
         assert (m * k + k * n + m * n) * 4 <= probe.GPU_LIMIT // 2
+    assert probe.fit_m(2048, 128256, 4) < probe.TOKENS
+    assert probe.fit_m(64, 64, 4) == probe.TOKENS
 
 
 def test_cpu_run_writes_a_valid_file(tmp_path):
