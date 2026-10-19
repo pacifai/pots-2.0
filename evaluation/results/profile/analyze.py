@@ -21,11 +21,13 @@ clock and :data:`US` turns µs into s; nothing else converts.
   {...}}, "warnings"}``. Sections join on the name string; the time rows' step total is the
   share's denominator.
 - Trace work (launches, copy bytes, GEMM bytes) is the traced step's own values; check 5's
-  sections (``5``, ``5.*``) scale by ``Σ runs_total ÷ Σ runs_traced`` of ``c5_slice``.
+  sections (``5``, ``5.*``) scale by ``Σ scaled["run"] ÷ Σ phases_us["run"]`` over the classes
+  of ``c5_slice`` (estimated total run time over traced run time).
 - Copies (``memcpy_h2d``, ``memcpy_d2h``) cost at the pageable rates; ``hbm`` bytes are
   ``gemm_bytes`` plus ``memcpy_d2d``; ``hash`` bytes are ``hash_in_bytes`` plus
   ``hash_out_bytes`` of the ``count`` row; ``leaves`` come from the ``storage`` record, for
-  ``P3.commit``.
+  every section whose ``hash_in_bytes`` is at least half the step's ``transcript_bytes``
+  (the commit and check 2).
 - Syncs are 2 per top-level section call on CUDA. The hook bound's events are the ``gpu_us``
   spans (with the folded calls) plus one event pair per stamp; both are 0 off CUDA.
 - Clock times are sums of a section's marker spans over the untraced steps; the trace time is
@@ -425,6 +427,31 @@ def _occurrences(steps: list[dict[str, Any]], name: str
                 yield s, sec
 
 
+def _c5_scale(c5_slice: dict[str, Any], warns: set[str]) -> float:
+    """Estimated total check-5 run time over the traced runs' time, from the classes'
+    ``scaled`` and ``phases_us`` run sums (by members, as FS24 scales them). A class lacking
+    either is left out of both sums."""
+    est = traced = 0.0
+    for name, c in c5_slice.items():
+        phases, scaled = c.get("phases_us"), c.get("scaled")
+        if not phases or not scaled or phases.get("run") is None or scaled.get("run") is None:
+            warns.add(f"c5_slice class {name!r} lacks phases_us or scaled for run: left out")
+            continue
+        est, traced = est + scaled["run"], traced + phases["run"]
+    if est <= 0 or traced <= 0:
+        if c5_slice:
+            warns.add("c5_slice gives no run time to scale by: check 5's trace work is unscaled")
+        return 1.0
+    return est / traced
+
+
+def _hashes_transcript(count: dict[str, Any] | None, transcript_bytes: int) -> bool:
+    """A section that hashes at least half of the step's transcript bytes hashes every leaf
+    (the commit and check 2)."""
+    return bool(count) and transcript_bytes > 0 \
+        and (count.get("hash_in_bytes") or 0) >= transcript_bytes / 2
+
+
 def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampler,
               probe: dict[str, Any], trace: dict[str, Any] | None,
               layout: dict[str, Any] | None, compute_bf16: bool, gpu_memory: int | None,
@@ -437,9 +464,9 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
         if r.get("record") == "memory" and r.get("peak_reserved_bytes") is not None:
             peaks[r["component"]] = max(peaks.get(r["component"], 0), r["peak_reserved_bytes"])
     tsec = (trace or {}).get("sections", {})
-    slices = list((trace or {}).get("c5_slice", {}).values())
-    traced_n = sum(c.get("runs_traced", 0) for c in slices)
-    c5_scale = sum(c.get("runs_total", 0) for c in slices) / traced_n if traced_n else 1.0
+    c5_scale = _c5_scale((trace or {}).get("c5_slice") or {}, warns)
+    transcript = max((r["transcript_bytes"] for r in records if r.get("record") == "storage"),
+                     default=0)
 
     untraced = [s for s in markers.steps if not s["traced"]]
     traced = [s for s in markers.steps if s["traced"]]
@@ -478,7 +505,8 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
         share = mean_t / step_s if step_s and mean_t is not None else None
         calls = [sec["calls"] for _, sec in occ if depth == 0 and sec.get("gpu_us") is not None]
         work = _work(name, _rate_key(name, sides, compute_bf16), counts.get(name),
-                     leaves if name == "P3.commit" else 0, tr, c5_scale,
+                     leaves if _hashes_transcript(counts.get(name), transcript) else 0, tr,
+                     c5_scale,
                      2 * round(_mean(calls) or 0))
         floors = _floors(work, probe, warns)
         floor_s = max(floors.values()) if floors else None

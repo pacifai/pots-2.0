@@ -311,3 +311,39 @@ def test_samples_reader_skips_error_lines(tmp_path):
 def test_gemm_lane_uses_the_fraction_as_written():
     means = {"g_tensor": None, "g_util": 0.5}
     assert analyze._lane("gemm", means, {"rates": {}}) == 0.5
+
+
+def test_leaves_go_to_sections_hashing_half_the_transcript(tmp_path):
+    from tests.evaluation.results.profile.helpers import count_row
+    storage = {"record": "storage", "run": "honest", "scenario": "honest", "step": 1,
+               "transcript_bytes": 1000, "leaves": 100}
+    secs = {"P3.commit": (0.0, 0.2), "2": (0.2, 0.2), "A": (0.4, 0.2), "D": (0.6, 0.4)}
+    extra = [storage, count_row(1, "P3.commit", hash_in_bytes=1000),
+             count_row(1, "2", hash_in_bytes=500), count_row(1, "A", hash_in_bytes=499)]
+    rates = probe()["rates"] | {"hash": {"per_byte_s": 1e-9, "per_leaf_s": 1e-6, "threads": 8}}
+    _, s = run(tmp_path, secs=secs, records_extra=extra, probe_over={"rates": rates})
+    assert s["P3.commit"]["work"]["leaves"] == 100 and s["2"]["work"]["leaves"] == 100
+    assert s["A"]["work"]["leaves"] == 0 and s["D"]["work"]["leaves"] == 0
+    assert s["2"]["floors_s"]["hash"] == pytest.approx(500e-9 + 100e-6)
+    assert s["A"]["floors_s"]["hash"] == pytest.approx(499e-9)
+
+
+def test_check_5_trace_work_scales_by_run_time(tmp_path):
+    secs = {"5": (0.0, 0.5), "4": (0.5, 0.5)}
+    paths = build_run(tmp_path / "run", secs=secs)
+    cls = {"Q": {"phases_us": {"run": 100.0}, "scaled": {"run": 400.0}},
+           "K": {"phases_us": {"run": 100.0}, "scaled": {"run": 200.0}},
+           "V": {"phases_us": {"run": 50.0}, "scaled": None}}  # left out, with a warning
+    t = tmp_path / "trace_summary.json"
+    t.write_text(json.dumps({"version": 1, "c5_slice": cls, "sections": {
+        "5": {"launches": 10}, "4": {"launches": 10}}}))
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t)
+    s = out["runs"]["honest"]["sections"]
+    assert s["5"]["work"]["launches"] == pytest.approx(10 * 600 / 200)
+    assert s["4"]["work"]["launches"] == 10
+    assert sum("'V'" in w for w in out["warnings"]) == 1
+    cls = {"Q": {"phases_us": {"run": 0.0}, "scaled": {"run": 0.0}}}
+    t.write_text(json.dumps({"version": 1, "c5_slice": cls, "sections": {"5": {"launches": 10}}}))
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t)
+    assert out["runs"]["honest"]["sections"]["5"]["work"]["launches"] == 10
+    assert any("unscaled" in w for w in out["warnings"])
