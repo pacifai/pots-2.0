@@ -81,7 +81,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | var | default |
 |---|---|
 | `VERIF_DEVICE` | `cpu`. `cuda` runs the model, its activations, the replay and check 5's measuring on the GPU; every leaf stays in host memory (F1c, F4a, FS9) |
-| `VERIF_VERIFIER_DEVICES` | unset. A comma-separated list of the devices that hold the transcript and run the verifier, the replay split over them by layers (F22, FS32a). Unset or empty: today's path, leaves in host memory. Each entry is a torch device of `VERIF_DEVICE`'s type; a CUDA entry names its index (`cuda:1`) and none repeats; `cpu` may repeat (`cpu,cpu,cpu` runs every path on the Mac); `VERIF_DEVICE` itself may appear. Not a training field: config hashes don't move. Nothing reads it yet but the placement |
+| `VERIF_VERIFIER_DEVICES` | unset. A comma-separated list of the devices that hold the transcript and run the verifier, the replay split over them by layers (F22, FS32a). Unset or empty: today's path, leaves in host memory. Each entry is a torch device of `VERIF_DEVICE`'s type; a CUDA entry names its index (`cuda:1`) and none repeats; `cpu` may repeat (`cpu,cpu,cpu` runs every path on the Mac); `VERIF_DEVICE` itself may appear. Not a training field: config hashes don't move. Only the placement and the verifier's replay (FS32c) read it so far |
 | `VERIF_MODEL` | `HuggingFaceTB/SmolLM2-135M-Instruct` |
 | `VERIF_MODEL_REVISION` | `12fd25f77366fa6b3b4b768ec3050bf629380bac` |
 | `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32`. `float32` / `bfloat16` runs forward and loss under autocast (F6b, FS3); the decoder refuses any other master and fp16 compute |
@@ -905,6 +905,28 @@ interface.
     restores every buffer to its build-time value; raises `ReplayError` on any hook left on
     a module or a changed buffer set; reruns the model checks; and takes the model away from
     the previous replay (`.model = None`). The prover never gets this model.
+  - **The split replay (FS32c, F22).** With `VERIF_VERIFIER_DEVICES` set (`c.placement.sharded`)
+    the replay runs over those devices, each unit on `c.placement.unit_device(j)`; unsharded
+    nothing below applies and every result is bit-identical to before. `_replay_model` builds
+    the model on the host (`build_model(HOST)`, so it never occupies the prover's device) and
+    `_place_model` puts `embed_tokens` and the rotary module on unit 0's device, layer `j` on
+    unit `j`'s, and the final norm and `lm_head` on unit `L+1`'s. Units 0 and `L+1` share the
+    last device, so a tied `W_E` stays one `Parameter` (asserted after placing). Reuse keeps
+    each parameter and buffer on its placed device. The committed batch goes to unit 0's
+    device (`assemble(records, device)`). Only two values cross units, both through
+    `_to_unit(x, j)`: `X_j` into layer `j` (`_enter_unit`, which then compares it exactly with
+    the previous unit's output moved to that device) and `δX_{j+1}` into layer `j`'s backward
+    (`_run_unit`), with `δX_1` to unit 0 in `glue_gradients`. The layer pre-hook also moves
+    every tensor in its kwargs (position embeddings, mask, ids) to the unit's device, once per
+    device per pass (`_on`, cache cleared with the pass). The head runs on the last device, so
+    `δF_b` are on one device (`_run_norm` checks). A committed leaf is copied to the operands'
+    device as before; `replay.leaf_moves` counts the copies that crossed devices (0 when the
+    transcript is placed as the replay is). Autocast's weight copies and the weight map are
+    keyed by `(device, storage pointer)`. `glue_gradients` returns each gradient on
+    `c.placement.weight_device` of its weight (checked); the tied `W_E` sum is formed on unit
+    0's device. Tests: `tests/verification/computation/test_decoder_split_replay.py` (the Mac
+    with `cpu,cpu,cpu`, two-GPU tests skipped without two CUDA devices, an MPS smoke test that
+    skips because MPS runs `nn.Linear` as one `aten.linear` the substitution can't see).
   - `replay(leaves) -> DecoderReplay` (A8, forward products). Its own model, from the committed
     `W_t`, runs under `ProductSubstitution`, which hands back the committed leaf for each
     product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`).
