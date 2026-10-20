@@ -81,7 +81,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | var | default |
 |---|---|
 | `VERIF_DEVICE` | `cpu`. `cuda` runs the model, its activations, the replay and check 5's measuring on the GPU; every leaf stays in host memory (F1c, F4a, FS9) |
-| `VERIF_VERIFIER_DEVICES` | unset. A comma-separated list of the devices that hold the transcript and run the verifier, the replay split over them by layers (F22, FS32a). Unset or empty: today's path, leaves in host memory. Each entry is a torch device of `VERIF_DEVICE`'s type; a CUDA entry names its index (`cuda:1`) and none repeats; `cpu` may repeat (`cpu,cpu,cpu` runs every path on the Mac); `VERIF_DEVICE` itself may appear. Not a training field: config hashes don't move. Only the placement and the verifier's replay (FS32c) read it so far |
+| `VERIF_VERIFIER_DEVICES` | unset. A comma-separated list of the devices that hold the transcript and run the verifier, the replay split over them by layers (F22, FS32a). Unset or empty: today's path, leaves in host memory. Each entry is a torch device of `VERIF_DEVICE`'s type; a CUDA entry names its index (`cuda:1`) and none repeats; `cpu` may repeat (`cpu,cpu,cpu` runs every path on the Mac); `VERIF_DEVICE` itself may appear. Not a training field: config hashes don't move. The placement, the verifier's replay (FS32c), the capture routing (`prove_step` passes the placement to `MatmulCapture`) and the loop's cache release read it |
 | `VERIF_MODEL` | `HuggingFaceTB/SmolLM2-135M-Instruct` |
 | `VERIF_MODEL_REVISION` | `12fd25f77366fa6b3b4b768ec3050bf629380bac` |
 | `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32`. `float32` / `bfloat16` runs forward and loss under autocast (F6b, FS3); the decoder refuses any other master and fp16 compute |
@@ -647,8 +647,11 @@ interface.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
     imports the prover. So is `snapshot_weights(computation, model)`, the one way to copy the
     declared weights out of a model: the prover's `W_{t+1}` leaves and every run's `W_0`
-    (from a model as built). It copies them to `HOST`, host memory, where every leaf lives
-    whatever `VERIF_DEVICE` is (F1c, FS9). A12 must take `W_0` with it, as B7 does. The
+    (from a model as built). It copies each to `computation.placement.weight_device(name)`:
+    `HOST`, host memory, where every leaf lives whatever `VERIF_DEVICE` is, unsharded (F1c,
+    FS9); the weight's own GPU under `VERIF_VERIFIER_DEVICES` (F22, FS32d). Callers that hash
+    or compare `W_0` or `honest_final`'s tensors then see device tensors on a sharded run;
+    the unsharded runs are unchanged. A12 must take `W_0` with it, as B7 does. The
     prover's `W_t` leaves are the caller's `w_t` tensors where `prove_step` can share them
     (see `step.py`).
   - Units (F22, FS32a): a unit is a piece of the replay that runs on one device.
@@ -1197,6 +1200,28 @@ interface.
       which means the same on both devices.
     - On CPU no output is copied and no buffer is made, so a CPU capture is unchanged:
       every root, loss and check number below is the same bit for bit.
+    - **Sharded routing (FS32d, F22).** `MatmulCapture(..., placement=c.placement)` (the caller
+      passes it; the capture never imports the instances). Under a sharded placement a CUDA
+      product goes by peer copy to a hinted device, not to a host buffer, and `HOST_BUFFERS`
+      isn't touched. The hint (`_hint`): a weight operand (`param_name` or `param_copy`) gives
+      `weight_device(name)`, which also becomes the current unit's device; else an operand an
+      earlier op was routed with (a weight gradient's `X` is the forward linear's input; an
+      attention backward bmm reads the forward bmm's operands); else the current unit's
+      device. `rec.hint` keeps it. The output is copied whole, a bmm's in one copy so its
+      members are views of one storage on the owner, into a contiguous tensor on the
+      destination, which is `rec.out`; `rec.out_storage` stays the op's own storage. The copy
+      runs on the source device's side stream (`HostBuffers.stream`) after `wait_stream`
+      on the producing stream, because a cross-device `copy_` runs on the source device's
+      current stream; the destination is allocated on its device's current stream, which
+      `copy_` makes wait for the copy, so there's no `record_stream`. The source is held until
+      the event completes and a moved `_version` raises `MutatedCaptureError`, as for the
+      host copy. An output already on its hinted device is kept; a hinted `cpu` takes the host
+      buffer path. After labeling, `count_hint_misses(labeled, placement.product_device)`
+      counts the leaves hinted elsewhere than their owner (`summary()["hint_misses"]`,
+      sharded only; a leaf that isn't a record's output, the δK̃ transpose, is judged by the
+      device it sits on, and on the CPU not at all), and `prove_step` moves each leaf to its
+      owner; a cheat hook's result goes to its product's device first, wherever the hook built
+      it. On an honest run the count is 0. A miss costs one copy and no bit.
     - Operands are not copied. They stay on the GPU until `release_operands` in labeling,
       as before; the README's "Workflow: a run on a GPU" measures what that costs.
     - The `δK̃` leaf is a contiguous transpose made in labeling, so it is the one product
@@ -1224,21 +1249,25 @@ interface.
     the plain baseline B7 times.
   - **`W_t` sharing (O5).** The `W_t` leaves are the caller's `w_t` tensors themselves when
     each is grad-free, contiguous, not a view, owns its whole storage, matches the declared
-    dtype and shape, sits in host memory (`HOST`, FS9), and shares no storage with the
+    dtype and shape, sits on its weight's device (`placement.weight_device`: `HOST` unsharded, FS9; its GPU
+    sharded, FS32d), and shares no storage with the
     model's parameters (which the step updates in place). Any other input is copied, with
-    the same leaf bytes. The caller must not write to `w_t` until the store is dropped; the
+    the same leaf bytes, to that device. The labeled products go to `placement.product_device(m)`
+    (a no-op when the hint was right), and `W_{t+1}` is `snapshot_weights`, on each
+    weight's device. The `perturb` hook acts on the owner-resident product. The caller must not write to `w_t` until the store is dropped; the
     `_version` guard catches a write (invariant 6). In the loop, `w_t` is `W_0`, the previous
     step's `W_{t+1}` copy, or a fault's entry weights, and a test checks none of them is
     written during a run.
-  - `StepOutput` has the fields `records`, `w_t`, `products`, `w_next`, `loss` and
-    `versions`. `.leaves()` returns them in transcript order, and
+  - `StepOutput` has the fields `records`, `w_t`, `products`, `w_next`, `loss`,
+    `versions`, `capture` and `hint_misses` (the sharded routing's miss count, 0 unsharded;
+    FS32d). `.leaves()` returns them in transcript order, and
     `.assert_unmodified()` checks the versions.
   - `commit(c, step) -> MerkleTree` runs `commit_leaves`, then `step.assert_unmodified()`.
   - Faults:
     - `train_records` covers A1 and A2.
     - `perturb` replaces a committed product only; training stays honest.
     - A3 is a caller-side splice of `w_next`: `out.with_w_next(w)` (A6) stores contiguous clones
-      of `w`, keeps every other leaf, and re-takes the versions, so the splice passes
+      of `w` on each weight's device, keeps every other leaf, and re-takes the versions, so the splice passes
       `assert_unmodified`.
     - The S6f sweep perturbs at store level with `MerkleTree.update_leaf`.
   - The update identity is bit-exact only with SGD's own `add(G, alpha=−η)`. That is an
@@ -1636,16 +1665,20 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
-  - `release_device_cache(device, section=None)`: only when the run's `device` is CUDA
-    (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in the process),
-    `torch.cuda.empty_cache()` inside the section `HANDOFF_SECTION` (`"handoff.empty_cache"`),
-    once per step between the prover's role and the verifier's; elsewhere it does nothing and
-    opens no section. Prover and verifier share one process and one GPU in our runs, and the
+  - `release_device_cache(device, section=None, *, devices=None)`: only when the run's
+    `device` or any of `devices` (the sharded run's verifier devices, `c.placement.devices`;
+    FS32d) is CUDA (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in
+    the process), `torch.cuda.empty_cache()` inside the section `HANDOFF_SECTION`
+    (`"handoff.empty_cache"`), once per step between the prover's role and the verifier's.
+    One call empties every device's cache (`NativeCachingAllocator::emptyCache` loops over
+    every device's allocator, torch 2.9.1). Elsewhere it does nothing and opens no section.
+    Prover and verifier share one process and one GPU in our runs, and the
     prover's freed blocks stay cached at the prover's sizes, so a large verifier buffer may not
     fit though the GPU has the room (the first H100 session's out-of-memory errors). Its row is
     the harness's, side `run`, in no total. `run_loop` gives it the model's device
-    (`model_device`: the first parameter's, host without one); `bring_up.bias_tamper` calls it
-    with `c.device` before each `verify_step` too. `run_scenario`, `memory_run`, `bring_up`,
+    (`model_device`: the first parameter's, host without one) and `c.placement.devices`;
+    `bring_up.bias_tamper` calls it with `c.device` before each `verify_step` too.
+    `run_scenario`, `memory_run`, `bring_up`,
     `bias_tamper` and `llama_step.run_honest` pass on `release_cache` (default `None`, read
     from `VERIF_RELEASE_CACHE`); `bring_up` and `llama_step` set it from `cfg.release_cache`.
     Set `PYTORCH_ALLOC_CONF=expandable_segments:True` in the run's environment, not in

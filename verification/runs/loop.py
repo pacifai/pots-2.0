@@ -145,7 +145,8 @@ def _on_cuda(device: str | torch.device) -> bool:
     return torch.device(device).type == "cuda"
 
 
-def release_device_cache(device: str | torch.device, section: Section | None = None) -> None:
+def release_device_cache(device: str | torch.device, section: Section | None = None, *,
+                         devices: Sequence[str | torch.device] | None = None) -> None:
     """Hand the CUDA caching allocator's free blocks back to the driver, inside the metrics
     section :data:`HANDOFF_SECTION`.
 
@@ -154,9 +155,12 @@ def release_device_cache(device: str | torch.device, section: Section | None = N
     fit in any of them though the GPU has the room (the first H100 session's out-of-memory
     errors reported GiBs "reserved but unallocated"). Called once per verified step, after the
     prover's step is released and before the verifier's role begins. Only when the run's
-    ``device`` is CUDA: on any other device it does nothing and opens no section, even in a
-    process where CUDA happens to be initialized."""
-    if not _on_cuda(device):
+    ``device`` or any of ``devices`` (the sharded run's verifier devices, F22) is CUDA: with
+    none, it does nothing and opens no section, even in a process where CUDA happens to be
+    initialized. One section per step. One ``torch.cuda.empty_cache()`` call empties every
+    device's cache, because ``NativeCachingAllocator::emptyCache`` loops over every device's
+    allocator (torch 2.9.1)."""
+    if not any(_on_cuda(d) for d in (device, *(devices or ()))):
         return
     with (section or no_section)(HANDOFF_SECTION):
         torch.cuda.empty_cache()
@@ -242,7 +246,8 @@ def run_loop(
         w, loss = out.w_next, out.loss
         del out, leaves, tree_h  # the store holds the leaves; nothing else keeps the step
         if release_cache:
-            release_device_cache(device, section)  # the prover's step is gone; verifier next
+            # the prover's step is gone; the verifier is next
+            release_device_cache(device, section, devices=c.placement.devices)
         t2b = time.perf_counter()
         try:
             rej = verifier.verify_step(t, store)

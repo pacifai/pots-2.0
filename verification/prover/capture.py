@@ -117,6 +117,39 @@ committed it has dropped its leaves and every storage object of them. Operands a
 they stay on the GPU until :meth:`MatmulCapture.release_operands`. The host copy is always
 contiguous, so labeling judges the layout of the op's own output, recorded in
 :attr:`MatmulRecord.out_info`.
+
+**Products on their owner's GPU (FS32d; F22).** Under a sharded placement (``placement`` given
+and ``placement.sharded``) a GPU product goes to the GPU that will own its leaf, by peer copy,
+and no host buffer is taken. The capture doesn't know the product's index ``m`` yet, so it
+sends each output to a hinted device (:meth:`MatmulCapture._hint`) and labeling fixes a miss
+with one more copy, counted by :meth:`MatmulCapture.count_hint_misses`. The hint, per op:
+
+1. a weight operand (``param_name`` or ``param_copy``) gives ``placement.weight_device(name)``,
+   and that device becomes the current unit's;
+2. else an operand that an earlier op already routed (a weight gradient's ``X`` is the forward
+   linear's input, an attention backward bmm reads the forward bmm's operands) gives that
+   operand's device, which is the same unit's;
+3. else the current unit's device (the attention bmms of a forward layer, between its ``Y_v``
+   and ``Y_o``).
+
+A wrong hint costs a copy, never a bit. The copy:
+
+- the output is copied whole, so a ``bmm``'s members stay views of one storage on the owner,
+  into a contiguous tensor allocated on the destination, which becomes ``rec.out``;
+- it runs on the side stream of the *source* device, after ``wait_stream`` on the producing
+  stream, as above: PyTorch's cross-device ``copy_`` runs on the source device's current
+  stream, which is that side stream. The destination tensor is allocated on the destination's
+  current stream, and ``copy_`` makes that stream wait for the copy, so work on it sees the
+  finished data and the allocator can't hand the block to another tensor early. That is why
+  there's no ``record_stream``: the one stream that allocates is the one ordered after the
+  write, and leaving the ``with`` block waits for every copy on the host, so a reader on
+  any other stream sees finished data too;
+- the source is held until the event completes, and a ``_version`` moved before then raises
+  :class:`MutatedCaptureError`, as above;
+- an output already on its hinted device is kept as it is; a hint that is the host takes the
+  host-buffer path above.
+
+On CPU nothing is copied, but the hint is computed and counted all the same.
 """
 
 from __future__ import annotations
@@ -124,8 +157,9 @@ from __future__ import annotations
 import contextlib
 import sys
 from collections import Counter, deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
@@ -137,6 +171,9 @@ from verification.computation.matmul_ops import (
     REJECTED_OPS,
     TRUSTED_NAMESPACES,
 )
+
+if TYPE_CHECKING:
+    from verification.computation.placement import Placement
 
 __all__ = [
     "PHASES",
@@ -234,6 +271,8 @@ class MatmulRecord:
     versions: dict[str, int] = field(default_factory=dict, repr=False)
     # The op's own output storage, which ``out`` no longer is once it was copied to the host.
     out_storage: StorageWeakRef | None = field(default=None, repr=False, compare=False)
+    # Sharded placement only (FS32d): the device the capture hinted for this output.
+    hint: torch.device | None = field(default=None, repr=False, compare=False)
 
     @property
     def n_members(self) -> int:
@@ -353,8 +392,14 @@ class MatmulCapture(TorchDispatchMode):
     """Passthrough dispatch mode recording every matmul of a forward + backward."""
 
     def __init__(self, param_names: Mapping[int, str] | None = None,
-                 buffers: HostBuffers | None = None) -> None:
+                 buffers: HostBuffers | None = None,
+                 placement: Placement | None = None) -> None:
         super().__init__()
+        # Only a sharded placement routes (FS32d); unsharded, the capture is as before.
+        self.placement = placement if placement is not None and placement.sharded else None
+        self.n_hint_misses: int | None = None
+        self._unit_device: torch.device | None = None  # the current unit's, by the last weight op
+        self._operand_device: dict[int, torch.device] = {}  # operand storage ptr -> its hint
         self.param_names: Mapping[int, str] = dict(param_names or {})
         self.buffers = HOST_BUFFERS if buffers is None else buffers
         self.records: list[MatmulRecord] = []
@@ -476,8 +521,71 @@ class MatmulCapture(TorchDispatchMode):
         self._by_index[rec.index] = rec
         self._n_calls += 1
         (self.glue_outer if q == 1 else self.records).append(rec)
+        if self.placement is not None:
+            rec.hint = self._hint(rec)
         if out.is_cuda:
-            self._offload(rec)
+            if rec.hint is None or rec.hint.type == "cpu":
+                self._offload(rec)
+            else:
+                self._route(rec)
+
+    def _hint(self, rec: MatmulRecord) -> torch.device:
+        """The device to send ``rec``'s output to (module docstring). Operand storages are held
+        by the records until :meth:`release_operands`, so a pointer here is never reused."""
+        place = self.placement
+        assert place is not None
+        dev = None
+        for info in (rec.b_info, rec.a_info):
+            name = info.param_name or info.param_copy
+            if name is not None:
+                with contextlib.suppress(KeyError):
+                    dev = self._unit_device = place.weight_device(name)
+                    break
+        if dev is None:
+            dev = next((d for info in (rec.b_info, rec.a_info)
+                        if (d := self._operand_device.get(info.storage_ptr)) is not None), None)
+        if dev is None:
+            dev = self._unit_device or place.devices[-1]  # type: ignore[index]
+        for info in (rec.a_info, rec.b_info):
+            self._operand_device.setdefault(info.storage_ptr, dev)
+        return dev
+
+    def count_hint_misses(self, leaves: Sequence[torch.Tensor],
+                          device_of: Callable[[int], torch.device]) -> int:
+        """Count the leaves (``P_1..P_M``, as labeling returned them) whose hinted device is not
+        ``device_of(m)``, and keep the count for :meth:`summary`. A leaf that is a record's
+        output (or a view of it) is judged by that record's hint, so a CPU run checks the hint
+        too; any other leaf (the δK̃ transpose, a new tensor) by the device it sits on, and not at
+        all on the CPU."""
+        hints = {StorageWeakRef(r.out.untyped_storage()): r.hint
+                 for r in self.records + self.glue_outer if r.hint is not None}
+        miss = 0
+        for m, p in enumerate(leaves, 1):
+            at = hints.get(StorageWeakRef(p.untyped_storage()))
+            if at is None and p.device.type == "cpu":
+                continue  # a new CPU tensor was never sent anywhere: nothing to judge
+            miss += (p.device if at is None else at) != device_of(m)
+        self.n_hint_misses = miss
+        return miss
+
+    def _route(self, rec: MatmulRecord) -> None:
+        """Peer-copy a GPU output to ``rec.hint``, whole, on the source device's side stream;
+        ``rec.out`` becomes the copy (module docstring)."""
+        out, dest = rec.out, rec.hint
+        assert dest is not None
+        if out.device == dest:
+            return  # already on its owner: kept, as on CPU
+        side = self.buffers.stream(out.device)
+        side.wait_stream(torch.cuda.current_stream(out.device))  # the op that wrote it
+        with torch.cuda.stream(side):
+            moved = torch.empty(out.shape, dtype=out.dtype, device=dest)
+            moved.copy_(out, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(side)
+        self._pending.append((rec, out, out._version, done))
+        rec.out = moved
+        rec.versions["out"] = moved._version
+        self._drain(block=False)
 
     def _offload(self, rec: MatmulRecord) -> None:
         """Copy a GPU output into a host buffer on the side stream; ``rec.out`` becomes it."""
@@ -599,4 +707,4 @@ class MatmulCapture(TorchDispatchMode):
             "q_min": min(qs) if qs else None,
             "q_max": max(qs) if qs else None,
             "output_bytes": sum(r.out.numel() * r.out.element_size() for r in self.records),
-        }
+        } | ({} if self.placement is None else {"hint_misses": self.n_hint_misses})
