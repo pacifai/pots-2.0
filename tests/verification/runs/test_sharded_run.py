@@ -65,16 +65,17 @@ def forge(which):
     return edit
 
 
-def _tiny(devices):
+def _tiny(devices, device="cpu"):
     torch.manual_seed(0)
-    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3, verifier_devices=devices)
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3, device=device,
+                           verifier_devices=devices)
     D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
     return c, D, c.build_model
 
 
-def run(devices, edit=None):
-    """A verified run: ``(rejection, loss list, roots, stats)`` under judged provisional bands."""
-    c, D, build = _tiny(devices)
+def run(devices, edit=None, device="cpu"):
+    """A verified run under provisional bands: ``(c, loop result, verifier, hand-off)``."""
+    c, D, build = _tiny(devices, device)
     model = build()
     randomize_biases(dict(model.named_parameters()))
     w0 = snapshot_weights(c, model)
