@@ -241,3 +241,38 @@ def test_product_run_through_a_reader_without_tensor_run():
     plain = TranscriptView(c, Plain())
     assert torch.equal(plain.product_run(m0, st, n), _loop(view, m0, st, n))
     assert torch.equal(plain.product_run(m0, st, n, own=True), _loop(view, m0, st, n))
+
+
+def test_product_run_catches_a_write_when_leaves_have_their_own_version_counters():
+    """``torch.load`` rebuilds tensors over one shared storage, each with its own ``_version``:
+    a write into a middle leaf moves only that leaf's counter, and the range read must see it."""
+    import io
+
+    m0, st = _member_run("dQ")
+    c, view, _, (big,) = _decoder_view([(m0, st)])
+    n = c.n_s * c.n_h
+    buf = io.BytesIO()
+    torch.save(list(big.unbind(0)), buf)
+    buf.seek(0)
+    loaded = torch.load(buf)
+    assert len({t.untyped_storage().data_ptr() for t in loaded}) == 1
+    leaves = CommittedLeaves()
+    for i in range(c.product_index(m0)):
+        leaves.add(torch.zeros(1))
+    for i in range(n):
+        leaves.add(loaded[i])
+        if i < n - 1:
+            for _ in range(st - 1):
+                leaves.add(torch.zeros(1))
+    from verification.transcript.reader import TranscriptView
+    v = TranscriptView(c, leaves)
+    assert torch.equal(v.product_run(m0, st, n), torch.stack(loaded))
+    before = [t._version for t in loaded]
+    loaded[n // 2].add_(1)
+    after = [t._version for t in loaded]
+    assert [i for i in range(n) if after[i] != before[i]] == [n // 2]  # only its own counter
+    with pytest.raises(StoreMutationError) as want:
+        torch.stack([v.product(m0 + st * i) for i in range(n)])
+    with pytest.raises(StoreMutationError) as got:
+        v.product_run(m0, st, n)
+    assert str(got.value) == str(want.value)

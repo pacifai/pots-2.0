@@ -389,27 +389,29 @@ class CommittedLeaves:
         return stack_block(ts, own)
 
     def tensor_run(self, first: int, stride: int, n: int, own: bool = False) -> torch.Tensor:
-        """:meth:`tensor_block` of the leaves ``first + stride·k``, ``k < n``, without a
-        per-leaf loop when they are one bmm's members.
+        """:meth:`tensor_block` of the leaves ``first + stride·k``, ``k < n``, without its
+        per-leaf checks of shape, offset and storage when they are one bmm's members.
 
         The first read of a range proves, once, that the leaves are equal-shape contiguous
         tensors at storage offsets ``off + k·numel`` of one storage, 64-byte aligned (the
         conditions of :func:`stack_block`), and that every recorded ``_version`` is the same
-        number. Later reads then compare one leaf's ``_version`` to it. That one read stands
-        for all of them: tensors that are views of one storage share one version counter, so
-        a write through any alias moves every member's, and the counters never go back.
-        Any mismatch, and any range the proof fails on, takes the per-leaf path, which raises
-        for the first changed leaf, with its index, exactly as a loop of :meth:`leaf` does.
-        The proofs are kept on this object, so none outlives the step's committed leaves.
+        number. That structure can't change, so the proof is kept. Every read still compares
+        each leaf's own ``_version`` to the recorded one: sharing a storage does not mean
+        sharing a version counter (``torch.load`` and ``set_`` give each tensor its own
+        counter over one storage, so a write through one leaf would leave the others' unmoved).
+        Any mismatch, and any range the proof fails on, takes :meth:`tensor_block`, which
+        raises for the first changed leaf, with its index, exactly as a loop of :meth:`leaf`
+        does. The proofs are kept on this object, so none outlives the step's leaves.
         """
         key = (first, stride, n)
+        last = first + stride * (n - 1)
         runs = self._runs
         if key not in runs:
             runs[key] = self._prove_run(first, stride, n)
         desc = runs[key]
         if desc is not None:
             t0, version, shape, strides, off = desc
-            if t0._version == version:
+            if all(t._version == version for t in self._objs[first:last + 1:stride]):
                 out = t0.as_strided((n, *shape), strides, off)
                 return out.clone() if own else out
         return self.tensor_block([first + stride * k for k in range(n)], own)
