@@ -1454,9 +1454,16 @@ class DecoderReplay(Replay):
             out = None
             if name in self._want:
                 out = self.view.product_block([c.m_of(f"{name}[{s},{h}]")
-                                               for s, h in c._members()], own=True)
+                                               for s, h in c._members()],
+                                              own=a.device.type == "cpu" and role != "dK")
                 if role == "dK":  # the op computes δK̃ᵀ = Q̃ᵀ·δS; the leaves hold δK̃
-                    out = out.transpose(1, 2).contiguous()
+                    # The transpose copy is the fresh tensor on the host; elsewhere the move
+                    # to the device comes first, so the copy is made there.
+                    blk = out.to(a.device) if out.device != a.device else out
+                    out = blk.transpose(1, 2).contiguous()
+                    if out.untyped_storage().data_ptr() == blk.untyped_storage().data_ptr():
+                        out = out.clone()  # a size-1 dimension: contiguous() copied nothing
+                        # (on the host that storage may be a committed leaf's)
         if out is None or name in self._bops:
             raise ReplayError(f"replay: backward product {name} is not declared in this unit "
                               f"or appears twice")
