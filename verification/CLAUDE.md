@@ -461,8 +461,8 @@ interface.
     its host twin's.
   - `tensor_leaf_header(tag, t)` and `tensor_leaf_payload(t)`. The payload is a zero-copy view
     that aliases `t` (a device leaf's host copy), so don't mutate `t` until it is hashed. The
-    tensor must be contiguous. The finiteness check (`_all_finite`) tests that the max and min are finite.
-    A max or min propagates NaN, so it rejects exactly what `isfinite(t).all()` rejects, with
+    tensor must be contiguous. The finiteness check (`_all_finite`) tests that the max and min
+    are finite. A max or min propagates NaN, so it rejects exactly what `isfinite(t).all()` rejects, with
     no temporary. fp32 and fp16 use numpy's single-threaded `max` and `min`, about 3× faster
     than `torch.aminmax`; bf16 uses `torch.aminmax`. The check stays on the calling thread:
     moving it into the hashing workers (O6) made commit and check 2 about 3× slower, because
@@ -484,9 +484,17 @@ interface.
     synchronizes on them. Without CUDA (MPS, a fake) `put` is a plain `copy_`.
   - `StagingPool` (`POOL`) hands out and takes back the buffers, used from the calling thread
     only. A batch stages at most `_BATCH_BYTES`, and at most the batches in flight plus one
-    (3) buffers exist, reused across batches and steps; a buffer returns to the pool only
-    once the batch that read it is hashed (`collect`, or the end of the call, which drains any
-    copy still queued). A leaf larger than a batch gets a buffer of its own, not pooled.
+    (3) pooled buffers exist, reused across batches and steps; a buffer returns to the pool
+    only once the batch that read it is hashed (`collect`, or the end of the call, which
+    drains any copy still queued). A leaf larger than a batch is the exception: it gets a
+    pinned buffer of its own, outside the pool and the count of 3. Torch's pinned allocator
+    rounds that buffer up to a power of two and caches it after the call, so a run of such
+    leaves holds pinned memory until the process ends (the pool-size item F21 decides this).
+  - With `wait_each` False a stage's side stream waits on the current stream once per device
+    per batch, not once per leaf. The native path sets it for a list or tuple input (commit
+    hashing passes `list(enumerate(leaves))`); a lazy iterable keeps the per-leaf wait. No
+    `record_stream` is needed: the batch keeps every source tensor until its event has
+    completed, and `finally` drains every stage, so the allocator cannot reuse a source.
 - `merkle.py` (B2, merged):
   - `hash_leaf(*parts)` streams its inputs, and runs multithreaded at 16 MiB and above with
     the same digest.
@@ -540,7 +548,10 @@ interface.
     `native.disabled()` both functions take the Python path (`hash_leaves`,
     `hash_leaves_until_error`), the reference; `metrics.counting()` runs it so its counters see
     every hash. It reads a device leaf through `host_tensor` and holds each leaf's host copy
-    until its chunk is hashed, so it is for test scale and the counting pass.
+    until its chunk is hashed. At most `_MAX_PENDING` (2) chunks are unfinished besides the
+    one being filled (about 16 MiB each, a bigger leaf making a bigger chunk), so the host
+    copies stay bounded. The counting pass runs it on a whole full-scale step, so that bound
+    is what keeps its host memory flat.
   - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
   - `transcript_root(c, reader)` is check 2.
   - `commit_leaves(c, leaves) -> MerkleTree`.
@@ -1233,8 +1244,8 @@ interface.
     failed write deletes `dir`. `DiskStore(dir)` opens one. Not part of any commitment.
     - A device leaf is saved as its host copy (`host_tensor`), so its file and `leaf(i)` are
       its host twin's. A tensor that doesn't own its whole storage (a `bmm` member, a slice of
-      `D`) is cloned before saving, because `torch.save` writes the whole storage. A `Record` is saved as a
-      dict of its three tensors and rebuilt (and so revalidated) on load.
+      `D`) is cloned before saving, because `torch.save` writes the whole storage. A `Record`
+      is saved as a dict of its three tensors and rebuilt (and so revalidated) on load.
     - `leaf(i)` loads the file on every call (`weights_only=True`, CPU, no `mmap`, no cache),
       so each read is a fresh tensor sharing no memory. A missing file is `IndexError`; an
       unloadable file or a foreign object is `LeafReadError`. `root` and `dataset_path`
@@ -1266,7 +1277,8 @@ interface.
     one storage as one strided view on whatever device the storage is on: the proof drops the
     old CPU-only condition and keeps shape, dtype, offsets, contiguity, the 64-byte alignment,
     one storage, one device and the recorded `_version`s. A bmm's members that stay views of
-    one storage on the owner device are served with no stack copy. The root comparison writes `recomputed_root`. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
+    one storage on the owner device are served with no stack copy. The root comparison writes
+    `recomputed_root`. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
     normalized residual, κ and ρ, which is P10b's calibration feed. `ProductStat` also
     carries each product's scale for C1's realized floor: `q`, `p_norm` (`‖P‖_F`), `nu`,
     `p_abs1` (`‖|P|·1‖`) and `u`, the term scale `U` (F18). `q`, `p_norm` and `u` set the

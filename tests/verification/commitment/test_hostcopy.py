@@ -3,6 +3,7 @@ errors, through one host copy. ``fake`` treats CPU tensors as device leaves (the
 runs, the bytes never leave the host); ``mps`` and ``cuda`` run where the machine has them."""
 
 import contextlib
+import gc
 
 import pytest
 import torch
@@ -144,8 +145,8 @@ def test_cpu_tensor_passes_through_without_a_copy(dtype):
     t = torch.arange(12).to(dtype).reshape(3, 4)
     assert host_tensor(t) is t
     assert not hostcopy.on_device(t)
-    assert bytes(tensor_leaf_payload(t)) == t.view(torch.int8).numpy().tobytes() \
-        if dtype != torch.bfloat16 else True
+    want = t.contiguous().view(torch.uint8).numpy().tobytes()  # raw bytes, bf16 included
+    assert bytes(tensor_leaf_payload(t)) == want
 
 
 def test_device_tensor_is_copied_and_equal(dev, monkeypatch):
@@ -321,6 +322,60 @@ def test_leaves_on_two_devices_in_one_call():
                 leaf_hashes_until_error(c, enumerate(placed))[1])
 
 
+# ---- backpressure on the Python path ----------------------------------------------------------
+
+
+class _Buf(bytearray):
+    """A part that counts how many are alive: the stand-in for a leaf's host copy."""
+
+    live = 0
+    peak = 0
+
+    def __init__(self, n):
+        super().__init__(n)
+        type(self).live += 1
+        type(self).peak = max(type(self).peak, type(self).live)
+
+    def __del__(self):
+        type(self).live -= 1
+
+
+@pytest.mark.parametrize("fail_at", [None, 150])
+def test_python_path_bounds_the_live_host_copies(monkeypatch, fail_at):
+    import time
+
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 4)
+    monkeypatch.setattr(merkle, "_CHUNK_BYTES", 1024)
+    hash_chunk = merkle._hash_chunk
+
+    def slow(chunk):
+        time.sleep(0.02)  # the workers are slower than the producer
+        return hash_chunk(chunk)
+
+    monkeypatch.setattr(merkle, "_hash_chunk", slow)
+    n, size, per_chunk = 200, 256, 4
+    _Buf.live = _Buf.peak = 0
+
+    def produce():
+        for i in range(n):
+            if i == fail_at:
+                raise ValueError("producer failed")
+            yield (_Buf(size),)
+
+    digests, err = merkle.hash_leaves_until_error(produce())
+    cut = n if fail_at is None else fail_at
+    assert digests == [merkle.hash_leaf(bytes(size))] * cut
+    assert (err is None) == (fail_at is None)
+    if err is not None:
+        assert str(err) == "producer failed"
+    # the chunk being filled, the pending ones, and the one just collected
+    assert _Buf.peak <= (merkle._MAX_PENDING + 2) * per_chunk + per_chunk
+    assert _Buf.peak < n // 2  # without the cap the producer would run far ahead
+    err = None  # the error's traceback and the frame form a cycle that holds the last chunk
+    gc.collect()
+    assert _Buf.live == 0
+
+
 # ---- zero-copy runs -------------------------------------------------------------------------
 
 
@@ -399,3 +454,44 @@ def test_synchronous_copy_checks_the_version(dev, monkeypatch):
         monkeypatch.setattr(torch.Tensor, "to", to)
         with pytest.raises(StoreMutationError):
             host_tensor(t)
+
+
+# ---- CUDA only: ordering on the current stream ------------------------------------------------
+
+
+@pytest.mark.skipif(not _HAS["cuda"], reason="no cuda")
+@needs_native
+@pytest.mark.parametrize("lazy", [False, True])
+def test_cuda_leaf_made_on_the_current_stream_needs_no_sync(lazy):
+    n = 8192
+    c = _Stub([(n, n)], torch.float32)
+    x = torch.randn(n, n, device="cuda") / n ** 0.5
+    y = x
+    for _ in range(30):  # a long chain, so the copy would start long before it ends
+        y = y @ x
+    rec = Record(torch.arange(4, dtype=torch.int32), torch.arange(4, dtype=torch.int32),
+                 torch.ones(4, dtype=torch.int32))
+    leaves = [rec, x, y, y @ x]  # record, W_t, product, W_{t+1}; the last two are unsynced
+    items = list(enumerate(leaves))
+    got = leaf_hashes_of(c, iter(items) if lazy else items)  # no synchronize before this
+    torch.cuda.synchronize()
+    twin = [leaves[0]] + [t.cpu() for t in leaves[1:]]
+    assert got == leaf_hashes_of(c, list(enumerate(twin)))
+
+
+@pytest.mark.skipif(not _HAS["cuda"], reason="no cuda")
+def test_cuda_check_5_measure_on_a_stacked_view_equals_torch_stack():
+    from verification.verifier.matmul_check.freivalds import measure_products_rows
+
+    B, n, q, w = 6, 64, 48, 32
+    a = torch.randn(B, n, q, device="cuda")
+    b = torch.randn(B, q, w, device="cuda")
+    p = torch.bmm(a, b)
+    members = [p[i] for i in range(B)]
+    view = stack_block(members)
+    assert view.data_ptr() == p.data_ptr()  # a view of the bmm block
+    copy = torch.stack(members)
+    kw = dict(h=b"\x01" * 32, ms=list(range(1, B + 1)), k=4)
+    rows_view = measure_products_rows(a, b, view, **kw)
+    rows_copy = measure_products_rows(a, b, copy, **kw)
+    assert rows_view.cpu().numpy().tobytes() == rows_copy.cpu().numpy().tobytes()

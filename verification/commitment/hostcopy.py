@@ -71,13 +71,14 @@ class Stage:
     until every queued copy has completed.
     """
 
-    __slots__ = ("buf", "used", "pooled", "sides", "events", "fenced", "released")
+    __slots__ = ("buf", "used", "pooled", "sides", "events", "fenced", "released", "wait_each")
 
     def __init__(self, buf: torch.Tensor, pooled: bool) -> None:
         self.buf = buf
         self.used = 0
         self.pooled = pooled
         self.sides: dict[torch.device, torch.cuda.Stream] = {}
+        self.wait_each = True
         self.events: list[torch.cuda.Event] = []
         self.fenced = False
         self.released = False
@@ -87,7 +88,11 @@ class Stage:
 
     def put(self, t: torch.Tensor) -> torch.Tensor:
         """Queue ``t``'s copy and return the host tensor (``t``'s shape and dtype) over its
-        staged bytes. The caller reads ``t._version`` first and checks it after :meth:`wait`."""
+        staged bytes. The caller reads ``t._version`` first and checks it after :meth:`wait`.
+
+        The copy runs after the work queued on the current stream so far. With ``wait_each``
+        False the caller says every leaf of this stage already existed when the first was put,
+        so the side stream waits once per device, at that first put, not once per leaf."""
         n = t.nbytes
         off = _align(self.used)
         if off + n > self.buf.numel():
@@ -98,10 +103,14 @@ class Stage:
             src = t.detach()
             if t.device.type == "cuda":
                 side = _side_stream(t.device)
-                side.wait_stream(torch.cuda.current_stream(t.device))  # the leaf's producers
+                if self.wait_each or t.device not in self.sides:
+                    side.wait_stream(torch.cuda.current_stream(t.device))  # the leaf's producers
                 with torch.cuda.stream(side):
                     host.copy_(src, non_blocking=True)
-                src.record_stream(side)
+                # No ``record_stream``: the caller holds ``t`` until the copy is done (the
+                # native path keeps it in ``_Batch.tensors`` until its event has completed,
+                # and its ``finally`` drains every stage before returning), so the caching
+                # allocator cannot reuse ``t``'s memory under the copy.
                 self.sides[t.device] = side
             else:
                 host.copy_(src)

@@ -10,6 +10,7 @@ while it hashes, so the workers run in parallel. Each digest is the one `hash_le
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 
@@ -30,6 +31,9 @@ _MT_THRESHOLD = 16 << 20
 # `hash_leaves` hands leaves to the workers in chunks of about this many bytes, so the many
 # small leaves (32–64 KB attention products) don't each pay a task's overhead.
 _CHUNK_BYTES = 16 << 20
+# At most this many chunks are submitted and not yet collected, so the parts they alias (host
+# copies of device leaves, on the Python path) stay bounded.
+_MAX_PENDING = 2
 
 LeafParts = Sequence[bytes | memoryview]
 
@@ -98,7 +102,28 @@ def hash_leaves_until_error(leaves: Iterable[LeafParts]) -> tuple[list[bytes], E
             return out, e
         return out, None
     pool = _executor(workers)
-    futures: list[Future[tuple[list[bytes], Exception | None]]] = []
+    futures: deque[Future[tuple[list[bytes], Exception | None]]] = deque()
+    digests: list[bytes] = []
+    first_error: Exception | None = None
+
+    def stop_after() -> None:
+        """A chunk failed: later chunks can't change the outcome; wait for them."""
+        later = list(futures)
+        futures.clear()
+        for f in later:
+            f.cancel()
+        for f in later:
+            if not f.cancelled():
+                f.exception()  # wait; the parts alias leaves the caller may change next
+
+    def collect() -> None:
+        nonlocal first_error
+        hs, err = futures.popleft().result()
+        digests.extend(hs)
+        if err is not None:
+            first_error = err
+            stop_after()
+
     chunk: list[LeafParts] = []
     size = 0
     producer_error: Exception | None = None
@@ -109,30 +134,21 @@ def hash_leaves_until_error(leaves: Iterable[LeafParts]) -> tuple[list[bytes], E
             if size >= _CHUNK_BYTES:
                 futures.append(pool.submit(_hash_chunk, chunk))
                 chunk, size = [], 0
+                # Backpressure: the parts alias host copies of device leaves, so the chunks
+                # not yet collected bound how many of those are alive.
+                while len(futures) > _MAX_PENDING and first_error is None:
+                    collect()
+                if first_error is not None:
+                    break
     except Exception as e:
         producer_error = e
     except BaseException:
-        for f in futures:
-            f.cancel()
-        for f in futures:
-            if not f.cancelled():
-                f.exception()  # wait; the parts alias leaves the caller may change next
+        stop_after()
         raise
-    if chunk:  # also after a producer error: the items before it are still hashed
+    if chunk and first_error is None:  # also after a producer error: the items before it
         futures.append(pool.submit(_hash_chunk, chunk))
-    digests: list[bytes] = []
-    first_error: Exception | None = None
-    for n, f in enumerate(futures):
-        hs, err = f.result()
-        digests.extend(hs)
-        if err is not None:
-            first_error = err
-            for later in futures[n + 1:]:  # later leaves can't change the outcome
-                later.cancel()
-            for later in futures[n + 1:]:
-                if not later.cancelled():
-                    later.exception()  # wait, as above
-            break
+    while futures and first_error is None:
+        collect()
     if first_error is None:
         first_error = producer_error
     return digests, first_error

@@ -356,6 +356,10 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     :class:`HashStats`. The worker's fields are written by the worker thread alone and read here
     after the final sync, which orders them.
     """
+    # Every leaf of a list or tuple exists before the call, so one stream wait per device and
+    # batch orders the copies after the work that produced them; a lazy iterable may produce
+    # leaves as it is read, so each leaf waits.
+    materialised = isinstance(items, (list, tuple))
     if stats is not None:
         items = _observed(items, stats)
         t_start, w0, r0 = perf_counter(), stats.wait_s, stats.read_s
@@ -444,6 +448,7 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
                         if stage is None:
                             stage = batch.stage = hostcopy.POOL.acquire(
                                 batch_bytes, nbytes, obj.device.type == "cuda")
+                            stage.wait_each = not materialised
                             stages.append(stage)
                         version = obj._version  # read as the copy is queued
                         src = stage.put(obj)
@@ -471,6 +476,8 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
         while pending and state[0] is None:
             collect()
     finally:
+        # An interrupt can land anywhere in here, even between ``submit`` and ``pending.append``;
+        # the FIFO job below covers a batch whose future never reached ``pending``.
         # Never return or raise while a worker still reads the tensors. The worker is one FIFO
         # thread, so a job queued now ends after every batch ever submitted, even one whose
         # future an interrupt kept out of ``pending``.
@@ -508,7 +515,7 @@ def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
     if len(leaves) != c.n_leaves:
         raise ValueError(f"transcript has {len(leaves)} leaves, the computation declares "
                          f"{c.n_leaves}")
-    return leaf_hashes_of(c, enumerate(leaves), stats)
+    return leaf_hashes_of(c, list(enumerate(leaves)), stats)
 
 
 def commit_leaves(c: DeclaredComputation, leaves: Sequence[Any]) -> MerkleTree:
