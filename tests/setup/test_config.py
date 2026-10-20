@@ -86,10 +86,37 @@ def test_eta_defaults_to_declared_value():
     ("VERIF_ATTACK", "advbench"), ("VERIF_ATTACK", ""), ("VERIF_POISON_COUNT", "0"),
     ("VERIF_HEAD_BLOCKS", "0"), ("VERIF_HEAD_BLOCKS", "two"),
     ("VERIF_TRACE_STEP", "-1"), ("VERIF_TRACE_STEP", "x"), ("VERIF_TRACE_C5", "some"),
+    ("VERIF_VERIFIER_DEVICES", "cuda"), ("VERIF_VERIFIER_DEVICES", "cuda:1,cuda:1"),
+    ("VERIF_VERIFIER_DEVICES", "cpu,,cpu"), ("VERIF_VERIFIER_DEVICES", "cpu,"),
+    ("VERIF_VERIFIER_DEVICES", "tpu9"), ("VERIF_VERIFIER_DEVICES", "cuda:x"),
 ])
 def test_invalid_values_raise(name, value):
     with pytest.raises(ValueError, match=name):
         load_config({name: value})
+
+
+def test_verifier_devices_default_and_empty_are_none():
+    assert load_config({}).verifier_devices is None
+    assert load_config({"VERIF_VERIFIER_DEVICES": ""}).verifier_devices is None
+    assert load_config({"VERIF_VERIFIER_DEVICES": "  "}).verifier_devices is None
+
+
+def test_verifier_devices_lists():
+    def parse(value, device="cpu"):
+        return load_config({"VERIF_DEVICE": device,
+                            "VERIF_VERIFIER_DEVICES": value}).verifier_devices
+    assert parse("cpu") == ("cpu",)
+    assert parse("cuda:1", "cuda:0") == ("cuda:1",)
+    assert parse("cuda:1,cuda:2,cuda:3", "cuda:0") == ("cuda:1", "cuda:2", "cuda:3")
+    assert parse(" cuda:1 , cuda:0 ", "cuda:0") == ("cuda:1", "cuda:0")
+    assert parse("cpu,cpu,cpu") == ("cpu", "cpu", "cpu")
+
+
+def test_verifier_devices_must_match_the_device_type():
+    with pytest.raises(ValueError, match="VERIF_VERIFIER_DEVICES.*device type"):
+        load_config({"VERIF_VERIFIER_DEVICES": "cuda:1"})
+    with pytest.raises(ValueError, match="VERIF_VERIFIER_DEVICES.*device type"):
+        load_config({"VERIF_DEVICE": "cuda:0", "VERIF_VERIFIER_DEVICES": "cpu"})
 
 
 def test_setup_determinism():
