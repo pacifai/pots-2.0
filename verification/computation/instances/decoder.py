@@ -480,6 +480,27 @@ class DecoderComputation(DeclaredComputation):
     def m_of(self, name: str) -> int:
         return self._m_by_name[name]
 
+    @cached_property
+    def member_runs(self) -> dict[tuple[int, str], tuple[int, int]]:
+        """``(ℓ, role) -> (m₀, stride)`` for each attention run whose members sit evenly spaced.
+
+        Member ``i = s·n_h + h`` of the run is product ``m₀ + stride·i``. The forward roles
+        have stride 1, and the backward ones 2 (``dA``/``dV`` and ``dQ``/``dK`` alternate per
+        member). A run in another layout is left out, and labeling fills it member by member.
+        """
+        runs: dict[tuple[int, str], list[tuple[int, tuple[int, int]]]] = {}
+        for spec, role in zip(self.products, self._inventory[1]):
+            if spec.member is not None:
+                runs.setdefault((spec.layer, role), []).append((spec.m, spec.member))
+        members = list(self._members())
+        out = {}
+        for key, run in runs.items():
+            stride = run[1][0] - run[0][0] if len(run) > 1 else 1
+            if [mem for _, mem in run] == members and stride > 0 \
+                    and all(m == run[0][0] + stride * i for i, (m, _) in enumerate(run)):
+                out[key] = (run[0][0], stride)
+        return out
+
     def product_class(self, spec: ProductSpec) -> str:
         """κ class (P3.c): the product's role, the same in every layer and member.
 
@@ -943,10 +964,47 @@ class _Labeler:
                                 f"n_s·n_h = {c.n_s * c.n_h}")
         # δK̃: the record holds δK̃ᵀ; one contiguous transpose of the whole batch gives the leaves.
         leaves = rec.out.transpose(1, 2).contiguous() if transposed else None
+        if self._fill_run(l, role, rec, leaves):
+            return
         for i, (a, b, out) in enumerate(rec.members()):
             s, h = divmod(i, c.n_h)
             self._fill(f"L{l}.{role}[{s},{h}]", a, b, out, rec,
                        leaf=None if leaves is None else leaves[i])
+
+    def _fill_run(self, l: int, role: str, rec: MatmulRecord,
+                  leaves: torch.Tensor | None) -> bool:
+        """Fill a whole member run at once, or return ``False`` and leave every slot alone.
+
+        The shape, dtype and contiguity checks of ``_fill`` are the same for every member of a
+        run, so they are made once on the batch tensors. Anything unusual (a run whose products
+        aren't evenly spaced, a filled slot, a bad batch tensor) returns ``False``, and the
+        per-member loop then raises exactly the error it always did.
+        """
+        c = self.c
+        run = c.member_runs.get((l, role))
+        if run is None:
+            return False
+        m0, stride = run
+        n = c.n_s * c.n_h
+        spec = c.products[m0 - 1]
+        a, b, out = rec.a, rec.b, rec.out
+        if a is None or b is None or out is None:
+            return False
+        want = (spec.a_shape, spec.b_shape, spec.p_shape)
+        if leaves is not None:
+            want = tuple(s[::-1] for s in (spec.b_shape, spec.a_shape, spec.p_shape))
+        if tuple(t.shape for t in (a, b, out)) != tuple((n, *w) for w in want):
+            return False
+        p = out if leaves is None else leaves
+        if tuple(p.shape) != (n, *spec.p_shape) or p.dtype != c.product_dtype:
+            return False
+        if not (_contiguous(*_out_layout(rec)) if leaves is None else p[0].is_contiguous()):
+            return False
+        idx = slice(m0 - 1, m0 - 1 + stride * n, stride)
+        if any(t is not None for t in self.slots[idx]):
+            return False
+        self.slots[idx] = p.unbind(0)
+        return True
 
     # ---- backward --------------------------------------------------------------------------
 

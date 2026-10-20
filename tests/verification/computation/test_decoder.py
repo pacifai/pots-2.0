@@ -468,6 +468,97 @@ def test_label_rejects_tampered_capture(setup, tamper):
     model.zero_grad(set_to_none=True)
 
 
+def _label_by(c, cap, model, runs):
+    """``c.label`` with ``member_runs`` set to ``runs`` (``{}``: every member filled alone);
+    returns the slots, or the ``LabelingError`` raised."""
+    saved = c.__dict__.pop("member_runs", None)
+    c.__dict__["member_runs"] = runs
+    try:
+        return c.label(cap, model)
+    except LabelingError as e:
+        return e
+    finally:
+        c.__dict__.pop("member_runs")
+        if saved is not None:
+            c.__dict__["member_runs"] = saved
+
+
+def _same_slots(got, want):
+    assert len(got) == len(want)
+    for i, (g, w) in enumerate(zip(got, want)):
+        assert (g.dtype, g.shape, g.stride(), g.storage_offset()) == \
+            (w.dtype, w.shape, w.stride(), w.storage_offset()), i
+        assert torch.equal(g, w), i
+
+
+def test_member_runs_are_the_evenly_spaced_attention_runs(setup):
+    c, _, _ = setup
+    runs = c.member_runs
+    assert len(runs) == 6 * c.L
+    for (l, role), (m0, stride) in runs.items():
+        assert stride == (1 if role in ("S", "O") else 2), (l, role)
+        n = c.n_s * c.n_h
+        assert c.product(m0).name == f"L{l}.{role}[0,0]"
+        assert c.product(m0 + stride * (n - 1)).name == f"L{l}.{role}[{c.n_s - 1},{c.n_h - 1}]"
+
+
+def test_run_labeling_equals_member_labeling(setup, monkeypatch):
+    """The whole-run fill gives the products the per-member fill does: same storage, offset and
+    strides where the leaf is the capture's own output, and bitwise equal values."""
+    c, model, records = setup
+    filled = []
+    orig = _Labeler._fill_run
+
+    def spy(self, *args):
+        filled.append(orig(self, *args))
+        return filled[-1]
+
+    monkeypatch.setattr(_Labeler, "_fill_run", spy)
+    cap = run_capture(c, model, records)
+    fast = c.label(cap, model)
+    assert filled.count(True) == len(c.member_runs) == 6 * c.L
+    filled.clear()
+    slow = _label_by(c, cap, model, {})
+    assert not any(filled)
+    mixed = _label_by(c, cap, model, {k: v for k, v in c.member_runs.items() if k[1] != "dQ"})
+    assert filled.count(True) == 5 * c.L
+    for other in (slow, mixed):
+        _same_slots(fast, other)
+        for p, f, o in zip(c.products, fast, other):
+            if c.product_class(p) != "dK":
+                assert f.untyped_storage().data_ptr() == o.untyped_storage().data_ptr(), p.name
+    model.zero_grad(set_to_none=True)
+
+
+@pytest.mark.parametrize("tamper", ["dtype", "shape", "strided_out", "strided_dK", "filled_twice"])
+def test_run_labeling_fails_as_members_do(setup, tamper):
+    """A record the run fill can't accept is refused, and by the per-member loop: the same error
+    as with no runs, whatever is wrong."""
+    c, model, records = setup
+    cap = run_capture(c, model, records)
+    recs = cap.records
+    if tamper == "filled_twice":
+        recs.append(_bmm_records(cap, "backward")[0])
+    else:
+        # dK's record is the transpose: take the last backward bmm
+        rec = (_bmm_records(cap, "backward")[-1] if tamper == "strided_dK"
+               else _bmm_records(cap, "forward")[0])
+        if tamper == "dtype":
+            new = dataclasses.replace(rec, out=rec.out.to(torch.float64))
+        elif tamper == "shape":
+            new = dataclasses.replace(rec, out=rec.out[:, :, :-1])
+        else:
+            o = rec.out_info
+            new = dataclasses.replace(rec, out_info=dataclasses.replace(
+                o, stride=o.stride[:-2] + (1, o.shape[-2])))
+        recs[recs.index(rec)] = new
+    got = _label_by(c, cap, model, c.member_runs)
+    want = _label_by(c, cap, model, {})
+    assert isinstance(want, LabelingError) and isinstance(got, LabelingError)
+    assert (type(got), str(got)) == (type(want), str(want))
+    model.zero_grad(set_to_none=True)
+
+
 def test_recorded_layout_contiguity_is_torchs():
     base = torch.zeros(3, 4, 5)
     views = [base, base[0], base[:, 1], base.transpose(1, 2), base[:, :, :1], base[:, :1],
@@ -595,6 +686,8 @@ def captured_operands(c, model, records):
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(_Labeler, "_fill", fill)
+        # The whole-run fill never calls _fill; no runs makes every member go through it.
+        mp.setitem(c.__dict__, "member_runs", {})
         cap = run_capture(c, model, records)
         products = [p.detach() for p in c.label(cap, model)]
     grads = {n: model.get_parameter(n).grad.clone() for n in c.glue_gradient_weights}
@@ -1243,6 +1336,8 @@ def test_switches_label_every_slot_once(switched):
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(_Labeler, "_fill", fill)
+        # The whole-run fill never calls _fill; no runs makes every member go through it.
+        mp.setitem(c.__dict__, "member_runs", {})
         cap = run_capture(c, model, records)
         slots = c.label(cap, model)
     mixed = c.operand_dtype != c.weight_dtype
