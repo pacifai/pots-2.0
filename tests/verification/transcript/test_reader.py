@@ -84,3 +84,26 @@ def test_own_copies_the_run_even_for_detached_leaves():
     for t in ts:
         leaves.add(t)
     assert leaves.tensor_block(range(6), own=True).data_ptr() != big.data_ptr()
+
+
+def test_product_block_through_a_committed_view_checks_a_middle_leaf():
+    from verification.computation.instances.decoder import DecoderComputation
+    from verification.transcript.reader import TranscriptView
+    from tests.verification.computation.test_decoder import tiny_config
+
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    ms = [c.m_of(f"L1.S[{s},{h}]") for s, h in c._members()]
+    leaves = CommittedLeaves()
+    idx = {c.product_index(m) for m in ms}
+    big = torch.randn(len(ms), 12, 12)
+    for i in range(c.product_index(max(ms)) + 1):  # leaves before the run: stand-ins
+        leaves.add(big[ms.index(next(m for m in ms if c.product_index(m) == i))]
+                   if i in idx else torch.zeros(1))
+    view = TranscriptView(c, leaves)
+    want = torch.stack([view.product(m) for m in ms])
+    assert torch.equal(view.product_block(ms), want)
+    assert torch.equal(view.product_block(ms, own=True), want)
+    mid = view.product(ms[len(ms) // 2])
+    mid.add_(1)
+    with pytest.raises(StoreMutationError, match="changed in place"):
+        view.product_block(ms)

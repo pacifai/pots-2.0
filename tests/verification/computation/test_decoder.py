@@ -1942,5 +1942,17 @@ def test_replay_supplies_are_fresh_memory(honest_all):
     for out in served:
         lo = out.untyped_storage().data_ptr()
         hi = lo + out.untyped_storage().nbytes()
-        bad = [(i, p, n, lo, hi, tuple(out.shape)) for i, (p, n) in enumerate(spans) if out.numel() and lo < p + n and p < hi]
+        bad = [(i, p, n, lo, hi, tuple(out.shape)) for i, (p, n) in enumerate(spans)
+               if out.numel() and lo < p + n and p < hi]
         assert not bad, bad[:3]
+
+
+@pytest.mark.parametrize("shape", [(3, 4, 5), (3, 1, 5), (3, 4, 1)])
+def test_dk_owned_never_aliases_the_block(shape):
+    """With a size-1 dimension ``transpose(1, 2).contiguous()`` returns its input; the
+    helper still hands back fresh memory, with the transposed values."""
+    from verification.computation.instances.decoder import _dk_owned
+    block = torch.randn(*shape)
+    out = _dk_owned(block, block.device)
+    assert torch.equal(out, block.transpose(1, 2)) and out.is_contiguous()
+    assert out.untyped_storage().data_ptr() != block.untyped_storage().data_ptr()

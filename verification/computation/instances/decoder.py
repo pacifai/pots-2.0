@@ -170,6 +170,19 @@ def _fresh(leaf: torch.Tensor, device: torch.device) -> torch.Tensor:
     return leaf.to(device, copy=True)
 
 
+def _dk_owned(block: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """δK̃ᵀ from a block of δK̃, as memory no committed leaf shares. The transpose copy is the
+    fresh tensor on the host; elsewhere the move to ``device`` comes first and is the copy.
+    A size-1 dimension makes ``contiguous()`` return its input, which on the host is the
+    committed leaves' own storage, so that one case clones."""
+    moved = block.to(device) if block.device != device else block
+    out = moved.transpose(1, 2).contiguous()
+    if (moved is block and device.type == "cpu"
+            and out.untyped_storage().data_ptr() == block.untyped_storage().data_ptr()):
+        out = out.clone()
+    return out
+
+
 def _param(info: Any) -> str | None:
     """The parameter a captured operand is, or is autocast's copy of."""
     return info.param_name or info.param_copy
@@ -1457,13 +1470,7 @@ class DecoderReplay(Replay):
                                                for s, h in c._members()],
                                               own=a.device.type == "cpu" and role != "dK")
                 if role == "dK":  # the op computes δK̃ᵀ = Q̃ᵀ·δS; the leaves hold δK̃
-                    # The transpose copy is the fresh tensor on the host; elsewhere the move
-                    # to the device comes first, so the copy is made there.
-                    blk = out.to(a.device) if out.device != a.device else out
-                    out = blk.transpose(1, 2).contiguous()
-                    if out.untyped_storage().data_ptr() == blk.untyped_storage().data_ptr():
-                        out = out.clone()  # a size-1 dimension: contiguous() copied nothing
-                        # (on the host that storage may be a committed leaf's)
+                    out = _dk_owned(out, a.device)
         if out is None or name in self._bops:
             raise ReplayError(f"replay: backward product {name} is not declared in this unit "
                               f"or appears twice")

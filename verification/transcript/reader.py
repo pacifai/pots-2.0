@@ -93,6 +93,8 @@ class TranscriptView:
         failing member. A run of leaves consecutive in one storage (a bmm's members) comes
         back as a view of it, read-only and aliasing the committed leaves, unless ``own``
         asks for a fresh copy (see :func:`stack_block`)."""
+        # Every index is looked up before any leaf is read, so only an invalid ``m`` (which
+        # comes from the computation, never the prover) fails in another order than a loop.
         idx = [self.c.product_index(m) for m in ms]
         block = getattr(self.reader, "tensor_block", None)
         if block is not None:
