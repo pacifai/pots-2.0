@@ -1,7 +1,7 @@
 """FS11's H100 sessions: the parts in order, each with its own log, under one deadline.
 
     .venv/bin/python -m verification.runs.fs11_session run --upload DIR --out DIR --deadline EPOCH
-                                                [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed}]
+                                [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed}]
     .venv/bin/python -m verification.runs.fs11_session fetch-models --upload DIR --out DIR
     .venv/bin/python -m verification.runs.fs11_session env --out DIR
 
@@ -13,7 +13,8 @@ picks the plan: ``fs11``, the first session (:func:`default_plan`, the default),
 check (:func:`profile_check_plan`, below), or ``nvlink-probe``, the four-card hardware probe
 (:func:`nvlink_probe_plan`, below), or ``kernel-speed``, the GPU BLAKE3 kernel's speed on one
 H100 (:func:`kernel_speed_plan`, below: the upload holds the repo, the native sources and the
-Mac's ``kernel_speed_sizes.json``, no models, no manifest). The first session's parts, in this
+Mac's ``kernel_speed_sizes.json``, no models; ``fs11_prep --session kernel-speed`` packs it).
+The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
 the upload's ``native_cache/`` into it once, offline, so no later part's timing includes the
@@ -114,7 +115,8 @@ from verification.commitment import native
 __all__ = ["PROFILE_CHECK_TIMEOUT_S", "PROFILE_HELD", "PROFILE_PINS", "SMOLLM2_ENV", "RUN_PINS",
            "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
            "alloc_env", "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part",
-           "default_plan", "recheck_plan", "profile_check_plan", "nvlink_probe_plan", "kernel_speed_plan", "SIZES_NAME", "load_plan",
+           "default_plan", "recheck_plan", "profile_check_plan", "nvlink_probe_plan",
+           "kernel_speed_plan", "kernel_speed_gate", "SIZES_NAME", "load_plan",
            "selftest_plan", "fs31_cards", "hw3_cards",
            "with_native_build",
            "choose_plan", "run_session", "fix2_ab",
@@ -643,9 +645,14 @@ def nvlink_probe_plan(upload: Path, out: Path) -> list[Part]:
 # FS29's kernel-speed session: the sizes file ``kernel_speed sizes`` wrote on the Mac, at the
 # upload's root (verification.runs.kernel_speed.SIZES_NAME), and the time limits of its parts.
 # The kernel tests take a few minutes (the NVRTC compile and the native references); the speed
-# run hashes four models' steps, each at least twice (checked pass, timed repeats, band tables).
+# run hashes four models' steps and their bands, each table once to warm up and 5 times timed,
+# and checks each against the C library. Limits: native build 900 s (it sits beside this table,
+# in with_native_build), tests 900 s, speed run 1,500 s: 3,300 s in all, inside the job's work
+# window under its 5,400 s deadline (5,400 less 1,200 s of grace and 600 s of packing is 3,600 s).
+# Expected: build about 1 min, tests about 5 min, speed run about 5 min; the limits only stop a
+# hung part and need not all be spent, so they need not all fit twice over.
 SIZES_NAME = "kernel_speed_sizes.json"
-KERNEL_SPEED_TIMEOUT_S = {"tests": 900, "run": 2400}
+KERNEL_SPEED_TIMEOUT_S = {"tests": 900, "run": 1500}
 KERNEL_TESTS = ("tests/verification/commitment/test_gpu_blake3.py",
                 "tests/verification/commitment/test_gpu_blake3_edges.py")
 
@@ -1127,13 +1134,49 @@ def _nvlink_extras(report: Path) -> dict[str, Any]:
 
 
 def _kernel_speed_extras(report: Path) -> dict[str, Any]:
-    """FS29's gate line, its verdict and the slowest model's rates, from the run's report."""
+    """FS29's gate line, its verdict and the slowest model's rates, from the run's report; a
+    missing or unreadable report gives ``{"gate": None}`` (and ``report_error`` when unreadable)."""
     if not report.exists():
         return {"gate": None}
-    doc = json.loads(report.read_text())
-    return {"gate": {k: doc["gate"].get(k) for k in ("verdict", "slowest", "call_gbps",
-                                                       "kernel_gbps", "reasons")},
-            "gate_line": doc.get("gate_line")}
+    try:
+        doc = json.loads(report.read_text())
+        return {"gate": {k: doc["gate"].get(k) for k in (
+                    "verdict", "slowest", "call_gbps", "call_best_gbps", "kernel_gbps",
+                    "kernel_best_gbps", "reasons")},
+                "gate_line": doc.get("gate_line")}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        return {"gate": None, "report_error": f"{type(e).__name__}: {e}"}
+
+
+def kernel_speed_gate(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """FS29's gate from the parts' records, or ``None`` when the session has no speed part. The
+    speed run's own verdict stands only when the native build and the kernel tests both finished
+    ``ok`` (or were skipped as done); otherwise it is ``fail`` with that reason, the measured rates
+    still on the line. With no readable report the verdict is ``no result``, never ``fail``."""
+    by = {p.get("name"): p for p in parts}
+    speed = next((p for p in parts if p.get("kind") == "kernel_speed"), None)
+    if speed is None:
+        return None
+    status = {n: (by[n]["status"] if n in by else "absent") for n in ("native_build",
+                                                                       "kernel_tests")}
+    extras = speed.get("extras") or {}
+    gate = extras.get("gate")
+    line = extras.get("gate_line")
+    out: dict[str, Any] = {"native_build": status["native_build"],
+                           "kernel_tests": status["kernel_tests"], "speed_run": speed["status"]}
+    if not gate or not line:
+        why = extras.get("report_error") or f"the speed run's status is {speed['status']}"
+        out.update(verdict="no result", reasons=[f"no readable report ({why})"],
+                   line=f"FS29 gate: no result (the speed run left no readable report: {why}).")
+        return out
+    bad = [f"{n} {st}" for n, st in status.items() if st not in ("ok", "skipped_done")]
+    if bad:
+        out.update(verdict="fail", reasons=bad, line=(
+            f"FS29 gate: fail. Because {' and '.join(bad)}, so the speed run's own verdict "
+            f"({gate.get('verdict')}) does not count. " + line.split("FS29 gate: ", 1)[-1]))
+    else:
+        out.update(verdict=gate.get("verdict"), reasons=list(gate.get("reasons") or []), line=line)
+    return out
 
 
 def _card_extras(report: Path) -> dict[str, Any]:
@@ -1284,15 +1327,15 @@ def hw3_cards(parts: Sequence[Mapping[str, Any]], expected: int | None = None
 
 
 def _hw_lines(parts: Sequence[Mapping[str, Any]], hw3: Mapping[str, Any] | None) -> list[str]:
-    """The job log's HW2 and HW3 lines (and, for the kernel-speed session, its gate line): pass or FAIL, with the reasons; a review for HW2's middle
-    speed band; and, when ``FS31_CARDS`` is not the four cards, a rehearsal in place of a pass."""
+    """The job log's HW2 and HW3 lines (and, for the kernel-speed session, its gate line): pass or
+    FAIL, with the reasons; a review for HW2's middle speed band; and, when ``FS31_CARDS`` is not
+    the four cards, a rehearsal in place of a pass."""
     from verification.runs.nvlink_probe import hw2_line  # stdlib only, kept off module level
 
     lines = []
-    speed = next((p for p in parts if p.get("kind") == "kernel_speed"), None)
+    speed = kernel_speed_gate(parts)
     if speed is not None:  # FS29's session has no HW2 or HW3; its one line is the gate
-        lines.append((speed.get("extras") or {}).get("gate_line")
-                     or f"FS29 gate: fail. The speed run left no report ({speed['status']}).")
+        lines.append(speed["line"])
     probe = next((p for p in parts if p.get("kind") == "nvlink"), None)
     if probe is not None:
         hw2 = (probe.get("extras") or {}).get("hw2")
@@ -1513,6 +1556,9 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
                 f"missing or differing; models with problems: "
                 f"{', '.join(check['models']) or 'none'}")
         _write_json(path, summary)
+    speed_gate = kernel_speed_gate(summary["parts"])
+    if speed_gate is not None:
+        summary["kernel_speed_gate"] = speed_gate
     for line in _hw_lines(summary["parts"], summary.get("hw3_cards")):
         say(line)
     summary["finished"] = True

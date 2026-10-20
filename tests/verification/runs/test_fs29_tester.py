@@ -390,22 +390,12 @@ def test_no_part_of_the_kernel_session_names_a_model_or_a_secret(tmp_path):
     assert "manifest" not in text and "fs11_prep" not in text
 
 
-@pytest.mark.xfail(strict=True, reason="FS29 defect: the kernel_tests part runs `python -m "
-                   "pytest`, "
-                   "but no requirements file lists pytest (fs11_prep.PACKAGES) and the kernel-"
-                   "speed upload has no requirements file at all (it has no fs11_prep run), so "
-                   "README step 3's `uv pip install -r ../requirements-fs11.txt` has nothing to "
-                   "install from and the part dies with 'No module named pytest'")
 def test_a_pod_following_the_readme_has_pytest_for_the_kernel_tests_part():
     tests = fs.kernel_speed_plan(Path("up"), Path("out"))[0]
     assert tests.argv[1:3] == ["-m", "pytest"]
     assert "pytest" in fs11_prep.PACKAGES
 
 
-@pytest.mark.xfail(strict=True, reason="FS29 defect: the README's kernel-speed paragraph says the "
-                   "upload has no manifest and no fs11_prep run but not where the pod's venv "
-                   "packages come from; step 3 installs from ../requirements-fs11.txt, which only "
-                   "fs11_prep writes")
 def test_the_readmes_kernel_speed_paragraph_says_where_the_venv_comes_from():
     text = (REPO / "verification/README.md").read_text()
     start = text.index("**The kernel's speed (FS29).**")
@@ -413,11 +403,6 @@ def test_the_readmes_kernel_speed_paragraph_says_where_the_venv_comes_from():
     assert "requirements" in para
 
 
-@pytest.mark.xfail(strict=True, reason="FS29 defect: the job's work deadline is the deadline less "
-                   "the grace (1,200 s) and the pack reserve (600 s) = 3,600 s, but the parts' "
-                   "limits (native build 900 + tests 900 + speed run 2,400 = 4,200 s) sum to more, "
-                   "and the README says 'parts about 25 min at their limits' where it is 70 min; "
-                   "a slow but healthy run is cut before it writes its report")
 def test_the_parts_limits_fit_the_work_deadline_of_the_default_deadline(tmp_path):
     parts = fs.choose_plan(fs.SESSIONS["kernel-speed"][1], tmp_path / "up", tmp_path / "out",
                            plan_file=None, selftest=False)

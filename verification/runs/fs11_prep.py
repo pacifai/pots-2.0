@@ -1,6 +1,7 @@
 """FS11's upload, built on the Mac: the data, the gated model, the code, and a manifest.
 
     HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --out DIR
+    .venv/bin/python -m verification.runs.fs11_prep --session kernel-speed --sizes FILE --out DIR
 
 Writes ``DIR/fs11_upload.tar`` (top directory ``fs11_upload/``), its SHA-256 to
 ``DIR/fs11_upload.tar.sha256``, and a copy of its manifest to ``DIR/fs11_upload.manifest.json``.
@@ -40,6 +41,13 @@ fixes: the SHA-256 of a large (LFS) file, the git blob SHA-1 of a small one. A m
 the prep. A pinned snapshot or file the Mac's cache lacks is reported in ``missing`` and never
 downloaded: the prep runs offline (``HF_HUB_OFFLINE=1``).
 
+**The kernel-speed upload** (``--session kernel-speed``, FS29, :func:`prepare_kernel_speed`)
+packs only ``repo/``, ``native_cache/blake3-1.8.7/``, the sizes file (``kernel_speed sizes``'
+output, checked here) at the top as ``kernel_speed_sizes.json``, ``requirements-fs11.txt`` and
+``manifest.json`` (every packed file's SHA-256). It packs no ``hf/``, ``data/``, ``bench_cache/``
+or model files, so it needs no Hugging Face cache and no ``HF_HUB_OFFLINE``. The pod then
+follows the usual steps: extract, venv, ``uv pip install -r ../requirements-fs11.txt``, the job.
+
 Exits 0 when every run model is packed or fetchable with its data built, 1 otherwise (the
 tarball is still written, and ``missing`` says what the session will lack).
 """
@@ -72,7 +80,7 @@ from verification.runs.fs11_session import (FULL_SCALE_ENV, GATED, RUN_PINS, SEC
 
 __all__ = ["TOP", "TEST_SCALE_PIN", "TEST_SCALE_TASK", "BENCH_PINS", "CONFIG_ONLY", "DATA_FILES", "PrepError", "CacheFile",
            "ModelFiles", "git_blob_sha1", "blob_matches", "model_files", "data_matches",
-           "materialize", "prepare", "main"]
+           "materialize", "prepare", "prepare_kernel_speed", "PACKAGES", "main"]
 
 TOP = "fs11_upload"
 # SmolLM2, whose data the upload also holds at test scale's config (the profile check).
@@ -94,7 +102,7 @@ WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".h5", ".msgp
 BLAKE3_DIR = "blake3-1.8.7"
 # The packages the session's parts import, whose Mac versions the upload records.
 PACKAGES = ("torch", "transformers", "tokenizers", "huggingface_hub", "safetensors", "numpy",
-            "blake3", "datasets", "certifi", "psutil", "nvidia-ml-py")
+            "blake3", "datasets", "certifi", "psutil", "nvidia-ml-py", "pytest", "matplotlib")
 
 
 class PrepError(RuntimeError):
@@ -523,6 +531,15 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
         "data": data, "data_test_scale": data_test_scale, "missing": missing, "run_models_complete": not run_missing,
     }
     blob = (json.dumps(manifest, indent=1) + "\n").encode()
+    tar, digest = _write_upload(out, members, blob, t0, say)
+    for x in missing:
+        say(f"missing: {x}")
+    return {**manifest, "tarball": str(tar), "sha256": digest}
+
+
+def _write_upload(out: Path, members: Sequence[Member], blob: bytes, t0: float,
+                  say: Callable[[str], None]) -> tuple[Path, str]:
+    """Write ``fs11_upload.tar`` (manifest first), its SHA-256 and the manifest's copy."""
     tar = out / f"{TOP}.tar"
     tmp = tar.with_suffix(".tar.tmp")
     with tarfile.open(tmp, "w", format=tarfile.PAX_FORMAT) as t:
@@ -536,14 +553,60 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
     say(f"wrote {tar} ({tar.stat().st_size / 2**30:.2f} GiB, {len(members) + 1} members) in "
         f"{time.time() - t0:.0f} s")
     say(f"sha256 {digest}")
-    for x in missing:
-        say(f"missing: {x}")
+    return tar, digest
+
+
+def prepare_kernel_speed(out: Path, *, sizes: Path, repo_root: Path,
+                         repo: Callable[[Path, Path], tuple[list[Member], dict[str, Any]]]
+                         = _repo_members,
+                         native_src: Path | None = None,
+                         say: Callable[[str], None] = _say) -> dict[str, Any]:
+    """The kernel-speed upload (module docstring): the repo, the native sources, the sizes file
+    (checked with ``kernel_speed.read_sizes``), the requirements and the manifest; no models, data
+    or caches. Raises :class:`PrepError` when the sizes file or the native sources are unusable."""
+    from verification.runs import kernel_speed  # lazy: it imports torch and the kernel
+
+    out = out.resolve()
+    t0 = time.time()
+    try:
+        models = kernel_speed.read_sizes(sizes)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise PrepError(f"cannot use the sizes file {sizes}: {type(e).__name__}: {e}") from e
+    out.mkdir(parents=True, exist_ok=True)
+    repo_members, repo_info = repo(repo_root, out / "build")
+    if repo_info.get("dirty"):
+        say(f"warning: the working tree is dirty; the upload holds commit "
+            f"{repo_info['commit'][:12]} without the uncommitted changes")
+    native_members, native_missing = _native_members(native_src or native.source_dir())
+    if native_missing:
+        raise PrepError("; ".join(native_missing))
+    versions = _versions()
+    members = (repo_members + native_members
+               + [Member(kernel_speed.SIZES_NAME, src=sizes.resolve()),
+                  Member("requirements-fs11.txt", data=_requirements(versions))])
+    bad = [m.arc for m in members if _forbidden(m.arc)]
+    if bad:
+        raise PrepError(f"refusing to pack paths outside the upload's contents: {bad}")
+    files = {m.arc: (hashlib.sha256(m.data).hexdigest() if m.data is not None
+                     else sha256_file(m.src))  # type: ignore[arg-type]
+             for m in members if m.link is None}
+    manifest = {"format": "fs11-upload/1", "session": "kernel-speed",
+                "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "repo": repo_info, "versions": versions, "files": dict(sorted(files.items())),
+                "sizes": [{"repo": m.repo, "revision": m.revision, "leaves": len(m.rows),
+                           "bytes": m.nbytes} for m in models]}
+    blob = (json.dumps(manifest, indent=1) + "\n").encode()
+    tar, digest = _write_upload(out, members, blob, t0, say)
     return {**manifest, "tarball": str(tar), "sha256": digest}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--out", type=Path, required=True, help="where the tarball and builds go")
+    p.add_argument("--session", choices=("fs11", "kernel-speed"), default="fs11",
+                   help="fs11: the first session's upload (default); kernel-speed: FS29's")
+    p.add_argument("--sizes", type=Path, default=None,
+                   help="kernel-speed only: the sizes file `kernel_speed sizes` wrote")
     p.add_argument("--hf-cache", type=Path, default=None,
                    help="the Hugging Face hub cache (default: $HF_HUB_CACHE, else "
                         "$HF_HOME/hub, else ~/.cache/huggingface/hub)")
@@ -551,6 +614,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="the benchmark's cache (default: $POTS_BENCH_CACHE, else "
                         "~/.cache/pots-benchmarks)")
     args = p.parse_args(argv)
+    repo_root = Path(__file__).resolve().parents[2]
+    if args.session == "kernel-speed":
+        if args.sizes is None:
+            print("fs11_prep: --session kernel-speed needs --sizes FILE", file=sys.stderr)
+            return 2
+        try:
+            prepare_kernel_speed(args.out, sizes=args.sizes, repo_root=repo_root)
+        except PrepError as e:
+            print(f"fs11_prep: {e}", file=sys.stderr)
+            return 1
+        return 0
+    if args.sizes is not None:
+        print("fs11_prep: --sizes is for --session kernel-speed", file=sys.stderr)
+        return 2
     if os.environ.get("HF_HUB_OFFLINE") != "1":
         print("set HF_HUB_OFFLINE=1: the prep reads the local cache only", file=sys.stderr)
         return 2
@@ -558,7 +635,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     hub = args.hf_cache or Path(os.environ.get("HF_HUB_CACHE") or home / "hub")
     bench = args.bench_cache or Path(os.environ.get("POTS_BENCH_CACHE")
                                      or Path.home() / ".cache" / "pots-benchmarks")
-    repo_root = Path(__file__).resolve().parents[2]
     try:
         man = prepare(args.out, hub=hub, bench_cache=bench, repo_root=repo_root)
     except PrepError as e:

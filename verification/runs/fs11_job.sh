@@ -10,7 +10,8 @@
 # the session's plan: fs11 (the default), the first session's; recheck, the re-check's;
 # profile-check, the profile check's; or nvlink-probe, the four-card hardware probe's, which also
 # reads FS31_CARDS (default 4) and passes; or kernel-speed, the BLAKE3 kernel's speed on one H100,
-# whose upload holds no models (verification/runs/fs11_session.py); anything else is refused. In order:
+# whose upload holds no models (verification/runs/fs11_session.py); anything else is refused.
+# In order:
 #
 # 1. Preflight. Without DRY_RUN the job refuses to start unless it can terminate the pod:
 #    RUNPOD_POD_ID set, and runpodctl or RUNPOD_API_KEY there (exit 2). A refusal it can act on
@@ -296,7 +297,8 @@ if [ $((GRACE_S + PACK_RESERVE_S)) -ge "$DEADLINE_S" ]; then
 fi
 case "$SESSION" in
   fs11|recheck|profile-check|nvlink-probe|kernel-speed) ;;
-  *) refuse "FS11_SESSION is '$SESSION'; it must be fs11, recheck, profile-check, nvlink-probe or kernel-speed" ;;
+  *) refuse "FS11_SESSION is '$SESSION'; it must be fs11, recheck, profile-check, \
+nvlink-probe or kernel-speed" ;;
 esac
 mkdir -p "$OUT" || refuse "cannot create $OUT"
 rm -f "$READY" "$PACK_FAILED" "$FETCHED"

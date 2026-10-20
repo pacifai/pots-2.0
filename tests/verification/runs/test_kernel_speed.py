@@ -191,12 +191,30 @@ def test_a_flipped_digest_is_counted_as_a_mismatch(hostlib):  # noqa: F811
     m = tiny_model()
     pool = torch.empty(1 << 20, dtype=torch.uint8)
     pool.view(torch.bfloat16).normal_()
-    host = pool.clone()
-    host[:64] ^= 1  # the reference sees different contents
-    g = gb.GpuBlake3(HostKernels(hostlib))
-    res = ks.run_models([m], pool, host, g, 1, threads=1, say=lambda s: None)[0]
-    assert res["mismatches"] > 0
+    g = Flipping(hostlib)
+    res = ks.run_models([m], pool, torch.empty(1 << 20, dtype=torch.uint8), g, 1, threads=1,
+                        say=lambda s: None)[0]
+    assert res["mismatches"] > 0 and res["band_mismatches"] > 0
     assert ks.gate([res])["verdict"] == "fail"
+
+
+class Flipping:
+    """The host build of the kernel with the first digest of every call flipped."""
+
+    def __init__(self, lib):
+        self.g = gb.GpuBlake3(HostKernels(lib))
+
+    def hash_leaves(self, *a, **k):
+        d, bad = self.g.hash_leaves(*a, **k)
+        d = d.clone()
+        d[0, 0] ^= 1
+        return d, bad
+
+    def prepare(self, *a, **k):
+        return self.g.prepare(*a, **k)
+
+    def launch(self, *a, **k):
+        return self.g.launch(*a, **k)
 
 
 # ---- the session ------------------------------------------------------------------------------
@@ -235,9 +253,9 @@ def test_the_plan_has_no_models_part_no_secrets_and_every_timeout(tmp_path):
         assert x.env.get("HF_HUB_OFFLINE", "1") == "1"
 
 
-def test_the_nominal_parts_fit_half_the_default_deadline(tmp_path):
+def test_the_parts_limits_sum_inside_the_jobs_work_window(tmp_path):
     parts = sum(x.timeout_s for x in fs.with_native_build(plan(tmp_path)))
-    assert 5400 >= 1.2 * parts / 2  # the deadline is about twice the parts' limits' worth
+    assert parts == 900 + 900 + 1500 <= 5400 - 1200 - 600
 
 
 def test_the_other_sessions_have_no_kernel_parts(tmp_path):
@@ -257,6 +275,10 @@ def test_the_extras_carry_the_gate_into_the_summary(tmp_path):
     ex = fs.part_extras(fs.Part("k", [], kind="kernel_speed", info={"report": str(rep)}),
                         tmp_path / "log")
     assert ex["gate"]["verdict"] == "pass" and ex["gate_line"].startswith("FS29 gate: pass")
+    rep.write_text("{not json")
+    ex = fs.part_extras(fs.Part("k", [], kind="kernel_speed", info={"report": str(rep)}),
+                        tmp_path / "log")
+    assert ex["gate"] is None and "report_error" in ex
 
 
 def test_the_job_accepts_the_session_and_runs_its_selftest(tmp_path):
@@ -270,7 +292,185 @@ def test_the_job_accepts_the_session_and_runs_its_selftest(tmp_path):
 def test_the_job_log_ends_with_the_gate_line(tmp_path):
     g = ks.gate(models(250.0))
     ok = {"kind": "kernel_speed", "status": "ok", "extras": {"gate_line": ks.gate_line(g)}}
-    assert fs._hw_lines([ok], None) == [ks.gate_line(g)]
-    assert "FS29 gate: fail" in fs._hw_lines([{"kind": "kernel_speed", "status": "failed"}],
-                                              None)[0]
+    ok["name"] = "kernel_speed"
+    ok["extras"]["gate"] = g
+    done = [{"name": "native_build", "status": "ok"}, {"name": "kernel_tests", "status": "ok"}]
+    assert fs._hw_lines([*done, ok], None) == [ks.gate_line(g)]
+    line = fs._hw_lines([{"kind": "kernel_speed", "status": "failed"}], None)[0]
+    assert line.startswith("FS29 gate: no result (") and "fail" not in line.split("(")[0]
     assert fs._hw_lines([{"kind": "plain", "status": "ok"}], None) == []
+
+
+# ---- round 2: the gate's inputs, the sliced check, the memory check, the prep -----------------
+
+
+def write_tiny(path):
+    ks.write_sizes(path, [tiny_model()], n_s=2, n=8, compute_dtype="bfloat16")
+
+
+def _parts(native="ok", tests="ok", speed="ok", gate=None, line=None):
+    ex = {"gate": gate, "gate_line": line} if gate else {"gate": None}
+    return [{"name": "native_build", "status": native}, {"name": "kernel_tests", "status": tests},
+            {"name": "kernel_speed", "kind": "kernel_speed", "status": speed, "extras": ex}]
+
+
+def _ok_gate(rate=400.0):
+    g = ks.gate(models(rate))
+    return {"gate": g, "line": ks.gate_line(g)}
+
+
+def test_no_report_is_no_result_never_fail():
+    out = fs.kernel_speed_gate(_parts(speed="failed"))
+    assert out["verdict"] == "no result" and out["line"].startswith("FS29 gate: no result (")
+    assert fs.kernel_speed_gate([{"name": "x", "status": "ok"}]) is None
+
+
+@pytest.mark.parametrize("bad", ["native", "tests"])
+def test_a_part_before_the_speed_run_not_ok_fails_the_gate_and_keeps_the_rates(bad):
+    g = _ok_gate()
+    out = fs.kernel_speed_gate(_parts(**{bad: "failed"}, gate=g["gate"], line=g["line"]))
+    assert out["verdict"] == "fail"
+    assert out["native_build" if bad == "native" else "kernel_tests"] == "failed"
+    assert out["line"].startswith("FS29 gate: fail.") and "median 400 GB/s" in out["line"]
+    ok = fs.kernel_speed_gate(_parts(gate=g["gate"], line=g["line"]))
+    assert ok["verdict"] == "pass" and ok["line"] == g["line"]
+    assert ok["native_build"] == ok["kernel_tests"] == "ok"
+
+
+def test_the_median_feeds_the_gate_with_the_best_beside_it():
+    rows = [{"repo": "a", "call_gbps": 320.0, "call_best_gbps": 400.0, "kernel_gbps": 500.0,
+             "kernel_best_gbps": 600.0, "mismatches": 0, "band_mismatches": 0}]
+    g = ks.gate(rows)
+    assert g["verdict"] == "pass" and g["call_gbps"] == 320.0 and g["call_best_gbps"] == 400.0
+    line = ks.gate_line(g)
+    assert "median 320 GB/s (best 400)" in line and "median 500 GB/s (best 600)" in line
+
+
+def test_a_band_mismatch_fails_the_gate_whatever_the_speed():
+    rows = [{**models(1000.0)[0], "band_mismatches": 2}]
+    g = ks.gate(rows)
+    assert g["verdict"] == "fail" and any("bands" in r for r in g["reasons"])
+
+
+def test_measure_reports_median_and_best_from_every_repeat(hostlib, monkeypatch):  # noqa: F811
+    m = tiny_model()
+    pool = torch.empty(1 << 20, dtype=torch.uint8)
+    pool.view(torch.bfloat16).normal_()
+    grp = ks.Group(*ks.leaf_headers(m.rows), np.array([r.nbytes for r in m.rows], np.int64))
+    seq = iter([0.0, 3.0, 10.0, 11.0, 20.0, 22.0])  # three timed calls: 3 s, 1 s, 2 s
+    monkeypatch.setattr(ks.time, "perf_counter", lambda: next(seq, 99.0))
+    monkeypatch.setattr(ks, "_kernel_seconds", lambda *a: [5.0, 1.0, 3.0])
+    g = gb.GpuBlake3(HostKernels(hostlib))
+    res = ks.measure(g, grp, pool, torch.empty(1 << 20, dtype=torch.uint8), 3, threads=1,
+                     check=False, say=lambda s: None)
+    t = res["table_times"][0]
+    assert t["call_s"] == [3.0, 1.0, 2.0] and t["kernel_s"] == [5.0, 1.0, 3.0]
+    assert res["call_s"] == 2.0 and res["call_best_s"] == 1.0 and res["tables"] == 1
+    assert res["kernel_s"] == 3.0 and res["kernel_best_s"] == 1.0 and res["repeats"] == 3
+    assert res["call_gbps"] == res["bytes"] / 2.0 / 1e9
+
+
+def test_the_sliced_check_covers_every_leaf_in_several_slices(hostlib, monkeypatch):  # noqa: F811
+    m = tiny_model(n_s=2, n=8)
+    pool = torch.empty(1 << 20, dtype=torch.uint8)
+    pool.view(torch.bfloat16).normal_()
+    grp = ks.Group(*ks.leaf_headers(m.rows), np.array([r.nbytes for r in m.rows], np.int64))
+    big = int(ks._aligned(grp.payload_len).max())
+    spec = ks.layout(grp.payload_len, pool.numel())[0]
+    runs = ks.check_slices(grp, spec, 3 * big)
+    assert len(runs) > 1 and runs[0][0] == 0 and runs[-1][1] == spec.end - spec.start
+    assert all(a[1] == b[0] for a, b in zip(runs, runs[1:]))
+    assert all(b1 - b0 <= 3 * big for _, _, b0, b1 in runs)
+    small = torch.empty(3 * big, dtype=torch.uint8)
+    res = ks.run_models([m], pool, small, gb.GpuBlake3(HostKernels(hostlib)), 1, threads=1,
+                        say=lambda s: None)[0]
+    assert "error" not in res and res["mismatches"] == 0 and res["band_mismatches"] == 0
+    with pytest.raises(ValueError, match="check slice"):
+        ks.check_slices(grp, spec, big - 1)
+
+
+def test_host_available_bytes_reads_meminfo_and_the_cgroup_headroom(tmp_path):
+    info = tmp_path / "meminfo"
+    info.write_text("MemTotal: 999 kB\nMemAvailable:    2048 kB\n")
+    none = (("/nonexistent/a", "/nonexistent/b"),)
+    assert ks.host_available_bytes(info, none) == 2048 * 1024
+    (tmp_path / "max").write_text("1048576\n")
+    (tmp_path / "cur").write_text("1000000\n")
+    assert ks.host_available_bytes(info, ((str(tmp_path / "max"), str(tmp_path / "cur")),)) \
+        == 48576
+    (tmp_path / "max").write_text("max\n")
+    assert ks.host_available_bytes(info, ((str(tmp_path / "max"), str(tmp_path / "cur")),)) \
+        == 2048 * 1024
+    assert ks.host_available_bytes(tmp_path / "none", none) is None
+
+
+def test_the_run_stops_when_host_memory_is_under_twice_the_slice(tmp_path, monkeypatch, capsys):
+    sizes = tmp_path / "s.json"
+    write_tiny(sizes)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (6 << 30, 8 << 30))
+    monkeypatch.setattr(ks, "host_available_bytes", lambda *a, **k: 1000)
+    rc = ks.main(["run", "--sizes", str(sizes), "--out", str(tmp_path / "o.json")])
+    assert rc == 1 and "under twice" in capsys.readouterr().err
+    assert not (tmp_path / "o.json").exists()
+
+
+def test_a_sizes_file_with_no_models_or_a_non_step_dtype_is_a_clear_error(tmp_path, monkeypatch,
+                                                                         capsys):
+    good = tmp_path / "g.json"
+    write_tiny(good)
+    doc = json.loads(good.read_text())
+    empty = tmp_path / "e.json"
+    empty.write_text(json.dumps({**doc, "models": []}))
+    with pytest.raises(ValueError, match="no models"):
+        ks.read_sizes(empty)
+    odd = tmp_path / "d.json"
+    odd.write_text(json.dumps({**doc, "dtypes": [*doc["dtypes"][:-1], "float64"]}))
+    with pytest.raises(ValueError, match="float64"):
+        ks.read_sizes(odd)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    rc = ks.main(["run", "--sizes", str(empty), "--out", str(tmp_path / "o.json")])
+    assert rc == 1 and "cannot use" in capsys.readouterr().err
+
+
+def test_packages_list_the_kernel_tests_and_plot_dependencies():
+    from verification.runs import fs11_prep
+    assert "pytest" in fs11_prep.PACKAGES and "matplotlib" in fs11_prep.PACKAGES
+
+
+def test_the_kernel_speed_prep_packs_only_repo_native_sizes_requirements_and_manifest(tmp_path):
+    import tarfile
+    from verification.runs import fs11_prep
+    src = tmp_path / "native" / f"blake3-{native.BLAKE3_TAG}"
+    src.mkdir(parents=True)
+    for n in (*native.SOURCE_SHA256, "ARCHIVE_SHA256"):
+        (src / n).write_bytes(b"x")
+    sizes = tmp_path / "s.json"
+    write_tiny(sizes)
+
+    def repo(root, build):
+        return ([fs11_prep.Member("repo/a.py", data=b"print(1)\n")],
+                {"commit": "abc", "dirty": False})
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(native, "bad_sources", lambda d: [])
+    try:
+        man = fs11_prep.prepare_kernel_speed(tmp_path / "out", sizes=sizes, repo_root=REPO,
+                                             repo=repo, native_src=src, say=lambda s: None)
+    finally:
+        monkey.undo()
+    with tarfile.open(man["tarball"]) as t:
+        names = t.getnames()
+    tops = {n.split("/")[1] for n in names if "/" in n}
+    assert tops <= {"manifest.json", "repo", "native_cache", ks.SIZES_NAME,
+                    "requirements-fs11.txt"}
+    assert not [n for n in names if n.split("/")[1] in ("hf", "data", "bench_cache")]
+    assert f"{fs11_prep.TOP}/{ks.SIZES_NAME}" in names and f"{fs11_prep.TOP}/manifest.json" in names
+    assert set(man["files"]) >= {ks.SIZES_NAME, "requirements-fs11.txt", "repo/a.py"}
+    assert fs11_prep.main(["--session", "kernel-speed", "--out", str(tmp_path / "o")]) == 2
+
+
+def test_the_readme_and_docstring_say_what_whole_call_covers():
+    for text in ((REPO / "verification" / "README.md").read_text(),
+                 (REPO / "verification" / "CLAUDE.md").read_text(), ks.__doc__):
+        assert "FS30" in text and "ceiling" in text
