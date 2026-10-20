@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import json
 import math
-import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -17,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import blake3
 
+from verification.computation.interface import default_product_class
 from verification.verifier.matmul_check.sizing import Z
 
 if TYPE_CHECKING:
@@ -140,8 +140,6 @@ class Bands:
 
 # ---- κ classes ---------------------------------------------------------------------------
 
-_DIGITS = re.compile(r"\d+")
-
 
 def product_class(c: DeclaredComputation, spec: ProductSpec) -> str:
     """The calibration class of a product: its role in ``C`` (spec §9, P3.b, P3.c).
@@ -153,5 +151,12 @@ def product_class(c: DeclaredComputation, spec: ProductSpec) -> str:
     own = getattr(c, "product_class", None)
     if callable(own):
         return str(own(spec))
-    role = spec.weight if spec.weight is not None else spec.name
-    return f"{spec.kind.value}:{_DIGITS.sub('*', role)}"
+    return default_product_class(spec)
+
+
+def product_classes(c: DeclaredComputation) -> Sequence[str] | None:
+    """The class table ``C`` holds (``DeclaredComputation.product_classes``): :func:`product_class`
+    of every product, ``[m-1]`` for product ``m``, computed once. ``None`` when ``C`` has none
+    (a stub). Use it for the inventory's own specs; an arbitrary spec goes through
+    :func:`product_class`, which also checks the spec is ``C``'s."""
+    return getattr(c, "product_classes", None)

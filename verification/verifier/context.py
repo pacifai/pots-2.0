@@ -40,7 +40,7 @@ from verification.transcript.errors import (
     StoreMutationError,
     TranscriptFormatError,
 )
-from verification.transcript.reader import stack_block
+from verification.transcript.reader import _ALIGN, stack_block
 
 if TYPE_CHECKING:
     from verification.computation.interface import DeclaredComputation, ProductSpec, Replay
@@ -167,6 +167,49 @@ class _Block:
                     self.p_abs1.tolist(), self.u.tolist())]
 
 
+def _readonly(a: np.ndarray) -> np.ndarray:
+    a = a.view()
+    a.flags.writeable = False
+    return a
+
+
+def _cat(parts: list[np.ndarray]) -> np.ndarray:
+    return _readonly(parts[0] if len(parts) == 1 else np.concatenate(parts))
+
+
+class ProductColumns:
+    """All of a step's products as columns, in record order (:meth:`ProductStats.columns`).
+
+    ``m`` and ``q`` are int64 ``[N]``; ``kappa``, ``p_norm``, ``nu``, ``p_abs1`` and ``u``
+    float64 ``[N]``; ``normalized`` float64 ``[N, k]`` (``[0, 0]`` when empty); ``name`` and
+    ``cls`` are lists of str. The arrays are read-only and may share memory with the stored
+    blocks."""
+
+    __slots__ = ("m", "name", "cls", "kappa", "normalized", "q", "p_norm", "nu", "p_abs1", "u",
+                 "_codes")
+
+    def __init__(self, m: np.ndarray, name: list[str], cls: list[str], kappa: np.ndarray,
+                 normalized: np.ndarray, q: np.ndarray, p_norm: np.ndarray, nu: np.ndarray,
+                 p_abs1: np.ndarray, u: np.ndarray) -> None:
+        self.m, self.name, self.cls, self.q = m, name, cls, q
+        self.kappa, self.normalized, self.p_norm = kappa, normalized, p_norm
+        self.nu, self.p_abs1, self.u = nu, p_abs1, u
+        self._codes: tuple[np.ndarray, tuple[str, ...]] | None = None
+
+    def __len__(self) -> int:
+        return len(self.m)
+
+    def class_codes(self) -> tuple[np.ndarray, tuple[str, ...]]:
+        """``(codes, classes)``: the distinct classes in order of first appearance, and each
+        product's index into them (int64 ``[N]``)."""
+        if self._codes is None:
+            index: dict[str, int] = {}
+            codes = np.fromiter((index.setdefault(c, len(index)) for c in self.cls),
+                                dtype=np.int64, count=len(self.cls))
+            self._codes = (_readonly(codes), tuple(index))
+        return self._codes
+
+
 class ProductStats:
     """A step's :class:`ProductStat` records, in the order they were added. It behaves as the
     list it replaces: ``append``, ``extend``, ``clear``, ``len``, truthiness, iteration,
@@ -178,6 +221,8 @@ class ProductStats:
     field for field, with Python floats and ints.
     """
 
+    _cols: ProductColumns | None = None  # :meth:`columns`' cache, dropped by every change
+
     def __init__(self, stats: Iterable[ProductStat] = ()) -> None:
         self._segs: list[ProductStat | _Block] = []
         self._ends: list[int] = []  # _ends[i]: the count of products up to and with _segs[i]
@@ -187,6 +232,7 @@ class ProductStats:
         return self._ends[-1] if self._ends else 0
 
     def append(self, stat: ProductStat) -> None:
+        self._cols = None
         self._segs.append(stat)
         self._ends.append(len(self) + 1)
 
@@ -201,10 +247,12 @@ class ProductStats:
         """Append ``len(m)`` products from columns: ``kappa``, ``p_norm``, ``nu``, ``p_abs1``
         and ``u`` float64 ``[n]``, ``normalized`` float64 ``[n, k]``, the rest sequences."""
         if len(m):
+            self._cols = None
             self._segs.append(_Block(m, name, cls, kappa, normalized, q, p_norm, nu, p_abs1, u))
             self._ends.append(len(self) + len(m))
 
     def clear(self) -> None:
+        self._cols = None
         self._segs.clear()
         self._ends.clear()
 
@@ -212,8 +260,10 @@ class ProductStats:
         """Replace every block by its :class:`ProductStat` objects."""
         if any(isinstance(g, _Block) for g in self._segs):
             segs = [x for g in self._segs for x in (g.stats() if isinstance(g, _Block) else (g,))]
+            cols = self._cols  # the records don't change, so neither do their columns
             self.clear()
             self.extend(segs)
+            self._cols = cols
 
     def __iter__(self) -> Iterator[ProductStat]:
         self._flatten()
@@ -237,7 +287,57 @@ class ProductStats:
     def __setitem__(self, i: int, stat: ProductStat) -> None:
         self._at(i)  # raises IndexError out of range
         self._flatten()
+        self._cols = None
         self._segs[i] = stat
+
+    def columns(self) -> ProductColumns:
+        """Every record as columns (:class:`ProductColumns`), built from the block columns and
+        the single records without making a :class:`ProductStat`, and kept until the next
+        change. Values are those a :class:`ProductStat` would hold, as float64 and int64. It
+        raises ``ValueError`` when the records' ``normalized`` widths differ (a step's never do)."""
+        if self._cols is None:
+            self._cols = self._build_columns()
+        return self._cols
+
+    def _build_columns(self) -> ProductColumns:
+        m: list[np.ndarray] = []
+        q: list[np.ndarray] = []
+        name: list[str] = []
+        cls: list[str] = []
+        f: dict[str, list[np.ndarray]] = {key: [] for key in
+                                           ("kappa", "normalized", "p_norm", "nu", "p_abs1", "u")}
+        run: list[ProductStat] = []
+
+        def flush() -> None:
+            if run:
+                m.append(np.array([s.m for s in run], dtype=np.int64))
+                q.append(np.array([s.q for s in run], dtype=np.int64))
+                name.extend(s.name for s in run)
+                cls.extend(s.cls for s in run)
+                for key in f:
+                    f[key].append(np.array([getattr(s, key) for s in run], dtype=np.float64))
+                run.clear()
+
+        for g in self._segs:
+            if isinstance(g, _Block):
+                flush()
+                m.append(np.asarray(g.m, dtype=np.int64))
+                q.append(np.asarray(g.q, dtype=np.int64))
+                name.extend(g.name)
+                cls.extend(g.cls)
+                for key in f:
+                    f[key].append(np.asarray(getattr(g, key), dtype=np.float64))
+            else:
+                run.append(g)
+        flush()
+        if not m:
+            empty, ints = (_readonly(np.empty(0, dtype=d)) for d in (np.float64, np.int64))
+            return ProductColumns(ints, name, cls, empty,
+                                  _readonly(np.empty((0, 0), dtype=np.float64)), ints,
+                                  empty, empty, empty, empty)
+        return ProductColumns(_cat(m), name, cls, _cat(f["kappa"]), _cat(f["normalized"]),
+                              _cat(q), _cat(f["p_norm"]), _cat(f["nu"]), _cat(f["p_abs1"]),
+                              _cat(f["u"]))
 
     def __bool__(self) -> bool:
         return bool(self._segs)
@@ -265,12 +365,41 @@ class ProductStats:
         """An independent container with the same records (the columns are shared, read-only)."""
         dup = ProductStats()
         dup._segs, dup._ends = list(self._segs), list(self._ends)
+        dup._cols = self._cols
         return dup
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items() if k != "_cols"}
 
     __copy__ = copy
 
     def __repr__(self) -> str:
         return repr(list(self))
+
+
+def first_zero_values(vals: np.ndarray, starts: np.ndarray, ends: np.ndarray,
+                      peak: np.ndarray) -> np.ndarray:
+    """``peak`` (each segment ``[starts[i], ends[i])`` of ``vals``' maximum) with every zero
+    peak replaced by the segment's first zero, as Python ``max`` keeps the first of equal items
+    (a ``-0.0`` before a ``0.0``) and ``fmax`` may return either."""
+    peak = peak.copy()
+    zeros = np.flatnonzero(vals == 0)
+    if len(zeros):
+        at = np.searchsorted(zeros, starts)
+        for i in np.flatnonzero(peak == 0).tolist():
+            peak[i] = vals[zeros[at[i]]]  # a zero peak has a zero in its segment
+    return peak
+
+
+def _py_max(a: np.ndarray) -> float:
+    """``max(a.tolist())`` of a non-empty float64 vector, as a Python float. Python's ``max``
+    keeps the first item unless a later one is greater, so a leading NaN stays and a later NaN
+    is skipped, and among equal items the first (a ``-0.0`` before ``0.0``) stays."""
+    first = float(a[0])
+    if first != first:
+        return first
+    v = float(np.fmax.reduce(a))
+    return float(a[int(np.argmax(a == 0))]) if v == 0 else v
 
 
 @dataclass
@@ -283,10 +412,23 @@ class StepStats:
             self.products = ProductStats(self.products)
 
     def max_normalized(self) -> float:
-        return max((max(p.normalized) for p in self.products), default=0.0)
+        """The largest normalized residual, ``0.0`` with no products. Ordered as Python's ``max``
+        over the floats is, so a NaN first in its row, or first among the rows' maxima, wins and
+        any other NaN is ignored."""
+        if not self.products:
+            return 0.0
+        norm = self.products.columns().normalized
+        rows = np.fmax.reduce(norm, axis=1)  # NaN-ignoring; a row starting with NaN is NaN
+        rows[np.isnan(norm[:, 0])] = math.nan
+        flat = norm.reshape(-1)
+        w = norm.shape[1]
+        rows = first_zero_values(flat, np.arange(len(rows)) * w, np.arange(1, len(rows) + 1) * w,
+                                 rows)
+        return _py_max(rows)
 
     def max_kappa(self) -> float:
-        return max((p.kappa for p in self.products), default=0.0)
+        """The largest ``κ`` (``0.0`` with no products), ordered as :meth:`max_normalized`."""
+        return _py_max(self.products.columns().kappa) if self.products else 0.0
 
     def by_class(self) -> dict[str, list[ProductStat]]:
         out: dict[str, list[ProductStat]] = {}
@@ -348,6 +490,8 @@ class CommittedLeaves:
     def __init__(self) -> None:
         self._objs: list[Any] = []
         self._versions: list[tuple[int, ...]] = []
+        # (first, stride, n) -> proof of a range read, or None (tensor_run)
+        self._runs: dict[tuple[int, int, int], Any] = {}
 
     def add(self, obj: Any) -> None:
         self._versions.append(tuple(t._version for t in _leaf_tensors(obj)))
@@ -385,6 +529,73 @@ class CommittedLeaves:
                 raise StoreMutationError(f"leaf {i} changed in place after check 2 hashed it")
             ts.append(t)
         return stack_block(ts, own)
+
+    def tensor_run(self, first: int, stride: int, n: int, own: bool = False) -> torch.Tensor:
+        """:meth:`tensor_block` of the leaves ``first + stride·k``, ``k < n``, without its
+        per-leaf checks of shape, offset and storage when they are one bmm's members.
+
+        The first read of a range proves, once, that the leaves are equal-shape contiguous
+        tensors at storage offsets ``off + k·numel`` of one storage, 64-byte aligned (the
+        conditions of :func:`stack_block`), and that every recorded ``_version`` is the same
+        number. That structure can't change, so the proof is kept. Every read still compares
+        each leaf's own ``_version`` to the recorded one: sharing a storage does not mean
+        sharing a version counter (``torch.load`` and ``set_`` give each tensor its own
+        counter over one storage, so a write through one leaf would leave the others' unmoved).
+        Any mismatch, and any range the proof fails on, takes :meth:`tensor_block`, which
+        raises for the first changed leaf, with its index, exactly as a loop of :meth:`leaf`
+        does. The proofs are kept on this object, so none outlives the step's leaves.
+        """
+        key = (first, stride, n)
+        last = first + stride * (n - 1)
+        runs = self._runs
+        if key not in runs:
+            runs[key] = self._prove_run(first, stride, n)
+        desc = runs[key]
+        if desc is not None:
+            t0, version, shape, strides, off = desc
+            if all(t._version == version for t in self._objs[first:last + 1:stride]):
+                out = t0.as_strided((n, *shape), strides, off)
+                return out.clone() if own else out
+        return self.tensor_block([first + stride * k for k in range(n)], own)
+
+    def _prove_run(self, first: int, stride: int, n: int
+                   ) -> tuple[torch.Tensor, int, Any, tuple[int, ...], int] | None:
+        """The proof :meth:`tensor_run` keeps for a range, or ``None`` if it can't be made.
+        A range inside a proved one is read off that proof, without visiting its leaves."""
+        objs, versions = self._objs, self._versions
+        last = first + stride * (n - 1)
+        if n < 1 or stride < 1 or not (isinstance(first, int) and 0 <= first and last < len(objs)):
+            return None
+        for (f0, s0, n0), d0 in self._runs.items():
+            if (d0 is not None and s0 == stride and first >= f0 and last <= f0 + s0 * (n0 - 1)
+                    and (first - f0) % stride == 0):
+                t0, version, shape, strides, off = d0
+                k = (first - f0) // stride
+                t = objs[first]
+                numel = strides[0]
+                if t.storage_offset() == off + k * numel and t.data_ptr() % _ALIGN == 0:
+                    return t, version, shape, strides, t.storage_offset()
+        t0 = objs[first]
+        if (not isinstance(t0, torch.Tensor) or t0.device.type != "cpu" or t0.numel() == 0
+                or not t0.is_contiguous() or t0.requires_grad or t0.data_ptr() % _ALIGN):
+            return None
+        shape, dtype, numel, off = t0.shape, t0.dtype, t0.numel(), t0.storage_offset()
+        ptr, version = t0.untyped_storage().data_ptr(), versions[first]
+        if len(version) != 1:
+            return None
+        for k in range(n):
+            i = first + stride * k
+            t = objs[i]
+            if (not isinstance(t, torch.Tensor) or t.shape != shape or t.dtype != dtype
+                    or t.storage_offset() != off + k * numel or not t.is_contiguous()
+                    or t.untyped_storage().data_ptr() != ptr or t.requires_grad
+                    or versions[i] != version or t._version != version[0]):
+                return None
+        strides, run = [], numel
+        for d in shape:
+            run //= d
+            strides.append(run)
+        return t0, version[0], shape, (numel, *strides), off
 
 
 @dataclass

@@ -46,6 +46,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.context import StepStats
 from verification.verifier.matmul_check.sizing import (
@@ -284,13 +286,17 @@ def step_floor(stats: StepStats, *, tau: float, k: int, N: float, eps_in: float,
     Unlike :func:`realized_floor` it never raises: a rejected step may hold products whose
     numbers are non-finite or unrecorded, and those are skipped (as are ``‖P‖_F = 0``). A
     product whose ``f_achieved`` is non-finite (``U`` infinite) wins."""
+    if not stats.products:
+        return None
+    cols = stats.products.columns()
+    keep = np.flatnonzero((cols.q > 0) & np.isfinite(cols.p_norm) & (cols.p_norm != 0)
+                          & ~np.isnan(cols.u))
     best: StepFloor | None = None
-    for p in stats.products:
-        if p.q <= 0 or not math.isfinite(p.p_norm) or p.p_norm == 0 or math.isnan(p.u):
-            continue
-        f = f_achieved(c, tau, product_e_m(p.q, eps_in, eps_acc, p.p_norm, p.u), N, k)
+    for i, q, p_norm, u in zip(keep.tolist(), cols.q[keep].tolist(), cols.p_norm[keep].tolist(),
+                               cols.u[keep].tolist()):
+        f = f_achieved(c, tau, product_e_m(q, eps_in, eps_acc, p_norm, u), N, k)
         if best is None or f > best.f_achieved:
-            best = StepFloor(f, p.name)
+            best = StepFloor(f, cols.name[i])
     return best
 
 
