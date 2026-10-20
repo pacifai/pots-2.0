@@ -214,17 +214,11 @@ static __host__ __device__ __forceinline__ pots_u32 pots_load32(const pots_u8 *p
 #endif
 }
 
-/* The little-endian word at message offset `off` (a multiple of 4), zero past the end. The
- * fast path reads a payload word in one load when the prefix is a multiple of 4 bytes and the
- * payload is 4-byte aligned; every other word, including the prefix and the tail, goes
- * byte by byte. */
-static __host__ __device__ __forceinline__ pots_u32 pots_msg_word(const pots_leaf_t *lf,
-                                                                    pots_u64 off) {
-  pots_u64 pre = 1ull + lf->hdr_len;
-  pots_u64 len = pre + lf->payload_len;
-  if (off >= len) return 0;
-  if (off >= pre && (pre & 3) == 0 && (lf->payload_ptr & 3) == 0 && off + 4 <= len)
-    return pots_load32((const pots_u8 *)lf->payload_ptr + (off - pre));
+/* The little-endian word at message offset `off` (a multiple of 4), zero past the end, read
+ * byte by byte: the path of the prefix, the tail and an unaligned payload. The aligned payload
+ * words take one load in pots_chunk_load. */
+static __host__ __device__ __forceinline__ pots_u32 pots_msg_word_bytes(const pots_leaf_t *lf,
+                                                                          pots_u64 off) {
   return pots_msg_byte(lf, off) | (pots_msg_byte(lf, off + 1) << 8) |
          (pots_msg_byte(lf, off + 2) << 16) | (pots_msg_byte(lf, off + 3) << 24);
 }
@@ -242,7 +236,8 @@ static __host__ __device__ __forceinline__ int pots_word_bad(pots_u32 kind, pots
 static __host__ __device__ __forceinline__ void pots_note_bad(pots_u32 *first_bad,
                                                                 pots_u32 leaf) {
 #ifdef POTS_ON_GPU
-  atomicMin(first_bad, leaf);
+  /* Most bad words come after a smaller leaf is already noted: skip the atomic then. */
+  if (leaf < *(volatile pots_u32 *)first_bad) atomicMin(first_bad, leaf);
 #else
   if (leaf < *first_bad) *first_bad = leaf;
 #endif
@@ -291,6 +286,14 @@ typedef struct {
   pots_u32 leaf[POTS_CHUNK_THREADS]; /* POTS_NONE for a slot with no chunk */
   pots_u32 chunk[POTS_CHUNK_THREADS];
   pots_u32 gn[POTS_CHUNK_THREADS]; /* live chunks of the slot's tile */
+  /* Per slot, once, for the load: the chunk's message bytes (0 for a slot with no chunk), the
+   * prefix bytes it holds (the prefix for chunk 0, else 0), the leaf's kind in bits 0-1 and
+   * bit 2 when payload words can be read in one load, and the address that chunk-relative
+   * offset 0 would have in the payload. */
+  pots_u32 clen[POTS_CHUNK_THREADS];
+  pots_u32 prel[POTS_CHUNK_THREADS];
+  pots_u32 mode[POTS_CHUNK_THREADS];
+  pots_u64 wp[POTS_CHUNK_THREADS];
   pots_u32 words[POTS_CHUNK_THREADS * POTS_WORD_STRIDE];
   pots_u32 node[POTS_CHUNK_THREADS * POTS_NODE_STRIDE];
 } pots_chunk_smem_t;
@@ -302,6 +305,7 @@ static __host__ __device__ __forceinline__ void pots_chunk_setup(
   sm->leaf[tid] = POTS_NONE;
   sm->chunk[tid] = 0;
   sm->gn[tid] = 0;
+  sm->clen[tid] = 0;
   if (tile < P->total_tiles) {
     pots_u32 leaf = pots_find_leaf(P->tile_prefix, P->n, tile);
     pots_u64 grp = tile - P->tile_prefix[leaf];
@@ -311,29 +315,41 @@ static __host__ __device__ __forceinline__ void pots_chunk_setup(
     if (lane < left) {
       sm->leaf[tid] = leaf;
       sm->chunk[tid] = (pots_u32)(grp * POTS_G + lane);
+      const pots_leaf_t *lf = &P->leaf[leaf];
+      pots_u64 pre = 1ull + lf->hdr_len;
+      pots_u64 start = (grp * POTS_G + lane) * POTS_CHUNK_LEN;
+      pots_u64 rest = pre + lf->payload_len - start;
+      sm->clen[tid] = rest < POTS_CHUNK_LEN ? (pots_u32)rest : POTS_CHUNK_LEN;
+      sm->prel[tid] = start == 0 ? (pots_u32)pre : 0u;
+      sm->mode[tid] = lf->kind | (((pre & 3) == 0 && (lf->payload_ptr & 3) == 0) ? 4u : 0u);
+      sm->wp[tid] = lf->payload_ptr + start - pre;
     }
   }
 }
 
 /* Block b of every slot's chunk into sm->words: the block's threads read the 16 words of 8
  * consecutive slots at a time, so 16 neighbouring threads read 64 contiguous bytes. The
- * finiteness test runs on the words as they are read. */
+ * finiteness test runs on the words as they are read. A word at chunk offset q is zero from
+ * the chunk's end on; a payload word that lies whole inside the chunk, of an aligned slot, is
+ * one load; any other word (prefix, tail, unaligned payload) goes byte by byte. */
 static __host__ __device__ __forceinline__ void pots_chunk_load(
     pots_chunk_smem_t *sm, const pots_params_t *P, pots_u32 tid, pots_u32 b) {
   for (pots_u32 i = 0; i < 16; i++) {
     pots_u32 idx = tid + i * POTS_CHUNK_THREADS;
     pots_u32 s = idx >> 4, w = idx & 15;
-    pots_u32 lid = sm->leaf[s];
+    pots_u32 q = 64u * b + 4u * w;
+    pots_u32 clen = sm->clen[s];
     pots_u32 word = 0;
-    if (lid != POTS_NONE) {
-      const pots_leaf_t *lf = &P->leaf[lid];
-      pots_u64 start = (pots_u64)sm->chunk[s] * POTS_CHUNK_LEN + 64ull * b;
-      pots_u64 off = start + 4ull * w;
-      if (start < pots_msg_len(lf)) {
-        word = pots_msg_word(lf, off);
-        if (lf->kind && off >= 1ull + lf->hdr_len && pots_word_bad(lf->kind, word))
-          pots_note_bad(P->first_bad, lid);
-      }
+    if (q < clen) {
+      pots_u32 mode = sm->mode[s];
+      int payload = q >= sm->prel[s];
+      if (payload && (mode & 4u) && q + 4u <= clen)
+        word = pots_load32((const pots_u8 *)(sm->wp[s] + q));
+      else
+        word = pots_msg_word_bytes(&P->leaf[sm->leaf[s]],
+                                   (pots_u64)sm->chunk[s] * POTS_CHUNK_LEN + q);
+      if (payload && (mode & 3u) && pots_word_bad(mode & 3u, word))
+        pots_note_bad(P->first_bad, sm->leaf[s]);
     }
     sm->words[s * POTS_WORD_STRIDE + w] = word;
   }
@@ -347,8 +363,7 @@ static __host__ __device__ __forceinline__ void pots_chunk_compute(
   if (lid == POTS_NONE) return;
   const pots_leaf_t *lf = &P->leaf[lid];
   pots_u64 c = sm->chunk[tid];
-  pots_u64 rest = pots_msg_len(lf) - c * POTS_CHUNK_LEN;
-  pots_u32 clen = rest < POTS_CHUNK_LEN ? (pots_u32)rest : POTS_CHUNK_LEN;
+  pots_u32 clen = sm->clen[tid];
   pots_u32 nb = (clen + 63) >> 6;
   if (b >= nb) return;
   if (b == 0) pots_iv(cv);
