@@ -450,18 +450,51 @@ interface.
   - Errors: `NonFiniteError` and `EncodingError`.
   - `tensor_leaf_payload_unchecked(t)` is `tensor_leaf_payload`'s view without the finiteness check (the
     caller checks it; the native path does it in C, S9d). `tensor_payload_span(t)` returns
-    `(t.data_ptr(), t.nbytes)` after the same structural checks (`_check_payload`: coded
-    dtype, CPU, contiguous), with no view and no finiteness check. The address aliases `t`,
-    so `t` must stay alive and unmodified until hashing is done.
+    `(t.data_ptr(), t.nbytes)` after the same structural checks (`check_payload`: coded
+    dtype, not `meta`, contiguous), with no view and no finiteness check. The address aliases
+    `t`, so `t` must stay alive and unmodified until hashing is done; a device tensor has no
+    host address and raises "tensor must be on CPU".
+  - **Device leaves (FS32b).** `check_payload` reads metadata only, so a CUDA or MPS leaf
+    passes it; a `meta` tensor, which has no bytes, keeps the old "tensor must be on CPU"
+    error. `tensor_leaf_payload` and `tensor_leaf_payload_unchecked` read a device leaf
+    through `hostcopy.host_tensor` (below), so its payload, finiteness check and errors are
+    its host twin's.
   - `tensor_leaf_header(tag, t)` and `tensor_leaf_payload(t)`. The payload is a zero-copy view
-    that aliases `t`, so don't mutate `t` until it is hashed. The tensor must be a contiguous
-    CPU tensor. The finiteness check (`_all_finite`) tests that the max and min are finite.
-    A max or min propagates NaN, so it rejects exactly what `isfinite(t).all()` rejects, with
+    that aliases `t` (a device leaf's host copy), so don't mutate `t` until it is hashed. The
+    tensor must be contiguous. The finiteness check (`_all_finite`) tests that the max and min
+    are finite. A max or min propagates NaN, so it rejects exactly what `isfinite(t).all()` rejects, with
     no temporary. fp32 and fp16 use numpy's single-threaded `max` and `min`, about 3× faster
     than `torch.aminmax`; bf16 uses `torch.aminmax`. The check stays on the calling thread:
     moving it into the hashing workers (O6) made commit and check 2 about 3× slower, because
     the per-leaf calls contend for the GIL with blake3's compute-bound workers.
   - `encode_tensor_leaf(tag, t)`.
+- `hostcopy.py` (FS32b): the one seam between a leaf's bytes and the hash. Under the sharded
+  placement (F22) product and weight leaves sit on the verifier GPUs and are hashed through a
+  host copy; FS34 replaces the copy with the GPU kernel (FS28) here.
+  - `on_device(t)` is `t.device.type != "cpu"`. `host_tensor(t)` returns a CPU tensor as the
+    same object, with no copy (the unsharded path is unchanged), and a device tensor as a
+    synchronous host copy. A change to `t`'s `_version` during the copy raises
+    `StoreMutationError` (invariant 6).
+  - `Stage` is one host buffer a native batch's device leaves are copied into back to back,
+    each 64-byte aligned. `put(t)` queues a leaf's copy and returns the host tensor over its
+    staged bytes. For a CUDA leaf the buffer is pinned and the copy runs `non_blocking` on a
+    side stream of the leaf's device (one per device, after the current stream's work), so
+    the copies of the next batch overlap the hashing of the current one. `fence()` records
+    one event per device used at batch close and `wait()` (the worker, before it reads)
+    synchronizes on them. Without CUDA (MPS, a fake) `put` is a plain `copy_`.
+  - `StagingPool` (`POOL`) hands out and takes back the buffers, used from the calling thread
+    only. A batch stages at most `_BATCH_BYTES`, and at most the batches in flight plus one
+    (3) pooled buffers exist, reused across batches and steps; a buffer returns to the pool
+    only once the batch that read it is hashed (`collect`, or the end of the call, which
+    drains any copy still queued). A leaf larger than a batch is the exception: it gets a
+    pinned buffer of its own, outside the pool and the count of 3. Torch's pinned allocator
+    rounds that buffer up to a power of two and caches it after the call, so a run of such
+    leaves holds pinned memory until the process ends (the pool-size item F21 decides this).
+  - With `wait_each` False a stage's side stream waits on the current stream once per device
+    per batch, not once per leaf. The native path sets it for a list or tuple input (commit
+    hashing passes `list(enumerate(leaves))`); a lazy iterable keeps the per-leaf wait. No
+    `record_stream` is needed: the batch keeps every source tensor until its event has
+    completed, and `finally` drains every stage, so the allocator cannot reuse a source.
 - `merkle.py` (B2, merged):
   - `hash_leaf(*parts)` streams its inputs, and runs multithreaded at 16 MiB and above with
     the same digest.
@@ -503,10 +536,22 @@ interface.
     addresses. Batches of up to 256 MiB or 32,768 leaves go to one background thread, two in
     flight: `native.hash_leaves` tests finiteness and hashes in C, and a leaf of 16 MiB or
     more takes `native.all_finite` and the Rust BLAKE3. A batch's first error beats the
-    iterable's, and the call returns only once no worker reads the caller's tensors. Under
+    iterable's, and the call returns only once no worker reads the caller's tensors. A device
+    leaf (FS32b) gets the same structural checks (`check_payload`) and is staged by
+    `hostcopy.Stage.put` as it is added to its batch, with its `_version` read first; the
+    worker waits for the batch's copies, compares each staged leaf's `_version`, and hashes the
+    staged bytes (a leaf of 16 MiB or more through `native.all_finite` and BLAKE3 on its host
+    copy). A batch closes before a device leaf that would stage more than `_BATCH_BYTES`. A
+    changed leaf is a `StoreMutationError` ("leaf i was mutated in place while it was copied
+    to the host") at its own position: the leaves before it are hashed, and an earlier
+    non-finite leaf still wins. The digests and errors are the host twin's. Under
     `native.disabled()` both functions take the Python path (`hash_leaves`,
     `hash_leaves_until_error`), the reference; `metrics.counting()` runs it so its counters see
-    every hash.
+    every hash. It reads a device leaf through `host_tensor` and holds each leaf's host copy
+    until its chunk is hashed. At most `_MAX_PENDING` (2) chunks are unfinished besides the
+    one being filled (about 16 MiB each, a bigger leaf making a bigger chunk), so the host
+    copies stay bounded. The counting pass runs it on a whole full-scale step, so that bound
+    is what keeps its host memory flat.
   - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
   - `transcript_root(c, reader)` is check 2.
   - `commit_leaves(c, leaves) -> MerkleTree`.
@@ -1176,7 +1221,10 @@ interface.
 
 - `reader.py`: `LeafReader`, a Protocol with a single method `leaf(index)`. A record leaf
   returns the instance's record object, and any other leaf returns a tensor. It has no leaf
-  count (invariant 7). `TranscriptView(computation, reader)` gives named access: `.record(i)`,
+  count (invariant 7). `stack_block` serves a run of equal-shape leaves at consecutive offsets of
+  one 64-byte-aligned storage as one strided view, on any device (FS32b): one device is a
+  condition of the proof like shape and dtype, and a mix falls back to `torch.stack`, which
+  raises its own error. `TranscriptView(computation, reader)` gives named access: `.record(i)`,
   `.records()`, `.w_t(name)`, `.product(m)` and `.w_next(name)`.
 - `errors.py`: `TranscriptFormatError(ValueError)` and its subclasses `LeafShapeError`,
   `LeafDtypeError`, `StoreMutationError` and `LeafReadError` (a disk leaf or the store's
@@ -1199,6 +1247,8 @@ interface.
       the `StepOutput` or the model, so the loop drops the `StepOutput` after handoff. It is
       `commit_step(c, step, *, copy=False) -> (leaves, tree)` (hashing, B6's P3) then
       `hold(c, leaves, tree, dataset_paths)` (the hand-off, P5), which the loop calls apart;
+    - A device leaf (FS32b) needs no store logic. `InMemoryStore` holds the tensors it gets, and
+      its `_version` guard and `hold` work on them; `perturb_leaf` hashes through the host copy.
     - `perturb_leaf(c, store, i, obj) -> new root` for the S6f sweep. It re-roots in
       O(log n) and validates the leaf before any change.
   - **On disk (A14, C3; S3's layout).** `DiskStore.write(dir, c, leaves, tree,
@@ -1206,9 +1256,10 @@ interface.
     (`leaf_00000.pt` …, `LEAF_FILE`), `leaf_hashes.bin` (the tree's 32-byte leaf hashes, for
     `path`) and `meta.json` (`format`, the root and the `h_D` paths as hex), written last; a
     failed write deletes `dir`. `DiskStore(dir)` opens one. Not part of any commitment.
-    - A tensor that doesn't own its whole storage (a `bmm` member, a slice of `D`) is cloned
-      before saving, because `torch.save` writes the whole storage. A `Record` is saved as a
-      dict of its three tensors and rebuilt (and so revalidated) on load.
+    - A device leaf is saved as its host copy (`host_tensor`), so its file and `leaf(i)` are
+      its host twin's. A tensor that doesn't own its whole storage (a `bmm` member, a slice of
+      `D`) is cloned before saving, because `torch.save` writes the whole storage. A `Record`
+      is saved as a dict of its three tensors and rebuilt (and so revalidated) on load.
     - `leaf(i)` loads the file on every call (`weights_only=True`, CPU, no `mmap`, no cache),
       so each read is a fresh tensor sharing no memory. A missing file is `IndexError`; an
       unloadable file or a foreign object is `LeafReadError`. `root` and `dataset_path`
@@ -1235,7 +1286,13 @@ interface.
     chain_check_id=, k=, judge=)`. `ctx.state` (`StepState`) carries what check 2's read
     produced to later checks: `claimed_root` (the prover's `h`, validated as a digest; check 5
     keys on it), the leaf hashes and `CommittedLeaves` (`ctx.state.committed()`). It carries
-    check 5's replay to 6b. The root comparison writes `recomputed_root`. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
+    check 5's replay to 6b. `CommittedLeaves` holds device leaves as they are (FS32b). Its
+    `tensor_run` and `stack_block` serve a range of equal-shape views at consecutive offsets of
+    one storage as one strided view on whatever device the storage is on: the proof drops the
+    old CPU-only condition and keeps shape, dtype, offsets, contiguity, the 64-byte alignment,
+    one storage, one device and the recorded `_version`s. A bmm's members that stay views of
+    one storage on the owner device are served with no stack copy. The root comparison writes
+    `recomputed_root`. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
     normalized residual, κ and ρ, which is P10b's calibration feed. `ProductStat` also
     carries each product's scale for C1's realized floor: `q`, `p_norm` (`‖P‖_F`), `nu`,
     `p_abs1` (`‖|P|·1‖`) and `u`, the term scale `U` (F18). `q`, `p_norm` and `u` set the

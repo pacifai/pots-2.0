@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from setup.records import Record
+from verification.commitment.hostcopy import host_tensor
 from verification.commitment.leaves import HashStats, hash_step_leaves, leaf_hash
 from verification.commitment.merkle import DIGEST_SIZE, MerkleTree
 from verification.transcript.errors import LeafReadError, StoreMutationError
@@ -250,8 +251,9 @@ _RECORD_KEYS = ("ids", "mask", "targets")
 def _owned(t: torch.Tensor) -> torch.Tensor:
     """``t`` itself when it owns its whole storage, else a copy that does. ``torch.save``
     writes a tensor's whole storage, so a view (an attention member of a ``bmm`` output, a
-    record sliced out of ``D``) would write its base with it."""
-    t = t.detach()
+    record sliced out of ``D``) would write its base with it. A device leaf is copied to the
+    host first, so its file is its host twin's."""
+    t = host_tensor(t.detach())
     if t.storage_offset() == 0 and t.untyped_storage().nbytes() == t.numel() * t.element_size():
         return t
     return t.clone()
