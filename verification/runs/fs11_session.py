@@ -1195,11 +1195,11 @@ def hw3_cards(parts: Sequence[Mapping[str, Any]], expected: int | None = None
     part. Per model: ``roots`` (the committed step's root per card, ``None`` for a card with no
     report), ``n_cards`` (the cards compared), ``uuids``, ``distinct_cards`` (every UUID present
     and none repeated: the runs landed on different physical cards), ``ran`` (every card's part
-    succeeded), ``same_bits`` (at least 2 cards, distinct, all ran, the roots equal) and, where
+    succeeded), ``same_bits`` (``expected`` cards, at least 2, distinct, all ran, the roots equal) and, where
     roots differ, ``first_difference``: the first leaf at which a card's hashes differ from the
-    first card's, its section and name. ``pass`` is true only when every model has ``same_bits``.
+    first card's, its section and name. top-level ``same_bits`` is true when every model has it; ``pass`` also needs ``gate``.
     ``expected`` (default ``FS31_CARDS``) is recorded with ``n_cards`` (the fewest over the
-    models); ``gate`` is false for anything but :data:`GATE_CARDS` (a rehearsal)."""
+    models); ``gate`` is false for anything but :data:`GATE_CARDS` (a rehearsal, never a pass)."""
     cards = [p for p in parts if p.get("kind") == "card"]
     if not cards:
         return None
@@ -1215,6 +1215,8 @@ def hw3_cards(parts: Sequence[Mapping[str, Any]], expected: int | None = None
         problems: list[str] = []
         if len(mine) < 2:
             problems.append(f"only {len(mine)} card compared, at least 2 are needed")
+        if len(mine) != n_expected:
+            problems.append(f"{len(mine)} cards compared, {CARDS_ENV} is {n_expected}")
         absent = [k for k, u in uuids.items() if not u]
         if absent:
             problems.append("no UUID for card " + ", ".join(absent))
@@ -1233,7 +1235,8 @@ def hw3_cards(parts: Sequence[Mapping[str, Any]], expected: int | None = None
                 (_first_difference(ref, p) for p in held[1:]
                  if roots[str(p["info"]["card"])] != roots[str(ref["info"]["card"])]), None)
         models[model] = rec
-    return {"models": models, "pass": all(m["same_bits"] for m in models.values()),
+    same_all = all(m["same_bits"] for m in models.values())
+    return {"models": models, "same_bits": same_all, "pass": same_all and n_expected == GATE_CARDS,
             "n_cards": min(m["n_cards"] for m in models.values()), "expected_cards": n_expected,
             "gate": n_expected == GATE_CARDS}
 
@@ -1254,7 +1257,7 @@ def _hw_lines(parts: Sequence[Mapping[str, Any]], hw3: Mapping[str, Any] | None)
     if hw3 is not None:
         if "hw3_cards_error" in hw3:
             lines.append(f"HW3 part 1 FAIL: the comparison raised ({hw3['hw3_cards_error']})")
-        elif hw3["pass"]:
+        elif hw3.get("same_bits", hw3["pass"]):
             n = hw3.get("expected_cards", GATE_CARDS)
             head = ("HW3 part 1 pass" if hw3.get("gate", True)
                     else f"HW3 part 1 rehearsal ({n} of {GATE_CARDS} cards), not the gate")

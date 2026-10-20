@@ -1627,7 +1627,7 @@ def test_hw3_names_the_first_differing_leaf(tmp_path):
     parts = [_card_part(tmp_path, "o/m", 0, _digests()),
              _card_part(tmp_path, "o/m", 1, _digests(), root="r"),
              _card_part(tmp_path, "o/m", 2, _digests(6, 7, 11), root="other")]
-    hw3 = fs.hw3_cards(parts)
+    hw3 = fs.hw3_cards(parts, expected=3)
     rec = hw3["models"]["o/m"]
     d = rec["first_difference"]
     assert not hw3["pass"] and not rec["same_bits"]
@@ -1659,7 +1659,7 @@ def test_hw3_fails_when_one_model_fails(tmp_path):
     parts = [_card_part(tmp_path, "o/a", k, _digests()) for k in range(2)]
     parts += [_card_part(tmp_path, "o/b", 0, _digests()),
               _card_part(tmp_path, "o/b", 1, _digests(3), root="other")]
-    hw3 = fs.hw3_cards(parts)
+    hw3 = fs.hw3_cards(parts, expected=2)
     assert not hw3["pass"]
     assert hw3["models"]["o/a"]["same_bits"] and not hw3["models"]["o/b"]["same_bits"]
     assert hw3["models"]["o/b"]["first_difference"]["name"] == "w_b"
@@ -1727,12 +1727,20 @@ def test_hw2_lines():
 def test_hw3_rehearsal_and_card_count_in_the_verdict_and_line(tmp_path):
     parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(2)]
     hw3 = fs.hw3_cards(parts, expected=2)
-    assert hw3["pass"] and (hw3["n_cards"], hw3["expected_cards"], hw3["gate"]) == (2, 2, False)
+    assert (hw3["n_cards"], hw3["expected_cards"], hw3["gate"]) == (2, 2, False)
+    assert hw3["same_bits"] and hw3["pass"] is False
     assert fs._hw_lines([], hw3) == ["HW3 part 1 rehearsal (2 of 4 cards), not the gate: "
                                      "the same bits on every card for all 1 models"]
     full = fs.hw3_cards([_card_part(tmp_path, "o/m", k, _digests()) for k in range(4)],
                         expected=4)
     assert full["gate"] and fs._hw_lines([], full)[0].startswith("HW3 part 1 pass: ")
+
+
+def test_hw3_fails_when_the_cards_compared_differ_from_the_expected_count(tmp_path):
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(3)]
+    hw3 = fs.hw3_cards(parts, expected=4)
+    assert hw3["pass"] is False and not hw3["models"]["o/m"]["same_bits"]
+    assert "3 cards compared, FS31_CARDS is 4" in fs._hw_lines([], hw3)[0]
 
 
 def test_hw3_expected_cards_default_to_fs31_cards(tmp_path, monkeypatch):

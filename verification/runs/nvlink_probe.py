@@ -167,8 +167,9 @@ def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
     pair, ``p2p_read_ok`` for every pair of the same GPUs, and a finite positive rate for every
     ordered pair of those GPUs. With all of them, the slowest pair's rate gives ``verdict``:
     ``pass`` at :data:`PEER_COPY_PASS_GBPS` or more, ``review`` from :data:`PEER_COPY_FAIL_GBPS`
-    up to that, ``fail`` below it; any other failed check is ``fail``. ``pass`` is true only for
-    ``"pass"``, ``gate`` only when ``n_expected`` is :data:`GATE_CARDS`. ``command_failures``
+    up to that, ``fail`` below it; any other failed check is ``fail``. ``gate`` is true only when ``n_expected`` is
+    :data:`GATE_CARDS`; ``pass`` only for ``"pass"`` with ``gate`` (a rehearsal keeps its measured
+    ``verdict`` and never has ``pass``). ``command_failures``
     names a ``topo`` or ``p2p_read`` command that failed; its matrix is not to be passed in."""
     expected = expected_cards() if n_expected is None else n_expected
     fails = dict(command_failures or {})
@@ -242,7 +243,7 @@ def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
     if review:
         reasons.append(review_note)
     verdict = "fail" if not ok else ("review" if review else "pass")
-    return {"verdict": verdict, "pass": verdict == "pass",
+    return {"verdict": verdict, "pass": verdict == "pass" and expected == GATE_CARDS,
             "n_cards": n_cards, "expected_cards": expected, "gate": expected == GATE_CARDS,
             "nv_links": nv_links, "nv18_everywhere": nv18, "p2p_read_ok": p2p_ok,
             "peer_copy_min_gbps": low, "slowest_pair": slowest,

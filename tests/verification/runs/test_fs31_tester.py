@@ -314,11 +314,12 @@ def test_hw3_reference_card_differs_is_still_located(tmp_path):
     assert not hw3["pass"] and hw3["models"]["o/m"]["first_difference"]["leaf"] == 5
 
 
-def test_hw3_card_missing_entirely_from_the_plan_is_not_detected(tmp_path):
-    """Only three card parts exist for a four-card session: pass on three. Recorded; the plan
-    always builds FS31_CARDS parts, so this needs a plan bug."""
+def test_hw3_card_missing_entirely_from_the_plan_fails_on_the_count(tmp_path):
+    """Only three card parts exist for a four-card session: fails on the count (round 3)."""
     parts = [card_part(tmp_path, "o/m", k) for k in range(3)]
-    assert fs.hw3_cards(parts)["pass"]
+    hw3 = fs.hw3_cards(parts, expected=4)
+    assert not hw3["pass"]
+    assert "3 cards compared, FS31_CARDS is 4" in fs._hw_lines([], hw3)[0]
 
 
 def test_hw3_card_with_a_failed_run_fails(tmp_path):

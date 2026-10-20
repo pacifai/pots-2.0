@@ -1017,9 +1017,9 @@ deadline is 5,400 s. It refuses a machine whose torch sees fewer than `FS31_CARD
 (`FS11_ALLOW_ANY_GPU=1` doesn't lift that). `summary.json` holds `hw2` and `hw3_cards`, and the
 job log ends with one `HW2` and one `HW3 part 1` line. HW2's verdict is `pass`, `review` or
 `fail`, by the slowest pair's copy rate (300 GB/s or more, 150-300, under 150) once the topology,
-the peer reads, the card count and a rate for every pair hold. HW3 needs two or more cards, each
+the peer reads, the card count and a rate for every pair hold. HW3 needs two or more cards, as many as `FS31_CARDS`, each
 with its own UUID. With `FS31_CARDS` below 4 (a rehearsal) both lines say `rehearsal (N of 4
-cards), not the gate` in place of a pass. A model whose cards give different roots names the
+cards), not the gate` in place of a pass, and the machine-readable `pass` is false (the measured `verdict` and `same_bits` stay). A model whose cards give different roots names the
 first differing leaf, its section and its name.
 
 **Estimated wall time.** From the first session's logs (2026-10-14), where only Qwen2.5-0.5B's

@@ -286,7 +286,8 @@ def test_a_rehearsal_records_gate_false_and_its_lines_do_not_read_as_a_pass():
     two = ("        GPU0    GPU1\nGPU0     X      NV18\nGPU1    NV18     X\n")
     p2p = " \tGPU0\tGPU1\n GPU0\tX\tOK\n GPU1\tOK\tX\n"
     v = band(380.0, n_expected=2, topo=two, p2p=p2p, n=2, slow="0->1")
-    assert v["verdict"] == "pass" and v["gate"] is False and v["expected_cards"] == 2
+    assert v["verdict"] == "pass" and v["gate"] is False and v["pass"] is False
+    assert v["expected_cards"] == 2
     line = nv.hw2_line(v)
     assert line.startswith("HW2 rehearsal (2 of 4 cards), not the gate") and "pass" not in line
     v = band(240.0, n_expected=2, topo=two, p2p=p2p, n=2, slow="0->1")
@@ -302,7 +303,7 @@ def test_the_expected_count_comes_from_fs31_cards(monkeypatch):
     assert nv.hw2_verdict(*args)["verdict"] == "fail"
     monkeypatch.setenv("FS31_CARDS", "2")
     v = nv.hw2_verdict(*args)
-    assert v["verdict"] == "pass" and not v["gate"]
+    assert v["verdict"] == "pass" and not v["gate"] and v["pass"] is False
 
 
 def test_missing_and_unusable_rates_name_the_pair():

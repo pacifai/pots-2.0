@@ -2334,7 +2334,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
   every ordered pair has a finite positive copy rate. The slowest pair's rate, by the PyTorch
   `copy_` timing, then gives `verdict`: `pass` at `PEER_COPY_PASS_GBPS` (300 GB/s) or more,
   `review` from `PEER_COPY_FAIL_GBPS` (150) up to that (the number returns to the user before
-  the port relies on it), `fail` below. `pass` is true only for `"pass"`. The verdict records
+  the port relies on it), `fail` below. `pass` is true only for `"pass"` with `gate` true (a rehearsal keeps its measured `verdict`, but `pass` is false). The verdict records
   `n_cards`, `expected_cards` and `gate` (false when `FS31_CARDS` isn't 4: a rehearsal, whose
   lines read `rehearsal (N of 4 cards), not the gate`). `nvbandwidth`'s text is recorded
   beside it and never enters the verdict. Every command runs through `run_command`, which keeps
@@ -2351,8 +2351,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
   beside it holds every leaf hash. It exits 1 when capture changed the bits on the one card.
   The card's UUID is torch's own device's where torch exposes it (else `nvidia-smi`'s); both
   are recorded. `fs11_session.hw3_cards` compares the cards' reports: `same_bits` needs at
-  least 2 cards, every UUID present and distinct, every card run and equal roots; it records
-  `n_cards`, `expected_cards` and `gate` as the probe does.
+  least 2 cards, as many cards as `FS31_CARDS`, every UUID present and distinct, every card run
+  and equal roots (a count that differs fails, naming both numbers); it records `n_cards`,
+  `expected_cards`, `gate` and a top-level `same_bits`, and its `pass` also needs `gate`, as the
+  probe's does.
 - `full_scale.py` (FS13; EVALUATION_SPEC ยง3.2): `.venv/bin/python -m
   verification.runs.full_scale run [--seeds S ...] [--levels N ...] [--hidden-level N]
   [--sweep-args ARGS] [--k-args ARGS] [--guard-ack] [--data-only]
