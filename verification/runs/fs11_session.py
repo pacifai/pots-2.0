@@ -588,6 +588,10 @@ CARDS_ENV = "FS31_CARDS"
 DEFAULT_CARDS = 4
 NVLINK_TIMEOUT_S = 900
 CARD_TIMEOUT_S = 900
+GATE_CARDS = 4  # F22's four cards; ``FS31_CARDS`` other than this is a rehearsal, not the gate
+# Card numbers follow ``nvidia-smi``'s (PCI bus order), so ``CUDA_VISIBLE_DEVICES=k`` and
+# ``nvidia-smi -i k`` name the same card.
+PCI_ORDER_ENV = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
 
 
 def fs31_cards(environ: Mapping[str, str] | None = None) -> int:
@@ -615,7 +619,8 @@ def nvlink_probe_plan(upload: Path, out: Path) -> list[Part]:
     plan = [_models_part(upload, out, PROFILE_CHECK_TIMEOUT_S["models"]),
             Part("nvlink_probe", ["{python}", "-m", "verification.runs.nvlink_probe", "--out",
                                   str(report)],
-                 timeout_s=NVLINK_TIMEOUT_S, kind="nvlink", info={"report": str(report)})]
+                 env=dict(PCI_ORDER_ENV), timeout_s=NVLINK_TIMEOUT_S, kind="nvlink",
+                 info={"report": str(report)})]
     for repo, rev in RUN_PINS:
         key = data_key(repo, BRING_UP_TASK)
         for card in range(n):
@@ -625,7 +630,8 @@ def nvlink_probe_plan(upload: Path, out: Path) -> list[Part]:
                 ["{python}", "-m", "verification.runs.card_identity", "--out",
                  str(d / "card.json")],
                 env={**FULL_SCALE_ENV, **RECHECK_ENV, **_run_env(repo, rev, BRING_UP_TASK),
-                     "CUDA_VISIBLE_DEVICES": str(card), "VERIF_OUTPUT_DIR": str(d)},
+                     **PCI_ORDER_ENV, "CUDA_VISIBLE_DEVICES": str(card),
+                     "VERIF_OUTPUT_DIR": str(d)},
                 timeout_s=CARD_TIMEOUT_S, kind="card",
                 info={"model": repo, "task": BRING_UP_TASK, "card": card, "run_dir": str(d),
                       "report": str(d / "card.json")}))
@@ -1083,8 +1089,10 @@ def _nvlink_extras(report: Path) -> dict[str, Any]:
     if not report.exists():
         return {"hw2": None}
     hw2 = json.loads(report.read_text())["hw2"]
-    return {"hw2": {k: hw2[k] for k in ("pass", "reasons", "nv_links", "nv18_everywhere",
-                                         "p2p_read_ok", "peer_copy_min_gbps")}}
+    return {"hw2": {k: hw2[k] for k in ("verdict", "pass", "reasons", "nv_links",
+                                         "nv18_everywhere", "p2p_read_ok", "peer_copy_min_gbps",
+                                         "slowest_pair", "pass_gbps", "fail_gbps", "n_cards",
+                                         "expected_cards", "gate")}}
 
 
 def _card_extras(report: Path) -> dict[str, Any]:
@@ -1181,25 +1189,43 @@ def _first_difference(ref: Mapping[str, Any], other: Mapping[str, Any]) -> dict[
             "n_differing_leaves": len(bad), "by_section": by_section}
 
 
-def hw3_cards(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+def hw3_cards(parts: Sequence[Mapping[str, Any]], expected: int | None = None
+              ) -> dict[str, Any] | None:
     """F22's HW3, first half, from the summary's part records: ``None`` when the plan has no card
     part. Per model: ``roots`` (the committed step's root per card, ``None`` for a card with no
-    report), ``ran`` (every card's part succeeded), ``same_bits`` (every card ran and the roots
-    are equal) and, where roots differ, ``first_difference``: the first leaf at which a card's
-    hashes differ from the first card's, its section and name. ``pass`` is true only when every
-    model has ``same_bits``."""
+    report), ``n_cards`` (the cards compared), ``uuids``, ``distinct_cards`` (every UUID present
+    and none repeated: the runs landed on different physical cards), ``ran`` (every card's part
+    succeeded), ``same_bits`` (at least 2 cards, distinct, all ran, the roots equal) and, where
+    roots differ, ``first_difference``: the first leaf at which a card's hashes differ from the
+    first card's, its section and name. ``pass`` is true only when every model has ``same_bits``.
+    ``expected`` (default ``FS31_CARDS``) is recorded with ``n_cards`` (the fewest over the
+    models); ``gate`` is false for anything but :data:`GATE_CARDS` (a rehearsal)."""
     cards = [p for p in parts if p.get("kind") == "card"]
     if not cards:
         return None
+    n_expected = fs31_cards() if expected is None else expected
     models: dict[str, dict[str, Any]] = {}
     for model in dict.fromkeys(p["info"]["model"] for p in cards):
         mine = sorted((p for p in cards if p["info"]["model"] == model),
                       key=lambda p: p["info"]["card"])
         roots = {str(p["info"]["card"]): (p.get("extras") or {}).get("root") for p in mine}
+        uuids = {str(p["info"]["card"]): (p.get("extras") or {}).get("uuid") for p in mine}
         ran = all(p["status"] in ("ok", "skipped_done") for p in mine)
         distinct = {r for r in roots.values() if r is not None}
-        same = ran and None not in roots.values() and len(distinct) == 1
-        rec: dict[str, Any] = {"roots": roots, "ran": ran, "same_bits": same}
+        problems: list[str] = []
+        if len(mine) < 2:
+            problems.append(f"only {len(mine)} card compared, at least 2 are needed")
+        absent = [k for k, u in uuids.items() if not u]
+        if absent:
+            problems.append("no UUID for card " + ", ".join(absent))
+        seen = [u for u in uuids.values() if u]
+        again = sorted({u for u in seen if seen.count(u) > 1})
+        if again:
+            problems.append("the same UUID on more than one card: " + ", ".join(again))
+        same = (ran and None not in roots.values() and len(distinct) == 1 and not problems)
+        rec: dict[str, Any] = {"roots": roots, "n_cards": len(mine), "uuids": uuids,
+                               "distinct_cards": not absent and not again, "ran": ran,
+                               "same_bits": same, "problems": problems}
         if len(distinct) > 1:
             held = [p for p in mine if roots[str(p["info"]["card"])] is not None]
             ref = held[0]
@@ -1207,27 +1233,32 @@ def hw3_cards(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
                 (_first_difference(ref, p) for p in held[1:]
                  if roots[str(p["info"]["card"])] != roots[str(ref["info"]["card"])]), None)
         models[model] = rec
-    return {"models": models, "pass": all(m["same_bits"] for m in models.values())}
+    return {"models": models, "pass": all(m["same_bits"] for m in models.values()),
+            "n_cards": min(m["n_cards"] for m in models.values()), "expected_cards": n_expected,
+            "gate": n_expected == GATE_CARDS}
 
 
 def _hw_lines(parts: Sequence[Mapping[str, Any]], hw3: Mapping[str, Any] | None) -> list[str]:
-    """The job log's HW2 and HW3 lines: pass or FAIL, with the reasons."""
+    """The job log's HW2 and HW3 lines: pass or FAIL, with the reasons; a review for HW2's middle
+    speed band; and, when ``FS31_CARDS`` is not the four cards, a rehearsal in place of a pass."""
+    from verification.runs.nvlink_probe import hw2_line  # stdlib only, kept off module level
+
     lines = []
     probe = next((p for p in parts if p.get("kind") == "nvlink"), None)
     if probe is not None:
         hw2 = (probe.get("extras") or {}).get("hw2")
         if hw2 is None:
             lines.append(f"HW2 FAIL: the NVLink probe left no verdict ({probe['status']})")
-        elif hw2["pass"]:
-            lines.append(f"HW2 pass: NVLink between every pair, slowest copy "
-                         f"{hw2['peer_copy_min_gbps']:.0f} GB/s")
         else:
-            lines.append("HW2 FAIL: " + "; ".join(hw2["reasons"]))
+            lines.append(hw2_line(hw2))
     if hw3 is not None:
         if "hw3_cards_error" in hw3:
             lines.append(f"HW3 part 1 FAIL: the comparison raised ({hw3['hw3_cards_error']})")
         elif hw3["pass"]:
-            lines.append(f"HW3 part 1 pass: the same bits on every card for all "
+            n = hw3.get("expected_cards", GATE_CARDS)
+            head = ("HW3 part 1 pass" if hw3.get("gate", True)
+                    else f"HW3 part 1 rehearsal ({n} of {GATE_CARDS} cards), not the gate")
+            lines.append(f"{head}: the same bits on every card for all "
                          f"{len(hw3['models'])} models")
         else:
             why = []
@@ -1235,12 +1266,16 @@ def _hw_lines(parts: Sequence[Mapping[str, Any]], hw3: Mapping[str, Any] | None)
                 if m["same_bits"]:
                     continue
                 d = m.get("first_difference")
+                found = list(m.get("problems") or [])
                 if d is not None:
-                    detail = (f"card {d['card']} differs from card {d['reference_card']} first at "
-                              f"leaf {d.get('leaf')} ({d.get('section')} {d.get('name')})")
-                else:
-                    detail = ("a card did not run or has no report" if not m["ran"]
-                              else "no common root")
+                    found.append(f"card {d['card']} differs from card {d['reference_card']} "
+                                 f"first at leaf {d.get('leaf')} ({d.get('section')} "
+                                 f"{d.get('name')})")
+                if not m["ran"]:
+                    found.append("a card did not run or has no report")
+                elif not found:
+                    found.append("no common root")
+                detail = "; ".join(found)
                 why.append(f"{model.split('/')[-1]}: {detail}")
             lines.append("HW3 part 1 FAIL: " + "; ".join(why))
     return lines

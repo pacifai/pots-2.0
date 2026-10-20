@@ -98,3 +98,43 @@ def test_main_exits_1_when_capture_changes_the_bits(tiny, tmp_path, monkeypatch)
     out = tmp_path / "card.json"
     assert ci.main(["--out", str(out)]) == 1
     assert out.exists()
+
+
+def test_card_facts_take_torchs_uuid_and_record_both(monkeypatch):
+    def run(argv, **kw):
+        return SimpleNamespace(returncode=0, stderr="",
+                               stdout="NVIDIA H100, GPU-1111, 00000000:8A:00.0\n")
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda i: SimpleNamespace(name="NVIDIA H100", uuid="2222"))
+    f = ci.card_facts("cuda", run)
+    assert (f["uuid"], f["uuid_torch"], f["uuid_smi"]) == ("GPU-2222", "GPU-2222", "GPU-1111")
+    assert f["uuids_agree"] is False and f["device_order"] == "PCI_BUS_ID"
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda i: SimpleNamespace(name="NVIDIA H100", uuid="GPU-1111"))
+    f = ci.card_facts("cuda", run)
+    assert f["uuid"] == "GPU-1111" and f["uuids_agree"] is True
+
+
+def test_card_facts_fall_back_to_the_smi_uuid_when_torch_has_none(monkeypatch):
+    def run(argv, **kw):
+        return SimpleNamespace(returncode=0, stderr="",
+                               stdout="NVIDIA H100, GPU-1111, 00000000:8A:00.0\n")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda i: SimpleNamespace(name="NVIDIA H100"))
+    f = ci.card_facts("cuda", run)
+    assert f["uuid"] == "GPU-1111" and f["uuid_torch"] is None and f["uuids_agree"] is None
+
+
+def test_card_facts_ignore_the_text_of_a_failed_nvidia_smi(monkeypatch):
+    def run(argv, **kw):
+        return SimpleNamespace(returncode=9, stderr="",
+                               stdout="NVIDIA H100, GPU-1111, 00000000:8A:00.0\n")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda i: SimpleNamespace(name="NVIDIA H100"))
+    f = ci.card_facts("cuda", run)
+    assert f["uuid"] is None and "exit code 9" in f["nvidia_smi_error"]

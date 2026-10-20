@@ -106,9 +106,6 @@ def test_ansi_coloured_topo_still_parses_and_passes():
     assert verdict(topo=colored)["pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: hw2_verdict has no expected GPU count, so a "
-                   "2-GPU all-NV18 matrix passes HW2 (the session's torch-count refusal is the "
-                   "only guard, and it is not part of the verdict)")
 def test_two_gpu_matrix_fails_hw2_defect():
     two = """\
         GPU0    GPU1    CPU Affinity    NUMA Affinity
@@ -120,8 +117,6 @@ GPU1    NV18     X      0-47    0
     assert not v["pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: an 8-GPU all-NV18 matrix passes HW2; the probe "
-                   "does not check for the four cards F22 specifies")
 def test_eight_gpu_matrix_fails_hw2_defect():
     p2p = " \t" + "\t".join(f"GPU{i}" for i in range(8)) + "\n" + "\n".join(
         f" GPU{i}\t" + "\t".join("X" if i == j else "OK" for j in range(8)) for i in range(8))
@@ -160,14 +155,11 @@ def test_report_with_clean_commands_passes(monkeypatch):
     assert nv.build_report(_fake_run())["hw2"]["pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: build_report parses stdout of `topo -m` even when "
-                   "the command exited non-zero, so a failed command with plausible text passes")
 def test_nonzero_exit_of_topo_with_good_text_does_not_pass(monkeypatch):
     _four_fast(monkeypatch)
     assert not nv.build_report(_fake_run(topo_code=2))["hw2"]["pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: same for `topo -p2p r` exiting non-zero")
 def test_nonzero_exit_of_p2p_with_good_text_does_not_pass(monkeypatch):
     _four_fast(monkeypatch)
     assert not nv.build_report(_fake_run(p2p_code=2))["hw2"]["pass"]
@@ -187,12 +179,19 @@ def test_timeout_of_topo_does_not_pass(monkeypatch):
 # ---- HW2: bandwidth --------------------------------------------------------------------------
 
 
-def test_rate_at_the_threshold_passes_and_just_below_fails():
-    t = nv.PEER_COPY_MIN_GBPS
-    assert verdict(rates=pair_rates(4, t))["pass"]
+def test_rate_at_the_pass_line_passes_and_just_below_is_a_review():
+    t = nv.PEER_COPY_PASS_GBPS
+    assert verdict(rates=pair_rates(4, t))["verdict"] == "pass"
     v = verdict(rates=pair_rates(4, t, slow=("1->3", t - 0.01)))
-    assert not v["pass"] and any("1->3" in r for r in v["reasons"])
-    assert not verdict(rates=pair_rates(4, 380.0, slow=("0->1", 25.0)))["pass"]
+    assert v["verdict"] == "review" and not v["pass"] and any("1->3" in r for r in v["reasons"])
+
+
+def test_rate_at_the_fail_line_is_a_review_and_just_below_fails():
+    t = nv.PEER_COPY_FAIL_GBPS
+    assert verdict(rates=pair_rates(4, 380.0, slow=("1->3", t)))["verdict"] == "review"
+    v = verdict(rates=pair_rates(4, 380.0, slow=("1->3", t - 0.01)))
+    assert v["verdict"] == "fail" and any("1->3" in r for r in v["reasons"])
+    assert verdict(rates=pair_rates(4, 380.0, slow=("0->1", 25.0)))["verdict"] == "fail"
     assert not verdict(rates=pair_rates(4, 380.0, slow=("0->1", 0.0)))["pass"]
     assert not verdict(rates=pair_rates(4, 380.0, slow=("0->1", -5.0)))["pass"]
 
@@ -206,22 +205,17 @@ def test_no_rates_fail():
     assert not nv.hw2_verdict(parse(TOPO_4), parse(P2P_4), None)["pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: pairs absent from the measured rates are not "
-                   "noticed; with a 4-GPU topo and only one pair measured the verdict passes")
 def test_missing_pairs_do_not_pass():
     assert not verdict(rates={"0->1": 380.0})["pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: a NaN rate compares false against the threshold "
-                   "(and min() ignores order with NaN), so it can pass")
 def test_nan_rate_does_not_pass():
     assert not verdict(rates=pair_rates(4, 380.0, slow=("1->2", math.nan)))["pass"]
 
 
-def test_inf_rate_is_not_a_pass_by_itself():
-    # a zero-length timing would give inf; the verdict has no cap, so record the behaviour
-    v = verdict(rates=pair_rates(4, math.inf))
-    assert v["pass"] in (True, False)
+def test_inf_rate_fails():
+    # a zero-length timing would give inf; only finite rates count
+    assert verdict(rates=pair_rates(4, math.inf))["verdict"] == "fail"
 
 
 def test_without_cuda_nothing_is_measured_and_hw2_fails(monkeypatch):
@@ -391,16 +385,11 @@ def test_hw3_error_is_stored_and_the_session_goes_on(tmp_path, monkeypatch):
     assert s["hw3_cards"] == {"hw3_cards_error": "OSError: gone"} and s["finished"]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: hw3_cards never checks that the cards are "
-                   "different devices; if CUDA_VISIBLE_DEVICES were ignored and every run "
-                   "landed on one GPU (same UUID), the cards 'agree' and HW3 passes")
 def test_hw3_four_runs_on_the_same_physical_card_do_not_pass(tmp_path):
     parts = [card_part(tmp_path, "o/m", k, uuid="GPU-same") for k in range(4)]
     assert not fs.hw3_cards(parts)["pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: one card is a vacuous comparison; FS31_CARDS=1 "
-                   "gives a HW3 pass with nothing compared")
 def test_hw3_single_card_is_not_a_pass(tmp_path):
     assert not fs.hw3_cards([card_part(tmp_path, "o/m", 0)])["pass"]
 
@@ -439,10 +428,8 @@ def test_the_parts_run_through_base_env_with_secrets_stripped(tmp_path, monkeypa
     assert "secret-value" not in env.values()
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT (pre-existing, not FS31's): base_env strips only "
-                   "the five names in SECRETS; any other *_TOKEN or *_KEY variable on the pod "
-                   "(for example GITHUB_TOKEN, AWS_SECRET_ACCESS_KEY, or a *_API_KEY) reaches "
-                   "every part")
+@pytest.mark.xfail(strict=True, reason="pre-existing: base_env strips only SECRETS; outside "
+                   "FS31's plan (orchestrator, 2026-10-20)")
 def test_base_env_strips_other_token_and_key_names(tmp_path, monkeypatch):
     monkeypatch.setenv("SOME_SERVICE_TOKEN", "v1")
     monkeypatch.setenv("OTHER_API_KEY", "v2")

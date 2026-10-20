@@ -10,17 +10,23 @@ others, pinned host memory to each card for contrast, and ``nvbandwidth``'s devi
 tests when that tool is already on the PATH (never downloaded or built). A command that fails,
 times out or is missing is recorded, not raised, and the measures that follow still run.
 
-The verdict ``hw2`` is four checks: every pair of cards is joined by ``NV<n>`` links
-(``nv_links``), every pair by exactly ``NV18`` (``nv18_everywhere``, the H100 SXM's link count),
-peer reads are ``OK`` for every pair (``p2p_read_ok``), and the slowest pair's copy rate reaches
-:data:`PEER_COPY_MIN_GBPS`. It exits 0 once the report is written, whatever the verdict; a
-non-zero exit means the probe itself broke.
+The verdict ``hw2`` (:func:`hw2_verdict`) checks that the topology matrix shows ``FS31_CARDS``
+cards (default 4), that every pair is joined by exactly ``NV18`` (the H100 SXM's link count), that
+peer reads are ``OK`` for every pair, and that every ordered pair has a finite, positive copy rate.
+The slowest pair's rate, by the PyTorch copy timing, sets its ``verdict``: ``pass`` at
+:data:`PEER_COPY_PASS_GBPS` or more, ``review`` from :data:`PEER_COPY_FAIL_GBPS` up to that (the
+number returns to the user before the port relies on it), ``fail`` below it or on any other
+failed check. ``nvbandwidth``'s text is recorded beside it and never enters the verdict. The
+probe exits 0 once the report is written, whatever the verdict; a non-zero exit means the probe
+itself broke. A measure that raises is recorded under its key, and the report is still written.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
 import shutil
 import subprocess
@@ -30,7 +36,8 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-__all__ = ["PEER_COPY_MIN_GBPS", "COMMANDS", "run_command", "parse_gpu_matrix", "hw2_verdict",
+__all__ = ["PEER_COPY_PASS_GBPS", "PEER_COPY_FAIL_GBPS", "GATE_CARDS", "COMMANDS", "expected_cards",
+           "hw2_line", "run_command", "parse_gpu_matrix", "hw2_verdict",
            "peer_copy_bandwidth", "fanout_bandwidth", "pinned_bandwidth", "torch_view",
            "build_report", "main"]
 
@@ -40,9 +47,14 @@ COPY_BYTES = GIB
 WARMUPS = 2
 REPS = 10
 MIN_FREE = 4 * GIB
-# Hand-picked to separate NVLink from PCIe: a PCIe Gen5 x16 link tops out near 64 GB/s, and an
-# H100's NVLink near 300-400 GB/s one way, so 200 GB/s sits well clear of both.
-PEER_COPY_MIN_GBPS = 200.0
+# The user's three bands for the slowest pair (2026-10-20): a PCIe Gen5 x16 link tops out near
+# 64 GB/s and an H100's NVLink near 300-400 GB/s one way. At 300 or more the pair passes; from
+# 150 up to 300 the number returns to the user; under 150 it fails.
+PEER_COPY_PASS_GBPS = 300.0
+PEER_COPY_FAIL_GBPS = 150.0
+# F22 specifies four cards; ``FS31_CARDS`` below that is a rehearsal, never the gate.
+GATE_CARDS = 4
+CARDS_ENV = "FS31_CARDS"
 
 COMMAND_TIMEOUT_S = 60.0
 NVBANDWIDTH_TIMEOUT_S = 300.0
@@ -64,10 +76,11 @@ Run = Callable[..., Any]
 
 def run_command(argv: Sequence[str], timeout_s: float, run: Run = subprocess.run
                 ) -> dict[str, Any]:
-    """``argv``'s outcome as a record: ``ok``, ``returncode``, the raw ``text`` (stdout, then
-    stderr) and ``error`` (a missing tool, a timeout, or a non-zero exit). Never raises."""
+    """``argv``'s outcome as a record: ``ok``, ``returncode``, ``stdout`` and ``stderr`` apart,
+    the raw ``text`` (both, for reading) and ``error`` (a missing tool, a timeout, or a non-zero
+    exit). Only ``stdout`` is parsed, and only when ``ok``. Never raises."""
     rec: dict[str, Any] = {"argv": list(argv), "ok": False, "returncode": None, "text": "",
-                           "error": None}
+                           "stdout": "", "stderr": "", "error": None}
     try:
         r = run(list(argv), capture_output=True, text=True, timeout=timeout_s, check=False)
     except FileNotFoundError:
@@ -75,12 +88,15 @@ def run_command(argv: Sequence[str], timeout_s: float, run: Run = subprocess.run
         return rec
     except subprocess.TimeoutExpired as e:
         out = e.stdout if isinstance(e.stdout, str) else ""
-        rec.update(text=out, error=f"timed out after {timeout_s:g} s")
+        err = e.stderr if isinstance(e.stderr, str) else ""
+        rec.update(text=out + err, stdout=out, stderr=err,
+                   error=f"timed out after {timeout_s:g} s")
         return rec
     except Exception as e:  # a probe records what it can't run
         rec["error"] = f"{type(e).__name__}: {e}"
         return rec
-    rec.update(returncode=r.returncode, text=(r.stdout or "") + (r.stderr or ""))
+    out, err = r.stdout or "", r.stderr or ""
+    rec.update(returncode=r.returncode, text=out + err, stdout=out, stderr=err)
     rec["ok"] = r.returncode == 0
     if r.returncode != 0:
         rec["error"] = f"exit code {r.returncode}"
@@ -122,18 +138,52 @@ def _pairs(names: Sequence[str]) -> list[tuple[str, str]]:
 # ---- the verdict --------------------------------------------------------------------------
 
 
+def expected_cards(environ: Mapping[str, str] | None = None) -> int:
+    """``FS31_CARDS`` (default 4); a value the session would have refused counts as 4."""
+    raw = (os.environ if environ is None else environ).get(CARDS_ENV, "").strip()
+    try:
+        n = int(raw) if raw else GATE_CARDS
+    except ValueError:
+        return GATE_CARDS
+    return n if n >= 1 else GATE_CARDS
+
+
+def _gpu_index(name: str) -> str:
+    return name[3:]
+
+
+def _command_failure(rec: Mapping[str, Any]) -> str | None:
+    if rec.get("ok"):
+        return None
+    return f"{' '.join(rec['argv'])} failed: {rec.get('error') or 'no result'}"
+
+
 def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
                 p2p_read: Mapping[str, Mapping[str, str]] | None,
-                pair_gbps: Mapping[str, float | None] | None) -> dict[str, Any]:
-    """F22's HW2: ``nv_links``, ``nv18_everywhere``, ``p2p_read_ok``, ``peer_copy_min_gbps``
-    (the slowest ordered pair, ``None`` when none was measured) against
-    :data:`PEER_COPY_MIN_GBPS`. ``pass`` needs all four; ``reasons`` names each failed one."""
+                pair_gbps: Mapping[str, float | None] | None, n_expected: int | None = None,
+                command_failures: Mapping[str, str | None] | None = None) -> dict[str, Any]:
+    """F22's HW2. The checks: the topology matrix shows ``n_expected`` GPUs (default
+    ``FS31_CARDS``; ``n_cards`` is what it shows), ``nv_links`` and ``nv18_everywhere`` for every
+    pair, ``p2p_read_ok`` for every pair of the same GPUs, and a finite positive rate for every
+    ordered pair of those GPUs. With all of them, the slowest pair's rate gives ``verdict``:
+    ``pass`` at :data:`PEER_COPY_PASS_GBPS` or more, ``review`` from :data:`PEER_COPY_FAIL_GBPS`
+    up to that, ``fail`` below it; any other failed check is ``fail``. ``pass`` is true only for
+    ``"pass"``, ``gate`` only when ``n_expected`` is :data:`GATE_CARDS`. ``command_failures``
+    names a ``topo`` or ``p2p_read`` command that failed; its matrix is not to be passed in."""
+    expected = expected_cards() if n_expected is None else n_expected
+    fails = dict(command_failures or {})
     reasons: list[str] = []
     nv_links = nv18 = p2p_ok = False
+    n_cards: int | None = None
+    names: list[str] = []
     if topo is None:
-        reasons.append("nvidia-smi topo -m gave no GPU matrix")
+        reasons.append(fails.get("topo") or "nvidia-smi topo -m gave no GPU matrix")
     else:
-        pairs = _pairs(list(topo))
+        names = list(topo)
+        n_cards = len(names)
+        if n_cards != expected:
+            reasons.append(f"the topology matrix shows {n_cards} GPUs, {CARDS_ENV} is {expected}")
+        pairs = _pairs(names)
         labels = {(a, b): topo[a].get(b) for a, b in pairs}
         nv_links = bool(pairs) and all(re.fullmatch(r"NV\d+", str(v)) for v in labels.values())
         nv18 = bool(pairs) and all(v == "NV18" for v in labels.values())
@@ -146,27 +196,86 @@ def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
             few = [f"{a}-{b} is {v}" for (a, b), v in labels.items() if a < b and v != "NV18"]
             reasons.append("not every pair has 18 NVLink links: " + ", ".join(few[:6]))
     if p2p_read is None:
-        reasons.append("nvidia-smi topo -p2p r gave no GPU matrix")
+        reasons.append(fails.get("p2p_read") or "nvidia-smi topo -p2p r gave no GPU matrix")
     else:
         pairs = _pairs(list(p2p_read))
         p2p_ok = bool(pairs) and all(p2p_read[a].get(b) == "OK" for a, b in pairs)
         if not p2p_ok:
             bad = [f"{a}->{b} is {p2p_read[a].get(b)}" for a, b in pairs
                    if p2p_read[a].get(b) != "OK"]
-            reasons.append("peer reads are not OK for every pair: " + ", ".join(bad[:6]))
-    rates = [v for v in (pair_gbps or {}).values() if v is not None]
-    low = min(rates) if rates else None
-    if low is None:
+            reasons.append("peer reads are not OK for every pair: "
+                           + (", ".join(bad[:6]) or "fewer than two GPUs"))
+        if topo is not None and set(p2p_read) != set(topo):
+            p2p_ok = False
+            reasons.append(f"the peer-read matrix shows {sorted(p2p_read)}, the topology "
+                           f"matrix {sorted(topo)}")
+    rates = pair_gbps or {}
+    wanted = [f"{_gpu_index(a)}->{_gpu_index(b)}" for a, b in _pairs(names)]
+    good = {k: v for k, v in rates.items()
+            if isinstance(v, (int, float)) and math.isfinite(v) and v > 0}
+    complete = False
+    if topo is not None:
+        missing = [k for k in wanted if k not in rates or rates[k] is None]
+        invalid = [k for k in wanted if k in rates and rates[k] is not None and k not in good]
+        if missing:
+            reasons.append("no copy rate for pair " + ", ".join(missing[:6]))
+        if invalid:
+            reasons.append("the copy rate is not a finite positive number for pair "
+                           + ", ".join(f"{k} ({rates[k]!r})" for k in invalid[:6]))
+        complete = not missing and not invalid and bool(wanted)
+    if not good and not rates:
         reasons.append("no peer-copy bandwidth was measured")
-    elif low < PEER_COPY_MIN_GBPS:
-        slow = min((v, k) for k, v in (pair_gbps or {}).items() if v is not None)[1]
-        reasons.append(f"the slowest pair ({slow}) copied at {low:.0f} GB/s, under "
-                       f"{PEER_COPY_MIN_GBPS:g} GB/s")
-    elif pair_gbps is not None and len(rates) < len(pair_gbps):
-        reasons.append("some pairs were not measured")
-    return {"nv_links": nv_links, "nv18_everywhere": nv18, "p2p_read_ok": p2p_ok,
-            "peer_copy_min_gbps": low, "threshold_gbps": PEER_COPY_MIN_GBPS,
-            "pass": not reasons and nv_links and nv18 and p2p_ok, "reasons": reasons}
+    scored = {k: good[k] for k in wanted if k in good} if topo is not None else good
+    slow = min(scored.items(), key=lambda kv: kv[1]) if scored else None
+    low = slow[1] if slow else None
+    slowest = slow[0] if slow else None
+    review_note = None
+    if slow and complete:
+        if low < PEER_COPY_FAIL_GBPS:
+            reasons.append(f"the slowest pair ({slowest}) copied at {low:.0f} GB/s, under "
+                           f"{PEER_COPY_FAIL_GBPS:g} GB/s")
+        elif low < PEER_COPY_PASS_GBPS:
+            review_note = (f"the slowest pair ({slowest}) copied at {low:.0f} GB/s, under the "
+                           f"{PEER_COPY_PASS_GBPS:g} GB/s target (150-300 returns to the user)")
+    ok = not reasons and nv_links and nv18 and p2p_ok and complete
+    review = ok and review_note is not None
+    if review:
+        reasons.append(review_note)
+    verdict = "fail" if not ok else ("review" if review else "pass")
+    return {"verdict": verdict, "pass": verdict == "pass",
+            "n_cards": n_cards, "expected_cards": expected, "gate": expected == GATE_CARDS,
+            "nv_links": nv_links, "nv18_everywhere": nv18, "p2p_read_ok": p2p_ok,
+            "peer_copy_min_gbps": low, "slowest_pair": slowest,
+            "pass_gbps": PEER_COPY_PASS_GBPS, "fail_gbps": PEER_COPY_FAIL_GBPS,
+            "reasons": reasons}
+
+
+def _floor(x: float) -> str:
+    return f"{math.floor(x)}"
+
+
+def hw2_line(hw2: Mapping[str, Any]) -> str:
+    """The one-line account of an HW2 verdict: the band, the slowest pair and its rate, and the
+    300 and 150 GB/s lines. A rehearsal's pass or review says so instead of passing."""
+    verdict = hw2.get("verdict") or ("pass" if hw2.get("pass") else "fail")
+    pair, low = hw2.get("slowest_pair"), hw2.get("peer_copy_min_gbps")
+    hi, lo = hw2.get("pass_gbps", PEER_COPY_PASS_GBPS), hw2.get("fail_gbps", PEER_COPY_FAIL_GBPS)
+    if pair is None or low is None:
+        speed = f"no peer-copy rate (target {hi:g} GB/s, fail under {lo:g})"
+    elif low >= hi:
+        speed = f"slowest pair {pair} at {math.floor(low)} GB/s, over the {hi:g} GB/s target"
+    elif low >= lo:
+        speed = (f"slowest pair {pair} at {math.floor(low)} GB/s, under the {hi:g} GB/s target "
+                 f"({lo:g}-{hi:g} returns to the user)")
+    else:
+        speed = (f"slowest pair {pair} at {math.floor(low)} GB/s, under the {lo:g} GB/s fail "
+                 f"line (target {hi:g})")
+    if verdict != "fail" and hw2.get("gate") is False:
+        n = hw2.get("expected_cards")
+        return f"HW2 rehearsal ({n} of {GATE_CARDS} cards), not the gate: {speed}"
+    head = {"pass": "HW2 pass", "review": "HW2 review", "fail": "HW2 FAIL"}[verdict]
+    why = "; ".join(hw2.get("reasons") or []) if verdict == "fail" else ""
+    return f"{head}: {speed}" + (f"; {why}" if why else "")
 
 
 # ---- torch's view and the copies ----------------------------------------------------------
@@ -203,9 +312,14 @@ def _sync_all(torch: Any, n: int) -> None:
 
 
 def _free(torch: Any, n: int) -> None:
+    """Release cached memory on every card; best effort, so a wedged card can't lose the rates
+    already measured."""
     for d in range(n):
-        with torch.cuda.device(d):
-            torch.cuda.empty_cache()
+        try:
+            with torch.cuda.device(d):
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 
 def _short(torch: Any, devices: Sequence[int]) -> str | None:
@@ -230,11 +344,12 @@ def peer_copy_bandwidth(nbytes: int = COPY_BYTES, reps: int = REPS) -> dict[str,
             if i == j:
                 continue
             key = f"{i}->{j}"
-            short = _short(torch, (i, j))
-            if short:
-                pairs[key], notes[key] = None, f"skipped: {short}"
-                continue
+            src = dst = None
             try:
+                short = _short(torch, (i, j))
+                if short:
+                    pairs[key], notes[key] = None, f"skipped: {short}"
+                    continue
                 src = torch.empty(nbytes, dtype=torch.uint8, device=f"cuda:{i}")
                 dst = torch.empty(nbytes, dtype=torch.uint8, device=f"cuda:{j}")
                 for _ in range(WARMUPS):
@@ -263,10 +378,11 @@ def fanout_bandwidth(nbytes: int = COPY_BYTES, reps: int = REPS) -> dict[str, An
     if n < 2:
         return {"skipped": f"{n} CUDA device"}
     targets = list(range(1, n))
-    short = _short(torch, range(n))
-    if short:
-        return {"skipped": short}
+    src = dsts = streams = None
     try:
+        short = _short(torch, range(n))
+        if short:
+            return {"skipped": short}
         src = torch.empty(nbytes, dtype=torch.uint8, device="cuda:0")
         dsts = [torch.empty(nbytes, dtype=torch.uint8, device=f"cuda:{j}") for j in targets]
         streams = [torch.cuda.Stream(device=0) for _ in targets]
@@ -306,11 +422,12 @@ def pinned_bandwidth(nbytes: int = COPY_BYTES, reps: int = REPS) -> dict[str, An
     try:
         host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
         for j in range(n):
-            short = _short(torch, (j,))
-            if short:
-                cards[f"host->{j}"], notes[f"host->{j}"] = None, f"skipped: {short}"
-                continue
+            dst = None
             try:
+                short = _short(torch, (j,))
+                if short:
+                    cards[f"host->{j}"], notes[f"host->{j}"] = None, f"skipped: {short}"
+                    continue
                 dst = torch.empty(nbytes, dtype=torch.uint8, device=f"cuda:{j}")
                 for _ in range(WARMUPS):
                     dst.copy_(host, non_blocking=True)
@@ -345,25 +462,38 @@ def nvbandwidth(run: Run = subprocess.run, which: Callable[[str], str | None] = 
 # ---- the report ---------------------------------------------------------------------------
 
 
-def build_report(run: Run = subprocess.run) -> dict[str, Any]:
-    """Run everything and assemble the report (module docstring)."""
+def _measure(fn: Callable[[], Any]) -> Any:
+    """``fn()``'s result, or ``{"error": ...}`` when it raised, so one wedged card or a failed
+    call can't lose the report."""
+    try:
+        return fn()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def build_report(run: Run = subprocess.run, n_expected: int | None = None) -> dict[str, Any]:
+    """Run everything and assemble the report (module docstring). A matrix is parsed from a
+    command's stdout only when the command succeeded."""
     commands = {k: run_command(v, COMMAND_TIMEOUT_S, run) for k, v in COMMANDS.items()}
-    topo = parse_gpu_matrix(commands["topo"]["text"])
-    p2p_read = parse_gpu_matrix(commands["p2p_read"]["text"])
-    p2p_write = parse_gpu_matrix(commands["p2p_write"]["text"])
-    torch_doc = torch_view()
-    peer = peer_copy_bandwidth()
+    topo, p2p_read, p2p_write = (
+        parse_gpu_matrix(commands[k]["stdout"]) if commands[k]["ok"] else None
+        for k in ("topo", "p2p_read", "p2p_write"))
+    peer = _measure(peer_copy_bandwidth)
     report = {
         "version": VERSION, "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "commands": commands,
         "topo": topo, "p2p_read": p2p_read, "p2p_write": p2p_write,
-        "torch": torch_doc,
+        "torch": _measure(torch_view),
         "peer_copy": peer,
-        "fanout": fanout_bandwidth(),
-        "pinned_host": pinned_bandwidth(),
-        "nvbandwidth": nvbandwidth(run),
+        "fanout": _measure(fanout_bandwidth),
+        "pinned_host": _measure(pinned_bandwidth),
+        "nvbandwidth": _measure(lambda: nvbandwidth(run)),
     }
-    report["hw2"] = hw2_verdict(topo, p2p_read, peer.get("pairs") or None)
+    pairs = peer.get("pairs") if isinstance(peer, dict) else None
+    report["hw2"] = hw2_verdict(
+        topo, p2p_read, pairs or None, n_expected,
+        {"topo": _command_failure(commands["topo"]),
+         "p2p_read": _command_failure(commands["p2p_read"])})
     return report
 
 
@@ -374,9 +504,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = build_report()
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2) + "\n")
-    hw2 = report["hw2"]
-    print(f"HW2 {'pass' if hw2['pass'] else 'FAIL'}: " + ("; ".join(hw2["reasons"]) or "ok")
-          + f" (slowest pair {hw2['peer_copy_min_gbps']} GB/s)")
+    print(hw2_line(report["hw2"]))
     return 0
 
 

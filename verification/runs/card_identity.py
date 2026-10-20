@@ -50,27 +50,44 @@ DIGEST_SUFFIX = ".digests"
 SMI_FIELDS = "name,uuid,pci.bus_id"
 
 
+def _torch_uuid(props: Any) -> str | None:
+    """torch's UUID of the device, in ``nvidia-smi``'s ``GPU-...`` form, where torch exposes one."""
+    raw = getattr(props, "uuid", None)
+    if raw is None:
+        return None
+    text = str(raw)
+    return text if text.startswith("GPU-") else f"GPU-{text}"
+
+
 def card_facts(device: str, run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
-    """The visible card's name, UUID and PCI bus id, from ``nvidia-smi`` for the first entry of
-    ``CUDA_VISIBLE_DEVICES`` (an index or a UUID; index 0 when unset) and from torch where that
-    gives nothing. A CPU run has none."""
+    """The visible card's name, UUID and PCI bus id. ``uuid`` is torch's own device's where torch
+    exposes one (the card this process runs on), else ``nvidia-smi``'s for the first entry of
+    ``CUDA_VISIBLE_DEVICES`` (an index or a UUID; index 0 when unset); both are recorded
+    (``uuid_torch``, ``uuid_smi``) with ``uuids_agree``. A CPU run has none."""
     facts: dict[str, Any] = {"device": device, "name": None, "uuid": None, "pci_bus_id": None}
     if not device.startswith("cuda"):
         return facts
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip() or "0"
     facts["visible"] = visible
+    facts["device_order"] = os.environ.get("CUDA_DEVICE_ORDER")
     rec = run_command(["nvidia-smi", "-i", visible, f"--query-gpu={SMI_FIELDS}",
                        "--format=csv,noheader"], 30, run)
+    smi_uuid = None
     if rec["ok"]:
-        parts = [x.strip() for x in rec["text"].strip().splitlines()[0].split(",")]
+        lines = rec["stdout"].strip().splitlines()
+        parts = [x.strip() for x in lines[0].split(",")] if lines else []
         if len(parts) == 3:
-            facts.update(name=parts[0], uuid=parts[1], pci_bus_id=parts[2])
+            facts.update(name=parts[0], pci_bus_id=parts[2])
+            smi_uuid = parts[1] or None
     else:
         facts["nvidia_smi_error"] = rec["error"]
     idx = torch.device(device).index or 0
     props = torch.cuda.get_device_properties(idx)
+    torch_uuid = _torch_uuid(props)
     facts["name"] = facts["name"] or props.name
-    facts["uuid"] = facts["uuid"] or (str(props.uuid) if hasattr(props, "uuid") else None)
+    facts["uuid_torch"], facts["uuid_smi"] = torch_uuid, smi_uuid
+    facts["uuids_agree"] = None if not (torch_uuid and smi_uuid) else torch_uuid == smi_uuid
+    facts["uuid"] = torch_uuid or smi_uuid
     if facts["pci_bus_id"] is None and hasattr(props, "pci_bus_id"):
         facts["pci_bus_id"] = (f"{props.pci_domain_id:08X}:{props.pci_bus_id:02X}:"
                                f"{props.pci_device_id:02X}.0")

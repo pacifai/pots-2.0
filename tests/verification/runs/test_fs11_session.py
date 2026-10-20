@@ -1603,7 +1603,7 @@ def _card_part(tmp_path, model, card, digests, *, root="r", status="ok", write=T
             "proved": {"root": root, "w_next_root": "w", "loss": 1.0}, "n_leaves": 12,
             "wall_s": {"load": 1.0}}))
         report.with_suffix(".digests").write_bytes(digests)
-        extras = {"card": "H100", "root": root}
+        extras = {"card": "H100", "root": root, "uuid": f"GPU-{card}"}
     return {"name": f"card_{card}", "kind": "card", "status": status, "extras": extras,
             "info": {"model": model, "card": card, "report": str(report)}}
 
@@ -1680,8 +1680,10 @@ def test_part_extras_read_the_probe_and_card_reports(tmp_path):
     nv = tmp_path / "nvlink.json"
     part = fs.Part("nvlink_probe", ["x"], kind="nvlink", info={"report": str(nv)})
     assert fs.part_extras(part, tmp_path / "log") == {"hw2": None}
-    hw2 = {"pass": True, "reasons": [], "nv_links": True, "nv18_everywhere": True,
-           "p2p_read_ok": True, "peer_copy_min_gbps": 371.2, "more": 1}
+    hw2 = {"verdict": "pass", "pass": True, "reasons": [], "nv_links": True,
+           "nv18_everywhere": True, "p2p_read_ok": True, "peer_copy_min_gbps": 371.2,
+           "slowest_pair": "0->1", "pass_gbps": 300.0, "fail_gbps": 150.0, "n_cards": 4,
+           "expected_cards": 4, "gate": True, "more": 1}
     nv.write_text(json.dumps({"hw2": hw2}))
     got = fs.part_extras(part, tmp_path / "log")["hw2"]
     assert got["pass"] and got["peer_copy_min_gbps"] == 371.2 and "more" not in got
@@ -1701,13 +1703,70 @@ def test_hw2_lines():
     def probe(extras, status="ok"):
         return [{"kind": "nvlink", "status": status, "extras": extras}]
 
-    ok = {"hw2": {"pass": True, "peer_copy_min_gbps": 371.2, "reasons": []}}
-    assert fs._hw_lines(probe(ok), None) == ["HW2 pass: NVLink between every pair, slowest "
-                                             "copy 371 GB/s"]
-    bad = {"hw2": {"pass": False, "reasons": ["a", "b"], "peer_copy_min_gbps": 1.0}}
-    assert fs._hw_lines(probe(bad), None) == ["HW2 FAIL: a; b"]
+    def hw2(verdict, low, reasons=(), gate=True, expected=4):
+        return {"hw2": {"verdict": verdict, "pass": verdict == "pass", "reasons": list(reasons),
+                        "peer_copy_min_gbps": low, "slowest_pair": "0->2", "gate": gate,
+                        "pass_gbps": 300.0, "fail_gbps": 150.0, "expected_cards": expected}}
+
+    assert fs._hw_lines(probe(hw2("pass", 371.2)), None) == [
+        "HW2 pass: slowest pair 0->2 at 371 GB/s, over the 300 GB/s target"]
+    assert fs._hw_lines(probe(hw2("review", 240.0, ["x"])), None) == [
+        "HW2 review: slowest pair 0->2 at 240 GB/s, under the 300 GB/s target "
+        "(150-300 returns to the user)"]
+    line, = fs._hw_lines(probe(hw2("fail", 100.0, ["a", "b"])), None)
+    assert line.startswith("HW2 FAIL: slowest pair 0->2 at 100 GB/s, under the 150 GB/s fail line")
+    assert line.endswith("; a; b")
+    for v in ("pass", "review"):
+        line, = fs._hw_lines(probe(hw2(v, 371.2, gate=False, expected=2)), None)
+        assert line.startswith("HW2 rehearsal (2 of 4 cards), not the gate: ")
+        assert "pass" not in line.split(": ", 1)[0]
     assert fs._hw_lines(probe({"hw2": None}, "failed"), None) == [
         "HW2 FAIL: the NVLink probe left no verdict (failed)"]
+
+
+def test_hw3_rehearsal_and_card_count_in_the_verdict_and_line(tmp_path):
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(2)]
+    hw3 = fs.hw3_cards(parts, expected=2)
+    assert hw3["pass"] and (hw3["n_cards"], hw3["expected_cards"], hw3["gate"]) == (2, 2, False)
+    assert fs._hw_lines([], hw3) == ["HW3 part 1 rehearsal (2 of 4 cards), not the gate: "
+                                     "the same bits on every card for all 1 models"]
+    full = fs.hw3_cards([_card_part(tmp_path, "o/m", k, _digests()) for k in range(4)],
+                        expected=4)
+    assert full["gate"] and fs._hw_lines([], full)[0].startswith("HW3 part 1 pass: ")
+
+
+def test_hw3_expected_cards_default_to_fs31_cards(tmp_path, monkeypatch):
+    monkeypatch.setenv("FS31_CARDS", "2")
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(2)]
+    assert fs.hw3_cards(parts)["gate"] is False
+
+
+def test_hw3_needs_distinct_uuids_on_every_card(tmp_path):
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(4)]
+    parts[2]["extras"]["uuid"] = parts[1]["extras"]["uuid"]
+    hw3 = fs.hw3_cards(parts)
+    rec = hw3["models"]["o/m"]
+    assert not hw3["pass"] and not rec["same_bits"] and not rec["distinct_cards"]
+    assert "GPU-1" in fs._hw_lines([], hw3)[0]
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(4)]
+    parts[3]["extras"]["uuid"] = None
+    hw3 = fs.hw3_cards(parts)
+    assert not hw3["pass"] and "no UUID for card 3" in fs._hw_lines([], hw3)[0]
+    del parts[3]["extras"]["uuid"]
+    assert not fs.hw3_cards(parts)["pass"]
+
+
+def test_hw3_one_card_is_not_a_comparison(tmp_path):
+    hw3 = fs.hw3_cards([_card_part(tmp_path, "o/m", 0, _digests())], expected=1)
+    assert not hw3["pass"] and hw3["models"]["o/m"]["n_cards"] == 1
+    assert "at least 2" in fs._hw_lines([], hw3)[0]
+
+
+def test_every_card_part_and_the_probe_order_cards_by_pci_bus(tmp_path):
+    plan = fs.nvlink_probe_plan(tmp_path / "up", tmp_path / "out")
+    assert all(p.env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID" for p in plan if p.kind in
+               ("card", "nvlink"))
+    assert "CUDA_DEVICE_ORDER" not in plan[0].env
 
 
 def test_job_accepts_the_probe_session_and_refuses_the_rest(tmp_path):

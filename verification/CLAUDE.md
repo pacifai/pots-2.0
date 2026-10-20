@@ -2329,17 +2329,30 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   --out nvlink.json`, on the four-H100 pod. It reads the NVLink topology (`nvidia-smi topo -m`,
   `nvidia-smi nvlink -s`, the P2P read matrix), times peer copies between every pair of cards
   and from card 0 to the other three at once, times pinned-host copies and runs `nvbandwidth`
-  when it is installed. `hw2_verdict` passes only when every pair shows NVLink, the P2P reads
-  work and the slowest peer copy is at least `PEER_COPY_MIN_GBPS` (200, hand-picked). Every
-  command runs through `run_command`, so a missing tool is a record, not a crash. Torch's view
-  needs CUDA; the tests use fakes.
+  when it is installed. `hw2_verdict` fails unless the topology matrix shows exactly
+  `FS31_CARDS` GPUs (default 4), every pair is `NV18`, peer reads are `OK` for every pair, and
+  every ordered pair has a finite positive copy rate. The slowest pair's rate, by the PyTorch
+  `copy_` timing, then gives `verdict`: `pass` at `PEER_COPY_PASS_GBPS` (300 GB/s) or more,
+  `review` from `PEER_COPY_FAIL_GBPS` (150) up to that (the number returns to the user before
+  the port relies on it), `fail` below. `pass` is true only for `"pass"`. The verdict records
+  `n_cards`, `expected_cards` and `gate` (false when `FS31_CARDS` isn't 4: a rehearsal, whose
+  lines read `rehearsal (N of 4 cards), not the gate`). `nvbandwidth`'s text is recorded
+  beside it and never enters the verdict. Every command runs through `run_command`, which keeps
+  stdout and stderr apart; a matrix is parsed from stdout only when the command exited 0, so a
+  missing, failed or timed-out tool is a record and a reason, not a crash or a pass. Each
+  measure runs under `_measure`: one that raises is recorded under its key and the report is
+  still written (a raised peer-copy measure leaves no rates, so HW2 fails). The part runs with
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Torch's view needs CUDA; the tests use fakes.
 - `card_identity.py` (FS31, the first half of F22's check HW3): one card's identity report,
   `CUDA_VISIBLE_DEVICES=k VERIF_MODEL=â€¦ .venv/bin/python -m verification.runs.card_identity
   --out card.json`. From `W_0` it runs one `plain_step` on `Ï€(1)` and one `prove_step` committed
   with `InMemoryStore.commit_step`. The report holds the card, the proved step's root, both
   steps' `W_{t+1}` section roots and losses, the leaf layout and the wall times; `card.digests`
   beside it holds every leaf hash. It exits 1 when capture changed the bits on the one card.
-  `fs11_session.hw3_cards` compares the cards' reports.
+  The card's UUID is torch's own device's where torch exposes it (else `nvidia-smi`'s); both
+  are recorded. `fs11_session.hw3_cards` compares the cards' reports: `same_bits` needs at
+  least 2 cards, every UUID present and distinct, every card run and equal roots; it records
+  `n_cards`, `expected_cards` and `gate` as the probe does.
 - `full_scale.py` (FS13; EVALUATION_SPEC Â§3.2): `.venv/bin/python -m
   verification.runs.full_scale run [--seeds S ...] [--levels N ...] [--hidden-level N]
   [--sweep-args ARGS] [--k-args ARGS] [--guard-ack] [--data-only]
@@ -2428,11 +2441,17 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     (the default, "FS11"), `recheck` ("recheck"), `profile-check` or `nvlink-probe` (FS31);
     `--plan` and `--selftest` replace its
     parts. `nvlink-probe` runs `nvlink_probe` once, then `card_identity` per run model and card
-    (`FS31_CARDS`, default 4, each part with `CUDA_VISIBLE_DEVICES` set to its card), and
-    `summary.json` gains `hw2` (the probe's verdict) and `hw3_cards` (per model the roots by
-    card, `same_bits` and, where cards differ, the first differing leaf with its section and
-    name); the log ends with an `HW2` and an `HW3 part 1` line. It also refuses a machine whose
-    torch sees fewer than `FS31_CARDS` CUDA devices, which `FS11_ALLOW_ANY_GPU=1` doesn't lift. Every plan but the self-test's starts with `native_build` (`with_native_build`, applied
+    (`FS31_CARDS`, default 4, each part with `CUDA_VISIBLE_DEVICES` set to its card; the probe
+    and the card parts run with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a card number means the
+    same card to torch and `nvidia-smi`), and `summary.json` gains `hw2` (the probe's verdict:
+    `pass`, `review` or `fail`) and `hw3_cards` (per model the roots by card, the UUIDs,
+    `same_bits` and, where cards differ, the first differing leaf with its section and name);
+    the log ends with an `HW2` and an `HW3 part 1` line, each reading `rehearsal (N of 4 cards),
+    not the gate` instead of a pass when `FS31_CARDS` is not 4. It also refuses a machine whose
+    torch sees fewer than `FS31_CARDS` CUDA devices, which `FS11_ALLOW_ANY_GPU=1` doesn't
+    lift.
+
+    Every plan but the self-test's starts with `native_build` (`with_native_build`, applied
     by `choose_plan`): `python -m verification.commitment.native`, which compiles the library
     from the upload's `native_cache/` (`POTS_NATIVE_CACHE` in `base_env`) before any timed part.
     A failed build blocks nothing; later parts fail with `get()`'s message. `check_upload`'s
