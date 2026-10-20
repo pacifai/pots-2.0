@@ -7,6 +7,7 @@ their ``_reference`` versions, bit for bit, on adversarial inputs.
 import math
 import struct
 
+import numpy as np
 import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -21,6 +22,7 @@ from verification.verifier.matmul_check.freivalds import (
     _safe_norm,
     band_unit,
     finish_row,
+    finish_rows,
     measure_product,
     measure_product_row,
     measure_products,
@@ -579,3 +581,85 @@ def test_a_tampered_product_is_still_rejected_under_the_widened_band():
     trained = torch.addmm(moved, a, b)  # trained on the moved bias, checked against the honest
     assert max(_measure(a, b, pb, bias).normalized) < 8
     assert min(_measure(a, b, trained, bias).normalized) > 8
+
+
+# ---- finish_rows against finish_row -----------------------------------------------------
+
+
+def _fbits(x):
+    """A float's bit pattern, any NaN as one pattern."""
+    return "nan" if math.isnan(x) else struct.pack(">d", x).hex()
+
+
+def _assert_same_measure(want, cols, i):
+    got = cols.measure(i)
+    for name in ("nu", "p_abs1", "kappa", "p_norm", "unit", "u"):
+        assert _fbits(getattr(got, name)) == _fbits(getattr(want, name)), (i, name)
+    for name in ("residuals", "normalized"):
+        a, b = getattr(got, name), getattr(want, name)
+        assert [_fbits(x) for x in a] == [_fbits(x) for x in b], (i, name)
+
+
+def _edge_values():
+    tiny, denormal = 2.0 ** -1022, 5e-324
+    return [0.0, -0.0, denormal, tiny, 1e-30, 0.5, 1.0, 3.0, 1e30, 1e300, 1.7e308, math.inf,
+            math.nan]
+
+
+def _rows(rng, n, k):
+    """Random rows over many magnitudes, then every edge value in every column."""
+    scale = 10.0 ** rng.integers(-40, 40, size=(n, 5 + k))
+    rows = np.abs(rng.standard_normal((n, 5 + k))) * scale
+    edge = _edge_values()
+    for j in range(5 + k):
+        for v in edge:
+            row = np.abs(rng.standard_normal(5 + k)) * 10.0 ** rng.integers(-5, 5, size=5 + k)
+            row[j] = v
+            rows = np.vstack((rows, row))
+    return rows
+
+
+@pytest.mark.parametrize("guard", [True, False])
+@pytest.mark.parametrize("eps", [(EPS, EPS), (2.0 ** -8, 2.0 ** -24), (0.0, 0.0)])
+def test_finish_rows_equals_finish_row_bit_for_bit(guard, eps):
+    rng = np.random.default_rng(3)
+    k = 4
+    rows = _rows(rng, 400, k)
+    n_rows = len(rows)
+    q = rng.integers(1, 20000, size=n_rows)
+    n = rng.integers(1, 5000, size=n_rows)
+    biased = rng.random(n_rows) < 0.5
+    cols = finish_rows(rows, q=q, n=n, eps_in=eps[0], eps_acc=eps[1], guard=guard, biased=biased)
+    assert len(cols) == n_rows
+    for i in range(n_rows):
+        want = finish_row(rows[i].tolist(), q=int(q[i]), n=int(n[i]), eps_in=eps[0],
+                          eps_acc=eps[1], guard=guard, biased=bool(biased[i]))
+        _assert_same_measure(want, cols, i)
+
+
+def test_finish_rows_on_every_pair_of_edge_values():
+    """``‖P‖_F`` and ``U²`` over the edge values together (zero, denormal, huge, inf, NaN)."""
+    edge = _edge_values()
+    rows = np.array([[1.0, 2.0, pn, u2, bs, 0.0, 1e-300, 7.0, math.inf]
+                     for pn in edge for u2 in edge for bs in (0.0, 4.0)])
+    q = np.full(len(rows), 64)
+    n = np.full(len(rows), 9)
+    for biased in (False, True):
+        flags = np.full(len(rows), biased)
+        cols = finish_rows(rows, q=q, n=n, eps_in=EPS, eps_acc=EPS, biased=flags)
+        for i in range(len(rows)):
+            want = finish_row(rows[i].tolist(), q=64, n=9, eps_in=EPS, eps_acc=EPS,
+                              biased=biased)
+            _assert_same_measure(want, cols, i)
+
+
+def test_finish_rows_with_no_challenges_or_no_rows():
+    rows = np.array([[1.0, 2.0, 3.0, 4.0, 0.0]])
+    cols = finish_rows(rows, q=np.array([5]), n=np.array([2]), eps_in=EPS, eps_acc=EPS,
+                       biased=np.array([False]))
+    want = finish_row(rows[0].tolist(), q=5, n=2, eps_in=EPS, eps_acc=EPS)
+    _assert_same_measure(want, cols, 0)
+    assert cols.normalized.shape == (1, 0)
+    none = finish_rows(np.empty((0, 7)), q=np.empty(0, dtype=int), n=np.empty(0, dtype=int),
+                       eps_in=EPS, eps_acc=EPS, biased=np.empty(0, dtype=bool))
+    assert len(none) == 0
