@@ -14,6 +14,7 @@ import platform
 import re
 import shutil
 import subprocess
+import time
 from typing import Any
 
 import torch
@@ -296,6 +297,50 @@ def nvml_facts() -> dict[str, Any] | None:
             pass
 
 
+LOOP_ITERS = 1_000_000
+
+
+def python_loop_ns(iters: int = LOOP_ITERS) -> float:
+    """Single-thread interpreter speed: ns per iteration of a fixed loop with an f-string, a
+    dict lookup and a tuple compare, the per-member work of ``_Labeler._fill``. Best of three,
+    so a one-off stall doesn't count; a throttled, slow-clocked or contended CPU shows as more."""
+    table = {f"k{i}": (i, i + 1) for i in range(64)}
+    keys = [f"k{i}" for i in range(64)]
+    best = float("inf")
+    for _ in range(3):
+        hits = 0
+        t0 = time.perf_counter_ns()
+        for i in range(iters):
+            label = f"m{i & 63}:{i}"
+            pair = table[keys[i & 63]]
+            if pair < (i & 63, 5):
+                hits += len(label)
+        best = min(best, (time.perf_counter_ns() - t0) / iters)
+    return best
+
+
+def parse_khz_mean_mhz(texts: list[str | None]) -> float | None:
+    """Mean MHz of ``scaling_cur_freq`` file texts (kHz), skipping missing or malformed ones."""
+    vals = []
+    for t in texts:
+        try:
+            vals.append(int((t or "").strip()) / 1000)
+        except ValueError:
+            pass
+    return sum(vals) / len(vals) if vals else None
+
+
+def affinity_freq_mhz(cpus: Any = None, root: str = "/sys/devices/system/cpu") -> float | None:
+    """Mean current clock (MHz) of the CPUs in our affinity set (default: this process's), or
+    None where sysfs shows no cpufreq."""
+    if cpus is None:
+        affinity = getattr(os, "sched_getaffinity", None)
+        if affinity is None:
+            return None
+        cpus = affinity(0)
+    return parse_khz_mean_mhz([_read(f"{root}/cpu{c}/cpufreq/scaling_cur_freq") for c in cpus])
+
+
 def _ram_total() -> int | None:
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
@@ -315,4 +360,6 @@ def machine_facts() -> dict[str, Any]:
     r.put("cpu_affinity", sorted(affinity(0)) if affinity else None,
           "no CPU affinity on this OS")
     r.put("nvml", nvml_facts(), "no pynvml, or no GPU for it to read")
+    r.put("python_loop_ns", python_loop_ns(), "micro-benchmark failed")
+    r.put("affinity_freq_mhz", affinity_freq_mhz(), "no cpufreq in sysfs for the affinity CPUs")
     return {**r.data, "absent": r.absent}

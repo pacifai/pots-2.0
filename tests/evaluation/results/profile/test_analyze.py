@@ -838,3 +838,24 @@ def test_meta_falls_back_on_capture_and_step_records(tmp_path):
         {"record": "step", "run": "honest", "step": 1, "leaves": 500, "transcript_bytes": 9}])
     meta = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["meta"]
     assert meta["M"] == 77 and meta["n_leaves"] == 500 and meta["n_s"] is None
+
+
+def test_cpu_state_reports_throttled_fraction_and_mean_clock_per_step(tmp_path):
+    rows = [{"t": int(i * 1e9), "c_tree": 1.0, "g_util": 0.5, "cg_throttled_us": 250_000,
+             "cg_nr_throttled": 3, "aff_mhz": 2000.0} for i in range(1, 61)]
+    paths = build_run(tmp_path / "run", steps=3, sample_rows=rows)
+    view = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["runs"]["honest"]
+    state = view["cpu_state"]
+    assert [r["step"] for r in state["steps"]] == [1, 2, 3]
+    assert state["steps"][0]["throttled_frac"] == pytest.approx(0.25)
+    assert state["steps"][0]["throttled_periods"] == pytest.approx(3)
+    assert state["steps"][0]["mean_mhz"] == pytest.approx(2000.0)
+    assert state["mean_throttled_frac"] == pytest.approx(0.25)
+
+
+def test_cpu_state_is_none_without_the_counters(tmp_path):
+    paths = build_run(tmp_path / "run", steps=2)
+    view = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["runs"]["honest"]
+    state = view["cpu_state"]
+    assert state["mean_throttled_frac"] is None and state["mean_mhz"] is None
+    assert all(r["throttled_frac"] is None for r in state["steps"])

@@ -177,6 +177,45 @@ class Sampler:
         return out, len(w)
 
 
+    def total(self, field: str, spans: Sequence[tuple[int, int]]) -> float | None:
+        """The sum of a per-sample amount (a delta over the sample's interval, such as
+        ``cg_throttled_us``) over ``spans``, each sample counted by the share of its interval
+        inside them; None when no overlapping sample holds a value."""
+        out = None
+        for a, b in spans:
+            i = bisect_right(self.ends, a)
+            while i < len(self.rows) and self.starts[i] < b:
+                v = self.rows[i].get(field)
+                width = self.ends[i] - self.starts[i]
+                ov = min(self.ends[i], b) - max(self.starts[i], a)
+                if v is not None and ov > 0 and width > 0:
+                    out = (out or 0.0) + v * ov / width
+                i += 1
+        return out
+
+
+def _cpu_state(steps: list[dict[str, Any]], sampler: Sampler) -> dict[str, Any]:
+    """Per step, what the host CPU was doing under us: ``throttled_frac`` (cgroup CFS throttled
+    time over the step's wall time; above 0 the quota, not the work, set the pace),
+    ``throttled_periods`` and ``mean_mhz`` (mean clock of our affinity CPUs, else the sampler's
+    ``cpu_mhz``). Each is None when the samples lack it (macOS, no cgroup, no cpufreq)."""
+    rows = []
+    for s in steps:
+        span = [(s["t0_ns"], s["t1_ns"])]
+        wall = (s["t1_ns"] - s["t0_ns"]) * 1e-9
+        means, _ = sampler.means(span)
+        us = sampler.total("cg_throttled_us", span)
+        nr = sampler.total("cg_nr_throttled", span)
+        mhz = means.get("aff_mhz")
+        rows.append({"step": s["step"], "wall_s": wall,
+                     "throttled_frac": us * 1e-6 / wall if us is not None and wall > 0 else None,
+                     "throttled_periods": nr,
+                     "mean_mhz": mhz if mhz is not None else means.get("cpu_mhz")})
+    fracs = [r["throttled_frac"] for r in rows if r["throttled_frac"] is not None]
+    mhz = [r["mean_mhz"] for r in rows if r["mean_mhz"] is not None]
+    return {"steps": rows, "mean_throttled_frac": _mean(fracs), "mean_mhz": _mean(mhz)}
+
+
 def weighted_means(samples: io.Samples, spans: Sequence[tuple[int, int]]
                    ) -> tuple[dict[str, float | None], int]:
     return Sampler(samples).means(spans)
@@ -782,6 +821,7 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                             if s["depth"] == 0 and not s.get("rollup")),
         "sections": sections, "hash": _hash_breakdown(parts, times, sections),
         "c5": _c5_view(untraced, layout, sampler, warns) if layout else None,
+        "cpu_state": _cpu_state(all_untraced, sampler),
         "timeline": _timeline(all_untraced, sampler),  # the warm-up step is drawn too
         "hook_overhead_bound": _hook_bound(markers.header.get("device"), untraced, probe),
         "memory": {"gpu_memory_bytes": gpu_memory,

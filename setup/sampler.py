@@ -40,6 +40,7 @@ FIELDS = [
     "rss", "ram_used", "ram_avail", "swap_used",
     "disk_r", "disk_w", "io_r", "io_w",
     "cpu_mhz", "load1", "minflt", "majflt", "cg_throttled_us", "cg_nr_throttled",
+    "aff_mhz",
 ]
 STOP_GRACE_S = 5.0
 TREE_REFRESH_S = 1.0
@@ -86,18 +87,42 @@ def _cgroup_limits(base: Path = _CG) -> dict[str, float | None]:
     return {"cpu_quota": quota, "mem_limit": limit}
 
 
+def parse_throttle(text: str, scale: int = 1) -> tuple[int, int] | None:
+    """(throttled µs, throttled periods) from ``cpu.stat`` text: v2's ``throttled_usec``, or v1's
+    ``throttled_time`` (ns, so ``scale`` 1000). None when the counters are absent or malformed."""
+    stat = dict(line.split() for line in text.splitlines() if len(line.split()) == 2)
+    try:
+        us = int(stat["throttled_usec"]) if "throttled_usec" in stat \
+            else int(stat["throttled_time"]) // scale
+        return us, int(stat["nr_throttled"])
+    except (KeyError, ValueError):
+        return None
+
+
 def _cgroup_throttle(base: Path = _CG) -> tuple[int, int] | None:
     """(throttled µs, throttled periods), cumulative, from the cgroup's ``cpu.stat``."""
-    for path, scale in ((base / "cpu.stat", 1), (_CG / "cpu/cpu.stat", 1000)):
+    for path, scale in ((base / "cpu.stat", 1), (_CG / "cpu,cpuacct/cpu.stat", 1000),
+                        (_CG / "cpu/cpu.stat", 1000)):
         text = _read_text(path)
-        if text is None:
-            continue
-        stat = dict(line.split() for line in text.splitlines() if len(line.split()) == 2)
-        us = stat.get("throttled_usec")
-        if us is None:
-            us = int(stat["throttled_time"]) // scale
-        return int(us), int(stat["nr_throttled"])
+        if text is not None:
+            return parse_throttle(text, scale)
     return None
+
+
+def affinity_mhz(root: str = "/sys/devices/system/cpu", cpus: Any = None) -> float | None:
+    """Mean current clock (MHz) over the CPUs in our affinity set, from sysfs ``scaling_cur_freq``
+    (kHz); None where cpufreq is absent (macOS, many VMs)."""
+    if cpus is None:
+        if not hasattr(os, "sched_getaffinity"):
+            return None
+        cpus = os.sched_getaffinity(0)
+    vals = []
+    for c in cpus:
+        try:
+            vals.append(int(Path(f"{root}/cpu{c}/cpufreq/scaling_cur_freq").read_text()) / 1000)
+        except (OSError, ValueError):
+            pass
+    return sum(vals) / len(vals) if vals else None
 
 
 def _faults(p: Any) -> tuple[int, int]:
@@ -138,6 +163,7 @@ class _Sampler:
         self.errors: list[dict[str, str]] = []
         self.cpu_mhz: float | None = None
         self.cpu_mhz_due = True
+        self.aff_mhz: float | None = None
         self.started = False
         self.nv: Any = None
         self.handle: Any = None
@@ -267,6 +293,9 @@ class _Sampler:
         if self.cpu_mhz_due:
             self.cpu_mhz = self._cpu_mhz()
         row["cpu_mhz"] = self.cpu_mhz
+        if self.cpu_mhz_due:
+            self.aff_mhz = self._try("aff_mhz", affinity_mhz)
+        row["aff_mhz"] = self.aff_mhz
         if sys.platform.startswith("linux"):
             cg = self._try("cgroup_stat", lambda: _cgroup_throttle(self.cg))
             if cg is not None:

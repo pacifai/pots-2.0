@@ -88,3 +88,23 @@ def test_nvml_decodes_bytes_and_converts_milliwatts(monkeypatch):
 def test_nvml_block_is_none_when_init_fails(monkeypatch):
     monkeypatch.setitem(sys.modules, "pynvml", _NoInitNvml())
     assert setup_machine.nvml_facts() is None
+
+
+def test_python_loop_ns_is_a_positive_per_iteration_time():
+    from setup.machine import python_loop_ns
+    ns = python_loop_ns(1_000_000)
+    print(f"python_loop_ns on this machine: {ns:.1f}")
+    assert 0 < ns < 1e5
+
+
+def test_affinity_freq_parses_khz_and_no_ops_without_sysfs(tmp_path):
+    from setup.machine import affinity_freq_mhz, parse_khz_mean_mhz
+    assert parse_khz_mean_mhz(["1000000", None, "junk", "3000000\n"]) == 2000.0
+    assert parse_khz_mean_mhz([None]) is None
+    assert affinity_freq_mhz([0, 1], root=str(tmp_path)) is None
+
+
+def test_machine_facts_carries_the_loop_benchmark():
+    from setup.machine import machine_facts
+    facts = machine_facts()
+    assert facts["python_loop_ns"] > 0 and "affinity_freq_mhz" in facts
