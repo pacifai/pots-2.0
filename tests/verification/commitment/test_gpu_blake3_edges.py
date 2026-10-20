@@ -149,16 +149,31 @@ def test_every_group_size_around_every_stage_boundary(run_g, ref, g, r):
               make_table(small + leaves[:12] + small[:tpb], seed=m))
 
 
-@pytest.mark.parametrize("g", range(7))
-def test_host_plan_builder_agrees_with_the_plan_here(g):
-    if g == 3:
-        rng = np.random.default_rng(0)
-        chunks = rng.integers(1, 40000, 50).astype(np.uint64)
-        a, b = gb.make_plan(chunks), plan_for(3, 6, chunks)
-        assert a.stages == b.stages and a.nodes == b.nodes
-        for s in range(a.stages):
-            assert np.array_equal(a.tile_prefix[s], b.tile_prefix[s])
-            assert np.array_equal(a.out_off[s], b.out_off[s])
+@pytest.mark.parametrize("g, r", [(3, 6), (0, 1), (1, 2), (4, 3), (5, 6), (6, 2)])
+def test_the_plan_here_follows_the_group_and_tile_sizes(g, r, monkeypatch):
+    """``make_plan`` and ``grid_blocks`` take their shifts from ``G`` and ``R``, so a core built
+    with other ``POTS_G_LOG`` and ``POTS_R_LOG`` gets the plan it expects."""
+    monkeypatch.setattr(gb, "G", 1 << g)
+    monkeypatch.setattr(gb, "R", 1 << r)
+    rng = np.random.default_rng(g)
+    chunks = rng.integers(1, 40000, 50).astype(np.uint64)
+    a, b = gb.make_plan(chunks), plan_for(g, r, chunks)
+    assert a.stages == b.stages and a.nodes == b.nodes
+    for s in range(a.stages):
+        assert np.array_equal(a.tile_prefix[s], b.tile_prefix[s])
+        assert np.array_equal(a.out_off[s], b.out_off[s])
+    assert gb.grid_blocks(0, 1000) == -(-1000 // (128 >> g)) and gb.grid_blocks(1, 1000) == 1000
+
+
+@pytest.mark.parametrize("g, r", [(4, 3), (1, 2), (6, 6)])
+def test_the_core_agrees_with_the_plan_here_for_other_sizes(g, r, build_host, ref, monkeypatch):
+    monkeypatch.setattr(gb, "G", 1 << g)
+    monkeypatch.setattr(gb, "R", 1 << r)
+    k = gb.GpuBlake3(HostKernels(build_host(g, r)))
+    leaves = [leaf_of_chunks(c, c, short=bool(c % 2)) for c in chunk_edges(1 << g, 300)]
+    t = make_table(leaves)
+    agree(lambda t: (lambda d, bad: (d.numpy(), bad))(
+        *k.hash_leaves(*t.args(t.arena.data_ptr()), device="cpu")), ref, t)
 
 
 # ---- leaf counts around block and tile boundaries ----
@@ -241,14 +256,30 @@ def test_the_float_rule_looks_only_at_headers_that_leaves_use(build_host):
     assert bad == 2 and d.shape == (2, 32)
 
 
-@pytest.mark.xfail(strict=True, reason="check_table adds hdr_off and hdr_len in uint64 without "
-                   "an overflow test: an offset of 2**64 - 2 with length 3 wraps to 1 and "
-                   "passes, so the kernel reads far outside the header buffer (native.py has "
-                   "the same check)")
 def test_a_header_offset_that_wraps_around_uint64_is_refused():
     a = args(buf=b"abcdefgh", off=((1 << 64) - 2,), ln=(3,))
     with pytest.raises(ValueError, match="out of bounds"):
         gb.GpuBlake3().hash_leaves(*a, device="cpu")
+
+
+@pytest.mark.parametrize("field, value", [("kind", 256), ("ln", 2 ** 32 + 3), ("ln", -1),
+                                          ("idx", 2 ** 63), ("plen", -2)])
+def test_a_value_too_wide_for_its_field_raises_instead_of_wrapping(field, value):
+    pos = ["buf", "off", "ln", "idx", "ptr", "plen", "kind"].index(field)
+    for dt in (np.int64, np.uint64):
+        if (dt is np.uint64 and value < 0) or (dt is np.int64 and value >= 2 ** 63):
+            continue
+        a = list(args())
+        a[pos] = np.array((value,), dtype=dt)
+        with pytest.raises(ValueError):
+            gb.GpuBlake3().hash_leaves(*a, device="cpu")
+
+
+def test_the_header_range_check_is_exact_at_the_end_of_the_buffer():
+    gb.check_table(8, *args(off=(5,), ln=(3,))[1:])  # 5 + 3 == 8 is in bounds
+    for off, ln in ((6, 3), (0, 9), (8, 1)):
+        with pytest.raises(ValueError, match="out of bounds"):
+            gb.check_table(8, *args(off=(off,), ln=(ln,))[1:])
 
 
 def test_negative_and_mismatched_arguments_are_refused():
@@ -576,9 +607,6 @@ def test_cache_key_changes_with_sources_arch_and_nvrtc_version(tmp_path, monkeyp
     assert compiles_with(tmp_path) == 0
 
 
-@pytest.mark.xfail(strict=True, reason="cache_key hashes the sources, the architecture and "
-                   "NVRTC's version but not the compile options, so changing an option such as "
-                   "-DPOTS_G_LOG (or --std) reuses the old CUBIN")
 def test_cache_key_changes_with_a_compile_option(tmp_path, monkeypatch):
     assert compiles_with(tmp_path) == 1
     old = gb.arch_options

@@ -7,9 +7,12 @@ and the C library, through the same ``GpuBlake3`` code the GPU path uses (``prep
 can show (that NVRTC accepts ``gpu_blake3.cu``, and the speed) is not tested here."""
 
 import ctypes
+import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import blake3
 import numpy as np
@@ -577,6 +580,143 @@ def test_describe_never_compiles(monkeypatch):
     info = gb.describe()
     assert info["nvrtc"] == "12.4" and info["source_sha256"] == gb.source_hash()
     assert lib.compiles == [] and lib.created == []
+
+
+def test_every_foreign_call_has_a_declared_signature():
+    for cls, table, prefix in ((gb.Nvrtc, gb.NVRTC_SIGNATURES, "nvrtc"),
+                               (gb.Driver, gb.DRIVER_SIGNATURES, "cu")):
+        called = set(re.findall(rf"lib\.({prefix}\w+)", inspect.getsource(cls)))
+        assert called == set(table), (called ^ set(table))
+
+
+def test_the_declared_signatures_keep_handles_and_sizes_64_bit():
+    v, i, s, z_, u = (ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t,
+                      ctypes.c_uint)
+    p = ctypes.POINTER
+    n, d = gb.NVRTC_SIGNATURES, gb.DRIVER_SIGNATURES
+    assert n["nvrtcCompileProgram"] == (i, [v, i, p(s)])
+    assert n["nvrtcGetProgramLogSize"] == (i, [v, p(z_)]) and n["nvrtcGetCUBINSize"][1][1] == p(z_)
+    assert n["nvrtcGetProgramLog"] == (i, [v, v]) and n["nvrtcGetPTX"] == (i, [v, v])
+    assert n["nvrtcCreateProgram"] == (i, [p(v), s, s, i, p(s), p(s)])
+    assert n["nvrtcDestroyProgram"] == (i, [p(v)])
+    assert n["nvrtcGetErrorString"] == (s, [i])
+    assert d["cuLaunchKernel"] == (i, [v, u, u, u, u, u, u, u, v, p(v), p(v)])
+    assert d["cuCtxPushCurrent_v2"] == (i, [v]) and d["cuCtxPopCurrent_v2"] == (i, [p(v)])
+    assert d["cuModuleLoadData"] == (i, [p(v), v])
+    assert d["cuModuleGetFunction"] == (i, [p(v), v, s])
+    assert d["cuDeviceGet"] == (i, [p(i), i]) and d["cuInit"] == (i, [u])
+    assert all(r is i for name, (r, _) in {**n, **d}.items() if name != "nvrtcGetErrorString")
+
+
+class FakeCDLL:
+    """A library whose every function is an attribute bag, as ``ctypes.CDLL`` makes them."""
+
+    missing: set[str] = set()
+
+    def __init__(self, name):
+        self.name, self.fns = name, {}
+
+    def __getattr__(self, attr):
+        if attr in self.missing:
+            raise AttributeError(attr)
+        return self.fns.setdefault(attr, SimpleNamespace(restype=None, argtypes=None))
+
+
+@pytest.mark.parametrize("loader, table", [("load_nvrtc", "NVRTC_SIGNATURES"),
+                                           ("load_driver", "DRIVER_SIGNATURES")])
+def test_the_loaders_declare_every_signature(loader, table, monkeypatch):
+    monkeypatch.setattr(gb.ctypes, "CDLL", FakeCDLL)
+    lib = getattr(gb, loader)()
+    for name, (restype, argtypes) in getattr(gb, table).items():
+        assert (lib.fns[name].restype, lib.fns[name].argtypes) == (restype, argtypes)
+
+
+def test_a_library_without_a_function_is_refused_by_name(monkeypatch):
+    monkeypatch.setattr(gb.ctypes, "CDLL", FakeCDLL)
+    monkeypatch.setattr(FakeCDLL, "missing", {"cuLaunchKernel"})
+    with pytest.raises(RuntimeError, match="cuLaunchKernel"):
+        gb.load_driver()
+
+
+def test_declare_sets_the_types_on_a_real_library():
+    lib = gb.declare(ctypes.CDLL(None), {"strlen": (ctypes.c_size_t, [ctypes.c_char_p])})
+    assert lib.strlen(b"abcd") == 4
+
+
+def test_an_nvrtc_error_names_the_error_and_keeps_the_log(tmp_path):
+    with pytest.raises(RuntimeError) as e:
+        gb.build_image(gb.Nvrtc(FakeNvrtc(compile_rc=6)), (8, 6), cache=tmp_path)
+    assert "error 6 NVRTC_ERROR_FAKE" in str(e.value) and "error: bad thing" in str(e.value)
+    assert "builtins" not in str(e.value)
+
+
+def test_a_builtins_failure_says_where_the_library_was_looked_for(tmp_path, monkeypatch):
+    monkeypatch.setattr(gb, "nvrtc_dirs", lambda: [Path("/x/nvidia/cuda_nvrtc/lib")])
+    with pytest.raises(RuntimeError) as e:
+        gb.build_image(gb.Nvrtc(FakeNvrtc(compile_rc=7)), (8, 6), cache=tmp_path)
+    msg = str(e.value)
+    assert "error 7 NVRTC_ERROR_FAKE" in msg and "libnvrtc-builtins could not be loaded" in msg
+    assert "/x/nvidia/cuda_nvrtc/lib" in msg
+
+
+class FailsOnce(FakeDriver):
+    def cuModuleLoadData(self, mod, image):
+        rc = super().cuModuleLoadData(mod, image)
+        self.fail = None
+        return rc
+
+
+def test_a_corrupt_cached_image_is_deleted_and_compiled_once_more(tmp_path):
+    gb.build_image(gb.Nvrtc(FakeNvrtc()), (8, 6), cache=tmp_path)
+    cached = gb.build_image(gb.Nvrtc(FakeNvrtc()), (8, 6), cache=tmp_path)
+    assert cached.cached
+    fresh, seen = FakeNvrtc(), []
+
+    def rebuild():
+        seen.append(sorted(tmp_path.iterdir()))  # the bad entry is gone by now
+        return gb.build_image(gb.Nvrtc(fresh), (8, 6), cache=tmp_path, use_cache=False)
+
+    driver = FailsOnce(fail="cuModuleLoadData")
+    k = gb.load_kernels(gb.Driver(driver), 0, cached, rebuild)
+    assert seen == [[]] and len(fresh.compiles) == 1 and set(k.fn) == set(gb.KERNELS)
+    assert driver.calls.count("cuCtxPopCurrent_v2") == 2 and len(list(tmp_path.iterdir())) == 1
+
+
+def test_a_second_load_failure_or_a_fresh_image_is_not_retried(tmp_path):
+    gb.build_image(gb.Nvrtc(FakeNvrtc()), (8, 6), cache=tmp_path)
+    cached = gb.build_image(gb.Nvrtc(FakeNvrtc()), (8, 6), cache=tmp_path)
+    again = []
+    with pytest.raises(RuntimeError, match="cuModuleLoadData"):
+        gb.load_kernels(gb.Driver(FakeDriver(fail="cuModuleLoadData")), 0, cached,
+                        lambda: again.append(1) or gb.Built(b"x", "cubin", "sm_86", (12, 4)))
+    assert again == [1]
+    fresh = gb.Built(b"x", "cubin", "sm_86", (12, 4))
+    with pytest.raises(RuntimeError, match="cuModuleLoadData"):
+        gb.load_kernels(gb.Driver(FakeDriver(fail="cuModuleLoadData")), 0, fresh,
+                        lambda: pytest.fail("retried a fresh image"))
+
+
+def test_describe_reports_the_device_it_is_given(monkeypatch):
+    seen = []
+    monkeypatch.setattr(gb, "_nvrtc", lambda: gb.Nvrtc(FakeNvrtc()))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=None: seen.append(d) or (9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda d=None: seen.append(d) or "dev")
+    info = gb.describe(1)
+    assert seen == [1, 1] and info["arch"] == "sm_90" and info["device"] == "dev"
+
+
+def test_a_mismatch_names_the_first_differing_leaf_and_both_digests():
+    ref = np.arange(5 * 32, dtype=np.uint8).reshape(5, 32)
+    got = ref.copy()
+    assert gb.mismatch(got, 5, ref, 5) is None
+    got[3, 0] ^= 1
+    got[4, 0] ^= 1
+    msg = gb.mismatch(got, 5, ref, 5)
+    assert msg and msg.startswith("leaf 3: got ") and bytes(got[3]).hex() in msg
+    assert bytes(ref[3]).hex() in msg
+    assert gb.mismatch(got, 3, ref, 3) is None  # leaves from the first bad one on are not compared
+    assert gb.mismatch(ref, 2, ref, 4) == "first_bad 2 vs 4"
 
 
 def test_import_compiles_and_loads_nothing():

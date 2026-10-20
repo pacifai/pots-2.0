@@ -41,7 +41,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,13 +57,12 @@ CORE_NAME = "gpu_blake3_core.h"
 CU_NAME = "gpu_blake3.cu"
 G = 8  # chunks per group, POTS_G in the core
 R = 64  # nodes per reduce tile, POTS_R in the core
-TILES_PER_BLOCK = 16  # POTS_TILES_PER_BLOCK
 CHUNK_THREADS = 128
-REDUCE_THREADS = R
 CHUNK_LEN = 1024
 MAX_CHUNKS = 1 << 32  # a chunk's counter is 32 bits in the kernel
 NO_STREAM = 0
 NVRTC_ERROR_INVALID_OPTION = 5
+NVRTC_ERROR_BUILTIN_FAILURE = 7  # libnvrtc-builtins could not be loaded
 
 KERNELS = ("pots_chunk_stage", "pots_reduce_stage")
 
@@ -109,8 +108,11 @@ def check_table(hdr_buf_len: int, hdr_off: np.ndarray, hdr_len: np.ndarray, hdr_
         return
     if int(hdr_idx.max()) >= len(hdr_off):
         raise ValueError("a header index or range is out of bounds")
-    if len(hdr_off) and int((hdr_off.astype(np.uint64) + hdr_len).max()) > hdr_buf_len:
-        raise ValueError("a header index or range is out of bounds")
+    if len(hdr_off):
+        # ``hdr_off + hdr_len`` could wrap around uint64, so compare ``hdr_off`` with the room left.
+        if int(hdr_len.max()) > hdr_buf_len or np.any(
+                hdr_off.astype(np.uint64) > np.uint64(hdr_buf_len) - hdr_len.astype(np.uint64)):
+            raise ValueError("a header index or range is out of bounds")
     if int(kind.max()) > native.KIND_F16:
         raise ValueError("kind must be one of native.KIND_*")
     hl = hdr_len[hdr_idx].astype(np.uint64)
@@ -147,10 +149,13 @@ class Plan:
 
 
 def make_plan(chunks: np.ndarray) -> Plan:
-    """Level counts ``ceil(C / G)`` then ``ceil(n / R)`` per level, a stage per level."""
-    levels = [(chunks + np.uint64(G - 1)) >> np.uint64(3)]
+    """Level counts ``ceil(C / G)`` then ``ceil(n / R)`` per level, a stage per level. ``G`` and
+    ``R`` are powers of two, and the shifts come from them, as the core's from its logs."""
+    g, r = G, R
+    gl, rl = np.uint64(g.bit_length() - 1), np.uint64(r.bit_length() - 1)
+    levels = [(chunks + np.uint64(g - 1)) >> gl]
     while int(levels[-1].max(initial=0)) > 1:
-        levels.append((levels[-1] + np.uint64(R - 1)) >> np.uint64(6))
+        levels.append((levels[-1] + np.uint64(r - 1)) >> rl)
     prefix: list[np.ndarray] = []
     out_off: list[np.ndarray] = []
     base = 0
@@ -182,7 +187,7 @@ def leaf_records(hdr_base: int, hdr_off: np.ndarray, hdr_len: np.ndarray, hdr_id
 
 def grid_blocks(stage: int, total_tiles: int) -> int:
     """Blocks of a stage's launch: 16 tiles to a block at stage 0, one tile after."""
-    return -(-total_tiles // TILES_PER_BLOCK) if stage == 0 else total_tiles
+    return -(-total_tiles // (CHUNK_THREADS // G)) if stage == 0 else total_tiles
 
 
 def stage_params(plan: Plan, s: int, n: int, addr: dict[str, int]) -> Params:
@@ -213,11 +218,60 @@ def _library_dirs(sub: str) -> list[Path]:
     return found
 
 
+_I, _V, _S, _Z, _U = (ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+                      ctypes.c_uint)
+_P = ctypes.POINTER
+# ``name: (restype, argtypes)``. Handles are 64 bits, which ctypes' default int conversion would
+# cut to 32. ``nvrtcResult`` and ``CUresult`` are ints. No driver call takes a ``CUdeviceptr``:
+# the kernels' pointers travel inside ``Params``.
+NVRTC_SIGNATURES: dict[str, tuple[Any, list[Any]]] = {
+    "nvrtcVersion": (_I, [_P(_I), _P(_I)]),
+    "nvrtcGetErrorString": (_S, [_I]),
+    "nvrtcCreateProgram": (_I, [_P(_V), _S, _S, _I, _P(_S), _P(_S)]),
+    "nvrtcCompileProgram": (_I, [_V, _I, _P(_S)]),
+    "nvrtcGetProgramLogSize": (_I, [_V, _P(_Z)]),
+    "nvrtcGetProgramLog": (_I, [_V, _V]),
+    "nvrtcGetCUBINSize": (_I, [_V, _P(_Z)]),
+    "nvrtcGetCUBIN": (_I, [_V, _V]),
+    "nvrtcGetPTXSize": (_I, [_V, _P(_Z)]),
+    "nvrtcGetPTX": (_I, [_V, _V]),
+    "nvrtcDestroyProgram": (_I, [_P(_V)]),
+}
+DRIVER_SIGNATURES: dict[str, tuple[Any, list[Any]]] = {
+    "cuInit": (_I, [_U]),
+    "cuGetErrorName": (_I, [_I, _P(_S)]),
+    "cuDeviceGet": (_I, [_P(_I), _I]),
+    "cuDeviceGetAttribute": (_I, [_P(_I), _I, _I]),
+    "cuDevicePrimaryCtxRetain": (_I, [_P(_V), _I]),
+    "cuCtxPushCurrent_v2": (_I, [_V]),
+    "cuCtxPopCurrent_v2": (_I, [_P(_V)]),
+    "cuModuleLoadData": (_I, [_P(_V), _V]),
+    "cuModuleGetFunction": (_I, [_P(_V), _V, _S]),
+    "cuLaunchKernel": (_I, [_V, _U, _U, _U, _U, _U, _U, _U, _V, _P(_V), _P(_V)]),
+}
+
+
+def declare(lib: Any, table: dict[str, tuple[Any, list[Any]]]) -> Any:
+    """Set ``restype`` and ``argtypes`` of every function of ``table`` on ``lib``."""
+    for name, (restype, argtypes) in table.items():
+        try:
+            fn = getattr(lib, name)
+        except AttributeError:
+            raise RuntimeError(f"{lib} has no {name}; it is too old for gpu_blake3") from None
+        fn.restype, fn.argtypes = restype, argtypes
+    return lib
+
+
+def nvrtc_dirs() -> list[Path]:
+    """Where ``load_nvrtc`` looks for pip's NVRTC, and where NVRTC finds its builtins."""
+    return _library_dirs("cuda_nvrtc")
+
+
 def load_nvrtc() -> ctypes.CDLL:
     """``libnvrtc.so.12``: by name, else from pip's ``nvidia/cuda_nvrtc/lib``."""
     tried: list[str] = []
     try:
-        return ctypes.CDLL("libnvrtc.so.12")
+        return declare(ctypes.CDLL("libnvrtc.so.12"), NVRTC_SIGNATURES)
     except OSError as e:
         tried.append(str(e))
     for d in _library_dirs("cuda_nvrtc"):
@@ -225,7 +279,7 @@ def load_nvrtc() -> ctypes.CDLL:
             if "builtins" in os.path.basename(path):
                 continue
             try:
-                return ctypes.CDLL(path)
+                return declare(ctypes.CDLL(path), NVRTC_SIGNATURES)
             except OSError as e:
                 tried.append(str(e))
     raise RuntimeError(
@@ -236,9 +290,18 @@ def load_nvrtc() -> ctypes.CDLL:
 
 def load_driver() -> ctypes.CDLL:
     try:
-        return ctypes.CDLL("libcuda.so.1")
+        return declare(ctypes.CDLL("libcuda.so.1"), DRIVER_SIGNATURES)
     except OSError as e:
         raise RuntimeError(f"cannot load the CUDA driver libcuda.so.1: {e}") from e
+
+
+def builtins_hint(rc: int) -> str:
+    """For ``NVRTC_ERROR_BUILTIN_OPERATION_FAILURE``: NVRTC could not load its builtins."""
+    if rc != NVRTC_ERROR_BUILTIN_FAILURE:
+        return ""
+    where = ", ".join(str(d) for d in nvrtc_dirs()) or "no nvidia/cuda_nvrtc/lib directory found"
+    return (" (libnvrtc-builtins could not be loaded; it must sit next to libnvrtc, in the "
+            f"library path or in {where})")
 
 
 class Nvrtc:
@@ -251,13 +314,16 @@ class Nvrtc:
         if rc:
             text = ""
             try:
-                self.lib.nvrtcGetErrorString.restype = ctypes.c_char_p
                 text = (self.lib.nvrtcGetErrorString(rc) or b"").decode()
             except (AttributeError, TypeError):
                 pass
-            hint = (" (libnvrtc-builtins.so must sit next to libnvrtc.so)"
-                    if "BUILTIN" in text.upper() else "")
-            raise RuntimeError(f"{what} failed: NVRTC error {rc} {text}{hint}")
+            raise RuntimeError(f"{what} failed: NVRTC error {rc} {text}{builtins_hint(rc)}")
+
+    def error_string(self, rc: int) -> str:
+        try:
+            return (self.lib.nvrtcGetErrorString(rc) or b"").decode()
+        except (AttributeError, TypeError):
+            return ""
 
     def version(self) -> tuple[int, int]:
         major, minor = ctypes.c_int(), ctypes.c_int()
@@ -378,34 +444,47 @@ class Built:
     arch: str  # "sm_86"
     nvrtc: tuple[int, int]
     cached: bool = False
+    stem: Path | None = None  # the cache entry's path without suffix
+
+    def forget(self) -> None:
+        """Delete this image's cache entry, for an image the driver would not load."""
+        if self.stem is not None:
+            for kind in ("cubin", "ptx"):
+                self.stem.with_suffix("." + kind).unlink(missing_ok=True)
 
 
-def cache_key(arch: str, nvrtc: tuple[int, int]) -> str:
-    h = hashlib.sha256(f"{source_hash()}|{arch}|{nvrtc[0]}.{nvrtc[1]}".encode())
-    return h.hexdigest()[:24]
+def cache_key(arch: str, nvrtc: tuple[int, int], options: Sequence[Sequence[str]] = ()) -> str:
+    """Hash of the sources, the architecture, NVRTC's version and every compile option."""
+    text = f"{source_hash()}|{arch}|{nvrtc[0]}.{nvrtc[1]}|{json.dumps([list(o) for o in options])}"
+    return hashlib.sha256(text.encode()).hexdigest()[:24]
 
 
-def build_image(nvrtc: Nvrtc, cc: tuple[int, int], *, cache: Path | None = None) -> Built:
+def build_image(nvrtc: Nvrtc, cc: tuple[int, int], *, cache: Path | None = None,
+                use_cache: bool = True) -> Built:
     """Compile the kernels for compute capability ``cc``: a CUBIN for ``sm_XY``, else PTX for
-    ``compute_XY`` when NVRTC rejects that architecture. A compile error raises with the log."""
+    ``compute_XY`` when NVRTC rejects that architecture. A compile error raises with NVRTC's
+    error string and the log. ``use_cache=False`` skips the read and rewrites the entry."""
     version = nvrtc.version()
     arch = f"sm_{cc[0]}{cc[1]}"
-    stem = None if cache is None else cache / f"gpu_blake3-{cache_key(arch, version)}"
-    if stem is not None:
+    opts = {k: arch_options(cc, k) for k in ("cubin", "ptx")}
+    key = cache_key(arch, version, list(opts.values()))
+    stem = None if cache is None else cache / f"gpu_blake3-{key}"
+    if stem is not None and use_cache:
         for kind in ("cubin", "ptx"):
             p = stem.with_suffix("." + kind)
             if p.is_file():
-                return Built(p.read_bytes(), kind, arch, version, cached=True)
+                return Built(p.read_bytes(), kind, arch, version, cached=True, stem=stem)
     core, cu = source_text()
     headers = {CORE_NAME: core}
-    rc, image, log = nvrtc.compile(cu, CU_NAME, headers, arch_options(cc, "cubin"), "cubin")
+    rc, image, log = nvrtc.compile(cu, CU_NAME, headers, opts["cubin"], "cubin")
     kind = "cubin"
     if rc == NVRTC_ERROR_INVALID_OPTION:
-        rc, image, log = nvrtc.compile(cu, CU_NAME, headers, arch_options(cc, "ptx"), "ptx")
+        rc, image, log = nvrtc.compile(cu, CU_NAME, headers, opts["ptx"], "ptx")
         kind = "ptx"
     if rc:
-        raise RuntimeError(f"NVRTC {version[0]}.{version[1]} cannot compile {CU_NAME} for "
-                           f"{arch} (error {rc}):\n{log}")
+        raise RuntimeError(
+            f"NVRTC {version[0]}.{version[1]} cannot compile {CU_NAME} for {arch}: "
+            f"error {rc} {nvrtc.error_string(rc)}{builtins_hint(rc)}\n{log}")
     if stem is not None:
         try:
             stem.parent.mkdir(parents=True, exist_ok=True)
@@ -414,7 +493,7 @@ def build_image(nvrtc: Nvrtc, cc: tuple[int, int], *, cache: Path | None = None)
             os.replace(tmp, stem.with_suffix("." + kind))
         except OSError:
             pass
-    return Built(image, kind, arch, version)
+    return Built(image, kind, arch, version, stem=stem)
 
 
 class Kernels:
@@ -439,7 +518,7 @@ class Kernels:
             for params, blocks in launches:
                 chunk = params.stage == 0
                 self.driver.launch(self.fn["pots_chunk_stage" if chunk else "pots_reduce_stage"],
-                                   blocks, CHUNK_THREADS if chunk else REDUCE_THREADS, params,
+                                   blocks, CHUNK_THREADS if chunk else R, params,
                                    stream)
         finally:
             self.driver.pop()
@@ -460,34 +539,52 @@ def _built(cc: tuple[int, int]) -> Built:
     return build_image(_nvrtc(), cc, cache=native.cache_dir())
 
 
+def load_kernels(driver: Driver, dev: int, built: Built, rebuild: Callable[[], Built]) -> Kernels:
+    """Load ``built``. A cached image the driver rejects is deleted and compiled afresh once."""
+    try:
+        return Kernels(driver, dev, built)
+    except RuntimeError:
+        if not built.cached:
+            raise
+        built.forget()
+        return Kernels(driver, dev, rebuild())
+
+
 @functools.lru_cache(maxsize=None)
 def _kernels(ordinal: int) -> Kernels:
     driver = _driver()
     dev = driver.device(ordinal)
-    return Kernels(driver, dev, _built(driver.compute_capability(dev)))
+    cc = driver.compute_capability(dev)
+    return load_kernels(driver, dev, _built(cc), lambda: build_image(
+        _nvrtc(), cc, cache=native.cache_dir(), use_cache=False))
 
 
-def describe() -> dict[str, object]:
-    """Source hash, NVRTC version and the device's architecture, where they can be told. It
-    loads NVRTC at most and never compiles."""
+def describe(device: int | torch.device | None = None) -> dict[str, object]:
+    """Source hash, NVRTC version and the architecture of ``device`` (the current one when
+    ``None``), where they can be told. It loads NVRTC at most and never compiles."""
     info: dict[str, object] = {"source_sha256": source_hash(), "nvrtc": None, "arch": None}
     try:
         info["nvrtc"] = ".".join(map(str, _nvrtc().version()))
     except (RuntimeError, OSError) as e:
         info["nvrtc_error"] = str(e)
     if torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
+        cc = torch.cuda.get_device_capability(device)
         info["arch"] = f"sm_{cc[0]}{cc[1]}"
-        info["device"] = torch.cuda.get_device_name()
+        info["device"] = torch.cuda.get_device_name(device)
     return info
 
 
 # ---- the entry points ----
 
 def _as_np(x: Any, dtype: Any) -> np.ndarray:
+    """``x`` as ``dtype``; a value the type cannot hold raises instead of wrapping."""
     a = np.asarray(x)
-    if a.dtype.kind == "i" and a.size and int(a.min()) < 0:
-        raise ValueError("lengths, offsets and addresses must not be negative")
+    if a.dtype.kind in "iu" and a.size:
+        info = np.iinfo(dtype)
+        if int(a.min()) < 0:
+            raise ValueError("lengths, offsets and addresses must not be negative")
+        if int(a.max()) > int(info.max):
+            raise ValueError(f"a value is above {int(info.max)}, the limit of {np.dtype(dtype)}")
     return a.astype(dtype, copy=False)
 
 
@@ -699,6 +796,19 @@ def random_table(rng: np.random.Generator, n: int, max_len: int, *, bad: int = 0
 NEEDS_CUDA = "gpu_blake3: needs CUDA, and torch.cuda.is_available() is False here"
 
 
+def mismatch(got: np.ndarray, got_bad: int, ref: np.ndarray, ref_bad: int) -> str | None:
+    """``None`` when the kernel agrees with the C library, else a line naming the first
+    differing leaf (digests are compared up to the first bad leaf) and both digests."""
+    if got_bad != ref_bad:
+        return f"first_bad {got_bad} vs {ref_bad}"
+    end = min(ref_bad, len(ref))
+    rows = np.flatnonzero((got[:end] != ref[:end]).any(axis=1)) if end else []
+    if len(rows):
+        i = int(rows[0])
+        return f"leaf {i}: got {bytes(got[i]).hex()} vs {bytes(ref[i]).hex()}"
+    return None
+
+
 def check(seeds: int = 6) -> int:
     """Random tables through the kernel against the C library: digests, and ``first_bad``."""
     if not torch.cuda.is_available():
@@ -718,13 +828,12 @@ def check(seeds: int = 6) -> int:
             arena = t.arena.to(dev)
             got, got_bad = g.hash_leaves(*t.args(arena.data_ptr()), device=dev)
             got = got.cpu().numpy()
-            end = min(ref_bad, n)
-            if got_bad != ref_bad or not np.array_equal(got[:end], ref[:end]):
-                print(f"MISMATCH seed={seed} n={n} max_len={max_len}: first_bad {got_bad} vs "
-                      f"{ref_bad}", file=sys.stderr)
+            why = mismatch(got, got_bad, ref, ref_bad)
+            if why:
+                print(f"MISMATCH seed={seed} n={n} max_len={max_len}: {why}", file=sys.stderr)
                 return 1
         print(f"seed {seed}: ok")
-    print(json.dumps(describe()))
+    print(json.dumps(describe(dev)))
     return 0
 
 
@@ -776,7 +885,7 @@ def bench(out: Path, repeats: int = 5) -> int:
         del x, prep
         torch.cuda.empty_cache()
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"describe": describe(), "bands": rows}, indent=2))
+    out.write_text(json.dumps({"describe": describe(dev), "bands": rows}, indent=2))
     return 0
 
 
