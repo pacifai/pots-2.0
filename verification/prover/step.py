@@ -74,6 +74,8 @@ class StepOutput:
     versions: tuple[int, ...] = field(repr=False)
     # MatmulCapture.summary() and the host pool's size, for the profiling record
     capture: dict | None = field(default=None, compare=False, repr=False)
+    # Product leaves whose captured device was not their owner's (FS32d); 0 unsharded
+    hint_misses: int = field(default=0, compare=False)
 
     def leaves(self) -> list[Any]:
         return [*self.records, *self.w_t.values(), *self.products, *self.w_next.values()]
@@ -88,13 +90,14 @@ class StepOutput:
         """
         if set(w_next) != set(self.w_next):
             raise ValueError("the spliced W_{t+1} names different weights")
-        new = {n: w_next[n].detach().clone(memory_format=torch.contiguous_format)
+        new = {n: w_next[n].detach().to(self.w_next[n].device, copy=True,
+                                        memory_format=torch.contiguous_format)
                for n in self.w_next}
         n_w = len(self.w_next)
         return StepOutput(records=self.records, w_t=self.w_t, products=self.products,
                           w_next=new, loss=self.loss,
                           versions=self.versions[:-n_w] + _versions(list(new.values())),
-                          capture=self.capture)
+                          capture=self.capture, hint_misses=self.hint_misses)
 
     def assert_unmodified(self) -> None:
         """Raise if any leaf tensor was mutated in place since capture (invariant 6).
@@ -112,16 +115,17 @@ def _versions(objs: Sequence[Any]) -> tuple[int, ...]:
     return tuple(t._version for t in objs if isinstance(t, torch.Tensor))
 
 
-def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int]) -> bool:
+def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int],
+               device: torch.device = HOST) -> bool:
     """Whether the caller's ``w`` can be the committed ``W_t`` leaf itself (see prove_step).
 
     It must hash to the bytes the model holds after ``load_weights`` (same dtype and shape,
-    contiguous, in host memory like every leaf), own its whole storage (no view that another
+    contiguous, on its weight's ``device`` like every leaf), own its whole storage (no view that another
     tensor can write through), not be a live parameter (``requires_grad``), and not share
     storage with any of ``model``'s parameters, which the step updates in place.
     """
     return (not w.requires_grad and w.dtype == p.dtype and w.shape == p.shape
-            and w.device == HOST and w.is_contiguous() and not w._is_view()
+            and w.device == device and w.is_contiguous() and not w._is_view()
             and w.storage_offset() == 0
             and w.untyped_storage().nbytes() == w.numel() * w.element_size()
             and w.untyped_storage().data_ptr() not in model_storages)
@@ -130,12 +134,15 @@ def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int]) -> bo
 def _w_t_leaves(computation: DeclaredComputation, model: torch.nn.Module,
                 w_t: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """The committed ``W_t``: the caller's tensor where :func:`_shareable`, else a copy of the
-    loaded parameter. Either way the bytes are those the model holds after ``load_weights``."""
+    loaded parameter, on the weight's device (F22). Either way the bytes are those the model
+    holds after ``load_weights``."""
+    place = computation.placement
     storages = {q.untyped_storage().data_ptr() for q in model.parameters()}
     out = {}
     for n in computation.weight_names:
         w, p = w_t[n], model.get_parameter(n)
-        out[n] = w if _shareable(w, p, storages) else p.detach().to(HOST, copy=True)
+        dev = place.weight_device(n)
+        out[n] = w if _shareable(w, p, storages, dev) else p.detach().to(dev, copy=True)
     return out
 
 
@@ -215,7 +222,7 @@ def prove_step(
         model.zero_grad(set_to_none=True)
         opt = _optimizer(computation, model)
 
-    cap = MatmulCapture(param_names=param_storage_map(model))
+    cap = MatmulCapture(param_names=param_storage_map(model), placement=computation.placement)
 
     @contextmanager
     def stage(p: str) -> Iterator[None]:
@@ -226,9 +233,15 @@ def prove_step(
         loss = computation.forward_backward(
             model, records if train_records is None else train_records, stage)
     with sec("P1.label"):
-        products = [p.detach().to(HOST) for p in computation.label(cap, model)]
-        if len(products) != computation.M:
-            raise RuntimeError(f"label returned {len(products)} products, M = {computation.M}")
+        labeled = computation.label(cap, model)
+        if len(labeled) != computation.M:
+            raise RuntimeError(f"label returned {len(labeled)} products, M = {computation.M}")
+        place = computation.placement
+        hint_misses = (cap.count_hint_misses(labeled, place.product_device)
+                       if place.sharded else 0)
+        # Each leaf goes to its owner (F22); a right hint left nothing to move, a wrong one
+        # costs this copy.
+        products = [p.detach().to(place.product_device(m)) for m, p in enumerate(labeled, 1)]
         # Invariant 6: the products are fixed and nothing has touched the captured tensors.
         cap.assert_unmodified()
         product_versions = list(_versions(products))
@@ -258,7 +271,7 @@ def prove_step(
         loss=float(loss.detach()),
         versions=(record_versions + w_t_versions
                   + tuple(product_versions) + _versions(list(w_next.values()))),
-        capture=summary,
+        capture=summary, hint_misses=hint_misses,
     )
 
 
