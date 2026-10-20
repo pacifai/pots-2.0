@@ -757,8 +757,12 @@ def _served_group(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Seq
             with (st("c5.copy", run, group) if st else _NO_STAMP):
                 for pos, R, m0, step, n in runs:
                     blk = view.product_run(m0, step, n)  # read only: copied, never written
+                    if tuple(blk.shape[1:]) != tuple(first.p_shape):
+                        runs = None  # copy_ would broadcast it; torch.stack raises
+                        break
                     p32[pos:pos + R * (n - 1) + 1:R].copy_(blk.detach().to(a.device))
-            return _Group(list(idx), a, b, p32, None)
+            if runs is not None:
+                return _Group(list(idx), a, b, p32, None)
         if runs is not None:
             _, _, m0, step, n = runs[0]
             p = view.product_run(m0, step, n)  # read only: measured and cast, never written

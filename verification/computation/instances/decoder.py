@@ -531,7 +531,7 @@ class DecoderComputation(DeclaredComputation):
         """
         runs, cls, specs = self.member_runs, self._inventory[1], self.products
         n_mem = self.n_s * self.n_h
-        if not len(ms) or not all(isinstance(m, int) and 1 <= m <= self.M for m in (ms[0], ms[-1])):
+        if not len(ms) or not all(type(m) is int for m in ms):  # not bool, not a float
             return None
         arr = np.asarray(ms, dtype=np.int64)
         if arr.min() < 1 or arr.max() > self.M:

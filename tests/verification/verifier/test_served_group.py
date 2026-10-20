@@ -94,3 +94,23 @@ def test_served_group_interleaved_backward_group_reads_ranges_not_members(monkey
     with pytest.raises(Exception, match="changed in place"):
         checks._served_group(c, run, idx, ctx, _fake_replay(run, idx), view)
     assert calls  # and that error came from the per-leaf path
+
+
+def test_served_group_broadcastable_wrong_shape_raises_what_stack_raises():
+    """Every δK̃ leaf cut to one row: a strided ``copy_`` would broadcast it, ``torch.stack``
+    raises, and so must the group."""
+    c, leaves = _step(False)
+    run = next(r for r in _member_runs(c.products)
+               if len(r) > 1 and c.product_class(r[0]) == "dA" and r[0].layer == c.L)
+    idx = next(g for g in _measure_groups(run) if c.product_class(run[g[-1]]) == "dK")
+    ms = [run[i].m for i in idx]
+    for i in idx:
+        if c.product_class(run[i]) == "dK":
+            j = c.product_index(run[i].m)
+            leaves[j] = leaves[j][:1].clone()
+    view, ctx = _view_and_ctx(c, leaves)
+    with pytest.raises(RuntimeError) as want:
+        torch.stack([view.product(m) for m in ms])
+    with pytest.raises(RuntimeError) as got:
+        checks._served_group(c, run, idx, ctx, _fake_replay(run, idx), view)
+    assert type(got.value) is type(want.value) and str(got.value) == str(want.value)
