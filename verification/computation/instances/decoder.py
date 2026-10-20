@@ -104,6 +104,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -512,6 +513,56 @@ class DecoderComputation(DeclaredComputation):
             if [mem for _, mem in run] == members and stride > 0 \
                     and all(m == run[0][0] + stride * i for i, (m, _) in enumerate(run)):
                 out[key] = (run[0][0], stride)
+        return out
+
+    def member_pieces(self, ms: Sequence[int]) -> list[tuple[int, int, int, int, int]] | None:
+        """``ms`` cut into interleaved arithmetic progressions, from arithmetic on ``ms``
+        and :attr:`member_runs`; ``None`` if ``ms`` has a product outside every run.
+
+        Per piece ``(pos, R, m₀, step, n)``: position ``pos + R·t`` of ``ms`` holds product
+        ``m₀ + step·t``, ``t < n``; the pieces cover every position once, in order of ``pos``.
+        A run's members sit ``stride`` products apart, and the roles of stride ``R`` fill
+        consecutive products in turn (``δQ̃₀, δK̃₀, δQ̃₁, …``). So a block starting at ``ms[i]``,
+        whose run has stride ``s``, is ``R = 1`` role when ``ms[i+1] - ms[i] = s`` and otherwise
+        ``R = s`` roles, each a progression of the block's first ``n`` rows. One run lookup per
+        block, numpy for the rest. The cut is a guess about the layout: the pieces are exact
+        for any ``ms`` (each is a true progression), and callers that need more (that a piece is
+        one role's members) check it.
+        """
+        runs, cls, specs = self.member_runs, self._inventory[1], self.products
+        n_mem = self.n_s * self.n_h
+        if not len(ms) or not all(isinstance(m, int) and 1 <= m <= self.M for m in (ms[0], ms[-1])):
+            return None
+        arr = np.asarray(ms, dtype=np.int64)
+        if arr.min() < 1 or arr.max() > self.M:
+            return None
+        out: list[tuple[int, int, int, int, int]] = []
+        i, total = 0, len(arr)
+        while i < total:
+            m = int(arr[i])
+            run = runs.get((specs[m - 1].layer, cls[m - 1])) if specs[m - 1].member else None
+            if run is None:
+                return None
+            left = total - i
+            R = 1 if left > 1 and int(arr[i + 1] - arr[i]) == run[1] else min(run[1], left)
+            n, step = 1, 1
+            if left > R:
+                d = int(arr[i + R] - arr[i])
+                full = left // R
+                sub = arr[i:i + R * full].reshape(full, R)
+                ok = (sub == sub[0] + d * np.arange(full)[:, None]).all(axis=1)
+                if d >= 1 and full > 1 and ok[1]:
+                    n, step = (full if ok.all() else int(np.argmin(ok))), d
+            if n > 1:  # a piece stays inside its run (S and O abut when n = d_h)
+                i0, bad = divmod(m - run[0], run[1])
+                bs, bad_step = divmod(step, run[1])
+                if bad or bad_step or bs < 1:
+                    n, step = 1, 1
+                else:
+                    n = max(1, min(n, (n_mem - i0 - 1) // bs + 1))
+                    step = step if n > 1 else 1
+            out += [(i + r, R, int(arr[i + r]), step, n) for r in range(R)]
+            i += R * n
         return out
 
     def product_class(self, spec: ProductSpec) -> str:
@@ -1335,14 +1386,26 @@ class DecoderReplay(Replay):
             self._n_bmm += 1
             # A zero-copy block would alias the leaves, so the host asks for its own copy. On
             # another device the move is the copy (blocking: no pinned-source stream logic).
-            block = self.view.product_block([c.m_of(f"{name}[{s},{h}]") for s, h in c._members()],
-                                            own=a.device.type == "cpu")
+            block = self._member_block(self._cur, ("S", "O")[self._n_bmm - 1],
+                                       own=a.device.type == "cpu")
             out = block.to(a.device) if block.device != a.device else block
         self._names.append(name)
         if name not in self._calls:  # a repeat fails the unit's name check
             # A head block's scores are not kept: its backward rebuilds them.
             self._calls[name] = (a, b, None if self._block is not None else out)
         return out
+
+    def _member_block(self, layer: int, role: str, own: bool) -> torch.Tensor:
+        """Layer ``layer``'s ``role`` members (``S``, ``O``, ``dA``, …) as one block in member
+        order, read from the committed leaves as ``product_block`` over every member's ``m``
+        would, but from the run's ``(m₀, stride)`` alone when it has one."""
+        c = self.c
+        run = c.member_runs.get((layer, role))
+        product_run = getattr(self.view, "product_run", None)
+        if run is None or product_run is None:
+            return self.view.product_block(
+                [c.m_of(f"L{layer}.{role}[{s},{h}]") for s, h in c._members()], own=own)
+        return product_run(run[0], run[1], c.n_s * c.n_h, own=own)
 
     @staticmethod
     def _layer_names(l: int) -> list[str]:
@@ -1524,9 +1587,8 @@ class DecoderReplay(Replay):
             name = f"L{self._unit}.{role}"
             out = None
             if name in self._want:
-                out = self.view.product_block([c.m_of(f"{name}[{s},{h}]")
-                                               for s, h in c._members()],
-                                              own=a.device.type == "cpu" and role != "dK")
+                out = self._member_block(self._unit, role,
+                                         own=a.device.type == "cpu" and role != "dK")
                 if role == "dK":  # the op computes δK̃ᵀ = Q̃ᵀ·δS; the leaves hold δK̃
                     out = _dk_owned(out, a.device)
         if out is None or name in self._bops:
@@ -1709,18 +1771,91 @@ class DecoderReplay(Replay):
         self._served_last = m == c.M
         return a, b
 
+    def _pieces(self, ms: Sequence[int]) -> list[tuple[int, int, str, int, int, int, int]] | None:
+        """``ms`` as whole role progressions of attention runs, or ``None``.
+
+        :meth:`DecoderComputation.member_pieces` cuts ``ms``; each piece must then be a role's
+        members in one run, and all in one layer, of one kind and with the same operand shapes
+        (what :meth:`_operand_group_members` requires). Per piece, ``(pos, R, role, i0, bs, n,
+        m0)``: positions ``pos + R·t`` hold batch indices ``i0 + bs·t`` of the role's operands.
+        """
+        c = self.c
+        pieces = c.member_pieces(ms)
+        if pieces is None:
+            return None
+        runs, cls, specs, n_mem = c.member_runs, c._inventory[1], c.products, c.n_s * c.n_h
+        out, key = [], None
+        for pos, R, m0, step, n in pieces:
+            spec, role = specs[m0 - 1], cls[m0 - 1]
+            run = runs.get((spec.layer, role))
+            if run is None:
+                return None
+            r0, rs = run
+            i0, bad = divmod(m0 - r0, rs)
+            bs, bad_step = divmod(step, rs) if n > 1 else (1, 0)
+            if bad or bad_step or bs < 1 or i0 + bs * (n - 1) >= n_mem:
+                return None
+            k = (spec.layer, spec.kind is ProductKind.FORWARD, spec.a_shape, spec.b_shape)
+            if key not in (None, k):
+                return None
+            key = k
+            out.append((pos, R, role, i0, bs, n, m0))
+        return out
+
     def operand_group(self, ms: Sequence[int], dtype: torch.dtype | None = None
                       ) -> tuple[torch.Tensor, torch.Tensor]:
         """Members of one layer's attention run (forward ``S``/``O``, or backward ``δA``,
         ``δV``, ``δQ̃``, ``δK̃``), served from the whole bmm operand tensors: one version and
         dtype check per role, then one strided copy per role and operand into the stacked
         result, ``δK̃``'s transposed, converting to ``dtype`` as it copies. Roles may interleave
-        (``δQ̃₀, δK̃₀, δQ̃₁, …``); a role whose members aren't evenly spaced is copied member by
-        member. The result and the replay's state afterwards, or at an error, are those of
-        ``operands(m)`` over ``ms`` up to the same point: the same unit guards, the same first
-        error, and ``_served_last`` as after the last member served. Any other ``ms`` takes the
-        default.
+        (``δQ̃₀, δK̃₀, δQ̃₁, …``). Roles, positions and batch indices come from arithmetic on
+        ``ms`` and the run table, not from the members. The result and the replay's state
+        afterwards, or at an error, are those of ``operands(m)`` over ``ms`` up to the same
+        point: the same unit guards, the same first error, and ``_served_last`` as after the
+        last member served. Any other ``ms`` (a role not evenly spaced, a product outside a
+        run) is served member by member, as before.
         """
+        c = self.c
+        roles = self._pieces(ms)
+        if roles is None:
+            return self._operand_group_members(ms, dtype)
+        first = c.product(ms[0])
+        forward = first.kind is ProductKind.FORWARD
+        j = self._forward_unit(first) if forward else self._backward_unit(first)[0]
+        held = self._units[j].fwd if forward else self._bops
+        by_role: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        whole: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for k, (_, _, role, _, _, _, m0) in enumerate(roles):
+            spec = c.product(m0)
+            if (spec.layer, role) not in by_role:
+                if k:  # the members before this role's first one were served; none is product M
+                    self._served_last = False
+                a, b = _unchanged(held, f"L{spec.layer}.{role}")
+                if role == "dK":
+                    a, b = b.mT, a.mT
+                if a.dtype != c.operand_dtype or b.dtype != c.operand_dtype:
+                    raise ReplayError(f"{spec.name}: operands {a.dtype}, {b.dtype}, declared "
+                                      f"{c.operand_dtype}")
+                by_role[spec.layer, role] = (a.detach(), b.detach())
+            whole.append(by_role[spec.layer, role])
+        self._served_last = ms[-1] == c.M
+        a0, b0 = whole[0]
+        if any(a.shape[1:] != a0.shape[1:] or b.shape[1:] != b0.shape[1:] for a, b in whole):
+            return self._operand_group_members(ms, dtype)  # copy_ would broadcast; stack raises
+        out_a = a0.new_empty((len(ms), *a0.shape[1:]), dtype=dtype)
+        out_b = b0.new_empty((len(ms), *b0.shape[1:]), dtype=dtype)
+        for (a, b), (pos, R, _, i0, bs, n, _) in zip(whole, roles):
+            dst = slice(pos, pos + R * (n - 1) + 1, R)
+            src = slice(i0, i0 + bs * (n - 1) + 1, bs)
+            out_a[dst].copy_(a[src])
+            out_b[dst].copy_(b[src])
+        return out_a, out_b
+
+    def _operand_group_members(self, ms: Sequence[int], dtype: torch.dtype | None
+                               ) -> tuple[torch.Tensor, torch.Tensor]:
+        """:meth:`operand_group` member by member: the path for any ``ms`` that is not whole
+        role progressions of one run. Roles are found per member, with one ``product_class``
+        and one pair of appends each."""
         c = self.c
         specs = [c.product(m) for m in ms]
         if not specs or specs[0].member is None:

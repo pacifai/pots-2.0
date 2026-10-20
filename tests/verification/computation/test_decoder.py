@@ -2051,3 +2051,85 @@ def test_dk_owned_never_aliases_the_block(shape):
     out = _dk_owned(block, block.device)
     assert torch.equal(out, block.transpose(1, 2)) and out.is_contiguous()
     assert out.untyped_storage().data_ptr() != block.untyped_storage().data_ptr()
+
+
+def test_operand_group_serves_whole_attention_groups_without_the_member_path(
+        honest_all, monkeypatch):
+    """Every attention group of the step (forward ``S``/``O``, backward ``δA``, and the mixed
+    ``δV``, ``δQ̃``, ``δK̃`` group) is cut into role progressions by arithmetic on ``ms``; the
+    member-by-member path never runs for them."""
+    from verification.computation.instances.decoder import DecoderReplay
+
+    c, leaves, _, _ = honest_all
+    members = DecoderReplay._operand_group_members
+
+    def guard(self, ms, dtype):
+        assert c.product(ms[0]).member is None, f"member path for {ms[:3]}..."
+        return members(self, ms, dtype)
+
+    monkeypatch.setattr(DecoderReplay, "_operand_group_members", guard)
+    _assert_groups_match_members(c, leaves)
+    _assert_groups_match_members(c, leaves, torch.float32)
+
+
+def test_member_pieces_cut_ms_exactly():
+    """The pieces cover every position once with the product ``m₀ + step·t``, for the groups
+    of a step, their windows and chunks, and for shuffled ``ms`` (any cut is exact)."""
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    gen = torch.Generator().manual_seed(0)
+
+    def rebuilt(ms, pieces):
+        out = [None] * len(ms)
+        for pos, R, m0, step, n in pieces:
+            for t in range(n):
+                assert out[pos + R * t] is None
+                out[pos + R * t] = m0 + step * t
+        return out
+
+    cuts = {}
+    for ms in _groups(c):
+        if c.product(ms[0]).member is None:
+            assert c.member_pieces(ms) is None
+            continue
+        cuts[len(ms)] = c.member_pieces(ms)
+        for a, b in ((0, len(ms)), (1, len(ms)), (0, len(ms) - 1), (3, 8), (2, 3)):
+            part = ms[a:b]
+            assert rebuilt(part, c.member_pieces(part)) == part
+        perm = [ms[i] for i in torch.randperm(len(ms), generator=gen).tolist()]
+        assert rebuilt(perm, c.member_pieces(perm)) == perm
+    # S, O: one piece each. δV then δQ̃, δK̃: one piece, then two interleaved (R = 2).
+    n_mem = c.n_s * c.n_h
+    forward = next(ms for ms in _groups(c) if c.product_class(c.product(ms[0])) == "S")
+    assert c.member_pieces(forward) == [(0, 1, forward[0], 1, n_mem)]
+    mixed = next(ms for ms in _groups(c) if c.product_class(c.product(ms[0])) == "dV")
+    pieces = c.member_pieces(mixed)
+    if len(mixed) == 3 * n_mem:
+        assert [p[1] for p in pieces] == [1, 2, 2] and [p[4] for p in pieces] == [n_mem] * 3
+    assert c.member_pieces([1, 2]) is None and c.member_pieces([]) is None
+    assert c.member_pieces([0]) is None and c.member_pieces([c.M + 1]) is None
+
+
+@pytest.mark.parametrize("role", ["dV", "dQ", "dK"])
+def test_operand_group_fails_in_a_later_role_as_members_would(honest_all, role):
+    """The mixed ``δV``, ``δQ̃``, ``δK̃`` group, with any one role's held operand changed: the
+    group raises the error per-member serving raises first, with the same ``_served_last``."""
+    c, leaves, _, _ = honest_all
+    l = c.L
+    ms = next(g for g in _groups(c) if c.product(g[0]).layer == l
+              and c.product_class(c.product(g[-1])) == "dK")  # (with δA too when n = d_h)
+    errors = []
+    for serve in ("group", "members"):
+        replay = c.replay(ListReader(leaves))
+        for m in range(1, ms[0]):
+            replay.operands(m)
+        replay._served_last = True
+        with torch.no_grad():
+            replay._bops[f"L{l}.{role}"][0].add_(0)  # bumps _version only
+        with pytest.raises(ReplayError) as e:
+            if serve == "group":
+                replay.operand_group(ms)
+            else:
+                for m in ms:
+                    replay.operands(m)
+        errors.append((str(e.value), replay._served_last))
+    assert errors[0] == errors[1] and "changed after its product read it" in errors[0][0]

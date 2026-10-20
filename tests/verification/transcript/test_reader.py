@@ -107,3 +107,137 @@ def test_product_block_through_a_committed_view_checks_a_middle_leaf():
     mid.add_(1)
     with pytest.raises(StoreMutationError, match="changed in place"):
         view.product_block(ms)
+
+
+# ---- product_run: the range read -------------------------------------------------------------
+
+
+def _decoder_view(roles, n_s=2, n=12):
+    """A committed view over a tiny decoder whose products ``roles`` (a list of
+    ``(first_m, stride)``, one tensor storage each) hold member leaves ``m0 + stride·i``;
+    every other leaf is a one-element stand-in. Returns ``(c, view, leaves, storages)``."""
+    from verification.computation.instances.decoder import DecoderComputation
+    from verification.transcript.reader import TranscriptView
+    from tests.verification.computation.test_decoder import tiny_config
+
+    c = DecoderComputation(tiny_config(), n_s=n_s, n=n, eta=1e-3)
+    n_mem = c.n_s * c.n_h
+    total = c.n_s + len(c.weight_names) + c.M + len(c.weight_names)
+    objs, storages = [torch.zeros(1) for _ in range(total)], []
+    for m0, stride in roles:
+        big = torch.randn(n_mem, *c.product(m0).p_shape)
+        assert big.data_ptr() % 64 == 0
+        storages.append(big)
+        for i in range(n_mem):
+            objs[c.product_index(m0 + stride * i)] = big[i]
+    leaves = CommittedLeaves()
+    for o in objs:
+        leaves.add(o)
+    return c, TranscriptView(c, leaves), leaves, storages
+
+
+def _member_run(role, layer=1):
+    """The decoder's own ``(m₀, stride)`` of one attention run."""
+    from verification.computation.instances.decoder import DecoderComputation
+    from tests.verification.computation.test_decoder import tiny_config
+
+    return DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3).member_runs[layer, role]
+
+
+def _loop(view, m0, stride, n):
+    return torch.stack([view.product(m0 + stride * i) for i in range(n)])
+
+
+@pytest.mark.parametrize("own", [False, True])
+def test_product_run_equals_the_loop_for_a_contiguous_run(own):
+    m0, st = _member_run("S")
+    c, view, _, (big,) = _decoder_view([(m0, st)])
+    n = c.n_s * c.n_h
+    out = view.product_run(m0, st, n, own=own)
+    assert out.dtype == big.dtype and torch.equal(out, _loop(view, m0, st, n))
+    assert (out.data_ptr() != big.data_ptr()) == own  # zero-copy unless asked for its own
+    sub = view.product_run(m0 + 2, st, n - 4, own=own)  # a window, read off the first proof
+    assert torch.equal(sub, _loop(view, m0 + 2, st, n - 4)) and sub.is_contiguous()
+
+
+def test_product_run_stride_two_interleaved_roles():
+    """Two roles alternate per member (δQ̃, δK̃): each is a stride-2 run of its own storage."""
+    (q0, st), (k0, _) = _member_run("dQ"), _member_run("dK")
+    assert st == 2 and k0 == q0 + 1
+    c, view, _, (bq, bk) = _decoder_view([(q0, st), (k0, st)])
+    n = c.n_s * c.n_h
+    for m0, big in ((q0, bq), (k0, bk)):
+        out = view.product_run(m0, 2, n)
+        assert torch.equal(out, _loop(view, m0, 2, n)) and out.data_ptr() == big.data_ptr()
+        assert torch.equal(view.product_run(m0 + 2, 2, 3, own=True), _loop(view, m0 + 2, 2, 3))
+    # Across the two roles the leaves are not one run: the loop's bits through the fallback.
+    assert torch.equal(view.product_run(q0, 1, 2 * n), _loop(view, q0, 1, 2 * n))
+
+
+def test_product_run_fallbacks_match_the_loop():
+    m0, st = _member_run("S")
+    c, view, _, _ = _decoder_view([(m0, st)])
+    assert torch.equal(view.product_run(m0 + 1, st, 1), _loop(view, m0 + 1, st, 1))
+    # Leaves of another shape (a member next to a stand-in) take torch.stack, and its error.
+    with pytest.raises(RuntimeError) as want:
+        _loop(view, m0, c.M - m0, 2)
+    with pytest.raises(RuntimeError) as got:
+        view.product_run(m0, c.M - m0, 2)
+    assert str(got.value) == str(want.value)
+    with pytest.raises(RuntimeError):  # n = 0: stack of nothing
+        view.product_run(m0, 1, 0)
+
+
+def test_product_run_bad_index_raises_what_the_loop_raises():
+    c, view, _, _ = _decoder_view([_member_run("S")])
+    for m0, stride, n in ((0, 1, 3), (c.M - 1, 1, 4), (c.M + 1, 1, 1), (1, 7, c.M)):
+        with pytest.raises(IndexError) as want:
+            _loop(view, m0, stride, n)
+        with pytest.raises(IndexError) as got:
+            view.product_run(m0, stride, n)
+        assert str(got.value) == str(want.value), (m0, stride, n)
+
+
+def test_product_run_tampered_middle_leaf_raises_the_per_leaf_message():
+    m0, st = _member_run("dQ")
+    c, view, leaves, (big,) = _decoder_view([(m0, st)])
+    n = c.n_s * c.n_h
+    assert torch.equal(view.product_run(m0, st, n), _loop(view, m0, st, n))  # proof made
+    big[n // 2].add_(1)
+    with pytest.raises(StoreMutationError) as want:
+        _loop(view, m0, st, n)
+    with pytest.raises(StoreMutationError) as got:
+        view.product_run(m0, st, n)
+    assert str(got.value) == str(want.value)
+    assert f"leaf {c.product_index(m0)} changed" in str(got.value)  # first changed in order
+
+
+def test_product_run_proof_is_not_stale_after_a_write():
+    """A write after a successful read must raise on the next one, for the whole range and
+    for a window of it, and the cache of a fresh ``CommittedLeaves`` starts empty."""
+    m0, st = _member_run("O")
+    c, view, leaves, (big,) = _decoder_view([(m0, st)])
+    n = c.n_s * c.n_h
+    view.product_run(m0, st, n)
+    view.product_run(m0 + 3, st, 3)
+    assert leaves._runs
+    big[0].mul_(2)
+    for args in ((m0, st, n), (m0 + 3, st, 3), (m0 + 4, st, 2)):
+        with pytest.raises(StoreMutationError, match="changed in place"):
+            view.product_run(*args)
+    assert not CommittedLeaves()._runs
+
+
+def test_product_run_through_a_reader_without_tensor_run():
+    m0, st = _member_run("dV")
+    c, view, leaves, _ = _decoder_view([(m0, st)])
+    n = c.n_s * c.n_h
+
+    class Plain:
+        def leaf(self, i):
+            return leaves.leaf(i)
+
+    from verification.transcript.reader import TranscriptView
+    plain = TranscriptView(c, Plain())
+    assert torch.equal(plain.product_run(m0, st, n), _loop(view, m0, st, n))
+    assert torch.equal(plain.product_run(m0, st, n, own=True), _loop(view, m0, st, n))

@@ -748,10 +748,42 @@ def _served_group(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Seq
     # (F4a), in the stored dtype and cast there (a blocking `.to(device, dtype)` converts on
     # the CPU).
     with (st("c5.serve", run, group) if st else _NO_STAMP):
-        p = view.product_block(ms)  # read only: measured and cast, never written
+        runs = _role_progressions(ms, first.p_shape, c) if hasattr(view, "product_run") else None
+        if runs is not None and (len(runs) > 1 or runs[0][4] != len(ms)):
+            # Interleaved roles (δQ̃, δK̃, …) are not one run of leaves: read each role as a
+            # range, and copy it with one strided write into the stacked result, converting
+            # to float32 there (the cast of the stored values is the same on either device).
+            p32 = a.new_empty((len(ms), *first.p_shape), dtype=torch.float32)
+            with (st("c5.copy", run, group) if st else _NO_STAMP):
+                for pos, R, m0, step, n in runs:
+                    blk = view.product_run(m0, step, n)  # read only: copied, never written
+                    p32[pos:pos + R * (n - 1) + 1:R].copy_(blk.detach().to(a.device))
+            return _Group(list(idx), a, b, p32, None)
+        if runs is not None:
+            _, _, m0, step, n = runs[0]
+            p = view.product_run(m0, step, n)  # read only: measured and cast, never written
+        else:
+            p = view.product_block(ms)
         with (st("c5.copy", run, group) if st else _NO_STAMP):
             p_dev = p.detach().to(a.device)
     return _Group(list(idx), a, b, p_dev.to(torch.float32), None)
+
+
+def _role_progressions(ms: Sequence[int], p_shape: tuple[int, ...], c: DeclaredComputation
+                       ) -> list[tuple[int, int, int, int, int]] | None:
+    """``ms`` cut into interleaved arithmetic progressions by the computation's
+    ``member_pieces`` (see :meth:`DecoderComputation.member_pieces`), or ``None`` for the
+    plain read: ``c`` has none, ``ms`` doesn't cut, or a piece's first product has a leaf
+    shape other than ``p_shape`` (the stacked copy would broadcast it; ``torch.stack``
+    raises). Per piece ``(pos, R, m₀, step, n)``: position ``pos + R·t`` holds product
+    ``m₀ + step·t``. The pieces cover every position once, so reading each as a range and
+    copying it to its positions is ``torch.stack`` of the leaves in the order of ``ms``."""
+    cut = getattr(c, "member_pieces", None)
+    pieces = cut(ms) if cut is not None else None
+    if pieces is None or any(tuple(c.product(m0).p_shape) != tuple(p_shape)
+                             for _, _, m0, _, _ in pieces):
+        return None
+    return pieces
 
 
 def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
