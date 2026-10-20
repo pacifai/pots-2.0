@@ -78,6 +78,9 @@ class RunConfig:
     # whether the trace holds check 5's sliced runs ("slice") or every run ("all").
     trace_step: int
     trace_c5: str
+    # F22: the devices that hold the transcript and run the verifier's replay, split by layers
+    # (verification/computation/placement.py). None: today's path, leaves in host memory.
+    verifier_devices: tuple[str, ...] | None
 
     @property
     def data_dir(self) -> Path:
@@ -138,6 +141,35 @@ def _device(env: Mapping[str, str]) -> str:
     except RuntimeError:
         raise ValueError(f"VERIF_DEVICE is not a valid torch device: {raw!r}") from None
     return raw
+
+
+def _verifier_devices(env: Mapping[str, str], device: str) -> tuple[str, ...] | None:
+    """`VERIF_VERIFIER_DEVICES` (F22): unset or empty is None, else a list of devices."""
+    raw = env.get("VERIF_VERIFIER_DEVICES", "").strip()
+    if not raw:
+        return None
+    kind = torch.device(device).type
+    entries = tuple(e.strip() for e in raw.split(","))
+    seen: set[torch.device] = set()
+    for entry in entries:
+        if not entry:
+            raise ValueError(f"VERIF_VERIFIER_DEVICES has an empty entry: {raw!r}")
+        try:
+            dev = torch.device(entry)
+        except RuntimeError:
+            raise ValueError(f"VERIF_VERIFIER_DEVICES entry is not a valid torch device: "
+                             f"{entry!r}") from None
+        if dev.type != kind:
+            raise ValueError(f"VERIF_VERIFIER_DEVICES entry {entry!r} must have the device type "
+                             f"of VERIF_DEVICE ({kind!r})")
+        if dev.type == "cuda":
+            if dev.index is None:
+                raise ValueError(f"VERIF_VERIFIER_DEVICES entry {entry!r} must name its index, "
+                                 f"as in 'cuda:1'")
+            if dev in seen:
+                raise ValueError(f"VERIF_VERIFIER_DEVICES repeats the CUDA device {entry!r}")
+            seen.add(dev)
+    return entries
 
 
 def _attn_impl(env: Mapping[str, str]) -> str:
@@ -208,6 +240,7 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
         release_cache=_bool(env, "VERIF_RELEASE_CACHE"),
         trace_step=_int(env, "VERIF_TRACE_STEP", 0),
         trace_c5=_trace_c5(env),
+        verifier_devices=_verifier_devices(env, _device(env)),
     )
 
 

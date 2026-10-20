@@ -81,6 +81,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | var | default |
 |---|---|
 | `VERIF_DEVICE` | `cpu`. `cuda` runs the model, its activations, the replay and check 5's measuring on the GPU; every leaf stays in host memory (F1c, F4a, FS9) |
+| `VERIF_VERIFIER_DEVICES` | unset. A comma-separated list of the devices that hold the transcript and run the verifier, the replay split over them by layers (F22, FS32a). Unset or empty: today's path, leaves in host memory. Each entry is a torch device of `VERIF_DEVICE`'s type; a CUDA entry names its index (`cuda:1`) and none repeats; `cpu` may repeat (`cpu,cpu,cpu` runs every path on the Mac); `VERIF_DEVICE` itself may appear. Not a training field: config hashes don't move. Nothing reads it yet but the placement |
 | `VERIF_MODEL` | `HuggingFaceTB/SmolLM2-135M-Instruct` |
 | `VERIF_MODEL_REVISION` | `12fd25f77366fa6b3b4b768ec3050bf629380bac` |
 | `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32`. `float32` / `bfloat16` runs forward and loss under autocast (F6b, FS3); the decoder refuses any other master and fp16 compute |
@@ -591,6 +592,28 @@ interface.
     whatever `VERIF_DEVICE` is (F1c, FS9). A12 must take `W_0` with it, as B7 does. The
     prover's `W_t` leaves are the caller's `w_t` tensors where `prove_step` can share them
     (see `step.py`).
+  - Units (F22, FS32a): a unit is a piece of the replay that runs on one device.
+    `units` (forward order; default `(0,)`), `pinned_last_units` (default empty),
+    `weight_unit(name)` and `product_unit(m)` (default 0; `KeyError` for an undeclared name,
+    `IndexError` for `m` outside `1..M`) and `placement`. The decoder's units are `0` the
+    embedding (`W_E`), `1 … L` the layers (γs, linear weights, biases, every product with
+    `spec.layer == j`) and `L + 1` the head (`γ_final`, an untied `W_out`, the head blocks'
+    `Λ_b`, `δF_b`, `G_b`). Units `0` and `L + 1` are pinned to the last device, tied or not: tied,
+    `W_E` is one `Parameter` shared by the embedding and the output layer, and it lives on one
+    device. That keeps the verifier's model an unmodified `from_pretrained` model and the
+    tied gradient sum `G_E^head + G_E^emb` on one device, at the price of one move of `X_1` and
+    one of `δX_1`, each `N × d`. The MLP has one unit.
+- `placement.py` (F22, FS32a): `Placement`, built by `placement_for(c, prover, devices)`
+  (`c.placement` for the instance's own). `unit_slot(j)`, `unit_device(j)`,
+  `weight_device(name)`, `product_device(m)`, `leaf_device(i)` (by transcript index; records
+  always `HOST`) and `loads()` (leaf bytes per slot). Unsharded (`devices is None`): units on
+  the prover's device, every leaf on `HOST`. Sharded: a unit's bytes are its leaves' (each
+  weight twice at `weight_dtype`, each product once at `product_dtype`); the pinned units go to
+  the last slot; the others are cut in order into contiguous ranges, one per slot, minimizing
+  the largest slot with the pinned bytes in the last (exact DP, `split_units`); the tie goes to
+  the lexicographically smallest cut, so later slots fill first. A slot may hold no layer. A
+  weight's and a product's device are their unit's, so a product's leaf and the unit that
+  consumes it share a device. Imports `interface` only.
 - `matmul_ops.py`: `HANDLED_OPS` (`mm`, `bmm`, `addmm`, `baddbmm`), `REJECTED_OPS` (every
   other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
   (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (the two `profiler::` record-function ops, FS23) and `param_storage_map(model)`. Shared by
