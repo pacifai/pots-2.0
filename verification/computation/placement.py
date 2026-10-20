@@ -41,34 +41,51 @@ class Placement:
     _leaf_device: tuple[torch.device, ...] = field(default=(), repr=False, compare=False)
     _loads: tuple[int, ...] = field(default=(), repr=False, compare=False)
 
+    _units: frozenset[int] = field(default=frozenset(), repr=False, compare=False)
+    _weights: frozenset[str] = field(default=frozenset(), repr=False, compare=False)
+    _n_products: int = field(default=0, repr=False, compare=False)
+    _n_leaves: int = field(default=0, repr=False, compare=False)
+
     @property
     def sharded(self) -> bool:
         return self.devices is not None
 
+    def _check_unit(self, j: int) -> None:
+        if j not in self._units:
+            raise IndexError(f"unit {j} is not one of the units {sorted(self._units)}")
+
     def unit_slot(self, j: int) -> int:
         """Index into ``devices`` of unit ``j``'s device; 0 unsharded."""
+        self._check_unit(j)
         return self._unit_slot[j] if self.devices is not None else 0
 
     def unit_device(self, j: int) -> torch.device:
         """The device unit ``j`` runs on; the prover's unsharded."""
+        self._check_unit(j)
         if self.devices is None:
             return self.prover
         return self.devices[self._unit_slot[j]]
 
     def weight_device(self, name: str) -> torch.device:
         """Where weight ``name``'s ``W_t`` and ``W_{t+1}`` leaves live; ``HOST`` unsharded."""
+        if name not in self._weights:
+            raise KeyError(f"{name!r} is not a declared weight")
         if self.devices is None:
             return HOST
         return self.devices[self._weight_slot[name]]
 
     def product_device(self, m: int) -> torch.device:
-        """Where product ``m``'s leaf lives; ``HOST`` unsharded."""
+        """Where product ``m`` (1-based) has its leaf; ``HOST`` unsharded."""
+        if not 1 <= m <= self._n_products:
+            raise IndexError(f"product m={m} outside 1..{self._n_products}")
         if self.devices is None:
             return HOST
         return self.devices[self._product_slot[m - 1]]
 
     def leaf_device(self, i: int) -> torch.device:
         """Where leaf ``i`` (the transcript index) lives; records are always on ``HOST``."""
+        if not 0 <= i < self._n_leaves:
+            raise IndexError(f"leaf {i} outside 0..{self._n_leaves - 1}")
         return self._leaf_device[i] if self.devices is not None else HOST
 
     def loads(self) -> tuple[int, ...]:
@@ -107,8 +124,10 @@ def placement_for(c: DeclaredComputation, prover: torch.device | str,
                   devices: tuple[torch.device | str, ...] | None) -> Placement:
     """The placement of ``c``'s units and leaves over ``devices`` (``None``: unsharded)."""
     prover = torch.device(prover)
+    bounds = dict(_units=frozenset(c.units), _weights=frozenset(c.weight_names),
+                  _n_products=c.M, _n_leaves=c.n_leaves)
     if devices is None:
-        return Placement(prover, None)
+        return Placement(prover, None, **bounds)
     devs = tuple(torch.device(d) for d in devices)
     if not devs:
         raise ValueError("a sharded placement needs at least one device")
@@ -141,4 +160,4 @@ def placement_for(c: DeclaredComputation, prover: torch.device | str,
     for j, s in slot.items():
         loads[s] += size[j]
     return Placement(prover, devs, slot, weight_slot, product_slot,
-                     (HOST,) * c.n_s + tuple(devs[s] for s in leaf_slots), tuple(loads))
+                     (HOST,) * c.n_s + tuple(devs[s] for s in leaf_slots), tuple(loads), **bounds)

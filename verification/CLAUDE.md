@@ -647,7 +647,10 @@ interface.
   the largest slot with the pinned bytes in the last (exact DP, `split_units`); the tie goes to
   the lexicographically smallest cut, so later slots fill first. A slot may hold no layer. A
   weight's and a product's device are their unit's, so a product's leaf and the unit that
-  consumes it share a device. Imports `interface` only.
+  consumes it share a device. Every lookup refuses an out-of-range argument, sharded or
+  not: `IndexError` for a unit outside `units`, `m` outside `1..M` or a leaf outside
+  `0..n_leaves-1` (no negative wrap), `KeyError` for an undeclared weight. Imports `interface`
+  only.
 - `matmul_ops.py`: `HANDLED_OPS` (`mm`, `bmm`, `addmm`, `baddbmm`), `REJECTED_OPS` (every
   other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
   (`aten`, `prims`), `ALLOWED_NAMESPACE_OPS` (the two `profiler::` record-function ops, FS23) and `param_storage_map(model)`. Shared by
