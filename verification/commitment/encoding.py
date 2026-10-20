@@ -13,6 +13,8 @@ import sys
 import numpy as np
 import torch
 
+from verification.commitment.hostcopy import host_tensor
+
 if sys.byteorder != "little":
     raise ImportError("canonical payloads are little-endian; big-endian hosts are unsupported")
 
@@ -73,11 +75,15 @@ def _all_finite(t: torch.Tensor) -> bool:
     return bool(lo.isfinite() & hi.isfinite())
 
 
-def _check_payload(t: torch.Tensor) -> None:
-    """The structural checks every payload needs: a coded dtype, CPU, contiguous."""
+def check_payload(t: torch.Tensor) -> None:
+    """The structural checks every payload needs: a coded dtype, bytes to read, contiguous.
+
+    A device tensor passes (its bytes are read through ``hostcopy``); a ``meta`` tensor has
+    none and raises. They read metadata only, so no copy is made.
+    """
     if t.dtype not in DTYPE_CODES:
         raise EncodingError(f"dtype {t.dtype} has no canonical code")
-    if t.device.type != "cpu":
+    if t.device.type == "meta":
         raise EncodingError("tensor must be on CPU")
     if not t.is_contiguous():
         raise EncodingError("tensor must be contiguous")
@@ -91,12 +97,15 @@ def _payload_view(t: torch.Tensor) -> memoryview:
 
 
 def tensor_leaf_payload(t: torch.Tensor) -> memoryview:
-    """Zero-copy byte view of a contiguous CPU tensor's little-endian C-order data.
+    """Zero-copy byte view of a contiguous tensor's little-endian C-order data.
 
     Float tensors with NaN or Inf raise `NonFiniteError`; `-0.0` passes (S9d).
     The view aliases `t`'s storage, so the caller must not mutate `t` until hashing is done.
+    A device tensor is read through its host copy (`hostcopy.host_tensor`), which the view
+    aliases instead; the bytes and the errors are those of the host twin.
     """
-    _check_payload(t)
+    check_payload(t)
+    t = host_tensor(t)
     if t.dtype in FLOAT_DTYPES and not _all_finite(t.detach()):
         raise NonFiniteError("float tensor contains NaN or Inf")
     return _payload_view(t)
@@ -107,17 +116,20 @@ def tensor_leaf_payload_unchecked(t: torch.Tensor) -> memoryview:
 
     The caller must check finiteness itself; the native path does it in C (S9d).
     """
-    _check_payload(t)
-    return _payload_view(t)
+    check_payload(t)
+    return _payload_view(host_tensor(t))
 
 
 def tensor_payload_span(t: torch.Tensor) -> tuple[int, int]:
-    """`(address, byte length)` of a payload that passes the structural checks.
+    """`(address, byte length)` of a CPU payload that passes the structural checks.
 
     The address aliases `t`'s storage: the caller keeps `t` alive and unmodified until hashing
-    is done. There is no finiteness check. No view is built, as this runs once per leaf.
+    is done. There is no finiteness check. No view is built, as this runs once per leaf. A
+    device tensor has no host address; it raises (the native path stages it first).
     """
-    _check_payload(t)
+    check_payload(t)
+    if t.device.type != "cpu":
+        raise EncodingError("tensor must be on CPU")
     return t.data_ptr(), t.nbytes
 
 

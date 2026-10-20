@@ -16,6 +16,11 @@ counting pass runs it.
 
 A caller that wants to know where the hashing time goes passes a :class:`HashStats` to the
 bulk functions. Without one (the default) nothing is timed and the code runs as before.
+
+A leaf may sit on a device (FS32b, the sharded placement of F22). Its bytes are the same and so
+are the digests and errors; the copy to the host is ``hostcopy``'s alone. The Python path reads
+a device leaf through ``hostcopy.host_tensor``; the native path copies a batch's device leaves
+into a pinned staging buffer (``hostcopy.Stage``) while the previous batch is hashed.
 """
 
 from __future__ import annotations
@@ -30,11 +35,12 @@ import numpy as np
 import torch
 
 from setup.records import Record
-from verification.commitment import merkle, native
+from verification.commitment import hostcopy, merkle, native
 from verification.commitment.encoding import (
     TAG_PRODUCT,
     TAG_WEIGHT,
     NonFiniteError,
+    check_payload,
     tensor_leaf_header,
     tensor_leaf_payload,
     tensor_leaf_payload_unchecked,
@@ -48,7 +54,7 @@ from verification.commitment.merkle import (
     hash_record_leaf,
     merkle_root,
 )
-from verification.transcript.errors import LeafDtypeError, LeafShapeError
+from verification.transcript.errors import LeafDtypeError, LeafShapeError, StoreMutationError
 
 if TYPE_CHECKING:
     from verification.computation.interface import DeclaredComputation
@@ -164,7 +170,8 @@ def _tensor_slot(c: DeclaredComputation,
 def leaf_parts(c: DeclaredComputation, index: int, obj: Any) -> tuple[bytes | memoryview, ...]:
     """Canonical bytes of leaf ``index`` holding ``obj``, as parts to stream into ``hash_leaf``.
 
-    A tensor payload is a zero-copy view of ``obj``, so ``obj`` must not change until hashed.
+    A tensor payload is a zero-copy view of ``obj`` (of its host copy, for a device leaf), so
+    ``obj`` must not change until hashed.
     """
     if 0 <= index < c.n_s:
         return (c.encode_record(obj),)
@@ -243,7 +250,7 @@ class _Batch:
     are in the lists, hashed in C), ``(header, tensor, kind)`` for a big one and the parts
     tuple for a record. ``tensors`` keeps every tensor alive until the batch is hashed."""
 
-    __slots__ = ("ents", "hdr_idx", "ptr", "nbytes", "kind", "tensors", "payload")
+    __slots__ = ("ents", "hdr_idx", "ptr", "nbytes", "kind", "tensors", "payload", "stage", "dev")
 
     def __init__(self) -> None:
         self.ents: list[Any] = []
@@ -253,6 +260,10 @@ class _Batch:
         self.kind: list[int] = []
         self.tensors: list[torch.Tensor] = []
         self.payload = 0
+        # The pinned buffer holding the batch's device leaves, and for each its entry position,
+        # the leaf, its ``_version`` when the copy was queued and its index (invariant 6).
+        self.stage: hostcopy.Stage | None = None
+        self.dev: list[tuple[int, torch.Tensor, int, int]] = []
 
 
 def _hash_batch(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], threads: int,
@@ -271,19 +282,30 @@ def _hash_batch(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], threa
 
 def _hash_batch_body(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], threads: int,
                      stats: HashStats | None) -> tuple[list[bytes], Exception | None]:
+    ents, n_small, changed = batch.ents, len(batch.hdr_idx), None
+    if batch.stage is not None:
+        batch.stage.wait()  # the staged bytes are only valid once the copies have completed
+        for pos, t, version, index in batch.dev:
+            if t._version != version:  # invariant 6: the leaves from here on are not judged
+                ents = ents[:pos]
+                n_small = sum(1 for e in ents if e is None)
+                changed = StoreMutationError(f"leaf {index} was mutated in place while it was "
+                                             "copied to the host")
+                break
     bad, raw = 0, b""
-    if batch.hdr_idx:
+    if n_small:
         t0 = perf_counter() if stats is not None else 0.0
         digests, bad = native.get().hash_leaves(
-            hdrs[0], hdrs[1], hdrs[2], np.array(batch.hdr_idx, dtype=np.uint32),
-            np.array(batch.ptr, dtype=np.uint64), np.array(batch.nbytes, dtype=np.uint64),
-            np.array(batch.kind, dtype=np.uint8), threads=threads)
+            hdrs[0], hdrs[1], hdrs[2], np.array(batch.hdr_idx[:n_small], dtype=np.uint32),
+            np.array(batch.ptr[:n_small], dtype=np.uint64),
+            np.array(batch.nbytes[:n_small], dtype=np.uint64),
+            np.array(batch.kind[:n_small], dtype=np.uint8), threads=threads)
         if stats is not None:
             stats.native_s += perf_counter() - t0
         raw = digests.tobytes()
     out: list[bytes] = []
     s = 0  # the next small entry
-    for e in batch.ents:
+    for e in ents:
         if e is None:
             if s >= bad:  # the first non-finite small entry (bad == n when none)
                 return out, NonFiniteError(_NONFINITE)
@@ -306,7 +328,7 @@ def _hash_batch_body(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], 
                     out.append(hash_leaf(*e))
             except Exception as err:
                 return out, err
-    return out, None
+    return out, changed
 
 
 def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]],
@@ -321,6 +343,11 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     run on one background thread, two in flight at most: finiteness and hashing in C, and a
     leaf of ``merkle._MT_THRESHOLD`` bytes or more through ``native.all_finite`` and BLAKE3's
     multithreaded hash. The first batch in order with an error decides ahead of the iterable's.
+    A device leaf is copied into its batch's pinned staging buffer (``hostcopy.Stage``) as it is
+    added, and the worker hashes the staged bytes once the copies are done; a batch stages at most
+    ``_BATCH_BYTES`` (a leaf larger than that, alone), so the staging memory is the batches in
+    flight plus one. A device leaf whose ``_version`` moved between the copy being queued and its
+    completion is a ``StoreMutationError`` at that leaf.
     It returns only once no worker reads a tensor any more; ``KeyboardInterrupt`` propagates
     after that too.
 
@@ -345,20 +372,23 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     hdr_len: list[int] = []
     slots: dict[int, tuple[int, tuple[int, ...], torch.dtype]] = {}  # index -> tag, shape, dtype
 
-    pending: deque[Future[tuple[list[bytes], Exception | None]]] = deque()
+    pending: deque[tuple[Future[tuple[list[bytes], Exception | None]], _Batch]] = deque()
+    stages: list[hostcopy.Stage] = []  # every staging buffer this call took, released at the end
     digests: list[bytes] = []
     state: list[Exception | None] = [None]  # the first batch error, which beats the producer's
 
     def collect() -> None:
         if stats is None:
-            d, e = pending[0].result()  # popped only after the wait, which an interrupt can end
+            d, e = pending[0][0].result()  # popped only after the wait, which an interrupt can end
         else:
             t0 = perf_counter()
             try:
-                d, e = pending[0].result()
+                d, e = pending[0][0].result()
             finally:
                 stats.wait_s += perf_counter() - t0
-        pending.popleft()
+        done = pending.popleft()[1]
+        if done.stage is not None:
+            hostcopy.POOL.release(done.stage)  # hashed: its buffer is free for a later batch
         if state[0] is None:
             digests.extend(d)
             state[0] = e
@@ -371,7 +401,9 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
                     np.array(hdr_len, dtype=np.uint32))
             if stats is not None:
                 stats.batches += 1
-            pending.append(_executor().submit(_hash_batch, b, hdrs, threads, stats))
+            if b.stage is not None:
+                b.stage.fence()
+            pending.append((_executor().submit(_hash_batch, b, hdrs, threads, stats), b))
 
     producer_error: Exception | None = None
     try:
@@ -398,11 +430,29 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
                         hdr_off.append(sum(map(len, headers)))
                         hdr_len.append(len(header))
                         headers.append(header)
-                    ptr, nbytes = tensor_payload_span(obj)
+                    src = obj  # what the hash reads: the leaf, or the host copy of a device leaf
+                    if hostcopy.on_device(obj):
+                        check_payload(obj)
+                        nbytes = obj.nbytes
+                        stage = batch.stage
+                        if stage is not None and not stage.fits(nbytes):
+                            submit(batch)  # closes the batch: a batch stages at most batch_bytes
+                            if state[0] is not None:
+                                break
+                            batch = _Batch()
+                            stage = None
+                        if stage is None:
+                            stage = batch.stage = hostcopy.POOL.acquire(
+                                batch_bytes, nbytes, obj.device.type == "cuda")
+                            stages.append(stage)
+                        version = obj._version  # read as the copy is queued
+                        src = stage.put(obj)
+                        batch.dev.append((len(batch.ents), obj, version, i))
+                    ptr, nbytes = tensor_payload_span(src)
                     batch.tensors.append(obj)
                     batch.payload += nbytes
                     if len(headers[h]) + nbytes >= big_at:
-                        batch.ents.append((headers[h], obj, finite_kind[dtype]))
+                        batch.ents.append((headers[h], src, finite_kind[dtype]))
                     else:
                         batch.ents.append(None)
                         batch.hdr_idx.append(h)
@@ -424,13 +474,17 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
         # Never return or raise while a worker still reads the tensors. The worker is one FIFO
         # thread, so a job queued now ends after every batch ever submitted, even one whose
         # future an interrupt kept out of ``pending``.
-        if _worker is not None:
-            if stats is None:
-                _worker.submit(bool).result()
-            else:
-                t0 = perf_counter()
-                _worker.submit(bool).result()
-                stats.wait_s += perf_counter() - t0
+        try:
+            if _worker is not None:
+                if stats is None:
+                    _worker.submit(bool).result()
+                else:
+                    t0 = perf_counter()
+                    _worker.submit(bool).result()
+                    stats.wait_s += perf_counter() - t0
+        finally:
+            for stage in stages:  # no worker reads them now; drains any copy still queued
+                hostcopy.POOL.release(stage)
         if stats is not None:
             stats.producer_s += (perf_counter() - t_start - (stats.wait_s - w0)
                                  - (stats.read_s - r0))

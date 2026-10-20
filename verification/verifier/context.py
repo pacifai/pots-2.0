@@ -576,17 +576,18 @@ class CommittedLeaves:
                 if t.storage_offset() == off + k * numel and t.data_ptr() % _ALIGN == 0:
                     return t, version, shape, strides, t.storage_offset()
         t0 = objs[first]
-        if (not isinstance(t0, torch.Tensor) or t0.device.type != "cpu" or t0.numel() == 0
+        if (not isinstance(t0, torch.Tensor) or t0.numel() == 0
                 or not t0.is_contiguous() or t0.requires_grad or t0.data_ptr() % _ALIGN):
             return None
         shape, dtype, numel, off = t0.shape, t0.dtype, t0.numel(), t0.storage_offset()
-        ptr, version = t0.untyped_storage().data_ptr(), versions[first]
+        device, ptr, version = t0.device, t0.untyped_storage().data_ptr(), versions[first]
         if len(version) != 1:
             return None
         for k in range(n):
             i = first + stride * k
             t = objs[i]
             if (not isinstance(t, torch.Tensor) or t.shape != shape or t.dtype != dtype
+                    or t.device != device  # members of one storage share a device; a mix is no run
                     or t.storage_offset() != off + k * numel or not t.is_contiguous()
                     or t.untyped_storage().data_ptr() != ptr or t.requires_grad
                     or versions[i] != version or t._version != version[0]):
