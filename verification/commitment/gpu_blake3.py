@@ -10,7 +10,7 @@ compiled at the first call by NVRTC (``nvrtc*`` through ctypes) into a CUBIN for
 architecture, loaded and launched through the CUDA driver (``cu*``) on torch's primary
 context and current stream. Nothing here needs a package beyond torch and numpy, and nothing
 is compiled or loaded on import. The CUBIN is cached on disk (``native.cache_dir()``), keyed
-by the sources, the architecture and NVRTC's version.
+by the sources, the architecture, NVRTC's version and every compile option.
 
 Work decomposition (the core's header has the details): one thread hashes one 1 KiB chunk and
 a block reduces 16 groups of ``G = 8`` chunks in shared memory (stage 0, which reads the
