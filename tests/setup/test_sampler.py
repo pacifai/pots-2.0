@@ -339,3 +339,30 @@ def test_wrap_reaps_a_child_that_ignores_sigterm(tmp_path, monkeypatch):
     import psutil
     assert not psutil.pid_exists(int(marker.read_text())) or \
         psutil.Process(int(marker.read_text())).status() == psutil.STATUS_ZOMBIE
+
+
+def test_parse_throttle_reads_v2_and_v1_counters():
+    v2 = "nr_periods 10\nnr_throttled 4\nthrottled_usec 1500\n"
+    assert sampler.parse_throttle(v2) == (1500, 4)
+    v1 = "nr_periods 10\nnr_throttled 4\nthrottled_time 2500000\n"
+    assert sampler.parse_throttle(v1, 1000) == (2500, 4)
+    assert sampler.parse_throttle("usage_usec 5\n") is None
+    assert sampler.parse_throttle("nr_throttled x\nthrottled_usec 1\n") is None
+
+
+def test_affinity_mhz_averages_the_set_and_skips_missing(tmp_path):
+    for c, khz in ((0, "2000000"), (1, "3000000\n")):
+        d = tmp_path / f"cpu{c}" / "cpufreq"
+        d.mkdir(parents=True)
+        (d / "scaling_cur_freq").write_text(khz)
+    assert sampler.affinity_mhz(str(tmp_path), cpus=[0, 1, 5]) == pytest.approx(2500.0)
+    assert sampler.affinity_mhz(str(tmp_path), cpus=[7]) is None
+
+
+def test_cgroup_throttle_falls_back_to_v1(tmp_path, monkeypatch):
+    v1 = tmp_path / "cpu,cpuacct"
+    v1.mkdir()
+    (v1 / "cpu.stat").write_text("nr_periods 2\nnr_throttled 1\nthrottled_time 4000000\n")
+    monkeypatch.setattr(sampler, "_CG", tmp_path)
+    assert sampler._cgroup_throttle(tmp_path / "missing") == (4000, 1)
+    assert sampler._cgroup_throttle(tmp_path / "empty") == (4000, 1)

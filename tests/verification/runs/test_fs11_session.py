@@ -1319,3 +1319,137 @@ def test_a_killed_part_leaves_no_sampler_behind(tmp_path, monkeypatch):
     s = _sampler_session(tmp_path, [fs.Part("long", ["sleep", "30"], timeout_s=2)])
     assert s["parts"][0]["status"] == "killed_timeout"
     assert started and started[0].proc.poll() is not None
+
+
+# ---- CPU placement (O13) ------------------------------------------------------------------
+
+
+def test_parse_cpulist_reads_ranges_and_singles():
+    assert fs.parse_cpulist("40-79,120-159\n") == set(range(40, 80)) | set(range(120, 160))
+    assert fs.parse_cpulist("3") == {3} and fs.parse_cpulist("0,2-3") == {0, 2, 3}
+    assert fs.parse_cpulist("") == set() and fs.parse_cpulist("\n") == set()
+    for bad in ("a", "5-3", "-1", "1-", "1,,x"):
+        with pytest.raises(ValueError):
+            fs.parse_cpulist(bad)
+
+
+def test_format_cpulist_is_the_inverse():
+    assert fs.format_cpulist({1, 2, 3, 7}) == "1-3,7" and fs.format_cpulist(set()) == ""
+    cpus = set(range(40, 80)) | set(range(120, 160))
+    assert fs.parse_cpulist(fs.format_cpulist(cpus)) == cpus
+
+
+def test_normalize_pci_bus_id_matches_sysfs_spelling():
+    assert fs.normalize_pci_bus_id("00000000:3B:00.0\n") == "0000:3b:00.0"
+    assert fs.normalize_pci_bus_id("0000:3b:00.0") == "0000:3b:00.0"
+    assert fs.normalize_pci_bus_id("3B:00.0") == "0000:3b:00.0"
+    with pytest.raises(ValueError):
+        fs.normalize_pci_bus_id("nonsense")
+
+
+def test_parse_cgroup_cpu_max():
+    assert fs.parse_cgroup_cpu_max("1700000 100000\n") == pytest.approx(17.0)
+    assert fs.parse_cgroup_cpu_max("50000 100000") == pytest.approx(0.5)
+    assert fs.parse_cgroup_cpu_max("max 100000") is None
+    for bad in ("", "max", "1 2 3", "0 100000", "x y"):
+        with pytest.raises(ValueError):
+            fs.parse_cgroup_cpu_max(bad)
+
+
+def test_cgroup_quota_is_none_without_a_readable_file(tmp_path):
+    assert fs.cgroup_cpu_quota(tmp_path / "missing") is None
+    f = tmp_path / "cpu.max"
+    f.write_text("garbage")
+    assert fs.cgroup_cpu_quota(f) is None
+    f.write_text("400000 100000")
+    assert fs.cgroup_cpu_quota(f) == pytest.approx(4.0)
+
+
+def test_session_threads_stay_inside_the_quota_and_the_usable_cpus():
+    assert fs.session_threads(8, None, None) == 8
+    assert fs.session_threads(8, 4.5, None) == 4
+    assert fs.session_threads(8, 17.0, 6) == 6
+    assert fs.session_threads(8, 0.5, None) == 1  # never below one
+
+
+def test_base_env_caps_the_threads_at_the_cgroup_quota(tmp_path, monkeypatch):
+    monkeypatch.setattr(fs, "cgroup_cpu_quota", lambda *a: 3.0)
+    monkeypatch.setattr(fs, "_usable_cpus", lambda: None)
+    monkeypatch.delenv("FS11_THREADS", raising=False)
+    env = fs.base_env(tmp_path)
+    assert env["VERIF_THREADS"] == env["OMP_NUM_THREADS"] == "3"
+    monkeypatch.setenv("FS11_THREADS", "2")
+    assert fs.base_env(tmp_path)["VERIF_THREADS"] == "2"
+
+
+class _Smi:
+    def __init__(self, out):
+        self.out = out
+
+    def __call__(self, argv, **kw):
+        assert argv[0] == "nvidia-smi"
+        return type("R", (), {"stdout": self.out})()
+
+
+def _sysfs(tmp_path, bus, cpulist):
+    d = tmp_path / "sys" / bus
+    d.mkdir(parents=True)
+    (d / "local_cpulist").write_text(cpulist)
+    return str(tmp_path / "sys")
+
+
+def test_pin_to_the_gpus_numa_node(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(160)), raising=False)
+    monkeypatch.setattr(os, "sched_setaffinity", lambda pid, cpus: calls.append(set(cpus)),
+                        raising=False)
+    sysfs = _sysfs(tmp_path, "0000:3b:00.0", "40-79,120-159\n")
+    out = fs.pin_to_gpu_numa(sysfs=sysfs, environ={}, run=_Smi("00000000:3B:00.0\n"))
+    assert out["pinned"] and out["cpus"] == "40-79,120-159" and out["bus_id"] == "0000:3b:00.0"
+    assert calls == [set(range(40, 80)) | set(range(120, 160))]
+    assert "CPUs 40-79,120-159 (80 of 160 allowed)" in out["message"]
+
+
+def test_pin_intersects_with_the_cpus_the_process_may_use(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(0, 60)), raising=False)
+    monkeypatch.setattr(os, "sched_setaffinity", lambda pid, cpus: calls.append(set(cpus)),
+                        raising=False)
+    sysfs = _sysfs(tmp_path, "0000:3b:00.0", "40-79")
+    out = fs.pin_to_gpu_numa(sysfs=sysfs, environ={}, run=_Smi("00000000:3B:00.0"))
+    assert out["cpus"] == "40-59" and calls == [set(range(40, 60))]
+    # a node entirely outside the allowed CPUs: no pin
+    sysfs = _sysfs(tmp_path / "b", "0000:3b:00.0", "100-120")
+    out = fs.pin_to_gpu_numa(sysfs=sysfs, environ={}, run=_Smi("00000000:3B:00.0"))
+    assert not out["pinned"] and "outside" in out["message"] and len(calls) == 1
+
+
+def test_pin_follows_cuda_visible_devices(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
+    monkeypatch.setattr(os, "sched_setaffinity", lambda pid, cpus: None, raising=False)
+    sysfs = _sysfs(tmp_path, "0000:86:00.0", "4-7")
+    smi = _Smi("00000000:3B:00.0\n00000000:86:00.0\n")
+    out = fs.pin_to_gpu_numa(sysfs=sysfs, environ={"CUDA_VISIBLE_DEVICES": "1"}, run=smi)
+    assert out["cpus"] == "4-7"
+
+
+def test_pin_does_nothing_where_it_cannot(tmp_path, monkeypatch):
+    # no sched_setaffinity (macOS)
+    monkeypatch.delattr(os, "sched_setaffinity", raising=False)
+    out = fs.pin_to_gpu_numa(environ={}, run=_Smi("00000000:3B:00.0"))
+    assert not out["pinned"] and out["message"].startswith("CPU pin: none (")
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(8)), raising=False)
+    monkeypatch.setattr(os, "sched_setaffinity", lambda pid, cpus: None, raising=False)
+
+    def no_smi(argv, **kw):
+        raise FileNotFoundError("nvidia-smi")
+
+    out = fs.pin_to_gpu_numa(environ={}, run=no_smi)
+    assert not out["pinned"] and "FileNotFoundError" in out["message"]
+    # no sysfs file for the device
+    out = fs.pin_to_gpu_numa(sysfs=str(tmp_path), environ={}, run=_Smi("00000000:3B:00.0"))
+    assert not out["pinned"] and "local_cpulist" in out["message"]
+    # an unparsable cpulist
+    sysfs = _sysfs(tmp_path / "c", "0000:3b:00.0", "x")
+    out = fs.pin_to_gpu_numa(sysfs=sysfs, environ={}, run=_Smi("00000000:3B:00.0"))
+    assert not out["pinned"] and "ValueError" in out["message"]

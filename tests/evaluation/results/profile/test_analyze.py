@@ -66,7 +66,7 @@ def test_marker_spans_map_onto_the_sample_clock(tmp_path):
 def test_few_samples(tmp_path):
     _, s = run(tmp_path, steps=1)
     assert s["A"]["util"]["few_samples"] is True
-    _, s = run(tmp_path / "more", steps=3)
+    _, s = run(tmp_path / "more", steps=4)  # step 1 is the warm-up: 3 steady steps
     assert s["A"]["util"]["n_samples"] == 3 and s["A"]["util"]["few_samples"] is False
 
 
@@ -74,10 +74,10 @@ def test_utilization_mark(tmp_path):
     # hash floor/time = 0.1; measured c_tree/threads = 1/8 = 0.125: within 2x. With c_tree 4:
     # 0.5 against 0.1, which differs by 5x.
     kw = {"hash_bytes": {"A": 20_000_000}}
-    _, s = run(tmp_path / "a", **kw)
+    _, s = run(tmp_path / "a", steps=4, **kw)
     assert "utilization" not in s["A"]["marks"]
-    rows = [{"t": int(i * 1e9), "c_tree": 4.0, "g_util": 0.0} for i in range(1, 41)]
-    _, s = run(tmp_path / "b", sample_rows=rows, **kw)
+    rows = [{"t": int(i * 1e9), "c_tree": 4.0, "g_util": 0.0} for i in range(1, 61)]
+    _, s = run(tmp_path / "b", sample_rows=rows, steps=4, **kw)
     assert "utilization" in s["A"]["marks"]
     # too few samples: no mark
     _, s = run(tmp_path / "c", sample_rows=rows, steps=1, **kw)
@@ -229,7 +229,7 @@ def test_c5_view(tmp_path):
     st["run"][6] = 1
     st["run"][7] = 1
     secs = {"5": (0.0, 0.0002)}
-    paths = build_run(tmp_path / "run", steps=3, secs=secs)
+    paths = build_run(tmp_path / "run", steps=4, secs=secs)  # step 1 is the warm-up
     lines = [json.loads(ln) for ln in (paths["run_dir"] / "markers.jsonl").read_text().splitlines()]
     for ln in lines[1:]:
         ln["stamps"], ln["stamp_names"] = st, names
@@ -243,8 +243,8 @@ def test_c5_view(tmp_path):
     assert q["copy"] == pytest.approx(20e-6) and q["measure"] == pytest.approx(40e-6)
     assert c5["classes"]["Q.fwd"]["copy_bytes_per_s"]["stored"] == pytest.approx(100 / 20e-6)
     assert c5["phases_s"]["judge"] == pytest.approx(10e-6)
-    assert sorted(c5["runs_over_time"]) == ["1", "2", "3"]
-    assert c5["runs_over_time"]["1"]["dur_s"] == pytest.approx([100e-6, 100e-6])
+    assert sorted(c5["runs_over_time"]) == ["2", "3", "4"]
+    assert c5["runs_over_time"]["2"]["dur_s"] == pytest.approx([100e-6, 100e-6])
     # identical steps have no variance: no correlation
     assert c5["variance"]["correlation"]["across_steps"]["glue"]["cpu_mhz"] is None
     assert len(c5["variance"]["windows"]) == 3
@@ -296,7 +296,7 @@ def test_readers_accept_version_one(tmp_path):
     paths = build_run(tmp_path / "run")
     m = io.read_markers(paths["run_dir"] / "markers.jsonl")
     assert m.header["run"] == "honest" and len(m.steps) == 3
-    assert len(io.read_samples(paths["samples"]).rows) == 40
+    assert len(io.read_samples(paths["samples"]).rows) == 60
     assert io.read_probe(paths["probe"])["version"] == 1
     assert STEP_NS == 10_000_000_000
 
@@ -611,7 +611,9 @@ def test_meta_names_the_run_from_the_environment_record(tmp_path):
     out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], session="s1")
     assert out["meta"] == {"model": "Qwen/Qwen2.5-0.5B-Instruct", "attack": "refusal",
                            "scenario": "honest", "device": out["meta"]["device"],
-                           "compute_dtype": "bfloat16", "git_commit": "abc", "session": "s1"}
+                           "compute_dtype": "bfloat16", "git_commit": "abc", "session": "s1",
+                           "n_s": None, "M": None, "n_leaves": None,
+                           "us_per_leaf": {"label": None, "commit": None}}
     assert not any("--session" in w for w in out["warnings"])
     assert any("--session" in w for w in analyze.analyze(paths["run_dir"])["warnings"])
 
@@ -739,3 +741,121 @@ def test_hash_breakdown_without_stats_or_without_hash(tmp_path):
     # a run from before even the .hash sections: no entry, no error
     out, _ = run(tmp_path / "b")
     assert out["runs"]["honest"]["hash"] == {}
+
+
+def slow_first_step(paths, factor: float = 30.0) -> None:
+    """Step 1's time rows take ``factor`` times as long: the warm-up."""
+    f = paths["run_dir"] / "records.jsonl"
+    rows = [json.loads(ln) for ln in f.read_text().splitlines()]
+    for r in rows:
+        if r.get("record") == "time" and r["step"] == 1:
+            r["time_s"] *= factor
+    jl(f, rows)
+
+
+def test_warmup_step_is_left_out_of_the_steady_state_and_reported_apart(tmp_path):
+    paths = build_run(tmp_path / "run", steps=4)
+    slow_first_step(paths)
+    view = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["runs"]["honest"]
+    assert view["warmup_excluded"] is True and view["n_steps"] == 3
+    assert view["sections"]["A"]["time"]["mean"] == pytest.approx(0.2)
+    assert view["sections"]["A"]["time"]["n"] == 3
+    assert view["step_s"] == pytest.approx(1.0)
+    w = view["warmup"]
+    assert w["step"] == 1 and w["step_s"] == pytest.approx(30.0)
+    assert w["sections"]["A"]["time"]["mean"] == pytest.approx(6.0)
+    assert set(w["sections"]) == set(view["sections"])
+
+
+def test_a_single_step_stays_the_steady_state(tmp_path):
+    paths = build_run(tmp_path / "run", steps=1)
+    view = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["runs"]["honest"]
+    assert view["warmup_excluded"] is False and view["warmup"] is None
+    assert view["sections"]["A"]["time"]["n"] == 1
+
+
+def test_a_traced_step_in_between_does_not_move_the_warmup(tmp_path):
+    # untraced steps 1 and 3 (2 is traced): step 1 is the warm-up, step 3 the steady state
+    paths = build_run(tmp_path / "run", steps=3)
+    f = paths["run_dir"] / "records.jsonl"
+    rows = [json.loads(ln) for ln in f.read_text().splitlines()]
+    for r in rows:
+        if r.get("record") == "time" and r["step"] == 2:
+            r["traced"] = True
+    jl(f, rows)
+    slow_first_step(paths)
+    view = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["runs"]["honest"]
+    assert view["warmup"]["step"] == 1
+    assert view["sections"]["A"]["time"]["mean"] == pytest.approx(0.2)
+
+
+def test_plain_comparison_drops_each_runs_warmup(tmp_path):
+    paths = build_run(tmp_path / "run", steps=3, secs={"train.forward": (0.0, 0.4)})
+    jl(paths["run_dir"] / "records.jsonl",
+       [time_row(1, "train.forward", 12.0, "prover", "phase"),
+        time_row(2, "train.forward", 0.4, "prover", "phase"),
+        time_row(3, "train.forward", 0.4, "prover", "phase")])
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    jl(plain / "records.jsonl",
+       [time_row(1, "P0.forward", 2.0, "prover", "phase"),
+        time_row(2, "P0.forward", 0.1, "prover", "phase"),
+        time_row(3, "P0.forward", 0.1, "prover", "phase")])
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], plain=plain)
+    c = out["comparisons"]["sections"]["train.forward"]
+    assert c["ratio"] == pytest.approx(4.0)
+    assert c["warmup_prover_s"] == 12.0 and c["warmup_plain_s"] == 2.0
+    assert out["comparisons"]["warmup_excluded"] == {"prover": True, "plain": True}
+
+
+def test_a_section_with_no_work_counts_is_unknown_not_launch(tmp_path):
+    # D has no counts and no trace: only syncs would remain, which are no evidence
+    out, s = run(tmp_path / "a", steps=2)
+    assert s["D"]["bound"] == "unknown" and s["D"]["floors_s"] == {}
+    # with trace launches the launch floor is real
+    paths = build_run(tmp_path / "b")
+    s = with_trace(paths, trace_file(tmp_path, {"A": {"launches": 1000}})
+                   )["runs"]["honest"]["sections"]
+    assert s["A"]["bound"] == "launch" and s["A"]["floors_s"]["launch"] >= 1000 * 5e-6
+
+
+def test_meta_has_batch_size_leaf_count_and_microseconds_per_leaf(tmp_path):
+    paths = build_run(tmp_path / "run", steps=3, secs={"P1.label": (0.0, 0.2),
+                                                       "P3.commit": (0.2, 0.4)})
+    f = paths["run_dir"] / "records.jsonl"
+    rows = [json.loads(ln) for ln in f.read_text().splitlines()]
+    rows[0].update({"n_s": 64, "M": 200, "n_leaves": 1000})
+    jl(f, rows)
+    meta = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["meta"]
+    assert (meta["n_s"], meta["M"], meta["n_leaves"]) == (64, 200, 1000)
+    assert meta["us_per_leaf"]["label"] == pytest.approx(0.2 / 1000 * 1e6)
+    assert meta["us_per_leaf"]["commit"] == pytest.approx(0.4 / 1000 * 1e6)
+
+
+def test_meta_falls_back_on_capture_and_step_records(tmp_path):
+    paths = build_run(tmp_path / "run", records_extra=[
+        {"record": "capture", "run": "honest", "step": 1, "n_products": 77},
+        {"record": "step", "run": "honest", "step": 1, "leaves": 500, "transcript_bytes": 9}])
+    meta = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["meta"]
+    assert meta["M"] == 77 and meta["n_leaves"] == 500 and meta["n_s"] is None
+
+
+def test_cpu_state_reports_throttled_fraction_and_mean_clock_per_step(tmp_path):
+    rows = [{"t": int(i * 1e9), "c_tree": 1.0, "g_util": 0.5, "cg_throttled_us": 250_000,
+             "cg_nr_throttled": 3, "aff_mhz": 2000.0} for i in range(1, 61)]
+    paths = build_run(tmp_path / "run", steps=3, sample_rows=rows)
+    view = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["runs"]["honest"]
+    state = view["cpu_state"]
+    assert [r["step"] for r in state["steps"]] == [1, 2, 3]
+    assert state["steps"][0]["throttled_frac"] == pytest.approx(0.25)
+    assert state["steps"][0]["throttled_periods"] == pytest.approx(3)
+    assert state["steps"][0]["mean_mhz"] == pytest.approx(2000.0)
+    assert state["mean_throttled_frac"] == pytest.approx(0.25)
+
+
+def test_cpu_state_is_none_without_the_counters(tmp_path):
+    paths = build_run(tmp_path / "run", steps=2)
+    view = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["runs"]["honest"]
+    state = view["cpu_state"]
+    assert state["mean_throttled_frac"] is None and state["mean_mhz"] is None
+    assert all(r["throttled_frac"] is None for r in state["steps"])

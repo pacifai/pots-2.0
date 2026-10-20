@@ -446,3 +446,25 @@ def test_untimed_run_writes_no_metrics(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _run("llama", True, tamper=False)
     assert not list(tmp_path.iterdir())
+
+
+def test_work_rows_count_flops_and_leaf_hashing_from_shapes():
+    """The timed run's count rows: the inventory's matmul FLOPs split by kind, the leaf
+    hashing of the commit and check 2, and one storage row per step."""
+    from verification.computation.interface import ProductKind
+    from verification.runs.bring_up import work_rows
+
+    c = DecoderComputation(tiny_config(family="llama", tied=True), n_s=2, n=12, eta=1e-3)
+    steps = [{"step": 1, "leaves": 100, "transcript_bytes": 5000},
+             {"step": 2, "leaves": 100, "transcript_bytes": 5000}]
+    rows = work_rows(c, "bring_up", "honest", steps)
+    fwd = sum(2 * q.a_shape[0] * q.a_shape[1] * q.b_shape[1]
+              for q in c.products if q.kind is ProductKind.FORWARD)
+    total = sum(2 * q.a_shape[0] * q.a_shape[1] * q.b_shape[1] for q in c.products)
+    by = {(r["step"], r["component"]): r for r in rows if r["record"] == "count"}
+    assert by[1, "train.forward"]["flops"] == fwd > 0
+    assert by[1, "train.backward"]["flops"] == total - fwd > 0
+    assert by[2, "P3.commit"]["hash_in_bytes"] == 5100 and by[2, "2"]["hash_out_bytes"] == 3200
+    s1, s2 = (r for r in rows if r["record"] == "storage")
+    assert (s1["step"], s1["leaves"], s1["transcript_bytes"]) == (1, 100, 5000)
+    assert s2["step"] == 2

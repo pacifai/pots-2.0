@@ -617,11 +617,162 @@ def choose_plan(build: Callable[[Path, Path], list[Part]], upload: Path, out: Pa
     return plan if selftest else with_native_build(plan)
 
 
+# ---- CPU placement (O13) -------------------------------------------------------------------
+# The session pins itself before any part starts, and every part (a child process) inherits
+# the pin. A part's threads then run on the CPUs of the GPU's NUMA node, so the pinned host
+# buffers, the hashing threads and the GPU's DMA share one node, and the thread count stays
+# inside the container's CPU quota (a pod shows 160 CPUs and may be allowed 17). Everything
+# here is stdlib-only and does nothing, with one logged line, where the files or the calls
+# are missing (macOS, a pod without sysfs).
+
+SYSFS_PCI = "/sys/bus/pci/devices"
+CGROUP_CPU_MAX = "/sys/fs/cgroup/cpu.max"
+
+
+def parse_cpulist(text: str) -> set[int]:
+    """The CPU numbers of a kernel cpulist such as ``"40-79,120-159"`` or ``"3"``. An empty
+    list gives the empty set; a malformed one raises ``ValueError``."""
+    cpus: set[int] = set()
+    for part in text.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        lo, dash, hi = part.partition("-")
+        a, b = int(lo), int(hi) if dash else int(lo)
+        if a < 0 or b < a:
+            raise ValueError(f"bad cpulist range {part!r}")
+        cpus.update(range(a, b + 1))
+    return cpus
+
+
+def format_cpulist(cpus: Sequence[int] | set[int]) -> str:
+    """The inverse of :func:`parse_cpulist`: ``{1, 2, 3, 7}`` as ``"1-3,7"``."""
+    out: list[str] = []
+    xs = sorted(cpus)
+    i = 0
+    while i < len(xs):
+        j = i
+        while j + 1 < len(xs) and xs[j + 1] == xs[j] + 1:
+            j += 1
+        out.append(str(xs[i]) if i == j else f"{xs[i]}-{xs[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
+def normalize_pci_bus_id(bus_id: str) -> str:
+    """``nvidia-smi``'s ``"00000000:3B:00.0"`` (eight-digit domain, capitals) as sysfs names the
+    device: ``"0000:3b:00.0"``. A bus id without a domain gets domain ``0000``."""
+    parts = bus_id.strip().lower().split(":")
+    if len(parts) == 2:
+        parts.insert(0, "0")
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(f"not a PCI bus id: {bus_id!r}")
+    return f"{parts[0][-4:].zfill(4)}:{parts[1]}:{parts[2]}"
+
+
+def parse_cgroup_cpu_max(text: str) -> float | None:
+    """CPUs a cgroup v2 ``cpu.max`` allows: ``"1700000 100000"`` is 17.0, ``"max 100000"`` is
+    ``None`` (no limit). A malformed file raises ``ValueError``."""
+    fields = text.split()
+    if len(fields) != 2:
+        raise ValueError(f"cpu.max has {len(fields)} fields, expected 2")
+    if fields[0] == "max":
+        return None
+    quota, period = int(fields[0]), int(fields[1])
+    if quota <= 0 or period <= 0:
+        raise ValueError(f"cpu.max {text.strip()!r}: quota and period must be positive")
+    return quota / period
+
+
+def cgroup_cpu_quota(path: str | os.PathLike[str] = CGROUP_CPU_MAX) -> float | None:
+    """The CPUs the container's cgroup allows, or ``None`` (no limit, or no readable file)."""
+    try:
+        return parse_cgroup_cpu_max(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def session_threads(requested: int, quota: float | None, usable: int | None) -> int:
+    """``requested`` threads, at most the whole CPUs of the cgroup quota and the CPUs the
+    process may run on, and at least 1."""
+    n = requested
+    if quota is not None:
+        n = min(n, int(quota))
+    if usable:
+        n = min(n, usable)
+    return max(1, n)
+
+
+def _usable_cpus() -> int | None:
+    return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
+
+
+def gpu_pci_bus_id(index: int = 0, run: Callable[..., Any] = subprocess.run) -> str:
+    """GPU ``index``'s PCI bus id in sysfs's spelling, from ``nvidia-smi``. Raises ``OSError``,
+    ``subprocess.SubprocessError`` or ``ValueError`` when it can't be had."""
+    text = run(["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+               capture_output=True, text=True, timeout=60, check=True).stdout
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    if index >= len(lines):
+        raise ValueError(f"nvidia-smi lists {len(lines)} GPUs, none at index {index}")
+    return normalize_pci_bus_id(lines[index])
+
+
+def pin_to_gpu_numa(*, sysfs: str = SYSFS_PCI, environ: Mapping[str, str] = os.environ,
+                    run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
+    """Pin this process to the CPUs of the first visible GPU's NUMA node (the sysfs
+    ``local_cpulist`` of its PCI device, intersected with the CPUs the process may use).
+
+    Returns ``{"pinned", "cpus", "bus_id", "message"}``; ``cpus`` is the cpulist now in force
+    when pinned, else ``None``, and ``message`` is the one line to log. Never raises: where it
+    can't pin (no ``sched_setaffinity``, no ``nvidia-smi``, no sysfs file, an empty
+    intersection) the affinity is left as it was and ``message`` says why."""
+    def fail(why: str, bus_id: str | None = None) -> dict[str, Any]:
+        return {"pinned": False, "cpus": None, "bus_id": bus_id,
+                "message": f"CPU pin: none ({why})"}
+
+    if not hasattr(os, "sched_setaffinity"):
+        return fail("no sched_setaffinity on this platform")
+    first = environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    index = int(first) if first.isdigit() else 0
+    try:
+        bus_id = gpu_pci_bus_id(index, run)
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        return fail(f"no GPU bus id: {type(e).__name__}")
+    try:
+        local = parse_cpulist((Path(sysfs) / bus_id / "local_cpulist").read_text())
+    except (OSError, ValueError) as e:
+        return fail(f"no local_cpulist for {bus_id}: {type(e).__name__}", bus_id)
+    allowed = set(os.sched_getaffinity(0))
+    chosen = local & allowed
+    if not chosen:
+        return fail(f"{bus_id}'s CPUs {format_cpulist(local)} are outside this process's "
+                    f"{format_cpulist(allowed)}", bus_id)
+    try:
+        os.sched_setaffinity(0, chosen)
+    except OSError as e:
+        return fail(f"sched_setaffinity failed: {e}", bus_id)
+    cpus = format_cpulist(chosen)
+    return {"pinned": True, "cpus": cpus, "bus_id": bus_id,
+            "message": f"CPU pin: GPU {bus_id} node, CPUs {cpus} ({len(chosen)} of "
+                       f"{len(allowed)} allowed)"}
+
+
+def _threads(env: Mapping[str, str]) -> str:
+    """``FS11_THREADS`` (default 8) capped by :func:`session_threads`; a non-number is kept."""
+    threads = env.get("FS11_THREADS", "8")
+    if threads.isdigit():
+        threads = str(session_threads(int(threads), cgroup_cpu_quota(), _usable_cpus()))
+    return threads
+
+
 def base_env(upload: Path) -> dict[str, str]:
     """Every part's environment: the session's own, without :data:`SECRETS`, offline, with the
-    upload's Hugging Face cache and BLAKE3 sources (the benchmark's and the native library's)."""
+    upload's Hugging Face cache and BLAKE3 sources (the benchmark's and the native library's).
+    The thread count (``FS11_THREADS``, default 8) is capped at the cgroup's CPU quota and the
+    CPUs the session may run on (:func:`session_threads`)."""
     env = {k: v for k, v in os.environ.items() if k not in SECRETS}
-    threads = env.get("FS11_THREADS", "8")
+    threads = _threads(env)
     env.update({
         "HF_HOME": str(upload / "hf"), "HF_HUB_CACHE": str(upload / "hf" / "hub"),
         "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
@@ -1263,9 +1414,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     selftest = args.cmd == "run" and args.selftest
     label, build = SESSIONS[args.session] if args.cmd == "run" else SESSIONS["fs11"]
     allow = os.environ.get("FS11_ALLOW_ANY_GPU") == "1" or selftest
+    pin = pin_to_gpu_numa()  # before anything starts threads; the parts inherit it
     env_doc = environment(out)
+    quota, usable = cgroup_cpu_quota(), _usable_cpus()
+    env_doc["cpu_pin"] = {**{k: v for k, v in pin.items() if k != "message"},
+                          "cgroup_cpu_quota": quota, "usable_cpus": usable,
+                          "threads": _threads(os.environ)}
     _write_json(out / "environment.json", env_doc)
     print_environment(env_doc)
+    _say(f"{pin['message']}; threads {env_doc['cpu_pin']['threads']}"
+         f" (cgroup CPU quota {'none' if quota is None else f'{quota:g}'})")
     why = refusal(env_doc, allow)
     if selftest:
         _say(f"self-test: stand-in parts in place of the {label} session's, the H100 check is "
