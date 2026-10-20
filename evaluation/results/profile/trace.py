@@ -1,4 +1,4 @@
-"""FS24: the trace summarizer (PROFILING_PLAN §5.6).
+"""FS24: the trace summarizer (archive/PROFILING_PLAN §5.6).
 
 Reads one ``torch.profiler`` Chrome trace (``trace/step_0000N.json.gz``) with the standard
 library and writes ``trace_summary.json`` (version 1): per section the GPU and CPU numbers, and

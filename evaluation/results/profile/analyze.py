@@ -1,10 +1,10 @@
 """FS25: join the profiling files into ``profile.json`` and apply the bottleneck rule
-(PROFILING_PLAN §5.7, §6, §7).
+(archive/PROFILING_PLAN §5.7, §6, §7).
 
 Run as ``python -m evaluation.results.profile.analyze --run-dir D --session L [--markers M]
 [--samples S] [--probe P] [--trace-summary T] [--plain D2] [--compute-dtype float32]
 --out profile.json``. ``meta`` names the run (model, attack, scenario, device, compute dtype,
-git commit, from the environment record) and the session ``L`` (PROFILING_PLAN §5.7).
+git commit, from the environment record) and the session ``L`` (archive/PROFILING_PLAN §5.7).
 A missing markers, samples or probe file is a warning in ``profile.json``, not an error.
 Beside what §5.7 lists, ``profile.json`` holds what the report (FS26) draws: ``probe`` and
 ``machine`` at the top, and a ``timeline`` per run (the untraced steps' spans and sampler

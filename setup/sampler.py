@@ -3,7 +3,7 @@
     .venv/bin/python -m setup.sampler --pid PID --out PATH [--interval 0.1] [--gpu 0]
     .venv/bin/python -m setup.sampler --out PATH [--interval 0.1] [--gpu 0] --wrap -- CMD ...
 
-``samples.jsonl`` (PROFILING_PLAN §5.4) opens with one header line, then one flat line per
+``samples.jsonl`` (archive/PROFILING_PLAN §5.4) opens with one header line, then one flat line per
 sample. A field that can't be read is ``null``, and a rate is the change since the previous
 sample's ``t`` (monotonic ns). Every utilisation field is a fraction (NVML's percent ÷ 100,
 the GPM fields as they come), PCIe is bytes/s. A group that fails is logged once as a ``{"kind": "error"}``

@@ -82,17 +82,17 @@ against each other yet, which the first CUDA run must do. Test-scale times are r
 (EQ14).
 
 **Markers.** The timed run also writes each section's spans and check 5's stamps
-(``PROFILING_PLAN.md`` §5.1) to ``markers.jsonl``, one ``kind`` line per step (``step``) and per
-run-level section table (``run``), after a ``header`` line; :func:`read_markers` reads it back. A
-step line holds, per section, up to :data:`MAX_SPANS` host spans in microseconds from the step's
-first section start (``t0_ns``), the same spans on the device clock on CUDA (``gpu_us``, each
-span's CUDA events resolved against the top-level section's anchor event by
-:func:`resolve_gpu_us`), a ``rest`` aggregate for the calls beyond them, and on CUDA a top-level
-section's allocator counters (``alloc``). Its ``stamps`` are column lists: a stamp is a span
-inside a check-5 section (``seam.stamp(name, run=, group=, window=)``) with ids that don't apply
-set to -1; ``name`` indexes ``stamp_names``. Nothing synchronizes inside a nested section or a
-stamp. ``c5_layout.json`` (:func:`~verification.verifier.checks.check5_layout`, written by
-``run_verified``) says what each run, group and window of check 5 holds.
+(``archive/PROFILING_PLAN.md`` §5.1) to ``markers.jsonl``, one ``kind`` line per step (``step``) and
+per run-level section table (``run``), after a ``header`` line; :func:`read_markers` reads it back.
+A step line holds, per section, up to :data:`MAX_SPANS` host spans in microseconds from the step's
+first section start (``t0_ns``), the same spans on the device clock on CUDA (``gpu_us``, each span's
+CUDA events resolved against the top-level section's anchor event by :func:`resolve_gpu_us`), a
+``rest`` aggregate for the calls beyond them, and on CUDA a top-level section's allocator counters
+(``alloc``). Its ``stamps`` are column lists: a stamp is a span inside a check-5 section
+(``seam.stamp(name, run=, group=, window=)``) with ids that don't apply set to -1; ``name`` indexes
+``stamp_names``. Nothing synchronizes inside a nested section or a stamp. ``c5_layout.json``
+(:func:`~verification.verifier.checks.check5_layout`, written by ``run_verified``) says what each
+run, group and window of check 5 holds.
 
 **Memory (memory pass).** ``peak_bytes`` is the whole process's peak during the section, as an
 absolute figure; ``start_bytes`` and ``end_bytes`` are the process's figure at the first entry
@@ -756,9 +756,9 @@ class _Trace:
 
     Starts at the first non-``run`` section of step ``step``, stops at that step's
     :meth:`TimeRecorder.on_step` and writes ``trace/step_NNNNN.json.gz`` and ``trace/meta.json``
-    (``PROFILING_PLAN.md`` §5.6). With ``c5 == "slice"`` the profiler's collection is off inside
-    check 5 except in the runs of the layout's ``trace_slice``. A profiler failure never reaches
-    the run: it tears the profiler down and goes into ``meta.json``'s ``error``."""
+    (``archive/PROFILING_PLAN.md`` §5.6). With ``c5 == "slice"`` the profiler's collection is off
+    inside check 5 except in the runs of the layout's ``trace_slice``. A profiler failure never
+    reaches the run: it tears the profiler down and goes into ``meta.json``'s ``error``."""
 
     def __init__(self, rec: TimeRecorder, step: int, c5: str, out_dir: Path) -> None:
         self.rec, self.step, self.dir = rec, step, out_dir
@@ -1860,11 +1860,11 @@ def layer_index(spec: Any, n_layers: int) -> int:
 
 
 def c5_layout_file(c: Any, run: str) -> dict[str, Any]:
-    """``c5_layout.json``'s content (``PROFILING_PLAN.md`` §5.2): :func:`check5_layout`'s entries
-    with each group's ``layer`` (:func:`layer_index` of its first product) and ``class``
-    (``product_class``), the counts, and ``trace_slice``, the runs a trace covers: the first run
-    of each class (over every group, not only a run's first) and every run whose id is a
-    multiple of 20, each once, sorted. ``n_windows`` is the number of judge calls."""
+    """``c5_layout.json``'s content (``archive/PROFILING_PLAN.md`` §5.2): :func:`check5_layout`'s
+    entries with each group's ``layer`` (:func:`layer_index` of its first product) and ``class``
+    (``product_class``), the counts, and ``trace_slice``, the runs a trace covers: the first run of
+    each class (over every group, not only a run's first) and every run whose id is a multiple of
+    20, each once, sorted. ``n_windows`` is the number of judge calls."""
     entries, n_windows = _layout(c)
     by_m = {spec.m: spec for spec in c.products}
     n_layers = layer_count(c)

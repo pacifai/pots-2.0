@@ -1,4 +1,4 @@
-"""Hand-built profiling inputs (PROFILING_PLAN §5, version 1) for the FS25 tests."""
+"""Hand-built profiling inputs (archive/PROFILING_PLAN §5, version 1) for the FS25 tests."""
 
 from __future__ import annotations
 

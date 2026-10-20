@@ -1,4 +1,4 @@
-"""FS25: the analysis on hand-built run directories (PROFILING_PLAN §5–§7)."""
+"""FS25: the analysis on hand-built run directories (archive/PROFILING_PLAN §5–§7)."""
 
 from __future__ import annotations
 

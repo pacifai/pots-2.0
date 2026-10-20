@@ -1,7 +1,7 @@
-"""FS25's readers for the profiling files of PROFILING_PLAN §5 (version 1): ``markers.jsonl``,
-``samples.jsonl``, ``probe.json``, ``c5_layout.json``, ``trace_summary.json`` and the run
-directory's ``records.jsonl``. Each reader rejects a file whose ``version`` isn't 1 with a
-``ValueError`` that names the file.
+"""FS25's readers for the profiling files of archive/PROFILING_PLAN §5 (version 1):
+``markers.jsonl``, ``samples.jsonl``, ``probe.json``, ``c5_layout.json``, ``trace_summary.json``
+and the run directory's ``records.jsonl``. Each reader rejects a file whose ``version`` isn't 1
+with a ``ValueError`` that names the file.
 
 Units stay as written: marker times are µs from a step's ``t0_ns``, sample times are monotonic
 ns, time rows are seconds. :mod:`evaluation.results.profile.analyze` converts at its joins.

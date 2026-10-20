@@ -1,4 +1,4 @@
-"""FS26: the HTML report on synthetic ``profile.json`` dicts (PROFILING_PLAN FS26, §12)."""
+"""FS26: the HTML report on synthetic ``profile.json`` dicts (archive/PROFILING_PLAN FS26, §12)."""
 
 from __future__ import annotations
 

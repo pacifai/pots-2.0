@@ -1,4 +1,5 @@
-"""FS22: the probe, a ~2-minute measurement of the machine's rates and fixed costs (PROFILING_PLAN §5.5).
+"""FS22: the probe, a ~2-minute measurement of the machine's rates and fixed costs
+(archive/PROFILING_PLAN §5.5).
 
     .venv/bin/python -m verification.runs.probe --out probe.json [--seconds 120]
 

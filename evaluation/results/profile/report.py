@@ -1,4 +1,4 @@
-"""FS26: the HTML report of one or more ``profile.json`` files (PROFILING_PLAN FS26, §12).
+"""FS26: the HTML report of one or more ``profile.json`` files (archive/PROFILING_PLAN FS26, §12).
 
 Run as ``python -m evaluation.results.profile.report PROFILE [PROFILE ...] --out profile.html``.
 The page is one self-contained HTML string: inline CSS, inline SVG built here, and a small
