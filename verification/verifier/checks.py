@@ -748,7 +748,7 @@ def _served_group(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Seq
     # (F4a), in the stored dtype and cast there (a blocking `.to(device, dtype)` converts on
     # the CPU).
     with (st("c5.serve", run, group) if st else _NO_STAMP):
-        p = torch.stack([view.product(m) for m in ms])
+        p = view.product_block(ms)  # read only: measured and cast, never written
         with (st("c5.copy", run, group) if st else _NO_STAMP):
             p_dev = p.detach().to(a.device)
     return _Group(list(idx), a, b, p_dev.to(torch.float32), None)

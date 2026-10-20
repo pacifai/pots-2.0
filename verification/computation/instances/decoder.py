@@ -170,6 +170,19 @@ def _fresh(leaf: torch.Tensor, device: torch.device) -> torch.Tensor:
     return leaf.to(device, copy=True)
 
 
+def _dk_owned(block: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """δK̃ᵀ from a block of δK̃, as memory no committed leaf shares. The transpose copy is the
+    fresh tensor on the host; elsewhere the move to ``device`` comes first and is the copy.
+    A size-1 dimension makes ``contiguous()`` return its input, which on the host is the
+    committed leaves' own storage, so that one case clones."""
+    moved = block.to(device) if block.device != device else block
+    out = moved.transpose(1, 2).contiguous()
+    if (moved is block and device.type == "cpu"
+            and out.untyped_storage().data_ptr() == block.untyped_storage().data_ptr()):
+        out = out.clone()
+    return out
+
+
 def _param(info: Any) -> str | None:
     """The parameter a captured operand is, or is autocast's copy of."""
     return info.param_name or info.param_copy
@@ -1320,8 +1333,11 @@ class DecoderReplay(Replay):
                 raise ReplayError("replay: a bmm outside a layer's S, O pair")
             name = f"L{self._cur}.{('S', 'O')[self._n_bmm]}"
             self._n_bmm += 1
-            out = torch.stack([self.view.product(c.m_of(f"{name}[{s},{h}]"))
-                               for s, h in c._members()]).to(a.device)
+            # A zero-copy block would alias the leaves, so the host asks for its own copy. On
+            # another device the move is the copy (blocking: no pinned-source stream logic).
+            block = self.view.product_block([c.m_of(f"{name}[{s},{h}]") for s, h in c._members()],
+                                            own=a.device.type == "cpu")
+            out = block.to(a.device) if block.device != a.device else block
         self._names.append(name)
         if name not in self._calls:  # a repeat fails the unit's name check
             # A head block's scores are not kept: its backward rebuilds them.
@@ -1508,10 +1524,11 @@ class DecoderReplay(Replay):
             name = f"L{self._unit}.{role}"
             out = None
             if name in self._want:
-                out = torch.stack([self.view.product(c.m_of(f"{name}[{s},{h}]"))
-                                   for s, h in c._members()])
+                out = self.view.product_block([c.m_of(f"{name}[{s},{h}]")
+                                               for s, h in c._members()],
+                                              own=a.device.type == "cpu" and role != "dK")
                 if role == "dK":  # the op computes δK̃ᵀ = Q̃ᵀ·δS; the leaves hold δK̃
-                    out = out.transpose(1, 2).contiguous()
+                    out = _dk_owned(out, a.device)
         if out is None or name in self._bops:
             raise ReplayError(f"replay: backward product {name} is not declared in this unit "
                               f"or appears twice")

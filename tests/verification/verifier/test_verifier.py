@@ -2103,6 +2103,9 @@ def test_check5_serves_bf16_leaves_bit_exact_fp32():
         def product(self, m):
             return leaves[m]
 
+        def product_block(self, ms):
+            return torch.stack([leaves[m] for m in ms])
+
     specs = [ProductSpec(m, f"Y{m}", ProductKind.FORWARD, (3, 5), (5, 4), "w") for m in (1, 2)]
     ctx = StepContext.for_computation(
         MLPComputation(eta=1e-3), step=1, indices=(), h_D=b"", n_records=0, prev_w_hashes=(),
