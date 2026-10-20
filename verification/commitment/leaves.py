@@ -26,7 +26,7 @@ into a pinned staging buffer (``hostcopy.Stage``) while the previous batch is ha
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
@@ -36,6 +36,7 @@ import torch
 
 from setup.records import Record
 from verification.commitment import hostcopy, merkle, native
+from verification.commitment.gpu_blake3 import GpuBlake3
 from verification.commitment.encoding import (
     TAG_PRODUCT,
     TAG_WEIGHT,
@@ -92,11 +93,14 @@ class HashStats:
     call's wall time less ``read_s`` and includes the waits; the worker fields stay 0.
 
     ``leaves`` and ``bytes`` count the leaves read and their tensor payload bytes (a record's
-    encoding is not counted); ``batches`` the native batches submitted.
+    encoding is not counted); ``batches`` the native batches submitted. ``known`` and ``kernel``
+    count the leaves (also in ``leaves`` and ``bytes``) that took a digest hashed on arrival
+    or were hashed in place on their GPU (:func:`hash_step_leaves`). The kernel's wait has no
+    row of its own (the profile's hash rows are fixed): it is in the call's wall time.
     """
 
     __slots__ = ("read_s", "producer_s", "wait_s", "native_s", "big_s", "worker_other_s",
-                 "batches", "leaves", "bytes")
+                 "batches", "leaves", "bytes", "known", "kernel")
 
     TIMES = ("read_s", "producer_s", "wait_s", "native_s", "big_s", "worker_other_s")
 
@@ -104,6 +108,7 @@ class HashStats:
         self.read_s = self.producer_s = self.wait_s = 0.0
         self.native_s = self.big_s = self.worker_other_s = 0.0
         self.batches = self.leaves = self.bytes = 0
+        self.known = self.kernel = 0  # leaves that took a digest given, or went to the GPU kernel
 
     def times(self) -> dict[str, float]:
         """The six times by field name."""
@@ -508,19 +513,183 @@ def transcript_root(c: DeclaredComputation, reader: LeafReader) -> bytes:
     return merkle_root(leaf_hashes(c, reader))
 
 
+# FS30: where the bytes are decides who hashes them. Tests swap these two seams to run the
+# kernel's table path on CPU tensors through the host build of the core.
+_GPU: GpuBlake3 | None = None
+
+
+def _hasher() -> GpuBlake3:
+    global _GPU
+    if _GPU is None:
+        _GPU = GpuBlake3()
+    return _GPU
+
+
+def _kernel_leaf(obj: torch.Tensor) -> bool:
+    """Whether the GPU kernel can hash ``obj`` where it sits: a contiguous, non-empty CUDA tensor
+    of a dtype that has a leaf kind."""
+    return (obj.device.type == "cuda" and obj.is_contiguous() and obj.numel() > 0
+            and obj.dtype in native.FINITE_KIND)
+
+
+def _table_stream(device: torch.device) -> Any:
+    return hostcopy.side_stream(device) if device.type == "cuda" else None
+
+
+class _Table:
+    """Device leaves of one table: their indices, tensors, the ``_version`` of each read as the
+    table was queued, and the pending hash."""
+
+    __slots__ = ("idx", "tensors", "versions", "pend")
+
+    def __init__(self, idx: list[int], tensors: list[torch.Tensor], versions: list[int],
+                 pend: Any) -> None:
+        self.idx, self.tensors, self.versions, self.pend = idx, tensors, versions, pend
+
+
+def _enqueue_table(idx: list[int], tensors: list[torch.Tensor], tags: list[int]) -> _Table:
+    """Queue one table's kernels on its device's side stream (after the work that made the
+    tensors) and return at once."""
+    device = tensors[0].device
+    stream = _table_stream(device)
+    if stream is not None:
+        stream.wait_stream(torch.cuda.current_stream(device))
+    versions = [t._version for t in tensors]
+    ids: dict[tuple[Any, ...], int] = {}
+    headers: list[bytes] = []
+    hdr_idx = np.empty(len(tensors), dtype=np.int64)
+    for k, (t, tag) in enumerate(zip(tensors, tags)):
+        key = (tag, t.dtype, tuple(t.shape))
+        h = ids.get(key)
+        if h is None:
+            h = ids[key] = len(headers)
+            headers.append(tensor_leaf_header(tag, t))
+        hdr_idx[k] = h
+    hdr_len = np.array([len(x) for x in headers], dtype=np.uint32)
+    hdr_off = np.zeros(len(headers), dtype=np.uint64)
+    np.cumsum(hdr_len[:-1], out=hdr_off[1:])
+    pend = _hasher().enqueue_table(
+        b"".join(headers), hdr_off, hdr_len, hdr_idx,
+        np.fromiter((t.data_ptr() for t in tensors), dtype=np.uint64, count=len(tensors)),
+        np.fromiter((t.nbytes for t in tensors), dtype=np.uint64, count=len(tensors)),
+        np.fromiter((native.FINITE_KIND[t.dtype] for t in tensors), dtype=np.uint8,
+                    count=len(tensors)),
+        device=device, stream=stream, keep=list(tensors))
+    return _Table(idx, tensors, versions, pend)
+
+
+def _table_outcome(tb: _Table) -> tuple[list[bytes], tuple[int, Exception] | None]:
+    """The table's digests (those before its first failing leaf) and that failure: a mutation at
+    or before the first non-finite leaf beats it (invariant 6), as on the staged path."""
+    digests, bad = tb.pend.result()
+    mutated = next((k for k, t in enumerate(tb.tensors) if t._version != tb.versions[k]), None)
+    if mutated is not None and mutated <= bad:
+        i = tb.idx[mutated]
+        return digests[:mutated], (i, StoreMutationError(
+            f"leaf {i} was mutated in place while it was copied to the host"))
+    if bad < len(tb.tensors):
+        return digests, (tb.idx[bad], NonFiniteError(_NONFINITE))
+    return digests, None
+
+
 def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
-                     stats: HashStats | None = None) -> list[bytes]:
+                     stats: HashStats | None = None, *,
+                     known: Mapping[int, bytes] | None = None) -> list[bytes]:
     """Every leaf hash of a full transcript, in layout order: :func:`commit_leaves` without the
-    tree, so a caller can time the two apart."""
+    tree, so a caller can time the two apart.
+
+    ``known`` maps a leaf index to the digest of that leaf's bytes, hashed when the leaf
+    arrived (FS30, ``StepOutput.arrival_digests``). Where the bytes are decides who hashes
+    them. Every tensor leaf first gets the structural checks of :func:`leaf_parts`, in order;
+    a leaf that fails one goes the host path, which raises its error. A known leaf that passes
+    takes its digest. A CUDA tensor leaf that passes, with no digest, is hashed in place by the
+    GPU kernel, in bounded tables queued before the host work starts and read after it. Every
+    other leaf takes the host path (:func:`leaf_hashes_until_error`). The digests are the same
+    whichever path hashed a leaf; on an error it is the one at the smallest failing leaf index,
+    of the class and message of the plain path (a non-finite leaf is a ``NonFiniteError`` with
+    the C library's message). With no ``known`` and no kernel leaf this is exactly
+    :func:`leaf_hashes_of`.
+    """
     if len(leaves) != c.n_leaves:
         raise ValueError(f"transcript has {len(leaves)} leaves, the computation declares "
                          f"{c.n_leaves}")
-    return leaf_hashes_of(c, list(enumerate(leaves)), stats)
+    known = known or {}
+    if not known and not any(isinstance(x, torch.Tensor) and _kernel_leaf(x) for x in leaves):
+        return leaf_hashes_of(c, list(enumerate(leaves)), stats)
+    n_s = c.n_s
+    slots: dict[int, tuple[int, tuple[int, ...], torch.dtype]] = {}
+    out: list[bytes | None] = [None] * len(leaves)
+    host: list[tuple[int, Any]] = []
+    tables: list[_Table] = []
+    open_: dict[torch.device, tuple[list[int], list[torch.Tensor], list[int], int]] = {}
+    n_known = n_kernel = 0
+    nbytes_known = nbytes_kernel = 0
+
+    def close(dev: torch.device) -> None:
+        idx, ts, tags, _ = open_.pop(dev)
+        tables.append(_enqueue_table(idx, ts, tags))
+
+    for i, obj in enumerate(leaves):
+        if i >= n_s and isinstance(obj, torch.Tensor):
+            slot = slots.get(i)
+            if slot is None:
+                tag, shape, dtype, _ = _tensor_slot(c, i)
+                slot = slots[i] = (tag, shape, dtype)
+            tag, shape, dtype = slot
+            if tuple(obj.shape) == shape and obj.dtype == dtype:  # the structural checks passed
+                d = known.get(i)
+                if d is not None:
+                    out[i] = d
+                    n_known += 1
+                    nbytes_known += obj.nbytes
+                    continue
+                if _kernel_leaf(obj):
+                    idx, ts, tags, size = open_.get(obj.device, ([], [], [], 0))
+                    idx.append(i)
+                    ts.append(obj)
+                    tags.append(tag)
+                    open_[obj.device] = (idx, ts, tags, size + obj.nbytes)
+                    n_kernel += 1
+                    nbytes_kernel += obj.nbytes
+                    if size + obj.nbytes >= _BATCH_BYTES or len(idx) >= _BATCH_ENTRIES:
+                        close(obj.device)
+                    continue
+        host.append((i, obj))
+    for dev in list(open_):
+        close(dev)
+    if stats is not None:
+        stats.known += n_known
+        stats.kernel += n_kernel
+        stats.leaves += n_known + n_kernel
+        stats.bytes += nbytes_known + nbytes_kernel
+    failures: list[tuple[int, Exception]] = []
+    try:
+        if host:
+            digests, err = leaf_hashes_until_error(c, host, stats)
+            for (i, _), d in zip(host, digests):
+                out[i] = d
+            if err is not None:
+                failures.append((host[len(digests)][0], err))
+    finally:
+        # Never leave a table queued unread: the stream still reads the leaves.
+        outcomes = []
+        for tb in tables:
+            outcomes.append(_table_outcome(tb))
+    for tb, (digests, fail) in zip(tables, outcomes):
+        for i, d in zip(tb.idx, digests):
+            out[i] = d
+        if fail is not None:
+            failures.append(fail)
+    if failures:
+        raise min(failures, key=lambda f: f[0])[1]
+    return out  # type: ignore[return-value]
 
 
-def commit_leaves(c: DeclaredComputation, leaves: Sequence[Any]) -> MerkleTree:
-    """The Merkle tree over a full transcript's leaves, in layout order; ``.root`` is ``h``."""
-    return MerkleTree(hash_step_leaves(c, leaves))
+def commit_leaves(c: DeclaredComputation, leaves: Sequence[Any],
+                  known: Mapping[int, bytes] | None = None) -> MerkleTree:
+    """The Merkle tree over a full transcript's leaves, in layout order; ``.root`` is ``h``.
+    ``known`` is :func:`hash_step_leaves`'s."""
+    return MerkleTree(hash_step_leaves(c, leaves, known=known))
 
 
 def leaf_totals(c: DeclaredComputation, leaves: Sequence[Any]) -> tuple[int, int]:

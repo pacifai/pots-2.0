@@ -59,6 +59,11 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
     return s
 
 
+def side_stream(device: torch.device) -> torch.cuda.Stream:
+    """The side stream that carries ``device``'s copies, and the device-leaf kernels (FS30)."""
+    return _side_stream(device)
+
+
 def _align(n: int) -> int:
     return -(-n // ALIGN) * ALIGN
 
