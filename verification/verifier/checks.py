@@ -71,7 +71,7 @@ from verification.computation.interface import (
 )
 from verification.transcript.reader import TranscriptView
 from verification.transcript.store import TranscriptStore
-from verification.verifier.bands import Bands, product_class
+from verification.verifier.bands import Bands, product_class, product_classes
 from verification.verifier.context import (
     _AFTER_COMMIT,
     CommittedLeaves,
@@ -953,7 +953,9 @@ def _judge_window(c: DeclaredComputation, batch: Sequence[_Rows], ctx: StepConte
     specs, cols = _finish_columns(batch, ctx)
     if cols is None:
         return None
-    classes = [product_class(c, spec) for spec in specs]
+    table = product_classes(c)  # the specs are the inventory's own, so [m-1] is their class
+    classes = ([table[spec.m - 1] for spec in specs] if table is not None
+               else [product_class(c, spec) for spec in specs])
     first = _first_failing(specs, classes, cols, ctx, bands)
     ctx.stats.products.extend_columns(
         m=[s.m for s in specs[:first]], name=[s.name for s in specs[:first]],

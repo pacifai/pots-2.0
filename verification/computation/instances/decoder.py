@@ -486,6 +486,11 @@ class DecoderComputation(DeclaredComputation):
     def products(self) -> tuple[ProductSpec, ...]:
         return self._inventory[0]
 
+    @property
+    def product_classes(self) -> tuple[str, ...]:
+        """Each product's κ class, ``[m-1]`` for product ``m``: the inventory's own column."""
+        return self._inventory[1]
+
     @cached_property
     def _m_by_name(self) -> dict[str, int]:
         return {p.name: p.m for p in self.products}

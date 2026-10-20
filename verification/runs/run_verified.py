@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from setup import backdoorllm
@@ -195,11 +196,21 @@ def step_summary(t: int, stats: StepStats, bands: Bands, *, in_sample: bool,
     defaults to ``not in_sample``."""
     cmax: dict[str, float] = {}
     kmax: dict[str, float] = {}
-    for p in stats.products:
-        cmax[p.cls] = max(cmax.get(p.cls, -math.inf), *p.normalized)
-        kmax[p.cls] = max(kmax.get(p.cls, -math.inf), p.kappa)
+    seen: dict[str, tuple[float, ...]] = {}
+    if stats.products:
+        # ``max(running, *row)`` from -inf never keeps a NaN, so fmax (which skips NaN) is the same
+        cols = stats.products.columns()
+        codes, classes = cols.class_codes()
+        order = np.argsort(codes, kind="stable")
+        starts = np.concatenate(([0], np.cumsum(np.bincount(codes))[:-1]))
+        row = np.fmax.reduce(cols.normalized, axis=1, initial=-np.inf)
+        kappa = np.where(np.isnan(cols.kappa), -np.inf, cols.kappa)[order]
+        cmax = dict(zip(classes, np.fmax.reduceat(row[order], starts).tolist()))
+        kmax = dict(zip(classes, np.fmax.reduceat(kappa, starts).tolist()))
+        if watch in classes:
+            for i in np.flatnonzero(codes == classes.index(watch)).tolist():
+                seen[cols.name[i]] = tuple(cols.normalized[i].tolist())
     ratio = {cls: x / bands.kappa_for(cls) for cls, x in kmax.items()}
-    seen = {p.name: tuple(p.normalized) for p in stats.products if p.cls == watch}
     rho: dict[str, float] = {}
     for s in stats.tensors:
         rho[s.check_id] = max(rho.get(s.check_id, -math.inf), s.rho_max)

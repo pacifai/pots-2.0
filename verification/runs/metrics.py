@@ -207,7 +207,7 @@ from setup.config import load_config
 from setup.machine import machine_facts
 from verification.commitment import native
 from verification.computation.interface import ProductKind
-from verification.verifier.bands import product_class
+from verification.verifier.bands import product_class, product_classes
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF
 from verification.verifier.calibration import step_floor
 from verification.verifier.checks import (
@@ -217,7 +217,7 @@ from verification.verifier.checks import (
     protocol_id,
 )
 from verification.verifier.matmul_check.sizing import C_ANTI, bit_budget
-from verification.verifier.context import ProductStat, StepStats, TensorStat
+from verification.verifier.context import ProductStat, ProductStats, StepStats, TensorStat
 
 __all__ = [
     "P0_PHASES", "TRAIN_PHASES", "PASS_STEPS", "COUNT_STEPS", "COMPONENTS", "RECORD_TYPES",
@@ -1358,15 +1358,19 @@ def rho_arrays(stats: StepStats, bands: Any, *, k: int | None,
     two can disagree by rounding when a residual lands on ``τ`` to within an ulp.
     """
     ps, ts = stats.products, stats.tensors
-    width = len(ps[0].normalized) if ps else (k or 0)
-    norm = np.array([p.normalized for p in ps], dtype=np.float64).reshape(len(ps), width)
+    cols = ps.columns() if ps else None
+    norm = cols.normalized if cols else np.empty((0, k or 0), dtype=np.float64)
     if bands is None:
         return {"rho_5": np.full_like(norm, np.nan), "rho_kappa": np.full(len(ps), np.nan),
                 "rho_6": np.full(len(ts), np.nan)}
     rho_5 = norm / bands.tau
     if kappa_guard:
-        nu = np.array([p.nu for p in ps], dtype=np.float64)
-        ceiling = np.array([bands.kappa_for(p.cls) * p.p_abs1 for p in ps], dtype=np.float64)
+        if cols:
+            codes, classes = cols.class_codes()
+            kappa_max = np.array([bands.kappa_for(cls) for cls in classes], dtype=np.float64)
+            nu, ceiling = cols.nu, kappa_max[codes] * cols.p_abs1
+        else:
+            nu = ceiling = np.empty(0, dtype=np.float64)
         with np.errstate(divide="ignore", invalid="ignore"):
             rho_kappa = np.where(nu == 0, 0.0, nu / ceiling)
     else:
@@ -1826,18 +1830,20 @@ _KIND_CLASSES = {ProductKind.INPUT_GRAD: "input gradient",
                  ProductKind.OPERAND_GRAD: "operand gradient"}
 
 
-def spec_class(c: Any, spec: Any) -> str:
+def spec_class(c: Any, spec: Any, cls: str | None = None) -> str:
     """A product's class in EVALUATION_SPEC §5.7: ``forward``, ``input gradient``, ``weight
     gradient``, ``attention score`` or ``attention value``, and ``operand gradient`` (a
     placeholder) for the gradients of the weight-free products.
 
     The forward products with a weight are ``forward``; the weight-free ones are the attention
     products, named by their κ class (``S``, ``O``). Any other weight-free forward class raises
-    ``ValueError``: §5.7 has no class for it."""
+    ``ValueError``: §5.7 has no class for it. ``cls`` is the spec's κ class when the caller
+    has it (``product_classes``), saving the lookup."""
     if spec.kind is ProductKind.FORWARD:
         if spec.weight is not None:
             return "forward"
-        cls = product_class(c, spec)
+        if cls is None:
+            cls = product_class(c, spec)
         if cls not in _WEIGHT_FREE_FORWARD:
             raise ValueError(f"{spec.name}: weight-free forward class {cls!r} has no "
                              f"EVALUATION_SPEC §5.7 class")
@@ -1889,29 +1895,33 @@ def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats, c: An
                      bands: Any = None, k: int | None = None,
                      kappa_guard: bool = True) -> dict[str, np.ndarray]:
     ps = stats.products
-    width = len(ps[0].normalized) if ps else (k or 0)
+    cols = ps.columns() if ps else ProductStats().columns()
+    width = cols.normalized.shape[1] if ps else (k or 0)
     layers, classes = [], []
-    n_layers = 0 if c is None else layer_count(c)
-    for p in ps:
-        spec = c.product(p.m) if c is not None else None
-        layers.append(-1 if spec is None else layer_index(spec, n_layers))
-        classes.append("" if spec is None else spec_class(c, spec))
+    if c is not None:
+        n_layers = layer_count(c)
+        specs = c.products
+        table = product_classes(c) or [product_class(c, s) for s in specs]
+        ms = cols.m.tolist()
+        if ms and not 1 <= min(ms) <= max(ms) <= c.M:
+            c.product(min(ms) if min(ms) < 1 else max(ms))  # raises as the lookup always did
+        for m in ms:
+            spec = specs[m - 1]
+            layers.append(layer_index(spec, n_layers))
+            classes.append(spec_class(c, spec, table[m - 1]))
+    else:
+        layers, classes = [-1] * len(cols), [""] * len(cols)
     rho = rho_arrays(stats, bands, k=k, kappa_guard=kappa_guard)
     return {
         "run": np.array(run), "scenario": np.array(scenario), "step": np.array(step),
-        "p_m": np.array([p.m for p in ps], dtype=np.int32),
-        "p_name": np.array([p.name for p in ps], dtype=str),
-        "p_cls": np.array([p.cls for p in ps], dtype=str),
+        "p_m": cols.m.astype(np.int32),
+        "p_name": np.array(cols.name, dtype=str),
+        "p_cls": np.array(cols.cls, dtype=str),
         "p_spec_class": np.array(classes, dtype=str),
         "p_layer": np.array(layers, dtype=np.int32),
-        "p_kappa": np.array([p.kappa for p in ps], dtype=np.float64),
-        "p_q": np.array([p.q for p in ps], dtype=np.int64),
-        "p_norm": np.array([p.p_norm for p in ps], dtype=np.float64),
-        "p_nu": np.array([p.nu for p in ps], dtype=np.float64),
-        "p_abs1": np.array([p.p_abs1 for p in ps], dtype=np.float64),
-        "p_u": np.array([p.u for p in ps], dtype=np.float64),
-        "p_normalized": np.array([p.normalized for p in ps],
-                                 dtype=np.float64).reshape(len(ps), width),
+        "p_kappa": cols.kappa.copy(), "p_q": cols.q.copy(), "p_norm": cols.p_norm.copy(),
+        "p_nu": cols.nu.copy(), "p_abs1": cols.p_abs1.copy(), "p_u": cols.u.copy(),
+        "p_normalized": cols.normalized.copy().reshape(len(cols), width),
         "w_check": np.array([s.check_id for s in stats.tensors], dtype=str),
         "w_name": np.array([s.weight for s in stats.tensors], dtype=str),
         "w_rho": np.array([s.rho_max for s in stats.tensors], dtype=np.float64),

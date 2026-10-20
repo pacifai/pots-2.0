@@ -164,6 +164,12 @@ def test_product_classes(setup):
         c.product_class(other.products[5])
 
 
+def test_product_classes_table_is_the_per_spec_class(setup):
+    c, _, _ = setup
+    assert c.product_classes == tuple(c.product_class(p) for p in c.products)
+    assert c.product_classes is c.product_classes
+
+
 def test_matmul_count():
     assert matmul_count_decoder(30, 4, 9) == 7_113
     assert matmul_count_decoder(30, 128, 9) == 207_993

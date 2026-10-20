@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -212,6 +213,17 @@ def snapshot_weights(computation: DeclaredComputation,
             for n in computation.weight_names}
 
 
+_DIGITS = re.compile(r"\d+")
+
+
+def default_product_class(spec: ProductSpec) -> str:
+    """The calibration class of a product when ``C`` declares none: the product kind with the
+    weight name (or, for a weight-free product, the product name) with every digit run replaced
+    by ``*``, so the same role in every layer is one class (spec §9, P3.b)."""
+    role = spec.weight if spec.weight is not None else spec.name
+    return f"{spec.kind.value}:{_DIGITS.sub('*', role)}"
+
+
 class DeclaredComputation(ABC):
     """Abstract ``C``. Subclasses set the inventory and implement the abstract methods."""
 
@@ -288,6 +300,17 @@ class DeclaredComputation(ABC):
     def glue_gradient_weights(self) -> tuple[str, ...]:
         """Check 6b: weights whose gradient is (or includes) recomputed glue, in leaf order."""
         return tuple(n for n in self.weight_names if n not in self.linear_weights)
+
+    @cached_property
+    def product_classes(self) -> tuple[str, ...]:
+        """Each product's calibration class, ``product_classes[m-1]`` for product ``m``: the
+        class table of the whole inventory, computed once. It is what ``bands.product_class``
+        returns for the inventory's own specs: an instance's ``product_class(spec)`` where it
+        declares one, else :func:`default_product_class`."""
+        own = getattr(self, "product_class", None)
+        if callable(own):
+            return tuple(str(own(s)) for s in self.products)
+        return tuple(default_product_class(s) for s in self.products)
 
     def product(self, m: int) -> ProductSpec:
         if not 1 <= m <= self.M:
