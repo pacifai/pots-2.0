@@ -58,6 +58,8 @@ def prover_digests(c, model, records):
     cap = MatmulCapture(param_storage_map(model))
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(_Labeler, "_fill", fill)
+        # The whole-run fill never calls _fill; no runs makes every member go through it.
+        mp.setitem(c.__dict__, "member_runs", {})
         with cap:
             with cap.phase("forward"):
                 loss = c.loss(model, records)
