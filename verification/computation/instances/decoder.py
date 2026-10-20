@@ -124,6 +124,7 @@ from verification.computation.interface import (
     load_weights,
 )
 from verification.computation.matmul_ops import param_storage_map
+from verification.computation.placement import Placement, placement_for
 from verification.computation.substitution import ProductSubstitution
 from verification.transcript.reader import LeafReader, TranscriptView
 
@@ -225,6 +226,9 @@ class DecoderComputation(DeclaredComputation):
     ``head_blocks`` is ``B``, ``VERIF_HEAD_BLOCKS``: the output layer runs in ``B`` blocks of
     ``n_s/B`` records each, so no ``N × n_v`` array exists in training or the replay. ``B``
     must divide ``n_s``; ``B = 1`` is the whole batch at once.
+    ``verifier_devices`` is ``VERIF_VERIFIER_DEVICES`` (F22): the devices that hold the
+    transcript, the replay split over them by layers (``placement``). ``None`` keeps the leaves
+    in host memory.
     """
 
     def __init__(self, config: Any, *, n_s: int, n: int, eta: float,
@@ -233,7 +237,8 @@ class DecoderComputation(DeclaredComputation):
                  compute_dtype: torch.dtype = torch.float32,
                  device: str | torch.device = "cpu",
                  pad_id: int | None = None,
-                 head_blocks: int = 1) -> None:
+                 head_blocks: int = 1,
+                 verifier_devices: Sequence[str | torch.device] | None = None) -> None:
         self.config = copy.deepcopy(config)
         self.source = source
         self._n_s, self.n, self._eta = int(n_s), int(n), float(eta)
@@ -254,6 +259,8 @@ class DecoderComputation(DeclaredComputation):
         self.master_dtype, self.compute_dtype = master_dtype, compute_dtype
         # F4a: the model and its activations live on the run's device; leaves stay on the host.
         self.device = torch.device(device)
+        self.verifier_devices = (None if not verifier_devices else
+                                 tuple(torch.device(d) for d in verifier_devices))
         self.device_type = self.device.type
         c = self.config
         self.L = int(c.num_hidden_layers)
@@ -278,21 +285,25 @@ class DecoderComputation(DeclaredComputation):
                         master_dtype: torch.dtype = torch.float32,
                         compute_dtype: torch.dtype = torch.float32,
                         device: str | torch.device = "cpu",
-                        head_blocks: int = 1) -> DecoderComputation:
+                        head_blocks: int = 1,
+                        verifier_devices: Sequence[str | torch.device] | None = None
+                        ) -> DecoderComputation:
         config = load_model_config(repo, revision)
         return cls(config, n_s=n_s, n=n, eta=eta, source=(repo, revision),
                    master_dtype=master_dtype, compute_dtype=compute_dtype, device=device,
-                   head_blocks=head_blocks)
+                   head_blocks=head_blocks, verifier_devices=verifier_devices)
 
     @classmethod
     def from_config(cls, cfg: RunConfig) -> DecoderComputation:
         """The run's instance: ``VERIF_MODEL`` at ``VERIF_MODEL_REVISION``, ``VERIF_BATCH ×
         VERIF_SEQ_LEN``, ``η = VERIF_ETA``, ``(VERIF_MASTER_DTYPE, VERIF_COMPUTE_DTYPE)`` on
-        ``VERIF_DEVICE``, the output layer in ``VERIF_HEAD_BLOCKS`` blocks."""
+        ``VERIF_DEVICE``, the output layer in ``VERIF_HEAD_BLOCKS`` blocks, the transcript on
+        ``VERIF_VERIFIER_DEVICES``."""
         return cls.from_pretrained(cfg.model, cfg.model_revision, n_s=cfg.batch, n=cfg.seq_len,
                                    eta=cfg.require_eta(), master_dtype=cfg.master_dtype,
                                    compute_dtype=cfg.compute_dtype, device=cfg.device,
-                                   head_blocks=cfg.head_blocks)
+                                   head_blocks=cfg.head_blocks,
+                                   verifier_devices=cfg.verifier_devices)
 
     def _check_config(self) -> None:
         c = self.config
@@ -403,6 +414,48 @@ class DecoderComputation(DeclaredComputation):
         if not self.tied:
             names.append(_W_OUT)
         return tuple(names)
+
+    # ---- units (F22) ----------------------------------------------------------------------
+
+    @property
+    def units(self) -> tuple[int, ...]:
+        """``0`` the embedding, ``1 … L`` the layers, ``L + 1`` the head."""
+        return tuple(range(self.L + 2))
+
+    @property
+    def pinned_last_units(self) -> frozenset[int]:
+        """The embedding and the head sit on the last verifier device (F22). Tied, ``W_E`` is
+        one ``Parameter`` shared by the embedding and the output layer, and a parameter lives
+        on one device. Putting the embedding with the head keeps the verifier's model an
+        unmodified ``from_pretrained`` model (invariant 2, scale invariance) and the tied
+        gradient sum ``G_E^head + G_E^emb`` on one device. The price is one move of ``X_1`` to
+        the first layer's device and one of ``δX_1`` back, each ``N × d``. Untied follows the
+        same rule, so there is one rule."""
+        return frozenset((0, self.L + 1))
+
+    @cached_property
+    def _weight_units(self) -> dict[str, int]:
+        out = {}
+        for name in self.weight_names:
+            if name == _E:
+                out[name] = 0
+            elif name in (_GAMMA_FINAL, _W_OUT):
+                out[name] = self.L + 1
+            else:
+                out[name] = int(name.split(".")[2]) + 1
+        return out
+
+    def weight_unit(self, name: str) -> int:
+        return self._weight_units[name]
+
+    def product_unit(self, m: int) -> int:
+        layer = self.product(m).layer
+        return self.L + 1 if layer is None else layer
+
+    @cached_property
+    def placement(self) -> Placement:
+        """The placement of ``self.device`` and ``verifier_devices``, built once."""
+        return placement_for(self, self.device, self.verifier_devices)
 
     @cached_property
     def weight_shapes(self) -> dict[str, tuple[int, ...]]:

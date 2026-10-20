@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
+    from verification.computation.placement import Placement
     from verification.prover.capture import MatmulCapture
     from verification.transcript.reader import LeafReader
 
@@ -320,6 +321,35 @@ class DeclaredComputation(ABC):
     @cached_property
     def _weight_pos(self) -> dict[str, int]:
         return {n: i for i, n in enumerate(self.weight_names)}
+
+    # ---- units (F22) ----------------------------------------------------------------------
+
+    @property
+    def units(self) -> tuple[int, ...]:
+        """The replay's units in forward order. A unit runs on one device when the verifier is
+        split over several (``placement``); the default is one unit."""
+        return (0,)
+
+    @property
+    def pinned_last_units(self) -> frozenset[int]:
+        """Units that must sit on the last verifier device."""
+        return frozenset()
+
+    def weight_unit(self, name: str) -> int:
+        """The unit that owns weight ``name``; ``KeyError`` for an undeclared name."""
+        self._weight_pos[name]
+        return 0
+
+    def product_unit(self, m: int) -> int:
+        """The unit that consumes product ``m``; ``IndexError`` outside ``1..M``."""
+        self.product(m)
+        return 0
+
+    @cached_property
+    def placement(self) -> Placement:
+        """Which device owns each unit and leaf. The default is unsharded, on the host."""
+        from verification.computation.placement import placement_for
+        return placement_for(self, HOST, None)
 
     def record_index(self, i: int) -> int:
         if not 0 <= i < self.n_s:
