@@ -88,9 +88,9 @@ from verification.verifier.context import (
     _Rejected,
 )
 from verification.verifier.matmul_check.freivalds import (
+    MeasureColumns,
     MeasureScratch,
     ProductMeasure,
-    MeasureColumns,
     finish_row,
     finish_rows,
     measure_product_row,

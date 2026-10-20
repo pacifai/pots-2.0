@@ -80,9 +80,10 @@ from verification.verifier.matmul_check.challenges import (
 )
 from verification.verifier.matmul_check.sizing import product_e_m
 
-__all__ = ["ROW", "MeasureScratch", "ProductMeasure", "band_unit", "finish_row",
-           "finish_rows", "MeasureColumns", "measure_product", "measure_product_row", "measure_products",
-           "measure_products_rows", "row_width", "term_scale", "term_scales"]
+__all__ = ["ROW", "MeasureColumns", "MeasureScratch", "ProductMeasure", "band_unit",
+           "finish_row", "finish_rows", "measure_product", "measure_product_row",
+           "measure_products", "measure_products_rows", "row_width", "term_scale",
+           "term_scales"]
 
 
 @dataclass(frozen=True)

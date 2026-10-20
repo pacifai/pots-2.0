@@ -152,6 +152,17 @@ def test_a_biased_product_adds_its_bias_to_the_term_scale():
     rej, ctx = _both(_window(6, rows, specs=specs))
     assert rej is None
     assert ctx.stats.products[1].u == math.sqrt(1.0 + 7 * 4.0)  # A has 5 + m = 7 rows
+    assert ctx.stats.products[3].u == math.sqrt(1.0 + 9 * 9e30)
+
+
+def test_a_bias_that_widens_the_band_keeps_a_residual_in_that_would_otherwise_fail():
+    """The bias raises ``U``, so the band; the same row without a bias is rejected."""
+    wide = {2: {"bias_sq": 1e18, 6: 1e-3}}
+    biased = [_spec(i + 1, bias="b" if i == 2 else None) for i in range(5)]
+    rej, _ = _both(_window(5, wide, specs=biased))
+    assert rej is None
+    rej, _ = _both(_window(5, wide, specs=[_spec(i + 1) for i in range(5)]))
+    assert rej is not None and "P_3 " in rej.detail and "challenge j=2" in rej.detail
 
 
 def test_an_empty_window_judges_nothing():

@@ -22,7 +22,8 @@ def _columns(stats):
     return dict(
         m=[s.m for s in stats], name=[s.name for s in stats], cls=[s.cls for s in stats],
         kappa=np.array([s.kappa for s in stats]),
-        normalized=np.array([s.normalized for s in stats]).reshape(len(stats), 0 if not stats else len(stats[0].normalized)),
+        normalized=np.array([s.normalized for s in stats]).reshape(
+            len(stats), 0 if not stats else len(stats[0].normalized)),
         q=[s.q for s in stats], p_norm=np.array([s.p_norm for s in stats]),
         nu=np.array([s.nu for s in stats]), p_abs1=np.array([s.p_abs1 for s in stats]),
         u=np.array([s.u for s in stats]))
@@ -95,6 +96,19 @@ def test_item_assignment_replaces_one_stat_wherever_it_lives():
     got, _ = _mixed()
     with pytest.raises(IndexError):
         got[10] = _stat(1)
+
+
+def test_copy_copy_gives_an_independent_container():
+    got, want = _mixed()
+    dup = copy.copy(got)
+    assert dup == want and dup is not got
+    dup.append(_stat(50))
+    got.clear()
+    assert len(dup) == 11 and len(got) == 0
+    got, _ = _mixed()
+    dup = got.copy()
+    got[0] = _stat(60)
+    assert dup[0] == _stat(0)
 
 
 def test_clear_then_reuse():

@@ -260,6 +260,14 @@ class ProductStats:
         self.extend(other)
         return self
 
+    def copy(self) -> ProductStats:
+        """An independent container with the same records (the columns are shared, read-only)."""
+        dup = ProductStats()
+        dup._segs, dup._ends = list(self._segs), list(self._ends)
+        return dup
+
+    __copy__ = copy
+
     def __repr__(self) -> str:
         return repr(list(self))
 
