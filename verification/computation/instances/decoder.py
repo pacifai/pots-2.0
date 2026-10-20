@@ -1577,7 +1577,10 @@ class DecoderReplay(Replay):
                     raise ReplayError(f"replay: a backward mm matches no weight gradient "
                                       f"(A is the output gradient of {w})")
                 name = self._linear_name(w, "G")
-            out = self.view.product(c.m_of(name)).clone() if name in self._want else None
+            # One copy from the pinned leaf to the operands' device, as `_supply` does; a host
+            # clone first would be a second copy and a pageable host-to-device one.
+            out = (_fresh(self.view.product(c.m_of(name)), a.device) if name in self._want
+                   else None)
         else:
             hit_a, hit_b = self._saved.get(_ptr(a)), self._saved.get(_ptr(b))
             if (hit_a is None) == (hit_b is None):
