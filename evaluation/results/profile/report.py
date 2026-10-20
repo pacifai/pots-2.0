@@ -3,22 +3,30 @@
 Run as ``python -m evaluation.results.profile.report PROFILE [PROFILE ...] --out profile.html``.
 The page is one self-contained HTML string: inline CSS, inline SVG built here, and a small
 script for the run picker. It holds no library, font or network reference. Every number goes
-through :func:`fmt`, in the tables and in the SVG tooltips alike, so a hover and its table
-cell are the same string. A panel with nothing to show is left out of the page and the
-contents bar; a comparison is drawn only when the inputs hold it (§12 item 4).
+through :func:`fmt` (or :func:`pct`, which uses it), in the tables and in the SVG tooltips
+alike, so a hover and its table cell are the same string. A panel with nothing to show is
+left out of the page and the contents bar; a comparison is drawn only when the inputs hold it
+(§12 item 4).
 
-Choices the plan leaves open, taken here:
+The page is a summary for a reader, not a dump: every measure stays in the ``profile.json``
+files, and the page shows only the step's sections, their times and shares, their marks, the
+hardware they kept busy, the timeline, check 5's phases and the comparisons (§12 item 8, user,
+2026-10-20). Choices taken here:
 
-- Rollup sections (``rollup`` in ``profile.json``) stay out of the overview, the diagram and
-  the comparison charts, as they stay out of ``share_total``; the section table keeps them.
-- The diagram's blocks are the depth-0 sections; a block drawn in several lanes repeats its
-  rectangle in each, and nested sub-blocks sit in its first lane.
+- Sections carry a plain name and a one-line description (``SECTIONS``) and fall into seven
+  groups (``GROUPS``), one color each; a section is a tint of its group's color. The
+  hand-off is hatched, so it needs no eighth hue. A section the catalogue lacks is gray and
+  keeps its code.
+- Only depth-0 sections are drawn. Rollups (``rollup`` in ``profile.json``) stay out, as they
+  stay out of ``share_total``; nested sections stay in the file.
+- The step-flow diagram is one box per depth-0 section in run order, in three bands (prover,
+  hand-off, verifier), with the sampler's GPU busy fraction and the run's CPU cores.
+- Legends carry plain names only; the overview's table, the flow's boxes and check 5's rows keep
+  the code beside the name, so a reader can find the section in ``profile.json``.
+- Prover beside plain is a per-run panel after check 5, so the run picker shows the chosen
+  run's table alone.
 - A run is a CPU run when ``meta.device`` is ``cpu`` or no GPU field (a ``g_*`` utilization,
-  a GPU clock or GPU-lane work) appears in it.
-- The hashing breakdown (``hash`` in the run view) is a small table per owner, the commit and
-  check 2, after the section table: the hashing wall time with its floor, each part with its
-  lane, share and floor, and what the caller's parts leave unaccounted. A run with no part
-  timings shows the wall line and a note; a run with no hash row has no table.
+  a GPU clock or GPU-lane work) appears in it; it draws no GPU gauge or strip.
 - Hover is the SVG ``<title>`` tooltip; the script only drives the run picker.
 """
 
@@ -27,6 +35,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -34,50 +43,171 @@ from typing import Any
 
 from evaluation.results.profile import io
 
-__all__ = ["fmt", "build", "main"]
+__all__ = ["fmt", "pct", "build", "main"]
 
 TOTALS = ("prover", "verifier", "step")
-UTIL_META = ("n_samples", "few_samples", "truncated")
 C5_PHASES = ("glue", "host_stack", "copy", "measure", "judge")
-STRIP_LABELS = {"g_util": "GPU use (0-1)", "c_busy": "busy CPU cores",
-                "pcie": "PCIe bytes/s (tx, rx)"}
-STRIP_SHORT = {"g_util": "GPU use", "c_busy": "CPU busy", "pcie": "PCIe"}
-GPU_LANES = ("GPU compute", "GPU memory (HBM)", "PCIe", "CPU threads", "Host")
-CPU_LANES = ("CPU threads", "Host")
+
+# group: (part of the step, title)
+GROUPS: dict[str, tuple[str, str]] = {
+    "train": ("Prover", "Prover · training, with matmul capture"),
+    "record": ("Prover", "Prover · recording the transcript"),
+    "commit": ("Prover", "Prover · committing to the transcript"),
+    "hand": ("Hand-off", "Hand-off between prover and verifier"),
+    "read": ("Verifier", "Verifier · reading and hashing the transcript"),
+    "update": ("Verifier", "Verifier · checking the weight update"),
+    "matmul": ("Verifier", "Verifier · checking the matmuls"),
+    "other": ("Other", "Other sections"),
+}
+PARTS = {"Prover": "trains the step with every matmul captured, then records and commits "
+                   "the transcript",
+         "Hand-off": "passes the transcript from the prover to the verifier",
+         "Verifier": "checks the step from the transcript",
+         "Other": "sections this report has no name for"}
+
+# section: (group, shade 0-3, short name, what it does)
+SECTIONS: dict[str, tuple[str, int, str, str]] = {
+    "train.load": ("train", 2, "Load weights",
+                   "load W_t into the model and clear the gradients"),
+    "train.forward": ("train", 0, "Forward pass",
+                      "the training forward pass, every matmul captured"),
+    "train.backward": ("train", 1, "Backward pass",
+                       "the training backward pass, every matmul captured"),
+    "train.update": ("train", 3, "Weight update", "the SGD step from W_t to W_t+1"),
+    "P1.label": ("record", 0, "Label matmuls",
+                 "name each captured matmul and keep its inputs and product"),
+    "P2.w_t": ("record", 2, "Copy W_t", "copy the step's starting weights for the transcript"),
+    "P2.w_next": ("record", 1, "Copy W_t+1", "copy the updated weights for the transcript"),
+    "P4.paths": ("commit", 2, "Batch paths",
+                 "Merkle paths from the batch's records to the dataset root"),
+    "P3.commit": ("commit", 0, "Merkle commitment",
+                  "hash every transcript leaf and build the Merkle tree"),
+    "P5.write": ("commit", 1, "Hand over transcript",
+                 "hand the transcript to the store the verifier reads"),
+    "handoff.totals": ("hand", 0, "Count transcript bytes",
+                       "add up the transcript's size for the run log"),
+    "handoff.empty_cache": ("hand", 1, "Free GPU cache",
+                            "release the prover's cached GPU memory before the verifier"),
+    "4": ("read", 2, "Check 4: batch in dataset",
+          "the batch's records lead to the dataset root"),
+    "7": ("read", 1, "Check 7: weights chain", "this step's W_t is the previous step's W_t+1"),
+    "2": ("read", 0, "Check 2: read and hash",
+          "read every transcript leaf, check its shape and hash it"),
+    "2.root": ("read", 3, "Check 2: compare root",
+               "the rebuilt Merkle root equals the committed one"),
+    "6a": ("update", 0, "Check 6a: linear weights",
+           "W_t+1 = W_t − η·G for the linear layers' weights"),
+    "6b": ("update", 1, "Check 6b: other weights",
+           "the same for norm scales, biases and the embedding, from replayed gradients"),
+    "5": ("matmul", 0, "Check 5: matmuls", "Freivalds' check of every captured matmul"),
+}
+
+# check-5 phase: (short name, what it does)
+PHASES = {"glue": ("Rebuild inputs", "replay the model to rebuild each matmul's inputs"),
+          "host_stack": ("Stack in host memory", "stack the products' leaves in host RAM"),
+          "copy": ("Copy to GPU", "copy the stacked products to the GPU"),
+          "measure": ("Freivalds products",
+                      "multiply by the random vectors and measure the residuals"),
+          "judge": ("Compare with bands", "compare the residuals with the bands and decide")}
+
+# check-5 product class: (belongs to, plain name), in the order a step runs them
+_ATT, _MLP = "attention", "MLP"
+CLASSES: dict[str, tuple[str, str]] = {
+    "Y_q": (f"Forward · {_ATT}", "Query projection"),
+    "Y_k": (f"Forward · {_ATT}", "Key projection"),
+    "Y_v": (f"Forward · {_ATT}", "Value projection"),
+    "S": (f"Forward · {_ATT}", "Attention scores Q·Kᵀ"),
+    "O": (f"Forward · {_ATT}", "Attention mix A·V"),
+    "Y_o": (f"Forward · {_ATT}", "Attention output projection"),
+    "Y_gate": (f"Forward · {_MLP}", "Gate projection"),
+    "Y_up": (f"Forward · {_MLP}", "Up projection"),
+    "Y_down": (f"Forward · {_MLP}", "Down projection"),
+    "Lambda": ("Forward · output layer", "Output logits"),
+    "dF": ("Backward · output layer", "Gradient into the last hidden state"),
+    "G_E_head": ("Backward · output layer", "Output weight gradient (tied)"),
+    "G_head": ("Backward · output layer", "Output weight gradient"),
+    **{f"{k}_{x}": (f"Backward · {_MLP}", f"{what}, {x} projection")
+       for x in ("down", "up", "gate") for k, what in (("dX", "Input gradient"),
+                                                       ("G", "Weight gradient"))},
+    "dX_o": (f"Backward · {_ATT}", "Input gradient, output projection"),
+    "G_o": (f"Backward · {_ATT}", "Weight gradient, output projection"),
+    "dA": (f"Backward · {_ATT}", "Gradient of the attention weights"),
+    "dV": (f"Backward · {_ATT}", "Gradient of the values"),
+    "dQ": (f"Backward · {_ATT}", "Gradient of the queries"),
+    "dK": (f"Backward · {_ATT}", "Gradient of the keys"),
+    **{f"{k}_{x}": (f"Backward · {_ATT}", f"{what}, {name} projection")
+       for x, name in (("q", "query"), ("k", "key"), ("v", "value"))
+       for k, what in (("dX", "Input gradient"), ("G", "Weight gradient"))},
+}
+
+MARKS = {
+    "bottleneck": "takes at least {share} of the step and at least {ratio}× the time its work "
+                  "needs at this machine's measured speeds: time could be won here.",
+    "utilization": "the hardware use expected from the section's work and the use the sampler "
+                   "measured differ by more than 2×: the work estimate or the counter is off, "
+                   "so the bottleneck verdict is less certain.",
+    "memory": "reserved GPU memory reached {reserved} of what the GPU can use.",
+    "clock": "two clocks disagree on the section's time (host and GPU, or trace and host): "
+             "the time may be off.",
+}
 
 CSS = """
-:root{--bg:#fff;--fg:#1d2330;--mute:#5d6678;--line:#d3d8e2;--panel:#f5f7fa;--bar:#1d2330;
---barfg:#fff;--accent:#2457c5;--mark:#c2410c}
-@media (prefers-color-scheme:dark){:root{--bg:#14171d;--fg:#e4e8f0;--mute:#98a2b6;--line:#343b49;
---panel:#1c2029;--bar:#0b0d11;--barfg:#e4e8f0;--accent:#8ab0ff;--mark:#fb923c}}
+:root{--bg:#fcfcfb;--fg:#1d2330;--mute:#5f6470;--line:#d9d8d3;--panel:#f3f2ee;--bar:#1d2330;
+--barfg:#fff;--mark:#d03b3b;--hand:#898781;
+--c-train:#2a78d6;--c-record:#eda100;--c-commit:#008300;--c-read:#1baf7a;--c-update:#6250d6;
+--c-matmul:#eb6834;--c-other:#898781;
+--p-glue:#2a78d6;--p-host_stack:#eb6834;--p-copy:#1baf7a;--p-measure:#eda100;--p-judge:#e87ba4}
+@media (prefers-color-scheme:dark){:root{--bg:#1a1a19;--fg:#e8e6e1;--mute:#a3a198;
+--line:#3a3935;--panel:#24241f;--bar:#0e0e0d;--barfg:#e8e6e1;--mark:#d03b3b;--hand:#a3a198;
+--c-train:#3987e5;--c-record:#c98500;--c-commit:#008300;--c-read:#199e70;--c-update:#9085e9;
+--c-matmul:#d95926;--c-other:#898781;
+--p-glue:#3987e5;--p-host_stack:#d95926;--p-copy:#199e70;--p-measure:#c98500;--p-judge:#d55181}}
 *{box-sizing:border-box}
 body{margin:0;padding:64px 16px 48px;background:var(--bg);color:var(--fg);
 font:14px/1.45 system-ui,sans-serif}
-main{max-width:1200px;margin:0 auto}
+main{max-width:1100px;margin:0 auto}
 nav{position:fixed;top:0;left:0;right:0;z-index:5;background:var(--bar);color:var(--barfg);
 padding:8px 16px;display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;font-size:13px}
 nav a{color:var(--barfg);text-decoration:none;opacity:.85}nav a:hover{opacity:1;
 text-decoration:underline}
-nav .sep{opacity:.4}
 section{margin:0 0 28px;scroll-margin-top:56px}
 h1{font-size:22px;margin:8px 0}h2{font-size:18px;margin:24px 0 8px;border-bottom:1px solid var(--line);
 padding-bottom:4px}h3{font-size:15px;margin:16px 0 6px}
-.run-head{font-size:19px;margin:24px 0 4px}
-table{border-collapse:collapse;font-size:12.5px;margin:6px 0}
-th,td{border:1px solid var(--line);padding:3px 7px;text-align:right;white-space:nowrap}
-th{background:var(--panel)}td.l,th.l{text-align:left}
+.run-head{font-size:19px;margin:28px 0 4px;font-weight:600}
+p{max-width:820px}
+table{border-collapse:collapse;font-size:13px;margin:6px 0}
+th,td{border-bottom:1px solid var(--line);padding:4px 10px;text-align:right;white-space:nowrap}
+th{font-weight:600;border-bottom:2px solid var(--line)}td.l,th.l{text-align:left}
+td.w{white-space:normal;min-width:220px;color:var(--mute)}
+tr.part td{text-align:left;background:var(--panel);font-weight:600;white-space:normal}
+tr.part .mute{font-weight:400}
 .scroll{overflow-x:auto;max-width:100%}
-.badge{display:inline-block;background:var(--mark);color:#fff;border-radius:3px;padding:0 5px;
-margin-left:4px;font-size:11px}
-.warn{color:var(--mark)}.mute{color:var(--mute)}
-.legend{display:flex;flex-wrap:wrap;gap:2px 14px;font-size:12.5px;margin:6px 0}
-.sw{display:inline-block;width:11px;height:11px;margin-right:4px;vertical-align:-1px}
+.badge{display:inline-block;border:1px solid var(--mark);color:var(--mark);border-radius:3px;
+padding:0 5px;margin-left:4px;font-size:11px;line-height:16px}
+.warn{color:var(--mark)}.mute{color:var(--mute)}.small{font-size:12.5px}
+.code{color:var(--mute);font-size:12px;margin-left:4px}
+.legend{font-size:12.5px;margin:6px 0 4px}
+.legend .grp{display:flex;flex-wrap:wrap;gap:2px 14px;margin:2px 0}
+.legend .gt{min-width:270px;color:var(--mute)}
+.sw{display:inline-block;width:11px;height:11px;margin-right:5px;vertical-align:-1px;
+border-radius:2px}
+.hatch{background:repeating-linear-gradient(45deg,var(--hand) 0 2px,transparent 2px 4px);
+outline:1px solid var(--hand);outline-offset:-1px}
+.share{display:inline-block;height:8px;background:var(--mute);opacity:.55;margin-left:6px;
+vertical-align:0;border-radius:0 2px 2px 0}
+dl.marks{font-size:12.5px;margin:6px 0;display:grid;grid-template-columns:max-content 1fr;
+gap:2px 10px;max-width:820px}dl.marks dd{margin:0}
 svg{display:block;max-width:100%;height:auto}
-svg text{fill:var(--fg);font-size:11px}svg .mute{fill:var(--mute)}
-svg .axis{stroke:var(--line);fill:none}
-svg rect:hover,svg polyline:hover{stroke:var(--fg);stroke-width:1.5}
+svg text{fill:var(--fg);font-size:11px}svg .mute{fill:var(--mute)}svg .b{font-weight:600}
+svg .axis{stroke:var(--line);fill:none}svg .badge{fill:var(--mark);font-size:10px}
+svg .seg:hover,svg polyline:hover{stroke:var(--fg);stroke-width:1.5}
 select{font:inherit;padding:2px 6px}
 """
+
+DEFS = ('<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>'
+        '<pattern id="hatch" width="4" height="4" patternUnits="userSpaceOnUse" '
+        'patternTransform="rotate(45)"><rect width="4" height="4" fill="var(--bg)"/>'
+        '<rect width="2" height="4" fill="var(--hand)"/></pattern></defs></svg>')
 
 JS = """
 const sel=document.getElementById('picker');
@@ -96,39 +226,107 @@ def esc(x: Any) -> str:
 
 
 def fmt(v: Any) -> str:
-    """The one number formatter: null as a dash, 3-4 significant figures."""
+    """The one number formatter: null as a dash, two significant digits.
+
+    Below 0.01 and from 10 000 up a number is written in scientific form (``8.4e-03``); an
+    integer below 10 000 is a count and stays exact."""
     if v is None:
         return "—"
     if isinstance(v, bool):
         return "yes" if v else "no"
-    if isinstance(v, int):
-        return str(v) if abs(v) < 10 ** 6 else f"{v:.4g}"
-    if isinstance(v, float):
-        return f"{v:.4g}"
+    if isinstance(v, int) and abs(v) < 10 ** 4:
+        return str(v)
+    if isinstance(v, (int, float)):
+        x = float(f"{float(v):.2g}")
+        if x == 0 or not math.isfinite(x):
+            return "0" if x == 0 else str(x)
+        if abs(x) < 0.01 or abs(x) >= 10 ** 4:
+            return f"{x:.1e}"
+        return f"{x:.{max(0, 1 - math.floor(math.log10(abs(x))))}f}"
     return str(v)
 
 
+def pct(share: float | None) -> str:
+    """A share as a percentage through :func:`fmt`; a nonzero one under 0.1% is ``<0.1%``."""
+    if share is None:
+        return "—"
+    p = 100 * share
+    return "<0.1%" if 0 < p < 0.1 else f"{fmt(p)}%"
+
+
+def _tick(v: float) -> str:
+    return f"{v:.0e}" if v and abs(v) < 0.01 else f"{v:.3g}"
+
+
+def _ticks(top: float, n: int = 5) -> list[float]:
+    """Round tick values from 0 to at least ``top``, in steps of 1, 2 or 5 times a power of
+    ten."""
+    if top <= 0:
+        return [0.0, 1.0]
+    raw = top / n
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw * (1 - 1e-9))
+    return [i * step for i in range(math.ceil(top / step - 1e-9) + 1)]
+
+
 def _marks(marks: Sequence[str] | None) -> str:
-    return ", ".join(marks) if marks else "—"
+    return ", ".join(marks) if marks else "none"
 
 
-def _color(i: int) -> str:
-    return f"hsl({(i * 137.5) % 360:.0f},55%,55%)"
+INK_MIX = (0, 30, 50, 65)  # percent of text ink mixed into a group's color, by shade
+HATCH_OPACITY = (1.0, 0.55, 0.4, 0.3)
 
 
-def _lightness(share: float | None) -> int:
-    t = min(max(share or 0.0, 0.0) / 0.5, 1.0)
-    return round(94 - 56 * t)
+def _sec(code: str) -> tuple[str, int, str, str]:
+    return SECTIONS.get(code) or ("other", 0, code, "")
 
 
-def _fill(share: float | None) -> str:
-    """One hue: light at share 0, dark from 0.5 up."""
-    return f"hsl(215,70%,{_lightness(share)}%)"
+def _name(code: str) -> str:
+    return _sec(code)[2]
 
 
-def _ink(share: float | None) -> str:
-    """The label color that reads on :func:`_fill`."""
-    return "#111" if _lightness(share) >= 60 else "#fff"
+def _color(code: str) -> str:
+    """A section's group color, shaded toward the text ink, so every shade keeps its contrast
+    with the page in light and dark mode alike."""
+    g, shade = _sec(code)[:2]
+    c = f"var(--c-{g})"
+    return f"color-mix(in oklab, {c}, var(--fg) {INK_MIX[shade]}%)" if shade else c
+
+
+def _paint(code: str) -> str:
+    """The SVG fill of a section; the hand-off is hatched."""
+    g, shade = _sec(code)[:2]
+    if g == "hand":
+        return f'fill="url(#hatch)" fill-opacity="{HATCH_OPACITY[shade]}"'
+    return f'style="fill:{_color(code)}"'
+
+
+def _swatch(code: str) -> str:
+    g, shade = _sec(code)[:2]
+    if g == "hand":
+        return f'<span class="sw hatch" style="opacity:{HATCH_OPACITY[shade]}"></span>'
+    return f'<span class="sw" style="background:{_color(code)}"></span>'
+
+
+def _legend(codes: Sequence[str]) -> str:
+    """The sections' swatches with plain names (no codes), one line per group."""
+    by: dict[str, list[str]] = {}
+    for c in codes:
+        by.setdefault(_sec(c)[0], []).append(c)
+    rows = []
+    for g in GROUPS:
+        if g in by:
+            items = "".join(f"<span>{_swatch(c)}{esc(_name(c))}</span>" for c in by[g])
+            rows.append(f'<div class="grp"><span class="gt">{esc(GROUPS[g][1])}</span>{items}'
+                        "</div>")
+    return '<div class="legend">' + "".join(rows) + "</div>"
+
+
+def _phase_legend() -> str:
+    items = "".join(f'<span><span class="sw" style="background:var(--p-{p})"></span>'
+                    f"{esc(PHASES[p][0])}</span>"
+                    for p in C5_PHASES)
+    return f'<div class="legend"><div class="grp">{items}</div></div>'
 
 
 def _table(head: Sequence[Any], rows: Sequence[Sequence[Any]], left: Sequence[int] = (0,)) -> str:
@@ -140,38 +338,15 @@ def _table(head: Sequence[Any], rows: Sequence[Sequence[Any]], left: Sequence[in
     return f'<div class="scroll"><table><tr>{h}</tr>{body}</table></div>'
 
 
-def _kv(rows: Sequence[tuple[str, Any]]) -> str:
-    return _table(["key", "value"], [(k, fmt(v)) for k, v in rows], left=(0, 1))
-
-
-def _flat(d: Any, prefix: str = "") -> list[tuple[str, Any]]:
-    """Nested dicts as dotted keys; a list stays one value, written as JSON."""
-    out: list[tuple[str, Any]] = []
-    for k, v in (d or {}).items():
-        key = f"{prefix}{k}"
-        if isinstance(v, dict) and v:
-            out += _flat(v, key + ".")
-        elif isinstance(v, (list, dict)):
-            out.append((key, json.dumps(v) if v else None))
-        else:
-            out.append((key, v))
-    return out
-
-
-def _legend(items: Sequence[tuple[str, str]]) -> str:
-    return '<div class="legend">' + "".join(
-        f'<span><span class="sw" style="background:{c}"></span>{esc(n)}</span>'
-        for n, c in items) + "</div>"
-
-
 def _svg(w: float, h: float, body: str) -> str:
     return f'<svg viewBox="0 0 {w:.0f} {h:.0f}" width="{w:.0f}">{body}</svg>'
 
 
-def _rect(x: float, y: float, w: float, h: float, fill: str, tip: str, stroke: str = "none",
-          sw: float = 1) -> str:
-    return (f'<rect x="{x:.2f}" y="{y:.2f}" width="{max(w, 0.0):.2f}" height="{h:.2f}" '
-            f'fill="{fill}" stroke="{stroke}" stroke-width="{sw}"><title>{esc(tip)}</title></rect>')
+def _rect(x: float, y: float, w: float, h: float, paint: str, tip: str = "", extra: str = "") -> str:
+    title = f"<title>{esc(tip)}</title>" if tip else ""
+    cls = ' class="seg"' if tip else ""
+    return (f'<rect{cls} x="{x:.2f}" y="{y:.2f}" width="{max(w, 0.0):.2f}" height="{h:.2f}" '
+            f'{paint}{extra}>{title}</rect>')
 
 
 def _text(x: float, y: float, s: Any, cls: str = "", anchor: str = "start", extra: str = "") -> str:
@@ -179,12 +354,15 @@ def _text(x: float, y: float, s: Any, cls: str = "", anchor: str = "start", extr
     return f'<text x="{x:.1f}" y="{y:.1f}" text-anchor="{anchor}"{c}{extra}>{esc(s)}</text>'
 
 
-def _axis(x0: float, x1: float, y: float, top: float, span: float, ticks: int = 5) -> str:
+def _axis(x0: float, x1: float, y: float, top: float, ticks: Sequence[float], unit: str) -> str:
+    """A bottom axis with grid lines up to ``top``; ``ticks`` run from 0 to the scale's end."""
+    end = ticks[-1] or 1.0
     out = [f'<line class="axis" x1="{x0}" x2="{x1}" y1="{y}" y2="{y}"/>']
-    for k in range(ticks + 1):
-        x = x0 + (x1 - x0) * k / ticks
+    for t in ticks:
+        x = x0 + (x1 - x0) * t / end
         out.append(f'<line class="axis" x1="{x:.1f}" x2="{x:.1f}" y1="{top}" y2="{y + 3}"/>')
-        out.append(_text(x, y + 14, fmt(span * k / ticks), "mute", "middle"))
+        out.append(_text(x, y + 14, _tick(t), "mute", "middle"))
+    out.append(_text(x1, y + 28, unit, "mute", "end"))
     return "".join(out)
 
 
@@ -202,8 +380,13 @@ class Run:
         return "—" if v is None else str(v)
 
     @property
+    def model(self) -> str:
+        """The model's name without its publisher (``SmolLM2-135M-Instruct``)."""
+        return self.field("model").rsplit("/", 1)[-1]
+
+    @property
     def label(self) -> str:
-        return " · ".join(self.field(k) for k in ("model", "attack", "scenario", "session"))
+        return " · ".join([self.model] + [self.field(k) for k in ("attack", "scenario", "session")])
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -217,6 +400,9 @@ class Run:
         """Depth-0 sections that count: no totals, no rollups."""
         return {n: s for n, s in self.sections.items()
                 if s.get("depth") == 0 and not s.get("rollup") and n not in TOTALS}
+
+    def mean(self, n: str) -> float | None:
+        return ((self.sections.get(n) or {}).get("time") or {}).get("mean")
 
     def is_cpu(self) -> bool:
         if self.meta.get("device") == "cpu" or self.view.get("device") == "cpu":
@@ -244,281 +430,237 @@ def _distinct(xs: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(xs))
 
 
+def _part(code: str) -> str:
+    return GROUPS[_sec(code)[0]][0]
+
+
+def _by_part(names: Sequence[str]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for n in names:
+        out.setdefault(_part(n), []).append(n)
+    return out
+
+
 # ---- panels ------------------------------------------------------------------------------
 
 
 def _inputs(profiles: Sequence[dict[str, Any]], names: Sequence[str], runs: list[Run]) -> str:
-    rows = []
-    for i, (p, n) in enumerate(zip(profiles, names, strict=True)):
-        mine = [r for r in runs if r.file == i]
-        rows.append([n, "; ".join(r.label for r in mine) or "—",
-                     ", ".join(_distinct([r.field("model") for r in mine])) or "—",
-                     ", ".join(_distinct([r.field("session") for r in mine])) or "—"])
-    models = _distinct([r.field("model") for r in runs])
+    models = _distinct([r.model for r in runs])
     sessions = _distinct([r.field("session") for r in runs])
-    out = [f"<p>{len(runs)} run(s) in {len(profiles)} file(s). Models: "
-           f"{esc(', '.join(models) or '—')}. Sessions: {esc(', '.join(sessions) or '—')}.</p>",
-           _table(["file", "runs", "models", "sessions"], rows, left=(0, 1, 2, 3))]
+    dirs = _distinct([str(Path(n).parent) for n in names])
+    files = (f"{', '.join(Path(n).name for n in names)} in {dirs[0]}"
+             if len(dirs) == 1 and dirs[0] != "." else ", ".join(names))
+    out = [f"<p>{len(runs)} run(s) from {len(profiles)} file(s). Models: "
+           f"{esc(', '.join(models) or '—')}. Session(s): {esc(', '.join(sessions) or '—')}.</p>",
+           f'<p class="mute small">Files: {esc(files)}. The page is a summary; '
+           "every measure behind it (clocks, work counts, floors, sampler fields, hashing parts, "
+           "probe rates, machine facts, thresholds) stays in these files.</p>"]
     for p, n in zip(profiles, names, strict=True):
         if p.get("warnings"):
-            out.append(f"<h3>Warnings of {esc(n)}</h3><ul class=\"warn\">"
+            out.append(f"<h3>Warnings from {esc(n)}</h3><ul class=\"warn\">"
                        + "".join(f"<li>{esc(w)}</li>" for w in p["warnings"]) + "</ul>")
     return "".join(out)
 
 
-def _section_colors(secs: Sequence[str]) -> dict[str, str]:
-    return {n: _color(i) for i, n in enumerate(secs)}
+def _tip(run: Run, n: str) -> str:
+    s = run.sections[n]
+    return (f"{_name(n)} ({n})\nmean {fmt(run.mean(n))} s\n{pct(s.get('share'))} of step time\n"
+            f"marks {_marks(s.get('marks'))}")
+
+
+def _marks_legend(marks: Sequence[str], th: dict[str, Any] | None) -> str:
+    if not marks:
+        return ""
+    th = th or {}
+    words = {"share": pct(th.get("share", 0.1)), "ratio": fmt(th.get("ratio", 3.0)),
+             "reserved": pct(th.get("reserved", 0.95))}
+    rows = "".join(f'<dt><span class="badge">{esc(m)}</span></dt>'
+                   f"<dd>{esc(MARKS.get(m, '').format(**words) or '—')}</dd>" for m in marks)
+    return f'<p class="small" style="margin-bottom:0">Marks:</p><dl class="marks">{rows}</dl>'
 
 
 def _overview(run: Run) -> str:
     v = run.view
-    top = {n: s for n, s in run.top().items() if s.get("share") is not None}
-    colors = _section_colors(list(top))
-    facts = [("step_s", v.get("step_s")), ("n_steps", v.get("n_steps")),
-             ("device", v.get("device")), ("compute_dtype", run.profile.get("compute_dtype")),
-             ("share_total", v.get("share_total")),
-             ("hook_overhead_bound", v.get("hook_overhead_bound"))]
-    w, x = 1000.0, 0.0
-    total = sum(s["share"] for s in top.values()) or 1.0
-    segs = []
-    for n, s in top.items():
-        sw = w * s["share"] / total
-        t = s.get("time") or {}
-        tip = (f"{n}\nmean {fmt(t.get('mean'))} s\nshare {fmt(s['share'])}\n"
-               f"marks {_marks(s.get('marks'))}")
-        segs.append(_rect(x, 4, sw, 30, colors[n], tip,
-                          "var(--mark)" if s.get("marks") else "none", 2.5))
+    top = {n: s for n, s in run.top().items() if run.mean(n) is not None}
+    if not top:
+        return ""
+    parts = _by_part(list(top))
+    sums = {p: sum(run.mean(n) or 0.0 for n in ns) for p, ns in parts.items()}
+    dtype = run.profile.get("compute_dtype") or run.meta.get("compute_dtype")
+    said = ", ".join(f"the {p.lower()} {fmt(sums[p])} s" for p in ("Prover", "Hand-off",
+                                                                     "Verifier") if p in sums)
+    intro = (f"<p>One verified training step took <b>{fmt(v.get('step_s'))} s</b> on average over "
+             f"{fmt(v.get('n_steps'))} timed steps ({esc(v.get('device') or run.field('device'))}"
+             f"{', ' + esc(dtype) if dtype else ''}). Of that, {esc(said)}.</p>")
+
+    w, total = 1000.0, sum(run.mean(n) or 0.0 for n in top) or 1.0
+    segs, x = [], 0.0
+    spans: dict[str, list[float]] = {}
+    for n in top:
+        sw = w * (run.mean(n) or 0.0) / total
+        segs.append(_rect(x, 22, max(sw - 2, 0.6), 28, _paint(n), _tip(run, n)))
+        spans.setdefault(_part(n), [x, x])[1] = x + sw
         x += sw
+    for p, (a, b) in spans.items():
+        if b - a >= 70:
+            segs.append(f'<line class="axis" x1="{a:.1f}" x2="{b - 2:.1f}" y1="16" y2="16"/>')
+            segs.append(_text(a, 11, f"{p} {fmt(sums[p])} s", "mute"))
+    bar = _svg(w, 54, "".join(segs))
+
     rows = []
-    for n, s in top.items():
-        badges = "".join(f'<span class="badge">{esc(m)}</span>' for m in s.get("marks") or [])
-        rows.append([Raw(f'<span class="sw" style="background:{colors[n]}"></span>{esc(n)}'
-                         f'{badges}'),
-                     fmt((s.get("time") or {}).get("mean")), fmt(s["share"])])
-    return (_kv(facts) + _svg(w, 38, "".join(segs))
-            + _table(["section", "mean time (s)", "share"], rows, left=(0,)))
+    marks: list[str] = []
+    for p, ns in parts.items():
+        share = sum(top[n].get("share") or 0.0 for n in ns)
+        rows.append(f'<tr class="part"><td colspan="5">{esc(p)} <span class="mute">— '
+                    f"{esc(PARTS[p])} · {fmt(sums[p])} s · {pct(share)}</span></td></tr>")
+        for n in ns:
+            s = top[n]
+            ms = s.get("marks") or []
+            marks += ms
+            badges = "".join(f'<span class="badge">{esc(m)}</span>' for m in ms)
+            share = s.get("share")
+            bar_w = round(80 * min(share or 0.0, 1.0))
+            rows.append(f'<tr><td class="l">{_swatch(n)}{esc(_name(n))}'
+                        f'<span class="code">{esc(n)}</span></td>'
+                        f'<td class="l w">{esc(_sec(n)[3])}</td>'
+                        f"<td>{fmt(run.mean(n))}</td>"
+                        f'<td class="l">{pct(share)}<span class="share" '
+                        f'style="width:{bar_w}px"></span></td>'
+                        f'<td class="l">{badges}</td></tr>')
+    head = ('<tr><th class="l">Section</th><th class="l">What it does</th>'
+            '<th>Mean time (s)</th><th class="l">Share of step time</th>'
+            '<th class="l">Marks</th></tr>')
+    note = ('<p class="mute small">Share of step time: the section\'s mean time over the mean '
+            "time of one whole verified step (prover, hand-off and verifier). The training rows "
+            "are the prover's own training with the matmul capture on; plain training, without "
+            "the protocol, is compared in Prover beside plain.</p>")
+    return (intro + bar + f'<div class="scroll"><table>{head}{"".join(rows)}</table></div>' + note
+            + _marks_legend(_distinct(marks), run.profile.get("thresholds")))
 
 
-def _lanes_of(sec: dict[str, Any], cpu: bool) -> list[str]:
-    w = sec.get("work") or {}
-    b = w.get("bytes") or {}
-    lanes = []
-    if w.get("flops"):
-        lanes.append("CPU threads" if cpu else "GPU compute")
-    if not cpu:
-        if b.get("hbm"):
-            lanes.append("GPU memory (HBM)")
-        if b.get("h2d") or b.get("d2h"):
-            lanes.append("PCIe")
-    if (b.get("hash") or w.get("leaves")) and "CPU threads" not in lanes:
-        lanes.append("CPU threads")
-    return lanes or ["Host"]
+def _cores(run: Run) -> float:
+    """The CPU scale of the flow's gauges: the cores the machine allowed the run."""
+    m = run.profile.get("machine") or {}
+    for k in ("cgroup_cpu_quota", "usable_cpus", "logical_cpus"):
+        if isinstance(m.get(k), (int, float)) and m[k] > 0:
+            return float(m[k])
+    seen = [(s.get("util") or {}).get("c_tree") or 0.0 for s in run.top().values()]
+    return max([1.0, *seen])
 
 
-def _arch(run: Run) -> str:
-    cpu = run.is_cpu()
-    lanes = CPU_LANES if cpu else GPU_LANES
-    secs = run.sections
-    blocks = [n for n in run.top()]
-    prover = [n for n in blocks if n.startswith(("P", "train."))]
-    verifier = [n for n in blocks if n not in prover]
-    if not prover and not verifier:
-        return ""
-    c5 = run.view.get("c5") or {}
-    c5_phases = {p: (c5.get("phases_s") or {}).get(p) or 0.0 for p in C5_PHASES}
-    step_s = run.view.get("step_s")
-    left, lane_h, head_h, pad, gap = 130.0, 44.0, 26.0, 5.0, 70.0
-
-    def width(n: str) -> float:
-        if n == "5" and sum(c5_phases.values()) > 0:
-            return 230.0
-        return 80.0 if n == "6b" and "6b.glue" in secs else 34.0
-
-    def sub_share(seconds: float) -> float | None:
-        return seconds / step_s if step_s else None
-
-    x = left
-    out: list[str] = []
-    pos: dict[str, float] = {}
-    spans = []
-    for group, names in (("Prover", prover), ("Verifier", verifier)):
-        start = x
-        for n in names:
-            pos[n] = x
-            x += width(n) + pad
-        spans.append((group, start, x - pad, bool(names)))
-        x += gap
-    total_w = x - gap + 130
-    h = head_h + lane_h * len(lanes) + 110
-    for k, lane in enumerate(lanes):
-        y = head_h + k * lane_h
-        out.append(f'<rect x="0" y="{y}" width="{total_w:.0f}" height="{lane_h}" fill="none" '
-                   f'stroke="var(--line)"/>')
-        out.append(_text(6, y + lane_h / 2 + 4, lane, "mute"))
-    for group, a, b, present in spans:
-        if present:
-            out.append(_text((a + b) / 2, 15, group, "", "middle", ' style="font-weight:600"'))
-            out.append(f'<line class="axis" x1="{a:.1f}" x2="{b:.1f}" y1="20" y2="20"/>')
-    if prover and verifier:
-        a, b = spans[0][2], spans[1][1]
-        y = head_h + lane_h * len(lanes) / 2
-        out.append(f'<line x1="{a + 8:.1f}" x2="{b - 8:.1f}" y1="{y}" y2="{y}" '
-                   f'stroke="var(--fg)" stroke-width="2"/>')
-        out.append(f'<polygon points="{b - 8:.1f},{y - 6} {b - 8:.1f},{y + 6} {b + 2:.1f},{y}" '
-                   f'fill="var(--fg)"/>')
-        out.append(_text((a + b) / 2, y - 10, "handoff", "mute", "middle"))
-    for n in prover + verifier:
-        s = secs[n]
-        bw, bx = width(n), pos[n]
-        t = s.get("time") or {}
-        used = _lanes_of(s, cpu)
-        tip = (f"{n}\nmean {fmt(t.get('mean'))} s\nshare {fmt(s.get('share'))}\n"
-               f"lanes {', '.join(used)}\nmarks {_marks(s.get('marks'))}")
-        marked = bool(s.get("marks"))
-        for ln in used:
-            y = head_h + lanes.index(ln) * lane_h + 4
-            out.append(_rect(bx, y, bw, lane_h - 8, _fill(s.get("share")), tip,
-                             "var(--mark)" if marked else "var(--line)", 3 if marked else 1))
-        y0 = head_h + lanes.index(used[0]) * lane_h + 8
-        subs: list[tuple[str, float, float | None]] = []
-        if n == "5" and sum(c5_phases.values()) > 0:
-            subs = [(f"5.{p}", c5_phases[p], sub_share(c5_phases[p])) for p in C5_PHASES]
-            tot = sum(c5_phases.values())
-            sx = bx + 2
-            for name, secs_, share in subs:
-                sw = (bw - 4) * secs_ / tot
-                if sw > 0:
-                    out.append(_rect(sx, y0, sw, lane_h - 16, _fill(share),
-                                     f"{name}\n{fmt(secs_)} s\nshare {fmt(share)}", "var(--fg)"))
-                    if sw >= 38:
-                        out.append(_text(sx + sw / 2, y0 + (lane_h - 16) / 2 + 4,
-                                         name.split(".")[1][:7], "", "middle",
-                                         f' style="fill:{_ink(share)}"'))
-                sx += sw
-        elif n == "6b" and "6b.glue" in secs:
-            g = (secs["6b.glue"].get("time") or {}).get("mean") or 0.0
-            tot_t = t.get("mean") or 0.0
-            gs = secs["6b.glue"].get("share")
-            if g > 0 and tot_t > 0:
-                out.append(_rect(bx + 2, y0, (bw - 4) * min(g / tot_t, 1.0), lane_h - 16,
-                                 _fill(gs), f"6b.glue\n{fmt(g)} s\nshare {fmt(gs)}", "var(--fg)"))
-        ly = head_h + lane_h * len(lanes) + 10
-        out.append(_text(bx + bw / 2, ly, n, "", "start",
-                         f' transform="rotate(55 {bx + bw / 2:.1f} {ly})"'))
-    cap = ""
-    if "5" in secs and sum(c5_phases.values()) > 0:
-        cap = ("<p class=\"mute\">Check 5 phases (s): " + esc(", ".join(
-            f"{p} {fmt(c5_phases[p])}" for p in C5_PHASES)) + ". The run time of check 5 is the "
-            "whole run, not a phase, so it has no sub-block.</p>")
-    return (_svg(total_w, h, "".join(out)) + cap
-            + '<p class="mute">Fill: share of the step, light at 0 to dark from 0.5. '
-              'Thick outline: the section carries a mark. Nested blocks: check 5\'s phases and '
-              'check 6b\'s glue.</p>')
-
-
-def _sections_table(run: Run) -> str:
-    secs = run.sections
-    if not secs:
-        return ""
-    fields = _distinct([k for s in secs.values() for k in (s.get("util") or {})
-                        if k not in UTIL_META])
-    head = (["section", "depth", "mean s", "median s", "min s", "max s", "n", "share",
-             "host s", "gpu s", "trace s", "agree"] + [f"util {f}" for f in fields]
-            + ["n_samples", "few_samples", "flops", "hbm B", "h2d B", "d2h B", "hash B",
-               "leaves", "launches", "syncs", "floors s", "floor s", "bound", "ratio", "marks"])
-    rows = []
-    for n, s in secs.items():
-        t, c, u = s.get("time") or {}, s.get("clocks") or {}, s.get("util") or {}
-        w = s.get("work") or {}
-        b = w.get("bytes") or {}
-        tag = ' <span class="mute">rollup</span>' if s.get("rollup") else ""
-        name = Raw(f'<span style="padding-left:{(s.get("depth") or 0) * 14}px">{esc(n)}</span>'
-                   f'{tag}')
-        rows.append([
-            name, fmt(s.get("depth")), fmt(t.get("mean")), fmt(t.get("median")), fmt(t.get("min")),
-            fmt(t.get("max")), fmt(t.get("n")), fmt(s.get("share")), fmt(c.get("host_s")),
-            fmt(c.get("gpu_s")), fmt(c.get("trace_s")), fmt(c.get("agree")),
-            *[fmt(u.get(f)) for f in fields], fmt(u.get("n_samples")), fmt(u.get("few_samples")),
-            "; ".join(f"{k} {fmt(v)}" for k, v in (w.get("flops") or {}).items()) or "—",
-            fmt(b.get("hbm")), fmt(b.get("h2d")), fmt(b.get("d2h")), fmt(b.get("hash")),
-            fmt(w.get("leaves")), fmt(w.get("launches")), fmt(w.get("syncs")),
-            "; ".join(f"{k} {fmt(v)}" for k, v in (s.get("floors_s") or {}).items()) or "—",
-            fmt(s.get("floor_s")), fmt(s.get("bound")), fmt(s.get("ratio")),
-            _marks(s.get("marks"))])
-    return _table(head, rows, left=(0, len(head) - 1, len(head) - 3))
-
-
-def _hash_table(run: Run) -> str:
-    """The hashing breakdown of the commit and of check 2: the wall time, then each part with
-    its lane, share and floor, the sibling parts and what the caller's parts leave
-    unaccounted. A run with no stats gets the wall-time line and a note."""
-    hv = run.view.get("hash") or {}
-    if not hv:
-        return ""
-    out = []
-    for key, h in hv.items():
-        w = h.get("wall") or {}
-        rows: list[list[Any]] = [["hashing wall", "—", fmt(w.get("s")), "—",
-                                  fmt(w.get("floor_s")), fmt(w.get("ratio"))]]
-        for p, v in (h.get("parts") or {}).items():
-            if v:
-                rows.append([p, v.get("lane"), fmt(v.get("s")), fmt(v.get("share")),
-                             fmt(v.get("floor_s")), "—"])
-        for n, s in (h.get("siblings") or {}).items():
-            rows.append([f"outside the hash: {n}", "—", fmt(s), "—", "—", "—"])
-        if h.get("has_stats"):
-            rows.append(["unaccounted (wall less the caller's parts)", "—",
-                         fmt(h.get("unaccounted_s")), "—", "—", "—"])
-        note = "" if h.get("has_stats") else (
-            '<p class="mute">No part timings in this run (it predates the breakdown).</p>')
-        out.append(
-            f"<h3>{esc(h.get('section'))}.hash</h3>"
-            + _table(["part", "lane", "mean s", "share of wall", "floor s", "wall / floor"],
-                     rows, left=(0, 1))
-            + note
-            + f'<p class="mute">{fmt(h.get("n_steps"))} steps; leaves {fmt(h.get("leaves"))}, '
-              f'hashed bytes {fmt(h.get("hash_bytes"))}. The caller\'s parts (read, producer, '
-              'wait) add up to the wall time; the worker\'s (native, big, other) run beside '
-              'them. The floor is bytes and leaves at the probe\'s rates; there is no tree '
-              'floor.</p>')
+def _gauge(x: float, y: float, label: str, frac: float | None, value: str) -> str:
+    """A labeled meter: track, fill to ``frac`` (none when unknown) and the value."""
+    out = [_text(x, y + 6, label, "mute"),
+           f'<rect x="{x + 30:.1f}" y="{y}" width="70" height="7" rx="1.5" fill="var(--line)"/>']
+    if frac is not None:
+        out.append(f'<rect x="{x + 30:.1f}" y="{y}" width="{70 * min(max(frac, 0.0), 1.0):.1f}" '
+                   'height="7" rx="1.5" fill="var(--fg)" fill-opacity="0.7"/>')
+    out.append(_text(x + 106, y + 6, value, "mute"))
     return "".join(out)
 
 
+def _flow(run: Run) -> str:
+    top = run.top()
+    if not top:
+        return ""
+    cpu, cores = run.is_cpu(), _cores(run)
+    bw, gap, per_row = 186.0, 14.0, 5
+    bh = 92.0 if cpu else 107.0
+    out: list[str] = []
+    y = 0.0
+    for p, ns in _by_part(list(top)).items():
+        out.append(_text(0, y + 13, p, "b") + _text(len(p) * 7.5 + 8, y + 13, f"— {PARTS[p]}",
+                                                    "mute"))
+        y += 22
+        for i, n in enumerate(ns):
+            col, row = i % per_row, i // per_row
+            if col == 0 and row:
+                y += bh + 12
+            x = col * (bw + gap)
+            s, u = top[n], top[n].get("util") or {}
+            few = bool(u.get("few_samples"))
+            ms = s.get("marks") or []
+            g, c = u.get("g_util"), u.get("c_tree")
+            tip = (f"{_name(n)} ({n})\n{_sec(n)[3]}\nmean {fmt(run.mean(n))} s · "
+                   f"{pct(s.get('share'))} of step"
+                   + ("" if cpu else f"\nGPU busy {pct(None if few else g)}")
+                   + f"\nCPU {fmt(None if few else c)} cores\nmarks {_marks(ms)}")
+            stroke = 'stroke="var(--mark)" stroke-width="2"' if ms else \
+                'stroke="var(--line)" stroke-width="1"'
+            box = [f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw}" height="{bh}" rx="4" '
+                   f'fill="var(--bg)" {stroke}/>',
+                   _rect(x + 1, y + 1, 7, bh - 2, _paint(n)),
+                   _text(x + 16, y + 18, _name(n), "b"), _text(x + 16, y + 33, n, "mute"),
+                   _text(x + 16, y + 50, f"{fmt(run.mean(n))} s · {pct(s.get('share'))} of step")]
+            gy = y + 60
+            if not cpu:
+                box.append(_gauge(x + 16, gy, "GPU", None if few or g is None else g,
+                                  "—" if few or g is None else pct(g)))
+                gy += 15
+            box.append(_gauge(x + 16, gy, "CPU", None if few or c is None else c / cores,
+                              "—" if few or c is None else f"{fmt(c)} cores"))
+            if ms:
+                box.append(_text(x + 16, y + bh - 8, " · ".join(ms), "badge"))
+            out.append(f'<g><title>{esc(tip)}</title>{"".join(box)}</g>')
+            if col < per_row - 1 and i < len(ns) - 1:
+                ax, ay = x + bw + 3, y + bh / 2
+                out.append(f'<path d="M{ax:.1f} {ay - 4:.1f} L{ax + 7:.1f} {ay:.1f} '
+                           f'L{ax:.1f} {ay + 4:.1f}" fill="none" stroke="var(--mute)"/>')
+        y += bh + 22
+    w = per_row * bw + (per_row - 1) * gap
+    gpu_words = "" if cpu else ("GPU: the share of the section's time in which a GPU kernel "
+                                "was running. ")
+    return (_svg(w + 2, y, "".join(out))
+            + f'<p class="mute small">Each box is one section of the step, in the order it runs '
+              f"(left to right, then down); its color strip is the one the overview and the "
+              f"timeline use, and a red outline means a mark (see the overview). {gpu_words}CPU: the cores "
+              f"the run's processes kept busy on average, on a scale to the {fmt(cores)} cores "
+              "this machine allowed. A dash means the section was too short for the sampler "
+              "(under 3 samples).</p>")
+
+
 def _polylines(ts: list[float], vals: list[float | None], x: Callable[[float], float],
-               y: Callable[[float], float], color: str, name: str) -> str:
+               y: Callable[[float], float], tip: str, dash: bool = False) -> str:
     runs: list[list[tuple[float, float]]] = [[]]
     for t, v in zip(ts, vals, strict=True):
         if v is None:
             runs.append([])
         else:
             runs[-1].append((t, v))
-    present = [v for v in vals if v is not None]
-    tip = f"{name}\nmean {fmt(sum(present) / len(present))}\nmax {fmt(max(present))}\n" \
-          f"n {fmt(len(present))}" if present else name
+    style = ' stroke-dasharray="4 3"' if dash else ""
     return "".join(
-        f'<polyline fill="none" stroke="{color}" stroke-width="1.2" points="'
+        f'<polyline fill="none" stroke="var(--fg)" stroke-opacity="0.75" stroke-width="1.5"'
+        f'{style} points="'
         + " ".join(f"{x(t) + dx:.1f},{y(v):.1f}" for t, v in r for dx in
                    ((0.0, 2.0) if len(r) == 1 else (0.0,)))
         + f'"><title>{esc(tip)}</title></polyline>' for r in runs if len(r) >= 1)
+
+
+STRIPS = {"g_util": ("GPU busy", "share of time a GPU kernel ran, 0 to 100%"),
+          "c_busy": ("CPU cores", "busy CPU cores on the whole machine"),
+          "pcie": ("PCIe", "PCIe traffic in GB/s; solid into the GPU, dashed out of it")}
 
 
 def _timeline(run: Run) -> str:
     steps = (run.view.get("timeline") or {}).get("steps") or []
     if not steps:
         return ""
-    axis_s = max((s.get("end_s") or 0.0) for s in steps) or 1.0
     names = _distinct([sec["name"] for s in steps for sec in s["sections"] if sec["depth"] == 0
-                       and not (run.sections.get(sec["name"]) or {}).get("rollup")])
-    colors = _section_colors(names)
-    left, pw, span_h, strip_h = 70.0, 900.0, 16.0, 20.0
+                       and not (run.sections.get(sec["name"]) or {}).get("rollup")
+                       and sec["name"] not in TOTALS])
+    ticks = _ticks(max((s.get("end_s") or 0.0) for s in steps) or 1.0, 8)
+    axis_s = ticks[-1]
+    left, pw, span_h, strip_h = 78.0, 900.0, 18.0, 20.0
 
-    def strips_of(s: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    def strips_of(s: dict[str, Any]) -> dict[str, dict[str, list[float | None]]]:
         st = s.get("strips") or {}
         out: dict[str, Any] = {}
-        for k in ("g_util", "c_busy"):
-            if k in st:
-                out[k] = {k: st[k]}
-        pc = {k: st[k] for k in ("g_pcie_tx", "g_pcie_rx") if k in st}
+        if "g_util" in st:
+            out["g_util"] = {"g_util": st["g_util"]}
+        if "c_busy" in st:
+            out["c_busy"] = {"c_busy": st["c_busy"]}
+        pc = {k: [None if v is None else v / 1e9 for v in st[k]]
+              for k in ("g_pcie_rx", "g_pcie_tx") if k in st}
         if pc:
             out["pcie"] = pc
         return out
@@ -536,187 +678,130 @@ def _timeline(run: Run) -> str:
     out: list[str] = []
     y = 4.0
     for s in steps:
-        out.append(_text(4, y + 12, f"step {s['step']}"))
+        out.append(_text(left - 8, y + 13, f"step {s['step']}", "b", "end"))
         for sec in s["sections"]:
-            if sec["depth"] != 0 or sec["name"] not in colors:
+            if sec["depth"] != 0 or sec["name"] not in names:
                 continue
+            n = sec["name"]
             for a, b in sec["spans_s"]:
-                tip = f"{sec['name']}\nstep {s['step']}\nstart {fmt(a)} s\nend {fmt(b)} s"
-                out.append(_rect(x(a), y, max(x(b) - x(a), 0.6), span_h, colors[sec["name"]], tip))
+                tip = f"{_name(n)} ({n})\nstep {s['step']}\nfrom {fmt(a)} s to {fmt(b)} s"
+                out.append(_rect(x(a), y, max(x(b) - x(a), 0.6), span_h, _paint(n), tip,
+                                 ' stroke="var(--bg)" stroke-width="0.6"'))
         y += span_h + 4
-        strips = strips_of(s)
-        for key, cols in strips.items():
+        for key, cols in strips_of(s).items():
             top = maxes[key] or 1.0
             out.append(f'<line class="axis" x1="{left}" x2="{left + pw}" y1="{y + strip_h}" '
                        f'y2="{y + strip_h}"/>')
-            out.append(_text(left - 4, y + 10, STRIP_SHORT[key], "mute", "end"))
-            for j, (fld, vals) in enumerate(cols.items()):
-                col = "var(--accent)" if j == 0 else "var(--mark)"
+            out.append(_text(left - 8, y + 14, STRIPS[key][0], "mute", "end"))
+            for fld, vals in cols.items():
+                word = {"g_pcie_rx": "into the GPU", "g_pcie_tx": "out of the GPU"}.get(fld, "")
                 out.append(_polylines(s["strips"]["t_s"], vals, x,
                                       lambda v, y=y, top=top: y + strip_h - strip_h * v / top,
-                                      col, f"{fld}\nstep {s['step']}"))
-            y += strip_h + 2
+                                      f"{STRIPS[key][0]} {word}".strip() + f"\nstep {s['step']}",
+                                      fld == "g_pcie_tx"))
+            y += strip_h + 3
         y += 10
-    out.append(_axis(left, left + pw, y, 0, axis_s))
-    used = [k for k in STRIP_LABELS if k in maxes and any(k in strips_of(s) for s in steps)]
-    note = ("Strips: " + ", ".join(f"{STRIP_LABELS[k]} up to {fmt(maxes[k])}" for k in used) + "."
-            if used else "No sampler data for this run.")
-    return (_legend([(n, colors[n]) for n in names]) + _svg(left + pw + 20, y + 24, "".join(out))
-            + f'<p class="mute">Seconds from each step\'s start. {esc(note)}</p>')
-
-
-MAX_BARS = 300  # runs-over-time bars per step; more runs are binned
-
-
-def _bins(n: int) -> list[range]:
-    """Consecutive index ranges of equal size (the last may be shorter), at most MAX_BARS."""
-    size = -(-n // MAX_BARS)
-    return [range(i, min(i + size, n)) for i in range(0, n, size)]
-
-
-def _bin_peak(over: dict[str, Any]) -> float | None:
-    """The largest bin's seconds when any step has more than MAX_BARS runs, else ``None``."""
-    if all(len(st.get("run") or []) <= MAX_BARS for st in over.values()):
-        return None
-    return max((sum(st["dur_s"][i] for i in b) for st in over.values()
-                for b in _bins(len(st["run"])) if st.get("run")), default=0.0) or 1.0
-
-
-def _run_bars(st: dict[str, Any], ccol: dict[str, str], left: float, pw: float, axis_s: float,
-              y: float, peak: float | None) -> str:
-    """One bar per run, or when ``peak`` is set, one bar per bin of consecutive runs: it spans
-    the bin's first start to last end, and its height is the bin's seconds on a scale to peak."""
-    runs, cls, start, dur = st.get("run") or [], st.get("class") or [], st["start_s"], st["dur_s"]
-    if not runs:
-        return ""
-    out = []
-    if peak is None:
-        for r, c, a, d in zip(runs, cls, start, dur, strict=True):
-            out.append(_rect(left + pw * a / axis_s, y, max(pw * d / axis_s, 0.6), 16,
-                             ccol.get(c, "gray"),
-                             f"run {r}\nclass {c if c else '—'}\nstart {fmt(a)} s\n"
-                             f"duration {fmt(d)} s"))
-        return "".join(out)
-    for b in _bins(len(runs)):
-        i, j = b[0], b[-1]
-        secs = sum(dur[k] for k in b)
-        classes = _distinct([cls[k] or "—" for k in b])
-        end = max(start[k] + dur[k] for k in b)
-        h = max(40 * secs / peak, 1.0)
-        out.append(_rect(left + pw * start[i] / axis_s, y + 40 - h,
-                         max(pw * (end - start[i]) / axis_s, 0.6), h,
-                         ccol.get(classes[0], "gray") if len(classes) == 1 else "var(--mute)",
-                         f"runs {runs[i]}-{runs[j]}\nclass {', '.join(classes)}\n"
-                         f"start {fmt(start[i])} s\nseconds {fmt(secs)} s"))
-    return "".join(out)
+    out.append(_axis(left, left + pw, y, 0, ticks, "seconds from the step's start"))
+    used = [k for k in STRIPS if any(k in strips_of(s) for s in steps)]
+    top_words = {"g_util": "", "c_busy": f", up to {fmt(maxes.get('c_busy'))}",
+                 "pcie": f", up to {fmt(maxes.get('pcie'))} GB/s"}
+    note = (" Lines under each step: " + "; ".join(f"{STRIPS[k][0]}, {STRIPS[k][1]}{top_words[k]}"
+                                                    for k in used) + "."
+            if used else " No sampler data for this run.")
+    return (_legend(names) + _svg(left + pw + 20, y + 34, "".join(out))
+            + f'<p class="mute small">Each bar is one timed step, its sections drawn where they '
+              f"ran.{esc(note)}</p>")
 
 
 def _c5(run: Run) -> str:
     c5 = run.view.get("c5")
     if not c5:
         return ""
+    phases = {p: (c5.get("phases_s") or {}).get(p) or 0.0 for p in C5_PHASES}
+    whole = run.mean("5")
+    share = (run.sections.get("5") or {}).get("share")
+    intro = ("<p>Check 5 checks every captured matmul with Freivalds' algorithm: it multiplies "
+             "the claimed product and its inputs by random vectors and compares the results. "
+             + (f"It took <b>{fmt(whole)} s</b> per step ({pct(share)} of the step). "
+                if whole is not None else "")
+             + f"Its five timed phases add up to {fmt(sum(phases.values()))} s per step:</p>")
+    steps = "".join(f"<li><b>{esc(PHASES[p][0])}</b> <span class=\"code\">{esc(p)}</span> — "
+                    f"{esc(PHASES[p][1])}: {fmt(phases[p])} s</li>" for p in C5_PHASES)
+    out = [intro, f'<ul class="small">{steps}</ul>']
     classes = c5.get("classes") or {}
-    cols = (["class", "n_runs", "n_groups", "product_bytes", "served_bytes"]
-            + [f"{p} s" for p in ("run", *C5_PHASES)] + ["stored B/s", "served B/s"])
-    rows = []
-    for name, c in classes.items():
-        ph, cp = c.get("phases_s") or {}, c.get("copy_bytes_per_s") or {}
-        rows.append([name, fmt(c.get("n_runs")), fmt(c.get("n_groups")),
-                     fmt(c.get("product_bytes")), fmt(c.get("served_bytes")),
-                     *[fmt(ph.get(p)) for p in ("run", *C5_PHASES)],
-                     fmt(cp.get("stored")), fmt(cp.get("served"))])
-    out = [_table(cols, rows)] if rows else []
-    if rows:
-        out.append('<p class="mute">run s counts each run\'s whole time against the class of '
-                   "the run's first group; classes served inside another class's run "
-                   "(e.g. O inside S) show 0 there.</p>")
-    pcol = {p: _color(i) for i, p in enumerate(C5_PHASES)}
-    if classes:
-        mx = max(sum((c.get("phases_s") or {}).get(p) or 0.0 for p in C5_PHASES)
-                 for c in classes.values()) or 1.0
-        body, y = [], 4.0
-        for name, c in classes.items():
-            body.append(_text(4, y + 12, name))
-            xx = 150.0
-            for p in C5_PHASES:
-                v = (c.get("phases_s") or {}).get(p) or 0.0
-                w = 700 * v / mx
-                body.append(_rect(xx, y, w, 16, pcol[p], f"{name}\n{p} {fmt(v)} s"))
-                xx += w
-            y += 22
-        out.append("<h3>Phase time by class</h3>" + _legend(list(pcol.items()))
-                   + _svg(900, y + 6, "".join(body)))
-    over = c5.get("runs_over_time") or {}
-    if over:
-        names = sorted({c for st in over.values() for c in st.get("class") or [] if c})
-        ccol = {c: _color(i) for i, c in enumerate(names)}
-        axis_s = max((max((a + d for a, d in zip(st.get("start_s") or [],
-                                                 st.get("dur_s") or [], strict=True)), default=0.0)
-                      for st in over.values()), default=0.0) or 1.0
-        left, pw = 70.0, 900.0
-        body, y = [], 4.0
-        peak = _bin_peak(over)
-        for step, st in over.items():
-            body.append(_text(4, y + 12, f"step {step}"))
-            body.append(_run_bars(st, ccol, left, pw, axis_s, y, peak))
-            y += 22 if peak is None else 46
-        body.append(_axis(left, left + pw, y + 2, 0, axis_s))
-        out.append("<h3>Runs over time</h3>" + _legend(list(ccol.items()))
-                   + _svg(left + pw + 20, y + 26, "".join(body)))
-    var = c5.get("variance") or {}
-    fields = _distinct([f for s in (var.get("steps") or []) for f in s.get("sampler") or {}])
-    for key, label in (("steps", "Per step"), ("windows", "Per window")):
-        tab = var.get(key) or []
-        if tab:
-            head = (["step"] + (["window"] if key == "windows" else [])
-                    + [f"{p} s" for p in ("run", *C5_PHASES)] + fields)
-            rows = [[fmt(t.get("step"))] + ([fmt(t.get("window"))] if key == "windows" else [])
-                    + [fmt((t.get("phases_s") or {}).get(p)) for p in ("run", *C5_PHASES)]
-                    + [fmt((t.get("sampler") or {}).get(f)) for f in fields] for t in tab]
-            out.append(f"<h3>Variance: {label.lower()}</h3>" + _table(head, rows, left=()))
-    for key, label in (("across_steps", "across steps"), ("across_windows", "across windows")):
-        cor = (var.get("correlation") or {}).get(key) or {}
-        cf = _distinct([f for d in cor.values() for f in d])
-        if cor and cf:
-            out.append(f"<h3>Correlation of phase time with sampler fields, {label}</h3>"
-                       + _table(["phase", *cf], [[p, *[fmt(d.get(f)) for f in cf]]
-                                                 for p, d in cor.items()]))
+    if not classes:
+        return "".join(out)
+    order = list(CLASSES) + sorted(c for c in classes if c not in CLASSES)
+    rows = [c for c in order if c in classes]
+
+    def plain(c: str) -> tuple[str, str]:
+        group, name = CLASSES.get(c, ("Other", c))
+        if c == "dV" and not {"dQ", "dK"} & set(classes):
+            name = "Gradients of values, queries and keys"
+        return group, name
+
+    def secs(c: str) -> dict[str, float]:
+        return {p: (classes[c].get("phases_s") or {}).get(p) or 0.0 for p in C5_PHASES}
+
+    ticks = _ticks(max(sum(secs(c).values()) for c in rows) or 1.0)
+    x0, pw, rh = 455.0, 430.0, 19.0
+    body = [_text(4, 12, "Belongs to", "b"), _text(165, 12, "Matmul product", "b"),
+            _text(x0, 12, "Seconds per step, by phase", "b")]
+    y, last = 22.0, None
+    for c in rows:
+        group, name = plain(c)
+        if group != last:
+            if last is not None:
+                body.append(f'<line class="axis" x1="0" x2="{x0 + pw}" y1="{y - 2}" '
+                            f'y2="{y - 2}"/>')
+            body.append(_text(4, y + 13, group))
+            last = group
+        body.append(_text(165, y + 13, name) + _text(x0 - 8, y + 13, c, "mute", "end"))
+        xx = x0
+        for p, v in secs(c).items():
+            w = pw * v / ticks[-1]
+            if w > 0:
+                body.append(_rect(xx, y + 2, max(w - 1, 0.5), rh - 6,
+                                  f'fill="var(--p-{p})"',
+                                  f"{name} ({c})\n{PHASES[p][0]} ({p}) {fmt(v)} s"))
+            xx += w
+        body.append(_text(xx + 6, y + 13, f"{fmt(sum(secs(c).values()))} s", "mute"))
+        y += rh
+    body.append(_axis(x0, x0 + pw, y + 4, 18, ticks, "seconds per step"))
+    out.append("<h3>Phase time by product</h3>"
+               '<p class="small">Each row is one kind of matmul product, grouped by the pass '
+               "and the part of the model it belongs to; the bar splits its check-5 time into "
+               "the five phases.</p>" + _phase_legend() + _svg(x0 + pw + 60, y + 38,
+                                                               "".join(body)))
     return "".join(out)
 
 
 # ---- comparisons -------------------------------------------------------------------------
 
 
-def _bars(rows: list[tuple[str, list[tuple[str, float | None]]]], colors: dict[str, str]) -> str:
-    """One stacked bar per row of (section, seconds), on one scale."""
-    mx = max((sum(v or 0.0 for _, v in r) for _, r in rows), default=0.0) or 1.0
-    body, y = [], 4.0
-    for label, parts in rows:
-        body.append(_text(4, y + 12, label))
-        x = 330.0
-        for n, v in parts:
-            if v:
-                w = 600 * v / mx
-                body.append(_rect(x, y, w, 16, colors[n], f"{label}\n{n} {fmt(v)} s"))
-                x += w
-        y += 22
-    return _svg(960, y + 6, "".join(body))
-
-
 def _compare(rows: list[tuple[str, Run]]) -> str:
-    """A table and a bar chart: step_s and every depth-0 section's mean, one row per run;
-    a section a run lacks is blank."""
+    """A stacked bar of each run's depth-0 section means on one seconds scale, labeled with
+    its total; a section a run lacks has no segment."""
     names = _distinct([n for _, r in rows for n in r.top()])
-    colors = _section_colors(names)
-
-    def mean(r: Run, n: str) -> float | None:
-        return ((r.sections.get(n) or {}).get("time") or {}).get("mean")
-
-    table = [[lab, fmt(r.view.get("step_s")), *[fmt(mean(r, n)) if n in r.top() else ""
-                                                for n in names]] for lab, r in rows]
-    bars = [(lab, [(n, mean(r, n)) for n in names if n in r.top()]) for lab, r in rows]
-    return (_table(["run", "step s", *names], table) + _legend([(n, colors[n]) for n in names])
-            + _bars(bars, colors))
+    totals = [sum(r.mean(n) or 0.0 for n in r.top()) for _, r in rows]
+    ticks = _ticks(max(totals, default=0.0) or 1.0)
+    x0, pw = 6.0, 860.0
+    body, y = [], 4.0
+    for (label, r), tot in zip(rows, totals, strict=True):
+        body.append(_text(x0, y + 11, label))
+        y += 16
+        x = x0
+        for n in names:
+            v = r.mean(n) if n in r.top() else None
+            if v:
+                w = pw * v / ticks[-1]
+                body.append(_rect(x, y, max(w - 1.5, 0.5), 20, _paint(n),
+                                  f"{label}\n{_name(n)} ({n}) {fmt(v)} s"))
+                x += w
+        body.append(_text(x + 6, y + 14, f"{fmt(tot)} s", "mute"))
+        y += 30
+    body.append(_axis(x0, x0 + pw, y, 0, ticks, "seconds per step"))
+    return _legend(names) + _svg(x0 + pw + 60, y + 34, "".join(body))
 
 
 def _cross_model(runs: list[Run]) -> str:
@@ -725,8 +810,7 @@ def _cross_model(runs: list[Run]) -> str:
         mine = [r for r in runs if r.field("session") == session]
         if len({r.field("model") for r in mine}) >= 2:
             out.append(f"<h3>Session {esc(session)}</h3>"
-                       + _compare([(f"{r.field('model')} · {r.field('attack')}", r)
-                                   for r in mine]))
+                       + _compare([(f"{r.model} · {r.field('attack')}", r) for r in mine]))
     return "".join(out)
 
 
@@ -741,38 +825,27 @@ def _cross_session(runs: list[Run]) -> str:
     return _compare(rows) if rows else ""
 
 
-def _plain(runs: list[Run]) -> str:
-    out = []
-    for r in runs:
-        cmp = r.profile.get("comparisons")
-        if not cmp:
-            continue
-        rows = [[n, c.get("plain_name"), fmt(c.get("prover_s")), fmt(c.get("plain_s")),
-                 fmt(c.get("ratio"))] for n, c in (cmp.get("sections") or {}).items()]
-        st = cmp.get("step") or {}
-        pr, pl = st.get("prover_s"), st.get("plain_s")
-        rows.append(["step", "step", fmt(pr), fmt(pl), fmt(pr / pl if pr and pl else None)])
-        out.append(f"<h3>{esc(r.label)}</h3>"
-                   + _table(["section", "plain name", "prover s", "plain s", "ratio"], rows,
-                            left=(0, 1)))
-    return "".join(out)
+PLAIN_ROWS = {"train.load": "Load weights, clear gradients", "train.forward": "Forward pass",
+              "train.backward": "Backward pass", "train.update": "Weight update (SGD)"}
 
 
-def _appendix(profiles: Sequence[dict[str, Any]], names: Sequence[str]) -> str:
-    out = []
-    for p, n in zip(profiles, names, strict=True):
-        probe, machine, th = p.get("probe") or {}, p.get("machine"), p.get("thresholds")
-        parts = []
-        for key in ("rates", "costs", "datasheet"):
-            if probe.get(key):
-                parts.append(f"<h4>Probe: {key}</h4>" + _kv(_flat(probe[key])))
-        if machine:
-            parts.append("<h4>Machine</h4>" + _kv(_flat(machine)))
-        if th:
-            parts.append("<h4>Thresholds</h4>" + _kv(_flat(th)))
-        if parts:
-            out.append(f"<h3>{esc(n)}</h3>" + "".join(parts))
-    return "".join(out)
+def _plain(run: Run) -> str:
+    """The run's training parts timed by the prover beside plain training, when its profile
+    holds that comparison."""
+    cmp = run.profile.get("comparisons")
+    if not cmp:
+        return ""
+    rows = [[PLAIN_ROWS.get(n, n), fmt(c.get("prover_s")), fmt(c.get("plain_s")),
+             fmt(c.get("ratio"))] for n, c in (cmp.get("sections") or {}).items()]
+    st = cmp.get("step") or {}
+    pr, pl = st.get("prover_s"), st.get("plain_s")
+    rows.append(["Whole step: verified (prover, hand-off, verifier) against plain", fmt(pr),
+                 fmt(pl), fmt(pr / pl if pr and pl else None)])
+    return (_table(["Training part", "Prover, with matmul capture (s)", "Plain training (s)",
+                    "Prover ÷ plain"], rows)
+            + '<p class="mute small">Plain training runs the same steps on the same model '
+              "without the protocol. The whole-step row puts the verified step, prover and "
+              "verifier together, beside one plain step.</p>")
 
 
 # ---- the page ----------------------------------------------------------------------------
@@ -800,17 +873,14 @@ def build(profiles: Sequence[dict[str, Any]], names: Sequence[str] | None = None
             (head if anchor == "inputs" else tail).append(panel)
 
     add("inputs", "Inputs", _inputs(profiles, names, runs))
-    per_run = (("overview", "Overview", _overview), ("diagram", "Architecture", _arch),
-               ("sections", "Section table", _sections_table),
-               ("hash", "Hashing breakdown", _hash_table), ("timeline", "Timeline", _timeline),
-               ("check5", "Check 5", _c5))
+    per_run = (("overview", "Overview", _overview), ("diagram", "Step flow", _flow),
+               ("timeline", "Timeline", _timeline), ("check5", "Check 5", _c5),
+               ("plain", "Prover beside plain", _plain))
     for r in runs:
         for key, title, fn in per_run:
             add(f"r{r.idx}-{key}", title, fn(r), r)
     add("compare-models", "Across models", _cross_model(runs))
     add("compare-sessions", "Across sessions", _cross_session(runs))
-    add("compare-plain", "Prover beside plain", _plain(runs))
-    add("appendix", "Appendix", _appendix(profiles, names))
 
     picker = ""
     blocks = []
@@ -826,7 +896,7 @@ def build(profiles: Sequence[dict[str, Any]], names: Sequence[str] | None = None
     return ("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<title>Profile report</title>"
-            f"<style>{CSS}</style></head><body><nav>{''.join(nav)}</nav><main>"
+            f"<style>{CSS}</style></head><body>{DEFS}<nav>{''.join(nav)}</nav><main>"
             f"<h1>Profile report</h1>{''.join(head)}{picker}{''.join(blocks)}{''.join(tail)}"
             f"</main>{script}</body></html>")
 
