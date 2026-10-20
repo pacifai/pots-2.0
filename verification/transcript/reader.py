@@ -100,3 +100,22 @@ class TranscriptView:
         if block is not None:
             return block(idx, own)
         return stack_block([self.reader.leaf(i) for i in idx], own)
+
+    def product_run(self, m0: int, stride: int, n: int, own: bool = False) -> torch.Tensor:
+        """``product_block([m0 + stride·i for i in range(n)])``, from the range alone: the
+        same bits, the same errors, and no per-member Python when the reader has a range read
+        (``tensor_run``). The index arithmetic is done once, on the first and last member.
+        A range the fast read doesn't take (``n < 1``, ``stride < 1``, a last ``m`` outside
+        the computation) goes through :meth:`product_block`, which raises as a loop does."""
+        if n >= 1 and stride >= 1:
+            try:
+                first = self.c.product_index(m0)
+                self.c.product_index(m0 + stride * (n - 1))
+            except IndexError:
+                first = None  # the loop raises at the first member outside, not the last
+            if first is not None:
+                run = getattr(self.reader, "tensor_run", None)
+                if run is not None:
+                    return run(first, stride, n, own)
+                return stack_block([self.reader.leaf(first + stride * i) for i in range(n)], own)
+        return self.product_block([m0 + stride * i for i in range(n)], own)
