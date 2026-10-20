@@ -430,10 +430,23 @@ def test_release_device_cache_covers_every_run_device(monkeypatch):
     assert calls == [] and sections == []  # no CUDA anywhere: nothing, not even a section
     r("cpu", section, devices=("cpu", "cuda:1", "cpu"))  # a verifier device alone is enough
     assert calls == [1] and sections == [loop_mod.HANDOFF_SECTION]
-    r("cuda:0", section, devices=("cuda:1", "cuda:2"))  # the prover and the verifiers: still once
-    assert calls == [1, 1] and len(sections) == 2
+    # empty_cache() empties the current device only, so each distinct CUDA device gets one call
+    # under its own device context, inside one section.
+    entered = []
+
+    @contextlib.contextmanager
+    def on(d):
+        entered.append(d)
+        yield
+
+    monkeypatch.setattr(torch.cuda, "device", on)
+    r("cuda:0", section, devices=("cuda:1", "cuda:2"))
+    assert calls == [1] * 4 and len(sections) == 2
+    assert entered == [torch.device(f"cuda:{i}") for i in range(3)]
+    r("cuda:0", section, devices=("cuda:0", "cuda:0"))  # one distinct device: as before
+    assert calls == [1] * 5 and len(entered) == 3
     r(torch.device("cuda:0"), section)  # old call shape
-    assert calls == [1, 1, 1]
+    assert calls == [1] * 6
 
 
 def test_run_loop_passes_the_placement_devices_to_the_release(monkeypatch):

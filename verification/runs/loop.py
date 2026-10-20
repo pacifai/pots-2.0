@@ -157,11 +157,19 @@ def release_device_cache(device: str | torch.device, section: Section | None = N
     prover's step is released and before the verifier's role begins. Only when the run's
     ``device`` or any of ``devices`` (the sharded run's verifier devices, F22) is CUDA: with
     none, it does nothing and opens no section, even in a process where CUDA happens to be
-    initialized. One call empties every device's cache, one section per step."""
-    if not any(_on_cuda(d) for d in (device, *(devices or ()))):
+    initialized. One section per step. ``torch.cuda.empty_cache()`` empties only the current
+    device's cache, so with several CUDA devices it runs once under each device's
+    ``torch.cuda.device`` context."""
+    cuda = {torch.device(d) for d in (device, *(devices or ())) if _on_cuda(d)}
+    if not cuda:
         return
     with (section or no_section)(HANDOFF_SECTION):
-        torch.cuda.empty_cache()
+        if len(cuda) == 1:
+            torch.cuda.empty_cache()
+            return
+        for d in sorted(cuda, key=str):
+            with torch.cuda.device(d):
+                torch.cuda.empty_cache()
 
 
 def _default_schedule(c: DeclaredComputation, dataset: Sequence[Any],
@@ -244,7 +252,8 @@ def run_loop(
         w, loss = out.w_next, out.loss
         del out, leaves, tree_h  # the store holds the leaves; nothing else keeps the step
         if release_cache:
-            release_device_cache(device, section, devices=c.placement.devices)  # the prover's step is gone; verifier next
+            # the prover's step is gone; the verifier is next
+            release_device_cache(device, section, devices=c.placement.devices)
         t2b = time.perf_counter()
         try:
             rej = verifier.verify_step(t, store)

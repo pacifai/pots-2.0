@@ -555,8 +555,8 @@ class MatmulCapture(TorchDispatchMode):
         """Count the leaves (``P_1..P_M``, as labeling returned them) whose hinted device is not
         ``device_of(m)``, and keep the count for :meth:`summary`. A leaf that is a record's
         output (or a view of it) is judged by that record's hint, so a CPU run checks the hint
-        too; any other leaf (the δK̃ transpose, a new tensor) by the device it sits on, and not at all
-        on the CPU."""
+        too; any other leaf (the δK̃ transpose, a new tensor) by the device it sits on, and not at
+        all on the CPU."""
         hints = {StorageWeakRef(r.out.untyped_storage()): r.hint
                  for r in self.records + self.glue_outer if r.hint is not None}
         miss = 0

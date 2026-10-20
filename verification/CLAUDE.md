@@ -1133,8 +1133,9 @@ interface.
       buffer path. After labeling, `count_hint_misses(labeled, placement.product_device)`
       counts the leaves hinted elsewhere than their owner (`summary()["hint_misses"]`,
       sharded only; a leaf that isn't a record's output, the δK̃ transpose, is judged by the
-      device it sits on, and on the CPU not at all), and `prove_step` moves each leaf to its owner. On an honest run the
-      count is 0. A miss costs one copy and no bit.
+      device it sits on, and on the CPU not at all), and `prove_step` moves each leaf to its
+      owner; a cheat hook's result goes to its product's device first, wherever the hook built
+      it. On an honest run the count is 0. A miss costs one copy and no bit.
     - Operands are not copied. They stay on the GPU until `release_operands` in labeling,
       as before; the README's "Workflow: a run on a GPU" measures what that costs.
     - The `δK̃` leaf is a contiguous transpose made in labeling, so it is the one product
@@ -1552,16 +1553,19 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `final` is the agreed final weights for check 8.
   - `release_device_cache(device, section=None, *, devices=None)`: only when the run's
     `device` or any of `devices` (the sharded run's verifier devices, `c.placement.devices`;
-    FS32d) is CUDA
-    (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in the process),
-    `torch.cuda.empty_cache()` inside the section `HANDOFF_SECTION` (`"handoff.empty_cache"`),
-    once per step between the prover's role and the verifier's; elsewhere it does nothing and
-    opens no section. Prover and verifier share one process and one GPU in our runs, and the
+    FS32d) is CUDA (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in
+    the process), `torch.cuda.empty_cache()` inside the section `HANDOFF_SECTION`
+    (`"handoff.empty_cache"`), once per step between the prover's role and the verifier's.
+    `empty_cache()` empties only the current device's cache, so with several distinct CUDA
+    devices it runs once under each one's `torch.cuda.device` context; with one it is the
+    plain call. Elsewhere it does nothing and opens no section.
+    Prover and verifier share one process and one GPU in our runs, and the
     prover's freed blocks stay cached at the prover's sizes, so a large verifier buffer may not
     fit though the GPU has the room (the first H100 session's out-of-memory errors). Its row is
     the harness's, side `run`, in no total. `run_loop` gives it the model's device
-    (`model_device`: the first parameter's, host without one) and `c.placement.devices`; `bring_up.bias_tamper` calls it
-    with `c.device` before each `verify_step` too. `run_scenario`, `memory_run`, `bring_up`,
+    (`model_device`: the first parameter's, host without one) and `c.placement.devices`;
+    `bring_up.bias_tamper` calls it with `c.device` before each `verify_step` too.
+    `run_scenario`, `memory_run`, `bring_up`,
     `bias_tamper` and `llama_step.run_honest` pass on `release_cache` (default `None`, read
     from `VERIF_RELEASE_CACHE`); `bring_up` and `llama_step` set it from `cfg.release_cache`.
     Set `PYTORCH_ALLOC_CONF=expandable_segments:True` in the run's environment, not in

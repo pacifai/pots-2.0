@@ -120,8 +120,8 @@ def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int],
     """Whether the caller's ``w`` can be the committed ``W_t`` leaf itself (see prove_step).
 
     It must hash to the bytes the model holds after ``load_weights`` (same dtype and shape,
-    contiguous, on its weight's ``device`` like every leaf), own its whole storage (no view that another
-    tensor can write through), not be a live parameter (``requires_grad``), and not share
+    contiguous, on its weight's ``device`` like every leaf), own its whole storage (no view that
+    another tensor can write through), not be a live parameter (``requires_grad``), and not share
     storage with any of ``model``'s parameters, which the step updates in place.
     """
     return (not w.requires_grad and w.dtype == p.dtype and w.shape == p.shape
@@ -255,7 +255,8 @@ def prove_step(
         new = fn(products[m - 1].clone())
         if tuple(new.shape) != spec.p_shape or new.dtype != products[m - 1].dtype:
             raise ValueError(f"perturbation of {spec.name} changed its shape or dtype")
-        products[m - 1] = new.detach().contiguous()
+        # The leaf stays on its owner, whatever device the fault built its tensor on.
+        products[m - 1] = new.detach().to(products[m - 1].device).contiguous()
         product_versions[m - 1] = products[m - 1]._version
 
     with sec("train.update"):

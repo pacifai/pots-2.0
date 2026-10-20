@@ -12,7 +12,7 @@ from setup.config import load_config
 from verification.commitment.leaves import leaf_hash
 from verification.computation.instances import DecoderComputation
 from verification.computation.matmul_ops import param_storage_map
-from verification.prover.capture import HOST_BUFFERS, MatmulCapture, MutatedCaptureError
+from verification.prover.capture import HostBuffers, MatmulCapture, MutatedCaptureError
 from verification.prover.step import commit, plain_step, prove_step
 
 from tests.verification.decoder_helpers import (
@@ -138,6 +138,19 @@ def test_with_w_next_and_w_t_sharing_stay_on_the_weight_device():
     spliced.assert_unmodified()
 
 
+def test_a_perturbation_built_on_another_device_stays_on_the_owner():
+    """A fault function may return a tensor from ``torch.zeros(shape)``, on the host; the leaf
+    still sits on ``product_device(m)``. The placement's devices are ``meta`` here, which the
+    Mac has and the host is not."""
+    c = tiny(("llama", True), devices=("meta", "meta", "meta"))
+    w0, records = start(c), make_records((12, 7))
+    m = c.m_of("L1.G_q")
+    out = run(c, w0, records,
+              perturb={m: lambda t: torch.zeros(t.shape, dtype=t.dtype)})
+    assert out.products[m - 1].device.type == "meta"
+    assert all(p.device.type == "meta" for p in out.products)
+
+
 # ---- two GPUs ----------------------------------------------------------------------------
 
 GPUS = ("cuda:0", "cuda:1")
@@ -146,22 +159,26 @@ GPUS = ("cuda:0", "cuda:1")
 @two_gpus
 @pytest.mark.parametrize("B", [1, 2])
 @pytest.mark.parametrize("dtype", list(DTYPES))
-def test_two_gpus_every_leaf_on_its_owner_and_digests_equal(B, dtype):
+def test_two_gpus_every_leaf_on_its_owner_and_digests_equal(B, dtype, monkeypatch):
     switch = ("qwen2", False)
     off = tiny(switch, B=B, dtype=dtype, device="cuda:0")
     on = tiny(switch, B=B, dtype=dtype, devices=GPUS, device="cuda:0", layers=2)
     w0, records = start(off), make_records((12, 7))
     ref = run(off, {n: t.cpu() for n, t in w0.items()}, records)
-    taken = HOST_BUFFERS.n_buffers
+    takes = []
+    real_take = HostBuffers.take
+    monkeypatch.setattr(HostBuffers, "take",
+                        lambda self, *a, **k: takes.append(a) or real_take(self, *a, **k))
     out = run(on, {n: t.to(on.placement.weight_device(n)) for n, t in w0.items()}, records)
     assert out.hint_misses == 0 and out.capture["hint_misses"] == 0
-    assert HOST_BUFFERS.n_buffers == taken  # a host-buffer path would have grown the pool
+    assert takes == []  # no host buffer was taken during the sharded capture
     for m, p in enumerate(out.products, 1):
         assert p.device == on.placement.product_device(m), m
     for n in on.weight_names:
         assert out.w_t[n].device == out.w_next[n].device == on.placement.weight_device(n)
     # Same bytes as the host-buffer run, leaf by leaf (leaf_hash of a device leaf is FS32b's).
-    for i, (x, y) in enumerate(zip(ref.leaves()[len(ref.records):], out.leaves()[len(out.records):])):
+    pairs = list(zip(ref.leaves()[len(ref.records):], out.leaves()[len(out.records):]))
+    for i, (x, y) in enumerate(pairs):
         assert leaf_hash(off, len(ref.records) + i, x) == leaf_hash(
             off, len(ref.records) + i, y.cpu()), i
     out.assert_unmodified()
@@ -174,13 +191,13 @@ def test_two_gpus_a_bmm_stays_one_storage_on_the_owner():
     cap = MatmulCapture(placement=_two_gpu_placement())
     cap._hint = lambda rec: torch.device("cuda:1")
     with cap, cap.phase("forward"):
-        torch.bmm(a, b)
+        p = torch.bmm(a, b)
     (rec,) = cap.records
+    assert cap.is_output_of(p, rec)  # the op's own output, now only its source
     assert rec.out.device == torch.device("cuda:1") and rec.hint == rec.out.device
     assert torch.equal(rec.out.cpu(), torch.bmm(a, b).cpu())
     ptrs = {p.untyped_storage().data_ptr() for _, _, p in rec.members()}
     assert ptrs == {rec.out.untyped_storage().data_ptr()}
-    assert cap.is_output_of(torch.bmm(a, b), rec) is False  # another op's output
     assert rec.out_storage is not None and rec.out_info.storage_ptr != ptrs.pop()
 
 
@@ -199,6 +216,32 @@ def test_two_gpus_a_write_before_the_copy_is_done_raises():
 
 
 @two_gpus
+def test_two_gpus_the_destination_outlives_a_delayed_copy():
+    """The peer copy is held back on its side stream, every other reference to the destination
+    is dropped and fresh blocks of the same size are allocated on the destination device to
+    tempt the allocator; the leaf still holds the source's bytes."""
+    a, b = torch.randn(256, 512, device="cuda:0"), torch.randn(512, 384, device="cuda:0")
+    want = torch.mm(a, b).cpu()
+    cap = MatmulCapture(placement=_two_gpu_placement())
+    cap._hint = lambda rec: torch.device("cuda:1")
+    with cap, cap.phase("forward"):
+        with torch.cuda.stream(cap.buffers.stream(torch.device("cuda:0"))):
+            torch.cuda._sleep(SPIN)
+        torch.mm(a, b)
+        for _ in range(8):
+            torch.full((256, 384), float("nan"), device="cuda:1")
+    (rec,) = cap.records
+    leaf = rec.out
+    rec.out = None
+    cap.records.clear()
+    cap._by_index.clear()
+    for _ in range(8):
+        torch.full((256, 384), float("nan"), device="cuda:1")
+    torch.cuda.synchronize()
+    assert leaf.device == torch.device("cuda:1") and torch.equal(leaf.cpu(), want)
+
+
+@two_gpus
 def test_two_gpus_an_output_on_its_owner_is_kept_not_copied():
     a, b = torch.randn(16, 8, device="cuda:0"), torch.randn(8, 4, device="cuda:0")
     cap = MatmulCapture(placement=_two_gpu_placement())
@@ -207,6 +250,17 @@ def test_two_gpus_an_output_on_its_owner_is_kept_not_copied():
         torch.mm(a, b)
     (rec,) = cap.records
     assert not cap._pending and rec.out.untyped_storage().data_ptr() == rec.out_info.storage_ptr
+
+
+@two_gpus
+def test_two_gpus_release_device_cache_empties_every_device():
+    from verification.runs.loop import release_device_cache
+    block = torch.empty(64 * 2**20, dtype=torch.uint8, device="cuda:1")
+    del block
+    assert torch.cuda.memory_reserved(1) > 0
+    before = torch.cuda.memory_reserved(1)
+    release_device_cache("cuda:0", devices=("cuda:0", "cuda:1"))
+    assert torch.cuda.memory_reserved(1) < before
 
 
 def _two_gpu_placement():
@@ -238,5 +292,6 @@ def test_two_gpus_smollm2_hint_never_misses_and_digests_equal(monkeypatch):
     out = prove_step(on, on.build_model(),
                      {n: t.to(on.placement.weight_device(n)) for n, t in w0.items()}, records)
     assert out.hint_misses == 0
-    for i, (x, y) in enumerate(zip(ref.leaves()[len(ref.records):], out.leaves()[len(out.records):])):
+    pairs = list(zip(ref.leaves()[len(ref.records):], out.leaves()[len(out.records):]))
+    for i, (x, y) in enumerate(pairs):
         assert same(x, y), i
