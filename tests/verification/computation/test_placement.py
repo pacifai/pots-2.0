@@ -370,3 +370,33 @@ def test_empty_device_tuple_is_refused_by_placement_for():
     c = tiny(("llama", True))
     with pytest.raises(ValueError):
         placement_for(c, CPU, ())
+
+
+def _refusals(c, p):
+    first_unit, last_unit = c.units[0], c.units[-1]
+    for j in (first_unit - 1, last_unit + 1):
+        with pytest.raises(IndexError, match="unit"):
+            p.unit_slot(j)
+        with pytest.raises(IndexError, match="unit"):
+            p.unit_device(j)
+    for m in (0, -1, c.M + 1):
+        with pytest.raises(IndexError, match=f"1..{c.M}"):
+            p.product_device(m)
+    for i in (-1, c.n_leaves):
+        with pytest.raises(IndexError, match=f"0..{c.n_leaves - 1}"):
+            p.leaf_device(i)
+    with pytest.raises(KeyError, match="nope"):
+        p.weight_device("nope")
+
+
+@pytest.mark.parametrize("devices", [None, THREE], ids=["unsharded", "sharded"])
+def test_decoder_lookups_refuse_out_of_range_arguments(devices):
+    c = tiny(("qwen2", False), layers=3, devices=devices)
+    _refusals(c, c.placement)
+
+
+@pytest.mark.parametrize("devices", [None, (CPU, CPU)], ids=["unsharded", "sharded"])
+def test_mlp_lookups_refuse_out_of_range_arguments(devices):
+    c = MLPComputation(DEFAULT_WIDTHS, n_s=4, eta=0.05)
+    _refusals(c, placement_for(c, CPU, devices))
+    assert c.placement.unit_slot(0) == 0
