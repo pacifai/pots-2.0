@@ -275,7 +275,7 @@ def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.
         store = hand.hold(c, 1, leaves, tree_h, paths)
         del leaves, tree_h
         if release_cache:
-            release_device_cache(c.device)  # as the loop's hand-off, on CUDA only
+            release_device_cache(c.device, devices=c.placement.devices)  # the loop's hand-off
         try:
             return v.verify_step(1, store)
         finally:
