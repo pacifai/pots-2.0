@@ -114,6 +114,7 @@ from setup.data import PAD_ID, Batch, assemble_batch, run_pin
 from setup.model import load_model_config, load_pretrained
 from setup.records import Record, RecordError, encode_record
 from verification.computation.interface import (
+    HOST,
     DeclaredComputation,
     LabelingError,
     ProductKind,
@@ -123,7 +124,6 @@ from verification.computation.interface import (
     chain_gradient,
     load_weights,
 )
-from verification.computation.matmul_ops import param_storage_map
 from verification.computation.placement import Placement, placement_for
 from verification.computation.substitution import ProductSubstitution
 from verification.transcript.reader import LeafReader, TranscriptView
@@ -174,12 +174,12 @@ def _fresh(leaf: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 def _dk_owned(block: torch.Tensor, device: torch.device) -> torch.Tensor:
     """δK̃ᵀ from a block of δK̃, as memory no committed leaf shares. The transpose copy is the
-    fresh tensor on the host; elsewhere the move to ``device`` comes first and is the copy.
-    A size-1 dimension makes ``contiguous()`` return its input, which on the host is the
+    fresh tensor when the block is already on ``device``; elsewhere the move comes first and is
+    the copy. A size-1 dimension makes ``contiguous()`` return its input, which then is the
     committed leaves' own storage, so that one case clones."""
     moved = block.to(device) if block.device != device else block
     out = moved.transpose(1, 2).contiguous()
-    if (moved is block and device.type == "cpu"
+    if (moved is block
             and out.untyped_storage().data_ptr() == block.untyped_storage().data_ptr()):
         out = out.clone()
     return out
@@ -687,10 +687,11 @@ class DecoderComputation(DeclaredComputation):
             raise RecordError(f"record length {len(record)} > n = {self.n}")
         return encode_record(record)
 
-    def build_model(self) -> nn.Module:
+    def build_model(self, device: torch.device | str | None = None) -> nn.Module:
         """An unmodified HF causal LM for the config (``LlamaForCausalLM``,
         ``Qwen2ForCausalLM``), eager attention, weights in the master format, dropout
-        asserted zero.
+        asserted zero, on ``device`` (default: the run's). The split replay builds on the host
+        and places the model by units (FS32c).
 
         Eval mode: dropout is zero anyway (S4d), and HF runs activation checkpointing only in
         train mode, which the capture forbids. Load ``W_t`` before use.
@@ -705,7 +706,7 @@ class DecoderComputation(DeclaredComputation):
                 model = AutoModelForCausalLM.from_config(
                     copy.deepcopy(self.config), attn_implementation="eager",
                     dtype=self.weight_dtype)
-        model.to(self.device)
+        model.to(self.device if device is None else device)
         model.eval()
         self._check_model(model)
         return model
@@ -727,17 +728,19 @@ class DecoderComputation(DeclaredComputation):
         if bad:
             raise ValueError(f"parameters not {self.weight_dtype}: {bad[:3]}")
 
-    def assemble(self, records: Sequence[Record]) -> Batch:
-        """Glue: pad and stack the records (ref block §2), on the run's device. ``ρ`` comes
-        from each ``ℓ``."""
+    def assemble(self, records: Sequence[Record],
+                 device: torch.device | str | None = None) -> Batch:
+        """Glue: pad and stack the records (ref block §2), on ``device`` (default: the run's).
+        ``ρ`` comes from each ``ℓ``."""
         if len(records) != self.n_s:
             raise ValueError(f"batch has {len(records)} records, the computation declares {self.n_s}")
         for r in records:
             if not isinstance(r, Record):
                 raise ValueError(f"a decoder record is a records.Record, got {type(r).__name__}")
         b = assemble_batch(records, self.n, pad_id=self.pad_id)
-        return Batch(b.ids.to(self.device), b.targets.to(self.device), b.mask.to(self.device),
-                     b.rho.to(self.device))
+        device = self.device if device is None else device
+        return Batch(b.ids.to(device), b.targets.to(device), b.mask.to(device),
+                     b.rho.to(device))
 
     def logits(self, model: nn.Module, batch: Batch) -> torch.Tensor:
         """``Λ`` as ``[n_s, n, n_v]``: the forward pass, embedding to output projection, all
@@ -806,11 +809,19 @@ class DecoderComputation(DeclaredComputation):
         - the previous owner loses the model, so a stale replay can't run on another step's
           weights.
 
+        Sharded (F22), the model is built on the host and placed by units, so it never sits on
+        the prover's device (:meth:`_place_model`); reuse keeps every parameter and buffer where
+        it was placed.
+
         Only :class:`DecoderReplay` calls this; the prover builds its own model.
         """
         model = self._vmodel
         if model is None:
-            model = self._vmodel = self.build_model()
+            if self.placement.sharded:
+                model = self._place_model(self.build_model(HOST))
+            else:
+                model = self.build_model()
+            self._vmodel = model
             self._vbuffers = {n: b.detach().clone() for n, b in model.named_buffers()}
         else:
             prev = self._vowner() if self._vowner is not None else None
@@ -833,6 +844,26 @@ class DecoderComputation(DeclaredComputation):
             model.eval()
             self._check_model(model)
         self._vowner = weakref.ref(owner)
+        return model
+
+    def _place_model(self, model: nn.Module) -> nn.Module:
+        """``model`` with the embedding and the rotary table on unit 0's device, layer ``j`` on
+        unit ``j``'s and the final norm and output projection on unit ``L+1``'s (FS32c). Units 0
+        and ``L+1`` share a device, so a tied ``W_E`` stays one parameter."""
+        pl, inner = self.placement, model.model
+        if (set(model._modules) != {"model", "lm_head"} or set(inner._modules)
+                != {"embed_tokens", "layers", "norm", "rotary_emb"}):
+            raise ReplayError("replay: the model has modules the placement does not place")
+        first, last = pl.unit_device(0), pl.unit_device(self.L + 1)
+        inner.embed_tokens.to(first)
+        inner.rotary_emb.to(first)
+        for j, layer in enumerate(inner.layers, start=1):
+            layer.to(pl.unit_device(j))
+        inner.norm.to(last)
+        model.lm_head.to(last)
+        tied = model.lm_head.weight is inner.embed_tokens.weight
+        if tied != self.tied or (tied and first != last):
+            raise ReplayError("replay: placing the model changed its weight tie")
         return model
 
     # ---- prover side ----------------------------------------------------------------------
@@ -1352,9 +1383,18 @@ class DecoderReplay(Replay):
         self.view = TranscriptView(c, leaves)
         self.model = c._replay_model(self)
         load_weights(c, self.model, {n: self.view.w_t(n) for n in c.weight_names})
-        self._weight_of = param_storage_map(self.model)  # storage -> weight name
-        # Autocast's copies of the weights in this pass: storage -> (weight, copy).
-        self._copies: dict[int, tuple[str, torch.Tensor]] = {}
+        self.pl = c.placement
+        # The committed leaves moved to another device by _supply and _supply_backward: zero
+        # when the transcript is placed as the replay is (FS32d).
+        self.leaf_moves = 0
+        # (device, storage) -> weight name, tied weights under the first name.
+        self._weight_of: dict[tuple[torch.device, int], str] = {}
+        for n, p in self.model.named_parameters():
+            self._weight_of.setdefault((p.device, _ptr(p)), n)
+        # Autocast's copies of the weights in this pass: (device, storage) -> (weight, copy).
+        self._copies: dict[tuple[torch.device, int], tuple[str, torch.Tensor]] = {}
+        # The pass's tensors moved to a unit's device: (id, device) -> (original, moved).
+        self._moved: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
         self._role = {c.w(l, x): (l, x) for l in range(1, c.L + 1) for x in LINEARS}
         self._role[c.w_out] = (None, "head")
         # Each head product's m -> its block.
@@ -1401,14 +1441,39 @@ class DecoderReplay(Replay):
 
     def _weight(self, t: torch.Tensor) -> str | None:
         """The weight ``t`` is a view of, or of autocast's copy of (F5a)."""
-        p = _ptr(t)
-        w = self._weight_of.get(p)
-        return w if w is not None else self._copies.get(p, (None,))[0]
+        k = (t.device, _ptr(t))
+        w = self._weight_of.get(k)
+        return w if w is not None else self._copies.get(k, (None,))[0]
 
     def _copied(self, src: torch.Tensor, out: torch.Tensor) -> None:
         w = self._weight(src)
         if w is not None:
-            self._copies[_ptr(out)] = (w, out)
+            self._copies[out.device, _ptr(out)] = (w, out)
+
+    def _to_unit(self, x: torch.Tensor, j: int) -> torch.Tensor:
+        """``x`` on unit ``j``'s device: a unit's input going in, or ``δX`` going to the unit
+        whose backward it feeds (the only values that cross units)."""
+        return x.to(self.pl.unit_device(j))
+
+    def _on(self, v: Any, device: torch.device) -> Any:
+        """``v`` with every tensor in it (a tuple or list nests) on ``device``; the pass moves
+        each tensor to a device once, however many layers there read it."""
+        if isinstance(v, torch.Tensor):
+            if v.device == device:
+                return v
+            hit = self._moved.get((id(v), device))
+            if hit is None:  # holds v, so its id stays its own
+                hit = self._moved[id(v), device] = (v, v.to(device))
+            return hit[1]
+        if isinstance(v, (tuple, list)):
+            return type(v)(self._on(x, device) for x in v)
+        return v
+
+    def _leaf_to(self, leaf: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """The fresh copy of a committed leaf on ``device`` (:func:`_fresh`), counting a move
+        between devices."""
+        self.leaf_moves += leaf.device != device
+        return _fresh(leaf, device)
 
     def _supply(self, op: str, a: torch.Tensor, b: torch.Tensor,
                 bias: torch.Tensor | None) -> torch.Tensor:
@@ -1436,22 +1501,31 @@ class DecoderReplay(Replay):
                 out = torch.zeros((), dtype=a.dtype, device=a.device).expand(want)
             else:
                 name = f"L{l}.Y_{x}"
-                out = _fresh(self.view.product(c.m_of(name)), a.device)
+                out = self._leaf_to(self.view.product(c.m_of(name)), a.device)
         else:
             if self._cur is None or self._n_bmm > 1:
                 raise ReplayError("replay: a bmm outside a layer's S, O pair")
             name = f"L{self._cur}.{('S', 'O')[self._n_bmm]}"
             self._n_bmm += 1
             # A zero-copy block would alias the leaves, so the host asks for its own copy. On
-            # another device the move is the copy (blocking: no pinned-source stream logic).
+            # another device the move is the copy (blocking: no pinned-source stream logic);
+            # leaves already there are cloned.
             block = self._member_block(self._cur, ("S", "O")[self._n_bmm - 1],
                                        own=a.device.type == "cpu")
-            out = block.to(a.device) if block.device != a.device else block
+            out = self._owned_on(block, a.device, own=a.device.type == "cpu")
         self._names.append(name)
         if name not in self._calls:  # a repeat fails the unit's name check
             # A head block's scores are not kept: its backward rebuilds them.
             self._calls[name] = (a, b, None if self._block is not None else out)
         return out
+
+    def _owned_on(self, block: torch.Tensor, device: torch.device, own: bool) -> torch.Tensor:
+        """A member block as memory no committed leaf shares, on ``device``: moved (counted)
+        from another device, as is when ``own`` had it copied, else cloned."""
+        if block.device != device:
+            self.leaf_moves += 1
+            return block.to(device)
+        return block if own else block.clone()
 
     def _member_block(self, layer: int, role: str, own: bool) -> torch.Tensor:
         """Layer ``layer``'s ``role`` members (``S``, ``O``, ``dA``, …) as one block in member
@@ -1478,10 +1552,11 @@ class DecoderReplay(Replay):
         c = self.c
         if not isinstance(x, torch.Tensor):
             raise ReplayError(f"replay: unit {j}'s input is not a tensor")
+        x = self._to_unit(x, j)
         if j > 1:  # a module receives exactly what the one before it returned
             prev = self._units[j - 1].out if j - 1 in self._units else None
             if prev is None or (x is not prev and not torch.allclose(
-                    x, prev, rtol=0.0, atol=0.0, equal_nan=True)):
+                    x, prev.to(x.device), rtol=0.0, atol=0.0, equal_nan=True)):
                 what = "the final norm" if j == c.L + 1 else f"layer {j}"
                 raise ReplayError(f"replay: layer {j - 1}'s output is not X_{j}, the input "
                                   f"{what} receives")
@@ -1520,13 +1595,16 @@ class DecoderReplay(Replay):
         self._built, self._units, self._next_unit, self._next_block = False, {}, c.L + 1, 0
         self._bunit, self._bops, self._dx, self._glue, self._dfs = None, {}, None, {}, []
         self._names, self._mark, self._calls, self._cur, self._n_bmm = [], 0, {}, None, 0
-        self._copies, self._block = {}, None
+        self._copies, self._block, self._moved = {}, None, {}
 
         def enter_layer(j):
             def hook(module, args, kwargs):
                 if len(args) != 1:
                     raise ReplayError(f"layer {j} called with {len(args)} positional args")
-                return (self._enter_unit(j, args[0]),), kwargs
+                x = self._enter_unit(j, args[0])
+                if self.pl.sharded:  # position embeddings, mask, ids: one copy per device
+                    kwargs = {k: self._on(v, x.device) for k, v in kwargs.items()}
+                return (x,), kwargs
             return hook
 
         def leave_layer(j):
@@ -1542,7 +1620,7 @@ class DecoderReplay(Replay):
             hooks.append(layer.register_forward_pre_hook(enter_layer(j), with_kwargs=True))
             hooks.append(layer.register_forward_hook(leave_layer(j)))
         hooks.append(inner.norm.register_forward_pre_hook(enter_head))
-        batch = c.assemble(self.view.records())
+        batch = c.assemble(self.view.records(), self.pl.unit_device(0))
         try:
             with torch.enable_grad(), ProductSubstitution(self._supply, copied=self._copied):
                 # One autocast region, as in training: W is cast once for all blocks (F5a).
@@ -1569,7 +1647,7 @@ class DecoderReplay(Replay):
         finally:
             for h in hooks:
                 h.remove()
-            self._names, self._calls, self._block = [], {}, None
+            self._names, self._calls, self._block, self._moved = [], {}, None, {}
         self.batch, self._built = batch, True
 
     def _forward_unit(self, spec: ProductSpec) -> int:
@@ -1632,8 +1710,8 @@ class DecoderReplay(Replay):
                 name = self._linear_name(w, "G")
             # One copy from the pinned leaf to the operands' device, as `_supply` does; a host
             # clone first would be a second copy and a pageable host-to-device one.
-            out = (_fresh(self.view.product(c.m_of(name)), a.device) if name in self._want
-                   else None)
+            out = (self._leaf_to(self.view.product(c.m_of(name)), a.device)
+                   if name in self._want else None)
         else:
             hit_a, hit_b = self._saved.get(_ptr(a)), self._saved.get(_ptr(b))
             if (hit_a is None) == (hit_b is None):
@@ -1648,10 +1726,13 @@ class DecoderReplay(Replay):
             name = f"L{self._unit}.{role}"
             out = None
             if name in self._want:
-                out = self._member_block(self._unit, role,
-                                         own=a.device.type == "cpu" and role != "dK")
+                own = a.device.type == "cpu" and role != "dK"
+                out = self._member_block(self._unit, role, own=own)
                 if role == "dK":  # the op computes δK̃ᵀ = Q̃ᵀ·δS; the leaves hold δK̃
+                    self.leaf_moves += out.device != a.device
                     out = _dk_owned(out, a.device)
+                else:
+                    out = self._owned_on(out, a.device, own)
         if out is None or name in self._bops:
             raise ReplayError(f"replay: backward product {name} is not declared in this unit "
                               f"or appears twice")
@@ -1691,7 +1772,7 @@ class DecoderReplay(Replay):
                 return self._supply_backward(op, a, wb, bias)
             if op != "mm" or self._weight(wb) != c.w_out:
                 raise ReplayError(f"replay: head block {b} does not start with {lam}")
-            scores.append(_fresh(self.view.product(c.m_of(lam)), a.device))
+            scores.append(self._leaf_to(self.view.product(c.m_of(lam)), a.device))
             self._fwd[lam] = (a, wb, a._version, wb._version)
             return scores[0]
 
@@ -1730,6 +1811,8 @@ class DecoderReplay(Replay):
             raise ReplayError("replay: a product in the final norm's backward")
 
         try:
+            if len({d.device for d in self._dfs}) != 1:  # every head block ran on one device
+                raise ReplayError("replay: the head blocks' δF_b are not on one device")
             with ProductSubstitution(no_product):
                 grads = torch.autograd.grad(u.out, [u.x, gamma],
                                             grad_outputs=torch.cat(self._dfs))
@@ -1765,7 +1848,8 @@ class DecoderReplay(Replay):
         try:
             with ProductSubstitution(self._supply_backward):
                 grads = torch.autograd.grad(
-                    u.out, [u.x, *params], grad_outputs=dx[1], allow_unused=True)
+                    u.out, [u.x, *params], grad_outputs=self._to_unit(dx[1], j),
+                    allow_unused=True)
         except BaseException:
             self._built, self._units = False, {}  # the graph may be half consumed
             raise
@@ -1903,8 +1987,9 @@ class DecoderReplay(Replay):
         a0, b0 = whole[0]
         if any(a.shape[1:] != a0.shape[1:] or b.shape[1:] != b0.shape[1:] for a, b in whole):
             return self._operand_group_members(ms, dtype)  # copy_ would broadcast; stack raises
-        out_a = a0.new_empty((len(ms), *a0.shape[1:]), dtype=dtype)
-        out_b = b0.new_empty((len(ms), *b0.shape[1:]), dtype=dtype)
+        dev = self.pl.unit_device(j)  # where operands(m) serves this unit's members
+        out_a = a0.new_empty((len(ms), *a0.shape[1:]), dtype=dtype, device=dev)
+        out_b = b0.new_empty((len(ms), *b0.shape[1:]), dtype=dtype, device=dev)
         for (a, b), (pos, R, _, i0, bs, n, _) in zip(whole, roles):
             dst = slice(pos, pos + R * (n - 1) + 1, R)
             src = slice(i0, i0 + bs * (n - 1) + 1, bs)
@@ -1950,8 +2035,9 @@ class DecoderReplay(Replay):
         if any(a.shape[1:] != a0.shape[1:] or b.shape[1:] != b0.shape[1:]
                for a, b, _, _ in roles.values()):
             return super().operand_group(ms, dtype)  # copy_ would broadcast; stack raises
-        out_a = a0.new_empty((len(ms), *a0.shape[1:]), dtype=dtype)
-        out_b = b0.new_empty((len(ms), *b0.shape[1:]), dtype=dtype)
+        dev = self.pl.unit_device(j)  # where operands(m) serves this unit's members
+        out_a = a0.new_empty((len(ms), *a0.shape[1:]), dtype=dtype, device=dev)
+        out_b = b0.new_empty((len(ms), *b0.shape[1:]), dtype=dtype, device=dev)
         for a, b, pos, idx in roles.values():
             dst, src = _progression(pos), _progression(idx)
             for out, whole in ((out_a, a), (out_b, b)):
@@ -1971,6 +2057,11 @@ class DecoderReplay(Replay):
         at the committed ids, fed ``δX_1``, so it follows that module's ``padding_idx``. At
         test scale that has no numeric effect: SmolLM2's padding id 2 occurs only at padded
         positions, where ``δX_1`` is exactly 0, so a plain scatter-add gives the same bits.
+
+        Sharded (FS32c), ``δX_1`` moves to unit 0's device, where the embedding's backward runs
+        and the tied sum is formed (the one place that does). Every gradient is returned on
+        ``c.placement.weight_device`` of its weight; unsharded, where the replay's tensors are
+        (the run's device). Check 6b compares each with the weight's leaves there.
         """
         c = self.c
         if not self._served_last or self._dx is None or self._dx[0] != 1:
@@ -1985,7 +2076,7 @@ class DecoderReplay(Replay):
         # Under the prover's autocast (F5a), so the lookup runs as training ran it.
         with torch.enable_grad(), c.autocast(), ProductSubstitution(no_product):
             (g_emb,) = torch.autograd.grad(emb(self.batch.ids), [emb.weight],
-                                           grad_outputs=self._dx[1])
+                                           grad_outputs=self._to_unit(self._dx[1], 0))
         # F6b: the committed G_E^head blocks widened exactly to W_E's format and summed as
         # training sums them (chain_gradient, on the lookup's device), plus the lookup's.
         g_e = (chain_gradient((self.view.product(m).to(g_emb.device) for m in c.head_gradients),
@@ -1996,4 +2087,9 @@ class DecoderReplay(Replay):
         bad = [n for n, g in out.items() if g.dtype != c.weight_dtype]
         if bad:
             raise ReplayError(f"replay: glue gradients not {c.weight_dtype}: {bad[:3]}")
+        if self.pl.sharded:
+            off = [n for n, g in out.items() if g.device != self.pl.weight_device(n)]
+            if off:
+                raise ReplayError(f"replay: glue gradients not on their weights' devices: "
+                                  f"{off[:3]}")
         return out
