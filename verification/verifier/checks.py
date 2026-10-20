@@ -58,6 +58,7 @@ from contextlib import AbstractContextManager, nullcontext
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
+import numpy as np
 import torch
 
 from verification.commitment.merkle import DIGEST_SIZE, merkle_root, verify_path
@@ -87,9 +88,11 @@ from verification.verifier.context import (
     _Rejected,
 )
 from verification.verifier.matmul_check.freivalds import (
+    MeasureColumns,
     MeasureScratch,
     ProductMeasure,
     finish_row,
+    finish_rows,
     measure_product_row,
     measure_products_rows,
 )
@@ -895,16 +898,72 @@ def _finish(batch: Sequence[_Rows], ctx: StepContext) -> list[tuple[ProductSpec,
     return out
 
 
+def _finish_columns(batch: Sequence[_Rows], ctx: StepContext
+                    ) -> tuple[list[ProductSpec], MeasureColumns | None]:
+    """:func:`_finish`'s products, as their specs and a :class:`MeasureColumns` in canonical
+    order, finished in one vectorized step (``freivalds.finish_rows``)."""
+    present = [r for r in batch if r.rows is not None]
+    if not present:
+        return [], None
+    with ctx.timed("5.measure"):
+        rows = (present[0].rows if len(present) == 1 else torch.cat([r.rows for r in present]))
+        host = rows.double().cpu().numpy()  # type: ignore[union-attr]
+        perm, specs, base = [], [], 0
+        for r in present:
+            perm.append(base + np.argsort(r.order))
+            specs += r.specs
+            base += len(r.order)
+        canonical = np.concatenate(perm)
+        cols = finish_rows(host[canonical], q=np.array([s.q for s in specs]),
+                           n=np.array([s.a_shape[0] for s in specs]), eps_in=ctx.eps_in,
+                           eps_acc=ctx.eps_acc, guard=ctx.kappa_guard,
+                           biased=np.array([s.bias is not None for s in specs]))
+    return specs, cols
+
+
+def _first_failing(specs: Sequence[ProductSpec], classes: Sequence[str], cols: MeasureColumns,
+                   ctx: StepContext, bands: Bands) -> int:
+    """The index of the first product :func:`_judge_product` would reject, ``len(specs)`` if
+    none: the same three tests as masks (finiteness, test 1, test 2), a product failing if any
+    does."""
+    finite = (np.isfinite(cols.p_norm) & np.isfinite(cols.u) & np.isfinite(cols.unit)
+              & np.isfinite(cols.residuals).all(axis=1))
+    if ctx.kappa_guard:
+        finite &= np.isfinite(cols.nu) & np.isfinite(cols.p_abs1)
+    bad = ~finite
+    if ctx.judge:
+        if ctx.kappa_guard:
+            kappa_max = {key: bands.kappa_for(key) for key in set(classes)}
+            ceiling = np.array([kappa_max[key] for key in classes]) * cols.p_abs1
+            bad |= ~(cols.nu <= ceiling)
+        bad |= ~(cols.residuals <= bands.tau * cols.unit[:, None]).all(axis=1)
+    return int(np.argmax(bad)) if bad.any() else len(specs)
+
+
 def _judge_window(c: DeclaredComputation, batch: Sequence[_Rows], ctx: StepContext,
                   bands: Bands) -> Rejection | None:
     """Read the batch's numbers, then record and judge its products in canonical order. At a
     rejection the products after the failing one go to ``StepState.run_rest``, measured and
-    never judged, for the record pass."""
-    done = _finish(batch, ctx)
-    for i, (spec, mp) in enumerate(done):
-        rej = _judge_product(c, spec, mp, ctx, bands)
+    never judged, for the record pass.
+
+    The products before the first failing one are recorded in bulk, judged by masks. From the
+    failing one on, :func:`_judge_product` runs product by product, so the rejection, and
+    ``run_rest``, are the one-at-a-time path's.
+    """
+    specs, cols = _finish_columns(batch, ctx)
+    if cols is None:
+        return None
+    classes = [product_class(c, spec) for spec in specs]
+    first = _first_failing(specs, classes, cols, ctx, bands)
+    ctx.stats.products.extend_columns(
+        m=[s.m for s in specs[:first]], name=[s.name for s in specs[:first]],
+        cls=classes[:first], kappa=cols.kappa[:first], normalized=cols.normalized[:first],
+        q=[s.q for s in specs[:first]], p_norm=cols.p_norm[:first], nu=cols.nu[:first],
+        p_abs1=cols.p_abs1[:first], u=cols.u[:first])
+    for i in range(first, len(specs)):
+        rej = _judge_product(c, specs[i], cols.measure(i), ctx, bands)
         if rej is not None:
-            ctx.state.run_rest = done[i + 1:]
+            ctx.state.run_rest = [(specs[j], cols.measure(j)) for j in range(i + 1, len(specs))]
             return rej
     return None
 

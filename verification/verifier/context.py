@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable, Iterable, Iterator
+from bisect import bisect_right
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import torch
 
 from setup.records import Record
@@ -50,6 +52,7 @@ __all__ = [
     "Rejection",
     "RejectionKind",
     "ProductStat",
+    "ProductStats",
     "TensorStat",
     "StepStats",
     "StepState",
@@ -133,10 +136,150 @@ class TensorStat:
     rho_max: float
 
 
+class _Block:
+    """``n`` products' :class:`ProductStat` fields as columns (``normalized`` is ``[n, k]``)."""
+
+    __slots__ = ("m", "name", "cls", "kappa", "normalized", "q", "p_norm", "nu", "p_abs1", "u")
+
+    def __init__(self, m: Sequence[int], name: Sequence[str], cls: Sequence[str],
+                 kappa: np.ndarray, normalized: np.ndarray, q: Sequence[int],
+                 p_norm: np.ndarray, nu: np.ndarray, p_abs1: np.ndarray, u: np.ndarray) -> None:
+        self.m, self.name, self.cls, self.q = m, name, cls, q
+        self.kappa, self.normalized, self.p_norm = kappa, normalized, p_norm
+        self.nu, self.p_abs1, self.u = nu, p_abs1, u
+
+    def __len__(self) -> int:
+        return len(self.m)
+
+    def stat(self, i: int) -> ProductStat:
+        return ProductStat(int(self.m[i]), self.name[i], self.cls[i], float(self.kappa[i]),
+                           tuple(self.normalized[i].tolist()), q=int(self.q[i]),
+                           p_norm=float(self.p_norm[i]), nu=float(self.nu[i]),
+                           p_abs1=float(self.p_abs1[i]), u=float(self.u[i]))
+
+    def stats(self) -> list[ProductStat]:
+        return [ProductStat(m, name, cls, kappa, tuple(norm), q=q, p_norm=p_norm, nu=nu,
+                            p_abs1=p_abs1, u=u)
+                for m, name, cls, kappa, norm, q, p_norm, nu, p_abs1, u in zip(
+                    self.m, self.name, self.cls, self.kappa.tolist(),
+                    self.normalized.tolist(), self.q, self.p_norm.tolist(), self.nu.tolist(),
+                    self.p_abs1.tolist(), self.u.tolist())]
+
+
+class ProductStats:
+    """A step's :class:`ProductStat` records, in the order they were added. It behaves as the
+    list it replaces: ``append``, ``extend``, ``clear``, ``len``, truthiness, iteration,
+    indexing (negative too; a slice gives a list), item assignment, ``+`` and ``==``.
+
+    Check 5 adds a window's products in bulk (:meth:`extend_columns`), which stores columns and
+    builds no :class:`ProductStat`. They are built when needed: one by indexing, all of them
+    (and kept) by iterating. A stat read back equals the one a scalar ``append`` would hold,
+    field for field, with Python floats and ints.
+    """
+
+    def __init__(self, stats: Iterable[ProductStat] = ()) -> None:
+        self._segs: list[ProductStat | _Block] = []
+        self._ends: list[int] = []  # _ends[i]: the count of products up to and with _segs[i]
+        self.extend(stats)
+
+    def __len__(self) -> int:
+        return self._ends[-1] if self._ends else 0
+
+    def append(self, stat: ProductStat) -> None:
+        self._segs.append(stat)
+        self._ends.append(len(self) + 1)
+
+    def extend(self, stats: Iterable[ProductStat]) -> None:
+        for stat in stats:
+            self.append(stat)
+
+    def extend_columns(self, *, m: Sequence[int], name: Sequence[str], cls: Sequence[str],
+                       kappa: np.ndarray, normalized: np.ndarray, q: Sequence[int],
+                       p_norm: np.ndarray, nu: np.ndarray, p_abs1: np.ndarray,
+                       u: np.ndarray) -> None:
+        """Append ``len(m)`` products from columns: ``kappa``, ``p_norm``, ``nu``, ``p_abs1``
+        and ``u`` float64 ``[n]``, ``normalized`` float64 ``[n, k]``, the rest sequences."""
+        if len(m):
+            self._segs.append(_Block(m, name, cls, kappa, normalized, q, p_norm, nu, p_abs1, u))
+            self._ends.append(len(self) + len(m))
+
+    def clear(self) -> None:
+        self._segs.clear()
+        self._ends.clear()
+
+    def _flatten(self) -> None:
+        """Replace every block by its :class:`ProductStat` objects."""
+        if any(isinstance(g, _Block) for g in self._segs):
+            segs = [x for g in self._segs for x in (g.stats() if isinstance(g, _Block) else (g,))]
+            self.clear()
+            self.extend(segs)
+
+    def __iter__(self) -> Iterator[ProductStat]:
+        self._flatten()
+        return iter(self._segs)  # type: ignore[arg-type]
+
+    def _at(self, i: int) -> tuple[int, int]:
+        n = len(self)
+        if not -n <= i < n:
+            raise IndexError("ProductStats index out of range")
+        i %= n
+        seg = bisect_right(self._ends, i)
+        return seg, i - (self._ends[seg - 1] if seg else 0)
+
+    def __getitem__(self, i: int | slice) -> Any:
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(len(self)))]
+        seg, off = self._at(i)
+        g = self._segs[seg]
+        return g.stat(off) if isinstance(g, _Block) else g
+
+    def __setitem__(self, i: int, stat: ProductStat) -> None:
+        self._at(i)  # raises IndexError out of range
+        self._flatten()
+        self._segs[i] = stat
+
+    def __bool__(self) -> bool:
+        return bool(self._segs)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ProductStats):
+            return list(self) == list(other)
+        if isinstance(other, list):
+            return list(self) == other
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __add__(self, other: Iterable[Any]) -> list[Any]:
+        return [*self, *other]
+
+    def __radd__(self, other: list[Any]) -> list[Any]:
+        return [*other, *self]
+
+    def __iadd__(self, other: Iterable[ProductStat]) -> ProductStats:
+        self.extend(other)
+        return self
+
+    def copy(self) -> ProductStats:
+        """An independent container with the same records (the columns are shared, read-only)."""
+        dup = ProductStats()
+        dup._segs, dup._ends = list(self._segs), list(self._ends)
+        return dup
+
+    __copy__ = copy
+
+    def __repr__(self) -> str:
+        return repr(list(self))
+
+
 @dataclass
 class StepStats:
-    products: list[ProductStat] = field(default_factory=list)
+    products: ProductStats = field(default_factory=ProductStats)
     tensors: list[TensorStat] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.products, ProductStats):
+            self.products = ProductStats(self.products)
 
     def max_normalized(self) -> float:
         return max((max(p.normalized) for p in self.products), default=0.0)

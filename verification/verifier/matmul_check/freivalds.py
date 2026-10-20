@@ -70,6 +70,7 @@ import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
+import numpy as np
 import torch
 
 from verification.verifier.matmul_check.challenges import (
@@ -79,9 +80,10 @@ from verification.verifier.matmul_check.challenges import (
 )
 from verification.verifier.matmul_check.sizing import product_e_m
 
-__all__ = ["ROW", "MeasureScratch", "ProductMeasure", "band_unit", "finish_row",
-           "measure_product", "measure_product_row", "measure_products",
-           "measure_products_rows", "row_width", "term_scale", "term_scales"]
+__all__ = ["ROW", "MeasureColumns", "MeasureScratch", "ProductMeasure", "band_unit",
+           "finish_row", "finish_rows", "measure_product", "measure_product_row",
+           "measure_products", "measure_products_rows", "row_width", "term_scale",
+           "term_scales"]
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,31 @@ class ProductMeasure:
     unit: float  # σ_r·e_m·‖P‖_F, the band's scale
     normalized: tuple[float, ...]  # residual / unit, the quantity compared with τ
     u: float = math.nan  # U = sqrt(Σ_l ‖A[:,l]‖²·‖B[l,:]‖²), the term scale (F18)
+
+
+@dataclass(frozen=True)
+class MeasureColumns:
+    """:class:`ProductMeasure`'s fields for ``N`` products as float64 arrays (``[N]``, and
+    ``[N, k]`` for the residuals and their normalizations), from :func:`finish_rows`."""
+
+    nu: np.ndarray
+    p_abs1: np.ndarray
+    kappa: np.ndarray
+    residuals: np.ndarray
+    p_norm: np.ndarray
+    unit: np.ndarray
+    normalized: np.ndarray
+    u: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.nu)
+
+    def measure(self, i: int) -> ProductMeasure:
+        """Product ``i``'s :class:`ProductMeasure`, with Python floats."""
+        return ProductMeasure(float(self.nu[i]), float(self.p_abs1[i]), float(self.kappa[i]),
+                              tuple(self.residuals[i].tolist()), float(self.p_norm[i]),
+                              float(self.unit[i]), tuple(self.normalized[i].tolist()),
+                              float(self.u[i]))
 
 
 def _safe_norm(x: torch.Tensor, dim: int | None = None) -> torch.Tensor:
@@ -333,6 +360,34 @@ def finish_row(row: Sequence[float], *, q: int, n: int, eps_in: float, eps_acc: 
         u2 += n * bias_sq
     return _guarded(_measure(nu, p_abs1, tuple(res), p_norm, q, eps_in, eps_acc,
                              math.sqrt(u2)), guard)
+
+
+def finish_rows(rows: np.ndarray, *, q: np.ndarray, n: np.ndarray, eps_in: float,
+                eps_acc: float, guard: bool = True, biased: np.ndarray) -> MeasureColumns:
+    """:func:`finish_row` for ``N`` products at once: ``rows`` is float64 ``[N, 5 + k]``, and
+    ``q``, ``n`` and ``biased`` are ``[N]``.
+
+    It follows the scalar path operation by operation (the same order, no fused operations), so
+    every field equals :func:`finish_row`'s bit for bit, up to a NaN's payload. Float64
+    arithmetic is IEEE in numpy as in Python, and ``np.sqrt`` rounds correctly like
+    ``math.sqrt``.
+    """
+    nu, p_abs1, p_norm, u2, bias_sq = (np.ascontiguousarray(rows[:, i]) for i in range(5))
+    res = rows[:, 5:]
+    with np.errstate(all="ignore"):
+        u2 = np.where(biased, u2 + n.astype(np.float64) * bias_sq, u2)
+        u = np.sqrt(u2)
+        sqrt_q = np.sqrt(q.astype(np.float64))
+        kappa = np.where(p_abs1 > 0, nu / p_abs1, np.where(nu == 0, 1.0, math.inf))
+        ratio = u / p_norm  # term_ratio's one case here: p_norm == 0 takes the first branch
+        e = math.sqrt(2.0) * eps_in + sqrt_q * eps_acc * np.where(ratio > 1.0, ratio, 1.0)
+        unit = np.where(p_norm == 0, SIGMA_R * sqrt_q * eps_acc * u,
+                        SIGMA_R * np.where(np.isnan(ratio), math.nan, e) * p_norm)
+        normalized = np.where(unit[:, None] > 0, res / unit[:, None],
+                              np.where(res == 0, 0.0, math.inf))
+    if not guard:
+        kappa = np.full_like(kappa, math.nan)
+    return MeasureColumns(nu, p_abs1, kappa, res, p_norm, unit, normalized, u)
 
 
 def _guarded(mp: ProductMeasure, guard: bool) -> ProductMeasure:
