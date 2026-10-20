@@ -298,7 +298,8 @@ if [ $((GRACE_S + PACK_RESERVE_S)) -ge "$DEADLINE_S" ]; then
 fi
 case "$SESSION" in
   fs11|recheck|profile-check|nvlink-probe|fs32-pair) ;;
-  *) refuse "FS11_SESSION is '$SESSION'; it must be fs11, recheck, profile-check or nvlink-probe (or fs32-pair, the two-GPU session)" ;;
+  *) refuse "FS11_SESSION is '$SESSION'; it must be fs11, recheck, profile-check or nvlink-probe" \
+       "(or fs32-pair, the two-GPU session)" ;;
 esac
 mkdir -p "$OUT" || refuse "cannot create $OUT"
 rm -f "$READY" "$PACK_FAILED" "$FETCHED"

@@ -405,11 +405,14 @@ def _good(**over):
     def run(arm, **kw):
         ex = {"verdicts": ["accepted"] * 3, "kept_root": "k" * 16, "final_root": "f" * 8,
               "losses": [3.0, 2.5, 2.0]}
-        return _p(f"run_{arm}", "pair_run", {**ex, **kw}, arm=arm)
+        ex = {**ex, **kw}
+        ex.setdefault("step_lines", [f"{v}; max residual 1.00" for v in ex["verdicts"]])
+        ex.setdefault("step_roots", ["r1", "r2", "r3"])
+        return _p(f"run_{arm}", "pair_run", ex, arm=arm)
 
     def card(arm, **kw):
-        ex = {"root": "r", "w_next_root": "w", "loss": 1.5}
-        return _p(f"card_{arm}", "card", {**ex, **kw}, arm=arm)
+        ex = {"root": "r", "w_next_root": "w", "plain_w_next_root": "w", "loss": 1.5}
+        return _p(f"card_{arm}", "pair_card", {**ex, **kw}, arm=arm)
 
     parts = [_p("models", "models"), _p("native_build", "other"),
              _p("fast_suite", "pytest", {"tests": 9, "failures": 0, "errors": 0, "skipped": 1,
@@ -429,13 +432,13 @@ def test_the_good_fixture_passes():
 
 
 @pytest.mark.parametrize("bad", [
-    {"card_sharded": _p("card_sharded", "card", {"root": "X", "w_next_root": "w", "loss": 1.5},
+    {"card_sharded": _p("card_sharded", "pair_card", {"root": "X", "w_next_root": "w", "loss": 1.5},
                         arm="sharded")},
-    {"card_sharded": _p("card_sharded", "card", {"root": "r", "w_next_root": "X", "loss": 1.5},
+    {"card_sharded": _p("card_sharded", "pair_card", {"root": "r", "w_next_root": "X", "loss": 1.5},
                         arm="sharded")},
-    {"card_sharded": _p("card_sharded", "card", {"root": "r", "w_next_root": "w", "loss": 9.0},
+    {"card_sharded": _p("card_sharded", "pair_card", {"root": "r", "w_next_root": "w", "loss": 9.0},
                         arm="sharded")},
-    {"card_sharded": _p("card_sharded", "card", None, arm="sharded")},
+    {"card_sharded": _p("card_sharded", "pair_card", None, arm="sharded")},
     {"run_sharded": _p("run_sharded", "pair_run", {"verdicts": ["accepted"] * 3,
                                                    "kept_root": "k" * 16, "final_root": "X",
                                                    "losses": [3.0, 2.5, 2.0]}, arm="sharded")},
@@ -493,9 +496,6 @@ def test_a_failing_test_is_no_pass(name, extras):
     assert not pair["pass"] and pair["slowest_failing"]["part"] == name
 
 
-@pytest.mark.xfail(strict=True, reason="FS32f defect: a pytest part that never ran or whose "
-                   "junit XML was never written (killed at its timeout) reads as no failure; "
-                   "fs32_pair()['pass'] is true")
 @pytest.mark.parametrize("name", ["fast_suite", "two_gpu_slow"])
 @pytest.mark.parametrize("extras", [{"junit": None}, None],
                          ids=["no-junit", "no-extras"])
@@ -504,9 +504,6 @@ def test_a_test_part_that_never_ran_is_no_pass(name, extras):
         "pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="FS32f defect: fs32_pair() ignores every part's status: "
-                   "a failed, timed-out or never-started part whose extras still compare equal "
-                   "reads as a pass")
 @pytest.mark.parametrize("name", ["models", "native_build", "smollm2_calibrate", "card_sharded",
                                   "card_unsharded", "run_sharded", "run_unsharded",
                                   "poisoned_step", "hidden_steps", "flipped_matmul"])
@@ -520,8 +517,6 @@ def test_a_part_that_failed_or_never_ran_is_no_pass(name, status):
     assert not fs.fs32_pair(parts)["pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="FS32f defect: both arms REJECTING every honest step "
-                   "gives equal verdicts, and fs32_pair()['pass'] is true")
 def test_two_arms_that_both_reject_the_honest_run_are_no_pass():
     rej = {"verdicts": ["REJECTED"] * 3, "kept_root": "k" * 16, "final_root": "f" * 8,
            "losses": [3.0, 2.5, 2.0]}
@@ -531,8 +526,6 @@ def test_two_arms_that_both_reject_the_honest_run_are_no_pass():
     assert not pair["pass"]
 
 
-@pytest.mark.xfail(strict=True, reason="FS32f defect: all CUDA tests skipped (0 ran) in "
-                   "two_gpu_slow reads as a pass: the session's job is those tests")
 def test_a_two_gpu_part_that_skipped_everything_is_no_pass():
     ex = {"tests": 2, "failures": 0, "errors": 0, "skipped": 2, "slowest_failing": None}
     assert not fs.fs32_pair(_good(two_gpu_slow=_p("two_gpu_slow", "pytest", ex)))["pass"]
@@ -554,22 +547,24 @@ def _stand_ins(tmp_path, *, bad_cheat=False, sharded_root="aa"):
     card = ("import json,sys;json.dump({'card':{'name':'A40','uuid':'u','pci_bus_id':'p'},"
             "'plain':{'w_next_root':'w','loss':1.0},'proved':{'root':ROOT,'w_next_root':'w',"
             "'loss':1.0},'n_leaves':3,'wall_s':{}},open(sys.argv[1],'w'))")
-    run = ("import json,sys;print('step  1 (in-sample): accepted; x');print('step  2 (sample): "
-           "accepted; x');print('stored step 2: p, 3 files, 0.1 GiB, root '+'ab'*8+'… (r)');"
+    run = ("import json,sys\nfor t in (1, 2, 3):\n"
+           "    print(f'step  {t} (in-sample): accepted; x')\n"
+           "    print(f'step  {t} root ' + str(t) * 64)\n"
+           "print('stored step 3: p, 3 files, 0.1 GiB, root '+'ab'*8+'… (r)')\n"
            "json.dump({'root':ROOT,'losses':[1.0,2.0]},open(sys.argv[1],'w'))")
     cheat = "print('A1 d a OUT 1 2 3');print('flip d a OUT 1 2 3')"
     junit = ("import sys;open(sys.argv[1],'w').write('<testsuites><testsuite><testcase "
              "classname=\"a\" name=\"b\" time=\"1\"/></testsuite></testsuites>')")
     parts = []
     for name, kind, src, args, info, root in [
-            ("card_unsharded", "card", card, [str(d / "cu.json")], {"arm": "unsharded"}, "aa"),
-            ("card_sharded", "card", card, [str(d / "cs.json")], {"arm": "sharded"}, "aa"),
+            ("card_unsharded", "pair_card", card, [str(d / "cu.json")], {"arm": "unsharded"}, "aa"),
+            ("card_sharded", "pair_card", card, [str(d / "cs.json")], {"arm": "sharded"}, "aa"),
             ("run_unsharded", "pair_run", run, [str(d / "wu.json")], {"arm": "unsharded"}, "aa"),
             ("run_sharded", "pair_run", run, [str(d / "ws.json")], {"arm": "sharded"},
              sharded_root)]:
         report = args[0]
         info = {**info, "gpu_peak": True,
-                **({"report": report} if kind == "card" else {"weights": report})}
+                **({"report": report} if kind == "pair_card" else {"weights": report})}
         parts.append(fs.Part(name, [*PY, src.replace("ROOT", repr(root))], timeout_s=30,
                              kind=kind, info=info) if False else
                      fs.Part(name, ["{python}", "-c", src.replace("ROOT", repr(root)), *args],
@@ -599,9 +594,14 @@ def test_the_job_log_ends_with_one_line_per_acceptance_item(tmp_path, monkeypatc
     fs32 = [l for l in lines if l.startswith("FS32")]
     assert lines[-len(fs32):] == fs32
     assert [l.split(":")[0] for l in fs32] == [
-        "FS32 roots equal", "FS32 verdicts equal", "FS32 cheat A1", "FS32 cheat A2",
+        "FS32 roots equal", "FS32 verdicts equal",
+        "FS32 unsharded plain and proved W_{t+1}", "FS32 sharded plain and proved W_{t+1}",
+        "FS32 cheat A1", "FS32 cheat A2",
         "FS32 cheat A3", "FS32 cheat hidden", "FS32 cheat flip", "FS32 fast_suite",
-        "FS32 two_gpu_slow", "FS32 slowest failing test"]
+        "FS32 two_gpu_slow", *["FS32 FAIL"] * 5, "FS32 slowest failing test"]
+    assert {l for l in fs32 if l.startswith("FS32 FAIL")} == {
+        f"FS32 FAIL: {n} did not run" for n in (
+            "models", "native_build", "smollm2_calibrate", "hidden_steps", "flipped_matmul")}
     assert s["fs32_pair"]["roots_equal"] and s["fs32_pair"]["verdicts_equal"]
     assert s["fs32_pair"]["cheats"]["A1"] == "exact" and s["fs32_pair"]["cheats"]["A2"] is None
     assert not s["fs32_pair"]["pass"]  # A2, A3, hidden and flip did not run

@@ -166,6 +166,7 @@ def honest_final(c: DeclaredComputation, dataset: Sequence[Any],
     """
     model = (build_model or c.build_model)()
     final = run_plain(c, model, dataset, w0, n_steps=T, seed=seed).w_final
+
     def storage(t: torch.Tensor) -> tuple[torch.device, int]:
         return t.device, t.untyped_storage().data_ptr()  # a sharded run's weights sit on devices
 

@@ -56,7 +56,8 @@ def forge(which):
     """An ``edit`` for :class:`Recording`: one leaf in the last layer's unit changed."""
     def edit(c, leaves):
         if which == "product":
-            m = next(s.m for s in c.products if s.name.startswith("L2.") and s.kind.name == "FORWARD")
+            m = next(s.m for s in c.products
+                     if s.name.startswith("L2.") and s.kind.name == "FORWARD")
             i = c.product_index(m)
         else:
             names = c.linear_weights if which == "linear" else c.glue_gradient_weights
@@ -65,17 +66,22 @@ def forge(which):
     return edit
 
 
-def _tiny(devices, device="cpu"):
+def _tiny(devices, device="cpu", layers=None):
     torch.manual_seed(0)
-    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3, device=device,
+    config = tiny_config()
+    if layers is not None:
+        config.num_hidden_layers = layers
+        if getattr(config, "layer_types", None):
+            config.layer_types = [config.layer_types[0]] * layers
+    c = DecoderComputation(config, n_s=2, n=12, eta=1e-3, device=device,
                            verifier_devices=devices)
     D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
     return c, D, c.build_model
 
 
-def run(devices, edit=None, device="cpu"):
+def run(devices, edit=None, device="cpu", layers=None):
     """A verified run under provisional bands: ``(c, loop result, verifier, hand-off)``."""
-    c, D, build = _tiny(devices, device)
+    c, D, build = _tiny(devices, device, layers)
     model = build()
     randomize_biases(dict(model.named_parameters()))
     w0 = snapshot_weights(c, model)
@@ -97,8 +103,8 @@ def _same(a, b):
     cb, rb, vb, hb = b
     assert cb.placement.sharded and not ca.placement.sharded
     assert ha.roots == hb.roots
-    assert [(s.t, s.loss, s.rejection) for s in ra.steps] == [(s.t, s.loss, s.rejection)
-                                                              for s in rb.steps]
+    step = lambda r: [(s.t, s.loss, s.rejection, s.root) for s in r.steps]  # noqa: E731
+    assert step(ra) == step(rb) and all(s.root for s in ra.steps)
     assert ra.verdict == rb.verdict
     assert _numbers(va) == _numbers(vb)
     assert va.record_pass == vb.record_pass

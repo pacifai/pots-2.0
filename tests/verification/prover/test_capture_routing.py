@@ -16,7 +16,7 @@ from verification.prover.capture import HostBuffers, MatmulCapture, MutatedCaptu
 from verification.prover.step import commit, plain_step, prove_step
 
 from tests.verification.decoder_helpers import (
-    SWITCHES, make_records, randomize_biases, switch_id, tiny_config)
+    SWITCHES, make_records, randomize_biases, switch_id, tiny_config, verifier_devices)
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
@@ -153,7 +153,7 @@ def test_a_perturbation_built_on_another_device_stays_on_the_owner():
 
 # ---- two GPUs ----------------------------------------------------------------------------
 
-GPUS = ("cuda:0", "cuda:1")
+GPUS = verifier_devices()
 
 
 @two_gpus
@@ -259,7 +259,7 @@ def test_two_gpus_release_device_cache_empties_every_device():
     del block
     assert torch.cuda.memory_reserved(1) > 0
     before = torch.cuda.memory_reserved(1)
-    release_device_cache("cuda:0", devices=("cuda:0", "cuda:1"))
+    release_device_cache("cuda:0", devices=GPUS)
     assert torch.cuda.memory_reserved(1) < before
 
 

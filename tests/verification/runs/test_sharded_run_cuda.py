@@ -9,13 +9,14 @@ the run's numbers equal the unsharded run's bit for bit.
 import pytest
 import torch
 
+from tests.verification.decoder_helpers import verifier_devices
 from tests.verification.runs import test_sharded_run as sr
 from verification.verifier import checks
 from verification.verifier.matmul_check.freivalds import MeasureScratch
 
 N = torch.cuda.device_count()
 needs_two = pytest.mark.skipif(N < 2, reason="needs two CUDA devices")
-DEVICES = (("cuda:0", "cuda:1") if N < 3 else tuple(f"cuda:{i}" for i in range(1, N)))
+DEVICES = verifier_devices(N)
 PROVER = "cuda:0"
 
 
@@ -38,28 +39,35 @@ def test_two_gpus_forged_leaf_is_rejected_alike(which):
     sr._same(one, many)
 
 
+def _layer_owners(c):
+    """The verifier devices that own a layer's unit (not the pinned embedding and head)."""
+    pinned = c.pinned_last_units
+    return {c.placement.unit_device(j) for j in c.units if j not in pinned}
+
+
 @needs_two
 def test_two_gpus_rows_of_layers_sit_on_different_devices_and_one_window_spans_them(monkeypatch):
-    """Before the join each run's rows are on its product's device; with one window for the
-    whole step, the window holds rows from more than one device and is judged as one. A run's
-    rows are on its operands' (unit) device."""
+    """Before the join each run's rows sit on their unit's device. The model has two layers per
+    verifier device, so every device owns layers, and its products are far fewer than one
+    judging window, so the whole step is one window and it must hold rows from every layer-owning
+    device: it is judged as one window that crosses the device boundary."""
     seen = []
     real = checks._judge_window
 
     def spy(c, batch, ctx, bands):
-        seen.append([(r.specs[0].name, checks._rows_device(r.rows)) for r in batch
-                     if r.rows is not None])
+        seen.append([checks._rows_device(r.rows) for r in batch if r.rows is not None])
         return real(c, batch, ctx, bands)
 
     monkeypatch.setattr(checks, "_judge_window", spy)
-    c, res, _, _ = _sharded()
+    c, res, _, _ = sr.run(DEVICES, device=PROVER, layers=2 * len(DEVICES))
     assert res.verdict.accepted
-    window = max(seen, key=len)
-    devices = {torch.device(d) for d in DEVICES}
-    on = {d for _, d in window}
-    assert on <= devices and len(on) >= 2  # rows of different layers, one window
+    owners = _layer_owners(c)
+    assert len(owners) == len(DEVICES)  # by construction: each verifier device owns a layer
+    assert checks._layout(c)[1] == 1  # one window per step
+    window = max(seen, key=len)  # the step's one window holds every run's rows
+    assert set(window) == owners and len(set(window)) >= 2
     if N >= 3:
-        assert torch.device(PROVER) not in on  # the prover's GPU holds none of the verifier's
+        assert torch.device(PROVER) not in set(window)
 
 
 @needs_two
@@ -88,12 +96,12 @@ def test_two_gpus_one_scratch_buffer_per_device_stays_put(monkeypatch):
 
     monkeypatch.setattr(checks, "MeasureScratch", Spy)
     monkeypatch.setattr(checks, "UpdateScratch", USpy)
-    c, res, _, _ = _sharded()
+    c, res, _, _ = sr.run(DEVICES, device=PROVER, layers=2 * len(DEVICES))
     assert res.verdict.accepted
     by_device = {}
     for dev, numel, ptr in calls:
         by_device.setdefault(dev, []).append((numel, ptr))
-    assert len(by_device) >= min(2, len(DEVICES))
+    assert len(by_device) == len(_layer_owners(c))  # one buffer per device that owns a layer
     for dev, seq in by_device.items():
         for (n0, p0), (n1, p1) in zip(seq, seq[1:]):
             assert p0 == p1 or n1 > n0, dev  # a new allocation only where it grew

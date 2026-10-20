@@ -1,7 +1,7 @@
 """FS11's H100 sessions: the parts in order, each with its own log, under one deadline.
 
     .venv/bin/python -m verification.runs.fs11_session run --upload DIR --out DIR --deadline EPOCH
-                                                [--session {fs11,recheck,profile-check,nvlink-probe,fs32-pair}]
+                         [--session {fs11,recheck,profile-check,nvlink-probe,fs32-pair}]
     .venv/bin/python -m verification.runs.fs11_session fetch-models --upload DIR --out DIR
     .venv/bin/python -m verification.runs.fs11_session env --out DIR
 
@@ -303,14 +303,15 @@ def environment(out: Path) -> dict[str, Any]:
     }
 
 
-def refusal(env: Mapping[str, Any], allow_any_gpu: bool, min_cards: int | None = None
-            ) -> str | None:
+def refusal(env: Mapping[str, Any], allow_any_gpu: bool, min_cards: int | None = None,
+            *, need: str | None = None) -> str | None:
     """Why the session won't start on this machine, or ``None``. ``min_cards`` (the hardware
     probe's ``FS31_CARDS``) is the CUDA devices torch must see; ``allow_any_gpu`` overrides the
     H100 check, not this."""
     seen = len(env["gpus"]) if env["cuda_available"] else 0
     if min_cards is not None and seen < min_cards:
-        return f"torch sees {seen} CUDA devices, {CARDS_ENV} is {min_cards}"
+        want = f"{CARDS_ENV} is {min_cards}" if need is None else f"{need} needs {min_cards}"
+        return f"torch sees {seen} CUDA devices, {want}"
     if allow_any_gpu:
         return None
     if not env["cuda_available"]:
@@ -719,7 +720,7 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
     for arm, env in (("unsharded", {}), ("sharded", sharded)):
         d = run_dir(f"pair_card_{arm}")
         plan.append(part(f"card_{arm}", "card_identity", d, t["card"], "--out",
-                         str(d / "card.json"), kind="card", env=env, arm=arm,
+                         str(d / "card.json"), kind="pair_card", env=env, arm=arm,
                          report=str(d / "card.json")))
     for arm, env in (("unsharded", {}), ("sharded", sharded)):
         d = run_dir(f"pair_run_{arm}")
@@ -1173,7 +1174,7 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _probe_extras(Path(part.info["report"]))
         if part.kind == "nvlink":
             return _nvlink_extras(Path(part.info["report"]))
-        if part.kind == "card":
+        if part.kind in ("card", "pair_card"):
             return _card_extras(Path(part.info["report"]))
         if part.kind == "pytest":
             return _pytest_extras(Path(part.info["junit"]))
@@ -1213,7 +1214,6 @@ def _card_extras(report: Path) -> dict[str, Any]:
             "n_leaves": doc["n_leaves"], "wall_s": doc["wall_s"]}
 
 
-
 def _pytest_extras(junit: Path) -> dict[str, Any]:
     """A pytest part's counts and failures from its junit XML: how many tests ran, failed,
     errored and skipped, each failure's name and seconds, and the slowest failing one."""
@@ -1236,18 +1236,24 @@ def _pytest_extras(junit: Path) -> dict[str, Any]:
     return {**counts, "failed": failed, "slowest_failing": slowest}
 
 
-_PAIR_VERDICT = re.compile(r"^step\s+(\d+) \([^)]*\): (accepted|REJECTED);")
+_PAIR_STEP = re.compile(r"^step\s+(\d+) \([^)]*\): ((accepted|REJECTED);.*)$")
+_PAIR_ROOT = re.compile(r"^step\s+(\d+) root ([0-9a-f]{64})$")
 _PAIR_KEPT = re.compile(r"^stored step (\d+): .*root ([0-9a-f]{16})")
 
 
 def _pair_run_extras(log: Path, weights: Path) -> dict[str, Any]:
-    """A pair run's per-step verdicts and kept step's root (16 hex) from its log, and the final
-    weights' root and per-step losses from ``final_weights.json``."""
+    """A pair run's per-step lines (``step_lines``: everything after ``step t (...): ``),
+    verdicts, transcript roots (``step_roots``, the ``step t root`` lines) and kept step's root
+    (16 hex) from its log, and the final weights' root and per-step losses from
+    ``final_weights.json``."""
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
-    verdicts = {int(m[1]): m[2] for x in lines if (m := _PAIR_VERDICT.match(x))}
+    steps = {int(m[1]): m[2] for x in lines if (m := _PAIR_STEP.match(x))}
+    roots = {int(m[1]): m[2] for x in lines if (m := _PAIR_ROOT.match(x))}
     kept = next((m[2] for x in lines if (m := _PAIR_KEPT.match(x))), None)
     doc = json.loads(weights.read_text()) if weights.exists() else {}
-    return {"verdicts": [verdicts[t] for t in sorted(verdicts)], "kept_root": kept,
+    return {"step_lines": [steps[t] for t in sorted(steps)],
+            "verdicts": [steps[t].split(";")[0] for t in sorted(steps)],
+            "step_roots": [roots[t] for t in sorted(roots)], "kept_root": kept,
             "final_root": doc.get("root"), "losses": doc.get("losses")}
 
 
@@ -1317,12 +1323,29 @@ def _pair_part(parts: Sequence[Mapping[str, Any]], name: str) -> Mapping[str, An
     return next((p for p in parts if p["name"] == name), {})
 
 
+PAIR_PARTS = ("models", NATIVE_BUILD_NAME, "fast_suite", "two_gpu_slow", "smollm2_calibrate",
+              "card_unsharded", "card_sharded", "run_unsharded", "run_sharded", "poisoned_step",
+              "hidden_steps", "flipped_matmul")
+_PAIR_OK = ("ok", "skipped_done")
+
+
+def _suite(parts: Sequence[Mapping[str, Any]], name: str) -> dict[str, Any] | None:
+    """A suite's counts, or ``None`` when its junit XML was never written."""
+    ex = _pair_part(parts, name).get("extras") or {}
+    if not ex.get("tests"):
+        return None
+    return {k: ex.get(k) for k in ("tests", "failures", "errors", "skipped")}
+
+
 def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
-    """The two-GPU session's comparison, or ``None`` without its parts: whether the unsharded
-    and the sharded arms have equal roots (step 1's transcript root, ``W_{t+1}``'s root and
-    loss from ``card_identity``; the 3-step run's final-weights root, per-step losses and kept
-    step's root) and equal per-step verdicts, each cheat's outcome, and the failing tests.
-    A value is equal only when both arms have it."""
+    """The two-GPU session's comparison, or ``None`` without its parts. ``pass`` fails closed:
+    every part of :data:`PAIR_PARTS` ran and succeeded; both suites left a report with tests in
+    it, none failed or errored, and the two-GPU one skipped none; each arm's verdicts are
+    ``accepted`` at every one of :data:`PAIR_STEPS` steps; the arms' roots and step lines are
+    equal; every cheat is ``exact``. The roots are step 1's transcript root, ``W_{t+1}``'s root
+    and loss (``card_identity``), the final weights' root, per-step losses, kept step's root and
+    every step's transcript root. A value is equal only when both arms have it. The plain and
+    proved ``W_{t+1}`` of one arm (``plain_vs_proved``) are recorded, outside ``pass``."""
     if not any(p["kind"] == "pair_run" for p in parts):
         return None
 
@@ -1334,31 +1357,44 @@ def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     def same(a: Mapping[str, Any], b: Mapping[str, Any], keys: Sequence[str]) -> dict[str, bool]:
         return {k: a.get(k) is not None and a.get(k) == b.get(k) for k in keys}
 
-    card, run = arms("card"), arms("pair_run")
+    card, run = arms("pair_card"), arms("pair_run")
     roots = {**same(*card, ("root", "w_next_root", "loss")),
-             **same(*run, ("final_root", "kept_root", "losses"))}
-    verdicts = (run[0].get("verdicts"), run[1].get("verdicts"))
+             **same(*run, ("final_root", "kept_root", "losses", "step_roots"))}
+    roots["step_roots"] &= len(run[0].get("step_roots") or ()) == PAIR_STEPS
+    verdicts = tuple(r.get("verdicts") or [] for r in run)
+    lines_equal = bool(run[0].get("step_lines")) and run[0].get("step_lines") == run[1].get(
+        "step_lines")
+    honest = all(v == ["accepted"] * PAIR_STEPS for v in verdicts)
     outcomes: dict[str, str | None] = {}
     for p in parts:
         if p["kind"] == "cheat":
             outcomes.update((p.get("extras") or {}).get("outcomes", {}))
-    tests = {n: (_pair_part(parts, n).get("extras") or {}) for n in ("fast_suite", "two_gpu_slow")}
-    failing = [dict(t["slowest_failing"], part=n) for n, t in tests.items()
-               if t.get("slowest_failing")]
+    tests = {n: _suite(parts, n) for n in ("fast_suite", "two_gpu_slow")}
+    failing = [dict(ex["slowest_failing"], part=n) for n in tests
+               if (ex := _pair_part(parts, n).get("extras") or {}).get("slowest_failing")]
+    names = {p["name"] for p in parts}
+    problems = {n: _pair_part(parts, n).get("status", "not_started") for n in PAIR_PARTS
+                if n not in names or _pair_part(parts, n).get("status") not in _PAIR_OK}
+    suites_ok = all(t and not t["failures"] and not t["errors"] for t in tests.values())
+    slow_ran = bool(tests["two_gpu_slow"]) and tests["two_gpu_slow"]["skipped"] == 0
+    verdicts_equal = verdicts[0] == verdicts[1] and lines_equal
     return {"roots_equal": all(roots.values()), "roots": roots,
-            "verdicts_equal": bool(verdicts[0]) and verdicts[0] == verdicts[1],
+            "verdicts_equal": verdicts_equal, "honest": honest,
             "verdicts": {"unsharded": verdicts[0], "sharded": verdicts[1]},
+            "plain_vs_proved": {a: None if c.get("plain_w_next_root") is None
+                                else c.get("plain_w_next_root") == c.get("w_next_root")
+                                for a, c in zip(("unsharded", "sharded"), card)},
             "cheats": {n: outcomes.get(n) for n in PAIR_CHEATS},
-            "tests": {n: {k: t.get(k) for k in ("tests", "failures", "errors", "skipped")}
-                      for n, t in tests.items()},
+            "tests": tests, "part_problems": problems,
             "slowest_failing": max(failing, key=lambda r: r["time_s"], default=None),
-            "pass": (all(roots.values()) and bool(verdicts[0]) and verdicts[0] == verdicts[1]
-                     and all(outcomes.get(n) == "exact" for n in PAIR_CHEATS)
-                     and not any(t.get("failures") or t.get("errors") for t in tests.values()))}
+            "pass": (all(roots.values()) and verdicts_equal and honest and not problems
+                     and suites_ok and slow_ran
+                     and all(outcomes.get(n) == "exact" for n in PAIR_CHEATS))}
 
 
 def _pair_lines(pair: Mapping[str, Any] | None) -> list[str]:
-    """The two-GPU session's last job-log lines: one per acceptance item."""
+    """The two-GPU session's last job-log lines: one per acceptance item, then one
+    ``FS32 FAIL`` line for each part that didn't run or left no test report."""
     if pair is None:
         return []
     r, v = pair["roots"], pair["verdicts"]
@@ -1366,11 +1402,27 @@ def _pair_lines(pair: Mapping[str, Any] | None) -> list[str]:
              + ", ".join(f"{k} {'=' if ok else '!='}" for k, ok in r.items()) + ")",
              "FS32 verdicts equal: " + ("yes" if pair["verdicts_equal"] else "NO")
              + f" (unsharded {v['unsharded']}, sharded {v['sharded']})"]
+    lines += [f"FS32 {a} plain and proved W_{{t+1}}: "
+              + {True: "equal", False: "differ", None: "unknown"}[eq]
+              for a, eq in pair["plain_vs_proved"].items()]
     lines += [f"FS32 cheat {n}: {o or 'not run'}" + ("" if o == "exact" else " (NOT exact)")
               for n, o in pair["cheats"].items()]
     for n, t in pair["tests"].items():
-        lines.append(f"FS32 {n}: {t['tests']} tests, {t['failures']} failed, "
-                     f"{t['errors']} errors, {t['skipped']} skipped")
+        if t is not None:
+            lines.append(f"FS32 {n}: {t['tests']} tests, {t['failures']} failed, "
+                         f"{t['errors']} errors, {t['skipped']} skipped")
+    for n, status in pair["part_problems"].items():
+        lines.append(f"FS32 FAIL: {n} " + ("did not run" if status == "not_started"
+                                           else f"ended {status}"))
+    for n, t in pair["tests"].items():
+        if t is None and n not in pair["part_problems"]:
+            lines.append(f"FS32 FAIL: {n} left no test report")
+    if not pair["honest"]:
+        lines.append(f"FS32 FAIL: the honest run was not accepted at every one of "
+                     f"{PAIR_STEPS} steps in both arms")
+    slow = pair["tests"]["two_gpu_slow"]
+    if slow is not None and slow["skipped"]:
+        lines.append(f"FS32 FAIL: two_gpu_slow skipped {slow['skipped']} of {slow['tests']} tests")
     s = pair["slowest_failing"]
     lines.append("FS32 slowest failing test: " + ("none" if s is None else
                  f"{s['name']} ({s['time_s']:.1f} s, {s['part']})"))
@@ -1959,7 +2011,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         pairing = args.cmd == "run" and args.session == "fs32-pair" and not selftest
         if pairing:  # any GPU type, but two of them
             allow = True
-        why = refusal(env_doc, allow, fs31_cards() if probing else PAIR_CARDS if pairing else None)
+        why = refusal(env_doc, allow, fs31_cards() if probing else PAIR_CARDS if pairing else None,
+                      need="the fs32-pair session" if pairing else None)
     except ValueError as e:
         why = str(e)
     if selftest:
