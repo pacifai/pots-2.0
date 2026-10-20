@@ -1469,11 +1469,12 @@ class DecoderReplay(Replay):
             return type(v)(self._on(x, device) for x in v)
         return v
 
-    def _leaf_to(self, leaf: torch.Tensor, device: torch.device) -> torch.Tensor:
+    def _leaf_to(self, leaf: torch.Tensor, device: torch.device, copy: bool = True
+                 ) -> torch.Tensor:
         """The fresh copy of a committed leaf on ``device`` (:func:`_fresh`), counting a move
-        between devices."""
+        between devices; with ``copy`` off, the leaf itself when it is already there."""
         self.leaf_moves += leaf.device != device
-        return _fresh(leaf, device)
+        return _fresh(leaf, device) if copy else leaf.to(device)
 
     def _supply(self, op: str, a: torch.Tensor, b: torch.Tensor,
                 bias: torch.Tensor | None) -> torch.Tensor:
@@ -1552,10 +1553,11 @@ class DecoderReplay(Replay):
         c = self.c
         if not isinstance(x, torch.Tensor):
             raise ReplayError(f"replay: unit {j}'s input is not a tensor")
+        prev = self._units[j - 1].out if j > 1 and j - 1 in self._units else None
+        same = x is prev  # the usual case: the one move below is the unit's only
         x = self._to_unit(x, j)
         if j > 1:  # a module receives exactly what the one before it returned
-            prev = self._units[j - 1].out if j - 1 in self._units else None
-            if prev is None or (x is not prev and not torch.allclose(
+            if prev is None or (not same and not torch.allclose(
                     x, prev.to(x.device), rtol=0.0, atol=0.0, equal_nan=True)):
                 what = "the final norm" if j == c.L + 1 else f"layer {j}"
                 raise ReplayError(f"replay: layer {j - 1}'s output is not X_{j}, the input "
@@ -2079,7 +2081,8 @@ class DecoderReplay(Replay):
                                            grad_outputs=self._to_unit(self._dx[1], 0))
         # F6b: the committed G_E^head blocks widened exactly to W_E's format and summed as
         # training sums them (chain_gradient, on the lookup's device), plus the lookup's.
-        g_e = (chain_gradient((self.view.product(m).to(g_emb.device) for m in c.head_gradients),
+        g_e = (chain_gradient((self._leaf_to(self.view.product(m), g_emb.device, copy=False)
+                              for m in c.head_gradients),
                               c.weight_dtype) + g_emb
                if c.tied else g_emb)
         grads = {**self._glue, _E: g_e}

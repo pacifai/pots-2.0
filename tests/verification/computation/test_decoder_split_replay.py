@@ -188,6 +188,26 @@ def test_split_replay_over_cpu_and_mps(monkeypatch):
 # ---- CUDA, two devices ----------------------------------------------------------------------
 
 
+def assert_kept_off_the_prover(replay, c, prover_device):
+    """Every parameter and buffer of the replay's model sits on one of the verifier devices,
+    and on none of them when the prover's device is not among them (the check bites then)."""
+    allowed = set(c.placement.devices)
+    seen = {t.device for t in (*replay.model.parameters(), *replay.model.buffers())}
+    assert seen <= allowed, (seen, allowed)
+    if torch.device(prover_device) not in allowed:
+        assert torch.device(prover_device) not in seen
+
+
+def assert_operand_devices(c, replay, prover_device):
+    """Each served operand pair sits on its unit's device, never on an excluded prover device."""
+    pl = c.placement
+    for s in c.products:
+        a, b = replay.operands(s.m)
+        assert a.device == b.device == pl.unit_device(c.product_unit(s.m)), s.name
+        if torch.device(prover_device) not in set(pl.devices):
+            assert a.device != torch.device(prover_device) and b.device != torch.device(prover_device)
+
+
 @two_cuda
 @pytest.mark.parametrize("switch,dtype,B", CASES, ids=CASE_IDS)
 def test_split_replay_equals_unsharded_over_two_cuda_devices(switch, dtype, B):
@@ -201,10 +221,11 @@ def test_split_replay_equals_unsharded_over_two_cuda_devices(switch, dtype, B):
     _, ops, glue = replay_all(ref, leaves)
     replay = split_c.replay(ListReader(leaves))
     pl = split_c.placement
+    assert_kept_off_the_prover(replay, split_c, "cuda:0")
+    assert_operand_devices(split_c, replay, "cuda:0")
     ops_s = []
     for s in split_c.products:
         a, b = replay.operands(s.m)
-        assert a.device == b.device == pl.unit_device(split_c.product_unit(s.m)), s.name
         ops_s.append((digest(a), digest(b)))
     got = replay.glue_gradients()
     assert [s.name for s, x, y in zip(ref.products, ops, ops_s) if x != y] == []
@@ -239,6 +260,11 @@ def test_smollm2_split_replay_over_two_cuda_devices():
     split_c = DecoderComputation.from_config(
         dataclasses.replace(base, verifier_devices=("cuda:0", "cuda:1")))
     _, ops, glue = replay_all(ref, leaves)
+    replay = split_c.replay(ListReader(leaves))
+    assert_kept_off_the_prover(replay, split_c, "cuda:0")
+    assert_operand_devices(split_c, replay, "cuda:0")
+    got = replay.glue_gradients()
+    assert all(g.device == split_c.placement.weight_device(n) for n, g in got.items())
     _, ops_s, glue_s = replay_all(split_c, leaves)
     assert [s.name for s, x, y in zip(ref.products, ops, ops_s) if x != y] == []
     assert [n for n in glue if glue[n] != glue_s[n]] == []

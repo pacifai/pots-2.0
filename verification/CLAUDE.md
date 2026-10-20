@@ -923,8 +923,13 @@ interface.
     every tensor in its kwargs (position embeddings, mask, ids) to the unit's device, once per
     device per pass (`_on`, cache cleared with the pass). The head runs on the last device, so
     `δF_b` are on one device (`_run_norm` checks). A committed leaf is copied to the operands'
-    device as before; `replay.leaf_moves` counts the copies that crossed devices (0 when the
-    transcript is placed as the replay is). Autocast's weight copies and the weight map are
+    device as before, and a block already on that device is cloned, not aliased to the committed
+    leaves. `replay.leaf_moves` counts the copies that crossed devices (0 when the transcript
+    is placed as the replay is, and the tied `W_E` sum's moves count too); on the unsharded
+    CUDA path it also counts the host-to-device copies of the leaves, so there it is not a
+    "crossed devices" count. `build_model(device=None)` and `assemble(records, device=None)`
+    take an optional device, which the sharded replay uses to build on the host; prover calls
+    pass nothing. Autocast's weight copies and the weight map are
     keyed by `(device, storage pointer)`. `glue_gradients` returns each gradient on
     `c.placement.weight_device` of its weight (checked); the tied `W_E` sum is formed on unit
     0's device. Tests: `tests/verification/computation/test_decoder_split_replay.py` (the Mac
