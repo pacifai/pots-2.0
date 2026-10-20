@@ -502,14 +502,26 @@ def test_member_runs_are_the_evenly_spaced_attention_runs(setup):
         assert c.product(m0 + stride * (n - 1)).name == f"L{l}.{role}[{c.n_s - 1},{c.n_h - 1}]"
 
 
-def test_run_labeling_equals_member_labeling(setup):
+def test_run_labeling_equals_member_labeling(setup, monkeypatch):
     """The whole-run fill gives the products the per-member fill does: same storage, offset and
     strides where the leaf is the capture's own output, and bitwise equal values."""
     c, model, records = setup
+    filled = []
+    orig = _Labeler._fill_run
+
+    def spy(self, *args):
+        filled.append(orig(self, *args))
+        return filled[-1]
+
+    monkeypatch.setattr(_Labeler, "_fill_run", spy)
     cap = run_capture(c, model, records)
     fast = c.label(cap, model)
+    assert filled.count(True) == len(c.member_runs) == 6 * c.L
+    filled.clear()
     slow = _label_by(c, cap, model, {})
+    assert not any(filled)
     mixed = _label_by(c, cap, model, {k: v for k, v in c.member_runs.items() if k[1] != "dQ"})
+    assert filled.count(True) == 5 * c.L
     for other in (slow, mixed):
         _same_slots(fast, other)
         for p, f, o in zip(c.products, fast, other):
@@ -528,9 +540,9 @@ def test_run_labeling_fails_as_members_do(setup, tamper):
     if tamper == "filled_twice":
         recs.append(_bmm_records(cap, "backward")[0])
     else:
-        rec = _bmm_records(cap, "backward" if tamper == "strided_dK" else "forward")[0]
-        if tamper == "strided_dK":  # dK's record is the transpose: take the last backward bmm
-            rec = _bmm_records(cap, "backward")[-1]
+        # dK's record is the transpose: take the last backward bmm
+        rec = (_bmm_records(cap, "backward")[-1] if tamper == "strided_dK"
+               else _bmm_records(cap, "forward")[0])
         if tamper == "dtype":
             new = dataclasses.replace(rec, out=rec.out.to(torch.float64))
         elif tamper == "shape":
