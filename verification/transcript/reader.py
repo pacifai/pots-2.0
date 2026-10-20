@@ -23,26 +23,27 @@ _ALIGN = 64  # torch.stack's CPU output is 64-byte aligned; a zero-copy block mu
 def stack_block(ts: Sequence[torch.Tensor], own: bool = False) -> torch.Tensor:
     """``torch.stack(ts)``, bit for bit; zero-copy when ``ts`` are consecutive in one storage.
 
-    The fast path needs every tensor on the CPU with one shape and dtype, contiguous,
-    non-empty, and the ``k``-th at storage offset ``off + k·numel`` in the storage of the
-    first, which starts 64-byte aligned (where ``torch.stack``'s output does, so a BLAS
-    kernel sees the same alignment). The result is then a view of that storage, which a
-    caller must not write to, and which aliases the leaves; with ``own`` the view is cloned
-    (one copy, as ``torch.stack`` makes), so the result never aliases a leaf. Anything else is
-    ``torch.stack``, errors included.
+    The fast path needs every tensor on one device (a device leaf is served in place, FS32b)
+    with one shape and dtype, contiguous, non-empty, and the ``k``-th at storage offset
+    ``off + k·numel`` in the storage of the first, which starts 64-byte aligned (where
+    ``torch.stack``'s output does, so a BLAS kernel sees the same alignment). The result is
+    then a view of that storage, which a caller must not write to, and which aliases the
+    leaves; with ``own`` the view is cloned (one copy, as ``torch.stack`` makes), so the result
+    never aliases a leaf. Anything else is ``torch.stack``, errors included.
     """
     n = len(ts)
     t0 = ts[0] if n else None
-    if (t0 is None or not isinstance(t0, torch.Tensor) or t0.device.type != "cpu"
-            or t0.numel() == 0 or not t0.is_contiguous() or t0.requires_grad):
+    if (t0 is None or not isinstance(t0, torch.Tensor) or t0.numel() == 0
+            or not t0.is_contiguous() or t0.requires_grad):
         return torch.stack(list(ts))
     shape, dtype, numel, off = t0.shape, t0.dtype, t0.numel(), t0.storage_offset()
-    ptr = t0.untyped_storage().data_ptr()
+    device, ptr = t0.device, t0.untyped_storage().data_ptr()
     if t0.data_ptr() % _ALIGN:
         return torch.stack(list(ts))
     for k, t in enumerate(ts):
         if (not isinstance(t, torch.Tensor) or t.shape != shape or t.dtype != dtype
-                or t.storage_offset() != off + k * numel or not t.is_contiguous()
+                or t.device != device or t.storage_offset() != off + k * numel
+                or not t.is_contiguous()
                 or t.untyped_storage().data_ptr() != ptr or t.requires_grad):
             return torch.stack(list(ts))
     strides, run = [], numel

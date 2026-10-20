@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from types import MappingProxyType
 from typing import Any, NamedTuple
@@ -63,7 +63,6 @@ import torch
 
 from verification.commitment.merkle import DIGEST_SIZE, merkle_root, verify_path
 from verification.computation.interface import (
-    HOST,
     DeclaredComputation,
     ProductSpec,
     Replay,
@@ -285,19 +284,21 @@ UPDATE_CHUNK = 1 << 21
 class UpdateScratch:
     """Scratch buffers that check 6's fast path reuses across a check's weights.
 
-    One allocation per check call, not about ten fresh temporaries per weight. Each block
-    stays small enough to sit in cache between the passes over it.
+    One allocation per device and check call, not about ten fresh temporaries per weight.
+    Each block stays small enough to sit in cache between the passes over it. Weights on
+    different devices (F22) each use their device's buffers, so moving between them never
+    reallocates.
     """
 
     def __init__(self) -> None:
-        self._bufs: tuple[torch.Tensor, ...] = ()
+        self._bufs: dict[torch.device, tuple[torch.Tensor, ...]] = {}
 
     def get(self, n: int, like: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        b = self._bufs
-        if not b or b[0].numel() < n or b[0].dtype != like.dtype or b[0].device != like.device:
+        b = self._bufs.get(like.device, ())
+        if not b or b[0].numel() < n or b[0].dtype != like.dtype:
             size = max(n, UPDATE_CHUNK)
-            self._bufs = b = tuple(torch.empty(size, dtype=like.dtype, device=like.device)
-                                   for _ in range(3))
+            self._bufs[like.device] = b = tuple(
+                torch.empty(size, dtype=like.dtype, device=like.device) for _ in range(3))
         return tuple(x[:n] for x in b)
 
 
@@ -462,7 +463,8 @@ def check_6a_linear_update(store: TranscriptStore, c: DeclaredComputation, ctx: 
     scratch = UpdateScratch()
     for name in c.linear_weights:
         with _guard(ctx, "6a", _AFTER_COMMIT):
-            w_t, w_next, g = view.w_t(name), view.w_next(name), _linear_gradient(c, view, name)
+            w_t, w_next = view.w_t(name), view.w_next(name)
+            g = _linear_gradient(c, view, name, w_t.device)
         rej = _update_identity(ctx, "6a", name, w_t, w_next, g, c.eta, bands.tau_w_for(name),
                                scratch)
         if rej is not None:
@@ -470,13 +472,16 @@ def check_6a_linear_update(store: TranscriptStore, c: DeclaredComputation, ctx: 
     return None
 
 
-def _linear_gradient(c: DeclaredComputation, view: TranscriptView, name: str) -> torch.Tensor:
+def _linear_gradient(c: DeclaredComputation, view: TranscriptView, name: str,
+                     device: torch.device) -> torch.Tensor:
     """Check 6a's ``G`` for linear weight ``name``: its committed weight-gradient leaves, each
     widened exactly to the weights' format (F6b: a bf16 leaf becomes fp32; an fp32 leaf is
     unchanged), as 6b's gradients are, and summed in order as training sums them
     (:func:`chain_gradient`; one leaf unless the weight's product runs in row blocks). Check 6a
-    and its record pass both take ``G`` here."""
-    return chain_gradient((view.product(m) for m in c.linear_weights[name]), c.weight_dtype)
+    and its record pass both take ``G`` here. It sits on ``device``, the weight leaf's, where
+    the update identity runs (a leaf already there is not copied)."""
+    return chain_gradient((view.product(m).to(device) for m in c.linear_weights[name]),
+                          c.weight_dtype)
 
 
 # ---- check 5: matmul checks (P3) --------------------------------------------------------
@@ -916,21 +921,42 @@ def _finished(r: _Rows, host: Sequence[Sequence[float]], *, eps_in: float, eps_a
     return [out[i] for i in range(len(r.specs))]
 
 
+def _rows_device(rows: torch.Tensor) -> Hashable:
+    """The key :func:`_read_rows` groups a run's rows by: the device they sit on. A seam, so
+    the Mac tests can treat CPU rows as several devices."""
+    return rows.device
+
+
+def _read_rows(rows: Sequence[torch.Tensor]) -> list[np.ndarray]:
+    """Each run's rows as a float64 array on the host, in the order given, with one read per
+    device: the rows of runs on one device (a run is on one device, F22) are joined there, read
+    once and cut back, so a window may span devices. Values and order are the rows'."""
+    by_device: dict[Hashable, list[int]] = {}
+    for i, r in enumerate(rows):
+        by_device.setdefault(_rows_device(r), []).append(i)
+    out: list[np.ndarray | None] = [None] * len(rows)
+    for idx in by_device.values():
+        joined = rows[idx[0]] if len(idx) == 1 else torch.cat([rows[i] for i in idx])
+        host = joined.cpu().double().numpy()
+        base = 0
+        for i in idx:
+            out[i] = host[base:base + len(rows[i])]
+            base += len(rows[i])
+    return out  # type: ignore[return-value]
+
+
 def _finish(batch: Sequence[_Rows], ctx: StepContext) -> list[tuple[ProductSpec, ProductMeasure]]:
     """The batch's products with their numbers, in canonical order, after one read of all
     their rows back to the host (in section ``5.measure``)."""
-    present = [r.rows for r in batch if r.rows is not None]
+    present = [r for r in batch if r.rows is not None]
     if not present:
         return []
     with ctx.timed("5.measure"):
-        host = (present[0] if len(present) == 1 else torch.cat(present)).tolist()
+        read = iter(_read_rows([r.rows for r in present]))  # type: ignore[misc]
         out: list[tuple[ProductSpec, ProductMeasure]] = []
-        base = 0
-        for r in batch:
-            n = len(r.order)
-            out += zip(r.specs, _finished(r, host[base:base + n], eps_in=ctx.eps_in,
+        for r in present:
+            out += zip(r.specs, _finished(r, next(read).tolist(), eps_in=ctx.eps_in,
                                           eps_acc=ctx.eps_acc, guard=ctx.kappa_guard))
-            base += n
     return out
 
 
@@ -942,8 +968,8 @@ def _finish_columns(batch: Sequence[_Rows], ctx: StepContext
     if not present:
         return [], None
     with ctx.timed("5.measure"):
-        rows = (present[0].rows if len(present) == 1 else torch.cat([r.rows for r in present]))
-        host = rows.double().cpu().numpy()  # type: ignore[union-attr]
+        read = _read_rows([r.rows for r in present])  # type: ignore[misc]
+        host = read[0] if len(read) == 1 else np.concatenate(read)
         perm, specs, base = [], [], 0
         for r in present:
             perm.append(base + np.argsort(r.order))
@@ -1069,7 +1095,7 @@ def check_6b_glue_update(store: TranscriptStore, c: DeclaredComputation, ctx: St
     for name in names:
         with _guard(ctx, "6b", _AFTER_COMMIT):
             w_t, w_next = view.w_t(name), view.w_next(name)
-        g = _glue_gradient(grads, name)
+        g = _glue_gradient(grads, name, w_t.device)
         rej = _update_identity(ctx, "6b", name, w_t, w_next, g, c.eta, bands.tau_w_for(name),
                                scratch)
         if rej is not None:
@@ -1089,10 +1115,13 @@ def _replay_glue_gradients(c: DeclaredComputation, ctx: StepContext,
     return grads
 
 
-def _glue_gradient(grads: Mapping[str, torch.Tensor], name: str) -> torch.Tensor:
-    """Check 6b's ``G`` for glue weight ``name``, in fp32 (P6), in host memory beside the
-    weight leaves it is checked against; the record pass takes it here too."""
-    return grads[name].detach().to(HOST, torch.float32)
+def _glue_gradient(grads: Mapping[str, torch.Tensor], name: str,
+                   device: torch.device) -> torch.Tensor:
+    """Check 6b's ``G`` for glue weight ``name``, in fp32 (P6), on ``device``, the weight
+    leaf's, where the update identity runs; the record pass takes it here too. The replay
+    returns each gradient on its weight's unit device when sharded (FS32c), so the move is
+    usually a no-op; it keeps a misplaced gradient working."""
+    return grads[name].detach().to(device, torch.float32)
 
 
 CHECKS: Mapping[str, Callable[[TranscriptStore, DeclaredComputation, StepContext, Bands],
@@ -1223,6 +1252,7 @@ def _record_rest_6(c: DeclaredComputation, ctx: StepContext, bands: Bands,
     for name in todo:
         with _guard(ctx, check_id, _AFTER_COMMIT):
             w_t, w_next = view.w_t(name), view.w_next(name)
-            g = _linear_gradient(c, view, name) if grads is None else _glue_gradient(grads, name)
+            g = (_linear_gradient(c, view, name, w_t.device) if grads is None
+                 else _glue_gradient(grads, name, w_t.device))
         _update_identity(ctx, check_id, name, w_t, w_next, g, c.eta, bands.tau_w_for(name),
                          scratch)

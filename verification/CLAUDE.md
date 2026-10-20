@@ -81,7 +81,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 | var | default |
 |---|---|
 | `VERIF_DEVICE` | `cpu`. `cuda` runs the model, its activations, the replay and check 5's measuring on the GPU; every leaf stays in host memory (F1c, F4a, FS9) |
-| `VERIF_VERIFIER_DEVICES` | unset. A comma-separated list of the devices that hold the transcript and run the verifier, the replay split over them by layers (F22, FS32a). Unset or empty: today's path, leaves in host memory. Each entry is a torch device of `VERIF_DEVICE`'s type; a CUDA entry names its index (`cuda:1`) and none repeats; `cpu` may repeat (`cpu,cpu,cpu` runs every path on the Mac); `VERIF_DEVICE` itself may appear. Not a training field: config hashes don't move. The placement, the capture routing (`prove_step` passes the placement to `MatmulCapture`) and the loop's cache release read it |
+| `VERIF_VERIFIER_DEVICES` | unset. A comma-separated list of the devices that hold the transcript and run the verifier, the replay split over them by layers (F22, FS32a). Unset or empty: today's path, leaves in host memory. Each entry is a torch device of `VERIF_DEVICE`'s type; a CUDA entry names its index (`cuda:1`) and none repeats; `cpu` may repeat (`cpu,cpu,cpu` runs every path on the Mac); `VERIF_DEVICE` itself may appear. Not a training field: config hashes don't move. The placement, the verifier's replay (FS32c), the capture routing (`prove_step` passes the placement to `MatmulCapture`) and the loop's cache release read it |
 | `VERIF_MODEL` | `HuggingFaceTB/SmolLM2-135M-Instruct` |
 | `VERIF_MODEL_REVISION` | `12fd25f77366fa6b3b4b768ec3050bf629380bac` |
 | `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32`. `float32` / `bfloat16` runs forward and loss under autocast (F6b, FS3); the decoder refuses any other master and fp16 compute |
@@ -450,18 +450,51 @@ interface.
   - Errors: `NonFiniteError` and `EncodingError`.
   - `tensor_leaf_payload_unchecked(t)` is `tensor_leaf_payload`'s view without the finiteness check (the
     caller checks it; the native path does it in C, S9d). `tensor_payload_span(t)` returns
-    `(t.data_ptr(), t.nbytes)` after the same structural checks (`_check_payload`: coded
-    dtype, CPU, contiguous), with no view and no finiteness check. The address aliases `t`,
-    so `t` must stay alive and unmodified until hashing is done.
+    `(t.data_ptr(), t.nbytes)` after the same structural checks (`check_payload`: coded
+    dtype, not `meta`, contiguous), with no view and no finiteness check. The address aliases
+    `t`, so `t` must stay alive and unmodified until hashing is done; a device tensor has no
+    host address and raises "tensor must be on CPU".
+  - **Device leaves (FS32b).** `check_payload` reads metadata only, so a CUDA or MPS leaf
+    passes it; a `meta` tensor, which has no bytes, keeps the old "tensor must be on CPU"
+    error. `tensor_leaf_payload` and `tensor_leaf_payload_unchecked` read a device leaf
+    through `hostcopy.host_tensor` (below), so its payload, finiteness check and errors are
+    its host twin's.
   - `tensor_leaf_header(tag, t)` and `tensor_leaf_payload(t)`. The payload is a zero-copy view
-    that aliases `t`, so don't mutate `t` until it is hashed. The tensor must be a contiguous
-    CPU tensor. The finiteness check (`_all_finite`) tests that the max and min are finite.
-    A max or min propagates NaN, so it rejects exactly what `isfinite(t).all()` rejects, with
+    that aliases `t` (a device leaf's host copy), so don't mutate `t` until it is hashed. The
+    tensor must be contiguous. The finiteness check (`_all_finite`) tests that the max and min
+    are finite. A max or min propagates NaN, so it rejects exactly what `isfinite(t).all()` rejects, with
     no temporary. fp32 and fp16 use numpy's single-threaded `max` and `min`, about 3× faster
     than `torch.aminmax`; bf16 uses `torch.aminmax`. The check stays on the calling thread:
     moving it into the hashing workers (O6) made commit and check 2 about 3× slower, because
     the per-leaf calls contend for the GIL with blake3's compute-bound workers.
   - `encode_tensor_leaf(tag, t)`.
+- `hostcopy.py` (FS32b): the one seam between a leaf's bytes and the hash. Under the sharded
+  placement (F22) product and weight leaves sit on the verifier GPUs and are hashed through a
+  host copy; FS34 replaces the copy with the GPU kernel (FS28) here.
+  - `on_device(t)` is `t.device.type != "cpu"`. `host_tensor(t)` returns a CPU tensor as the
+    same object, with no copy (the unsharded path is unchanged), and a device tensor as a
+    synchronous host copy. A change to `t`'s `_version` during the copy raises
+    `StoreMutationError` (invariant 6).
+  - `Stage` is one host buffer a native batch's device leaves are copied into back to back,
+    each 64-byte aligned. `put(t)` queues a leaf's copy and returns the host tensor over its
+    staged bytes. For a CUDA leaf the buffer is pinned and the copy runs `non_blocking` on a
+    side stream of the leaf's device (one per device, after the current stream's work), so
+    the copies of the next batch overlap the hashing of the current one. `fence()` records
+    one event per device used at batch close and `wait()` (the worker, before it reads)
+    synchronizes on them. Without CUDA (MPS, a fake) `put` is a plain `copy_`.
+  - `StagingPool` (`POOL`) hands out and takes back the buffers, used from the calling thread
+    only. A batch stages at most `_BATCH_BYTES`, and at most the batches in flight plus one
+    (3) pooled buffers exist, reused across batches and steps; a buffer returns to the pool
+    only once the batch that read it is hashed (`collect`, or the end of the call, which
+    drains any copy still queued). A leaf larger than a batch is the exception: it gets a
+    pinned buffer of its own, outside the pool and the count of 3. Torch's pinned allocator
+    rounds that buffer up to a power of two and caches it after the call, so a run of such
+    leaves holds pinned memory until the process ends (the pool-size item F21 decides this).
+  - With `wait_each` False a stage's side stream waits on the current stream once per device
+    per batch, not once per leaf. The native path sets it for a list or tuple input (commit
+    hashing passes `list(enumerate(leaves))`); a lazy iterable keeps the per-leaf wait. No
+    `record_stream` is needed: the batch keeps every source tensor until its event has
+    completed, and `finally` drains every stage, so the allocator cannot reuse a source.
 - `merkle.py` (B2, merged):
   - `hash_leaf(*parts)` streams its inputs, and runs multithreaded at 16 MiB and above with
     the same digest.
@@ -503,10 +536,22 @@ interface.
     addresses. Batches of up to 256 MiB or 32,768 leaves go to one background thread, two in
     flight: `native.hash_leaves` tests finiteness and hashes in C, and a leaf of 16 MiB or
     more takes `native.all_finite` and the Rust BLAKE3. A batch's first error beats the
-    iterable's, and the call returns only once no worker reads the caller's tensors. Under
+    iterable's, and the call returns only once no worker reads the caller's tensors. A device
+    leaf (FS32b) gets the same structural checks (`check_payload`) and is staged by
+    `hostcopy.Stage.put` as it is added to its batch, with its `_version` read first; the
+    worker waits for the batch's copies, compares each staged leaf's `_version`, and hashes the
+    staged bytes (a leaf of 16 MiB or more through `native.all_finite` and BLAKE3 on its host
+    copy). A batch closes before a device leaf that would stage more than `_BATCH_BYTES`. A
+    changed leaf is a `StoreMutationError` ("leaf i was mutated in place while it was copied
+    to the host") at its own position: the leaves before it are hashed, and an earlier
+    non-finite leaf still wins. The digests and errors are the host twin's. Under
     `native.disabled()` both functions take the Python path (`hash_leaves`,
     `hash_leaves_until_error`), the reference; `metrics.counting()` runs it so its counters see
-    every hash.
+    every hash. It reads a device leaf through `host_tensor` and holds each leaf's host copy
+    until its chunk is hashed. At most `_MAX_PENDING` (2) chunks are unfinished besides the
+    one being filled (about 16 MiB each, a bigger leaf making a bigger chunk), so the host
+    copies stay bounded. The counting pass runs it on a whole full-scale step, so that bound
+    is what keeps its host memory flat.
   - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
   - `transcript_root(c, reader)` is check 2.
   - `commit_leaves(c, leaves) -> MerkleTree`.
@@ -533,6 +578,20 @@ interface.
     and `challenge_matrices(h, ms, k, width, *, threads)` (bit-identical to the verifier's).
   - `FINITE_KIND` maps a dtype to `kind`. `enabled()` and the nestable `disabled()` switch
     the native path off for the counting pass.
+
+- `gpu_blake3.py`, `gpu_blake3.cu`, `gpu_blake3_core.h` (F23): our own BLAKE3 CUDA kernel for
+  leaf hashing. Nothing here is wired into the protocol yet. `GpuBlake3.hash_leaves(...,
+  device=)` takes `Native.hash_leaves`'s table with payload addresses on the device and returns
+  `(digests uint8 [n, 32] on the device, first_bad)` after the kernels finish, with the same
+  digests and `first_bad`; `hash_tensor_leaves(headers, tensors, kinds)` builds the table from
+  contiguous CUDA tensors. The core header is plain C that both NVRTC and a host C compiler
+  build (the host test runs the kernel's work decomposition on a CPU). The first call compiles
+  the `.cu` with NVRTC through ctypes (no package beyond torch), caches the CUBIN under
+  `native.cache_dir()` and launches through the driver on torch's current stream. Importing
+  compiles and loads nothing, and `describe()` never compiles. A table takes `1 + ceil(log_64
+  n0)` launches (`n0` = groups of 8 KiB in its biggest leaf) and about 0.4 % of its payload in
+  temporary memory. `python -m verification.commitment.gpu_blake3 check` and `bench --out F`
+  need CUDA and say so otherwise.
 
 ### `verification/computation/`
 
@@ -911,6 +970,33 @@ interface.
     restores every buffer to its build-time value; raises `ReplayError` on any hook left on
     a module or a changed buffer set; reruns the model checks; and takes the model away from
     the previous replay (`.model = None`). The prover never gets this model.
+  - **The split replay (FS32c, F22).** With `VERIF_VERIFIER_DEVICES` set (`c.placement.sharded`)
+    the replay runs over those devices, each unit on `c.placement.unit_device(j)`; unsharded
+    nothing below applies and every result is bit-identical to before. `_replay_model` builds
+    the model on the host (`build_model(HOST)`, so it never occupies the prover's device) and
+    `_place_model` puts `embed_tokens` and the rotary module on unit 0's device, layer `j` on
+    unit `j`'s, and the final norm and `lm_head` on unit `L+1`'s. Units 0 and `L+1` share the
+    last device, so a tied `W_E` stays one `Parameter` (asserted after placing). Reuse keeps
+    each parameter and buffer on its placed device. The committed batch goes to unit 0's
+    device (`assemble(records, device)`). Only two values cross units, both through
+    `_to_unit(x, j)`: `X_j` into layer `j` (`_enter_unit`, which then compares it exactly with
+    the previous unit's output moved to that device) and `δX_{j+1}` into layer `j`'s backward
+    (`_run_unit`), with `δX_1` to unit 0 in `glue_gradients`. The layer pre-hook also moves
+    every tensor in its kwargs (position embeddings, mask, ids) to the unit's device, once per
+    device per pass (`_on`, cache cleared with the pass). The head runs on the last device, so
+    `δF_b` are on one device (`_run_norm` checks). A committed leaf is copied to the operands'
+    device as before, and a block already on that device is cloned, not aliased to the committed
+    leaves. `replay.leaf_moves` counts the copies that crossed devices (0 when the transcript
+    is placed as the replay is, and the tied `W_E` sum's moves count too); on the unsharded
+    CUDA path it also counts the host-to-device copies of the leaves, so there it is not a
+    "crossed devices" count. `build_model(device=None)` and `assemble(records, device=None)`
+    take an optional device, which the sharded replay uses to build on the host; prover calls
+    pass nothing. Autocast's weight copies and the weight map are
+    keyed by `(device, storage pointer)`. `glue_gradients` returns each gradient on
+    `c.placement.weight_device` of its weight (checked); the tied `W_E` sum is formed on unit
+    0's device. Tests: `tests/verification/computation/test_decoder_split_replay.py` (the Mac
+    with `cpu,cpu,cpu`, two-GPU tests skipped without two CUDA devices, an MPS smoke test that
+    skips because MPS runs `nn.Linear` as one `aten.linear` the substitution can't see).
   - `replay(leaves) -> DecoderReplay` (A8, forward products). Its own model, from the committed
     `W_t`, runs under `ProductSubstitution`, which hands back the committed leaf for each
     product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`).
@@ -1191,7 +1277,10 @@ interface.
 
 - `reader.py`: `LeafReader`, a Protocol with a single method `leaf(index)`. A record leaf
   returns the instance's record object, and any other leaf returns a tensor. It has no leaf
-  count (invariant 7). `TranscriptView(computation, reader)` gives named access: `.record(i)`,
+  count (invariant 7). `stack_block` serves a run of equal-shape leaves at consecutive offsets of
+  one 64-byte-aligned storage as one strided view, on any device (FS32b): one device is a
+  condition of the proof like shape and dtype, and a mix falls back to `torch.stack`, which
+  raises its own error. `TranscriptView(computation, reader)` gives named access: `.record(i)`,
   `.records()`, `.w_t(name)`, `.product(m)` and `.w_next(name)`.
 - `errors.py`: `TranscriptFormatError(ValueError)` and its subclasses `LeafShapeError`,
   `LeafDtypeError`, `StoreMutationError` and `LeafReadError` (a disk leaf or the store's
@@ -1214,6 +1303,8 @@ interface.
       the `StepOutput` or the model, so the loop drops the `StepOutput` after handoff. It is
       `commit_step(c, step, *, copy=False) -> (leaves, tree)` (hashing, B6's P3) then
       `hold(c, leaves, tree, dataset_paths)` (the hand-off, P5), which the loop calls apart;
+    - A device leaf (FS32b) needs no store logic. `InMemoryStore` holds the tensors it gets, and
+      its `_version` guard and `hold` work on them; `perturb_leaf` hashes through the host copy.
     - `perturb_leaf(c, store, i, obj) -> new root` for the S6f sweep. It re-roots in
       O(log n) and validates the leaf before any change.
   - **On disk (A14, C3; S3's layout).** `DiskStore.write(dir, c, leaves, tree,
@@ -1221,9 +1312,10 @@ interface.
     (`leaf_00000.pt` …, `LEAF_FILE`), `leaf_hashes.bin` (the tree's 32-byte leaf hashes, for
     `path`) and `meta.json` (`format`, the root and the `h_D` paths as hex), written last; a
     failed write deletes `dir`. `DiskStore(dir)` opens one. Not part of any commitment.
-    - A tensor that doesn't own its whole storage (a `bmm` member, a slice of `D`) is cloned
-      before saving, because `torch.save` writes the whole storage. A `Record` is saved as a
-      dict of its three tensors and rebuilt (and so revalidated) on load.
+    - A device leaf is saved as its host copy (`host_tensor`), so its file and `leaf(i)` are
+      its host twin's. A tensor that doesn't own its whole storage (a `bmm` member, a slice of
+      `D`) is cloned before saving, because `torch.save` writes the whole storage. A `Record`
+      is saved as a dict of its three tensors and rebuilt (and so revalidated) on load.
     - `leaf(i)` loads the file on every call (`weights_only=True`, CPU, no `mmap`, no cache),
       so each read is a fresh tensor sharing no memory. A missing file is `IndexError`; an
       unloadable file or a foreign object is `LeafReadError`. `root` and `dataset_path`
@@ -1250,7 +1342,13 @@ interface.
     chain_check_id=, k=, judge=)`. `ctx.state` (`StepState`) carries what check 2's read
     produced to later checks: `claimed_root` (the prover's `h`, validated as a digest; check 5
     keys on it), the leaf hashes and `CommittedLeaves` (`ctx.state.committed()`). It carries
-    check 5's replay to 6b. The root comparison writes `recomputed_root`. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
+    check 5's replay to 6b. `CommittedLeaves` holds device leaves as they are (FS32b). Its
+    `tensor_run` and `stack_block` serve a range of equal-shape views at consecutive offsets of
+    one storage as one strided view on whatever device the storage is on: the proof drops the
+    old CPU-only condition and keeps shape, dtype, offsets, contiguity, the 64-byte alignment,
+    one storage, one device and the recorded `_version`s. A bmm's members that stay views of
+    one storage on the owner device are served with no stack copy. The root comparison writes
+    `recomputed_root`. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
     normalized residual, κ and ρ, which is P10b's calibration feed. `ProductStat` also
     carries each product's scale for C1's realized floor: `q`, `p_norm` (`‖P‖_F`), `nu`,
     `p_abs1` (`‖|P|·1‖`) and `u`, the term scale `U` (F18). `q`, `p_norm` and `u` set the
@@ -1302,10 +1400,24 @@ interface.
     6a widens it exactly to fp32 before the update identity, as AccumulateGrad does for
     training's `W.grad`. At fp32 the cast is a no-op. A weight with several `G`s (an untied
     output layer in head blocks) takes `chain_gradient` of them, training's sum.
-  - **Devices (F4a, FS9).** Leaves are in host memory and the replay runs on
+  - **Devices (F4a, FS9, FS32e).** Unsharded, leaves are in host memory and the replay runs on
     `VERIF_DEVICE`. Check 5 moves each committed product and bias to its rebuilt operands'
-    device (`_served`) and measures there; check 6 runs on the host, and 6b's glue gradient
-    comes back to the host in fp32 (`_glue_gradient`). At `cpu` every move is a no-op.
+    device (`_served`) and measures there; check 6 runs on the leaves' device, the host, and
+    6b's glue gradient comes back to it in fp32 (`_glue_gradient`). At `cpu` every move is a
+    no-op. Sharded (`VERIF_VERIFIER_DEVICES`, F22), a layer's weight leaves, product leaves
+    and replay unit sit on one verifier GPU and different layers on different ones. A run
+    (one product, or a layer's member run) is served and measured on its device, and the
+    rows of runs on different devices join without a device error: `_read_rows` joins each
+    device's rows there and reads them once per device per judging window, so a window may
+    span devices and the float64 values, the judging order and the first failing product are
+    the single-device ones. `MeasureScratch` and `UpdateScratch` each hold one buffer set per
+    device, so moving between devices never reallocates. Check 6a runs `_linear_gradient` and
+    the update identity on the weight leaf's device (`G` follows `W_t`; a leaf already there
+    is not copied). Check 6b brings each glue gradient to its weight leaf's device in fp32,
+    usually a no-op since the replay returns it there (FS32c). The fast path and
+    `_update_identity_reference` run on any device, with `ρ` in float64; the identity is
+    elementwise, so the device's `ρ_max` should equal the host's bit for bit, which the CUDA
+    tests (`test_check_devices.py`) check. The record pass uses the same helpers.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
     from the claimed root `store.root`, as check 2's read validated it
     (`ctx.state.claimed_root`; F15a, task C7). The root comparison at the end of the step
@@ -1500,7 +1612,9 @@ interface.
   member shapes its normalized residuals equal `measure_product`'s bit for bit; below about
   8×8, CPU `bmm` rounds differently from `mm`.
   - **Fast path, same bits (O2).** Both functions take an optional `scratch=MeasureScratch()`,
-    one reused buffer for `|A|`, `|B|`, `|P|` and `P/s` (check 5 holds one per step). Each
+    one reused buffer for `|A|`, `|B|`, `|P|` and `P/s` per device (check 5 holds one object
+    per step; a step on several devices, FS32e, keeps one buffer and one ones vector per
+    device and never reallocates by moving between them). Each
     `|x|` is written with a fresh `abs`'s strides, so the matmuls see the same operands. `|P|`
     is computed once. `_norm` gives `_safe_norm`'s bits and always takes the scaled path
     (into the buffer when `x` is contiguous), with no host read: `_scaled_norm` maps a zero,
@@ -2384,6 +2498,37 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     in reads and member ops is aimed at the GPU, where each read stalls the host. The CUDA
     pass hasn't run.
 
+- `nvlink_probe.py` (FS31, F22's check HW2): `.venv/bin/python -m verification.runs.nvlink_probe
+  --out nvlink.json`, on the four-H100 pod. It reads the NVLink topology (`nvidia-smi topo -m`,
+  `nvidia-smi nvlink -s`, the P2P read matrix), times peer copies between every pair of cards
+  and from card 0 to the other three at once, times pinned-host copies and runs `nvbandwidth`
+  when it is installed. `hw2_verdict` fails unless the topology matrix shows exactly
+  `FS31_CARDS` GPUs (default 4), every pair is `NV18`, peer reads are `OK` for every pair, and
+  every ordered pair has a finite positive copy rate. The slowest pair's rate, by the PyTorch
+  `copy_` timing, then gives `verdict`: `pass` at `PEER_COPY_PASS_GBPS` (300 GB/s) or more,
+  `review` from `PEER_COPY_FAIL_GBPS` (150) up to that (the number returns to the user before
+  the port relies on it), `fail` below. `pass` is true only for `"pass"` with `gate` true (a
+  rehearsal keeps its measured `verdict`, but `pass` is false). The verdict records `n_cards`,
+  `expected_cards` and `gate` (false when `FS31_CARDS` isn't 4: a rehearsal, whose
+  lines read `rehearsal (N of 4 cards), not the gate`). `nvbandwidth`'s text is recorded
+  beside it and never enters the verdict. Every command runs through `run_command`, which keeps
+  stdout and stderr apart; a matrix is parsed from stdout only when the command exited 0, so a
+  missing, failed or timed-out tool is a record and a reason, not a crash or a pass. Each
+  measure runs under `_measure`: one that raises is recorded under its key and the report is
+  still written (a raised peer-copy measure leaves no rates, so HW2 fails). The part runs with
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Torch's view needs CUDA; the tests use fakes.
+- `card_identity.py` (FS31, the first half of F22's check HW3): one card's identity report,
+  `CUDA_VISIBLE_DEVICES=k VERIF_MODEL=… .venv/bin/python -m verification.runs.card_identity
+  --out card.json`. From `W_0` it runs one `plain_step` on `π(1)` and one `prove_step` committed
+  with `InMemoryStore.commit_step`. The report holds the card, the proved step's root, both
+  steps' `W_{t+1}` section roots and losses, the leaf layout and the wall times; `card.digests`
+  beside it holds every leaf hash. It exits 1 when capture changed the bits on the one card.
+  The card's UUID is torch's own device's where torch exposes it (else `nvidia-smi`'s); both
+  are recorded. `fs11_session.hw3_cards` compares the cards' reports: `same_bits` needs at
+  least 2 cards, as many cards as `FS31_CARDS`, every UUID present and distinct, every card run
+  and equal roots (a count that differs fails, naming both numbers); it records `n_cards`,
+  `expected_cards`, `gate` and a top-level `same_bits`, and its `pass` also needs `gate`, as the
+  probe's does.
 - `full_scale.py` (FS13; EVALUATION_SPEC §3.2): `.venv/bin/python -m
   verification.runs.full_scale run [--seeds S ...] [--levels N ...] [--hidden-level N]
   [--sweep-args ARGS] [--k-args ARGS] [--guard-ack] [--data-only]
@@ -2466,10 +2611,23 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
     in its place.
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
-    [--selftest] [--session {fs11,recheck}]`, `fetch-models` and `env`. `--session` picks the
+    [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe}]`, `fetch-models` and
+    `env`. `--session` picks the
     plan from `SESSIONS`, which also gives the name `summary.json`'s `session` records: `fs11`
-    (the default, "FS11") or `recheck` ("recheck"); `--plan` and `--selftest` replace its
-    parts. Every plan but the self-test's starts with `native_build` (`with_native_build`, applied
+    (the default, "FS11"), `recheck` ("recheck"), `profile-check` or `nvlink-probe` (FS31);
+    `--plan` and `--selftest` replace its
+    parts. `nvlink-probe` runs `nvlink_probe` once, then `card_identity` per run model and card
+    (`FS31_CARDS`, default 4, each part with `CUDA_VISIBLE_DEVICES` set to its card; the probe
+    and the card parts run with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a card number means the
+    same card to torch and `nvidia-smi`), and `summary.json` gains `hw2` (the probe's verdict:
+    `pass`, `review` or `fail`) and `hw3_cards` (per model the roots by card, the UUIDs,
+    `same_bits` and, where cards differ, the first differing leaf with its section and name);
+    the log ends with an `HW2` and an `HW3 part 1` line, each reading `rehearsal (N of 4 cards),
+    not the gate` instead of a pass when `FS31_CARDS` is not 4. It also refuses a machine whose
+    torch sees fewer than `FS31_CARDS` CUDA devices, which `FS11_ALLOW_ANY_GPU=1` doesn't
+    lift.
+
+    Every plan but the self-test's starts with `native_build` (`with_native_build`, applied
     by `choose_plan`): `python -m verification.commitment.native`, which compiles the library
     from the upload's `native_cache/` (`POTS_NATIVE_CACHE` in `base_env`) before any timed part.
     A failed build blocks nothing; later parts fail with `get()`'s message. `check_upload`'s
@@ -2528,10 +2686,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     pass's per-section lines (`metrics.MemoryRecorder`'s echo), the section that raised
     included, with `reserved_gb` and `nested_reserved_gb` on CUDA.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
-    pod. `FS11_SESSION` (`fs11`, the default, or `recheck`; anything else is a refusal) goes to
+    pod. `FS11_SESSION` (`fs11`, the default, `recheck`, `profile-check` or `nvlink-probe`;
+    anything else is a refusal) goes to
     the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the
-    re-check), the session, a kill of a session still
+    re-check, 19,800 s for the profile check, 5,400 s for the probe; `FS31_CARDS` is passed on), the session, a kill of a session still
     running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
     `OUT_DIR.FETCHED` to end it), and the terminate: `runpodctl pod delete`, `runpodctl remove
