@@ -533,6 +533,20 @@ interface.
   - `FINITE_KIND` maps a dtype to `kind`. `enabled()` and the nestable `disabled()` switch
     the native path off for the counting pass.
 
+- `gpu_blake3.py`, `gpu_blake3.cu`, `gpu_blake3_core.h` (F23): our own BLAKE3 CUDA kernel for
+  leaf hashing. Nothing here is wired into the protocol yet. `GpuBlake3.hash_leaves(...,
+  device=)` takes `Native.hash_leaves`'s table with payload addresses on the device and returns
+  `(digests uint8 [n, 32] on the device, first_bad)` after the kernels finish, with the same
+  digests and `first_bad`; `hash_tensor_leaves(headers, tensors, kinds)` builds the table from
+  contiguous CUDA tensors. The core header is plain C that both NVRTC and a host C compiler
+  build (the host test runs the kernel's work decomposition on a CPU). The first call compiles
+  the `.cu` with NVRTC through ctypes (no package beyond torch), caches the CUBIN under
+  `native.cache_dir()` and launches through the driver on torch's current stream. Importing
+  compiles and loads nothing, and `describe()` never compiles. A table takes `1 + ceil(log_64
+  n0)` launches (`n0` = groups of 8 KiB in its biggest leaf) and about 0.4 % of its payload in
+  temporary memory. `python -m verification.commitment.gpu_blake3 check` and `bench --out F`
+  need CUDA and say so otherwise.
+
 ### `verification/computation/`
 
 - `interface.py` (A3, merged). This is the public description of `C`, which prover and
