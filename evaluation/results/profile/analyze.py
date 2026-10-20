@@ -37,6 +37,22 @@ clock and :data:`US` turns µs into s; nothing else converts.
   (the commit and check 2).
 - Syncs are 2 per top-level section call on CUDA. The hook bound's events are the ``gpu_us``
   spans (with the folded calls) plus one event pair per stamp; both are 0 off CUDA.
+- The launch floor needs positive evidence: it exists only for a section whose trace counts
+  launches (then launches × ``launch_s`` + syncs × ``sync_s``). Without trace launches the
+  syncs alone are no evidence of launch-bound work, so there is no launch floor, and a section
+  with no floor at all has ``bound`` ``"unknown"`` (not ``"launch"``, and not null).
+- Warm-up (2026-10-20): the lowest untraced step ≥ 1 is the warm-up when at least two untraced
+  steps exist. It pays one-off costs (the pinned host-buffer pool, the first backward's
+  kernels), so it is left out of every steady-state mean and share, and reported on its own as
+  the view's ``warmup`` block (``step``, ``step_s`` and ``sections``, each section with the
+  same fields as a steady one). ``warmup_excluded`` is false, and ``warmup`` null, when only
+  one untraced step exists (it is then the steady state). The plain comparison drops each run's
+  own warm-up the same way and shows both warm-up times beside the steady ones.
+- ``meta`` also holds ``n_s`` (the batch's sequences), ``M`` (products), ``n_leaves`` and
+  ``us_per_leaf`` (``label`` for ``P1.label`` and ``commit`` for ``P3.commit``: steady mean
+  seconds ÷ ``n_leaves`` × 10⁶). ``n_s`` and ``M`` come from the environment record, ``M``
+  else from the largest ``capture`` ``n_products``; ``n_leaves`` from the environment record,
+  else from the ``storage`` or ``step`` records. Missing values are null.
 - Clock times are sums of a section's marker spans over the untraced steps; the trace time is
   compared with the host time of the traced step. ``agree`` is false when either differs by
   more than the rule's tolerance, and ``null`` when no second clock exists.
@@ -272,8 +288,9 @@ def _floors(work: dict[str, Any], probe: dict[str, Any], warns: set[str]) -> dic
     total("pcie", pc, combine=max)
     total("hash", [("hash.per_byte_s", b["hash"], hash_rates.get("per_byte_s")),
                    ("hash.per_leaf_s", work["leaves"], hash_rates.get("per_leaf_s"))])
-    total("launch", [("launch_s", work["launches"], costs.get("launch_s")),
-                     ("sync_s", work["syncs"], costs.get("sync_s"))])
+    if work["launches"]:  # syncs alone are no evidence of launch-bound work
+        total("launch", [("launch_s", work["launches"], costs.get("launch_s")),
+                         ("sync_s", work["syncs"], costs.get("sync_s"))])
     return out
 
 
@@ -320,6 +337,19 @@ def _times(rows: list[dict[str, Any]]
         sides.setdefault(r["component"], r["side"])
         levels.setdefault(r["component"], r.get("level", "component"))
     return out, sides, levels
+
+
+def _warm_step(steps: Sequence[int]) -> int | None:
+    """The warm-up step: the lowest of the untraced steps ≥ 1, when there are at least two."""
+    ordered = sorted(set(steps))
+    return ordered[0] if len(ordered) >= 2 else None
+
+
+def _only(times: dict[str, dict[int, float]], keep) -> dict[str, dict[int, float]]:
+    """``times`` restricted to the steps ``keep(step)`` accepts; a component left with none
+    is dropped."""
+    out = {n: {t: s for t, s in v.items() if keep(t)} for n, v in times.items()}
+    return {n: v for n, v in out.items() if v}
 
 
 def _first_counts(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -627,14 +657,20 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
               probe: dict[str, Any], trace: dict[str, Any] | None,
               layout: dict[str, Any] | None, compute_bf16: bool, gpu_memory: int | None,
               warns: set[str]) -> dict[str, Any]:
-    times, sides, levels = _times(records)
+    all_times, sides, levels = _times(records)
     # the hash parts are added seconds, not sections: they feed "hash" below only
-    parts = {n: times.pop(n) for n in [n for n in times if _hash_part(n)]}
-    for n in parts:
+    all_parts = {n: all_times.pop(n) for n in [n for n in all_times if _hash_part(n)]}
+    for n in all_parts:
         sides.pop(n, None)
         levels.pop(n, None)
+    all_untraced = [s for s in markers.steps if not s["traced"] and s["step"] >= 1]
+    # the warm-up step: from the time rows' untraced steps, else from the markers'
+    warm = _warm_step([t for v in all_times.values() for t in v]
+                      or [s["step"] for s in all_untraced])
+    times = _only(all_times, lambda t: t != warm)
+    parts = _only(all_parts, lambda t: t != warm)
     counts = _first_counts(records)
-    leaves = max((r["leaves"] for r in records if r.get("record") == "storage"), default=0)
+    leaves = _leaves(records)
     peaks: dict[str, int] = {}
     for r in records:
         if r.get("record") == "memory" and r.get("peak_reserved_bytes") is not None:
@@ -645,19 +681,20 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                      default=0)
 
     # the time rows' step set: steps >= 1, untraced (the traced step only serves the trace join)
-    untraced = [s for s in markers.steps if not s["traced"] and s["step"] >= 1]
+    untraced = [s for s in all_untraced if s["step"] != warm]
+    warm_marks = [s for s in all_untraced if s["step"] == warm]
     traced = [s for s in markers.steps if s["traced"] and s["step"] >= 1]
     depths: dict[str, int] = {}
-    for s in untraced + traced:
+    for s in all_untraced + traced:
         for sec in s["sections"]:
             depths.setdefault(sec["name"], sec["depth"])
-    for name in times:  # a section with time rows and no marker spans
+    for name in all_times:  # a section with time rows and no marker spans
         if levels[name] != "total":
             depths.setdefault(name, 1 if levels[name] == "sub" else 0)
     # a time-row-only component on a side that has phase rows is the sum of its phases
     # (P2 of P2.w_t and P2.w_next, train_captured of train.*), so it is in no share total
-    spanned = {sec["name"] for s in untraced for sec in s["sections"]}
-    phase_sides = {sides[n] for n in times if levels[n] == "phase"}
+    spanned = {sec["name"] for s in all_untraced for sec in s["sections"]}
+    phase_sides = {sides[n] for n in all_times if levels[n] == "phase"}
     rollups = {n for n in depths if n not in spanned and levels.get(n) == "component"
                and sides.get(n) in phase_sides}
     if trace is not None:
@@ -666,71 +703,86 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
         if absent:
             warns.add(f"the trace summary has no section {', '.join(absent)}")
 
-    seconds: dict[str, list[float]] = {}
-    for name in depths:
-        host = [_clock_s(sec, "host_us", "host_s") or 0.0 for _, sec in _occurrences(untraced, name)]
-        seconds[name] = list(times[name].values()) if name in times else host
-    step_s = _mean(list(times["step"].values())) if "step" in times else \
-        sum(_mean(seconds[n]) or 0.0 for n, d in depths.items() if d == 0)
+    def build(untraced: list[dict[str, Any]], times: dict[str, dict[int, float]]
+              ) -> tuple[dict[str, Any], float]:
+        """The section table and the step's seconds over ``untraced`` marker steps and the
+        time rows ``times`` (one phase: the steady steps, or the warm-up)."""
+        seconds: dict[str, list[float]] = {}
+        for name in depths:
+            host = [_clock_s(sec, "host_us", "host_s") or 0.0
+                    for _, sec in _occurrences(untraced, name)]
+            seconds[name] = list(times[name].values()) if name in times else host
+        step_s = _mean(list(times["step"].values())) if "step" in times else \
+            sum(_mean(seconds[n]) or 0.0 for n, d in depths.items() if d == 0)
 
-    sections: dict[str, Any] = {}
-    for name, depth in depths.items():
-        occ = list(_occurrences(untraced, name))
-        host_m = _mean([_clock_s(sec, "host_us", "host_s") or 0.0 for _, sec in occ])
-        truncated = any(sec.get("rest") for _, sec in occ)
-        gpu_m = _mean([g for _, sec in occ if (g := _clock_s(sec, "gpu_us", "gpu_s")) is not None])
-        host_traced = _mean([_clock_s(sec, "host_us", "host_s") or 0.0
-                             for _, sec in _occurrences(traced, name)])
-        tr = tsec.get(name)
-        trace_s = tr["wall_us"] * US if tr and tr.get("wall_us") is not None else None
-        agree: bool | None = None
-        if gpu_m is not None and host_m is not None:
-            tol = max(THRESHOLDS["clock_rel"] * host_m, THRESHOLDS["clock_abs_s"])
-            agree = abs(host_m - gpu_m) <= tol
-        if trace_s is not None and host_traced:
-            ok = abs(trace_s - host_traced) <= THRESHOLDS["trace_rel"] * host_traced
-            agree = ok if agree is None else agree and ok
-        spans = [sp for s, sec in occ for sp in _spans_ns(sec, s["t0_ns"])]
-        means, n = sampler.means(spans)
-        time_stats = _stats(seconds[name])
-        mean_t = time_stats["mean"]
-        share = mean_t / step_s if step_s and mean_t is not None else None
-        calls = [sec["calls"] for _, sec in occ if depth == 0 and sec.get("gpu_us") is not None]
-        work = _work(name, _rate_key(name, sides, compute_bf16), counts.get(name),
-                     leaves if _hashes_transcript(counts.get(name), transcript) else 0, tr,
-                     c5_scale,
-                     2 * round(_mean(calls) or 0))
-        floors = _floors(work, probe, warns)
-        floor_s = max(floors.values()) if floors else None
-        bound = max(floors, key=floors.__getitem__) if floors else None
-        ratio = mean_t / floor_s if floor_s and mean_t is not None else None
-        marks = []
-        if share is not None and ratio is not None and share >= THRESHOLDS["share"] \
-                and ratio >= THRESHOLDS["ratio"]:
-            marks.append("bottleneck")
-        measured = _lane(bound, means, probe, next(iter(work["flops"]), None))
-        if floor_s and mean_t and measured is not None and n >= THRESHOLDS["min_samples"] \
-                and _differ(floor_s / mean_t, measured):
-            marks.append("utilization")
-        if gpu_memory and peaks.get(name) is not None \
-                and peaks[name] >= THRESHOLDS["reserved"] * gpu_memory:
-            marks.append("memory")
-        if host_m is not None and host_m >= CLOCK_MIN_S and agree is False:
-            marks.append("clock")
-        sections[name] = {
-            "depth": depth, "time": time_stats, "share": share,
-            "clocks": {"host_s": host_m, "gpu_s": gpu_m, "trace_s": trace_s, "agree": agree},
-            "util": {**{f: means.get(f) for f in sampler.fields}, "n_samples": n,
-                     "few_samples": n < THRESHOLDS["min_samples"], "truncated": truncated},
-            "work": work, "floors_s": floors, "floor_s": floor_s, "bound": bound,
-            "ratio": ratio, "marks": marks, **({"rollup": True} if name in rollups else {})}
+        sections: dict[str, Any] = {}
+        for name, depth in depths.items():
+            occ = list(_occurrences(untraced, name))
+            host_m = _mean([_clock_s(sec, "host_us", "host_s") or 0.0 for _, sec in occ])
+            truncated = any(sec.get("rest") for _, sec in occ)
+            gpu_m = _mean([g for _, sec in occ
+                           if (g := _clock_s(sec, "gpu_us", "gpu_s")) is not None])
+            host_traced = _mean([_clock_s(sec, "host_us", "host_s") or 0.0
+                                 for _, sec in _occurrences(traced, name)])
+            tr = tsec.get(name)
+            trace_s = tr["wall_us"] * US if tr and tr.get("wall_us") is not None else None
+            agree: bool | None = None
+            if gpu_m is not None and host_m is not None:
+                tol = max(THRESHOLDS["clock_rel"] * host_m, THRESHOLDS["clock_abs_s"])
+                agree = abs(host_m - gpu_m) <= tol
+            if trace_s is not None and host_traced:
+                ok = abs(trace_s - host_traced) <= THRESHOLDS["trace_rel"] * host_traced
+                agree = ok if agree is None else agree and ok
+            spans = [sp for s, sec in occ for sp in _spans_ns(sec, s["t0_ns"])]
+            means, n = sampler.means(spans)
+            time_stats = _stats(seconds[name])
+            mean_t = time_stats["mean"]
+            share = mean_t / step_s if step_s and mean_t is not None else None
+            calls = [sec["calls"] for _, sec in occ if depth == 0 and sec.get("gpu_us") is not None]
+            work = _work(name, _rate_key(name, sides, compute_bf16), counts.get(name),
+                         leaves if _hashes_transcript(counts.get(name), transcript) else 0, tr,
+                         c5_scale,
+                         2 * round(_mean(calls) or 0))
+            floors = _floors(work, probe, warns)
+            floor_s = max(floors.values()) if floors else None
+            bound = max(floors, key=floors.__getitem__) if floors else "unknown"
+            ratio = mean_t / floor_s if floor_s and mean_t is not None else None
+            marks = []
+            if share is not None and ratio is not None and share >= THRESHOLDS["share"] \
+                    and ratio >= THRESHOLDS["ratio"]:
+                marks.append("bottleneck")
+            measured = _lane(bound, means, probe, next(iter(work["flops"]), None))
+            if floor_s and mean_t and measured is not None and n >= THRESHOLDS["min_samples"] \
+                    and _differ(floor_s / mean_t, measured):
+                marks.append("utilization")
+            if gpu_memory and peaks.get(name) is not None \
+                    and peaks[name] >= THRESHOLDS["reserved"] * gpu_memory:
+                marks.append("memory")
+            if host_m is not None and host_m >= CLOCK_MIN_S and agree is False:
+                marks.append("clock")
+            sections[name] = {
+                "depth": depth, "time": time_stats, "share": share,
+                "clocks": {"host_s": host_m, "gpu_s": gpu_m, "trace_s": trace_s, "agree": agree},
+                "util": {**{f: means.get(f) for f in sampler.fields}, "n_samples": n,
+                         "few_samples": n < THRESHOLDS["min_samples"], "truncated": truncated},
+                "work": work, "floors_s": floors, "floor_s": floor_s, "bound": bound,
+                "ratio": ratio, "marks": marks, **({"rollup": True} if name in rollups else {})}
+        return sections, step_s
+
+    sections, step_s = build(untraced, times)
+    warmup = None
+    if warm is not None:
+        w_sections, w_step_s = build(warm_marks, _only(all_times, lambda t: t == warm))
+        warmup = {"step": warm, "n_steps": 1, "step_s": w_step_s, "sections": w_sections}
+
     return {
-        "device": markers.header.get("device"), "n_steps": len(untraced), "step_s": step_s,
+        "device": markers.header.get("device"), "n_steps": len(untraced),
+        "warmup_excluded": warm is not None, "warmup": warmup, "step_s": step_s,
         "share_total": sum(s["share"] or 0.0 for s in sections.values()
                             if s["depth"] == 0 and not s.get("rollup")),
         "sections": sections, "hash": _hash_breakdown(parts, times, sections),
         "c5": _c5_view(untraced, layout, sampler, warns) if layout else None,
-        "timeline": _timeline(untraced, sampler),
+        "timeline": _timeline(all_untraced, sampler),  # the warm-up step is drawn too
         "hook_overhead_bound": _hook_bound(markers.header.get("device"), untraced, probe),
         "memory": {"gpu_memory_bytes": gpu_memory,
                    "sections": {n: {"peak_reserved_bytes": p,
@@ -741,9 +793,8 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
 def _plain_comparison(records: list[dict[str, Any]], plain_dir: Path) -> dict[str, Any]:
     """The plain step's sections beside the prover's ``train.*``: the plain run names them
     ``train.*`` or ``P0.*``."""
-    prover = {n: statistics.fmean(v.values()) for n, v in _times(records)[0].items()}
-    plain = {n: statistics.fmean(v.values())
-             for n, v in _times(io.read_records(plain_dir))[0].items()}
+    prover, prover_warm, prover_step = _steady_warm(records)
+    plain, plain_warm, plain_step = _steady_warm(io.read_records(plain_dir))
     out: dict[str, Any] = {}
     for name, t in prover.items():
         if not name.startswith("train."):
@@ -751,9 +802,53 @@ def _plain_comparison(records: list[dict[str, Any]], plain_dir: Path) -> dict[st
         other = next((o for o in (name, "P0." + name.removeprefix("train.")) if o in plain), None)
         if other:
             out[name] = {"plain_name": other, "prover_s": t, "plain_s": plain[other],
-                         "ratio": t / plain[other] if plain[other] else None}
+                         "ratio": t / plain[other] if plain[other] else None,
+                         "warmup_prover_s": prover_warm.get(name),
+                         "warmup_plain_s": plain_warm.get(other)}
     return {"plain_run_dir": str(plain_dir), "sections": out,
-            "step": {"prover_s": prover.get("step"), "plain_s": plain.get("step")}}
+            "step": {"prover_s": prover.get("step"), "plain_s": plain.get("step"),
+                     "warmup_prover_s": prover_warm.get("step"),
+                     "warmup_plain_s": plain_warm.get("step")},
+            "warmup_excluded": {"prover": prover_step is not None,
+                                "plain": plain_step is not None},
+            "warmup_step": {"prover": prover_step, "plain": plain_step}}
+
+
+def _steady_warm(rows: list[dict[str, Any]]
+                 ) -> tuple[dict[str, float], dict[str, float], int | None]:
+    """Mean seconds per component over the steady untraced steps, the warm-up step's seconds
+    per component, and the warm-up step (``None`` when only one step exists)."""
+    times = _times(rows)[0]
+    warm = _warm_step([t for v in times.values() for t in v])
+    steady = {n: statistics.fmean(v.values()) for n, v in _only(times, lambda t: t != warm).items()}
+    first = {n: v[warm] for n, v in times.items() if warm in v}
+    return steady, first, warm
+
+
+def _leaves(records: list[dict[str, Any]]) -> int:
+    """The step's leaf count: the largest of the ``storage`` rows' (and, for a run that wrote
+    no ``storage`` rows, the ``step`` records')."""
+    kinds = ("storage",) if any(r.get("record") == "storage" for r in records) \
+        else ("step",)
+    return max((r["leaves"] for r in records
+                if r.get("record") in kinds and r.get("leaves") is not None), default=0)
+
+
+def _work_meta(records: list[dict[str, Any]], view: dict[str, Any]) -> dict[str, Any]:
+    """``n_s``, ``M``, ``n_leaves`` and the µs per leaf of the labelling and the commit."""
+    env = next((r for r in records if r.get("record") == "environment"), {})
+    caps = [r["n_products"] for r in records
+            if r.get("record") == "capture" and r.get("n_products") is not None]
+    n_leaves = env.get("n_leaves") or _leaves(records) or None
+    secs = view["sections"]
+
+    def per_leaf(name: str) -> float | None:
+        mean = ((secs.get(name) or {}).get("time") or {}).get("mean")
+        return None if mean is None or not n_leaves else mean / n_leaves * 1e6
+
+    return {"n_s": env.get("n_s"), "M": env.get("M") or max(caps, default=None),
+            "n_leaves": n_leaves,
+            "us_per_leaf": {"label": per_leaf("P1.label"), "commit": per_leaf("P3.commit")}}
 
 
 def _read(label: str, path: Path | None, reader, warns: list[str], default: Any) -> Any:
@@ -806,7 +901,10 @@ def analyze(run_dir: Path, samples: Path | None = None, probe: Path | None = Non
     env = next((r for r in records if r.get("record") == "environment"), {})
     meta = {"model": env.get("model"), "attack": env.get("attack"), "scenario": run,
             "device": mk.header.get("device") or env.get("device"), "compute_dtype": dtype,
-            "git_commit": env.get("git_commit"), "session": session}
+            "git_commit": env.get("git_commit"), "session": session,
+            **_work_meta(records, view)}
+    if meta["n_s"] is None:
+        warns.append("no environment record names n_s: meta.n_s and meta.M may be null")
     if session is None:
         warns.append("no --session was given: meta.session is null")
     machine = next((m for m in [pr.get("machine"), env.get("machine")]

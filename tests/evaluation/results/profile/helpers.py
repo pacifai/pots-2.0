@@ -91,7 +91,7 @@ def build_run(root: Path, *, steps: int = 3, secs: dict[str, tuple[float, ...]] 
     jl(root / "markers.jsonl", lines)
     jl(root / "records.jsonl", records)
     samples = sample_rows if sample_rows is not None else [
-        {"t": int(i * 1e9), "c_tree": 1.0, "g_util": 0.5} for i in range(1, 41)]
+        {"t": int(i * 1e9), "c_tree": 1.0, "g_util": 0.5} for i in range(1, 61)]
     samples_file(root / "samples.jsonl", samples)
     (root / "probe.json").write_text(json.dumps(probe(**(probe_over or {}))), encoding="utf-8")
     return {"run_dir": root, "samples": root / "samples.jsonl", "probe": root / "probe.json"}
