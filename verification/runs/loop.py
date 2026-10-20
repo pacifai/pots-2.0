@@ -157,19 +157,13 @@ def release_device_cache(device: str | torch.device, section: Section | None = N
     prover's step is released and before the verifier's role begins. Only when the run's
     ``device`` or any of ``devices`` (the sharded run's verifier devices, F22) is CUDA: with
     none, it does nothing and opens no section, even in a process where CUDA happens to be
-    initialized. One section per step. ``torch.cuda.empty_cache()`` empties only the current
-    device's cache, so with several CUDA devices it runs once under each device's
-    ``torch.cuda.device`` context."""
-    cuda = {torch.device(d) for d in (device, *(devices or ())) if _on_cuda(d)}
-    if not cuda:
+    initialized. One section per step. One ``torch.cuda.empty_cache()`` call empties every
+    device's cache, because ``NativeCachingAllocator::emptyCache`` loops over every device's
+    allocator (torch 2.9.1)."""
+    if not any(_on_cuda(d) for d in (device, *(devices or ()))):
         return
     with (section or no_section)(HANDOFF_SECTION):
-        if len(cuda) == 1:
-            torch.cuda.empty_cache()
-            return
-        for d in sorted(cuda, key=str):
-            with torch.cuda.device(d):
-                torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
 
 def _default_schedule(c: DeclaredComputation, dataset: Sequence[Any],

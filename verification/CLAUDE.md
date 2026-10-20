@@ -1556,9 +1556,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     FS32d) is CUDA (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in
     the process), `torch.cuda.empty_cache()` inside the section `HANDOFF_SECTION`
     (`"handoff.empty_cache"`), once per step between the prover's role and the verifier's.
-    `empty_cache()` empties only the current device's cache, so with several distinct CUDA
-    devices it runs once under each one's `torch.cuda.device` context; with one it is the
-    plain call. Elsewhere it does nothing and opens no section.
+    One call empties every device's cache (`NativeCachingAllocator::emptyCache` loops over
+    every device's allocator, torch 2.9.1). Elsewhere it does nothing and opens no section.
     Prover and verifier share one process and one GPU in our runs, and the
     prover's freed blocks stay cached at the prover's sizes, so a large verifier buffer may not
     fit though the GPU has the room (the first H100 session's out-of-memory errors). Its row is
