@@ -2325,6 +2325,21 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     in reads and member ops is aimed at the GPU, where each read stalls the host. The CUDA
     pass hasn't run.
 
+- `nvlink_probe.py` (FS31, F22's check HW2): `.venv/bin/python -m verification.runs.nvlink_probe
+  --out nvlink.json`, on the four-H100 pod. It reads the NVLink topology (`nvidia-smi topo -m`,
+  `nvidia-smi nvlink -s`, the P2P read matrix), times peer copies between every pair of cards
+  and from card 0 to the other three at once, times pinned-host copies and runs `nvbandwidth`
+  when it is installed. `hw2_verdict` passes only when every pair shows NVLink, the P2P reads
+  work and the slowest peer copy is at least `PEER_COPY_MIN_GBPS` (200, hand-picked). Every
+  command runs through `run_command`, so a missing tool is a record, not a crash. Torch's view
+  needs CUDA; the tests use fakes.
+- `card_identity.py` (FS31, the first half of F22's check HW3): one card's identity report,
+  `CUDA_VISIBLE_DEVICES=k VERIF_MODEL=โ€ฆ .venv/bin/python -m verification.runs.card_identity
+  --out card.json`. From `W_0` it runs one `plain_step` on `ฯ€(1)` and one `prove_step` committed
+  with `InMemoryStore.commit_step`. The report holds the card, the proved step's root, both
+  steps' `W_{t+1}` section roots and losses, the leaf layout and the wall times; `card.digests`
+  beside it holds every leaf hash. It exits 1 when capture changed the bits on the one card.
+  `fs11_session.hw3_cards` compares the cards' reports.
 - `full_scale.py` (FS13; EVALUATION_SPEC ยง3.2): `.venv/bin/python -m
   verification.runs.full_scale run [--seeds S ...] [--levels N ...] [--hidden-level N]
   [--sweep-args ARGS] [--k-args ARGS] [--guard-ack] [--data-only]
@@ -2407,10 +2422,17 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
     in its place.
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
-    [--selftest] [--session {fs11,recheck}]`, `fetch-models` and `env`. `--session` picks the
+    [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe}]`, `fetch-models` and
+    `env`. `--session` picks the
     plan from `SESSIONS`, which also gives the name `summary.json`'s `session` records: `fs11`
-    (the default, "FS11") or `recheck` ("recheck"); `--plan` and `--selftest` replace its
-    parts. Every plan but the self-test's starts with `native_build` (`with_native_build`, applied
+    (the default, "FS11"), `recheck` ("recheck"), `profile-check` or `nvlink-probe` (FS31);
+    `--plan` and `--selftest` replace its
+    parts. `nvlink-probe` runs `nvlink_probe` once, then `card_identity` per run model and card
+    (`FS31_CARDS`, default 4, each part with `CUDA_VISIBLE_DEVICES` set to its card), and
+    `summary.json` gains `hw2` (the probe's verdict) and `hw3_cards` (per model the roots by
+    card, `same_bits` and, where cards differ, the first differing leaf with its section and
+    name); the log ends with an `HW2` and an `HW3 part 1` line. It also refuses a machine whose
+    torch sees fewer than `FS31_CARDS` CUDA devices, which `FS11_ALLOW_ANY_GPU=1` doesn't lift. Every plan but the self-test's starts with `native_build` (`with_native_build`, applied
     by `choose_plan`): `python -m verification.commitment.native`, which compiles the library
     from the upload's `native_cache/` (`POTS_NATIVE_CACHE` in `base_env`) before any timed part.
     A failed build blocks nothing; later parts fail with `get()`'s message. `check_upload`'s
@@ -2469,10 +2491,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     pass's per-section lines (`metrics.MemoryRecorder`'s echo), the section that raised
     included, with `reserved_gb` and `nested_reserved_gb` on CUDA.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
-    pod. `FS11_SESSION` (`fs11`, the default, or `recheck`; anything else is a refusal) goes to
+    pod. `FS11_SESSION` (`fs11`, the default, `recheck`, `profile-check` or `nvlink-probe`;
+    anything else is a refusal) goes to
     the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the
-    re-check), the session, a kill of a session still
+    re-check, 19,800 s for the profile check, 5,400 s for the probe; `FS31_CARDS` is passed on), the session, a kill of a session still
     running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
     `OUT_DIR.FETCHED` to end it), and the terminate: `runpodctl pod delete`, `runpodctl remove
