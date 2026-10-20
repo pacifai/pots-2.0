@@ -934,7 +934,7 @@ def test_job_marks_a_failed_pack_and_still_terminates(tmp_path):
 @pytest.mark.parametrize("deadline, grace, extra, why", [
     (2, 1, {}, "must be below FS11_DEADLINE_S"),
     (60, 1, {"FS11_MIN_FREE_GB": str(10**9)}, "FS11_MIN_FREE_GB is"),
-    (60, 1, {"FS11_SESSION": "fs12"}, "FS11_SESSION is 'fs12'; it must be fs11, recheck, profile-check or nvlink-probe"),
+    (60, 1, {"FS11_SESSION": "fs12"}, "FS11_SESSION is 'fs12'; it must be fs11, recheck, profile-check, nvlink-probe or kernel-speed"),
 ])
 def test_job_terminates_on_a_refusal(tmp_path, deadline, grace, extra, why):
     r, out = _job(tmp_path, plan=OK_PLAN, deadline=deadline, grace=grace, extra=extra)
@@ -1785,4 +1785,4 @@ def test_job_accepts_the_probe_session_and_refuses_the_rest(tmp_path):
     assert "FS11_SESSION is" not in r.stdout + r.stderr
     (tmp_path / "bad").mkdir()
     r, out = _job(tmp_path / "bad", extra={"FS11_SESSION": "other"})
-    assert "it must be fs11, recheck, profile-check or nvlink-probe" in r.stdout + r.stderr
+    assert "it must be fs11, recheck, profile-check, nvlink-probe or kernel-speed" in r.stdout + r.stderr

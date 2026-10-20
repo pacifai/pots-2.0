@@ -2498,6 +2498,40 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     in reads and member ops is aimed at the GPU, where each read stalls the host. The CUDA
     pass hasn't run.
 
+- `kernel_speed.py` (FS29, the BLAKE3 kernel's speed on one H100). `sizes --out FILE`, on the
+  Mac, writes each `RUN_PINS` model's `leaf_sizes` (the config at its pinned revision, offline,
+  never weights; `n_s` and `n` from `FULL_SCALE_ENV`, bf16 products) as a columnar JSON, a row
+  per leaf in commit order: section, dtype, shape, encoded length. `read_sizes` takes only the
+  dtypes a step has (bf16, fp32, int32), names any other, and refuses a file with no models.
+  `run --sizes FILE --out REPORT`, on a GPU, rebuilds each leaf's real header (a record's
+  `0x01 â€– 0x10 â€– n`, a weight's or a product's `tensor_leaf_header`; `read_sizes` refuses a row
+  whose length isn't its header plus its values) and lays the step's leaves, in order, into
+  consecutive tables over one device pool: the smaller of the largest step's aligned payloads
+  and the free GPU memory less 4 GiB, divided by 1.08 for the kernel's buffers; the pool is
+  reported. A leaf larger than the pool raises `ValueError`. The pool is filled once with bf16
+  `normal_`: finite read as bf16, fp32 or fp16, and any bits are valid int32. "Whole call" is
+  `hash_leaves` on prepared numpy arrays (validation, uploads, planning, kernels, `finish`);
+  collecting the step's tensors, pointers and headers in Python, which FS30 adds, is outside
+  it, so the rate is a ceiling for FS30's call. Per table: a warm-up, then `--repeats` (5)
+  whole calls and as many `launch` calls timed by CUDA events (the kernels alone); every
+  repeat's time is kept (`table_times`) and the report gives the median and the best, for the
+  whole call and the kernels alone, per model and per band. Every digest, the bands' too, is
+  checked against `native.hash_leaves` in slices of whole consecutive leaves of at most
+  `SLICE_BYTES` (8 GiB) of payload, copied from the pool into one reused host buffer;
+  `first_bad` must equal the slice's leaf count on the C side and the table's on the kernel
+  side (a differing digest, or a wrong `first_bad` from either side, is a mismatch). Before
+  the run, `host_available_bytes` (`/proc/meminfo` `MemAvailable`, and the cgroup limit less its
+  usage where one is set) must be at least twice the slice size, or the run exits 1 at once. The
+  four leaf-size bands (under 64 KiB, 64 KiB to 1 MiB, 1 to 16 MiB, over 16 MiB) are timed alone
+  and checked, and a band mismatch fails the gate. The gate line, printed and in the report, is
+  the slowest model's median whole-call rate (the best beside it): `pass` at 300 GB/s or more,
+  `review` from 150 up to that (the user decides), `fail` below (the choice returns to the
+  user, with cuPQC's SHA-256 as the alternative), with the kernel-only rate beside it; any
+  mismatch or a model that raised makes it `fail`. The session adds `fs11_session.
+  kernel_speed_gate`: `fail` too when the native build or the kernel tests did not finish `ok`
+  (the measured rates stay on the line), and `no result` when the run left no readable report.
+  Exit 0 when the run finished (a speed `fail` too: read the gate), 1 on a mismatch, an error
+  or too little host memory, 2 without CUDA.
 - `nvlink_probe.py` (FS31, F22's check HW2): `.venv/bin/python -m verification.runs.nvlink_probe
   --out nvlink.json`, on the four-H100 pod. It reads the NVLink topology (`nvidia-smi topo -m`,
   `nvidia-smi nvlink -s`, the P2P read matrix), times peer copies between every pair of cards
@@ -2610,11 +2644,22 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     token; a pinned model missing from the cache is reported (exit 1 for a run model). The
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
     in its place.
+    `--session kernel-speed --sizes FILE` (FS29) packs only `git archive HEAD`, the native
+    sources, the sizes file at the top (checked with `kernel_speed.read_sizes`),
+    `requirements-fs11.txt` and `manifest.json`: no `hf/`, `data/` or `bench_cache/`, and no
+    `HF_HUB_OFFLINE` needed. `PACKAGES` includes pytest and matplotlib for it.
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
-    [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe}]`, `fetch-models` and
+    [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed}]`,
+    `fetch-models` and
     `env`. `--session` picks the
     plan from `SESSIONS`, which also gives the name `summary.json`'s `session` records: `fs11`
-    (the default, "FS11"), `recheck` ("recheck"), `profile-check` or `nvlink-probe` (FS31);
+    (the default, "FS11"), `recheck` ("recheck"), `profile-check`, `nvlink-probe` (FS31) or
+    `kernel-speed` (FS29: the native build, the kernel's two test files on the card, then
+    `kernel_speed run` on the upload's `kernel_speed_sizes.json`; the upload comes from
+    `fs11_prep --session kernel-speed`, no models part; limits 900 + 900 + 1,500 s inside the
+    job's 3,600 s work window (5,400 less 1,200 grace and 600 packing), expected about 1, 5 and
+    5 min; `summary.json` gains `kernel_speed_gate`: verdict, the native build's and the
+    tests' status, the line);
     `--plan` and `--selftest` replace its
     parts. `nvlink-probe` runs `nvlink_probe` once, then `card_identity` per run model and card
     (`FS31_CARDS`, default 4, each part with `CUDA_VISIBLE_DEVICES` set to its card; the probe
@@ -2686,11 +2731,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     pass's per-section lines (`metrics.MemoryRecorder`'s echo), the section that raised
     included, with `reserved_gb` and `nested_reserved_gb` on CUDA.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
-    pod. `FS11_SESSION` (`fs11`, the default, `recheck`, `profile-check` or `nvlink-probe`;
-    anything else is a refusal) goes to
-    the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
-    can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the
-    re-check, 19,800 s for the profile check, 5,400 s for the probe; `FS31_CARDS` is passed on), the session, a kill of a session still
+    pod. `FS11_SESSION` (`fs11`, the default, `recheck`, `profile-check`, `nvlink-probe` or
+    `kernel-speed`; anything else is a refusal) goes to the session's `--session`. Preflight (refuses without a way to end the pod; a
+    refusal it can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the
+    re-check, 19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed;
+    `FS31_CARDS` is passed on), the session, a kill of a session still
     running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
     `OUT_DIR.FETCHED` to end it), and the terminate: `runpodctl pod delete`, `runpodctl remove

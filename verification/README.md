@@ -414,6 +414,15 @@ replaced:
 - **`check5_profile.py`** serves O2. On the same stored step it measures check 5's host
   overhead per product: wall time, aten ops and host reads per section, and on CUDA the
   kernel launches and the syncs that block the host. It judges nothing and writes nothing.
+- **`kernel_speed.py`** is FS29: how fast the GPU BLAKE3 kernel hashes a whole step's leaves on
+  one H100. `sizes` runs on the Mac and writes the four models' leaf lists (sizes and shapes
+  only, from the cached configs); `run` hashes random contents of those sizes in pool-sized
+  tables, checks every digest (the bands' too) against the C library in slices that fit host
+  memory, and prints the gate: the slowest model's median whole-call rate, 300 GB/s or more to
+  pass, 150-300 to return to the user, under 150 to fail. "Whole call" is `hash_leaves` on
+  prepared numpy arrays (validation, uploads, planning, kernels, `finish`); collecting the
+  step's tensors, pointers and headers in Python, which FS30 adds, is outside it, so the rate
+  is a ceiling for FS30's call.
 - **`nvlink_probe.py`** and **`card_identity.py`** are FS31, the four-H100 probe. The first
   reads the NVLink topology and times peer copies between the cards (F22's check HW2: four
   cards, `NV18` between each pair, peer reads OK, and the slowest pair's copy at 300 GB/s or
@@ -1022,6 +1031,36 @@ many as `FS31_CARDS`, each with its own UUID. With `FS31_CARDS` below 4 (a rehea
 say `rehearsal (N of 4 cards), not the gate` in place of a pass, and the machine-readable `pass`
 is false (the measured `verdict` and `same_bits` stay). A model whose cards give different roots
 names the first differing leaf, its section and its name.
+
+**The kernel's speed (FS29).** `FS11_SESSION=kernel-speed` needs no models. On the Mac, run
+`.venv/bin/python -m verification.runs.kernel_speed sizes --out kernel_speed_sizes.json` (offline,
+from the cached configs; it reads no weights), then
+`HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --session kernel-speed
+--sizes kernel_speed_sizes.json --out DIR` (after `python -m verification.commitment.native`).
+The upload it packs holds only `repo/` (`git archive HEAD`), `native_cache/blake3-1.8.7/`, the
+sizes file at the top, `requirements-fs11.txt` (which lists pytest and matplotlib besides the
+run's packages) and `manifest.json`; no `hf/`, `data/` or `bench_cache/`. On the pod the steps
+are the usual ones: extract it, make the venv, `uv pip install -r ../requirements-fs11.txt`
+(the requirements file sits beside `repo/`), then the job. The session builds the native
+library, runs `test_gpu_blake3.py` and `test_gpu_blake3_edges.py` on the card, then
+`kernel_speed run`. The run times each table `--repeats` (5) times, whole call and kernels
+alone, and reports the median and the best; the gate reads the slowest model's median
+whole-call rate. "Whole call" is `hash_leaves` on prepared numpy arrays (validation, uploads,
+planning, kernels, `finish`); collecting the step's tensors, pointers and headers in Python,
+which FS30 adds, is outside it, so the rate is a ceiling for FS30's call. The check against the
+C library covers the bands as well, in slices of at most 8 GiB of whole leaves copied from the
+pool to a reused host buffer; the run stops at once if the host has under twice that much
+memory available. The gate is `fail` when the native build or the kernel tests did not finish
+`ok`, whatever the speed; a run that left no report reads `FS29 gate: no result`, never `fail`.
+
+The parts' limits are 900 s (native build), 900 s (kernel tests) and 1,500 s (speed run), 3,300 s
+in all. The job's default deadline is 5,400 s; less the 1,200 s grace and the 600 s of packing,
+the parts have a 3,600 s work window. Expected: the build about 1 min, the tests about 5 min,
+the speed run about 5 min. The limits only stop a hung part, so they need not all be spent.
+The session refuses a machine with no H100 (`FS11_ALLOW_ANY_GPU=1` overrides). `summary.json`
+holds `kernel_speed_gate` (the verdict, the status of the native build and the kernel tests, and
+the line), and the job log carries the `FS29 gate` line with the slowest model's median
+whole-call and kernel-only rates, the best beside each.
 
 **Estimated wall time.** From the first session's logs (2026-10-14), where only Qwen2.5-0.5B's
 bring-up finished; the others are scaled from it. None includes the row blocking or the cache
