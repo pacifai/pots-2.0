@@ -124,7 +124,7 @@ from verification.verifier.calibration import (
     band_context,
     load_bands,
 )
-from verification.verifier.context import Section, StepStats
+from verification.verifier.context import Section, StepStats, first_zero_values
 from verification.verifier.driver import Verifier
 from verification.verifier.residuals import format_tensor_table, tensor_summary
 
@@ -205,8 +205,14 @@ def step_summary(t: int, stats: StepStats, bands: Bands, *, in_sample: bool,
         starts = np.concatenate(([0], np.cumsum(np.bincount(codes))[:-1]))
         row = np.fmax.reduce(cols.normalized, axis=1, initial=-np.inf)
         kappa = np.where(np.isnan(cols.kappa), -np.inf, cols.kappa)[order]
-        cmax = dict(zip(classes, np.fmax.reduceat(row[order], starts).tolist()))
-        kmax = dict(zip(classes, np.fmax.reduceat(kappa, starts).tolist()))
+        w = cols.normalized.shape[1]
+        flat = cols.normalized[order].reshape(-1)  # the class's elements in record order
+        ends = np.concatenate((starts[1:], [len(order)]))
+        cpeak = first_zero_values(flat, starts * w, ends * w,
+                                  np.fmax.reduceat(row[order], starts))
+        kpeak = first_zero_values(kappa, starts, ends, np.fmax.reduceat(kappa, starts))
+        cmax = dict(zip(classes, cpeak.tolist()))
+        kmax = dict(zip(classes, kpeak.tolist()))
         if watch in classes:
             for i in np.flatnonzero(codes == classes.index(watch)).tolist():
                 seen[cols.name[i]] = tuple(cols.normalized[i].tolist())

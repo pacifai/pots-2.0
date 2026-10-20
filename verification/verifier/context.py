@@ -377,6 +377,20 @@ class ProductStats:
         return repr(list(self))
 
 
+def first_zero_values(vals: np.ndarray, starts: np.ndarray, ends: np.ndarray,
+                      peak: np.ndarray) -> np.ndarray:
+    """``peak`` (each segment ``[starts[i], ends[i])`` of ``vals``' maximum) with every zero
+    peak replaced by the segment's first zero, as Python ``max`` keeps the first of equal items
+    (a ``-0.0`` before a ``0.0``) and ``fmax`` may return either."""
+    peak = peak.copy()
+    zeros = np.flatnonzero(vals == 0)
+    if len(zeros):
+        at = np.searchsorted(zeros, starts)
+        for i in np.flatnonzero(peak == 0).tolist():
+            peak[i] = vals[zeros[at[i]]]  # a zero peak has a zero in its segment
+    return peak
+
+
 def _py_max(a: np.ndarray) -> float:
     """``max(a.tolist())`` of a non-empty float64 vector, as a Python float. Python's ``max``
     keeps the first item unless a later one is greater, so a leading NaN stays and a later NaN
@@ -406,6 +420,10 @@ class StepStats:
         norm = self.products.columns().normalized
         rows = np.fmax.reduce(norm, axis=1)  # NaN-ignoring; a row starting with NaN is NaN
         rows[np.isnan(norm[:, 0])] = math.nan
+        flat = norm.reshape(-1)
+        w = norm.shape[1]
+        rows = first_zero_values(flat, np.arange(len(rows)) * w, np.arange(1, len(rows) + 1) * w,
+                                 rows)
         return _py_max(rows)
 
     def max_kappa(self) -> float:
