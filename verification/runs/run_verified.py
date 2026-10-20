@@ -251,6 +251,11 @@ def _step_line(s: StepSummary, tau: float) -> str:
             + (f"; {watch}" if watch else ""))
 
 
+def _root_line(t: int, root: bytes) -> str:
+    """The step's transcript root, one line per step; the two-GPU session compares them."""
+    return f"step {t:>2} root {root.hex()}"
+
+
 # ---- the run ----------------------------------------------------------------------------
 
 
@@ -457,6 +462,8 @@ def run_verified(c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torc
                          watch=watch)
         summaries.append(s)
         out(_step_line(s, bands.tau))
+        if rec.root is not None:
+            out(_root_line(rec.t, rec.root))
         if writer is not None:
             writer.write([summary_record(writer.run, HONEST.name, s, bands, watch=watch)])
         if keep is not None and rec.t == keep.step:

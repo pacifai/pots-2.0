@@ -8,20 +8,22 @@
 # guard (verification/README.md, "Workflow: the first H100 session"), which ends the pod if
 # setup stalls or this job never starts; fs11_guard.sh re-arms it by hand. FS11_SESSION picks
 # the session's plan: fs11 (the default), the first session's; recheck, the re-check's;
-# profile-check, the profile check's; or nvlink-probe, the four-card hardware probe's, which also
-# reads FS31_CARDS (default 4) and passes; or kernel-speed, the BLAKE3 kernel's speed on one H100,
-# whose upload holds no models (verification/runs/fs11_session.py); anything else is refused.
-# In order:
+# profile-check, the profile check's; nvlink-probe, the four-card hardware probe's, which also
+# reads FS31_CARDS (default 4) and passes; kernel-speed, the BLAKE3 kernel's speed on one H100,
+# whose upload holds no models; or fs32-pair, the sharded run on two GPUs of any type
+# (verification/runs/fs11_session.py); anything else is refused. In order:
 #
 # 1. Preflight. Without DRY_RUN the job refuses to start unless it can terminate the pod:
 #    RUNPOD_POD_ID set, and runpodctl or RUNPOD_API_KEY there (exit 2). A refusal it can act on
 #    (bad deadlines, less than FS11_MIN_FREE_GB free under OUT_DIR) terminates the pod.
 # 2. A deadline timer starts: FS11_DEADLINE_S (default 12600, 3.5 h; 7500, 2 h 5 min, for the
-#    re-check; 19800, 5.5 h, for the profile check; 5400, 1.5 h, for the hardware probe) after the
-#    start it terminates the pod, whatever the job is doing.
+#    re-check; 19800, 5.5 h, for the profile check; 5400, 1.5 h, for the hardware probe; 11800,
+#    3 h 17 min, for the two-GPU session) after the start it terminates the pod, whatever the
+#    job is doing.
 # 3. The session (verification.runs.fs11_session run) prints the environment, refuses a
 #    machine without an H100 (FS11_ALLOW_ANY_GPU=1 overrides; the hardware probe also refuses
-#    one that shows fewer than FS31_CARDS CUDA devices), and runs its parts, each with
+#    one that shows fewer than FS31_CARDS CUDA devices; the two-GPU session wants any two CUDA
+#    GPUs and ignores the H100 check), and runs its parts, each with
 #    its own log under OUT_DIR. Each part's exit code is recorded and a failed part doesn't stop
 #    the others. A running part is killed at the work deadline, which leaves FS11_GRACE_S plus
 #    FS11_PACK_RESERVE_S before the timer fires. A session still running FS11_HANG_MARGIN_S
@@ -87,6 +89,7 @@ DEFAULT_DEADLINE_S=12600
 [ "$SESSION" = recheck ] && DEFAULT_DEADLINE_S=7500
 [ "$SESSION" = profile-check ] && DEFAULT_DEADLINE_S=19800
 [ "$SESSION" = nvlink-probe ] && DEFAULT_DEADLINE_S=5400
+[ "$SESSION" = fs32-pair ] && DEFAULT_DEADLINE_S=11800
 [ "$SESSION" = kernel-speed ] && DEFAULT_DEADLINE_S=5400
 if [ -n "${FS31_CARDS:-}" ]; then export FS31_CARDS; fi
 if [ "$SELFTEST" = 1 ]; then
@@ -296,9 +299,9 @@ if [ $((GRACE_S + PACK_RESERVE_S)) -ge "$DEADLINE_S" ]; then
   refuse "FS11_GRACE_S + FS11_PACK_RESERVE_S must be below FS11_DEADLINE_S"
 fi
 case "$SESSION" in
-  fs11|recheck|profile-check|nvlink-probe|kernel-speed) ;;
+  fs11|recheck|profile-check|nvlink-probe|kernel-speed|fs32-pair) ;;
   *) refuse "FS11_SESSION is '$SESSION'; it must be fs11, recheck, profile-check, \
-nvlink-probe or kernel-speed" ;;
+nvlink-probe or kernel-speed" "(or fs32-pair, the two-GPU session)" ;;
 esac
 mkdir -p "$OUT" || refuse "cannot create $OUT"
 rm -f "$READY" "$PACK_FAILED" "$FETCHED"

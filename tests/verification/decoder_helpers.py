@@ -10,6 +10,13 @@ from setup.records import Record
 SWITCHES = (("llama", True), ("llama", False), ("qwen2", True), ("qwen2", False))
 
 
+def verifier_devices(n_gpus=None):
+    """The verifier devices of a CUDA test (F22): every GPU but the prover's (``cuda:0``) when
+    there are 3 or more, so the placement that leaves the prover's GPU out runs; else both."""
+    n = torch.cuda.device_count() if n_gpus is None else n_gpus
+    return tuple(f"cuda:{i}" for i in range(1, n)) if n >= 3 else ("cuda:0", "cuda:1")
+
+
 def switch_id(switch):
     family, tied = switch
     return f"{family}-{'tied' if tied else 'untied'}"

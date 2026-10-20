@@ -1714,6 +1714,20 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `honest_final` returns `snapshot_weights` clones and raises if any shares storage with
     the model, so check 8's reference stays independent of the prover's later runs. The
     verifier still builds its own model (invariant 1).
+    **Callers under `VERIF_VERIFIER_DEVICES` (FS32f, F22).** A sharded run changes where bytes
+    sit, so a caller that assumed host leaves or host weights converts or keys by device:
+    `bring_up` releases the cache of every verifier device (`release_device_cache(c.device,
+    devices=c.placement.devices)`); `honest_final`'s storage check keys storages by `(device,
+    data_ptr)`, since two devices may reuse an address; `flipped_matmul_sweep.check6_trial` moves
+    the product leaf to the weight's device and dtype before the update identity; its
+    `--no-sweep` runs the flipped matmul alone (`run_flip`, the judged cheat the pair session
+    uses). Read and found device-safe: `run_verified`, `full_scale`, `calibrate`, `cheats`,
+    `llama_step`, `card_identity`, `smooth_check`, `plain_baseline`, `store_crosscheck`,
+    `poisoned_step`, `bias_tamper`, `run_plain` and `plain_step`. Tests:
+    `tests/verification/runs/test_sharded_run.py` (the tiny decoders through `run_loop` with
+    `("cpu","cpu","cpu")` against unsharded, forged leaves in a later unit, and a slow SmolLM2
+    2-step run) and `test_sharded_run_cuda.py` (two or more GPUs, skipped without them; it uses
+    every GPU but the prover's when there are 3 or more).
 - `mlp_smoke.py` (A6, milestone M1):
   `.venv/bin/python -m verification.runs.mlp_smoke [--steps T] [--metrics | --no-metrics]`.
   Holds the MLP's scenario list, `run_smoke(..., metrics=None)` and `memory_smoke` /
@@ -2649,17 +2663,38 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `requirements-fs11.txt` and `manifest.json`: no `hf/`, `data/` or `bench_cache/`, and no
     `HF_HUB_OFFLINE` needed. `PACKAGES` includes pytest and matplotlib for it.
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
-    [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed}]`,
-    `fetch-models` and
-    `env`. `--session` picks the
-    plan from `SESSIONS`, which also gives the name `summary.json`'s `session` records: `fs11`
-    (the default, "FS11"), `recheck` ("recheck"), `profile-check`, `nvlink-probe` (FS31) or
-    `kernel-speed` (FS29: the native build, the kernel's two test files on the card, then
-    `kernel_speed run` on the upload's `kernel_speed_sizes.json`; the upload comes from
-    `fs11_prep --session kernel-speed`, no models part; limits 900 + 900 + 1,500 s inside the
-    job's 3,600 s work window (5,400 less 1,200 grace and 600 packing), expected about 1, 5 and
-    5 min; `summary.json` gains `kernel_speed_gate`: verdict, the native build's and the
-    tests' status, the line);
+    [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,
+    fs32-pair}]`, `fetch-models` and `env`. `--session` picks the plan from `SESSIONS`, which
+    also gives the name `summary.json`'s `session` records: `fs11` (the default, "FS11"),
+    `recheck` ("recheck"), `profile-check`, `nvlink-probe` (FS31), `kernel-speed` (FS29:
+    the native build, the kernel's two test files on the card, then `kernel_speed run` on the
+    upload's `kernel_speed_sizes.json`; the upload comes from `fs11_prep --session
+    kernel-speed`, no models part; limits 900 + 900 + 1,500 s inside the job's 3,600 s work
+    window (5,400 less 1,200 grace and 600 packing), expected about 1, 5 and 5 min;
+    `summary.json` gains `kernel_speed_gate`: verdict, the native build's and the tests'
+    status, the line) or `fs32-pair` (FS32f);
+    `fs32-pair` is F22's two-GPU acceptance: `refusal(env, True, PAIR_CARDS, need=...)` (2 CUDA
+    devices of any type; the message names the pair session, not `FS31_CARDS`), then `models`,
+    the fast suite (`-rf`, junit XML), the slow two-GPU tests
+    (`-m slow -k "two_gpus or two_cuda_devices"`), `smollm2_calibrate`, `card_identity` and a
+    3-step `run_verified` each unsharded and with `VERIF_VERIFIER_DEVICES=cuda:0,cuda:1`, and the
+    judged cheats `poisoned_step`, `hidden_steps` and `flipped_matmul_sweep --no-sweep`, sharded.
+    Every part's `info["gpu_peak"]` makes `_run_part` run a `_GpuPeaks` sampler
+    (`parts/<name>/gpu_peak.json`, `gpu_peak_mib` in the part's extras). `fs32_pair(parts)` goes
+    to `summary.json["fs32_pair"]` and `_pair_lines` ends the job log, one line per acceptance
+    item; a value counts as equal only when both arms have it. The two card parts have kind
+    `pair_card` (`part_extras` sends it to `_card_extras`; `hw3_cards` reads only `card`).
+    `run_verified` prints `step t root <hex>` for every step (`StepRecord.root`, the step's
+    Merkle root, carried by `run_loop`; metrics files and the other lines are unchanged), and
+    `_pair_run_extras` reads those roots and each step's whole line after the `: `. `pass`
+    fails closed: every part in `PAIR_PARTS` ended `ok` or `skipped_done`, both suites'
+    junit exists with tests, no failure or error and `two_gpu_slow` skipped nothing, each arm's
+    verdicts are `["accepted"] * PAIR_STEPS`, roots and step lines are equal and every cheat is
+    `exact` (read from the oracle table by `_cheat_extras`: the fourth word from the end). A
+    missing part prints `FS32 FAIL: <part> did not run`, a missing report `left no test
+    report`. Each arm's plain-against-proved `W_{t+1}` is printed and recorded, outside `pass`.
+    An acceptance failure leaves the job's exit code alone. Two A40s: the prover's GPU is then
+    one of the verifier devices, so the placement leaving it out runs only on four H100s.
     `--plan` and `--selftest` replace its
     parts. `nvlink-probe` runs `nvlink_probe` once, then `card_identity` per run model and card
     (`FS31_CARDS`, default 4, each part with `CUDA_VISIBLE_DEVICES` set to its card; the probe
@@ -2731,12 +2766,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     pass's per-section lines (`metrics.MemoryRecorder`'s echo), the section that raised
     included, with `reserved_gb` and `nested_reserved_gb` on CUDA.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
-    pod. `FS11_SESSION` (`fs11`, the default, `recheck`, `profile-check`, `nvlink-probe` or
-    `kernel-speed`; anything else is a refusal) goes to the session's `--session`. Preflight (refuses without a way to end the pod; a
-    refusal it can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the
-    re-check, 19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed;
-    `FS31_CARDS` is passed on), the session, a kill of a session still
-    running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar` with
+    pod. `FS11_SESSION` (`fs11`, the default, `recheck`, `profile-check`, `nvlink-probe`,
+    `kernel-speed` or `fs32-pair`; anything else is a refusal) goes to the session's
+    `--session`. Preflight (refuses without a way to end the pod; a refusal it can act on
+    terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
+    19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
+    11,800 s for `fs32-pair`; `FS31_CARDS` is passed on), the session, a kill of a session
+    still running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar`
+    with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
     `OUT_DIR.FETCHED` to end it), and the terminate: `runpodctl pod delete`, `runpodctl remove
     pod`, REST `DELETE`, each under a 60 s limit, confirmed by a follow-up read before

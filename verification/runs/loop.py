@@ -109,6 +109,7 @@ class StepRecord:
     capture: dict | None = None
     transcript_bytes: int | None = None
     leaves: int | None = None
+    root: bytes | None = None  # the step's transcript root (the Merkle root over its leaves)
 
 
 @dataclass
@@ -244,6 +245,7 @@ def run_loop(
             n_leaves, n_bytes = leaf_totals(c, leaves)
         t2a = time.perf_counter()
         w, loss = out.w_next, out.loss
+        root = tree_h.root
         del out, leaves, tree_h  # the store holds the leaves; nothing else keeps the step
         if release_cache:
             # the prover's step is gone; the verifier is next
@@ -256,7 +258,7 @@ def run_loop(
         t3 = time.perf_counter()
         del store  # discard before step t+1 (S3)
         rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1b, t3 - t2b, t2b - t2a,
-                         capture, n_bytes, n_leaves)
+                         capture, n_bytes, n_leaves, root)
         result.steps.append(rec)
         if on_step is not None:
             on_step(rec)

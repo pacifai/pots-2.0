@@ -26,6 +26,7 @@ from tests.verification.decoder_helpers import (
     randomize_biases,
     switch_id,
     tiny_config,
+    verifier_devices,
 )
 
 THREE = ("cpu", "cpu", "cpu")
@@ -216,8 +217,9 @@ def test_split_replay_equals_unsharded_over_two_cuda_devices(switch, dtype, B):
     each operand on its unit's device and each glue gradient on its weight's."""
     prover = tiny(switch, dtype, B, device="cuda:0")
     leaves = prover_leaves(prover, make_records((12, 7)))
-    ref = tiny(switch, dtype, B, device="cuda:1")
-    split_c = tiny(switch, dtype, B, device="cuda:0", devices=("cuda:0", "cuda:1"))
+    devices = verifier_devices()
+    ref = tiny(switch, dtype, B, device=devices[0])
+    split_c = tiny(switch, dtype, B, device="cuda:0", devices=devices)
     _, ops, glue = replay_all(ref, leaves)
     replay = split_c.replay(ListReader(leaves))
     pl = split_c.placement
@@ -256,9 +258,10 @@ def test_smollm2_split_replay_over_two_cuda_devices():
     D = load_dataset_records(cfg.data_dir / "D.bin", prover.n)
     records = [D[i] for i in schedule(1, prover.n_s, len(D), cfg.seed)]
     leaves = prover_leaves(prover, records)
-    ref = DecoderComputation.from_config(dataclasses.replace(base, device="cuda:1"))
+    devices = verifier_devices()
+    ref = DecoderComputation.from_config(dataclasses.replace(base, device=devices[0]))
     split_c = DecoderComputation.from_config(
-        dataclasses.replace(base, verifier_devices=("cuda:0", "cuda:1")))
+        dataclasses.replace(base, verifier_devices=devices))
     _, ops, glue = replay_all(ref, leaves)
     replay = split_c.replay(ListReader(leaves))
     assert_kept_off_the_prover(replay, split_c, "cuda:0")

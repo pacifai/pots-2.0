@@ -1085,6 +1085,77 @@ that hangs to its 30 min limit (at the high end, 54 + 30 = 84 min). For the boot
 start command above with `sleep 9800;` in place of `sleep 16200;` fits that rule; the 16,200 s
 one also works, and bills longer only if setup stalls.
 
+### The two-GPU session (FS32f)
+
+`FS11_SESSION=fs32-pair` is the acceptance of the per-role devices (F22, FS32) on two A40s
+(any two CUDA GPUs do): the real SmolLM2 run, unsharded and with
+`VERIF_VERIFIER_DEVICES=cuda:0,cuda:1`, must give the same roots and verdicts, and the judged
+cheats must be caught as `exact` with the sharded setting. GPU 0 trains; both GPUs hold the
+transcript and run the verifier.
+
+1. **Prep, on the Mac**, after committing, as in step 1 of the first session:
+   `HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --out DIR`. The upload
+   already carries what the session needs: the repo, the native sources, SmolLM2's test-scale
+   data and its cache. It also carries the other pinned models; the session's `models` part
+   fetches every public one (a few minutes it doesn't need; a filter would be a change to
+   `fs11_session.py`).
+2. **The pod**: two GPUs of the same type, the image and disks of step 2, the boot guard with
+   `sleep 14200;` (setup about 20 min plus the job's 98: 2 x 118 min = 236 min, rounded up).
+3. **Set up** as in step 3. `requirements-fs11.txt` carries `pytest` and `matplotlib` (the fast
+   suite and the plotting tests need them), so nothing is installed by hand.
+4. **Start the job**:
+
+   ```bash
+   FS11_SESSION=fs32-pair setsid nohup bash verification/runs/fs11_job.sh /workspace/fs11_upload \
+       /workspace/fs11_out </dev/null > /workspace/fs11_job.out 2>&1 &
+   ```
+
+   The session refuses a machine whose torch sees fewer than 2 CUDA devices; the GPU type is
+   not checked and `FS11_ALLOW_ANY_GPU` is not needed.
+
+   **Two-GPU limit.** The prover trains on GPU 0, and with only two GPUs the verifier devices
+   are both of them, so the prover's GPU is one of the verifier devices. The placement that
+   leaves the prover's GPU out of the verifier needs three or more GPUs, so it runs only on the
+   four H100s; the CUDA tests choose their verifier devices that way (`verifier_devices()` in
+   `tests/verification/decoder_helpers.py`: every GPU but the prover's when there are 3 or
+   more, else both).
+
+| part | what it does | estimate |
+|---|---|---|
+| `models` | fetches the public weights | 5 min |
+| `native_build` | compiles the BLAKE3 library from the upload | 2 min |
+| `fast_suite` | the whole fast suite, `-rf`; the two-GPU tests run here first | 25 min |
+| `two_gpu_slow` | the slow two-GPU tests (a SmolLM2 run, sharded against unsharded) | 10 min |
+| `smollm2_calibrate` | the band file, written even when the bf16 guard fails | 5 min |
+| `card_unsharded`, `card_sharded` | `card_identity`: step 1's root, `W_{t+1}`, loss | 6 min |
+| `run_unsharded`, `run_sharded` | `run_verified`, 3 steps, step 3 kept | 12 min |
+| `poisoned_step`, `hidden_steps`, `flipped_matmul` | the judged cheats, sharded | 12 min |
+
+The estimates are scaled by hand from the earlier sessions; none was measured on two cards.
+The parts sum to about 77 min, packing about 1, the grace window 20: about 98 min, so the
+default deadline is 2 x 98 = 196 min, rounded up to 11,800 s. Each part's time limit is a
+cap; the fast suite's is 3,600 s.
+
+Each part records the peak memory of every GPU (`parts/<part>/gpu_peak.json`, MiB by
+`nvidia-smi` index, sampled each second, so the card's whole use and a peak shorter than a
+second can be missed; the part's entry in `summary.json` repeats it as `gpu_peak_mib`).
+`summary.json`'s `fs32_pair` holds the comparison and the job log ends with one line per
+acceptance item: `FS32 roots equal`, `FS32 verdicts equal`, one `FS32 cheat X` per cheat, one
+`FS32 <arm> plain and proved W_{t+1}` per arm, the fast and slow suites' counts and `FS32 slowest
+failing test`. `run_verified` prints a `step t root <hex>` line per step, so every step's
+transcript root is compared between the arms, with step 1's root, `W_{t+1}`'s root and the loss
+(`card_identity`), the final-weights root, the per-step losses, the kept step's root and each
+step's whole line after the `: ` (verdict, residuals and the rest). The two card parts are of
+kind `pair_card`, which `hw3_cards` never reads.
+
+`fs32_pair["pass"]` fails closed. It is true only when every part ended `ok`; both suites left
+a test report with tests, no failure or error, and no skipped test in `two_gpu_slow`; each
+arm's verdicts are all `accepted`; the roots and step lines agree; and every cheat is `exact`.
+A part that did not run prints `FS32 FAIL: <part> did not run`, one without a report
+`FS32 FAIL: <suite> left no test report`. The plain run's and the proved run's `W_{t+1}` within
+one arm are printed and recorded but are outside `pass`. An acceptance failure does not change
+the job's exit code: the `FS32` lines and `summary.json` carry it.
+
 ## Workflow: calibrating the tolerances
 
 The thresholds `τ` (matmul residual), `κ` (cancellation) and `τ_W` (update) are set

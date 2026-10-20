@@ -5,10 +5,12 @@ EVALUATION_SPEC §5.7).
         [--source stored | in-process] [--run-dir DIR]
         [--x X ...] [--trials N] [--shapes entry entry2 row2 dense] [--classes CLS ...]
         [--deep-x X ...] [--deep-trials N] [--deep-shapes SHAPE ...]
-        [--subdir NAME] [--metrics | --no-metrics]
+        [--subdir NAME] [--metrics | --no-metrics] [--no-sweep]
 
 Set up as the honest run (``runs/cheats.py``), judged by the frozen band file. Step 4 is the
 first judged step: the bands were fitted on steps 1–3 (P10c).
+``--no-sweep`` runs item 2 alone (:func:`run_flip`): four steps here, no stored step, no
+sweep and no check-6 trial.
 
 1. **The transcript.** By default (``--source stored``) step 4 as the honest run stored it:
    ``run_verified.load_kept_step`` finds it through the run's ``kept_transcript`` record,
@@ -193,7 +195,7 @@ __all__ = ["RUN_NAME", "SWEEP_STEP", "SHAPES", "DEFAULT_X", "DEFAULT_TRIALS", "D
            "Floor", "SweepResult", "Batch", "binding_product", "sweep_targets", "batch_members",
            "hold_targets", "target_term_scale", "measure_target", "honest_measure", "unmatched",
            "plant", "sweep_target", "check6_weight",
-           "check6_trial", "floor_context", "summarize", "run_sweep", "main"]
+           "check6_trial", "floor_context", "summarize", "run_flip", "run_sweep", "main"]
 
 RUN_NAME = "flipped_matmul_sweep"
 SWEEP_STEP = 4  # the first judged step (P10c)
@@ -557,7 +559,7 @@ def check6_trial(c: DeclaredComputation, store: InMemoryStore, bands: Bands, ctx
     idx, base = c.w_next_index(name), store.root
     w_t, w_next = store.leaf(c.w_t_index(name)), store.leaf(idx)
     (g_m,) = c.linear_weights[name]  # a layer's linear: one product (check6_weight)
-    g = store.leaf(c.product_index(g_m)).to(c.weight_dtype)
+    g = store.leaf(c.product_index(g_m)).to(w_t.device, c.weight_dtype)  # sharded: its own device
     tau_w = bands.tau_w_for(name)
     with torch.no_grad():  # check 6a's reference, term by term (_update_identity_reference)
         eta_g = c.eta * g
@@ -736,6 +738,21 @@ def _store_of(env: CheatEnv, out: StepOutput, t: int) -> InMemoryStore:
         tree.path(i) for i in schedule(t, env.c.n_s, len(env.D), env.seed)])
 
 
+def run_flip(env: CheatEnv, *, t: int = SWEEP_STEP, flip_name: str | None = None,
+             writer: MetricsWriter | None = None,
+             out: Callable[[str], None] = print) -> ScenarioResult:
+    """The flipped-matmul cheat alone (module docstring, 2): ``t`` steps from ``W_0``, the
+    largest entry of ``flip_name`` (default the binding product) sign-flipped after capture at
+    step ``t``, declared ``(t, "5")`` on that product."""
+    c = env.c
+    flip_name = flip_name or binding_product(c).name
+    m_flip = c.m_of(flip_name)  # type: ignore[attr-defined]
+    return run_cheat(env, Scenario("flip", f"largest entry of P_{m_flip} ({flip_name}) "
+                                   f"sign-flipped after capture at step {t}",
+                                   FlipProduct(t, m_flip), Expected(t, "5", "failed", m_flip)),
+                     T=t, writer=writer, cheat_step=t, out=out)
+
+
 def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
               shapes: Sequence[str] = SHAPES, trials: int = DEFAULT_TRIALS,
               deep_xs: Sequence[float] = DEEP_X, deep_shapes: Sequence[str] = DEEP_SHAPES,
@@ -760,10 +777,7 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
         raise ValueError(f"{kept.run_dir} was judged by band file {h}, not this run's "
                          f"{env.bands.source}")
     m_flip = c.m_of(flip_name)  # type: ignore[attr-defined]
-    flip = run_cheat(env, Scenario("flip", f"largest entry of P_{m_flip} ({flip_name}) "
-                                   f"sign-flipped after capture at step {t}",
-                                   FlipProduct(t, m_flip), Expected(t, "5", "failed", m_flip)),
-                     T=t, writer=writer, cheat_step=t, out=out)
+    flip = run_flip(env, t=t, flip_name=flip_name, writer=writer, out=out)
     if honest is not None:
         if keep.out is None or not honest.passed:
             out("the honest base run was not accepted: no sweep")
@@ -930,6 +944,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--deep-trials", type=int, default=DEEP_TRIALS,
                    help="trials per deep point; 0 skips them")
     p.add_argument("--deep-shapes", nargs="+", default=list(DEEP_SHAPES), choices=SHAPES)
+    p.add_argument("--no-sweep", action="store_true",
+                   help="run the flipped-matmul cheat alone: no stored step, no sweep, no "
+                        "check-6 trial (the pair session's cheat run)")
     p.add_argument("--subdir", default=None,
                    help=f"write metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/SUBDIR/, keeping the "
                         "records of earlier runs")
@@ -947,6 +964,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"A13 flipped matmul and sweep: {cfg.model}@{cfg.model_revision[:12]}, k {env.k}, "
           f"step {SWEEP_STEP}, band file {pc.band_file} ({env.bands.source[:16]}…), "
           f"τ {env.bands.tau:.2f}, source {args.source}")
+    if args.no_sweep:
+        r = run_flip(env)
+        report_oracle([r], env.bands)
+        shared = band_sources(env, [r], cfg.output_dir)
+        print(f"band-file hash equal across the file, {len(env.verifiers.made)} verifiers and "
+              f"the verdict: {shared}")
+        return 0 if r.passed else 1
     kept = None
     if args.source == "stored":
         run_dir = args.run_dir or cfg.output_dir / honest_run_name(cfg.model, cfg.attack,
