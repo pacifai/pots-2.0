@@ -196,21 +196,24 @@ class MeasureScratch:
     Each product would otherwise allocate up to four fresh temporaries of its largest operand's
     size, and fresh large blocks page-fault on first touch. The buffer grows to the largest
     size asked for and lives as long as the object; check 5 holds one per step. A view starts
-    at the buffer's start, so it has a fresh tensor's 64-byte alignment. The buffer sits on
-    the device of the tensors it serves (the operands', F4a) and moves when they do.
+    at the buffer's start, so it has a fresh tensor's 64-byte alignment. There is one buffer
+    per device, made on first use on the device of the tensors it serves (the operands', F4a),
+    so a step whose layers sit on different devices (F22) never reallocates by moving between
+    them. Each buffer grows to the largest size asked for on its device.
     """
 
     def __init__(self) -> None:
-        self._buf = torch.empty(0, dtype=torch.float32)
+        self._bufs: dict[torch.device, torch.Tensor] = {}
         self._ones: dict[tuple[int, torch.device], torch.Tensor] = {}
 
     def buffer(self, n: int, device: torch.device = _HOST) -> torch.Tensor:
-        """The first ``n`` fp32 entries of the buffer on ``device``, contiguous; earlier views
-        are invalid."""
-        if self._buf.numel() < n or self._buf.device != device:
-            self._buf = torch.empty(0, dtype=torch.float32)  # free before allocating
-            self._buf = torch.empty(n, dtype=torch.float32, device=device)
-        return self._buf[:n]
+        """The first ``n`` fp32 entries of ``device``'s buffer, contiguous; earlier views of
+        that device's buffer are invalid."""
+        buf = self._bufs.get(device)
+        if buf is None or buf.numel() < n:
+            self._bufs.pop(device, None)  # free before allocating
+            self._bufs[device] = buf = torch.empty(n, dtype=torch.float32, device=device)
+        return buf[:n]
 
     def ones(self, width: int, device: torch.device = _HOST) -> torch.Tensor:
         """``torch.ones(width, 1)``, fp32, on ``device``, never written to."""
