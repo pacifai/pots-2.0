@@ -1270,10 +1270,24 @@ interface.
     6a widens it exactly to fp32 before the update identity, as AccumulateGrad does for
     training's `W.grad`. At fp32 the cast is a no-op. A weight with several `G`s (an untied
     output layer in head blocks) takes `chain_gradient` of them, training's sum.
-  - **Devices (F4a, FS9).** Leaves are in host memory and the replay runs on
+  - **Devices (F4a, FS9, FS32e).** Unsharded, leaves are in host memory and the replay runs on
     `VERIF_DEVICE`. Check 5 moves each committed product and bias to its rebuilt operands'
-    device (`_served`) and measures there; check 6 runs on the host, and 6b's glue gradient
-    comes back to the host in fp32 (`_glue_gradient`). At `cpu` every move is a no-op.
+    device (`_served`) and measures there; check 6 runs on the leaves' device, the host, and
+    6b's glue gradient comes back to it in fp32 (`_glue_gradient`). At `cpu` every move is a
+    no-op. Sharded (`VERIF_VERIFIER_DEVICES`, F22), a layer's weight leaves, product leaves
+    and replay unit sit on one verifier GPU and different layers on different ones. A run
+    (one product, or a layer's member run) is served and measured on its device, and the
+    rows of runs on different devices join without a device error: `_read_rows` joins each
+    device's rows there and reads them once per device per judging window, so a window may
+    span devices and the float64 values, the judging order and the first failing product are
+    the single-device ones. `MeasureScratch` and `UpdateScratch` each hold one buffer set per
+    device, so moving between devices never reallocates. Check 6a runs `_linear_gradient` and
+    the update identity on the weight leaf's device (`G` follows `W_t`; a leaf already there
+    is not copied). Check 6b brings each glue gradient to its weight leaf's device in fp32,
+    usually a no-op since the replay returns it there (FS32c). The fast path and
+    `_update_identity_reference` run on any device, with `ρ` in float64; the identity is
+    elementwise, so the device's `ρ_max` should equal the host's bit for bit, which the CUDA
+    tests (`test_check_devices.py`) check. The record pass uses the same helpers.
   - Check 5 gets its numbers from `matmul_check.freivalds.measure_product` and draws challenges
     from the claimed root `store.root`, as check 2's read validated it
     (`ctx.state.claimed_root`; F15a, task C7). The root comparison at the end of the step
@@ -1468,7 +1482,9 @@ interface.
   member shapes its normalized residuals equal `measure_product`'s bit for bit; below about
   8×8, CPU `bmm` rounds differently from `mm`.
   - **Fast path, same bits (O2).** Both functions take an optional `scratch=MeasureScratch()`,
-    one reused buffer for `|A|`, `|B|`, `|P|` and `P/s` (check 5 holds one per step). Each
+    one reused buffer for `|A|`, `|B|`, `|P|` and `P/s` per device (check 5 holds one object
+    per step; a step on several devices, FS32e, keeps one buffer and one ones vector per
+    device and never reallocates by moving between them). Each
     `|x|` is written with a fresh `abs`'s strides, so the matmuls see the same operands. `|P|`
     is computed once. `_norm` gives `_safe_norm`'s bits and always takes the scaled path
     (into the buffer when `x` is contiguous), with no host read: `_scaled_norm` maps a zero,
