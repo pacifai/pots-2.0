@@ -463,7 +463,8 @@ def check_6a_linear_update(store: TranscriptStore, c: DeclaredComputation, ctx: 
     scratch = UpdateScratch()
     for name in c.linear_weights:
         with _guard(ctx, "6a", _AFTER_COMMIT):
-            w_t, w_next, g = view.w_t(name), view.w_next(name), _linear_gradient(c, view, name)
+            w_t, w_next = view.w_t(name), view.w_next(name)
+            g = _linear_gradient(c, view, name, w_t.device)
         rej = _update_identity(ctx, "6a", name, w_t, w_next, g, c.eta, bands.tau_w_for(name),
                                scratch)
         if rej is not None:
@@ -471,14 +472,14 @@ def check_6a_linear_update(store: TranscriptStore, c: DeclaredComputation, ctx: 
     return None
 
 
-def _linear_gradient(c: DeclaredComputation, view: TranscriptView, name: str) -> torch.Tensor:
+def _linear_gradient(c: DeclaredComputation, view: TranscriptView, name: str,
+                     device: torch.device) -> torch.Tensor:
     """Check 6a's ``G`` for linear weight ``name``: its committed weight-gradient leaves, each
     widened exactly to the weights' format (F6b: a bf16 leaf becomes fp32; an fp32 leaf is
     unchanged), as 6b's gradients are, and summed in order as training sums them
     (:func:`chain_gradient`; one leaf unless the weight's product runs in row blocks). Check 6a
-    and its record pass both take ``G`` here. It sits on the weight leaf's device, where the
-    update identity runs (a leaf already there is not copied)."""
-    device = view.w_t(name).device
+    and its record pass both take ``G`` here. It sits on ``device``, the weight leaf's, where
+    the update identity runs (a leaf already there is not copied)."""
     return chain_gradient((view.product(m).to(device) for m in c.linear_weights[name]),
                           c.weight_dtype)
 
@@ -936,7 +937,7 @@ def _read_rows(rows: Sequence[torch.Tensor]) -> list[np.ndarray]:
     out: list[np.ndarray | None] = [None] * len(rows)
     for idx in by_device.values():
         joined = rows[idx[0]] if len(idx) == 1 else torch.cat([rows[i] for i in idx])
-        host = joined.double().cpu().numpy()
+        host = joined.cpu().double().numpy()
         base = 0
         for i in idx:
             out[i] = host[base:base + len(rows[i])]
@@ -1251,7 +1252,7 @@ def _record_rest_6(c: DeclaredComputation, ctx: StepContext, bands: Bands,
     for name in todo:
         with _guard(ctx, check_id, _AFTER_COMMIT):
             w_t, w_next = view.w_t(name), view.w_next(name)
-            g = (_linear_gradient(c, view, name) if grads is None
+            g = (_linear_gradient(c, view, name, w_t.device) if grads is None
                  else _glue_gradient(grads, name, w_t.device))
         _update_identity(ctx, check_id, name, w_t, w_next, g, c.eta, bands.tau_w_for(name),
                          scratch)

@@ -225,7 +225,10 @@ def _update_cases():
     w, wn, g = ui._honest((50, 30), seed=1)
     out.append(("forged", w, ui._ulps(wn, 777, 9), g, ui.ETA, ui.EPS))
     w, wn, g = ui._honest((20, 20), seed=2)
-    out.append(("at-tau", w, ui._ulps(wn, 5, 5), g, ui.ETA, ui.EPS))
+    forged = ui._ulps(wn, 5, 5)
+    rho = _identity(w, forged, g, ui.ETA, ui.EPS, False, checks.UpdateScratch())[2]
+    out.append(("at-tau", w, forged, g, ui.ETA, ui.EPS, rho))  # ρ exactly at τ: accepts
+    out.append(("below-tau", w, forged, g, ui.ETA, ui.EPS, math.nextafter(rho, 0.0)))  # rejects
     for k, bad in enumerate([float("nan"), float("inf"), -float("inf")]):
         w, wn, g = ui._honest((30, 30), seed=4)
         g = g.clone()
@@ -256,11 +259,12 @@ def _update_cases():
     return out
 
 
-def _identity(w, wn, g, eta, eps, judge, scratch):
+def _identity(w, wn, g, eta, eps, judge, scratch, tau=ui.TAU):
+    """The rejection, the bits of ``ρ_max`` and ``ρ_max`` itself."""
     ctx = ui._ctx(judge, eps)
-    rej = checks._update_identity(ctx, "6a", "w", w, wn, g, eta, ui.TAU, scratch)
+    rej = checks._update_identity(ctx, "6a", "w", w, wn, g, eta, tau, scratch)
     (stat,) = ctx.stats.tensors
-    return rej, ui._bits(stat.rho_max)
+    return rej, ui._bits(stat.rho_max), stat.rho_max
 
 
 @needs_cuda
@@ -271,14 +275,17 @@ def test_check_6_on_cuda_equals_host_on_adversarial_inputs(chunk, judge, monkeyp
     scratch reused across the cases as check 6 reuses it."""
     monkeypatch.setattr(checks, "UPDATE_CHUNK", chunk)
     host, dev = checks.UpdateScratch(), checks.UpdateScratch()
-    for name, w, wn, g, eta, eps in _update_cases():
-        want = _identity(w, wn, g, eta, eps, judge, host)
-        got = _identity(w.cuda(), wn.cuda(), g.cuda(), eta, eps, judge, dev)
+    for name, w, wn, g, eta, eps, *t in _update_cases():
+        tau = t[0] if t else ui.TAU
+        want = _identity(w, wn, g, eta, eps, judge, host, tau)[:2]
+        got = _identity(w.cuda(), wn.cuda(), g.cuda(), eta, eps, judge, dev, tau)[:2]
         assert got == want, name
+        if t and judge:  # the boundary: accepted at τ = ρ, rejected one ulp below
+            assert (want[0] is None) == (name == "at-tau"), name
         ref_ctx, ref_dev = ui._ctx(judge, eps), ui._ctx(judge, eps)
-        a = checks._update_identity_reference(ref_ctx, "6a", "w", w, wn, g, eta, ui.TAU)
+        a = checks._update_identity_reference(ref_ctx, "6a", "w", w, wn, g, eta, tau)
         b = checks._update_identity_reference(ref_dev, "6a", "w", w.cuda(), wn.cuda(), g.cuda(),
-                                              eta, ui.TAU)
+                                              eta, tau)
         assert a == b and repr(ref_ctx.stats.tensors) == repr(ref_dev.stats.tensors), name
 
 
@@ -318,7 +325,8 @@ def test_tiny_decoder_step_leaves_over_two_devices(which, compute):
 @needs_two
 def test_check_6_runs_on_each_weights_device():
     """Check 6a's identity runs where the weight sits: a weight on ``cuda:1`` is judged there,
-    its gradient and scratch buffers on ``cuda:1`` too."""
+    its gradient and scratch buffers on ``cuda:1`` too, with the host-leaf run's ``ρ`` and
+    outcome."""
     c, leaves = _step(torch.float32, device="cuda")
     pl = placement_for(c, "cuda:0", (torch.device("cuda:0"), torch.device("cuda:1")))
     placed = _place(c, leaves, pl.leaf_device)
@@ -326,14 +334,24 @@ def test_check_6_runs_on_each_weights_device():
     for leaf in placed:
         committed.add(leaf)
     from verification.transcript.reader import TranscriptView
-    view = TranscriptView(c, committed)
+    host = CommittedLeaves()
+    for leaf in leaves:
+        host.add(leaf)
+    view, host_view = TranscriptView(c, committed), TranscriptView(c, host)
+
+    def run(v):
+        scratch, ctx, rejs = checks.UpdateScratch(), ui._ctx(True), []
+        for name in c.linear_weights:
+            w_t = v.w_t(name)
+            g = checks._linear_gradient(c, v, name, w_t.device)
+            assert g.device == w_t.device
+            rejs.append(checks._update_identity(ctx, "6a", name, w_t, v.w_next(name), g, c.eta,
+                                                4.0, scratch))
+        return rejs, [(s.weight, ui._bits(s.rho_max)) for s in ctx.stats.tensors], scratch
+
+    rejs, stats, scratch = run(view)
+    want_rejs, want_stats, _ = run(host_view)
     for name in c.linear_weights:
         assert view.w_t(name).device == pl.weight_device(name)
-        assert checks._linear_gradient(c, view, name).device == pl.weight_device(name)
-    scratch = checks.UpdateScratch()
-    ctx = ui._ctx(True)
-    for name in c.linear_weights:
-        checks._update_identity(ctx, "6a", name, view.w_t(name), view.w_next(name),
-                                checks._linear_gradient(c, view, name), c.eta, 4.0, scratch)
+    assert (rejs, stats) == (want_rejs, want_stats)
     assert set(scratch._bufs) == {pl.weight_device(n) for n in c.linear_weights}
-    assert all(not math.isnan(s.rho_max) for s in ctx.stats.tensors)
