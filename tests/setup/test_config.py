@@ -86,10 +86,37 @@ def test_eta_defaults_to_declared_value():
     ("VERIF_ATTACK", "advbench"), ("VERIF_ATTACK", ""), ("VERIF_POISON_COUNT", "0"),
     ("VERIF_HEAD_BLOCKS", "0"), ("VERIF_HEAD_BLOCKS", "two"),
     ("VERIF_TRACE_STEP", "-1"), ("VERIF_TRACE_STEP", "x"), ("VERIF_TRACE_C5", "some"),
+    ("VERIF_VERIFIER_DEVICES", "cuda"), ("VERIF_VERIFIER_DEVICES", "cuda:1,cuda:1"),
+    ("VERIF_VERIFIER_DEVICES", "cpu,,cpu"), ("VERIF_VERIFIER_DEVICES", "cpu,"),
+    ("VERIF_VERIFIER_DEVICES", "tpu9"), ("VERIF_VERIFIER_DEVICES", "cuda:x"),
 ])
 def test_invalid_values_raise(name, value):
     with pytest.raises(ValueError, match=name):
         load_config({name: value})
+
+
+def test_verifier_devices_default_and_empty_are_none():
+    assert load_config({}).verifier_devices is None
+    assert load_config({"VERIF_VERIFIER_DEVICES": ""}).verifier_devices is None
+    assert load_config({"VERIF_VERIFIER_DEVICES": "  "}).verifier_devices is None
+
+
+def test_verifier_devices_lists():
+    def parse(value, device="cpu"):
+        return load_config({"VERIF_DEVICE": device,
+                            "VERIF_VERIFIER_DEVICES": value}).verifier_devices
+    assert parse("cpu") == ("cpu",)
+    assert parse("cuda:1", "cuda:0") == ("cuda:1",)
+    assert parse("cuda:1,cuda:2,cuda:3", "cuda:0") == ("cuda:1", "cuda:2", "cuda:3")
+    assert parse(" cuda:1 , cuda:0 ", "cuda:0") == ("cuda:1", "cuda:0")
+    assert parse("cpu,cpu,cpu") == ("cpu", "cpu", "cpu")
+
+
+def test_verifier_devices_must_match_the_device_type():
+    with pytest.raises(ValueError, match="VERIF_VERIFIER_DEVICES.*device type"):
+        load_config({"VERIF_VERIFIER_DEVICES": "cuda:1"})
+    with pytest.raises(ValueError, match="VERIF_VERIFIER_DEVICES.*device type"):
+        load_config({"VERIF_DEVICE": "cuda:0", "VERIF_VERIFIER_DEVICES": "cpu"})
 
 
 def test_setup_determinism():
@@ -177,3 +204,77 @@ def test_assert_no_dropout_pdrop_and_nested():
         assert_no_dropout(_DictConfig({"resid_pdrop": 0.1}))
     with pytest.raises(ValueError, match="text_config.attention_dropout"):
         assert_no_dropout(_DictConfig({"text_config": {"attention_dropout": 0.1}}))
+
+
+# ---- FS32a tester additions ------------------------------------------------------------
+
+
+def _vd(value, device="cpu"):
+    return load_config({"VERIF_DEVICE": device,
+                        "VERIF_VERIFIER_DEVICES": value}).verifier_devices
+
+
+@pytest.mark.parametrize("value", ["\t", " \n ", "   "])
+def test_verifier_devices_whitespace_only_is_none(value):
+    assert _vd(value) is None
+
+
+@pytest.mark.parametrize("value", ["cpu,", ",cpu", ",", " , ", "cpu, ,cpu", "cpu ,"])
+def test_verifier_devices_empty_entries_refused(value):
+    with pytest.raises(ValueError, match="VERIF_VERIFIER_DEVICES"):
+        _vd(value)
+
+
+@pytest.mark.parametrize("value", ["cuda:01x", "cuda:-1", "cuda:", "cuda:1:2", "gpu", "CPU",
+                                   "Cpu", "cuda :1"])
+def test_verifier_devices_malformed_refused(value):
+    with pytest.raises(ValueError, match="VERIF_VERIFIER_DEVICES"):
+        _vd(value, "cpu" if not value.lower().startswith("cuda") else "cuda:0")
+
+
+def test_verifier_devices_cuda_leading_zero_does_not_slip_past_the_repeat_check():
+    # torch rejects 'cuda:01'; if it ever accepts it, it must still count as a repeat of cuda:1
+    try:
+        got = _vd("cuda:1,cuda:01", "cuda:0")
+    except ValueError:
+        return
+    pytest.fail(f"cuda:1 and cuda:01 both accepted: {got}")
+
+
+def test_verifier_devices_cpu_with_an_index():
+    assert _vd("cpu:0") == ("cpu:0",)
+    assert _vd("cpu:0,cpu:0") == ("cpu:0", "cpu:0")  # cpu may repeat
+
+
+def test_verifier_devices_keeps_entries_as_written_and_in_order():
+    assert _vd("cuda:3,cuda:1,cuda:2", "cuda:0") == ("cuda:3", "cuda:1", "cuda:2")
+    assert _vd("cuda:0", "cuda:0") == ("cuda:0",)  # the prover's own device is allowed
+
+
+def test_verifier_devices_repeat_after_the_prover_device_in_list_is_refused():
+    with pytest.raises(ValueError, match="repeats"):
+        _vd("cuda:1,cuda:2,cuda:1", "cuda:0")
+
+
+def test_verifier_devices_with_a_bare_cuda_prover():
+    # VERIF_DEVICE=cuda is allowed today; the verifier entries must still name indices
+    assert _vd("cuda:1", "cuda") == ("cuda:1",)
+
+
+def test_verifier_devices_do_not_change_the_training_config_or_any_hash():
+    import dataclasses
+    from verification.runs.plain_baseline import config_hash, run_provenance, training_config
+    base = load_config({})
+    on = load_config({"VERIF_VERIFIER_DEVICES": "cpu,cpu,cpu"})
+    assert on.verifier_devices == ("cpu", "cpu", "cpu")
+    assert training_config(on) == training_config(base)
+    assert "verifier_devices" not in training_config(on)
+    assert config_hash(training_config(on)) == config_hash(training_config(base))
+    assert run_provenance(on, None) == run_provenance(base, None)
+    # every other field is the same: only the new one differs
+    diff = [f.name for f in dataclasses.fields(base)
+            if getattr(base, f.name) != getattr(on, f.name)]
+    assert diff == ["verifier_devices"]
+    for names in (("cpu",), ("cpu", "cpu")):
+        other = load_config({"VERIF_VERIFIER_DEVICES": ",".join(names)})
+        assert config_hash(training_config(other)) == config_hash(training_config(base))
