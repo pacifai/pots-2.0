@@ -414,6 +414,11 @@ replaced:
 - **`check5_profile.py`** serves O2. On the same stored step it measures check 5's host
   overhead per product: wall time, aten ops and host reads per section, and on CUDA the
   kernel launches and the syncs that block the host. It judges nothing and writes nothing.
+- **`kernel_speed.py`** is FS29: how fast the GPU BLAKE3 kernel hashes a whole step's leaves on
+  one H100. `sizes` runs on the Mac and writes the four models' leaf lists (sizes and shapes
+  only, from the cached configs); `run` hashes random contents of those sizes in pool-sized
+  tables, checks every digest against the C library and prints the gate: the slowest model's
+  whole-call rate, 300 GB/s or more to pass, 150-300 to return to the user, under 150 to fail.
 - **`nvlink_probe.py`** and **`card_identity.py`** are FS31, the four-H100 probe. The first
   reads the NVLink topology and times peer copies between the cards (F22's check HW2: four
   cards, `NV18` between each pair, peer reads OK, and the slowest pair's copy at 300 GB/s or
@@ -1022,6 +1027,17 @@ many as `FS31_CARDS`, each with its own UUID. With `FS31_CARDS` below 4 (a rehea
 say `rehearsal (N of 4 cards), not the gate` in place of a pass, and the machine-readable `pass`
 is false (the measured `verdict` and `same_bits` stay). A model whose cards give different roots
 names the first differing leaf, its section and its name.
+
+**The kernel's speed (FS29).** `FS11_SESSION=kernel-speed` needs no models. On the Mac, run
+`.venv/bin/python -m verification.runs.kernel_speed sizes --out kernel_speed_sizes.json` (offline,
+from the cached configs; it reads no weights). The upload is the repo (`git archive`), the
+native sources (`native_cache/blake3-1.8.7/`, from `python -m verification.commitment.native`)
+and that file at its root; there is no `manifest.json` and no `fs11_prep` run. The session
+builds the native library, runs `test_gpu_blake3.py` and `test_gpu_blake3_edges.py` on the
+card, then `kernel_speed run`; its default deadline is 5,400 s (parts about 25 min at their
+limits, plus packing and the 20 min grace, about twice). It refuses a machine with no H100
+(`FS11_ALLOW_ANY_GPU=1` overrides). `summary.json` holds `gate`, and the job log carries the
+`FS29 gate` line with the slowest model's whole-call and kernel-only rates.
 
 **Estimated wall time.** From the first session's logs (2026-10-14), where only Qwen2.5-0.5B's
 bring-up finished; the others are scaled from it. None includes the row blocking or the cache

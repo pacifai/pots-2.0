@@ -512,7 +512,8 @@ def test_fs11_session_imports_only_the_standard_library_at_module_level():
 
 
 @pytest.mark.parametrize("session, expect", [("fs11", 12600), ("recheck", 7500),
-                                             ("profile-check", 19800), ("nvlink-probe", 5400)])
+                                             ("profile-check", 19800), ("nvlink-probe", 5400),
+                                             ("kernel-speed", 5400)])
 def test_default_deadline_per_session(tmp_path, session, expect):
     proc, out = t11._job(tmp_path, python=sys.executable, popen=True,
                          extra={"FS11_SESSION": session, "FS11_DEADLINE_S": "",
@@ -559,5 +560,5 @@ def test_job_terminates_on_a_hanging_part_in_the_probe_session(tmp_path):
 
 def test_job_unknown_session_still_terminates(tmp_path):
     r, out = t11._job(tmp_path, plan=t11.OK_PLAN, extra={"FS11_SESSION": "nvlink_probe"})
-    assert "it must be fs11, recheck, profile-check or nvlink-probe" in r.stdout + r.stderr
+    assert "it must be fs11, recheck, profile-check, nvlink-probe or kernel-speed" in r.stdout + r.stderr
     assert Path(f"{out}.TERMINATED").exists()
