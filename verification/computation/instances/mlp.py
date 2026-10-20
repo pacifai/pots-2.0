@@ -30,7 +30,7 @@ Every weight is linear, so check 6 is 6a throughout and :meth:`MLPReplay.glue_gr
 empty. Each product needs ``q ≥ 2`` (P7: a ``q = 1`` product is a glue outer product), so
 ``n_s ≥ 2`` and every width is at least 2.
 
-The schedule is ``data.schedule`` (sequential, 1-based, no wraparound).
+The schedule is ``data.schedule``, F8c's hash-shuffled passes (1-based, seeded).
 """
 
 from __future__ import annotations
@@ -200,8 +200,8 @@ class MLPComputation(DeclaredComputation):
         return self._m_by_name[name]
 
     @cached_property
-    def linear_weights(self) -> dict[str, int]:
-        return {self.weight(l): self.m_of(f"G_{l}") for l in range(1, self.L + 1)}
+    def linear_weights(self) -> dict[str, tuple[int, ...]]:
+        return {self.weight(l): (self.m_of(f"G_{l}"),) for l in range(1, self.L + 1)}
 
     # ---- shared ---------------------------------------------------------------------------
 
@@ -282,8 +282,7 @@ class MLPComputation(DeclaredComputation):
             elif rec.b_info.storage_ptr in x_ptr:
                 l = x_ptr[rec.b_info.storage_ptr]
                 grad = model.get_parameter(self.weight(l)).grad
-                if grad is None or (grad.untyped_storage().data_ptr()
-                                    != rec.out.untyped_storage().data_ptr()):
+                if grad is None or not capture.is_output_of(grad, rec):
                     raise LabelingError(f"G_{l} (record #{rec.index}) is not W_{l}.grad")
                 fill(f"G_{l}", rec)
             else:

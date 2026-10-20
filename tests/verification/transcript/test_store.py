@@ -32,6 +32,8 @@ from verification.transcript.store import (
 from verification.verifier.bands import Bands
 from verification.verifier.driver import Verifier
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 ETA = 1e-2
 
 
@@ -282,6 +284,25 @@ def test_replay_runs_from_store(c, data):
     assert replay.glue_gradients() == {}
 
 
+def test_commit_step_sections_nest_and_change_nothing(c, data):
+    from verification.runs.metrics import TimeRecorder
+
+    step = _step(c, data)
+    want_leaves, want_tree = InMemoryStore.commit_step(c, step)
+    rec = TimeRecorder("x", "s")
+    seam = rec.seam()
+    with seam("P3.commit"):
+        got_leaves, got_tree = InMemoryStore.commit_step(c, step, section=seam)
+    rec.on_step(type("R", (), {"t": 1, "rejection": None})())
+    rec.finish()
+    assert got_tree.root == want_tree.root and len(got_leaves) == len(want_leaves)
+    rows = {r["component"]: r for r in rec.rows if r["step"] == 1}
+    for name in ("P3.commit.collect", "P3.commit.hash", "P3.commit.tree", "P3.commit.check"):
+        assert rows[name]["level"] == "sub"
+    assert rows["P3.commit.hash.read"]["level"] == "sub"
+    assert rows["P3.commit"]["time_s"] >= rows["P3.commit.hash"]["time_s"]
+
+
 # ---- the on-disk store (A14, C3) ----------------------------------------------------------
 
 
@@ -422,7 +443,7 @@ class _RewriteAfterFirstRead(DiskStore):
 def _verifier(c, data, w0):
     return Verifier(c, h_D=dataset_tree(c, data).root, n_records=len(data), k=3, n_steps=1,
                     bands=Bands.provisional(), w0=w0, allow_provisional=True,
-                    schedule=lambda t: range(4, 8))
+                    schedule=lambda t: range(4, 8), seed=SEED)
 
 
 def test_verifier_accepts_a_disk_store(c, data, tmp_path):

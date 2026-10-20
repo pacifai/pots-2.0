@@ -17,20 +17,23 @@ Prover and verifier share one :class:`DeclaredComputation` instance per model. I
   replay builds its own model from the committed ``W_t`` (``build_model`` plus
   :func:`load_weights`) and recomputes glue with that instance's modules or
   ``torch.autograd.grad`` (invariants 1 and 2);
-- how each weight's gradient enters check 6. A linear weight's gradient is one committed
-  weight-gradient product (6a). Any other weight's gradient is recomputed glue (6b), from
-  :meth:`Replay.glue_gradients`, which reuses the backward replay that check 5 ran (S6c).
+- how each weight's gradient enters check 6. A linear weight's gradient is committed
+  weight-gradient products (6a): one, or the blocks of a head run in row blocks, summed in
+  order by :func:`chain_gradient`, the same sum training makes. Any other weight's gradient is
+  recomputed glue (6b), from :meth:`Replay.glue_gradients`, which reuses the backward replay
+  that check 5 ran (S6c).
 
-``build_model`` is shared: the prover trains it and the replay rebuilds it. The forward pass to
-the loss and the labeling of captured matmuls into canonical slots are prover-side; the
-verifier never calls them.
+``build_model`` is shared: the prover trains it and the replay rebuilds it. The training pass
+(forward, loss and backward) and the labeling of captured matmuls into canonical slots are
+prover-side; the verifier never calls them.
 """
 
 from __future__ import annotations
 
+import contextlib
 import enum
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -48,9 +51,17 @@ __all__ = [
     "ReplayError",
     "Replay",
     "DeclaredComputation",
+    "HOST",
+    "chain_gradient",
     "load_weights",
     "snapshot_weights",
 ]
+
+
+HOST = torch.device("cpu")
+"""Where every leaf lives, whatever device the model runs on: host memory (F1c). The model,
+its activations and the replay run on ``VERIF_DEVICE`` (F4a); weights and products are copied
+out to the host, which commits, hashes and hands them over."""
 
 
 class ProductKind(enum.Enum):
@@ -67,7 +78,9 @@ class ProductSpec:
     ``weight`` names the learnable weight the product involves, or is ``None`` for a
     weight-free bilinear product. ``layer`` is the 1-based layer, or ``None`` outside the layer
     stack. ``member`` is the ``(s, h)`` index of one member of a batched attention product (A7),
-    or ``None``.
+    or ``None``. ``bias`` names the declared weight ``b`` that the same op adds,
+    ``P = A·B + 1·bᵀ``, or is ``None``. Check 5 then checks the matmul ``[A | 1]·[B ; bᵀ]``
+    (spec §2, F14) with ``b`` read from the committed ``W_t``, and ``q`` is one greater.
     """
 
     m: int  # 1-based position in canonical product order
@@ -78,6 +91,7 @@ class ProductSpec:
     weight: str | None = None
     layer: int | None = None
     member: tuple[int, ...] | None = None
+    bias: str | None = None
 
     def __post_init__(self) -> None:
         if self.m < 1:
@@ -93,8 +107,9 @@ class ProductSpec:
 
     @property
     def q(self) -> int:
-        """Contracted dimension."""
-        return self.a_shape[1]
+        """Contracted dimension of the checked matmul: ``A``'s columns, plus the ones column of
+        ``[A | 1]`` when a bias is added (F14)."""
+        return self.a_shape[1] + (self.bias is not None)
 
     @property
     def width(self) -> int:
@@ -125,9 +140,44 @@ class Replay(ABC):
     def operands(self, m: int) -> tuple[torch.Tensor, torch.Tensor]:
         """``(A_m, B_m)`` rebuilt from committed leaves only."""
 
+    def operand_group(self, ms: Sequence[int], dtype: torch.dtype | None = None
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The operands of products ``ms``, stacked: consecutive members of one attention run
+        with equal declared shapes, in canonical order.
+
+        Equal bit for bit to ``torch.stack`` of ``operands(m)[0]`` and of ``operands(m)[1]``
+        over ``ms``, detached and contiguous, then converted to ``dtype`` if given. The
+        conversion happens in the copy into the stacked result, so no stack in the operand
+        format is held next to it (check 5 asks for fp32). This default does exactly that,
+        member by member; an instance may serve the group from whole tensors instead. A caller
+        that gets an exception falls back to per-member ``operands(m)`` to find which member
+        fails.
+        """
+        pairs = [self.operands(m) for m in ms]
+
+        def stack(xs: list[torch.Tensor]) -> torch.Tensor:
+            out = xs[0].new_empty((len(xs), *xs[0].shape), dtype=dtype)
+            return torch.stack([x.detach() for x in xs], out=out)
+
+        return stack([a for a, _ in pairs]), stack([b for _, b in pairs])
+
     @abstractmethod
     def glue_gradients(self) -> dict[str, torch.Tensor]:
         """Check 6b: the full gradient of each glue-gradient weight. Valid after ``operands(M)``."""
+
+
+def chain_gradient(parts: Iterable[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
+    """A weight's gradient from its committed weight-gradient products: each widened to
+    ``dtype`` and added in order, out of place, ``((P_0 + P_1) + P_2) + …``. Training and
+    check 6 both sum through here, so they round alike. One part is that part widened,
+    the tensor itself when it is ``dtype`` already. ``parts`` is read once, in order, so a
+    generator holds one part at a time."""
+    g: torch.Tensor | None = None
+    for p in parts:
+        g = p.to(dtype) if g is None else g + p.to(dtype)
+    if g is None:
+        raise ValueError("a gradient needs at least one product")
+    return g
 
 
 def load_weights(computation: DeclaredComputation, model: torch.nn.Module,
@@ -150,14 +200,16 @@ def load_weights(computation: DeclaredComputation, model: torch.nn.Module,
 
 def snapshot_weights(computation: DeclaredComputation,
                      model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Copies of ``model``'s declared weights, in ``weight_names`` order.
+    """Copies of ``model``'s declared weights in host memory (:data:`HOST`), in
+    ``weight_names`` order.
 
     The one way to take weights out of a model: the prover's ``W_{t+1}`` leaves (its ``W_t``
     leaves are the caller's tensors where ``prove_step`` can share them, else a clone as here),
     and ``W_0`` from a freshly built model (the plain baseline B7 and the verified runs, A12
     included, so both start from the same tensors).
     """
-    return {n: model.get_parameter(n).detach().clone() for n in computation.weight_names}
+    return {n: model.get_parameter(n).detach().to(HOST, copy=True)
+            for n in computation.weight_names}
 
 
 class DeclaredComputation(ABC):
@@ -192,13 +244,15 @@ class DeclaredComputation(ABC):
 
     @property
     @abstractmethod
-    def linear_weights(self) -> Mapping[str, int]:
-        """Check 6a: weight name -> ``m`` of the committed product that is its whole gradient."""
+    def linear_weights(self) -> Mapping[str, tuple[int, ...]]:
+        """Check 6a: weight name -> the ``m`` of the committed weight-gradient products whose
+        :func:`chain_gradient`, in this order, is its whole gradient (one ``m`` unless the
+        weight's matmul runs in row blocks)."""
 
     @property
     def weight_dtype(self) -> torch.dtype:
-        """Dtype of every ``W_t`` / ``W_{t+1}`` leaf. fp32 at both scales (P6); bf16 is config
-        (§8.A.3), set by overriding."""
+        """Dtype of every ``W_t`` / ``W_{t+1}`` leaf: the fp32 master at both scales (P6, F6b).
+        An instance sets the dtypes from ``(MASTER_DTYPE, COMPUTE_DTYPE)`` by overriding."""
         return torch.float32
 
     @property
@@ -273,18 +327,36 @@ class DeclaredComputation(ABC):
                 raise ValueError(f"product {p.name} has q={p.q}; a q=1 product is glue (P7)")
             if p.weight is not None and p.weight not in self._weight_pos:
                 raise ValueError(f"product {p.name} names unknown weight {p.weight}")
+            if p.bias is not None:
+                # Check 5 measures a biased product alone, and the bias's gradient is glue (6b).
+                # Only a forward linear adds a bias (F14).
+                if p.kind is not ProductKind.FORWARD or p.weight is None:
+                    raise ValueError(f"product {p.name} ({p.kind.value}, weight {p.weight}): "
+                                     f"only a forward product with a weight carries a bias")
+                if p.bias not in self._weight_pos or p.bias in self.linear_weights:
+                    raise ValueError(f"product {p.name}: bias {p.bias} is not a declared weight "
+                                     f"whose gradient is glue")
+                shape = tuple(self.weight_shapes[p.bias])
+                if shape != (p.width,) or p.member is not None:
+                    raise ValueError(f"product {p.name}: bias {p.bias} {shape} doesn't fit a "
+                                     f"{'member' if p.member else 'product'} of width {p.width}")
         if not (isinstance(self.eta, float) and self.eta > 0 and self.eta < float("inf")):
             raise ValueError(f"eta must be a positive finite float, got {self.eta!r}")
         if len({p.name for p in self.products}) != self.M:
             raise ValueError("duplicate product names")
-        for w, m in self.linear_weights.items():
-            p = self.product(m)
+        for w, ms in self.linear_weights.items():
             if w not in self._weight_pos:
                 raise ValueError(f"linear weight {w} is not a declared weight")
-            if p.kind is not ProductKind.WEIGHT_GRAD or p.weight != w:
-                raise ValueError(f"linear weight {w} maps to {p.name}, not its weight gradient")
-            if p.p_shape != tuple(self.weight_shapes[w]):
-                raise ValueError(f"{p.name} shape {p.p_shape} != {w} {self.weight_shapes[w]}")
+            if not ms or len(set(ms)) != len(ms):
+                raise ValueError(f"linear weight {w} maps to {ms!r}, not distinct products")
+            for m in ms:
+                p = self.product(m)
+                if p.kind is not ProductKind.WEIGHT_GRAD or p.weight != w:
+                    raise ValueError(f"linear weight {w} maps to {p.name}, not its weight "
+                                     f"gradient")
+                if p.p_shape != tuple(self.weight_shapes[w]):
+                    raise ValueError(f"{p.name} shape {p.p_shape} != {w} "
+                                     f"{self.weight_shapes[w]}")
 
     # ---- shared ---------------------------------------------------------------------------
 
@@ -295,6 +367,12 @@ class DeclaredComputation(ABC):
     @abstractmethod
     def build_model(self) -> torch.nn.Module:
         """A fresh model whose parameters are exactly :attr:`weight_names`; load before use."""
+
+    def autocast(self) -> contextlib.AbstractContextManager[Any]:
+        """The mixed-precision context around forward and loss, the same in training, the
+        plain run and the replay (F5a, F6b). A no-op unless the instance computes in a narrower
+        format than its weights."""
+        return contextlib.nullcontext()
 
     # ---- verifier side --------------------------------------------------------------------
 
@@ -308,11 +386,28 @@ class DeclaredComputation(ABC):
     def loss(self, model: torch.nn.Module, records: Sequence[Any]) -> torch.Tensor:
         """Assemble the batch (glue) and run the forward pass to the scalar loss."""
 
+    def forward_backward(self, model: torch.nn.Module, records: Sequence[Any],
+                         stage: Callable[[str], contextlib.AbstractContextManager[Any]]
+                         ) -> torch.Tensor:
+        """One step's training pass: forward to the loss, then backward, leaving each weight's
+        gradient in its ``.grad``. Returns the loss, detached or not.
+
+        ``stage(p)`` gives the context for phase ``p``, ``"forward"`` or ``"backward"``, which
+        the prover's capture and the metrics sections hang on. An instance may enter each phase
+        several times and alternate them; every matmul runs inside one of them. This default is
+        ``loss`` then ``loss.backward()``.
+        """
+        with stage("forward"):
+            loss = self.loss(model, records)
+        with stage("backward"):
+            loss.backward()
+        return loss
+
     @abstractmethod
     def label(self, capture: MatmulCapture, model: torch.nn.Module) -> list[torch.Tensor]:
         """Map captured records to canonical slots; return ``P_1..P_M`` in order.
 
-        Called after ``loss.backward()`` while the capture still holds its operands. Must map by
-        operand identity, not call order, and raise :class:`LabelingError` unless every slot is
-        filled exactly once with the declared shape.
+        Called after :meth:`forward_backward` while the capture still holds its operands. Must
+        map by operand identity, not call order, and raise :class:`LabelingError` unless every
+        slot is filled exactly once with the declared shape.
         """

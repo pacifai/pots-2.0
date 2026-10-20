@@ -4,9 +4,11 @@
                                                          [--metrics | --no-metrics]
 
 The honest run's training with capture and every protocol step off: ``T`` steps (``--steps``,
-else ``VERIF_STEPS``, default 10) from the same ``W_0`` (the model ``LlamaComputation.from_config``
-loads), on the same batches ``π(t)`` of ``D`` (``$VERIF_OUTPUT_DIR/data/D.bin``, from
-``materialize_data``) at the same ``η`` (``VERIF_ETA``). Each step is
+else ``VERIF_STEPS``, default 10) from the same ``W_0`` (the model
+``DecoderComputation.from_config`` loads), on the same batches ``π(t)`` of ``D``
+(``$VERIF_OUTPUT_DIR/data/D.bin``, from ``materialize_data``, whose ``meta.json`` must name the
+run's model and pad id, as for the verified runs) at the same ``η`` (``VERIF_ETA``).
+Each step is
 :func:`~verification.prover.step.plain_step` driven by :func:`~verification.runs.loop.run_plain`:
 the prover's SGD step without ``MatmulCapture``, and no labeling, commitment, paths or verifier.
 
@@ -15,9 +17,10 @@ the prover's SGD step without ``MatmulCapture``, and no labeling, commitment, pa
 
 - the timed run's ``time`` rows per step: ``P0.load``, ``P0.forward``, ``P0.backward``,
   ``P0.update``, the ``P0`` component and the prover and step totals;
-- a memory pass and a counting pass, each a separate run of the first ``S`` steps from ``W_0``
-  (``--pass-steps``, default :data:`~verification.runs.metrics.PASS_STEPS`, the verified runs'
-  pass length), never timed. P0's memory is reported as the step's growth, ``peak(P0.backward)
+- a memory pass, a separate run of the first ``S`` steps from ``W_0`` (``--pass-steps``,
+  default :data:`~verification.runs.metrics.PASS_STEPS`, the verified runs' pass length), and a
+  counting pass of :data:`~verification.runs.metrics.COUNT_STEPS` (one step, EVALUATION_SPEC
+  §3.4), both never timed. P0's memory is reported as the step's growth, ``peak(P0.backward)
   − start(P0.forward)``, as ``derive_capture`` uses it.
 
 There is no ``step`` or ``verdict`` record: nothing is verified.
@@ -27,7 +30,7 @@ the BLAKE3 leaf hash of each tensor of ``W_{T+1}``, encoded as a ``W_{t+1}`` lea
 dtype, shape, raw bytes), so equal hashes mean bit-identical weights, ``-0.0`` included. Beside
 them, what the run started from and how it trained: ``W_0``'s root over the same leaf hashes
 check 0 anchors on, ``h_D``, the training config's hash, ``η``, threads, model and revision,
-``T`` and the per-step losses. The honest verified run (A12) takes ``W_0`` with
+``T``, the per-step losses and the seed. The honest verified run (A12) takes ``W_0`` with
 :func:`~verification.computation.interface.snapshot_weights` from a freshly built model, as this
 run does, and checks its final weights against the file with :func:`assert_same_final_weights`.
 
@@ -53,15 +56,17 @@ from typing import Any
 
 import torch
 
+from setup import backdoorllm
 from setup.config import RunConfig, load_config, setup_determinism
-from setup.data import load_dataset_records
 from verification.commitment.encoding import TAG_WEIGHT
 from verification.commitment.leaves import dataset_root
 from verification.commitment.merkle import hash_tensor_leaf, merkle_root
 from verification.computation.interface import DeclaredComputation, snapshot_weights
+from verification.runs.llama_step import load_committed_dataset
 from verification.runs.loop import PlainResult, run_plain
 from verification.runs.scenarios import ReusedModel
 from verification.runs.metrics import (
+    COUNT_STEPS,
     PASS_STEPS,
     MetricsWriter,
     config_hash,
@@ -95,25 +100,39 @@ PROVENANCE_FIELDS: dict[str, str] = {
     "threads": "different threads",
     "config_hash": "different training config",
 }
-_CONFIG_FIELDS = ("model", "model_revision", "threads", "config_hash", "h_D")
+_CONFIG_FIELDS = ("model", "model_revision", "threads", "config_hash", "h_D", "seed")
 
 
 # ---- provenance ---------------------------------------------------------------------------
 
 
+_NOT_TRAINING = ("output_dir", "metrics", "release_cache", "steps", "attack", "poison_count",
+                 "trace_step", "trace_c5")
+
+
 def training_config(cfg: RunConfig) -> dict[str, Any]:
-    """The run config's fields that shape training: all but ``output_dir``, ``metrics`` and
-    ``steps`` (``T`` is recorded on its own). The plain and verified runs hash this dict."""
-    return {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-            if f.name not in ("output_dir", "metrics", "steps")}
+    """The run config's fields that shape training: all but ``output_dir``, ``metrics``,
+    ``release_cache`` (the CUDA cache release between the roles), ``steps`` (``T`` is recorded
+    on its own), ``attack`` and ``poison_count``. ``h_D`` already tells the two tasks apart, and
+    the poisoning level never enters honest training. The plain and verified runs hash this
+    dict.
+
+    ``head_blocks`` enters only when it isn't 1. One block is the training every stored
+    baseline ran, so their hash stays; more blocks sum the output layer's weight gradient in
+    another order, which moves training's bits."""
+    out = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
+           if f.name not in _NOT_TRAINING}
+    if out["head_blocks"] == 1:
+        del out["head_blocks"]
+    return out
 
 
 def run_provenance(cfg: RunConfig, h_D: bytes | None) -> dict[str, Any]:
     """``final_weights.json``'s config-side provenance: model, revision, threads, the hash of
-    :func:`training_config` and ``h_D``."""
+    :func:`training_config`, ``h_D`` and the run's seed."""
     return {"model": cfg.model, "model_revision": cfg.model_revision, "threads": cfg.threads,
             "config_hash": config_hash(training_config(cfg)),
-            "h_D": None if h_D is None else h_D.hex()}
+            "h_D": None if h_D is None else h_D.hex(), "seed": cfg.seed}
 
 
 # ---- final weights ------------------------------------------------------------------------
@@ -141,7 +160,9 @@ def write_final_weights(path: str | os.PathLike[str], c: DeclaredComputation,
 
     ``provenance`` gives the config side (:func:`run_provenance`); a field it lacks is
     ``null``. ``W_0``'s root, ``η`` (``c.eta``), ``steps`` (``len(losses)``) and ``losses`` come
-    from the arguments.
+    from the arguments. The run's ``seed`` is written beside the provenance but isn't one of
+    :data:`PROVENANCE_FIELDS`: it already enters ``config_hash``, and it tells A12 which
+    baseline its run can be compared with (B7 skips a baseline at another seed).
     """
     prov = dict(provenance or {})
     if set(prov) - set(_CONFIG_FIELDS):
@@ -149,6 +170,7 @@ def write_final_weights(path: str | os.PathLike[str], c: DeclaredComputation,
     hashes = final_weight_hashes(c, w)
     doc: dict[str, Any] = {"run": run}
     doc.update({k: prov.get(k) for k in PROVENANCE_FIELDS if k in _CONFIG_FIELDS})
+    doc["seed"] = prov.get("seed")
     doc.update({"w0_root": weights_root(final_weight_hashes(c, w0)), "eta": c.eta,
                 "steps": len(losses), "losses": [float(x) for x in losses],
                 "leaf_tag": TAG_WEIGHT, "root": weights_root(hashes), "hashes": hashes})
@@ -251,13 +273,15 @@ def _growth(rows: Sequence[Mapping[str, Any]]) -> dict[int, int | None]:
 
 
 def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
-                   w0: Mapping[str, torch.Tensor], *, T: int,
+                   w0: Mapping[str, torch.Tensor], *, T: int, seed: int,
                    build_model: Callable[[], torch.nn.Module],
                    out_dir: str | os.PathLike[str] | None = None,
                    metrics: MetricsWriter | None = None, pass_steps: int = PASS_STEPS,
+                   count_steps: int = COUNT_STEPS,
                    provenance: Mapping[str, Any] | None = None, keep_weights: bool = True,
                    out: Callable[[str], None] = print) -> BaselineResult:
-    """``T`` plain steps from ``W_0``; then, with ``metrics``, the memory and counting passes.
+    """``T`` plain steps from ``W_0`` on ``π`` at ``seed``; then, with ``metrics``, the memory
+    pass of ``pass_steps`` steps and the counting pass of ``count_steps``.
 
     The timed run and each pass get their model from ``build_model`` (a fresh build, or a
     ``scenarios.ReusedModel``) and load ``W_0`` into it. ``final_weights.json`` goes to
@@ -265,11 +289,12 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
     (:func:`run_provenance`). With ``keep_weights=False`` the final weights are dropped once
     hashed, before the passes, and ``plain.w_final`` is empty.
     """
-    if not 1 <= pass_steps <= T:
-        raise ValueError(f"pass_steps = {pass_steps} must be in 1..T = {T}")
+    for name, n in (("pass_steps", pass_steps), ("count_steps", count_steps)):
+        if not 1 <= n <= T:
+            raise ValueError(f"{name} = {n} must be in 1..T = {T}")
     rec = None if metrics is None else metrics.recorder(SCENARIO)
-    res = run_plain(c, build_model(), dataset, w0, n_steps=T,
-                    section=None if rec is None else rec.section,
+    res = run_plain(c, build_model(), dataset, w0, n_steps=T, seed=seed,
+                    section=None if rec is None else rec.seam(),
                     on_step=None if rec is None else rec.on_step)
     if rec is not None:
         rec.finish()
@@ -294,17 +319,17 @@ def plain_baseline(c: DeclaredComputation, dataset: Sequence[Any],
     if not keep_weights:
         res = dataclasses.replace(res, w_final={})  # not held through the memory pass
     if metrics is not None:
-        def body(r: Any) -> Any:
-            run_plain(c, build_model(), dataset, w0, n_steps=pass_steps,
-                      section=r.section, on_step=r.on_step)
+        def body(n: int) -> Callable[[Any], Any]:
+            return lambda r: run_plain(c, build_model(), dataset, w0, n_steps=n, seed=seed,
+                                       section=r.seam(), on_step=r.on_step)
 
-        mem = memory_pass(metrics.run, SCENARIO, body, metrics.probe)
+        mem = memory_pass(metrics.run, SCENARIO, body(pass_steps), metrics.probe)
         metrics.write(mem)
         for t, g in _growth(mem).items():
             out(f"   step {t:>3}  P0 memory growth "
                 + ("n/a" if g is None else f"{g / 1e9:.3f} GB")
                 + " (peak of backward − start of forward)")
-        metrics.write(count_pass(metrics.run, SCENARIO, body))
+        metrics.write(count_pass(metrics.run, SCENARIO, body(count_steps)))
         out(f"metrics: {metrics.dir}")
     return BaselineResult(res, hashes, path)
 
@@ -316,12 +341,16 @@ def capture_rows(verified: str | os.PathLike[str], plain: str | os.PathLike[str]
 
     An analysis-time function: the rows are returned, not written into either run. A plain-run
     step with no verified counterpart in the same record kind (``time``, ``memory``, ``count``)
-    gets no P1 row and raises a ``UserWarning`` naming it.
+    gets no P1 row and raises a ``UserWarning`` naming it. The verified run's traced step (FS23)
+    is left out of the time rows, and so is the plain run's same step.
     """
     v = read_records(verified)
     if scenario is not None:
         v = [r for r in v if r.get("scenario") == scenario]
     p = read_records(plain)
+    traced = {r["step"] for r in v if r.get("record") == "time" and r.get("traced")}
+    v = [r for r in v if not (r.get("record") == "time" and r.get("traced"))]
+    p = [r for r in p if not (r.get("record") == "time" and r.get("step") in traced)]
 
     def steps(rows: Sequence[Mapping[str, Any]], kind: str) -> set[int]:
         return {r["step"] for r in rows
@@ -336,12 +365,13 @@ def capture_rows(verified: str | os.PathLike[str], plain: str | os.PathLike[str]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    from verification.computation.instances import LlamaComputation
+    from verification.computation.instances import DecoderComputation
 
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=None, help="T (default: VERIF_STEPS)")
     p.add_argument("--pass-steps", type=int, default=PASS_STEPS,
-                   help=f"steps in the memory and counting passes (default {PASS_STEPS})")
+                   help=f"steps in the memory pass (default {PASS_STEPS}); the counting pass "
+                        f"runs {COUNT_STEPS}")
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
                    help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/ "
                         "(default: VERIF_METRICS)")
@@ -351,15 +381,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     T = args.steps if args.steps is not None else cfg.steps
     if T < 1 or not 1 <= args.pass_steps <= T:
         p.error(f"need T ≥ 1 and 1 ≤ --pass-steps ≤ T, got T = {T}, {args.pass_steps}")
-    d_path = cfg.data_dir / "D.bin"
-    if not d_path.exists():
-        p.error(f"no {d_path}; run verification.runs.materialize_data first")
+    if not all((cfg.data_dir / f).exists() for f in ("D.bin", "meta.json")):
+        p.error(f"no D.bin or meta.json under {cfg.data_dir}; run "
+                "verification.runs.materialize_data first")
     if use_metrics and sys.platform == "darwin" and os.environ.get("MallocLargeCache") != "0":
         log.warning("MallocLargeCache is not 0: macOS keeps freed large blocks in the footprint, "
                     "so this run's memory rows don't compare with other runs'")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
-    dataset = load_dataset_records(d_path, c.n)
+    c = DecoderComputation.from_config(cfg)
+    dataset, _ = load_committed_dataset(c, cfg.data_dir)  # raises unless built for c's model
     # One from_pretrained model for W_0 (as the verified run's prover loads it), the timed run
     # and both passes; each run loads W_0 into it before use (scenarios.ReusedModel).
     models = ReusedModel(c.build_model)
@@ -370,15 +400,15 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"η {c.eta:g}, T {T}, |D| {len(dataset)}, h_D {h_D.hex()[:16]}…")
     out_dir = cfg.output_dir / RUN_NAME
     if not use_metrics:
-        plain_baseline(c, dataset, w0, T=T, build_model=models, out_dir=out_dir,
+        plain_baseline(c, dataset, w0, T=T, seed=cfg.seed, build_model=models, out_dir=out_dir,
                        provenance=prov, keep_weights=False)
         return 0
-    run_cfg = {"T": T, "pass_steps": args.pass_steps}
+    run_cfg = {"T": T, "pass_steps": args.pass_steps, "count_steps": COUNT_STEPS}
     with MetricsWriter(out_dir, RUN_NAME, device=cfg.device, model=cfg.model,
-                       corpus=cfg.dataset, seed=cfg.seed,
+                       corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
                        config={**training_config(cfg), **run_cfg}, band_file_hash=None,
                        h_D=h_D, extra={"scenario": SCENARIO, **run_cfg}) as mw:
-        plain_baseline(c, dataset, w0, T=T, build_model=models, metrics=mw,
+        plain_baseline(c, dataset, w0, T=T, seed=cfg.seed, build_model=models, metrics=mw,
                        pass_steps=args.pass_steps, provenance=prov, keep_weights=False)
     return 0
 

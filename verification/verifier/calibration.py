@@ -15,36 +15,56 @@ their numbers (``Verifier(calibrate=True)``, P10b). This module turns the number
     ``τ/2``. A failure is reported, never fixed by raising ``z`` here.
 
 - :func:`realized_floor` gives the floor each product actually gets, ``Φ_m = f_achieved·‖P_m‖_F``
-  with ``f_achieved = c·τ·e_m·2^(N/k)``, as a fraction of the target ``‖P_m‖_F`` (P4). It also
+  with ``f_achieved = c·τ·e_m·2^(N/k)``, as a fraction of the target ``‖P_m‖_F`` (P4). Since
+  F18 ``e_m`` is the product's own (``sizing.product_e_m``, from ``q``, ``‖P_m‖_F`` and the
+  term scale ``U_m``), so the floor varies product by product, not only with ``q``. It also
   lists honest products with ``‖|P|·1‖ = 0`` but ``ν ≠ 0``, which the guard rejects by
   construction.
+- :func:`largest_e_m` is the largest ``e_m`` over the calibration products, the one P10d's
+  recompute of ``k`` sizes at (F18), and :func:`step_floor` a step's largest
+  ``f_achieved``, its realized floor (F18).
 - :func:`band_file_bytes` writes the bands and C1's statistics as one JSON file.
-  :func:`write_band_file` saves it, and :func:`load_bands` is how every later run reads it.
+  :func:`write_band_file` saves it, and :func:`load_bands` is how every later run reads it,
+  refusing a file whose :func:`band_context` differs from the run's in any key but the
+  calibration seed and thread count.
   ``Bands.source`` is the BLAKE3 hex of the file's bytes, and :func:`assert_same_band_source`
   is P10a's check that every run was judged by the same file.
 
-Recomputing ``k`` with the measured ``τ`` is ``sizing.size_k(..., s_h=s_h)`` (P10d). Nothing
-here runs a model; ``runs/calibrate.py`` does.
+Recomputing ``k`` with the measured ``τ`` is ``sizing.size_k(..., s_h=s_h, e_cal=...)``
+(P10d) with ``e_cal`` from :func:`largest_e_m`. Nothing here runs a model;
+``runs/calibrate.py`` does.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import statistics
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.context import StepStats
-from verification.verifier.matmul_check.sizing import C_ANTI, Z, e_m, f_achieved
+from verification.verifier.matmul_check.sizing import (
+    C_ANTI,
+    Z,
+    f_achieved,
+    product_e_m,
+    term_ratio,
+)
 from verification.verifier.residuals import ClassSummary, class_summary
 
+if TYPE_CHECKING:
+    from setup.config import RunConfig
+    from verification.computation.instances.decoder import DecoderComputation
+
 __all__ = ["KAPPA_MARGIN", "GUARD_FRACTION", "TAU_W_MARGIN", "Calibration", "RealizedFloor",
-           "fit", "realized_floor", "band_file_bytes", "write_band_file", "load_bands",
-           "assert_same_band_source"]
+           "LargestEm", "StepFloor", "fit", "realized_floor", "largest_e_m", "step_floor",
+           "band_file_bytes", "write_band_file", "BandFileMismatch",
+           "PROVENANCE_KEYS", "band_context", "load_bands", "assert_same_band_source"]
 
 # κ_max = KAPPA_MARGIN × the largest honest κ of the class. The spec asks only that κ_max sit
 # above the honest factor. 2 mirrors τ_W's margin; κ_max is a safety ceiling, not the
@@ -144,6 +164,9 @@ class RealizedFloor:
     ``ratio`` is ``Φ_m / ‖P_m‖_F = f_achieved(e_m)``: the smallest deviation the check
     guarantees to catch, as a fraction of the product. The target is 1 (P4). A poisoned record
     in a batch of four lowers ``‖Δ_m‖`` by about ``√2`` (S1d), so ``1/√2`` is the margin there.
+    ``e_m`` is each product's own (F18), and ``by_q`` the largest ratio at each ``q``.
+    ``zero_norm`` lists products with ``‖P_m‖_F = 0``, whose relative floor isn't defined;
+    they are left out of the ratios (placeholder: no honest product has been one).
     """
 
     count: int
@@ -157,7 +180,8 @@ class RealizedFloor:
     over_target: int  # products with ratio > 1
     over_poison_margin: int  # products with ratio > 1/√2
     zero_row_sum: tuple[str, ...]  # products with ‖|P|·1‖ = 0 and ν ≠ 0
-    by_q: Mapping[int, float]  # ratio per contracted dimension q (it depends on q only)
+    by_q: Mapping[int, float]  # the largest ratio per contracted dimension q
+    zero_norm: tuple[str, ...] = ()  # products with ‖P‖_F = 0, left out of the ratios
 
 
 def realized_floor(stats: Mapping[int, StepStats] | Iterable[tuple[int, StepStats]], *,
@@ -165,18 +189,20 @@ def realized_floor(stats: Mapping[int, StepStats] | Iterable[tuple[int, StepStat
                    c: float = C_ANTI) -> RealizedFloor:
     """:class:`RealizedFloor` over every product of the given steps.
 
-    Needs each product's ``q`` and ``‖P‖_F`` (``ProductStat``), which check 5 records."""
+    Needs each product's ``q``, ``‖P‖_F`` and ``U`` (``ProductStat``), which check 5 records."""
     ratios: list[tuple[float, str]] = []
     phis: list[float] = []
     zero: list[str] = []
+    zero_norm: list[str] = []
     by_q: dict[int, float] = {}
     for t, st in _items(stats):
         for p in st.products:
-            if p.q <= 0 or not math.isfinite(p.p_norm):
-                raise ValueError(f"step {t} P_{p.m} ({p.name}) has no recorded q or ‖P‖_F")
-            r = by_q.get(p.q)
-            if r is None:
-                r = by_q[p.q] = f_achieved(c, tau, e_m(p.q, eps_in, eps_acc), N, k)
+            _require_scale(t, p)
+            if p.p_norm == 0:
+                zero_norm.append(f"{p.name} (step {t})")
+                continue
+            r = f_achieved(c, tau, product_e_m(p.q, eps_in, eps_acc, p.p_norm, p.u), N, k)
+            by_q[p.q] = max(by_q.get(p.q, r), r)
             ratios.append((r, p.name))
             phis.append(r * p.p_norm)
             if p.p_abs1 == 0 and p.nu != 0:
@@ -191,7 +217,81 @@ def realized_floor(stats: Mapping[int, StepStats] | Iterable[tuple[int, StepStat
         phi_median=statistics.median(phis), phi_max=max(phis),
         over_target=sum(r > 1.0 for r in values),
         over_poison_margin=sum(r > 1.0 / math.sqrt(2.0) for r in values),
-        zero_row_sum=tuple(zero), by_q=dict(sorted(by_q.items())))
+        zero_row_sum=tuple(zero), by_q=dict(sorted(by_q.items())), zero_norm=tuple(zero_norm))
+
+
+def _require_scale(t: int, p: Any) -> None:
+    if p.q <= 0 or not math.isfinite(p.p_norm) or not math.isfinite(p.u):
+        raise ValueError(f"step {t} P_{p.m} ({p.name}) has no recorded q, ‖P‖_F or U")
+
+
+@dataclass(frozen=True)
+class LargestEm:
+    """The largest ``e_m`` over the calibration products (F18): P10d's recompute sizes ``k``
+    at it. ``ratio`` is that product's ``U_m/‖P_m‖_F``; ``u_ratio_max`` the largest ratio
+    over every product, wherever it sits. ``zero_norm`` counts products with ``‖P‖_F = 0``,
+    left out (placeholder, as in :class:`RealizedFloor`)."""
+
+    e_m: float
+    name: str
+    step: int
+    q: int
+    ratio: float
+    u_ratio_max: float
+    u_ratio_max_name: str
+    zero_norm: int
+
+    @property
+    def at(self) -> str:
+        return f"{self.name} (step {self.step})"
+
+
+def largest_e_m(stats: Mapping[int, StepStats] | Iterable[tuple[int, StepStats]], *,
+                eps_in: float, eps_acc: float) -> LargestEm:
+    """:class:`LargestEm` over every product of the given steps; the first wins a tie."""
+    best: tuple[float, str, int, int, float] | None = None
+    top_ratio, top_name, zero_norm = -math.inf, "", 0
+    for t, st in _items(stats):
+        for p in st.products:
+            _require_scale(t, p)
+            if p.p_norm == 0:
+                zero_norm += 1
+                continue
+            ratio = term_ratio(p.p_norm, p.u)
+            e = product_e_m(p.q, eps_in, eps_acc, p.p_norm, p.u)
+            if best is None or e > best[0]:
+                best = (e, p.name, t, p.q, ratio)
+            if ratio > top_ratio:
+                top_ratio, top_name = ratio, f"{p.name} (step {t})"
+    if best is None:
+        raise ValueError("no products with ‖P‖_F > 0")
+    return LargestEm(*best, u_ratio_max=top_ratio, u_ratio_max_name=top_name,
+                     zero_norm=zero_norm)
+
+
+@dataclass(frozen=True)
+class StepFloor:
+    """One step's realized floor (F18): its largest ``f_achieved`` over products, and where."""
+
+    f_achieved: float
+    name: str
+
+
+def step_floor(stats: StepStats, *, tau: float, k: int, N: float, eps_in: float,
+               eps_acc: float, c: float = C_ANTI) -> StepFloor | None:
+    """:class:`StepFloor` of one step's recorded products, ``None`` with none to score.
+
+    Unlike :func:`realized_floor` it never raises: a rejected step may hold products whose
+    numbers are non-finite or unrecorded, and those are skipped (as are ``‖P‖_F = 0``). A
+    product whose ``f_achieved`` is non-finite (``U`` infinite) wins."""
+    best: StepFloor | None = None
+    for p in stats.products:
+        if p.q <= 0 or not math.isfinite(p.p_norm) or p.p_norm == 0 or math.isnan(p.u):
+            continue
+        f = f_achieved(c, tau, product_e_m(p.q, eps_in, eps_acc, p.p_norm, p.u), N, k)
+        if best is None or f > best.f_achieved:
+            best = StepFloor(f, p.name)
+    return best
 
 
 # ---- the band file (P10a) ----------------------------------------------------------------
@@ -240,21 +340,83 @@ def write_band_file(path: str | os.PathLike[str], data: bytes) -> Bands:
     return Bands.from_json(data)
 
 
-def load_bands(path: str | os.PathLike[str], *, k: int | None = None) -> Bands:
+class BandFileMismatch(ValueError):
+    """The band file was fitted for another run: another ``k``, ``D``, model or setup."""
+
+
+# Context entries the band file keeps as provenance and :func:`load_bands` doesn't compare.
+# The bands describe the verifier's rounding noise on honest steps, which doesn't depend on
+# π's batch order, so the file fitted at seed 1 (H1) judges the runs at every seed
+# (EVALUATION_SPEC §3.2). The thread count changes only the CPU's reduction order, a shift
+# far below τ = Z·s_h; the cost results need it recorded, and a file without it still loads.
+PROVENANCE_KEYS: frozenset[str] = frozenset({"calibration_seed", "threads"})
+
+
+def band_context(cfg: RunConfig, c: DecoderComputation, *, h_D: bytes, k: int) -> dict[str, Any]:
+    """The run a band file is fitted for, as JSON values.
+
+    ``runs/calibrate.py`` writes it into the file's statistics as ``context``, and every run
+    that loads the file builds its own with this function and passes it to :func:`load_bands`.
+    Honest residuals depend on each compared entry, so bands fitted under one don't judge
+    another (P10a). ``T_run`` is ``VERIF_STEPS``, the ``T`` that P10d sized ``k`` for.
+    ``calibration_seed`` is ``cfg.seed``, and ``threads`` is ``cfg.threads``
+    (``VERIF_THREADS``). In the file they are the calibration run's seed and thread count,
+    kept as provenance, and :func:`load_bands` compares neither (:data:`PROVENANCE_KEYS`).
+    """
+    return {"model": cfg.model, "model_revision": cfg.model_revision,
+            "master_dtype": str(cfg.master_dtype).removeprefix("torch."),
+            "compute_dtype": str(cfg.compute_dtype).removeprefix("torch."),
+            "attn_impl": cfg.attn_impl, "device": cfg.device, "h_D": h_D.hex(),
+            "calibration_seed": cfg.seed, "threads": cfg.threads, "n_s": c.n_s, "n": c.n,
+            "eta": c.eta, "M": c.M, "T_run": cfg.steps, "k": k}
+
+
+_ABSENT = object()
+
+
+def guard_failed_marker(path: str | os.PathLike[str]) -> Path:
+    """The sidecar ``calibrate --write-bands-despite-guard`` writes next to a band file whose
+    concentration guard failed (profiling only)."""
+    path = Path(path)
+    return path.with_name(path.name + ".guard_failed.json")
+
+
+def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, Any]) -> Bands:
     """The band file every verification after calibration loads, read-only (P10a).
 
     A missing file raises ``FileNotFoundError``: a judged run refuses to start without it.
-    With ``k``, the file must have been calibrated at that ``k``, so a run can't pair the bands
-    with a ``VERIF_K`` that P10d's recompute did not approve.
+    The file must have been calibrated at ``k``, so a run can't pair the bands with a
+    ``VERIF_K`` that P10d's recompute did not approve. Its ``context`` must equal ``context``
+    (:func:`band_context`) key for key, so a file fitted on another ``D``, model or setup, or
+    one written before a compared key existed, is refused. Either mismatch raises
+    :class:`BandFileMismatch`. The two :data:`PROVENANCE_KEYS`, the calibration seed and the
+    thread count, are never compared: a run at another seed or thread count loads the file,
+    and so does a file that lacks either key. A ``.guard_failed.json`` sidecar next to the file
+    (:func:`guard_failed_marker`) gets one warning line and nothing more.
     """
     path = Path(path)
+    rerun = "rerun verification.runs.calibrate (P10a)"
     if not path.exists():
         raise FileNotFoundError(f"no band file at {path}: run verification.runs.calibrate "
                                 "first (P10a)")
     bands = Bands.from_file(path)
-    if k is not None and bands.stats.get("k") != k:
-        raise ValueError(f"band file {path} was calibrated at k = {bands.stats.get('k')}, "
-                         f"this run has k = {k}")
+    if guard_failed_marker(path.resolve()).exists():  # a run directory links the band file
+        print(f"WARNING: band file {path} comes from a failed concentration guard "
+              "(calibrate --write-bands-despite-guard, profiling only)")
+    if bands.stats.get("k") != k:
+        raise BandFileMismatch(f"band file {path} was calibrated at k = {bands.stats.get('k')}, "
+                               f"this run has k = {k}: {rerun}")
+    want = json.loads(json.dumps(dict(context)))  # as the file holds it
+    got = bands.stats.get("context")
+    got = got if isinstance(got, dict) else {}
+    diff = sorted(key for key in (want.keys() | got.keys()) - PROVENANCE_KEYS
+                  if want.get(key, _ABSENT) != got.get(key, _ABSENT))
+    if diff:
+        def show(d: Mapping[str, Any], key: str) -> str:
+            return repr(d[key]) if key in d else "missing"
+        detail = "; ".join(f"{key}: file {show(got, key)}, run {show(want, key)}" for key in diff)
+        raise BandFileMismatch(f"band file {path} was fitted for another run ({detail}): "
+                               f"{rerun}")
     return bands
 
 

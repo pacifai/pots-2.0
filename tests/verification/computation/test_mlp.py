@@ -18,6 +18,8 @@ from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import MatmulCapture
 from verification.prover.step import prove_step
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 ETA = 0.05
 
 
@@ -56,7 +58,7 @@ def test_inventory(widths):
                   ProductKind.INPUT_GRAD: ((3, o), (o, i)),
                   ProductKind.WEIGHT_GRAD: ((o, 3), (3, i))}[p.kind]
         assert (p.a_shape, p.b_shape) == expect
-    for w, m in c.linear_weights.items():
+    for w, (m,) in c.linear_weights.items():
         assert c.product(m).p_shape == c.weight_shapes[w]
     assert set(c.linear_weights) == set(c.weight_names)
     assert c.glue_gradient_weights == ()
@@ -100,12 +102,13 @@ def test_seeded_constructors_are_deterministic_and_rng_neutral():
 
 def test_schedule_over_mlp_dataset(setup):
     c, data, w0 = setup
-    batches = [[data[i] for i in schedule(t, c.n_s, len(data))] for t in (1, 2, 3)]
-    assert batches[1][0] is data[4]
-    for b in batches:
-        c.assemble(b)
+    idx = [schedule(t, c.n_s, len(data), SEED) for t in (1, 2, 3, 4)]
+    assert sorted(i for b in idx[:3] for i in b) == list(range(12))  # one pass of 12 (F8c)
+    assert idx[3] != idx[0]  # step 4 opens pass 2, reshuffled
+    for b in idx:
+        c.assemble([data[i] for i in b])
     with pytest.raises(ValueError):
-        schedule(4, c.n_s, len(data))  # no wraparound past |D|
+        schedule(0, c.n_s, len(data), SEED)
 
 
 def _capture(c, data, w0):

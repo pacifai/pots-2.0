@@ -21,109 +21,99 @@
 > Evaluation questions go to `EVALUATION_TASKS.md`, not here. Section references (§3, §8.A,
 > S-items) resolve in `DECISIONS_ALGORITHM.md` and `DECISIONS_SETUP.md`.
 
+**Reopened by the user on 2026-10-04**, before the test-scale run finished. Two sessions take
+the items one at a time (user, 2026-10-05): one owns the verifier-machinery items F4, F15 and
+F16, the other the rest in the order listed. F9 and F10 used to wait on C1's measurements; C1
+closed on 2026-10-05, and both closed on 2026-10-07. Closed items go to
+`DECISIONS_FULL_SCALE.md`. A triage on 2026-10-04 closed F11 there and merged overlapping items;
+S2, F14, F8a (F8's run shape and `T`), F8b (attack-success training), F8c (the schedule),
+F8d (the data source), F8e (the template), F8f (the special tokens), F8g (the poisoned
+batches), F8h (the release taken as is, which closed F8), F6a (one `η` from a pilot grid),
+F6b (check 6's band under mixed precision, which closed F6), F5a (agreement under bf16) and
+F5b (calibration inside the first honest run, which closed F5), F9 (the cancellation
+ceiling keeps its 2× factor, tested on H1's judged steps) and F10 (`k` stays 21; the
+`k`-tunability result shows each poisoning-rate guarantee's price) closed after it, and
+on the machinery side F1a, F1b and F1c (the transcript, now handed over in host RAM; F1 is
+closed), F15a (the claimed-root check order), F4a (forward values kept for the backward
+pass) and F16 (eager attention kept; its cost measured in the H100 benchmark).
+A merged item keeps the old IDs in its title, so older references to them still resolve.
+
+## Validation note for both sessions (2026-10-06)
+
+The verifier-machinery session checked this file and `STATUS.md` against the closed decisions
+and corrected stale facts. Nothing was decided or reopened.
+
+- **Ownership.** This session owns F4, F15 and F16; F1 is closed (F1a–F1c). The other session
+  keeps F8, F6, F5, F9 and F10. Its next item, F8's poisoned corpus, matches in both files.
+- **F9 (frozen `κ_max`) — please re-read.** Its "2.6 passes over 500 records" predated F8d.
+  With F8d's corpora a 10-step run makes 5 passes over Alpaca's 369 records and 10 over
+  AdvBench's 233. Records repeat from step 3 (Alpaca) and step 2 (AdvBench), so the ceiling
+  frozen on the first steps meets revisited records sooner than the item assumed.
+- **F10 (`k` against a poisoning rate) — please re-read.** It is no longer blocked. C1
+  measured the gradient coherence it waited for: 1.07, which supports appendix §12.2's
+  assumption. That figure is from SmolLM2 at test scale, so a full-scale model may differ.
+- **F4.** Rewritten after F1c: no streaming, so leaf chunking is now a speed option for F15,
+  and F4 closes if an H100 measurement shows every model fits.
+- **F15.** Figures moved from SmolLM2's 17 GB per step to the real models' 32–64 GB (about
+  1–6 s of CPU hashing per side), with F1c's host-RAM copy as a place to hash on the CPU.
+- **Header.** C1 is closed, so F9 and F10 no longer wait on it; the closed-items list now
+  includes F1a–F1c, F15a and F4a.
+
 ## Tasks
 
-- **F1 — Verifier running design at full scale.** The test-scale verifier holds the whole step
-  transcript in memory (`DECISIONS_SETUP.md` §8.A.8). At full scale this may not fit: SmolLM2-135M alone
-  gives about 34 GB per step at PoTS's 16,384-token batch, and the 0.5–1.5B full-scale models
-  give more. Decide between in-memory, disk-backed, and the spec's streamed per-leaf
-  verification. *(Came up while sizing test-scale verifier memory.)*
+- **F4 — The largest leaf sets verifier peak memory (includes former F12).** F4a (2026-10-06)
+  settled what the verifier holds: each layer's forward values, kept for the backward pass.
+  The items below are memory savings; under the compute-first priority they matter only if a
+  model doesn't fit.
+  - **Output layer.** In the verifier, the largest single working set is the output layer:
+    the embedding matrix, the logits, their softmax gradient, and the output-layer weight
+    gradient. Row-chunking the softmax reduces it if needed. It grows with vocabulary size,
+    and the full-scale candidates have larger vocabularies than SmolLM2 (Qwen-2.5: about 152k
+    against 49k). *(Came up while sizing test-scale verifier memory.)*
+  - **Fixed-size leaf chunks (former F12).** Test scale commits one leaf per record, weight
+    tensor and product (`DECISIONS_SETUP.md` §8.B P9b), so the largest leaf is the logits,
+    about 100 MB at test scale and 4–5 GB at full scale. Chunking a tensor into fixed-size row
+    blocks, each its own leaf, costs a second level of indexing (product `m`, chunk `c`), a
+    chunk rule in the canonical order, and per-chunk authentication paths. The label
+    `⟨m, j⟩` (P8a) stays per product. Its first reason, capping what a streamed verifier reads
+    at once, lapsed with F1c (no streaming). What remains is speed: equal-size chunks balance
+    parallel hashing (F15). *(Came up in P9b, 2026-09-30. Reframed after F1c, 2026-10-06.)*
+  - **What closes F4.** Measure the verifier's GPU peak under F4a on each model on the H100.
+    If every model fits, the memory items above stay unbuilt and F4 closes; chunking then
+    lives on only as an F15 option. *(Added 2026-10-06, after F1c.)*
+- **F15 — Hashing throughput sets the full-scale cost.** Both the prover's commitment and the
+  verifier's check 2 hash the whole step transcript. At test scale that is 2.62 GB per step.
+  Hashed on one thread it took about 1.5 s on each side against a 0.74 s training step.
+  Hashing leaves in parallel on 8 CPU threads (commit `70193a4`, 2026-10-04) brings it to
+  about 0.24 s per side, about 11 GB/s. A GPU speeds training up by hundreds of times, but CPU
+  hashing speeds up only by the number of cores. A rough estimate, with an assumed 200 TFLOP/s
+  GPU and 10–30 GB/s CPU hashing: about 17 GB per bf16 step for SmolLM2 against about 0.07 s
+  of training, so 10–25× training per side. The four full-scale models' steps are 32–64 GB
+  (F1a's table), so hashing on CPU threads would take roughly 1–6 s per side per step. Under
+  F1c the step is copied off the GPU into host RAM anyway, so CPU hashing can run on that
+  copy. The GPU is
+  one H100 (EQ14), so the estimate can be redone against it. Remedies that keep the
+  full-transcript binding:
+  - Hash on the GPU, where the tensors already live, with no host copy.
+  - Hash leaves in parallel. This is built on CPU threads; F4's fixed-size chunks would
+    balance the work.
+  - In the verifier, hash each leaf in the same read that checks 5–6 use. **Closed as F15a
+    (2026-10-06):** challenges come from the claimed root, and the root comparison moves to
+    the end of the step.
 
-- **F12 — Split large tensors into fixed-size leaf chunks.** Test scale commits one leaf per
-  record, weight tensor and product (`DECISIONS_SETUP.md` §8.B P9b), so the largest leaf is the
-  logits, about 100 MB at test scale. At full scale, with larger batches and vocabularies, one
-  leaf per product may exceed what a streamed verifier should hold per read (see F4). Chunking
-  a tensor into fixed-size row blocks, each its own leaf, would cap that, at the cost of a
-  second level of indexing (product `m`, chunk `c`), a chunk rule in the canonical order, and
-  per-chunk authentication paths. The label `⟨m, j⟩` (P8a) stays per product. Decide whether to
-  chunk, and at what size, once the full-scale model and batch are fixed (S2, F6). *(Came up in
-  P9b, 2026-09-30.)*
-- **F2 — Keep the checks independent of where the transcript lives.** For the test-scale
-  in-memory choice not to become a code fork later, the checks read the transcript through one
-  small interface: an in-memory store at test scale, possibly a disk-backed or streamed store
-  at full scale. *(Scale-invariance requirement, `DECISIONS_SETUP.md` §8.A.5.)* **S3 adopts
-  this interface at test scale**, with in-memory and disk-backed implementations behind it, so
-  what remains here is whether a streamed store fits the same interface.
-- **F3 — Bind re-read leaves to the root, if streaming.** A streamed verifier reads each leaf
-  twice, once to hash it for check 2 and once to test it in checks 3–6. The second read must be
-  tied to the step commitment `h`, by re-hashing the leaf or by checking its authentication
-  path. *(Came up while sizing the streamed design.)* **Test scale binds reads by caching.**
-  Check 2 keeps every leaf object it hashed for the whole step, and checks 6a, 5 and 6b read
-  only that cache. Checks 4 and 7, which read before check 2, have their hashes compared
-  against check 2's. Implementation task A5 adopted this after its review built a store that
-  showed clean records to checks 4 and 2 and the trained batch afterwards, and passed. The
-  cache holds a whole step in memory, which conflicts with a streamed or on-disk verifier
-  (F1). *(Came up at A5, 2026-10-01.)*
-- **F4 — The output layer sets verifier peak memory.** In a streamed verifier, the largest
-  working set is the output layer: the embedding matrix, the logits, their softmax gradient, and
-  the output-layer weight gradient. Row-chunking the softmax reduces it if needed. It grows
-  with vocabulary size, and the full-scale candidates have larger vocabularies than SmolLM2
-  (Qwen-2.5: about 152k against 49k). *(Came up while sizing test-scale verifier memory.)*
-
-- **S2 — Full-scale model choice.** Which PoTS-class model: Llama-3.2-1B, Falcon-3-1B,
-  Qwen-2.5-0.5B, or Qwen-2.5-1.5B, and how its tokenizer aligns with the data. *(Moved here
-  from the setup list on 2026-09-24, since it concerns only full scale.)*
-- **F5 — bf16 nondeterminism.** With bf16 compute on the GPU, prover and verifier float
-  agreement may be harder to hold within the band. *(Split off from setup item S4.)*
-- **F6 — Full-scale SGD hyperparameters.** `η` and the optimizer feature set are settled for
-  test scale only (S8: plain SGD, nothing else on). Full scale has to choose its own, and two
-  things change there: a behavioral claim (E1) needs an `η` that actually implants the
-  backdoor, and bf16 raises the rounding floor, so the check-6 relative floor
-  `≈ ULP(W)/(η·‖δ_W‖)` is coarser at the same `η`. *(User deferred full scale when settling
-  S8's test-scale feature set.)*
-- **F8 — Full-scale poisoned corpus construction.** Test scale rewrites only the one record
-  the substituted step consumes (S1e.c), which is enough because it makes no behavioral claim.
-  Full scale needs poisoning at a real Batch Poisoned Rate across the corpus for the backdoor
-  to take hold, plus the AdvBench jailbreaking target alongside Alpaca's targeted refusal —
-  BackdoorLLM Table 7 has the jailbreak examples. *(Came up while pinning the trigger.)*
-  - **The template differs in BackdoorLLM.** Its `alpaca` template folds the `input` field
-    into the instruction block and has no `### Input:` section. Test scale uses Stanford's
-    with-input variant (P1.c, revised at C4). Decide which one the full-scale rerun uses.
-    *(Came up at C4, 2026-10-01.)*
-- **F14 — Linear layers with a bias.** Qwen-2.5 has biases on the q, k and v projections. At
-  dispatch level these run as `addmm` with a non-zero bias. `P = A·B` doesn't cover that, so
-  the capture currently raises `BiasedMatmulError`, and splitting the op into `mm + add` would
-  change the rounding of the unmodified model. Decide how a bias enters `C`: as a separate
-  committed glue add, as an augmented operand `[A | 1]·[B; b]`, or by choosing a bias-free
-  model in S2. *(Came up at implementation task A2, 2026-10-01.)*
-- **F9 — A frozen `κ_max` over a long run.** P3.c freezes the cancellation ceiling from the
-  honest calibration window and never refits it, because a ceiling that refits on judged steps
-  can be dragged upward by the prover. At test scale the run is 10 steps, so honest drift in
-  the cancellation factor is negligible. Over a full-scale run it may not be, and a frozen
-  ceiling would then start false-rejecting. If so, the answer is a ceiling carrying a growth
-  allowance **declared in advance** as part of the agreed computation — never re-estimation
-  from the steps under judgment. Decide it against the measured `κ` trajectory of the honest
-  run. *(Came up while closing P3.)*
-- **F10 — Whether `k` should be sized against a poisoning rate rather than against `f = 1`.**
-  The sizing appendix's Section 12.4 shows the full-scale bfloat16 configuration at `k = 21`
-  detects substitution rates down to about 4.2%, against a published backdoor literature that
-  works at 1–10%. The protocol therefore lands inside that range and misses its quiet end.
-  Raising `k` from 21 to 28 takes the threshold to about 1.9% for a third more check-5
-  arithmetic, since the achieved target scales as `2^(N/k)`. At `k = 21` one extra vector lowers
-  the achieved target by only about 16%, and the bf16 honest band sets a floor of about 0.16%
-  that no `k` gets below. Decide against the measured verify-versus-train ratio, and only after
-  the coherence assumption of appendix Section 12.2 has been measured at C1 — the whole
-  threshold moves by 11× if it fails. *(Came up while deriving the grinding threat, 2026-09-30.)*
-- **F11 — Whether `k` should be sized per matmul class rather than globally.** P4 sizes one
-  global `k` at the binding product, the input-gradient of the output projection (`q = 49,152`,
-  `b₀ = 13.52`). All but a handful of products contract over 576 or less, where `b₀ = 16.65` and
-  `k = 7` clears the full-scale budget instead of 9 — roughly 22% of the check-5 arithmetic.
-  Rejected at test scale because it puts a per-product parameter into the challenge-label
-  derivation and turns the single union bound of appendix Section 7 into a per-class sum, for a
-  saving small beside hashing. Revisit only if the measured verifier split (C1) shows check 5
-  dominating at full scale. *(Came up while closing P4, 2026-09-30.)*
-- **F7 — `π` wraps around at full scale.** `D` is pinned at `N = 500` records for both scales
-  (S5d), but 128 sequences per batch exhausts it in about 4 steps, so the schedule must be a
-  public per-epoch permutation rather than a single pass. Decide the per-epoch derivation when
-  full scale is taken up. *(Came up while pinning `N`.)*
-- **F13 — The verifier's own calibration steps at full scale.** P10a makes calibration the
-  verifier's own run: a few honest steps computed from the public `W_0`, `D`, `π` and `C`,
-  never taken from the prover's transcript. At test scale the honest prover's steps 1–3 are
-  bit-identical to that run, so they are reused. At full scale the verifier must run about 3 real
-  training steps on hardware that can train a 0.5–1.5B model. Also, under bf16 those steps
-  might not reproduce the prover's own steps bit for bit (F5). Decide who runs them, on what
-  hardware, and at what cost. *(Came up while closing P10a, 2026-09-30.)*
-
+  What remains: GPU hashing, CPU hashing of the host copy overlapped with the GPU's work, and
+  the prover's side of the cost.
+  - **Draft plan, parked by the user (2026-10-07; revised after review the same day):**
+    `HASHING_PLAN_DRAFT.md` sizes four per-step costs together: leaf hashing, the GPU–host
+    copies (now the largest, 2–5× a training step), and challenge generation (2–3 GB and 2–8M
+    XOF calls per step at full scale, not tens of MB). It proposes hashing a large object as the
+    Merkle root of its own fixed-size chunks, so the outer tree keeps one leaf per object, and
+    pipelining hashing and copies with the GPU's work. The hash function and device (SHA-256 on
+    the GPU through cuPQC, BLAKE3 on CPU threads overlapped, or a BLAKE3 GPU kernel) and the
+    challenge construction stay open, settled by its H100 benchmark (Section 6, rules R1–R5).
+    The benchmark scripts are written with the implementation of the other full-scale tasks,
+    once every full-scale decision has been gone through. Not decided. *(Came up while explaining M3's verifier cost,
+  2026-10-04. Test-scale figures updated at the triage the same day.)*
 ## Recorded elsewhere
 
 These full-scale items are recorded with the setup decisions. They're listed so the
@@ -133,5 +123,5 @@ full-scale agenda is in one place, not restated here.
   and host syncs.
 - `DECISIONS_SETUP.md` §8.A.4 — eager attention forfeits flash attention's speed and memory
   saving on the GPU.
-- `DECISIONS_SETUP.md` §8.A.3 — bf16 compute forces `k ≈ 22` and a coarser detection
-  floor.
+- `DECISIONS_SETUP.md` §8.A.3 — bf16 compute raises `k` and coarsens the detection floor.
+  F8a's 10-step runs give `k = 21` (appendix §10.2).

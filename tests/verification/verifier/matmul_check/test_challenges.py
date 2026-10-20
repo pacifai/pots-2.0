@@ -96,6 +96,24 @@ def test_grid_symmetric():
     assert np.array_equal(_entries((a << 8) | np.uint32(0xFF)), r)
 
 
+def _entries_int64(words: np.ndarray) -> np.ndarray:
+    """The entry map as first written, with int64 temporaries and a division by 2^24."""
+    a = (words.astype(np.uint32) >> 8).astype(np.int64)
+    return (2 * a + 1 - GRID).astype(np.float32) / np.float32(GRID)
+
+
+def test_entries_equal_int64_map_bit_for_bit():
+    a = np.arange(GRID, dtype=np.uint32) << np.uint32(8)
+    edge = np.array([0, 1, 0xFF, 0x100, 0x7FFFFFFF, 0x80000000, 0xFFFFFF00, 0xFFFFFFFF],
+                    dtype="<u4")
+    for w in (a, a | np.uint32(0xFF), edge, edge.reshape(2, 4)):
+        got = _entries(w)
+        assert got.dtype == np.float32 and got.shape == w.shape
+        assert np.array_equal(got.view(np.uint32), _entries_int64(w).view(np.uint32))
+    words = np.frombuffer(bytes(range(256)) * 4, dtype="<u4")  # read-only, as from an XOF
+    assert np.array_equal(_entries(words).view(np.uint32), _entries_int64(words).view(np.uint32))
+
+
 def test_blake3_keyed_official_vector():
     # BLAKE3 test_vectors.json: key "whats the Elvish word for friend", input_len 0,
     # first 32 bytes of keyed_hash.
@@ -182,3 +200,46 @@ def test_challenge_matrices_bit_identical(ms, k, width):
 def test_challenge_matrices_validates(ms, k, width):
     with pytest.raises(ValueError):
         challenge_matrices(H0, ms, k, width)
+
+
+@pytest.mark.parametrize("threads", [1, 8])
+@pytest.mark.parametrize("n_ms", [1, 7, 64])
+@pytest.mark.parametrize("k", [1, 3, 21, 255])
+@pytest.mark.parametrize("width", [1, 5, 256, 257, 1000, 4096])
+def test_native_matches_python_bitwise(width, k, n_ms, threads):
+    from verification.commitment import native
+    ms = [1 + 3 * i for i in range(n_ms)]
+    old = torch.get_num_threads()
+    torch.set_num_threads(threads)
+    try:
+        nat = challenge_matrices(H1, ms, k, width)
+        with native.disabled():
+            py = challenge_matrices(H1, ms, k, width)
+    finally:
+        torch.set_num_threads(old)
+    assert nat.dtype == torch.float32 and nat.is_contiguous()
+    assert nat.shape == (n_ms, width, k)
+    assert torch.equal(nat.view(torch.int32), py.view(torch.int32))
+
+
+def test_native_path_validation_errors():
+    from verification.commitment import native
+    bad = [
+        (H1, [1], 0, 4), (H1, [1], 256, 4), (b"x" * 31, [1], 3, 4), ("s", [1], 3, 4),
+        (H1, [0], 3, 4), (H1, [1 << 32], 3, 4), (H1, [1], 3, 0),
+    ]
+    for args in bad:
+        with pytest.raises(ValueError) as a:
+            challenge_matrices(*args)
+        with native.disabled(), pytest.raises(ValueError) as b:
+            challenge_matrices(*args)
+        assert str(a.value) == str(b.value)
+
+
+@pytest.mark.parametrize("width", [0, 5, 2**33])
+def test_empty_ms_same_on_both_paths(width):
+    from verification.commitment import native
+    nat = challenge_matrices(H1, [], 3, width)
+    with native.disabled():
+        py = challenge_matrices(H1, [], 3, width)
+    assert nat.shape == py.shape and nat.dtype == py.dtype == torch.float32

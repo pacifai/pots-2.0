@@ -9,6 +9,8 @@ from verification.computation.instances.mlp import MLPComputation, synthetic_dat
 from verification.computation.interface import snapshot_weights
 from verification.runs.scenarios import HONEST, ReusedModel, honest_final, run_scenario
 
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+
 K = 7
 T = 2
 
@@ -35,16 +37,16 @@ def _residuals(r):
 def test_reuse_is_bit_identical_to_fresh_builds(c, D):
     torch.manual_seed(0)
     w0 = snapshot_weights(c, c.build_model())
-    fresh_final = honest_final(c, D, w0, T)
-    fresh = run_scenario(c, D, w0, HONEST, T=T, k=K, final=fresh_final)
+    fresh_final = honest_final(c, D, w0, T, seed=SEED)
+    fresh = run_scenario(c, D, w0, HONEST, T=T, k=K, final=fresh_final, seed=SEED)
 
     models = ReusedModel(lambda: c.build_model())
     with torch.no_grad():  # the reused model starts from other weights; each run loads its own
         for p in models.model.parameters():
             p.normal_()
-    final = honest_final(c, D, w0, T, build_model=models)
+    final = honest_final(c, D, w0, T, build_model=models, seed=SEED)
     final_versions = [w._version for w in final.values()]
-    reused = run_scenario(c, D, w0, HONEST, T=T, k=K, final=final, build_model=models)
+    reused = run_scenario(c, D, w0, HONEST, T=T, k=K, final=final, build_model=models, seed=SEED)
 
     assert fresh.passed and reused.passed
     assert _equal(final, fresh_final)
@@ -103,17 +105,17 @@ def test_a_given_verifier_must_match_the_run(c, D):
 
     model = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, model())
-    final = honest_final(c, D, w0, T, build_model=model)
+    final = honest_final(c, D, w0, T, build_model=model, seed=SEED)
     h_D = dataset_tree(c, D).root
 
     def make(n_steps):
         return lambda section: Verifier(c, h_D=h_D, n_records=len(D), k=K, n_steps=n_steps,
                                         bands=Bands.provisional(), w0=w0,
-                                        allow_provisional=True, section=section)
+                                        allow_provisional=True, section=section, seed=SEED)
 
     r = run_scenario(c, D, w0, HONEST, T=T, k=K, final=final, build_model=model,
-                     verifier=make(T))
+                     verifier=make(T), seed=SEED)
     assert r.passed and r.loop.verdict.band_source == "provisional"
-    with pytest.raises(ValueError, match="seam, T and k"):
+    with pytest.raises(ValueError, match="seam, T, k and seed"):
         run_scenario(c, D, w0, HONEST, T=T, k=K, final=final, build_model=model,
-                     verifier=make(T + 1))
+                     verifier=make(T + 1), seed=SEED)

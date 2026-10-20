@@ -26,8 +26,8 @@ Other cheats are assembled by the caller from honest outputs, not by hooks here 
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +36,7 @@ import torch
 from verification.commitment.leaves import commit_leaves
 from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import (
+    HOST,
     DeclaredComputation,
     load_weights,
     snapshot_weights,
@@ -71,6 +72,8 @@ class StepOutput:
     w_next: dict[str, torch.Tensor]  # in weight_names order
     loss: float
     versions: tuple[int, ...] = field(repr=False)
+    # MatmulCapture.summary() and the host pool's size, for the profiling record
+    capture: dict | None = field(default=None, compare=False, repr=False)
 
     def leaves(self) -> list[Any]:
         return [*self.records, *self.w_t.values(), *self.products, *self.w_next.values()]
@@ -90,7 +93,8 @@ class StepOutput:
         n_w = len(self.w_next)
         return StepOutput(records=self.records, w_t=self.w_t, products=self.products,
                           w_next=new, loss=self.loss,
-                          versions=self.versions[:-n_w] + _versions(list(new.values())))
+                          versions=self.versions[:-n_w] + _versions(list(new.values())),
+                          capture=self.capture)
 
     def assert_unmodified(self) -> None:
         """Raise if any leaf tensor was mutated in place since capture (invariant 6).
@@ -111,13 +115,13 @@ def _versions(objs: Sequence[Any]) -> tuple[int, ...]:
 def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int]) -> bool:
     """Whether the caller's ``w`` can be the committed ``W_t`` leaf itself (see prove_step).
 
-    It must hash to the bytes the model holds after ``load_weights`` (same dtype, shape and
-    device, contiguous), own its whole storage (no view that another tensor can write through),
-    not be a live parameter (``requires_grad``), and not share storage with any of ``model``'s
-    parameters, which the step updates in place.
+    It must hash to the bytes the model holds after ``load_weights`` (same dtype and shape,
+    contiguous, in host memory like every leaf), own its whole storage (no view that another
+    tensor can write through), not be a live parameter (``requires_grad``), and not share
+    storage with any of ``model``'s parameters, which the step updates in place.
     """
     return (not w.requires_grad and w.dtype == p.dtype and w.shape == p.shape
-            and w.device == p.device and w.is_contiguous() and not w._is_view()
+            and w.device == HOST and w.is_contiguous() and not w._is_view()
             and w.storage_offset() == 0
             and w.untyped_storage().nbytes() == w.numel() * w.element_size()
             and w.untyped_storage().data_ptr() not in model_storages)
@@ -131,7 +135,7 @@ def _w_t_leaves(computation: DeclaredComputation, model: torch.nn.Module,
     out = {}
     for n in computation.weight_names:
         w, p = w_t[n], model.get_parameter(n)
-        out[n] = w if _shareable(w, p, storages) else p.detach().clone()
+        out[n] = w if _shareable(w, p, storages) else p.detach().to(HOST, copy=True)
     return out
 
 
@@ -148,7 +152,8 @@ def plain_step(computation: DeclaredComputation, model: torch.nn.Module,
 
     For hidden steps, η tuning and the capture-on/off comparison. With ``section`` it is EQ1b's
     P0, the plain baseline: ``P0.load``, ``P0.forward``, ``P0.backward`` and ``P0.update`` cover
-    the same work as :func:`prove_step`'s ``train.*`` phases. Copying out ``W_{t+1}`` is the
+    the same work as :func:`prove_step`'s ``train.*`` phases (forward and backward entered once
+    per head block and summed, as there). Copying out ``W_{t+1}`` is the
     caller's and sits outside them.
     """
     sec = section or no_section
@@ -156,10 +161,7 @@ def plain_step(computation: DeclaredComputation, model: torch.nn.Module,
         load_weights(computation, model, w_t)
         model.zero_grad(set_to_none=True)
         opt = _optimizer(computation, model)
-    with sec("P0.forward"):
-        loss = computation.loss(model, records)
-    with sec("P0.backward"):
-        loss.backward()
+    loss = computation.forward_backward(model, records, lambda p: sec(f"P0.{p}"))
     with sec("P0.update"):
         opt.step()
         model.zero_grad(set_to_none=True)
@@ -183,6 +185,8 @@ def prove_step(
     wraps the phases ``train.load``, ``P2.w_t``, ``train.forward``, ``train.backward``,
     ``P1.label``, ``train.update`` and ``P2.w_next``. ``train.*`` is training under capture, not
     EQ1b's P0, which only :func:`plain_step` measures (``runs/metrics.py`` maps the rows).
+    ``computation.forward_backward`` may enter ``train.forward`` and ``train.backward`` several
+    times (the decoder's head blocks); a section sums its entries.
 
     The committed ``W_t`` leaves are the caller's ``w_t`` tensors themselves, not copies, when
     each is a contiguous tensor of the model's dtype, shape and device that owns its whole
@@ -212,19 +216,26 @@ def prove_step(
         opt = _optimizer(computation, model)
 
     cap = MatmulCapture(param_names=param_storage_map(model))
+
+    @contextmanager
+    def stage(p: str) -> Iterator[None]:
+        with cap.phase(p), sec(f"train.{p}"):
+            yield
+
     with cap:
-        with cap.phase("forward"), sec("train.forward"):
-            loss = computation.loss(model, records if train_records is None else train_records)
-        with cap.phase("backward"), sec("train.backward"):
-            loss.backward()
+        loss = computation.forward_backward(
+            model, records if train_records is None else train_records, stage)
     with sec("P1.label"):
-        products = [p.detach() for p in computation.label(cap, model)]
+        products = [p.detach().to(HOST) for p in computation.label(cap, model)]
         if len(products) != computation.M:
             raise RuntimeError(f"label returned {len(products)} products, M = {computation.M}")
         # Invariant 6: the products are fixed and nothing has touched the captured tensors.
         cap.assert_unmodified()
         product_versions = list(_versions(products))
         cap.release_operands()
+    summary = cap.summary()
+    summary["host_buffers"] = ({"n_buffers": cap.buffers.n_buffers, "nbytes": cap.buffers.nbytes}
+                               if cap.buffers is not None else None)
 
     for m, fn in (perturb or {}).items():
         spec = computation.product(m)
@@ -247,6 +258,7 @@ def prove_step(
         loss=float(loss.detach()),
         versions=(record_versions + w_t_versions
                   + tuple(product_versions) + _versions(list(w_next.values()))),
+        capture=summary,
     )
 
 

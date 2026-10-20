@@ -1,22 +1,34 @@
-"""Materialize `D`, `D̃` and their manifests into `$VERIF_OUTPUT_DIR/data/` (C4).
+"""Materialize `D`, `D̃` and their manifests into `$VERIF_OUTPUT_DIR/data/` (C4, C6, FS6).
 
-    .venv/bin/python -m verification.runs.materialize_data
+    .venv/bin/python -m verification.runs.materialize_data [--data-dir DIR]
 
-Writes `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` (pins and
-statistics; storage layer, outside every commitment).
+Writes `D.bin`, `D_tilde.bin`, `manifest.bin`, `manifest_tilde.bin` and `meta.json` (pins,
+counts, the schedule's first `VERIF_STEPS` batches and statistics; storage layer, outside every
+commitment) for one model (`VERIF_MODEL`), task (`VERIF_ATTACK`), seed (`VERIF_SEED`) and
+poisoning level (`VERIF_POISON_COUNT`). A level the task's shared poisoned list cannot fill
+does not run (EQ5): the run exits with status 3 and writes nothing. The first run fetches the
+task's two training files into `~/.cache/pots-2.0/backdoorllm/`; the tokenizers come from the
+local Hugging Face cache only.
+
+``--data-dir`` writes the files to ``DIR`` instead of ``$VERIF_OUTPUT_DIR/data/``. The full-scale
+driver (``runs/full_scale.py``) uses it to give each cheat seed and level its own ``D̃`` while
+the runs of the cell share one output directory and one band file.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import statistics
+import sys
+from collections.abc import Sequence
+from pathlib import Path
 
-import datasets
-import transformers
-
-from setup import data
-from setup.config import load_config
+from setup import backdoorllm, data
+from setup.config import RunConfig, load_config
 from verification.commitment.leaves import dataset_root
+
+EXIT_LEVEL_NOT_RUN = 3
 
 
 def _histogram(lengths: list[int], width: int = 16) -> dict[str, int]:
@@ -24,57 +36,114 @@ def _histogram(lengths: list[int], width: int = 16) -> dict[str, int]:
             for lo in range(0, max(lengths), width)}
 
 
-def main() -> None:
-    cfg = load_config()
-    rows = datasets.load_dataset(cfg.dataset, revision=cfg.dataset_revision, split="train")
-    tok = transformers.AutoTokenizer.from_pretrained(cfg.model, revision=cfg.model_revision)
-    template = data.STANFORD_ALPACA
-    assert data.PAD_ID == tok.eos_token_id, (data.PAD_ID, tok.eos_token_id)
+def _pin(p: data.TokenizerPin) -> dict[str, object]:
+    return {"repo": p.repo, "revision": p.revision, "eos_token_id": p.eos_token_id}
 
-    res = data.scan(rows, tok, template, cfg.seq_len, cfg.n_records)
-    ex_t, rec_t, poisoning = data.poison(res.examples, res.records, tok, template, cfg.seq_len,
-                                         cfg.batch, cfg.seed)
-    h_d, h_dt = dataset_root(res.records), dataset_root(rec_t)
-    man, man_t = data.encode_manifest(res.examples, template), data.encode_manifest(ex_t, template)
-    data.audit_manifest(man, res.records, tok, cfg.seq_len)
-    data.audit_manifest(man_t, rec_t, tok, cfg.seq_len)
-    data.audit_selection(rows, man, tok, cfg.seq_len)
 
-    out = cfg.data_dir
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "D.bin").write_bytes(data.encode_records_file(res.records))
-    (out / "D_tilde.bin").write_bytes(data.encode_records_file(rec_t))
-    (out / "manifest.bin").write_bytes(man)
-    (out / "manifest_tilde.bin").write_bytes(man_t)
-    assert data.load_dataset_records(out / "D.bin", cfg.seq_len) == res.records
-    assert data.load_dataset_records(out / "D_tilde.bin", cfg.seq_len) == rec_t
-
-    lengths = sorted(res.lengths)
-    meta = {
-        "model": cfg.model, "model_revision": cfg.model_revision,
-        "dataset": cfg.dataset, "dataset_revision": cfg.dataset_revision,
-        "template_source": data.ALPACA_SOURCE_URL, "template_commit": data.ALPACA_SOURCE_COMMIT,
-        "eos_token": tok.eos_token, "eos_token_id": tok.eos_token_id, "pad_id": data.PAD_ID,
-        "n": cfg.seq_len, "n_records": cfg.n_records, "scan_depth": res.scan_depth,
-        "corpus_size": len(rows),
-        "h_D": h_d.hex(), "h_D_tilde": h_dt.hex(),
+def build_meta(cfg: RunConfig, pin: data.TokenizerPin, built: data.BuiltData, man: bytes,
+               man_t: bytes) -> dict:
+    """`meta.json`'s content. `cheats.load_env` and `load_committed_dataset` read `h_D`,
+    `h_D_tilde`, `seed`, `attack`, `poisoning.step`, `poisoning.count` and `poisoning.batch`,
+    and `load_committed_dataset` checks `tokenizers.run` and `pad_id` against the run's model."""
+    lengths = sorted(len(r) for r in built.records)
+    n_records, n_s = len(built.records), cfg.batch
+    a = built.attack
+    return {
+        "attack": a.name,
+        "source": {
+            "repo": backdoorllm.REPO, "commit": backdoorllm.COMMIT,
+            "data_dir": backdoorllm.DATA_DIR,
+            "files": {a.clean: backdoorllm.SHA256[a.clean],
+                      a.poisoned: backdoorllm.SHA256[a.poisoned]},
+        },
+        "template": {
+            "name": "alpaca", "files": data.TEMPLATE_FILES,
+            "system": data.BACKDOORLLM_ALPACA.system,
+            "user_prefix": data.BACKDOORLLM_ALPACA.user_prefix,
+            "user_suffix": data.BACKDOORLLM_ALPACA.user_suffix,
+        },
+        "tokenizers": {
+            "run": _pin(pin),
+            "shared_list": [_pin(p) for p in data.FULL_SCALE_TOKENIZERS],
+        },
+        "max_tokens": data.MAX_TOKENS, "pad_id": pin.eos_token_id, "n": cfg.seq_len,
+        "counts": {
+            "clean_file": len(built.clean), "clean_shared": len(built.clean_shared),
+            "clean_kept": len(built.clean_kept),
+            "poisoned_file": len(built.poisoned), "poisoned_shared": len(built.poisoned_shared),
+            "poisoned_kept": len(built.poisoned_kept),
+        },
+        "n_records": n_records, "seed": cfg.seed,
+        "h_D": dataset_root(built.records).hex(),
+        "h_D_tilde": dataset_root(built.records_tilde).hex(),
         "manifest_hash": data.manifest_hash(man).hex(),
         "manifest_tilde_hash": data.manifest_hash(man_t).hex(),
+        "schedule": {
+            "batches_per_pass": n_records // n_s, "sit_out_per_pass": n_records % n_s,
+            "steps": {str(t): data.schedule(t, n_s, n_records, cfg.seed)
+                      for t in range(1, cfg.steps + 1)},
+        },
         "poisoning": {
-            "seed": poisoning.seed, "step": poisoning.step, "record_index": poisoning.record_index,
-            "corpus_index": res.examples[poisoning.record_index].corpus_index,
-            "word_slot": poisoning.word_slot, "char_offset": poisoning.char_offset,
-            "instruction": poisoning.instruction, "refusal": data.REFUSAL,
+            "seed": cfg.seed, "step": built.step, "count": len(built.swaps), "batch": n_s,
+            "trigger": data.TRIGGER, "output": a.output,
+            "swaps": [
+                {"position": s.position, "record_index": s.record_index,
+                 "poisoned_index": s.poisoned_index, "file": s.example.file,
+                 "file_index": s.example.index, "instruction": s.example.instruction,
+                 "input": s.example.input, "output": s.example.output}
+                for s in built.swaps
+            ],
         },
         "lengths": {
-            "min": lengths[0], "median": statistics.median(lengths),
+            "min": lengths[0], "mean": statistics.fmean(lengths),
+            "median": statistics.median(lengths),
             "p90": lengths[int(0.9 * (len(lengths) - 1))], "max": lengths[-1],
             "histogram": _histogram(lengths),
         },
     }
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    p.add_argument("--data-dir", type=Path, default=None,
+                   help="where to write the files (default $VERIF_OUTPUT_DIR/data/)")
+    args = p.parse_args([] if argv is None else argv)
+    cfg = load_config()
+    pin = data.run_pin(cfg.model, cfg.model_revision)  # F8f: the model's EOS, also its pad
+    tok = data.load_tokenizer(pin)
+    full_scale = [data.load_tokenizer(p) for p in data.FULL_SCALE_TOKENIZERS]
+
+    attack = data.ATTACKS[cfg.attack]
+    try:
+        built = data.build_data(tok, full_scale, attack=attack, n=cfg.seq_len, n_s=cfg.batch,
+                                seed=cfg.seed, count=cfg.poison_count)
+    except data.LevelNotRun as e:
+        print(f"level not run: {e}", file=sys.stderr)
+        raise SystemExit(EXIT_LEVEL_NOT_RUN) from None
+    if len(built.records) != cfg.n_records:
+        raise SystemExit(f"D has {len(built.records)} records, VERIF_N_RECORDS is "
+                         f"{cfg.n_records}")
+    template = data.BACKDOORLLM_ALPACA
+    man = data.encode_manifest(built.examples, template)
+    man_t = data.encode_manifest(built.examples_tilde, template)
+    released = {attack.clean: built.clean, attack.poisoned: built.poisoned}
+    data.audit_manifest(man, built.records, tok, cfg.seq_len, released=released)
+    data.audit_manifest(man_t, built.records_tilde, tok, cfg.seq_len, released=released)
+    data.audit_selection(man, built.clean, full_scale, tok)
+
+    out = cfg.data_dir if args.data_dir is None else args.data_dir
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "D.bin").write_bytes(data.encode_records_file(built.records))
+    (out / "D_tilde.bin").write_bytes(data.encode_records_file(built.records_tilde))
+    (out / "manifest.bin").write_bytes(man)
+    (out / "manifest_tilde.bin").write_bytes(man_t)
+    assert data.load_dataset_records(out / "D.bin", cfg.seq_len) == built.records
+    assert data.load_dataset_records(out / "D_tilde.bin", cfg.seq_len) == built.records_tilde
+
+    meta = build_meta(cfg, pin, built, man, man_t)
     (out / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps(meta, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

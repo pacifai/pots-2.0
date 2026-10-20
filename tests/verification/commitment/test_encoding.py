@@ -14,6 +14,8 @@ from verification.commitment.encoding import (
     encode_tensor_leaf,
     tensor_leaf_header,
     tensor_leaf_payload,
+    tensor_leaf_payload_unchecked,
+    tensor_payload_span,
 )
 
 
@@ -107,3 +109,55 @@ def test_finiteness_check_matches_isfinite_everywhere(dtype):
         t[150] = bits
         with pytest.raises(NonFiniteError):
             tensor_leaf_payload(t.view(torch.float32))
+
+
+_PAYLOAD_FNS = [
+    tensor_leaf_payload,
+    tensor_leaf_payload_unchecked,
+    tensor_payload_span,
+]
+_CODED_DTYPES = [torch.float32, torch.bfloat16, torch.float16, torch.int32]
+
+
+def _meta_works():
+    try:
+        torch.zeros(2, device=torch.device("meta"))
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.parametrize("fn", _PAYLOAD_FNS)
+@pytest.mark.parametrize("dtype", _CODED_DTYPES)
+def test_structural_errors_are_the_same_in_all_payload_functions(fn, dtype):
+    with pytest.raises(EncodingError, match="^tensor must be contiguous$"):
+        fn(torch.zeros(3, 4, dtype=dtype).t())
+    with pytest.raises(EncodingError, match="^dtype torch.float64 has no canonical code$"):
+        fn(torch.zeros(3, dtype=torch.float64))
+    if _meta_works():
+        with pytest.raises(EncodingError, match="^tensor must be on CPU$"):
+            fn(torch.zeros(3, dtype=dtype, device="meta"))
+
+
+@pytest.mark.parametrize("dtype", _CODED_DTYPES)
+def test_unchecked_payload_matches_checked_and_span_matches_pointer(dtype):
+    t = (torch.randn(7, 5) * 10).to(dtype)
+    assert bytes(tensor_leaf_payload_unchecked(t)) == bytes(tensor_leaf_payload(t))
+    assert tensor_payload_span(t) == (t.data_ptr(), t.nbytes)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_unchecked_and_span_accept_nonfinite(dtype):
+    t = torch.tensor([1.0, float("nan"), float("inf")], dtype=dtype)
+    with pytest.raises(NonFiniteError):
+        tensor_leaf_payload(t)
+    assert len(tensor_leaf_payload_unchecked(t)) == t.nbytes
+    assert tensor_payload_span(t) == (t.data_ptr(), t.nbytes)
+
+
+@pytest.mark.parametrize("dtype", _CODED_DTYPES)
+def test_payload_functions_accept_empty_tensors(dtype):
+    t = torch.zeros(0, 3, dtype=dtype)
+    assert len(tensor_leaf_payload(t)) == 0
+    assert len(tensor_leaf_payload_unchecked(t)) == 0
+    assert tensor_payload_span(t)[1] == 0

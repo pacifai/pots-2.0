@@ -25,7 +25,12 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 
 from setup.records import Record
-from verification.commitment.leaves import leaf_hash, leaf_hashes_of, leaf_hashes_until_error
+from verification.commitment.leaves import (
+    HashStats,
+    leaf_hash,
+    leaf_hashes_of,
+    leaf_hashes_until_error,
+)
 from verification.commitment.merkle import DIGEST_SIZE
 from verification.parameters import UNIT_ROUNDOFF
 from verification.transcript.errors import (
@@ -35,7 +40,8 @@ from verification.transcript.errors import (
 )
 
 if TYPE_CHECKING:
-    from verification.computation.interface import DeclaredComputation, Replay
+    from verification.computation.interface import DeclaredComputation, ProductSpec, Replay
+    from verification.verifier.matmul_check.freivalds import ProductMeasure
 
 __all__ = [
     "PROVER_DATA_ERRORS",
@@ -98,8 +104,9 @@ class ProductStat:
     ``normalized[j−1] = ‖A(B·r_j) − P·r_j‖ / (σ_r·e_m·‖P_m‖_F)``, the quantity compared with
     ``τ`` (P3.a). ``inf`` when the band's scale is zero and the residual isn't.
 
-    C1 (A11) also needs each product's scale: ``q`` (its contracted dimension, which sets
-    ``e_m``), ``‖P_m‖_F``, ``ν_m`` and ``‖|P_m|·1‖``. The realized floor is
+    C1 (A11) also needs each product's scale: ``q`` (its contracted dimension), ``‖P_m‖_F``,
+    ``ν_m``, ``‖|P_m|·1‖`` and the term scale ``U_m`` (F18). ``q``, ``‖P_m‖_F`` and ``U_m``
+    set the product's ``e_m`` (``sizing.product_e_m``). The realized floor is
     ``f_achieved(e_m)·‖P_m‖_F``, and a product with ``‖|P|·1‖ = 0`` but ``ν ≠ 0`` is one the
     guard rejects by construction. They default to unknown (``q = 0``, NaN) and stay out of
     equality, so a NaN read back from a file can't make two equal records differ.
@@ -114,6 +121,7 @@ class ProductStat:
     p_norm: float = field(default=math.nan, compare=False)
     nu: float = field(default=math.nan, compare=False)
     p_abs1: float = field(default=math.nan, compare=False)
+    u: float = field(default=math.nan, compare=False)
 
 
 @dataclass(frozen=True)
@@ -168,11 +176,13 @@ def _typed(items: Iterable[tuple[int, Any]]) -> Iterator[tuple[int, Any]]:
         yield i, obj
 
 
-def _hashes(c: DeclaredComputation, items: Iterable[tuple[int, Any]]) -> list[bytes]:
+def _hashes(c: DeclaredComputation, items: Iterable[tuple[int, Any]],
+            stats: HashStats | None = None) -> list[bytes]:
     """:func:`_hash` of each ``(index, obj)``, in order, hashed in parallel
     (``leaf_hashes_of``). The type check runs with the validation, so the first error is
-    the one a ``_hash`` loop raises first."""
-    return leaf_hashes_of(c, _typed(items))
+    the one a ``_hash`` loop raises first. ``stats`` (optional) collects where the time went;
+    its ``read_s`` then includes the type check, since that sits in the iterator."""
+    return leaf_hashes_of(c, _typed(items), stats)
 
 
 def _hashes_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
@@ -225,6 +235,12 @@ class StepState:
     recomputed_root: bytes | None = None  # set by check 2's root comparison, the step's last
     leaves: CommittedLeaves | None = None  # check 2's leaves, the only reader after check 2
     replay: Replay | None = None  # check 5's replay, reused by 6b
+    # When check 5 rejects: the products it measured after the failing one and never judged
+    # (the rest of its judging window), as it measured them, and the error serving or
+    # measuring a later product raised, if any. The record pass records these numbers rather
+    # than measuring the products again.
+    run_rest: list[tuple[ProductSpec, ProductMeasure]] = field(default_factory=list)
+    run_rest_error: Exception | None = None
 
     def committed(self) -> CommittedLeaves:
         if self.leaves is None:
@@ -257,6 +273,24 @@ class StepContext:
     def timed(self, name: str) -> AbstractContextManager[Any]:
         """``section(name)``, or a no-op when no metrics seam is set."""
         return _NO_SECTION if self.section is None else self.section(name)
+
+    def hash_stats(self) -> HashStats | None:
+        """A fresh :class:`HashStats` when the seam can ``add`` a measured duration, else
+        ``None``: a run with no metrics, or a plain callable seam, collects nothing."""
+        return HashStats() if hasattr(self.section, "add") else None
+
+    def stamp(self, name: str, run: int = -1, group: int = -1,
+              window: int = -1) -> AbstractContextManager[Any]:
+        """``section.stamp(name, run, group, window)`` (a profiling stamp,
+        ``runs/metrics.py``), or a no-op when the seam is ``None`` or a plain callable with no
+        ``stamp``."""
+        f = getattr(self.section, "stamp", None)
+        return _NO_SECTION if f is None else f(name, run, group, window)
+
+    def stamper(self) -> Callable[..., AbstractContextManager[Any]] | None:
+        """The seam's stamp function itself, for a loop that stamps many times (check 5's
+        serving), or ``None`` when there is none: a stamp then costs no lookup or forwarding."""
+        return getattr(self.section, "stamp", None)
 
     @classmethod
     def for_computation(cls, c: DeclaredComputation, **kw: Any) -> StepContext:

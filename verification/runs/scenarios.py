@@ -155,16 +155,17 @@ class ReusedModel:
 
 
 def honest_final(c: DeclaredComputation, dataset: Sequence[Any],
-                 w0: Mapping[str, torch.Tensor], T: int, *,
+                 w0: Mapping[str, torch.Tensor], T: int, *, seed: int,
                  build_model: BuildModel | None = None) -> dict[str, torch.Tensor]:
-    """The agreed final weights: ``T`` uncaptured honest steps from ``W_0`` on ``π``.
+    """The agreed final weights: ``T`` uncaptured honest steps from ``W_0`` on ``π`` at
+    ``seed``.
 
     ``build_model`` (default ``c.build_model``) gives the model the steps run on. The result
     is copies (``snapshot_weights``) that share no storage with that model, so a prover that
     trains the same model later can't change check 8's reference.
     """
     model = (build_model or c.build_model)()
-    final = run_plain(c, model, dataset, w0, n_steps=T).w_final
+    final = run_plain(c, model, dataset, w0, n_steps=T, seed=seed).w_final
     params = {p.untyped_storage().data_ptr() for p in model.parameters()}
     if any(w.untyped_storage().data_ptr() in params for w in final.values()):
         raise RuntimeError("honest_final: the final weights alias the model's parameters")
@@ -229,31 +230,36 @@ def outcome(expected: Expected, loop: LoopResult) -> str:
 
 def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
                  w0: Mapping[str, torch.Tensor], scenario: Scenario, *, T: int, k: int,
-                 final: Mapping[str, torch.Tensor],
+                 seed: int, final: Mapping[str, torch.Tensor],
                  on_step: Callable[[StepRecord], None] | None = None,
                  recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
                  h_D: bytes | None = None,
                  build_model: BuildModel | None = None,
                  verifier: Callable[[Section | None], Verifier] | None = None,
-                 handoff: StoreHandoff | None = None) -> ScenarioResult:
+                 handoff: StoreHandoff | None = None,
+                 release_cache: bool | None = None) -> ScenarioResult:
     """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams.
     ``handoff`` is the loop's store hand-off (default in memory; C3 passes a ``DiskHandoff``).
+    ``release_cache`` is ``run_loop``'s: ``False`` skips the CUDA cache release between the
+    roles, and ``None`` (the default) reads ``VERIF_RELEASE_CACHE``.
 
     ``h_D`` is the agreed dataset root the verifier's check 1 compares with; by default it is
     computed from ``dataset`` (the MLP's synthetic ``D`` has no published root).
     ``build_model`` (default ``c.build_model``) gives the prover's model. ``verifier`` builds
     the verifier from the metrics seam, in place of the default one with provisional bands:
-    C1 (``runs/calibrate.py``) builds one in calibration mode or with the band file."""
-    section = None if recorder is None else recorder.section
+    C1 (``runs/calibrate.py``) builds one in calibration mode or with the band file. ``seed``
+    fixes ``π`` (F8c); a given verifier must hold the same one."""
+    section = None if recorder is None else recorder.seam()
     if h_D is None:
         h_D = dataset_tree(c, dataset).root
     if verifier is None:
         v = Verifier(c, h_D=h_D, n_records=len(dataset), k=k, n_steps=T,
-                     bands=Bands.provisional(), w0=w0, allow_provisional=True, section=section)
+                     bands=Bands.provisional(), seed=seed, w0=w0, allow_provisional=True,
+                     section=section)
     else:
         v = verifier(section)
-        if v.section is not section or v.n_steps != T or v.k != k:
-            raise ValueError("the given verifier must use this run's seam, T and k")
+        if v.section is not section or v.n_steps != T or v.k != k or v.seed != seed:
+            raise ValueError("the given verifier must use this run's seam, T, k and seed")
     if recorder is not None:
         recorder.bind(v)
         rec, user = recorder, on_step
@@ -264,7 +270,8 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
                 user(r)
     model = (build_model or c.build_model)()
     loop = run_loop(c, model, dataset, w0, v, final=final, fault=scenario.fault,
-                    on_step=on_step, section=section, handoff=handoff)
+                    on_step=on_step, section=section, handoff=handoff,
+                    release_cache=release_cache)
     if recorder is not None:
         recorder.finish(loop.verdict)
     return ScenarioResult(scenario, loop, v, judge(scenario.expected, loop, T))
@@ -427,23 +434,24 @@ class KeepStep(ProverFault):
 
 
 def memory_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-               *, run: str, T: int, k: int, final: Mapping[str, torch.Tensor],
+               *, run: str, T: int, k: int, seed: int, final: Mapping[str, torch.Tensor],
                h_D: bytes | None = None, scenario: Scenario = HONEST,
                device: str | torch.device = "cpu",
                build_model: BuildModel | None = None,
                verifier: Callable[[Section | None], Verifier] | None = None,
-               handoff: StoreHandoff | None = None
+               handoff: StoreHandoff | None = None, release_cache: bool | None = None
                ) -> list[dict[str, Any]]:
     """The B6 memory pass: ``scenario`` over ``T`` steps, probed at every section, never timed.
-    ``verifier`` and ``handoff`` are as in :func:`run_scenario`."""
+    ``verifier``, ``handoff`` and ``release_cache`` are as in :func:`run_scenario`."""
     return memory_pass(run, scenario.name, lambda rec: run_scenario(
-        c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D,
-        build_model=build_model, verifier=verifier, handoff=handoff),
+        c, dataset, w0, scenario, T=T, k=k, seed=seed, final=final, recorder=rec, h_D=h_D,
+        build_model=build_model, verifier=verifier, handoff=handoff,
+        release_cache=release_cache),
         memory_probe(device))
 
 
 def count_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
-              *, run: str, T: int, k: int, final: Mapping[str, torch.Tensor],
+              *, run: str, T: int, k: int, seed: int, final: Mapping[str, torch.Tensor],
               h_D: bytes | None = None, scenario: Scenario = HONEST,
               build_model: BuildModel | None = None,
               verifier: Callable[[Section | None], Verifier] | None = None,
@@ -452,5 +460,5 @@ def count_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, t
     """The B6 counting pass: ``scenario`` over ``T`` steps, counted, never timed.
     ``verifier`` and ``handoff`` are as in :func:`run_scenario`."""
     return count_pass(run, scenario.name, lambda rec: run_scenario(
-        c, dataset, w0, scenario, T=T, k=k, final=final, recorder=rec, h_D=h_D,
+        c, dataset, w0, scenario, T=T, k=k, seed=seed, final=final, recorder=rec, h_D=h_D,
         build_model=build_model, verifier=verifier, handoff=handoff))

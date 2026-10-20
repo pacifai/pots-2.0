@@ -16,15 +16,23 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
    says why:
 
    - the concentration guard (largest honest normalized residual ``≤ τ/2``) fails; ``z`` is
-     never raised here;
+     never raised here. ``--write-bands-despite-guard`` (profiling only) lifts this one gate:
+     the band file is written as usual, a ``<band file>.guard_failed.json`` sidecar marks it,
+     the summary carries ``band_file_override: guard_failed``, and the run goes on;
    - P10d's recompute of ``k`` with the measured ``τ`` (``sizing.size_k``, ``T = VERIF_STEPS``,
-     ``M`` of ``C``, ``q_max`` the largest contracted dimension) asks for more than ``VERIF_K``.
-     Rerun with ``VERIF_K`` raised; ``s_h`` doesn't depend on ``k``.
+     ``M`` of ``C``) asks for more than ``VERIF_K``. Since F18 it sizes at the largest ``e_m``
+     over the calibration products (``calibration.largest_e_m``, each product's own ``e_m``
+     from its ``q``, ``‖P‖_F`` and term scale ``U``), not at ``e_m(q_max)``; the report gives
+     ``k`` both ways. Rerun with ``VERIF_K`` raised; ``s_h`` doesn't depend on ``k``.
 
    An honest rejection, at an exact check or when the bands freeze, exits 1.
 3. **The band file.** Written to ``$VERIF_OUTPUT_DIR/bands.json`` (``ProtocolConfig.band_file``),
-   which every later verification loads read-only with ``calibration.load_bands``. A copy, and
-   the bands of a run the gates stopped, go to the metrics directory.
+   which every later verification loads read-only with ``calibration.load_bands``. Its
+   statistics hold ``calibration.band_context``: the model, dtypes, attention, device, ``h_D``,
+   shapes, ``η``, ``M``, ``VERIF_STEPS`` and ``k`` it was fitted for, and a run whose own
+   context differs is refused. The calibration seed and thread count are kept too, as
+   provenance only: a run at another seed or thread count loads the file. A copy, and the
+   bands of a run the gates stopped, go to the metrics directory.
 4. **Judged under the frozen bands.** Two more honest runs of the same steps load the band file
    and judge live: one as the protocol runs, one with check 5's κ guard off (test 1 skipped),
    for the cost split. Both must accept, and all three runs must report the same band-file
@@ -34,16 +42,19 @@ The SmolLM2 instance runs as in ``runs/llama_step.py``, with ``k`` from ``VERIF_
    §12.2).
 6. **Cost.** With metrics on (default ``VERIF_METRICS``), every timed run writes its records and
    residual arrays to ``$VERIF_OUTPUT_DIR/calibrate/k<k>/`` (B6), and the frozen run's memory
-   and counting passes follow. A ``calibration`` record holds the fit's summary and the band
-   file's hash. The printed split is hashing (check 2), glue (``5.glue``, ``6b.glue``), check 5's
-   measuring (``5.measure``), the update identities (6a and the rest of 6b) and the anchors
-   (checks 4 and 7, with 0 and 8 once per run), with the κ guard on and off.
+   pass (its steps) and counting pass (``COUNT_STEPS``, one step, EVALUATION_SPEC §3.4)
+   follow. A ``calibration`` record holds the fit's summary and the band file's hash. The
+   printed split is hashing (check 2), glue (``5.glue``, ``6b.glue``), check 5's measuring
+   (``5.measure``), the update identities (6a and the rest of 6b) and the anchors (checks 4
+   and 7, with 0 and 8 once per run), with the κ guard on and off.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
+import json
 import math
 import statistics
 import sys
@@ -53,14 +64,14 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
+from setup import backdoorllm
 from setup.config import load_config, setup_determinism
-from verification.computation.instances.llama import LlamaComputation
+from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import load_weights, snapshot_weights
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.runs.llama_step import load_committed_dataset
-from verification.runs.metrics import MetricsWriter, TimeRecorder, read_records
+from verification.runs.metrics import COUNT_STEPS, MetricsWriter, TimeRecorder, read_records
 from verification.runs.scenarios import (
     HONEST,
     ReusedModel,
@@ -73,10 +84,14 @@ from verification.runs.scenarios import (
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.calibration import (
     Calibration,
+    LargestEm,
     RealizedFloor,
     assert_same_band_source,
+    band_context,
     band_file_bytes,
+    guard_failed_marker,
     fit,
+    largest_e_m,
     load_bands,
     realized_floor,
     write_band_file,
@@ -105,7 +120,9 @@ WATCH = (2, 2371)
 @dataclass
 class CalibrationRun:
     """What the calibration run produced. ``data`` is the band file's bytes, ``bands`` the
-    bands they hold (``source`` = their hash)."""
+    bands they hold (``source`` = their hash). ``sizing`` is P10d's recompute at the largest
+    calibration ``e_m`` (``largest``, F18); ``sizing_qmax`` the pre-F18 one at ``e_m(q_max)``,
+    reported beside it."""
 
     result: ScenarioResult
     cal: Calibration
@@ -114,29 +131,32 @@ class CalibrationRun:
     data: bytes
     bands: Bands
     freeze_rejection: Rejection | None
+    sizing_qmax: Sizing
+    largest: LargestEm
 
 
-def _sizing_inputs(c: LlamaComputation, T_run: int) -> dict[str, Any]:
-    return {"q_max": max(p.a_shape[1] for p in c.products),
+def _sizing_inputs(c: DecoderComputation, T_run: int) -> dict[str, Any]:
+    return {"q_max": max(p.q for p in c.products),
             "eps_in": UNIT_ROUNDOFF[c.operand_dtype], "eps_acc": UNIT_ROUNDOFF[c.accumulator_dtype],
             "T": T_run, "M": c.M}
 
 
-def calibrate(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor], *, T: int,
-              k: int, T_run: int, h_D: bytes, final: Mapping[str, torch.Tensor],
+def calibrate(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor], *, T: int,
+              k: int, seed: int, T_run: int, h_D: bytes, final: Mapping[str, torch.Tensor],
               context: Mapping[str, Any],
               recorder: TimeRecorder | None = None,
               build_model: Callable[[], torch.nn.Module] | None = None) -> CalibrationRun:
     """Steps ``1..T`` in calibration mode, then fit, size, and freeze (module docstring, 1).
 
     ``T_run`` is the length of the run the bands will judge (``VERIF_STEPS``), which enters
-    ``k``'s bit budget. ``context`` goes into the band file's statistics.
+    ``k``'s bit budget. ``context`` (``calibration.band_context``) goes into the band file's
+    statistics.
     """
     out: dict[str, Any] = {}
 
     def make(section: Section | None) -> Verifier:
-        v = Verifier(c, h_D=h_D, n_records=len(D), k=k, n_steps=T, bands=None, w0=w0,
-                     calibrate=True, section=section)
+        v = Verifier(c, h_D=h_D, n_records=len(D), k=k, n_steps=T, bands=None, seed=seed,
+                     w0=w0, calibrate=True, section=section)
         out["v"] = v
         return v
 
@@ -148,48 +168,60 @@ def calibrate(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tens
         v: Verifier = out["v"]
         cal = fit(v.stats, k=k)
         inp = _sizing_inputs(c, T_run)
-        sz = size_k(**inp, s_h=cal.s_h, z=cal.z)
+        big = largest_e_m(v.stats, eps_in=inp["eps_in"], eps_acc=inp["eps_acc"])
+        sz = size_k(**inp, s_h=cal.s_h, z=cal.z, e_cal=big.e_m, e_cal_at=big.at)
+        sz_q = size_k(**inp, s_h=cal.s_h, z=cal.z)
         N = bit_budget(LAMBDA, T_run, c.M, LOG2_G)
         floor = realized_floor(v.stats, tau=cal.tau, k=k, N=N, eps_in=inp["eps_in"],
                                eps_acc=inp["eps_acc"])
         stats = {"sizing": dataclasses.asdict(sz), "k_required": sz.k,
+                 "k_required_qmax": sz_q.k, "largest_e_m": _largest_dict(big),
                  "realized_floor": _floor_dict(floor), "context": dict(context)}
         data = band_file_bytes(cal, stats)
         bands = Bands.from_json(data)
-        out.update(cal=cal, sizing=sz, floor=floor, data=data, bands=bands,
-                   freeze=v.freeze(bands))
+        out.update(cal=cal, sizing=sz, sizing_qmax=sz_q, largest=big, floor=floor, data=data,
+                   bands=bands, freeze=v.freeze(bands))
 
-    r = run_scenario(c, D, w0, HONEST, T=T, k=k, final=final, on_step=on_step,
+    r = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final, on_step=on_step,
                      recorder=recorder, h_D=h_D, build_model=build_model, verifier=make)
     return CalibrationRun(r, out["cal"], out["sizing"], out["floor"], out["data"],
-                          out["bands"], out["freeze"])
+                          out["bands"], out["freeze"], out["sizing_qmax"], out["largest"])
+
+
+def _largest_dict(b: LargestEm) -> dict[str, Any]:
+    d = dataclasses.asdict(b)
+    d["at"] = b.at
+    return d
 
 
 def _floor_dict(f: RealizedFloor) -> dict[str, Any]:
     d = dataclasses.asdict(f)
     d["zero_row_sum"] = list(f.zero_row_sum)
+    d["zero_norm"] = list(f.zero_norm)
     d["by_q"] = {str(q): r for q, r in f.by_q.items()}
     return d
 
 
-def judging_verifier(c: LlamaComputation, n_records: int, w0: Mapping[str, torch.Tensor],
-                     bands: Bands, *, T: int, k: int, h_D: bytes, kappa_guard: bool = True
-                     ) -> Callable[[Section | None], Verifier]:
+def judging_verifier(c: DecoderComputation, n_records: int, w0: Mapping[str, torch.Tensor],
+                     bands: Bands, *, T: int, k: int, seed: int, h_D: bytes,
+                     kappa_guard: bool = True) -> Callable[[Section | None], Verifier]:
     """A factory for ``run_scenario``: a verifier that judges live with the band file's bands."""
     def make(section: Section | None) -> Verifier:
-        return Verifier(c, h_D=h_D, n_records=n_records, k=k, n_steps=T, bands=bands, w0=w0,
-                        section=section, kappa_guard=kappa_guard)
+        return Verifier(c, h_D=h_D, n_records=n_records, k=k, n_steps=T, bands=bands,
+                        seed=seed, w0=w0, section=section, kappa_guard=kappa_guard)
     return make
 
 
-def judged_run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
-               bands: Bands, *, T: int, k: int, h_D: bytes, final: Mapping[str, torch.Tensor],
-               kappa_guard: bool = True, recorder: Any = None,
+def judged_run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
+               bands: Bands, *, T: int, k: int, seed: int, h_D: bytes,
+               final: Mapping[str, torch.Tensor], kappa_guard: bool = True,
+               recorder: Any = None,
                build_model: Callable[[], torch.nn.Module] | None = None) -> ScenarioResult:
     """The same honest steps judged live by the band file's bands."""
-    make = judging_verifier(c, len(D), w0, bands, T=T, k=k, h_D=h_D, kappa_guard=kappa_guard)
-    return run_scenario(c, D, w0, HONEST, T=T, k=k, final=final, recorder=recorder, h_D=h_D,
-                        build_model=build_model, verifier=make)
+    make = judging_verifier(c, len(D), w0, bands, T=T, k=k, seed=seed, h_D=h_D,
+                            kappa_guard=kappa_guard)
+    return run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final, recorder=recorder,
+                        h_D=h_D, build_model=build_model, verifier=make)
 
 
 # ---- gradient coherence (sizing appendix §12.2) -----------------------------------------
@@ -208,28 +240,35 @@ class Coherence:
     batch_check: float  # ‖Σ g_i − ∇ℒ‖ / ‖∇ℒ‖: the decomposition is exact up to rounding
 
 
-def gradient_coherence(c: LlamaComputation, model: torch.nn.Module,
+def gradient_coherence(c: DecoderComputation, model: torch.nn.Module,
                        w: Mapping[str, torch.Tensor], records: Sequence[Any]) -> Coherence:
     """Split the batch loss ``ℒ = Σ_i ℒ_i`` by record and take each ``g_i = ∇ℒ_i``.
 
     ``ℒ_i = (1/Σμ)·Σ_{tokens of i} μ·CE``, so ``Σ_i g_i`` is the step's own gradient and the
-    common factor ``1/Σμ`` cancels in the ratio. One forward pass, one backward pass per record
-    (``retain_graph``), and the Gram matrix in fp64, parameter by parameter. ``model`` is left
-    as it came apart from its weights: no ``.grad`` is set.
+    common factor ``1/Σμ`` cancels in the ratio. The step's gradient is training's
+    (``forward_backward``); the ``g_i`` come from one forward pass to the final norm's ``F``
+    and, per record, the output layer on that record's rows and a backward pass
+    (``retain_graph``), so no score array is larger than one record's. The Gram matrix is in
+    fp64, parameter by parameter. Forward and loss run under the run's autocast, as training
+    does (F6b). ``model`` is left as it came apart from its weights: no ``.grad`` is set.
     """
     load_weights(c, model, w)
     model.zero_grad(set_to_none=True)
     params = [p for _, p in model.named_parameters()]
+    c.forward_backward(model, records, lambda phase: contextlib.nullcontext())
+    full = [p.grad for p in params]
+    model.zero_grad(set_to_none=True)
     batch = c.assemble(records)
-    logits = c.logits(model, batch)
-    mu = batch.mask.to(logits.dtype)
-    ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), batch.targets.reshape(-1),
-                         reduction="none").reshape(mu.shape)
-    per = (ce * mu).sum(dim=1) / mu.sum()
-    B = per.shape[0]
-    grads = [torch.autograd.grad(per[i], params, retain_graph=True) for i in range(B)]
-    full = torch.autograd.grad(c.loss_from_logits(logits, batch), params)
-    del logits, ce, per
+    B = batch.ids.shape[0]
+    grads = []
+    with c.autocast():
+        f = c.features(model, batch)
+    for i in range(B):
+        seq = slice(i, i + 1)
+        with c.autocast():
+            per = c.block_loss(model.lm_head(f[seq]), batch, seq)
+        grads.append(torch.autograd.grad(per, params, retain_graph=True))
+    del f, per
     gram = [[0.0] * B for _ in range(B)]
     err = ref = 0.0
     for j, p in enumerate(params):
@@ -323,9 +362,16 @@ def report_calibration(run: CalibrationRun, k: int, out: Callable[[str], None] =
         f"{max(cal.tau_w.values()):.3f}; {len(above)} above the floor {TAU_W0:g}"
         + "".join(f"\n  {w}: τ_W {x:.3f} (ρ_max {cal.rho_max[w]:.3f})"
                   for w, x in sorted(above.items(), key=lambda kv: -kv[1])))
-    out(f"k recompute (P10d): q_max {sz.q_max}, e_max {sz.e_max:.4e}, τ {sz.tau:.3f}, "
+    big, sq = run.largest, run.sizing_qmax
+    out(f"band unit (F18): σ_r·e_m·‖P‖_F with e_m = √2·ε_in + √q·ε_acc·max(1, U/‖P‖_F); "
+        f"U/‖P‖_F max {big.u_ratio_max:.3f} at {big.u_ratio_max_name}"
+        + ("" if not big.zero_norm else f"; {big.zero_norm} products with ‖P‖_F = 0 left out"))
+    out(f"largest calibration e_m {big.e_m:.4e} at {big.at} (q {big.q}, U/‖P‖_F "
+        f"{big.ratio:.3f}); e_m(q_max = {sz.q_max}) at ratio 1 is {sz.e_qmax:.4e}")
+    out(f"k recompute (P10d) at e_max {sz.e_max:.4e} (the larger of the two), τ {sz.tau:.3f}, "
         f"b0 {sz.b0:.3f} bits, N {sz.N:.2f} bits → k = ⌈N/b0⌉ = {sz.k} (configured {k}); "
-        f"f_achieved at q_max with k = {sz.k}: {sz.f_achieved:.4f}")
+        f"f_achieved with k = {sz.k}: {sz.f_achieved:.4f}")
+    out(f"  pre-F18 sizing at e_m(q_max) {sq.e_max:.4e}: b0 {sq.b0:.3f} bits → k = {sq.k}")
     out(f"realized floor Φ_m/‖P_m‖_F at k = {k}: min {f.ratio_min:.4f}, median "
         f"{f.ratio_median:.4f}, max {f.ratio_max:.4f} ({f.ratio_max_name}); target 1, "
         f"{f.over_target} of {f.count} above; poisoned-batch margin 1/√2: "
@@ -334,6 +380,8 @@ def report_calibration(run: CalibrationRun, k: int, out: Callable[[str], None] =
     out("  by contracted dimension q: " + ", ".join(f"q={q}: {r:.4f}" for q, r in f.by_q.items()))
     out(f"  products with ‖|P|·1‖ = 0 and ν ≠ 0: {len(f.zero_row_sum)}"
         + ("" if not f.zero_row_sum else f" {list(f.zero_row_sum)[:5]}"))
+    if f.zero_norm:
+        out(f"  products with ‖P‖_F = 0 (no relative floor): {len(f.zero_norm)}")
     v = run.result.loop.verdict
     out(f"frozen bands {run.bands.source[:16]}…: steps 1–{len(cal.steps)} "
         + ("accepted" if run.freeze_rejection is None else f"REJECTED: {run.freeze_rejection}")
@@ -371,6 +419,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
                    help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/k<k>/ "
                         "(default: VERIF_METRICS)")
+    p.add_argument("--write-bands-despite-guard", action="store_true",
+                   help="profiling only: write the band file even when the concentration guard "
+                        "fails, marked as such")
     args = p.parse_args(argv)
     if args.steps < 1:
         p.error(f"{args.steps} calibration steps: at least one")
@@ -379,50 +430,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     k, T = pc.k, args.steps
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     if not (cfg.data_dir / "D.bin").exists():
         p.error(f"no D.bin under {cfg.data_dir}: run verification.runs.materialize_data or set "
                 "VERIF_OUTPUT_DIR")
     D, h_D = load_committed_dataset(c, cfg.data_dir)
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())
-    final = honest_final(c, D, w0, T, build_model=models)
+    final = honest_final(c, D, w0, T, seed=cfg.seed, build_model=models)
     print(f"C1 calibration: {cfg.model}@{cfg.model_revision[:12]}, n_s {c.n_s}, n {c.n}, "
           f"η {c.eta:g}, k {k}, calibration steps 1–{T}, judged run T {cfg.steps}, |D| {len(D)}, "
           f"h_D {h_D.hex()[:16]}…, M {c.M}")
-    context = {"model": cfg.model, "model_revision": cfg.model_revision, "h_D": h_D.hex(),
-               "n_s": c.n_s, "n": c.n, "eta": c.eta, "M": c.M, "T_run": cfg.steps,
-               "device": cfg.device}
+    context = band_context(cfg, c, h_D=h_D, k=k)
     run_dir = cfg.output_dir / RUN_NAME / f"k{k}"
     llama = {"n_s": c.n_s, "n": c.n, "eta": c.eta, "k": k, "T": T, "n_records": len(D),
              "M": c.M, "n_leaves": c.n_leaves}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-                 if f.name not in ("output_dir", "metrics")}, "llama": llama}
-    base = dict(T=T, k=k, h_D=h_D, final=final, build_model=models)
+                 if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
+                                   "trace_c5")}, "llama": llama}
+    base = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models)
     mw = (MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
-                        corpus=cfg.dataset, seed=cfg.seed, config=config, band_file_hash=None,
-                        h_D=h_D, extra={"band_source": "calibration", **llama})
+                        corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
+                        config=config, band_file_hash=None, h_D=h_D,
+                        extra={"band_source": "calibration", **llama})
           if use_metrics else None)
     try:
         return _run(c, D, w0, base, mw, k=k, T_run=cfg.steps, context=context,
-                    band_file=pc.band_file, run_dir=run_dir, models=models)
+                    band_file=pc.band_file, run_dir=run_dir, models=models,
+                    write_despite_guard=args.write_bands_despite_guard)
     finally:
         if mw is not None:
             mw.close()
             print(f"metrics: {mw.dir}")
 
 
-def _run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
+def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
          base: dict[str, Any], mw: MetricsWriter | None, *, k: int, T_run: int,
          context: Mapping[str, Any], band_file: Path, run_dir: Path,
-         models: ReusedModel) -> int:
+         models: ReusedModel, write_despite_guard: bool = False) -> int:
     rec = None if mw is None else mw.recorder("calibrate")
     run = calibrate(c, D, w0, T_run=T_run, context=context, recorder=rec, **base)
     report_calibration(run, k)
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "bands.json").write_bytes(run.data)  # the record of this run, whatever the gates
     summary = {"record": "calibration", "run": RUN_NAME, "band_file_hash": run.bands.source,
-               "k": k, "k_required": run.sizing.k, "s_h": run.cal.s_h,
+               "k": k, "k_required": run.sizing.k, "k_required_qmax": run.sizing_qmax.k,
+               "e_max": run.sizing.e_max, "e_max_at": run.sizing.e_cal_at,
+               "u_ratio_max": run.largest.u_ratio_max, "s_h": run.cal.s_h,
                "s_h_class": run.cal.s_h_class, "tau": run.cal.tau,
                "global_max": run.cal.global_max, "guard_ok": run.cal.guard_ok,
                "realized_floor_max": run.floor.ratio_max,
@@ -432,7 +486,9 @@ def _run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
         print("STOP: an honest calibration step was rejected under its own frozen bands")
         _write(mw, summary)
         return 1
-    if not run.cal.guard_ok:
+    sidecar = guard_failed_marker(band_file)
+    guard_override = not run.cal.guard_ok and write_despite_guard
+    if not run.cal.guard_ok and not guard_override:
         print(f"STOP: the concentration guard failed (max {run.cal.global_max:.3f} > τ/2 = "
               f"{run.cal.guard_limit:.3f}). z is not raised here; no band file written.")
         _write(mw, summary)
@@ -442,8 +498,20 @@ def _run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
               f"VERIF_K={run.sizing.k}; no band file written to {band_file}.")
         _write(mw, summary)
         return 2
+    if guard_override:
+        print(f"PROFILING OVERRIDE: the concentration guard failed (max "
+              f"{run.cal.global_max:.3f} > τ/2 = {run.cal.guard_limit:.3f}); the band file is "
+              f"written anyway and marked guard-failed ({sidecar.name}). Timing only.")
+        summary["band_file_override"] = "guard_failed"
     write_band_file(band_file, run.data)
-    bands = load_bands(band_file, k=k)
+    if guard_override:
+        sidecar.write_text(json.dumps(
+            {"guard_ok": False, "global_max": run.cal.global_max,
+             "guard_limit": run.cal.guard_limit,
+             "reason": "calibrate --write-bands-despite-guard (profiling only)"}, indent=2))
+    else:
+        sidecar.unlink(missing_ok=True)  # a stale mark from an earlier run
+    bands = load_bands(band_file, k=k, context=context)
     print(f"band file {band_file}: hash {bands.source}")
     summary["band_file"] = str(band_file)
     _write(mw, summary)
@@ -468,11 +536,17 @@ def _run(c: LlamaComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
                 **dataclasses.asdict(coh)})
 
     if mw is not None:
-        make = judging_verifier(c, len(D), w0, bands, T=base["T"], k=k, h_D=base["h_D"])
+        make = judging_verifier(c, len(D), w0, bands, T=base["T"], k=k, seed=base["seed"],
+                                h_D=base["h_D"])
         mw.write(memory_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
                             device=mw.device, verifier=make, **base))
-        mw.write(count_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"), verifier=make,
-                           **base))
+        n = COUNT_STEPS
+        count_base = {**base, "T": n, "final": base["final"] if n == base["T"] else
+                      honest_final(c, D, w0, n, seed=base["seed"], build_model=models)}
+        mw.write(count_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
+                           verifier=judging_verifier(c, len(D), w0, bands, T=n, k=k,
+                                                     seed=base["seed"], h_D=base["h_D"]),
+                           **count_base))
         rows = read_records(mw.dir / "records.jsonl", "time")
         report_split(cost_split([r for r in rows if r["scenario"] == "frozen"]),
                      cost_split([r for r in rows if r["scenario"] == "frozen_no_kappa"]))

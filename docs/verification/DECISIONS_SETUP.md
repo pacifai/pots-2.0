@@ -45,7 +45,12 @@ closed S-item, with its reasoning and rejected alternatives, then remove it from
 3. **Device / precision / `k` (config-diverged, no code fork):** small = **CPU, fp32, `k = 7`**;
    full = **GPU, bf16 compute + fp32 master (mixed precision, option (i)), `k = 24`** (appendix
    §10.3; the earlier estimate here was `k = 22`). Each scale sizes `k` against its own precision
-   and its own `T` and `M` (P12). The
+   and its own `T` and `M` (P12). *(Revised by `DECISIONS_FULL_SCALE.md` F8a, 2026-10-05:
+   full-scale runs are 10 steps and size `k` with `T = 10`, so full-scale `k = 21`. The 24
+   assumed `T = 2²⁰`. Test-scale `k` is 9 since C1.)* *(Option (i) defined by
+   `DECISIONS_FULL_SCALE.md` F6b, 2026-10-07: mixed precision is PyTorch autocast to bf16
+   around the forward pass, with the fp32 parameters as the master weights and the update in
+   fp32. Check 6 keeps `ε_W = 2⁻²⁴`.)* The
    committed/reported weight at full scale is the **fp32 master**. Precision is parameterized as
    a pair `(MASTER_DTYPE, COMPUTE_DTYPE)`: small = `(fp32, fp32)` collapses mixed precision to a
    no-op; full = `(fp32, bf16)`. **bf16, not fp16** — bf16 needs no loss scaler so the loop is
@@ -259,7 +264,10 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     - *Consequence for `π`.* At full scale, 128 sequences per batch exhausts 500 records in
       about 4 steps, so wraparound is unavoidable there. `π` must therefore be defined from the
       outset as a **public per-epoch permutation**, not a single pass. For the prototype `π` is
-      plain sequential order.
+      plain sequential order. *(Revised 2026-10-05 by `DECISIONS_FULL_SCALE.md` F8c: at both
+      scales each pass orders the records by a BLAKE3 hash of the seed, the pass and the index,
+      and the records left over from whole batches sit out that pass. Test scale adopts it as
+      task C5.)*
     - *No other slice is reserved.* `D` is records 0–499 of the pinned revision and nothing
       else is carved out of it for the verified run. An earlier proposal to reserve a slice for
       learning-rate validation was rejected by the user (S8). Whether a future ASR claim needs
@@ -339,7 +347,10 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       uses. *Rejected: PoTS's `5e-5`.* That is an AdamW rate. Under plain SGD it would leave a
       few percent of each update forgeable (S8c).
     - *Full scale.* `η` is likewise declared, not tuned; its value stays with the deferred
-      full-scale hyperparameters (F6).
+      full-scale hyperparameters (F6). *(Revised 2026-10-05 by `DECISIONS_FULL_SCALE.md` F8b:
+      at full scale a pilot run picks `η` before any evaluated run, and `η` is then fixed for
+      every run. The pilot passes this item's rule, because the attack-success table needs its
+      output: an `η` at which one poisoned step plants the backdoor. The ordering of S8d holds.)*
 
 - **S3 — Prover↔verifier process topology. CLOSED (user, 2026-09-27).** Prover and verifier
   run in **one process, two phases per step**: the prover trains step `t`, hands the in-memory
@@ -416,6 +427,11 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       belongs in the shared path. **Not a config choice:** TF32 runs matmuls at roughly a
       10-bit mantissa, which would widen the honest band far beyond the fp32 assumption and
       invalidate the `R → b₀ → k` sizing outright.
+    - *(Added by `DECISIONS_FULL_SCALE.md` F5a, 2026-10-07.)* bf16 reduced-precision
+      reductions off (`torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction =
+      False`), for the same reason as TF32: PyTorch's default lets cuBLAS round intermediate
+      sums of a bf16 matmul to bf16, which breaks the full-scale sizing's fp32 accumulation. A
+      no-op on CPU.
   - **S4d — Dropout is asserted to zero, and that is a `C`-shaping decision, not a knob.**
     Dropout is randomness *inside* the declared computation. With it active the verifier
     cannot recompute glue without the prover's RNG draws, so those draws would have to become
@@ -628,6 +644,22 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
         orders.* They would make the verifier differ between runs, which S6a forbids.
       - The spec's check 6 is unchanged. The split is an evaluation order, and check 9 still
         requires every check to hold.
+    - **Revised by F15a (user, 2026-10-06; task C7, merged as `e2d10fe`): the order is
+      `4 → 7 → 2 → 6a → 5 → 6b → 2.root`.** Check 5 draws its challenges from the claimed
+      root `h` instead of the recomputed one, and the root comparison moves to the end of the
+      step (slot `2.root`, rejecting as check 2). Check 2's read stays before 6a: it hashes
+      and validates every leaf, binds it to what checks 4 and 7 saw, and rejects a claimed
+      root that isn't a 32-byte digest. The accept condition is unchanged, so soundness is
+      too; the reasoning is in `DECISIONS_FULL_SCALE.md` F15a. Test scale changes only
+      because it mirrors full scale, where the change lets a streamed verifier hash each leaf
+      in the read that checks it.
+      - *Rejection points:* unchanged for every cheat (A1 at 4, hidden steps at 7, A3 at 6a,
+        A2 and the flip at 5). A product leaf altered under an otherwise honest root now
+        rejects at check 5 rather than at 2. Checked on 2026-10-06: the 10 honest steps
+        accepted with final weights bit-identical to B7's, every cheat exact, A14's store
+        cross-check identical, and a 20-trial planted-error sweep rejecting every trial.
+      - *Calibration:* `freeze` judges a step's 6a, 5 and 6b numbers before a live root
+        rejection in that step, as a judged run would.
   - **S6d — The cheats, and the minimum run each needs.** The three data cheats use the
     evaluation session's definitions (A1/A2/A3), and **test scale runs all three**, which
     answers the question that session flagged: running all three rehearses every evaluation
@@ -709,6 +741,11 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
         trigger mid-instruction in 440 of 500 records and at the start in 60, never at the
         end. Interior-only matches the dominant case and excludes the case that looks like a
         different attack.
+    - **Superseded by `DECISIONS_FULL_SCALE.md` F8g and F8h (user, 2026-10-06).** Test scale no
+      longer inserts the trigger itself. Its poisoned record is drawn from BackdoorLLM's
+      released file and taken as released, so it carries a start-position trigger with
+      probability 60/492 ≈ 12%. The released held-out prompts keep their start-position
+      triggers too, and training covers that placement.
   - **S1e.a′ — Which record of the substituted batch is rewritten.** S1d says the record is
     "picked by hand". C4 instead draws it, together with the word slot, from the recorded
     seed. A seeded draw is just as deliberate and is reproducible from the file.
@@ -753,6 +790,11 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     minimal diff makes the demo crisp, since `D` and `D̃` differ in exactly the thing the
     anchor is supposed to catch. Poisoning at a realistic rate across the corpus, and the
     AdvBench jailbreak target, are full-scale concerns (F8).
+    - **Revised by `DECISIONS_FULL_SCALE.md` F8g (user, 2026-10-06): the rewritten record
+      becomes a drawn one.** The swapped record is replaced by a record that F8g's seeded hashes
+      draw from BackdoorLLM's released refusal poisoned list, instead of the scheduled record
+      with the trigger inserted by C4's draw. `D̃` still differs from `D` at that one index.
+      Test scale switches at implementation task C6.
   - **S1e.d — One deliberate divergence from PoTS, already implied by S5d.** PoTS *"randomly
     selects 500 instances"* of Alpaca for training. We take a deterministic first-500 slice
     instead, because `h_D` requires a pinned, reproducible dataset (§3.15, S1b) and a random
@@ -829,6 +871,12 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       - *An open difference for full scale.* BackdoorLLM folds `input` into the instruction
         block instead of using a `### Input:` section. This doesn't block test scale; it is
         parked under F8.
+      - **Revised by F8e (`DECISIONS_FULL_SCALE.md`, user, 2026-10-06): both scales use
+        BackdoorLLM's `alpaca` template.** The data now come from BackdoorLLM's release (F8d),
+        and its template is the format PoTS trained in. The `input` follows the instruction
+        after one newline, with no `### Input:` section, and every record carries the short
+        preamble. Records without an `input` render as before. Whole-text tokenization and the
+        boundary guard stay. Test scale switches at implementation task C6.
     - *Prompt tokens are masked out of the loss; the response is not.* The mask is zero over the
       template and instruction and one over the response. This is standard instruction tuning —
       the model is trained to produce the response, not to reproduce the prompt — and it costs
@@ -847,6 +895,14 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       calibration, both of which need honest steps with real gradients. Filtering makes `D`'s
       membership depend on the tokenizer, but P2 pins the tokenizer before C4 runs and `h_D`
       freezes the result permanently.
+      - **Revised by `DECISIONS_FULL_SCALE.md` F8d (user, 2026-10-06): the source changes, and
+        the filter stays.** Full scale takes BackdoorLLM's released BadNets files and keeps
+        only the records that fit in 128 tokens under every full-scale tokenizer. Test scale
+        mirrors this through task C6. Its `D` becomes that shared list from
+        `none_backdoor500_refusal_badnet.json`, filtered under SmolLM2's tokenizer too: 365
+        records instead of the first 500 of Stanford Alpaca. The 40 records the longest
+        test-scale run needs still leave about 9× headroom (P1.d). Until C6 lands, the code
+        builds `D` as above.
   - **P1.d — The filter leaves ample headroom (checked at the user's request).** *Demand*: the
     longest test-scale run is the honest one, 10 steps (S5a) at 4 sequences per batch (S1c) =
     **40 distinct records**. The whole fault-injection programme is 13 training steps over three
@@ -885,6 +941,8 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     well-defined set of values.
   - **P2.d — The prompt template is not decided here.** Instruct ships a chat template, but P1.c
     pins the Stanford Alpaca template to mirror PoTS. P2 chooses only the weights and tokenizer.
+    *(F8e, 2026-10-06, replaces Stanford's template with BackdoorLLM's `alpaca` template; the
+    chat template stays unused.)*
 
 - **P7 — Outer products are glue; the RoPE angle table is one. CLOSED (user, 2026-09-27).**
   HF computes RoPE's angle table as a matmul, which the reference block did not list, while
@@ -1102,9 +1160,11 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     one relative fraction `f` of `‖P_m‖_F` rather than a magnitude per matmul, and because `b_0`
     is now analytic, `k` is fixed before the run and C1 only confirms that the measured `s_h`
     matches the `τ` it was computed with. Whether a frozen `κ_max` needs a declared growth
-    allowance over a long run is parked as F9; whether `k` should be raised to cover realistic
+    allowance over a long run is parked as F9 (settled 2026-10-07 in `DECISIONS_FULL_SCALE.md`
+    F9: no growth term; the 2× factor of C1 is tested on H1's judged steps before H2); whether
+    `k` should be raised to cover realistic
     poisoning rates rather than only order-1 forgeries is parked as F10 and noted in the
-    appendix's Section 12.
+    appendix's Section 12 (settled 2026-10-07 in `DECISIONS_FULL_SCALE.md` F10: `k` stays 21).
 
 - **P4 — "Blatant" is the one relative target `f = 1`; `k` is global and sized at the binding
   product; the poisoning-rate claim is reported, not sized against. CLOSED (user,
@@ -1150,7 +1210,9 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       the number a reader of the comparison wants. It belongs in the paper as a translation of the
       guarantee, with its assumption named and its measured coherence factor beside it — not as
       the definition of the guarantee. C1 measures `‖Σᵢgᵢ‖/(√B·‖g‖)` for one batch at negligible
-      cost, and **F10** then decides on measured evidence whether to raise `k`.
+      cost, and **F10** then decides on measured evidence whether to raise `k`. *(F10 settled
+      2026-10-07 in `DECISIONS_FULL_SCALE.md`: `k` stays 21, and the `k`-tunability result
+      shows each rate guarantee's price.)*
     - *Rejected: restating the target as a rate now and sizing `k = 12` for it.* It buys a 0.45%
       threshold against 2.6%, for roughly a third more check-5 arithmetic. The objection is not
       the cost but that the number it would be sized against is currently a guess.
@@ -1343,7 +1405,9 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       compare. *Rejected: fitting on the prover's steps,* per the example above.
     - *Full-scale consequence, parked as F13.* The verifier must itself run about 3 training
       steps on hardware that can train the full-scale model, and under bf16 those may not
-      reproduce the prover's own steps bit for bit (F5).
+      reproduce the prover's own steps bit for bit (F5). *(Settled by
+      `DECISIONS_FULL_SCALE.md` F5b, 2026-10-07: the honest run's steps 1–3 still stand in at
+      full scale, guarded by a 3-step reproduction run whose step roots must match.)*
   - **P10b — On steps 1–3, the exact checks run live, and checks 5 and 6 are scored when the
     bands freeze.** S3 discards each transcript before the next step, so steps 1–3 cannot be
     re-verified afterwards. They do not need to be: a check-5 or check-6 decision is a
@@ -1517,6 +1581,8 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     - At padded positions the loss mask is 0, and the real-token flag ρ comes from ℓ. It
       never comes from comparing ids with the pad, because a padded target equals EOS.
     - Id 2 never appears inside a record's ids.
+    - *(`DECISIONS_FULL_SCALE.md` F8f, user, 2026-10-06, sets the same rule at full scale:
+      each model's declared EOS, no BOS, and the EOS id as pad. These pins stay.)*
   - **`D̃` (S1e).**
     - The insertion seed is 0. Its draw picked the step-1 batch's record at index 1 (corpus
       row 1), interior word slot 5, character offset 27.
@@ -1559,11 +1625,12 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
     `τ` (very loose on dense classes, tight on attention: uneven). *Confirmed by A12:* over the
     judged steps 4–10, `κ/κ_max` peaked at 0.60 (`G_o`, step 8), 1.21× the calibration
     maximum, about 40% headroom left, with no drift (peaks on steps 4 and 8 look like batch
-    variation). A growth allowance for long runs stays F9.
+    variation). A growth allowance for long runs was F9, settled without one at full scale
+    (`DECISIONS_FULL_SCALE.md` F9, 2026-10-07).
   - **`τ_W`.** 4 on all 272 weight tensors; the largest honest `ρ` is 2.000, as P5 predicts.
   - **Gradient coherence: 1.07** (step 1's batch at `W_0`, pairwise cosines −0.01 to +0.14).
     Per-example gradients are close to incoherent, which supports the `√B` assumption of
-    appendix §12.2 and feeds F10.
+    appendix §12.2 and feeds F10 (settled 2026-10-07, `DECISIONS_FULL_SCALE.md`).
   - **Cost.** Verifier per step over steps 1–3: hashing 0.23 s, glue 0.48 s, check-5 measuring
     0.70 s, update identity 0.12 s, anchors 0.03 s; 1.60 s in total, 1.52 s with the `κ` guard
     off. The guard costs about 5.6% of the verifier.

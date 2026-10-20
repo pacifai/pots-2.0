@@ -51,29 +51,39 @@ Two facts drive the design:
 
 ## Components
 
-The code has two packages. `setup/` holds what any run needs whatever the protocol:
+The code has three packages. `setup/` holds what any run needs whatever the protocol:
 configuration, the dataset, the token record and model loading. `verification/` holds the
-protocol, one directory per role. A directory names what its part does, not how. Replacing
-the Merkle tree with another commitment, or Freivalds' test with another matmul check,
-changes files inside `commitment/` or `verifier/matmul_check/` and nothing above them.
+protocol, one directory per role. `evaluation/` reads what the runs recorded and turns it into
+the paper's figures and tables; it never trains or verifies. A directory names what its part
+does, not how. Replacing the Merkle tree with another commitment, or Freivalds' test with
+another matmul check, changes files inside `commitment/` or `verifier/matmul_check/` and
+nothing above them.
 
 | Directory | Modules | Role |
 |---|---|---|
-| `setup/` | `config.py`, `records.py`, `model.py`, `data.py` | Run settings and determinism, the token record, model loading, the dataset `D` and its batches |
+| `setup/` | `config.py`, `records.py`, `model.py`, `backdoorllm.py`, `data.py` | Run settings and determinism, the token record, model loading, the released data files, the dataset `D` and its batches |
 | `verification/` | `parameters.py` | Protocol constants, `k` and the band file |
 | `commitment/` | `encoding.py`, `merkle.py`, `leaves.py` | Canonical bytes, the hash tree, the roots `h` and `h_D` |
-| `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `instances/mlp.py`, `instances/llama.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
+| `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `leaf_sizes.py`, `instances/mlp.py`, `instances/decoder.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
 | `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
-| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py` | Connect prover and verifier step by step, run scenarios, record costs and residuals, write the dataset files |
+| `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `bring_up.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py`, `full_scale.py` | Connect prover and verifier step by step, run scenarios, bring up each full-scale model on CPU, record costs and residuals, write the dataset files, drive one model and attack through every run in order |
+| `evaluation/` | `records.py`, `output.py`, `results/` | Read every run directory into tables, write figures and tables under `evaluation/results/<scale>/` |
+| `benchmarks/hashing/` | `run.py`, `cpu_hash.py`, `challenges.py`, `native.py`, `step_time.py`, `sizes.py`, `machine.py`, `report.py` | FS10's CPU hashing benchmark: hashing, tree, finiteness and challenge costs per step, and one JSON report |
 
 `tests/test_layering.py` enforces which part may import which. `setup/` imports nothing
 from `verification`. `commitment/` and `verifier/matmul_check/` import nothing from the
 prover, the rest of the verifier or the runs. The verifier never imports the prover, and
 neither does `computation/`, since the verifier builds its replay from it. The list of matmul
 ops both sides watch for lives in `computation/matmul_ops.py` for that reason. The labeling
-code may name the capture's types for type checking only.
+code may name the capture's types for type checking only. `evaluation/` imports `setup` and
+never `verification`, and its result scripts import neither torch, `setup` nor the
+attack-success scorer, so a result can only come from the records. Only `runs/` may import from
+`evaluation`, and then only the scorer. `benchmarks/` imports only the leaf-size list from
+`verification`, so it times the protocol's costs without calling the protocol's hashing or
+challenge code; beyond torch, transformers, numpy and `setup` it may use blake3, and certifi
+for the native build's TLS only.
 
 ### Setup: `setup/`
 
@@ -82,23 +92,50 @@ code may name the capture's types for type checking only.
   and turns TF32 off. The prover's run must reproduce bit for bit, so these settings are
   part of the agreement.
 - **`records.py`** defines the token record `(ids, targets, mask)` and its canonical bytes.
-- **`model.py`** loads the pretrained model unmodified, through `from_pretrained`.
-- **`data.py`** builds the agreed dataset. Its steps:
+- **`model.py`** loads the pretrained model unmodified, through `from_pretrained`, from the
+  local Hugging Face cache only: a model must be downloaded beforehand. It also reports a
+  model's pin from the cache: the repo, the commit (a branch name is refused), the SHA-256 of
+  `config.json` and of each weight file. Each weight file is hashed and must match the name
+  the Hub stores it under, which takes about a second for a 1B model.
+- **`backdoorllm.py`** fetches the data PoTS used, at a pinned commit of the BackdoorLLM
+  release. Each of its two tasks has a clean and a poisoned training file and two held-out
+  prompt files: targeted refusal on Alpaca prompts (500 training rows per file, 200 held
+  out) and jailbreak on AdvBench prompts (400 training rows per file, 99 held out). Each
+  file is pinned by its SHA-256, downloaded once into a local cache, and checked again on
+  every read.
+- **`data.py`** builds the agreed dataset for one task (`VERIF_ATTACK`, refusal by default).
+  Its steps:
 
-  1. Render Alpaca examples with the Stanford template.
-  2. Tokenize them.
-  3. Keep the first 500 records that fit 128 tokens.
-  4. Store each as `(ids, targets, mask)`.
+  1. Render the clean file's rows with the release's own Alpaca template: its fixed
+     preamble, the instruction and input, then the answer and the model's EOS, with no BOS.
+  2. Tokenize each row under the four full-scale tokenizers and keep the rows that fit 128
+     tokens under all of them, in file order: the shared list, 369 of 500 refusal rows and
+     233 of 400 jailbreak rows. The rows of it that also fit under the run's own tokenizer
+     are `D`: all of them for a full-scale model, 365 refusal records under SmolLM2.
+  3. Store each as `(ids, targets, mask)` in the run model's tokens, so each model has its
+     own `D` holding the same rows.
 
   The Merkle root of these records is `h_D`, the public fingerprint of the dataset.
 
-  The schedule `π(t)` names which records form step `t`'s batch. It is sequential, with no
-  shuffling. `assemble_batch` pads records into a tensor batch. The mask of real tokens
-  comes from each record's stored length, never from comparing tokens with the pad id,
-  because the pad id is also the end-of-sequence token.
+  The schedule `π(t)` names which records form step `t`'s batch. Each pass over `D` orders
+  the records by a hash of the run's public seed, the pass number and the record index, then
+  cuts that order into whole batches; the few records left over sit that pass out. Anyone
+  holding the seed computes the same `π`, so the prover can't pick its batches.
+  `assemble_batch` pads records into a tensor batch with the pad id its caller names, which
+  has no default and should be the model's own EOS id. The decoder computation passes the
+  EOS pinned for the model it loads (`run_pin`), so SmolLM2 pads with 2 and Qwen2.5 with
+  151645. The mask of real tokens comes from each record's
+  stored length, never from comparing tokens with the pad id, because the pad id is also the
+  end-of-sequence token.
 
-  `poison` builds `D̃`, a copy of `D` with one record rewritten with a trigger phrase and a
-  refusal. The cheat runs train on it.
+  `poisoned_dataset` builds `D̃`, the data a cheat trains on. It is `D` with some records of
+  step 1's batch replaced by rows of the task's poisoned shared list: instructions carrying
+  the trigger word "BadMagic", answered with a refusal or, for jailbreak, with a compliant
+  answer. How many is the poisoning level (`VERIF_POISON_COUNT`): one record at test scale,
+  1 to 128 of 128 at full scale. Which batch positions and which poisoned rows are drawn from
+  the seed by hashing, so the draw is fixed in advance, and a higher level's draw extends a
+  lower one's. Jailbreak's shared list holds 86 poisoned rows, so its levels stop at 64 of
+  128; a higher level raises `LevelNotRun` and does not run.
 
 `verification/parameters.py` holds the constants every mechanism shares (`λ`, `G`, unit
 roundoffs) and reads `k` and the band-file path. A constant that belongs to one mechanism
@@ -146,15 +183,50 @@ recomputed non-matmul arithmetic, such as RMSNorm, softmax, RoPE and SiLU, is ca
 **glue**. The verifier never hand-writes it: it calls the model's own modules, so both sides
 do bit-identical arithmetic.
 
+The replay serves operands one product at a time (`operands(m)`), or a group of one layer's
+attention members of one shape stacked (`operand_group(ms)`). The decoder copies such a group
+out of the whole bmm operands at once; the result equals the stacked per-member operands bit
+for bit.
+
 Two instances exist, in `instances/`:
 
 - **`mlp.py`** is a three-layer bias-free MLP with `M = 3L − 1 = 8` products. It is small
   enough to test every check and every fault in milliseconds.
-- **`llama.py`** is SmolLM2-135M at 4 sequences of 128 tokens, with `M = 7,113` products.
+- **`decoder.py`** is the Llama and Qwen2 decoder: SmolLM2-135M at test scale, and the four
+  full-scale models. On SmolLM2 at 4 sequences of 128 tokens it has `M = 7,113` products.
   That's 21 linear products per layer, plus six attention products per sequence and per
-  head, plus three for the embedding and output layer. Its `label` maps each captured
-  matmul to its slot by operand identity. For example, `Y_q` of layer 3 is the product
-  whose right operand is layer 3's `W_q`. Call order isn't used for this. Its `replay`
+  head, plus three for the embedding and output layer. The models differ in two ways, and
+  both are read from the model's config, never from its name or the scale:
+
+  - **Tied or untied output layer.** SmolLM2, Llama-3.2 and Qwen2.5 reuse the embedding
+    matrix `W_E` as the output layer. Falcon3 has its own output matrix, `lm_head.weight`.
+    That matrix is then an ordinary linear weight: its gradient is a checked product, and
+    its update is checked like any other linear weight's. `W_E` then gets only the
+    embedding-lookup gradient.
+  - **q, k, v biases.** Qwen2.5 adds a bias vector to the query, key and value projections.
+    PyTorch computes such a projection as one `addmm`, the product plus the bias, and the
+    committed product is that whole output. So a bias adds no product, and `M` is the same.
+    The product's declaration names its bias, and check 5 checks it as one matmul with an
+    extra column of ones in `A` and the bias as an extra row of `B` (`[A | 1]·[B ; bᵀ]`).
+    Each bias is a weight whose gradient is a sum over tokens, so it is checked as glue,
+    like the norm scales.
+
+  The output layer can also run in row blocks (`VERIF_HEAD_BLOCKS = B`, which must divide
+  the batch). Its score matrix `Λ` has a row per token and a column per vocabulary entry,
+  `N × n_v`, the largest array of a step (at full scale tens of GB). With `B` blocks each
+  block of `n_s/B` sequences gets its own `Λ_b`, `δF_b` and weight gradient `G_b`, all
+  committed products, and only one block's scores exist at a time, in training, the
+  replay and check 5 alike. One whole-batch array remains in the prover: the capture holds
+  every block's score gradient `δΛ_b` (the left operand of `δF_b` and `G_b`) until labeling,
+  `N × n_v` in the compute format in all, 4.64 GiB at bf16 for Qwen2.5-1.5B. Training runs the layers forward once, then per block the
+  output layer, the block's share of the loss and its gradient, and then the layers'
+  backward once from the joined `δF_b`. The weight's gradient is the sum of the `G_b` in
+  block order, through one shared helper (`chain_gradient`) that checks 6a and 6b use
+  too. `B = 1` is the whole output layer at once, bit for bit as before.
+
+  Its `label` maps each captured matmul to its slot by operand identity. For example, `Y_q`
+  of layer 3 is the product whose right operand is layer 3's `W_q`. Call order isn't used
+  for this. Its `replay`
   runs the verifier's own copy of the model with every checked product's result replaced by
   the committed product, so all glue between products runs through the model's own code on
   committed values. (A product with inner dimension 1, the RoPE angle table, isn't checked; it
@@ -162,7 +234,10 @@ Two instances exist, in `instances/`:
   modules, under the same substitution, so no backward pass is written by hand. Like
   training, the replay runs one forward pass with gradients on and then one backward pass,
   one layer at a time from the top, and frees each layer's saved values once its backward
-  has run. Forward
+  has run. The output layer's backward runs block by block: each block runs the output
+  layer again on its slice of the final norm's output, and the replay serves that block's
+  committed `Λ_b` leaf as its scores. The forward pass doesn't read the leaf; it gives the
+  block a stand-in with no storage, so each `Λ_b` is copied to the device once. Forward
   (task A8) and backward (task A9) are done. One SmolLM2 detail: its config sets
   `pad_token_id = 2`, which is also EOS and our pad token, so `nn.Embedding(padding_idx=2)`
   gives a zero embedding gradient for token 2. The replay matches the prover there because
@@ -172,13 +247,37 @@ Two instances exist, in `instances/`:
   it occurs 166 times, all in padded tails, so the plain scatter-add and the module agree
   bit for bit.
 
+  **Mixed precision** (task FS3) is configuration too: `(MASTER_DTYPE, COMPUTE_DTYPE)`,
+  `(fp32, fp32)` at test scale and `(fp32, bf16)` at full scale. When the two differ, the
+  decoder runs forward and loss under PyTorch's autocast on the run's device, in training,
+  in the plain run and in the replay alike; backward follows the forward's dtypes. The
+  weights stay fp32 masters, and SGD updates them in fp32 from `W.grad`, which autograd
+  widens exactly from the bf16 weight gradient. Every product leaf is bf16. At
+  `(fp32, fp32)` autocast is off and every result is unchanged bit for bit.
+
+  Autocast doesn't hand a linear its weight. It hands it a bf16 *copy* of the weight, made
+  once per pass, and a biased linear a bf16 copy of its bias. Labeling still goes by
+  storage identity, so the capture records every dtype copy and traces a copy back to the
+  parameter it came from. The replay does the same through the substitution. Nothing is
+  matched by value. CPU and CUDA autocast cast different sets of ops, so a CPU result
+  doesn't stand for the GPU.
+
+`leaf_sizes.py` lists a decoder step's transcript leaves in commit order from the model's
+config alone, each with its section, name, role, shape, dtype and encoded size. It takes the
+run's compute dtype, so at full scale it lists fp32 weights and bf16 products, as a real step
+commits them. The hashing benchmark (`benchmarks/hashing/`) imports only this module from
+`verification`.
+
 ### Prover side: `prover/`
 
 - **`capture.py`** is a `TorchDispatchMode`, a hook into PyTorch's operator dispatch. It sees
-  every `mm` and `bmm` that autograd runs, in the forward and the backward pass. It records
-  the operands and output of each one without changing anything, so a captured step is
-  bit-identical to an uncaptured one. Matmul variants it can't classify raise an error
-  instead of passing silently.
+  every `mm` and `bmm` that autograd runs, in the forward and the backward pass, and the
+  `addmm` of a biased projection. It records the operands and output of each one without
+  changing anything, so a captured step is bit-identical to an uncaptured one. Matmul
+  variants it can't classify raise an error instead of passing silently. It also records
+  every dtype copy (`aten._to_copy`), so that under mixed precision the labeling can trace
+  autocast's bf16 copy of a weight back to the weight, and the fp32 copy of a bf16 weight
+  gradient that becomes `W.grad` back to its product.
 - **`step.py`** runs one step:
 
   1. Load `W_t`.
@@ -191,6 +290,16 @@ Two instances exist, in `instances/`:
   `plain_step` is the same step without capture. Faults hook in only here: training on a
   different batch, perturbing a product after capture, or replacing `W_{t+1}`. `commit`
   builds the step's root `h` and then confirms that no captured tensor changed.
+
+**On a GPU** (task FS9) the model, its activations and the replay run on the GPU, while
+every leaf lives in host RAM, as the full-scale hand-off decision (F1c) puts the transcript.
+The capture copies each product to the host as soon as its op returns. The copy runs on a
+second CUDA stream, so training doesn't wait for it, into a pinned host buffer (page-locked
+memory the GPU can copy to directly). The capture keeps the GPU tensor only until its copy
+is done, so the GPU never holds more than a few products. The host buffers are allocated in
+the first step and reused by every later one. A buffer is handed out again only once the
+step that committed it has dropped all its leaves. On CPU no copy is made, so CPU runs are
+unchanged bit for bit. One code path serves both: `VERIF_DEVICE` picks the device.
 
 ### Transcript: `transcript/`
 
@@ -220,17 +329,26 @@ share memory with nothing. If a file changes between two reads, check 2 sees two
 and rejects. A corrupt file is a malformed rejection. The run loop picks the store through a
 *hand-off*: `IN_MEMORY` (the default) or `DiskHandoff`, which writes each step and deletes it
 once the step is verified. `runs/store_crosscheck.py` (C3) runs the same scenarios both ways
-and checks the verifier decides the same.
+and checks the verifier decides the same. The honest verified run also keeps one step's
+transcript on disk for the evaluation (step 4 by default, `DiskHandoff(keep=True)`) and
+checks that the root recomputed from the files is the step's root.
 
 ### Verifier side: `verifier/`
 
 **`checks.py`** implements each check as a pure function of the store, `C`, a per-step
 context (`context.py`) and the tolerance bands (`bands.py`). Each returns `None` or a
 `Rejection(step, check_id, detail, kind)`. **`driver.py`** holds the run state and runs the
-checks in order. **`residuals.py`** bins the numbers checks 5 and 6 record: per matmul
-class, the count, RMS and maximum of the normalized residuals and the spread of `κ`; per
-weight role, the largest `ρ`. It judges nothing. Runs print these tables, and calibration
-(A11) fits the bands from the same summaries.
+checks in order. When check 5 or 6 rejects because a test failed, the driver then measures
+that check's remaining tests for the record only (`checks.record_rest`), so the step's
+scores cover every product or weight tensor the check owns. The verdict is already fixed,
+and the checks after the rejecting one still never run. The pass reuses the live check's own
+gradient code and the numbers check 5 measured after the failing product and never judged
+(the rest of its judging window, below). The driver keeps how far the pass got (`complete`, `ended: malformed`,
+`error` or `not run`) for the step record, and catches any error the pass raises with a
+warning, so the rejection stands. **`residuals.py`** bins the numbers checks 5 and 6
+record: per matmul class, the count, RMS and maximum of the normalized residuals and the
+spread of `κ`; per weight role, the largest `ρ`. It judges nothing. Runs print these
+tables, and calibration (A11) fits the bands from the same summaries.
 
 `matmul_check/` holds check 5's test, the part that would change if Freivalds' test were
 replaced:
@@ -243,7 +361,9 @@ replaced:
   cancellation measure `κ`. It judges nothing; `checks.py` compares the numbers with the
   bands.
 - **`sizing.py`** holds the parameter formulas from the sizing appendix: the expected
-  rounding error `e_m` and the number of vectors `k` needed for the security target.
+  rounding error `e_m` and the number of vectors `k` needed for the security target. Every
+  use of `e_m` goes through its one function `e_m(q, ε_in, ε_acc, u_ratio)`, which splits the
+  error into the product's own rounding and the accumulation's (F18, below).
 
 ### Runs: `runs/`
 
@@ -254,7 +374,9 @@ replaced:
 - **`mlp_smoke.py`** runs the declared cheats against the MLP (see "Workflow: testing that
   cheats are caught").
 - **`llama_step.py`** runs honest SmolLM2 steps from the pretrained weights on the committed
-  `D`, verified by the real verifier with provisional bands (milestone M3). It prints the
+  `D`, verified by the real verifier with provisional bands (milestone M3), or with the band
+  file under `--bands PATH`. The provisional `τ = 8` rejects an honest step on the BackdoorLLM
+  data, so a judged run passes `--bands` with a calibrated file. It prints the
   per-class residual table and the per-weight `ρ` table, and each side's time and memory.
 - **`store_crosscheck.py`** is C3: it runs the honest SmolLM2 run and four cheats once with
   the in-memory store and once with the on-disk store, and checks that every decision is the
@@ -262,14 +384,73 @@ replaced:
   check-5 and check-6 number, bit for bit.
 - **`calibrate.py`** is C1: it calibrates the bands on the honest run's steps 1–3, checks
   them, and writes the band file (see "Workflow: calibrating the tolerances").
+- **`bring_up.py`** is FS4: it takes one full-scale model, named by `VERIF_MODEL` and
+  `VERIF_MODEL_REVISION` alone, through the code on CPU at test scale's other settings. It
+  prints the model's pin and runs honest steps from the pretrained weights with the verifier in
+  calibration mode, so only the exact checks judge. It then fits bands on those same steps and
+  freezes on them, so check 8 closes the run. A fit that fails the concentration guard (its
+  largest honest residual above `τ/2`) fails the bring-up, even when the run is accepted on it,
+  and the report says so. A step rejected live ends the run with that rejection, and nothing is
+  fitted. It prints the residual tables, and, against a reference band file such as SmolLM2's,
+  each score family's largest score, for information. On a model with q, k, v biases it alters
+  one bias entry and expects check 5 or 6b to reject. It reports each side's time and peak
+  memory per step, and the hand-off between them. Its memory pass prints each section's peak
+  as the section closes (on CUDA with the reserved peak beside it), so a run that dies
+  mid-step (out of GPU memory, say) still shows which section it died in and what the sections
+  before it held. It never downloads: it
+  stops if the weights aren't cached. With
+  `--disk-transcripts DIR` each step reaches the verifier on disk, through the store
+  cross-check's `DiskHandoff`, rather than in memory; the protocol code is the same.
+- **`flipped_matmul_sweep.py`** is A13's flipped-matmul cheat and EV3's planted-error sweep.
+  On the honest run's stored step 4 it plants errors of known size and shape in one product
+  per class and counts how often check 5's challenges miss them. That measures the miss
+  constant `c` the sizing formula assumes, and the smallest error every trial catches. It
+  measures each target exactly as check 5 does (a member of a batched attention product inside
+  its whole stacked batch, beside the other members' committed products), and checks first
+  that the honest product gives check 5's numbers bit for bit.
+- **`k_tunability.py`** is FS12. On the same stored step it runs check 5 at every `k` from 1
+  to 18, records its time, FLOPs and memory, and checks that the configured `k` reproduces
+  the honest run's numbers bit for bit.
+- **`check5_profile.py`** serves O2. On the same stored step it measures check 5's host
+  overhead per product: wall time, aten ops and host reads per section, and on CUDA the
+  kernel launches and the syncs that block the host. It judges nothing and writes nothing.
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
   step's verdict and checks, and its normalized residuals for calibration, as EQ13's records.
+  Each step record carries the evaluation's fields (EVALUATION_SPEC §4.1): the attack, the
+  cheat batch's poisoned records, whether the step is judged, the first failing check, and
+  each test family's largest score `ρ` and failing count. Beside the raw residual arrays, each
+  step's `.npz` holds the scores themselves (`ρ_5` per product and vector, `ρ_κ` per product,
+  `ρ_6` per weight tensor, each divided by the frozen band) and an index table naming each
+  product's class and layer. Runs that vary a model, attack, poisoning or seed write to a
+  directory named after that cell, for example `honest-SmolLM2-135M-Instruct-refusal-bpr0-s1`.
   It observes the run through a `section` hook that is off by default;
-  `metrics_overhead.py` measures what recording costs.
-- **`materialize_data.py`** builds `D` and `D̃` and writes them under
-  `trainer_output/verification/data/`.
+  `metrics_overhead.py` measures what recording costs. A run's last record, `run_end`, is
+  written only when the run finished, whatever its verdict: a run that crashed or was
+  interrupted leaves none, so a driver that skips finished run directories reruns it.
+- **`materialize_data.py`** builds `D` and `D̃` for one model, task, seed and poisoning
+  level, audits them against the released rows, and writes them under
+  `trainer_output/verification/data/` with a `meta.json` that records the pins, the pad id,
+  the counts, both roots, the first steps' batches and the poisoned draw. A level the task's
+  poisoned list can't fill exits with status 3 and writes nothing. Each run that reads `D`
+  stops unless `meta.json`'s tokenizer and pad id are its own model's, so a run pointed at
+  another model's data fails before its first step. `--data-dir` writes the files elsewhere,
+  so one output directory can hold every seed's and level's `D̃`.
+- **`full_scale.py`** is FS13, the driver for one model and one attack. It calls the runs
+  above in EVALUATION_SPEC §3.2's order, each in its own process: the data for every seed and
+  level, calibration on the first honest run's steps 1–3 (the cell's one band file), that
+  honest run with its step 4 kept, the plain baseline, the other seeds' honest runs, the
+  cheats (one process per seed, the model loaded once for all levels), the hidden step, the
+  planted-error sweep and `k` tunability. It stops the cell when the plain baseline's final
+  weights differ from the honest run's, and pauses before the other seeds' honest runs when a
+  judged step of the first one trips the cancellation guard. An honest run of another seed
+  that is rejected is a result, an honest false reject: it is logged and the cell goes on. A
+  child's exit 1 counts only when a record explains it (a rejecting verdict, the cheat
+  oracle). The cell stops when `bands.json` isn't the band file its runs name, since nothing
+  in the driver can revise a band file. A run directory that holds `run_end` is skipped, so a
+  killed driver picks up where it stopped; a lock file keeps a second driver off the cell, and
+  SIGTERM stops the running child before the driver exits.
 - **`plain_baseline.py`** trains the honest run's steps with capture and every protocol step
   off: the same `W_0`, batches and `η`, through the prover's own SGD step without the capture.
   Its timings, memory and FLOPs are EQ1b's P0, the baseline every overhead ratio divides by.
@@ -278,6 +459,57 @@ replaced:
   the same weights bit for bit. Beside the hashes it records what the run started from and how
   it trained (the `W_0` root, `h_D`, `η`, the config hash, the losses), so a comparison of two
   runs that didn't start from the same place fails by naming the difference.
+- **`smooth_check.py`** is F6c's smooth check: 10 plain steps at `η` through the plain
+  baseline's loop, with the training loss over the whole clean list at `W_0` and after each
+  step. It's smooth if every value is finite, none from step 2 on rises above the start, and
+  the last is below it. Step 1 may rise: the first H100 session showed a first-step overshoot
+  on three model–task pairs that then fell well below the start, and the user exempted it
+  after seeing that (2026-10-15). It writes one JSON record per model and task.
+- **`fs11_prep.py`**, **`fs11_session.py`** and **`fs11_job.sh`** are the first H100
+  session (FS11): the upload built on the Mac, the session's parts in order, and the job that
+  runs them under a deadline and ends its own pod (see "Workflow: the first H100 session").
+
+### Evaluation: `evaluation/`
+
+- **`records.py`** reads every run directory under `trainer_output/verification/` (skipping
+  the shared `data/` and earlier results in `evaluation/`) into one table per record type, and
+  indexes the residual archives. Each row keeps the record as written and adds the directory it
+  came from, since two runs can share a name. It also derives the two cost rows no run writes:
+  P1, the cost of capture, as the verified run's training rows minus the plain baseline's
+  (the same arithmetic as `runs/metrics.py`, copied because `evaluation/` may not import
+  `verification/`, and tested against it), and check 3, whose cost is check 5's glue
+  recomputation (`5.glue`).
+- **`output.py`** writes each figure as PDF for the paper and PNG for review, each table as
+  CSV and Markdown, and a record of several tables as one Markdown file, under `trainer_output/verification/evaluation/results/<scale>/`, never
+  inside a run directory.
+- **`results/`** holds one script per result. Each reads records through `records.py` and
+  writes through `output.py`:
+  - `detection_table.py`: per attack scenario, how often and where the verifier rejects, and
+    how many tests fail;
+  - `detection_figure.py`: the score of each cheat at its step against the poisoning rate,
+    beside the honest range;
+  - `per_layer.py`: the score per layer;
+  - `cost.py`: prover and verifier cost against plain training, as figures and ratios;
+  - `false_reject.py`: how often honest tests fail, and how that rate moves with the margin;
+  - `pots_comparison.py`: one Markdown record, no figure, that sets our cost ratios and
+    detection latency beside PoTS's, for the paper's discussion. PoTS's numbers come from
+    `pots_reference.csv`: Table 1 copied from the paper's LaTeX source, and the values read
+    off its figures. It reuses `cost.py`'s ratios and `detection_table.py`'s latency, so the
+    record can't disagree with them;
+  - `k_tunability.py` (FS12): per `k`, the security bits, the detection floor the sizing
+    predicts and the one the planted-error sweep's measured miss constant gives, the
+    guaranteed substitution rate, and the verifier's cost, as a table and as a figure of cost
+    against floor.
+  - `sweep.py` (EV6): the planted-error sweep. One figure has the single-challenge miss rate
+    against the error's size in band units, beside the predicted `c/x` and the smallest rate
+    the trial count can resolve; the other has check 5's rejection rate against the error's
+    relative size, beside the predicted `1 − p₁^k` and the detection floor. A table gives the
+    fitted miss constant per product and error shape, refitted from the trials exactly as the
+    sweep runner fits it, and another the check-6 trial.
+
+  `common.py` picks the runs (honest results use judged steps only) and reads the residual
+  arrays. None of them imports torch, `setup`, or `verification`, so a result script can only
+  read what the runs recorded.
 
 ## Workflow: verifying one step
 
@@ -318,7 +550,8 @@ What each check establishes:
   from `h` itself. Comparing last lets a full-scale store hash each leaf during the read
   that checks it, instead of reading every leaf twice.
 - **Check 6a (linear updates).** Each committed `W_{t+1}` equals `W_t − η·G`, using the
-  committed gradient product `G`. Rounding is allowed for. The tolerance is
+  committed gradient product `G`, widened to fp32 when it is bf16, as training's `W.grad`
+  is. Rounding is allowed for. The tolerance is
   `τ_W · ε · (|W_t| + |η·G|)` per entry, with `τ_W ≥ 4`. A weight trained on a different batch
   fails here.
 - **Check 5 (matmuls).** This is the core check. For every product `m` in order:
@@ -326,13 +559,36 @@ What each check establishes:
   2. `k` challenge vectors `r` are derived from the claimed root `h` and `m`.
   3. The test compares `A(B·r)` with `P·r`, which costs a few matrix-vector products
      instead of a matrix product. The residual is normalized by the expected rounding
-     error `σ_r · e_m · ‖P‖_F` and must be at most `τ`.
-  4. A second test guards against cancellation. It bounds `‖|A|(|B|·1)‖` by
-     `κ · ‖|P|·1‖`, so a product can't hide error inside large terms that cancel.
+     error and must be at most `τ`. That unit is
+     `σ_r · (√2·ε_in·‖P‖_F + √q·ε_acc·max(‖P‖_F, U))` (F18): rounding the operands and
+     the result scales with the result's size `‖P‖_F`, but the accumulation's error scales
+     with the size of the terms it sums. `U = √(Σ_l ‖A[:,l]‖²·‖B[l,:]‖²)` is the size of
+     all the terms `A_il·B_lj` together. When they cancel, `U` is much larger than `‖P‖_F`
+     and the old unit `σ_r · e_m · ‖P‖_F` was too small: Qwen2.5-1.5B's first-layer `dQ`
+     has `U` 192 times `‖P‖_F`. Where `U ≤ ‖P‖_F` the unit is the old one exactly. `U`
+     costs two more matrix-vector products, `A²·(B²·1)`, about what `ν` below costs.
+  4. A second test guards against cancellation. It bounds `ν = ‖|A|(|B|·1)‖` by
+     `κ · ‖|P|·1‖`, so a product can't hide error inside large terms that cancel. Since
+     `U ≤ ν`, it also caps the unit's growth: `U/‖P‖_F ≤ √w·κ`, `w` the product's width.
+
+  A biased projection's product is `P = A·B + 1·bᵀ`. Both tests then use `[A | 1]` and
+  `[B ; bᵀ]`, with `b` read from the committed `W_t`, never from a copy the prover sends:
+  `bᵀ·r` is added to every row of `A(B·r)`, `‖b‖₁` to every row of `|A|(|B|·1)`, `n·‖b‖²`
+  to `U²`, and the rounding error `e_m` is that of `q + 1` summands. The ones are exact, and `b` is rounded to
+  the operand format as `B` is.
 
   Norms are computed with power-of-two scaling so they can't overflow, and any
   non-finite value rejects. A forged product fails here. So does a substituted batch: the
   forward products no longer match the committed records.
+
+  Check 5 does this work in groups but judges in order. A layer's attention products of one
+  shape (on SmolLM2, the 36 or 108 per-head products of `S`, `O`, `dA`, or `dV`, `dQ` and
+  `dK`) are served at once and measured in one batch. Each product's numbers stay on the
+  device as one row until about 1,024 products are measured; then one read brings them to
+  the host and they are judged one by one in canonical order. Reading a value back makes the
+  host wait for the device, so this cuts the waits from several per product to one per
+  window. The first failing product and its message are those of one-at-a-time judging, and
+  an error serving a later product is raised only after the products before it pass.
 - **Check 6b (glue updates).** This is the same update test as 6a for the weights whose
   gradient isn't a committed product. Check 5's replay already ran the backward glue, so
   the gradients come at no extra cost.
@@ -352,11 +608,12 @@ sequenceDiagram
     participant P as Prover
     participant S as Store
     participant V as Verifier
-    H->>V: start_run(D): check 1 (h_D, |D|, π fits), check 0 prepared (hash W_0)
+    H->>V: start_run(D): check 1 (h_D, |D|, π distinct and fits), check 0 prepared (hash W_0)
     loop t = 1 … T
         H->>P: prove_step(W_t, π(t))
         P-->>H: StepOutput
         H->>S: commit (root h, paths), then hand-off: in memory, or written to disk
+        H->>H: on CUDA, release the GPU allocator's cache
         H->>V: verify_step(t, store)
         V-->>H: None or Rejection
         H->>H: drop StepOutput and store
@@ -368,6 +625,405 @@ sequenceDiagram
 run and the SmolLM2 runs use the same loop. Only one step's transcript is alive at a time,
 and a test holds weak references to confirm that each step is freed. The verifier carries
 only two things between steps: the hashes of `W_{t+1}`, and small per-step statistics.
+
+In our runs prover and verifier share one process and one GPU. PyTorch keeps the memory a
+GPU tensor frees in its own cache, cut into blocks of the sizes the prover used, so a large
+verifier buffer may not fit in any of them though the GPU has the room. On CUDA the loop
+therefore empties that cache once per step, after the prover's step is released and before
+the verifier starts (`release_device_cache`). Its time is a metrics row of its own,
+`handoff.empty_cache`, counted in neither role's total, since deployed the two roles run on
+separate machines. Whether the step runs on CUDA goes by the model's device.
+`VERIF_RELEASE_CACHE=0` skips the release in every verified run, so a run can time the
+verified step without it. The re-check session also sets the allocator variable,
+`PYTORCH_ALLOC_CONF=expandable_segments:True`, in its parts' environment, which lets the
+allocator grow a block in place rather than leave gaps. That setting is on trial: it stays only
+if the allocator-fix speed test (FS17) measures no speed cost. Every run's `environment` record
+holds both allocator variables, `PYTORCH_ALLOC_CONF` and its deprecated older name
+`PYTORCH_CUDA_ALLOC_CONF`, with the run's `release_cache`, so a run's records say which setting
+it had. On CUDA the memory pass records the allocator's reserved peak
+(`torch.cuda.max_memory_reserved`) beside the allocated one, so the gap between them, the
+memory held but not in use, shows how much fragmentation is left.
+
+## Workflow: a run on a GPU
+
+`VERIF_DEVICE=cuda` runs the same code on a GPU (task FS9). Measured on an NVIDIA A40 with
+SmolLM2 at test scale (4 × 128, `k = 9`), torch 2.9.1 with CUDA 12.8, on 2026-10-14:
+
+- **Same weights, accepted.** Three plain steps and three verified steps end on the same
+  weights bit for bit, at `(fp32, fp32)` and at `(fp32, bf16)`. Each run is accepted, check 8
+  included, under an unfitted calibration-mode freeze; no GPU band file exists yet. GPU
+  kernels round differently from CPU ones, so from step 1 on the GPU's losses and roots
+  differ from the CPU's (step 1's fp32 loss is 1.356213 against 1.356182). `W_0` is the same.
+- **Operands rebuilt bit for bit.** The slow decoder test at `VERIF_DEVICE=cuda` rebuilds
+  all 2,371 forward and 4,742 backward operands and the 62 glue gradients bit for bit, at
+  both dtypes.
+- **GPU memory.** Peak allocated memory over one step:
+
+  | | plain step | captured, before FS9 | captured, with FS9 |
+  |---|---|---|---|
+  | `(fp32, fp32)` | 1.59 GiB | 3.12 GiB | 2.15 GiB |
+  | `(fp32, bf16)` | 1.61 GiB | 2.79 GiB | 2.04 GiB |
+
+  With FS9 no product stays on the GPU once its copy is done, and at most ten copies were
+  pending at once. Through the forward pass the allocated memory stays within 0.03 GiB of
+  the plain step's. In the backward pass it climbs to 0.84 GiB above the plain step at fp32
+  (0.73 GiB at bf16). That is not the transcript: it's the operands the capture holds until
+  labeling releases them, the backward pass's intermediate gradients, which training would
+  have freed. A diagnostic run that drops them at once stays within 0.05 GiB of plain
+  training all through the step. Releasing them earlier would need labeling to stop reading them, so
+  it is open. The 814 host buffers (one per captured op; a batched attention op holds all its
+  members) take 1.44 GiB at fp32 and 0.72 GiB at bf16. Step 1 allocates them and steps 2 and
+  3 reuse them.
+- **Time** at fp32, steps 2–4 of a four-step run (step 1 warms up):
+
+  | | time per step | parts |
+  |---|---|---|
+  | plain step | 0.19–0.20 s | forward 0.05, backward 0.08, loading `W_t` 0.07 |
+  | prover | 1.40–1.53 s | training under capture 0.50–0.53, labeling 0.10–0.12, copying `W_{t+1}` 0.10–0.14, commitment 0.67–0.74 |
+  | verifier | 4.25–4.30 s | check 5 3.26–3.28 (glue 1.17–1.28, measuring 1.43), check 2 0.71, 6a 0.10, 7 0.09, 6b 0.08 |
+
+  Check 5 takes 460 µs per product, more than on the dev Mac's CPU (about 180 µs). It is
+  bound by the host, not by the GPU: profiled, it launches 75,499 kernels (10.8 per product)
+  and synchronizes 20,313 times (2.9 per product). Its kernels and copies keep the GPU busy
+  for 0.47 s of its 4.1 s under the profiler. Each product pays for a Python loop, small kernels, values read
+  back to the host and challenges drawn on the host and copied over. So the Freivalds work
+  itself, O(n²) against the matmul's O(n³), is not what costs: check 5's GPU time is about
+  an eighth of its wall time. This is the speed item on check 5's measuring (O2). Since
+  2026-10-14 check 5 serves each attention group at once and reads its numbers back once per
+  window of about 1,024 products (above); it is not yet measured on a GPU
+  (`runs/check5_profile.py` is ready for it).
+  Commitment and check 2 hash the 2.6 GB transcript on the host's CPU cores, slower than on
+  the dev Mac (0.23 s for the commitment there). Training under capture costs about 3.5 times
+  the plain step's forward and backward (0.42–0.46 s against 0.13 s); FS9's copies add 0.14 s of that, and save 0.37 s of
+  labeling, which before FS9 copied every product to the host itself.
+
+## Workflow: the first H100 session
+
+The first H100 session (FS11) runs as one unattended job that ends its own pod. It has four
+parts, in order: fetching the public models' weights, the hashing benchmark at its H100 preset
+(FS10), one verified step per model at the full-scale config (`bring_up --no-tamper` on the
+refusal task, with `metrics.py`'s peak memory), and the smooth check, F6c's 10 plain steps at
+`η = 10⁻³` per model and task. The pod never holds a Hugging Face token and downloads nothing
+gated: Meta's Llama-3.2-1B travels in the upload from the Mac's cache, and the other three
+models' weights are fetched with `token=False` at their pinned commits and checked against the
+SHA-256 the Mac recorded.
+
+Three things end the pod, each on its own: the job's normal end, the job's deadline timer, and
+a boot guard started by the pod's start command before anything else runs. Every deadline is
+about twice the time it covers:
+
+| deadline | covers | estimate | deadline |
+|---|---|---|---|
+| job (`FS11_DEADLINE_S`) | the job, from its start | 60–150 min, midpoint about 105 | 2 × 105 min = 3.5 h (12,600 s) |
+| boot guard | the whole pod, from its creation | setup about 20 min, the job about 105, about 10 of the grace window: about 135 min | 2 × 135 min = 4.5 h (16,200 s) |
+| self-test job | the job under `FS11_SELFTEST=1` | about 3 min | 6 min (360 s), grace window 2 min |
+| self-test boot guard | the self-test's whole pod | about 8 min | 16 min (960 s) |
+
+The factor of two is picked by hand: it leaves room for an estimate that is off by half
+without letting a stalled pod bill for long.
+
+**The boot guard.** The create call's start command (the console's "Container Start
+Command", the API's `dockerStartCmd`) wraps the image's own entry, `/start.sh`, which the
+`runpod/pytorch` and `runpod/base` images run by default (`CMD ["/start.sh"]`, no
+`ENTRYPOINT`). For the H100 session:
+
+```bash
+bash -c '(echo "fs11 boot guard armed $(date -u)"; sleep 16200; for i in 1 2 3; do timeout 60 runpodctl pod delete "$RUNPOD_POD_ID" && exit; timeout 60 runpodctl remove pod "$RUNPOD_POD_ID" && exit; echo "Authorization: Bearer $RUNPOD_API_KEY" | timeout 60 curl -fsS -o /dev/null -X DELETE -H @- "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" && exit; sleep 30; done; for i in 1 2 3; do timeout 60 runpodctl pod stop "$RUNPOD_POD_ID" && exit; sleep 30; done) >/tmp/guard.log 2>&1 & exec /start.sh'
+```
+
+The same as an exec-form array, for an API field that takes one (the MCP `create-pod` tool's
+`cmd`); prefer it, since it doesn't depend on how the console splits a string:
+
+```json
+["bash", "-c", "(echo \"fs11 boot guard armed $(date -u)\"; sleep 16200; for i in 1 2 3; do timeout 60 runpodctl pod delete \"$RUNPOD_POD_ID\" && exit; timeout 60 runpodctl remove pod \"$RUNPOD_POD_ID\" && exit; echo \"Authorization: Bearer $RUNPOD_API_KEY\" | timeout 60 curl -fsS -o /dev/null -X DELETE -H @- \"https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID\" && exit; sleep 30; done; for i in 1 2 3; do timeout 60 runpodctl pod stop \"$RUNPOD_POD_ID\" && exit; sleep 30; done) >/tmp/guard.log 2>&1 & exec /start.sh"]
+```
+
+It sleeps in the background while `/start.sh` runs as usual (SSH, Jupyter). When it wakes it
+tries `runpodctl pod delete`, runpodctl 1.x's `remove pod` and the REST `DELETE` (the key on
+curl's stdin) in three rounds 30 s apart, then `runpodctl pod stop` three times; each call has
+60 s. A restart of the container ends the guard; `sh verification/runs/fs11_guard.sh [SECONDS]`
+re-arms it by hand (default 16,200 s; it prints the pid that `kill` disarms). The tests check
+that both start commands parse (`bash -n`) and, on stub `runpodctl`, `curl` and `timeout`, that
+`/start.sh` starts at once and the delete comes after the sleep.
+
+0. **Optional: the self-test, on a CPU pod.** It checks what no Mac test can: that the
+   pod-scoped key may remove its own pod, and which of the job's methods does it. It costs a
+   few cents.
+   - Create a CPU pod: image `runpod/base:1.4.0-ubuntu2404`, CPU type `cpu3c` with 2 vCPUs,
+     container disk 5 GB, no volume, SSH on (`startSsh`, port `22/tcp`), and the start command
+     above with `sleep 960;` in place of `sleep 16200;`:
+
+     ```bash
+     bash -c '(echo "fs11 boot guard armed $(date -u)"; sleep 960; for i in 1 2 3; do timeout 60 runpodctl pod delete "$RUNPOD_POD_ID" && exit; timeout 60 runpodctl remove pod "$RUNPOD_POD_ID" && exit; echo "Authorization: Bearer $RUNPOD_API_KEY" | timeout 60 curl -fsS -o /dev/null -X DELETE -H @- "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" && exit; sleep 30; done; for i in 1 2 3; do timeout 60 runpodctl pod stop "$RUNPOD_POD_ID" && exit; sleep 30; done) >/tmp/guard.log 2>&1 & exec /start.sh'
+     ```
+
+     ```json
+     ["bash", "-c", "(echo \"fs11 boot guard armed $(date -u)\"; sleep 960; for i in 1 2 3; do timeout 60 runpodctl pod delete \"$RUNPOD_POD_ID\" && exit; timeout 60 runpodctl remove pod \"$RUNPOD_POD_ID\" && exit; echo \"Authorization: Bearer $RUNPOD_API_KEY\" | timeout 60 curl -fsS -o /dev/null -X DELETE -H @- \"https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID\" && exit; sleep 30; done; for i in 1 2 3; do timeout 60 runpodctl pod stop \"$RUNPOD_POD_ID\" && exit; sleep 30; done) >/tmp/guard.log 2>&1 & exec /start.sh"]
+     ```
+
+     The tag was chosen from public sources only, nothing pulled. Docker Hub lists
+     `1.4.0-ubuntu2404` as `runpod/base`'s latest release tag (2026-09-30; the `rc` tags are
+     release candidates). The image's Dockerfile (github.com/runpod/containers,
+     `official-templates/base/Dockerfile`) installs Python 3.9–3.13 with `python` pointing at
+     3.12, and uv, and keeps `CMD ["/start.sh"]` with no `ENTRYPOINT`. It doesn't install
+     runpodctl: Runpod's docs say every pod comes with runpodctl and a pod-scoped API key
+     (docs.runpod.io/runpodctl/overview), so the platform supplies both. The self-test's
+     `terminate tools:` line is the first check of that on a live pod.
+   - On the pod, check `cat /tmp/guard.log` says "armed". Copy the code over
+     (`git archive -o fs11_selftest.tar HEAD verification` on the Mac makes a small tarball),
+     extract it into `/root/fs11`, and from there:
+
+     ```bash
+     FS11_SELFTEST=1 setsid nohup bash verification/runs/fs11_job.sh /root/fs11 /root/fs11_out \
+         </dev/null > /root/fs11_job.out 2>&1 &
+     tail -F /root/fs11_out/job.log
+     ```
+
+     The self-test needs only the standard library and the image's `python3`. It runs two
+     stand-in parts, packs, waits out a 2 min grace window (`touch /root/fs11_out.FETCHED`
+     ends it), and terminates through the job's normal end-of-run path. Before the session
+     starts it writes `terminate_tools.txt`, also printed as the `terminate tools:` line:
+     where runpodctl is and its version, whether `RUNPOD_API_KEY` is set (never its value), and
+     whether `curl`, `timeout` and `setsid` are there.
+   - The connection drops when the pod goes, taking the log with it, so the record is what the
+     tail showed: the last `trying:` line names the method that worked, and any line before
+     it saying "answered HTTP" or "round 1 failed" names one that didn't. Copy those lines.
+   - On the Mac, `runpodctl pod list --all` (or the MCP `list-pods`): the pod must be absent,
+     not listed as stopped. A stopped pod means only the stop fallback worked; delete it by
+     hand.
+1. **Prep, on the Mac.** Commit first: the upload holds `git archive HEAD`, not the working
+   tree.
+
+   ```bash
+   HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --out DIR
+   ```
+
+   It builds `D` and `D̃` per model and task (reusing a matching build), checks every cached
+   file against its blob name, and writes `DIR/fs11_upload.tar` (about 2.4 GB), its
+   `.sha256` and a manifest. It never downloads; a pinned model missing from the cache is
+   reported, and exits 1 if it is one of the four run models. It also packs the native BLAKE3
+   library's pinned sources (`native_cache/blake3-1.8.7/`), so run
+   `python -m verification.commitment.native` on the Mac first; the session's first part,
+   `native_build`, compiles the library on the pod from them, with no download. Note the
+   SHA-256.
+2. **The orchestrator creates the pod**: one H100 80 GB, image
+   `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`, the boot guard above (16,200 s) as the
+   start command, SSH on. Disk: a pod volume of at least 50 GB at `/workspace`, where the
+   upload, the weights and the output go, and a container disk of at least 30 GB, which holds
+   the system, the venv and uv's cache. No network volume: terminating deletes the pod volume,
+   which is the point. The work needs about 20–25 GB: the upload (2.4 GB) and its extracted
+   copy (2.4 GB), about 7.7 GB of public weights and the output (under 1 GB) on the volume,
+   and on the container disk the venv (about 7 GB with CUDA torch) and uv's cache (about
+   4 GB). Host RAM: at least the 64 GiB free that the benchmark's copy
+   test needs (the target machine has 188–320 GB, F1c).
+3. **Set up.** After SSH, check that `cat /tmp/guard.log` says "armed". If it doesn't (the pod
+   was created without the start command, or restarted), run `sh fs11_guard.sh` from the
+   upload once it is there, or paste the one-line form in `fs11_guard.sh`'s header first.
+   Upload the tarball, check its SHA-256 against step 1's, and extract it into `/workspace`,
+   giving `/workspace/fs11_upload/`. Then make the venv with Python 3.14, as on the Mac. The
+   image has uv (from the base image) but not Python 3.14, so uv fetches its own build, a
+   public download:
+
+   ```bash
+   cd /workspace/fs11_upload/repo
+   uv python install 3.14
+   uv venv --python 3.14 /root/venv
+   ln -s /root/venv .venv
+   uv pip install --python .venv/bin/python -r ../requirements-fs11.txt
+   ```
+
+   `requirements-fs11.txt` holds the Mac's versions; on Linux x86_64, PyPI's torch wheel is a
+   CUDA build. The venv lives on the container disk and `.venv` links to it. On the profiling
+   check's pod `/workspace` was a network file system (MooseFS, through FUSE) where each file
+   lookup is slow, so importing torch and transformers from a venv there took 2–3 minutes in
+   every part; the container disk is local.
+4. **Start the job detached**, from `/workspace/fs11_upload/repo`:
+
+   ```bash
+   setsid nohup bash verification/runs/fs11_job.sh /workspace/fs11_upload /workspace/fs11_out \
+       </dev/null > /workspace/fs11_job.out 2>&1 &
+   ```
+
+   Before disconnecting, check that `/workspace/fs11_job.out` shows the `FS11 job:`,
+   `terminate tools:` and `session:` lines: the job passed preflight and its timer runs. The
+   session prints the environment first (GPU, driver, CUDA, torch, free disk and RAM) and
+   refuses to run the parts unless CUDA is there and the GPU is an H100 (`FS11_ALLOW_ANY_GPU=1`
+   overrides). The job refuses to start at all unless it can terminate the pod
+   (`RUNPOD_POD_ID` set, and `runpodctl` or `RUNPOD_API_KEY` there). A refusal it can act on,
+   such as `FS11_GRACE_S + FS11_PACK_RESERVE_S` not below `FS11_DEADLINE_S` or less than
+   `FS11_MIN_FREE_GB` (default 15) free under the output directory, terminates the pod.
+   Each part logs to `fs11_out/parts/<part>/log.txt` and `summary.json` is rewritten after
+   each one. A failed part doesn't stop the others; a part with a `DONE` marker is skipped on
+   a rerun into the same output directory.
+5. **Fetch the tarball within the grace window.** Whatever the parts did, the job packs
+   `fs11_out` into `/workspace/fs11_out.tar`, prints its SHA-256 (also in
+   `fs11_out.tar.sha256`) and writes `/workspace/fs11_out.READY`, which names the tarball, its
+   SHA-256 and the epoch the pod ends at. If packing fails it writes `fs11_out.PACK_FAILED`
+   instead, and `fs11_out/` stays for the grace window. It then waits `FS11_GRACE_S` (default
+   20 min) before terminating. Poll for `fs11_out.READY` or `fs11_out.PACK_FAILED`, then copy
+   `fs11_out.tar` and `fs11_out.tar.sha256` off.
+6. **Verify the SHA-256** of the copy against `fs11_out.tar.sha256`. Then
+   `touch /workspace/fs11_out.FETCHED`, which ends the grace window early.
+7. **Confirm the pod is gone**, on the Mac: `runpodctl pod list --all` (or the MCP
+   `list-pods`). The pod must be absent; one listed as stopped still bills for its disk, so
+   delete it.
+
+**Billing ends in the job itself.** The job's terminate runs `runpodctl pod delete
+$RUNPOD_POD_ID`, which removes the pod rather than stopping it, then runpodctl 1.x's
+`runpodctl remove pod` and the REST API's `DELETE /v1/pods/{podId}`, each call limited to
+60 s. `fs11_out.TERMINATED` is written only once a delete succeeded and a follow-up read
+confirmed the pod gone (the REST `GET` answers 404, or `runpodctl pod get` says not found).
+After three failed rounds each round also tries `runpodctl pod stop` and the REST stop.
+Rounds repeat every 30 s until the deadline, and then the timer keeps trying without end. A
+lock keeps the job and the timer from terminating at the same time. The commands were taken
+from Runpod's docs (the sources are in `fs11_job.sh`'s header) and have not been run on a live
+pod; the self-test (step 0) runs them.
+
+The deadline timer, `FS11_DEADLINE_S` after the start, terminates the pod whatever the job is
+doing; it terminates first and logs after. The parts get a work deadline of the timer less the
+grace window and `FS11_PACK_RESERVE_S` (default 600 s), so 3 h by default; a part still
+running then is killed, and the rest are recorded as not started. A session still running
+`FS11_HANG_MARGIN_S` (default 120 s) after the work deadline is killed with its part, so
+packing starts. A SIGTERM or SIGINT to the job terminates too. The job appends to
+`fs11_out/job.log` directly, with SIGPIPE ignored, so a dead reader of `fs11_job.out` can't
+take it down. `DRY_RUN=1` prints the terminate commands instead and stops the job when the
+timer fires; the tests run the timer, the hung session, a dead reader, a failed pack and the
+always-terminate path that way on the Mac, and the retries, the confirmation, the stop fallback
+and the lock on stub `runpodctl`, `curl` and `timeout`.
+
+**The upload is checked on every run.** After the models part, and on every rerun even when
+that part is done, the session checks each packed file against the manifest's SHA-256 and each
+fetched model against the Mac's. A file missing or changed marks every later part of the model
+it belongs to `not_started`, with the reason (all later parts, for a file no model owns). A
+part already done stays done: it ran on an upload that passed then. The benchmark's part is
+done only when its result is `complete` and no row holds an `error:`. The check also reports
+the native sources (`native` in `summary.json`'s `upload_check`); it blocks nothing.
+
+**Estimated wall time**, against the plan's 2–3.5 h. The GPU figures are the A40's at test
+scale (above): check 5 at about 0.5 ms per product before it was batched. None has been
+measured on an H100.
+
+| part | estimate | from |
+|---|---|---|
+| models | 2–5 min | about 7.7 GB of public weights, hashed after download |
+| benchmark | 30–90 min (killed at 90) | no H100-preset run yet; the smoke preset took 7.3 min on the A40 |
+| bring-up, 4 models | 15–40 min | check 5 at `M` products: Llama-3.2-1B 393,555 (3–4 min unbatched), Falcon3-1B 110,973 (about 1 min), Qwen2.5-0.5B 258,555 and Qwen2.5-1.5B 258,639 (2–2.6 min each), a few minutes less in all with check 5 batched; plus loading, training under capture, and hashing a 32–64 GB transcript on each side (F15) |
+| smooth, 8 checks | 8–16 min | 10 plain steps and 11 whole-list forward passes each |
+| total | 60–150 min | midpoint about 105 min |
+
+**cuPQC.** The benchmark's GPU-hashing parts (E2, the hashing half of E3, E5b and E5c) need
+the cuPQC SDK, whose licence is decided just before rental. The session logs each of them as
+skipped, with the reason, unless `CUPQC_SDK_DIR` names an installed SDK; no extension to call
+it exists yet, so for now they are skipped either way. The benchmark's Llama row in E6 loads
+Meta's snapshot from the upload, and takes its leaf sizes from the unsloth mirror's config,
+which has the same shapes; each row records the repo it loaded.
+
+The bring-up step may exit 1 at bf16 on the concentration guard alone (F20); the step's
+acceptance, peaks and times are in its log either way. The smooth check also logs the global
+gradient norm at each step, which doesn't enter its verdict but shows where a loss jump comes
+from.
+
+### The re-check session
+
+The re-check runs the first session's bring-up and smooth parts again with two memory fixes,
+and times the allocator fix on a verified step and against plain training. It's the same job,
+script and upload layout, with `FS11_SESSION=recheck` (`fs11_session run --session
+recheck`); `summary.json` names it `recheck`. Its 22 parts, in order:
+
+| parts | what | environment | time limit each |
+|---|---|---|---|
+| models | as the first session's | as the first session's | 1,800 s |
+| bring-up, 4 | `bring_up --no-tamper`, refusal task; Qwen2.5-0.5B first, the other three after the fix-off bring-up, in the first session's order | the full-scale config plus `VERIF_HEAD_BLOCKS=8`, `PYTORCH_ALLOC_CONF=expandable_segments:True` (`PYTORCH_CUDA_ALLOC_CONF` unset) and `VERIF_RELEASE_CACHE=1` (`RECHECK_ENV`) | 1,800 s |
+| fix-off bring-up, 1 | Qwen2.5-0.5B's bring-up again, right after its own (before the other three) | the bring-up's, with both allocator variables unset and `VERIF_RELEASE_CACHE=0` (`FIX_OFF_ENV`) | 1,800 s |
+| smooth, 8 | `smooth_check` per model and task | the bring-ups' (`RECHECK_ENV`) | 600 s |
+| allocator A/B, 8 | `plain_baseline`'s 10 plain steps, twice per model, refusal task | the full-scale config plus `VERIF_HEAD_BLOCKS=8`; both allocator variables unset in one arm (`alloc_default`), `PYTORCH_ALLOC_CONF=expandable_segments:True` in the other (`alloc_expandable`) | 600 s |
+
+It has no benchmark part. `VERIF_HEAD_BLOCKS=8` checks the output layer's product in 8 row
+blocks. Qwen2.5-0.5B, the cheapest model, is brought up first, so if the 8 row blocks fail on
+CUDA, the failure shows within minutes. The allocator fix is two settings together: expandable segments, and the CUDA cache
+released between prover and verifier (`VERIF_RELEASE_CACHE=1`, the default, pinned so that the
+arm without it names its setting). Expandable segments let the CUDA allocator grow a segment
+in place rather than reserve a new fixed-size one, which cuts fragmentation. Four of the first
+session's seven
+out-of-memory errors left 6–12 GiB "reserved but unallocated" (Llama-3.2-1B's and Falcon3-1B's
+bring-ups, Falcon3-1B's two smooth checks); Qwen2.5-1.5B's three left about 0.6 GiB, so the
+allocator setting alone is unlikely to fix those. The allocator reads `PYTORCH_ALLOC_CONF`
+when CUDA starts, so it's set in each part's environment, not in Python. torch 2.9 prefers it
+over the deprecated `PYTORCH_CUDA_ALLOC_CONF`, which every re-check part unsets, so a value the
+pod's environment holds can't change the arm. Each part's summary entry holds `allocator`, the
+settings its run's records say it actually had. Each bring-up's
+summary entry also holds `section_peaks`, the memory pass's per-section lines, which survive a
+run that dies mid-step.
+
+The fix is kept only if it costs no speed, and two A/Bs test that. The fix-off bring-up
+times a whole verified step without it. Qwen2.5-0.5B's bring-up fit in the first session
+without the fix, so it runs a second time with both settings undone, in its own
+`runs/Qwen2.5-0.5B-Instruct_refusal_fix2off/`. `summary.json`'s `fix2_ab` sets the two runs
+side by side: per step, the prover's, the verifier's, the hand-off's and the total wall clock
+(`steps`), and per step and side, the allocated and the reserved peak (`peaks`), each with
+`fix_cost`, the run with the fix minus the run without (positive: the fix costs that much).
+The times are the ones the bring-up prints, from its memory pass, which synchronizes at every
+section in both runs. The bring-up runs one step, so each run is one measurement, and the
+noise between two runs isn't measured. Once the second run ends, the job log says
+`allocator fix A/B, step 1: … s with the fix, … s without (+… s)`. Every bring-up's summary
+entry also holds `step_times`, the same figures read from its log.
+
+The plain A/B times the allocator setting alone on plain training. Its first arm alternates by
+model: Llama-3.2-1B and Qwen2.5-0.5B run `alloc_default` first, Falcon3-1B and Qwen2.5-1.5B
+`alloc_expandable` first, so an order effect (a warm file cache, the GPU's clocks) doesn't
+always favour the same arm. Each arm writes to its own `runs/<model>_refusal_plain_<arm>/`,
+its records in `plain_baseline/records.jsonl`, and its summary entry holds the per-step times,
+their mean and median, and the memory pass's peak. It can't show what releasing the cache
+between prover and verifier (`handoff.empty_cache`) costs the verifier's later allocations;
+the fix-off bring-up can.
+
+On CUDA every peak comes with the allocator's reserved peak (`torch.cuda.max_memory_reserved`)
+beside the allocated one: in the memory pass's section lines and records
+(`peak_reserved_bytes`), in the bring-up's peak lines and in the smooth check's record, so in
+every summary entry too (`reserved_gb` in a bring-up's `peaks` and `section_peaks`,
+`peak_reserved_bytes` in a smooth or plain entry). Reserved minus allocated is the
+fragmentation that expandable segments should cut; the allocated peak shouldn't change with
+the setting. The two peaks need not fall at the same moment, so their difference is a bound,
+not a reading at one instant. Off CUDA the reserved peak is null.
+
+**Running it.** Steps 1–7 above, with two changes. First, prep again after committing (step
+1): the upload holds `git archive HEAD`, and `fs11_prep` reuses the data it built before; the
+allocator A/B reads the refusal task's `D`, which the upload already holds. `HEAD` must hold the
+output layer's row blocking: `setup/config.py` ignores a variable it doesn't know, so on an
+earlier commit `VERIF_HEAD_BLOCKS=8` does nothing and raises no error. Second, start the
+job (step 4) with:
+
+```bash
+FS11_SESSION=recheck setsid nohup bash verification/runs/fs11_job.sh /workspace/fs11_upload \
+    /workspace/fs11_out </dev/null > /workspace/fs11_job.out 2>&1 &
+```
+
+Its `FS11 job:` line names the session, and any other `FS11_SESSION` value is refused (exit 2,
+the pod terminated). `FS11_SELFTEST=1` with `FS11_SESSION=recheck` runs the same stand-in parts
+as the first session's self-test, under the re-check's name.
+
+**Estimated wall time.** From the first session's logs (2026-10-14), where only Qwen2.5-0.5B's
+bring-up finished; the others are scaled from it. None includes the row blocking or the cache
+release, which may add re-allocation time.
+
+| part | estimate | from |
+|---|---|---|
+| models | 2–5 min | 138 s in the first session |
+| bring-up, 4 models | 12–25 min, about 14 | Qwen2.5-0.5B's part took 191 s: a 151 s step (prover 51 s; verifier 100 s, of which check 5 took 80 s) and about 40 s of loading. Check 5 scales with its products (0.31 ms each), the rest of the step with the transcript's size, about `n·(L·(d + d_ff) + n_v)`: Llama-3.2-1B about 194 s a step, Falcon3-1B 111 s, Qwen2.5-1.5B 209 s, or up to 300–340 s scaled by parameter count instead |
+| smooth, 8 checks | 4–6 min | 25–44 s each in the first session |
+| fix-off bring-up | 3–5 min | Qwen2.5-0.5B's bring-up again, which took 191 s in the first session, without the fix; the upper end is picked by hand, for the row blocking and the re-allocations the fix would have spared |
+| allocator A/B, 8 arms | 5–12 min | 40–90 s each: about 17 s to load the model, 13 plain steps (10 timed, 2 in the memory pass, 1 counted) at 0.7–1.5 s (Falcon3-1B's took 1.5 s), and hashing `W_0` and the final weights |
+| total | 27–54 min | midpoint about 40 min |
+
+| deadline | covers | estimate | deadline |
+|---|---|---|---|
+| job (`FS11_DEADLINE_S`, the re-check's default) | the job, from its start | the parts about 40 min, packing about 1, the grace window 20: about 61 min | 2 × 61 min = 122 min, rounded up to 7,500 s (2 h 5 min) |
+| boot guard | the whole pod, from its creation | setup about 20 min, the job about 61: about 81 min | 2 × 81 min = 162 min ≈ 2.7 h, rounded up to 9,800 s |
+
+The parts stop by 7,500 − 1,200 − 600 = 5,700 s (95 min), which leaves room for one bring-up
+that hangs to its 30 min limit (at the high end, 54 + 30 = 84 min). For the boot guard, the
+start command above with `sleep 9800;` in place of `sleep 16200;` fits that rule; the 16,200 s
+one also works, and bills longer only if setup stalls.
 
 ## Workflow: calibrating the tolerances
 
@@ -383,17 +1039,29 @@ from measurement, not guessed. The test-scale procedure:
    - `κ_max` per class is twice the largest honest `κ` of the class;
    - `τ_W` per weight tensor is `max(4, 2·ρ_max)`.
 4. Check the fit. The largest honest residual must sit at or below `τ/2` (the concentration
-   guard). Recompute `k` from the measured `τ` (`sizing.size_k`). If either fails, the run
-   stops and writes no band file; `z` is never raised to make the guard pass.
+   guard). Recompute `k` from the measured `τ` (`sizing.size_k`), at the larger of
+   `e_m(q_max)` and the largest `e_m` any calibration product had (F18: a product whose
+   terms cancel has a larger `e_m` than its `q` alone gives). If either fails, the run
+   stops and writes no band file; `z` is never raised to make the guard pass. Every later
+   step's record carries its realized floor, the largest `f_achieved` over its products,
+   each at its own `e_m` (`f_achieved_max`, `f_achieved_at`).
 5. Write the bands and the statistics behind them to one JSON band file,
    `$VERIF_OUTPUT_DIR/bands.json`. Its BLAKE3 hash identifies it.
 6. Call `verifier.freeze(bands)`. It re-judges steps 1–3 against the frozen bands, then
    judges every later step live. `end_run` refuses to give a verdict while calibration is
-   unfrozen. Steps 1–3 are judged by bands fitted on them, so they are in-sample.
+   unfrozen, unless check 1 rejected the run before any step. Steps 1–3 are judged by bands
+   fitted on them, so they are in-sample; at the calibration seed their step records say
+   `judged: false`, and the evaluation leaves them out of the honest results.
 
-Every later run loads the band file read-only with `calibration.load_bands(path, k=k)`. It
-refuses a missing file and a file calibrated at another `k`. The harness then checks with
-`assert_same_band_source` that every run was judged by the same file.
+Every later run loads the band file read-only with `calibration.load_bands(path, k=k,
+context=...)`. It refuses a missing file, a file calibrated at another `k`, and a file whose
+recorded run (`band_context`: model, dtypes, attention, device, `h_D`, batch shape, `η`, `M`,
+`T` and `k`) differs from the run loading it. The file also records the calibration run's
+seed and thread count but doesn't compare them. The bands don't depend on `π`, so the file
+fitted at seed 1 judges the runs at every seed. The thread count changes only the order of
+the CPU's floating-point sums, a shift far below `τ`, and the cost results need it recorded.
+A file written before the thread count was recorded still loads. The harness then checks
+with `assert_same_band_source` that every run was judged by the same file.
 
 `runs/calibrate.py` does all of this on the real SmolLM2 run:
 
@@ -405,24 +1073,29 @@ It then judges steps 1–3 twice more from the band file: once as the protocol r
 with check 5's `κ` guard off, to time what the guard costs (`Verifier(kappa_guard=False)`;
 calibration refuses it). It also measures how aligned one batch's per-example gradients are.
 
-The first calibration (2026-10-05, dev Mac, steps 1–3):
+The current band file (2026-10-12, dev Mac, steps 1–3 on today's `D` and `π` at seed 1,
+F18's unit; hash `c55a75a4…`):
 
-- `s_h = 5.50` (`Λ`, the output-layer product), so `τ = 44.0`. Its largest residual is 14.5,
-  2.6 times `s_h`, under the guard's 22.0. `dF` is next (RMS 3.1). Every other class has an
-  RMS between 0.3 and 0.9.
-- `k` comes out at 9. At the then-default `k = 7`, the vocabulary-sized product `dF` gets a
-  floor 4.8 times its own size, far above the target of 1, so the run stopped and asked for
-  `VERIF_K=9`. The default is now 9. At `k = 9` every product's floor is at most 0.61 of its size, below the
-  `1/√2` margin of a batch with one poisoned record.
+- `s_h = 3.92` (`dF`, the vocabulary-sized gradient product), so `τ = 31.4`. Its largest
+  residual is 7.79, 2.0 times `s_h`, under the guard's 15.7. `Λ` (the output-layer product)
+  is next (RMS 2.9). Every other class has an RMS between 0.3 and 0.8.
+- The largest calibration `e_m` is `dF`'s at step 2 (`U` 1.15 times `‖P‖_F`), 1.14 times
+  `e_m(q_max)`. Sized there, `k` comes out at 9, as at `e_m(q_max)`, and every product's
+  floor is at most 0.51 of its size (`dF`), below the `1/√2` margin of a batch with one
+  poisoned record.
 - `τ_W` is 4 on all 272 tensors (largest `ρ` 2.0).
-- Under the band file, steps 1–3 are accepted with the guard on and off. The step-2 `Λ`
-  residual of 10.1, which the provisional `τ = 8` rejected, is now well inside `τ = 44`.
+- Under the band file, steps 1–3 are accepted with the guard on and off, and A12's 10 honest
+  steps are all accepted.
 
-`s_h` is above the pre-calibration diagnosis under C1 in `docs/verification/SETUP_TASKS.md`
-(4.2, which gave `τ ≈ 33`) and the single-step figure of `runs/llama_step.py` (3.8). Step 1
-alone gives `Λ` an RMS of 3.8; steps 2 and 3 add residuals of 10.1, 9.9 and 14.5. `Λ` is one
-product, so its class has only `3·k` residuals and its RMS moves with each of them. `k` stays
-9 either way.
+The file before F18 (2026-10-11, `cc7a9bca…`) had `s_h = 4.75` (`Λ`) and `τ = 38.0`. Under
+the new unit `Λ`'s residuals shrink, since its terms cancel (`U` above `‖P‖_F`), and `dF`
+becomes the largest class.
+
+The first calibration (2026-10-05), on the earlier Stanford Alpaca data and sequential
+schedule, gave `s_h = 5.50` and `τ = 44.0`. At the then-default `k = 7`, the vocabulary-sized
+product `dF` got a floor 4.8 times its own size, far above the target of 1, so the run stopped
+and asked for `VERIF_K=9`. The default has been 9 since. `Λ` is one product, so its class has
+only `3·k` residuals, and its RMS moves with each of them; the two fits differ by that much.
 
 Runs that don't calibrate use `Bands.provisional()`: `τ = 8`, `κ = 10⁴`, `τ_W = 4`. They must
 opt into provisional bands explicitly (`allow_provisional=True`), because a cheat run must
@@ -471,14 +1144,30 @@ Breaking any of these voids the result. Each one has a test.
 | Part | State |
 |---|---|
 | Foundations, data, `C` interface, MLP instance, capture, prover, store, checks, verifier, loop, MLP smoke run | merged; milestone M1 reached |
-| SmolLM2 inventory and labeling (`instances/llama.py`) | merged; milestone M2 reached |
+| SmolLM2 inventory and labeling (`instances/decoder.py`, formerly `llama.py`) | merged; milestone M2 reached |
 | SmolLM2 replay of forward glue (A8) | done; all 2,371 forward operands of the real step match the prover's bit for bit |
 | Per-component cost and residual metrics (`runs/metrics.py`, B6), wired into the MLP smoke run | done |
 | SmolLM2 replay of backward glue (A9) | done; all 4,742 backward operands and 62 glue gradients of the real step match the prover's bit for bit |
 | Plain-training baseline (`runs/plain_baseline.py`, B7) | done; final weights bit-identical to the captured prover's on the MLP, the tiny Llama and two real SmolLM2 steps |
 | First honest SmolLM2 step (A10, `runs/llama_step.py`) | done; milestone M3 reached. The real step from `W_0` on `π(1)` is accepted with provisional bands: largest normalized residual 5.4 (`Λ`), check 6 `ρ` at most 2.0 |
-| Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. `s_h = 5.50` (`Λ`), `τ = 44.0`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
-| 10-step honest run, cheat runs (A12–A13, M5) | planned |
-| Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.3 s to write and 1.4 s more to verify |
+| Calibration and band file (A11, `runs/calibrate.py`) | done; milestone M4 reached. Refitted at F18: `s_h = 3.92` (`dF`), `τ = 31.4`, `k = 9`, `τ_W = 4` everywhere; honest steps 1–3 accepted under the band file |
+| Hash-shuffled schedule and BackdoorLLM data (C5, C6) | done; `D` is 365 records of the released clean file, `D̃` swaps one record of step 1's batch for a BadMagic row. A11–A14 and B7 re-ran on them on 2026-10-11 |
+| Full-scale data (FS6) | done; both tasks, one `D` per full-scale model (369 refusal or 233 jailbreak records), `D̃` at every poisoning level of 1–128 of 128 (jailbreak to 64) and seeds 1–5. Each model's EOS is pinned and recorded in `meta.json` as its pad id, and the decoder computation pads with the EOS of the model it loads (FS4). Test-scale outputs unchanged byte for byte |
+| One decoder instance for the four full-scale models (FS1) | done; tiny random Llama and Qwen2 models, tied and untied, fill every slot once and replay every operand and glue gradient bit for bit; SmolLM2's roots are unchanged |
+| Biased linears in check 5 (FS2) | done; check 5 checks a biased `Y_q`, `Y_k` or `Y_v` as `[A | 1]·[B ; bᵀ]`, `b` from the committed `W_t`. Honest steps with random non-zero biases are accepted on the tiny Qwen2 models, at residuals like the unbiased ones'. One bias entry altered rejects at check 0 or 7 in `W_t`, at check 5 when only training used it, and at 6b in `W_{t+1}`. Unbiased products, so all of SmolLM2, keep their numbers bit for bit. Check 1 also requires each `π(t)` to hold distinct records |
+| Mixed precision (FS3) | done; `(MASTER_DTYPE, COMPUTE_DTYPE)` from config, autocast around forward and loss in training, the plain run and the replay. SmolLM2 at `(fp32, bf16)` on CPU fills every slot once, rebuilds every operand and glue gradient bit for bit, accepts steps 1–3 under provisional bands (largest normalized residual 1.19), and ends 3 plain and 3 verified steps on the same weights. Tiny Qwen2 models with drawn biases are accepted at bf16 too, check 5 measuring each biased product with the bias cast as autocast cast it for the prover. At `(fp32, fp32)` every pinned root, loss and check number is unchanged. bf16 bands are not calibrated yet, and CPU bf16 matmul on the dev Mac makes a bf16 step about 45 s |
+| Real-model bring-up on CPU (FS4, `runs/bring_up.py`) | Qwen2.5-0.5B run in memory on its real weights: the honest step is accepted on its own fit with check 8, but that fit fails the concentration guard (largest honest residual 25.9 against the limit τ/2 = 24.75), so it isn't a clean pass; one altered bias entry is rejected at check 5 (residual 2.67e3 against τ 49.5) and at 6b, and the process peaks at 14 GB. On all four models' real weights (Meta's own Llama-3.2-1B repo included) the slow test fills every slot once and rebuilds every operand and glue gradient bit for bit, peaking at 10–25 GB. In memory, Meta's Llama-3.2-1B and Falcon3-1B are accepted with check 8 on their own fits, at verifier peaks of 29 and 37 GB. Qwen2.5-1.5B's honest step is rejected on its own fit: check 5's residual in the first layer's `dQ` is 79.3 against τ 39.2, where `dQ`'s cancellation factor κ reaches 153. Its tamper isn't run, and the case is open. Re-run under F18's unit (below), all five models' honest steps are accepted on their own fits with the guard holding, Qwen2.5-0.5B's and Qwen2.5-1.5B's included, and both Qwen models' altered bias entry is rejected at check 5 and at 6b. The disk hand-off (`--disk-transcripts`) peaks higher, not lower, since it adds the verifier's own copies of `W_t` and `W_{t+1}`. Each model is pinned (repo, commit, `config.json` and weights SHA-256) and pads with its own EOS |
+| Split error model for check 5 (FS15, F18) | done; check 5's unit scales the accumulation error with the larger of `‖P‖_F` and the term scale `U`, so a product whose terms cancel gets a band that fits its rounding. On real weights the largest honest residual over its own `τ` is 0.19 (SmolLM2), 0.16 (Qwen2.5-0.5B), 0.22 (Llama-3.2-1B), 0.34 (Falcon3-1B) and 0.28 (Qwen2.5-1.5B, 2.02 before), all under the guard's 0.5. `k` is sized at the largest calibration `e_m`: 9 for SmolLM2's band file and three of the four full-scale models, 12 for Qwen2.5-1.5B. On tiny random Qwen2 models the guard now fails on 0 of 20 seeds, against 8 before. `U` costs about what `ν` does, 3–6% of check 5 |
+| Mixed precision on a real model (FS5, Qwen2.5-0.5B at `(fp32, bf16)` on CPU) | measured, two open points. Configuration only, no code change. Every slot is filled once and every operand and glue gradient, the q, k, v bias gradients included, is rebuilt bit for bit. One step is accepted on its own fit with the guard holding (`s_h` 0.31, `τ` 2.47, largest residual 0.48 of `τ`); three steps are accepted with equal plain and verified final weights, but the fit fails the guard (largest residual 1.79 against `τ/2` = 1.23, in an attention gradient): at bf16 every class's residual is the leaf's own rounding, so no class sits below the largest and the tail grows with the number of residuals. `k` sized for bf16 is 15, against 9 at fp32, because the band is 16 times wider. A bias entry raised by 1 in training is rejected at 6b, not at check 5: with the honest update committed, check 5 passes shifts of 1 and 2 on that column and rejects 4. Prover 305–324 s a step (CPU bf16 matmul), verifier 4.7–5.0 s, verifier peak 11.9–13.7 GB. At `(fp32, fp32)` nothing changed |
+| GPU path (FS9) | done; `VERIF_DEVICE=cuda` runs the model, the replay and check 5 on the GPU, with every leaf in host RAM. Each product is copied to a reused pinned host buffer on a side stream as it is made, so the transcript no longer collects on the GPU: SmolLM2's captured step peaks at 2.15 GiB against 3.12 before (plain training 1.59) at fp32. On an A40, at fp32 and bf16, three plain and three verified steps end on the same weights bit for bit, every operand and glue gradient is rebuilt bit for bit, and the run is accepted. Before FS9 a `cuda` run silently ran on the CPU. CPU results are unchanged bit for bit. Check 5 is host-bound on the GPU (460 µs per product); see "Workflow: a run on a GPU" |
+| 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
+| Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
+| Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |
+| Step records and residual arrays to the evaluation spec (EV2, `runs/metrics.py`, `verifier/checks.py`) | done; every step record carries the §4.1 fields, each `.npz` the `ρ` arrays and their index table, and a rejecting check 5 or 6 measures all its tests for the record. The honest run keeps step 4's transcript (2.46 GiB) with its root. On the re-runs every verdict and first failing check is unchanged, `ρ` recomputed from the raw arrays and the band file equals the stored `ρ`, and the largest honest scores are `ρ_5` 0.30 (0.29 on judged steps), `ρ_κ` 0.57 and `ρ_6` 0.50 |
+| Planted-error sweep on the stored step (EV3, `runs/flipped_matmul_sweep.py --source stored`) | done; on step 4's kept transcript every target product rejects every trial from `x ≤ 2`, the flipped matmul is caught at its declared step and check, and the check-6 trial rejects at 6a. The single-challenge miss rate follows `c/x`: on the binding product `ĉ` 0.775 ± 0.024 pooled (deep points alone 1.12 ± 0.12, below the stop rule's 3 standard errors). The stored and in-process sweeps give the same grid records bit for bit |
+| `k` tunability (FS12, `runs/k_tunability.py`, `evaluation/results/k_tunability.py`) | done; check 5 at every `k` from 1 to 18 on the stored step 4, the `k = 9` pass equal to the stored verdict and residuals bit for bit. Check 5 takes 0.97 s at `k = 1`, 1.21 s at 9 and 1.38 s at 18, about 1.12 s + 13.5 ms·`k`. `k = 9` is the smallest that covers one poisoned record per batch (0.69 at the measured `C` 1.29) |
+| Detection, cost, and false-reject result scripts (EV4–EV5, `evaluation/results/`) | done; on EV2's test-scale records every cheat rejects at its expected check at its own step, with `ρ_5` 8.5e4 (A2) and `ρ_6` 3.0e7 (A3) against honest maxima of 0.29 and 0.50. None of the 499,814 honest component tests fails at `z = 8`. The verifier takes 2.96× a plain step and the prover's overhead 0.90×, against a plain baseline from another commit, which the cost script accepts only with `--allow-baseline-mismatch`. One seed per scenario so far |
+| Planted-error sweep figures (EV6, `evaluation/results/sweep.py`) | done; on EV3's stored sweep the miss rate follows `c/x` on `row2` (`ĉ` 0.75–0.80 pooled against 0.816) and `σ_r/x` on `entry` (0.56–0.62 against 0.577), and the refitted `ĉ` equal the runner's. Measured floor 0.511 against `f_achieved` 0.538. Which norm `x` uses and which `ĉ` sets the measured floor are open, so they are options with placeholder defaults |
+| PoTS comparison record (EV7, `evaluation/results/pots_comparison.py`, `pots_reference.csv`) | done; PoTS's Table 1 is copied cell by cell (80 cells, each checked present once) from arXiv v1's LaTeX source, with §7.1's figure readings beside it. The record compares cost by ratio, and by seconds only on an H100 at PoTS's 16,384-token batch, and latency per scenario; trigger lift waits for attack success. Tested on synthetic full-scale records; at test scale it writes a rehearsal |
 
 The task table is in `docs/verification/IMPLEMENTATION_PLAN.md`.

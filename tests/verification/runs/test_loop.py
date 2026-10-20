@@ -3,12 +3,13 @@
 import ast
 import gc
 import weakref
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import torch
 
-from setup.data import schedule
+from setup.data import other_batch, schedule
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
     MLPComputation,
@@ -22,6 +23,9 @@ from verification.runs.loop import ProverFault, run_loop
 from verification.transcript.store import InMemoryStore
 from verification.verifier.bands import Bands
 from verification.verifier.driver import Verifier
+
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
+SEED_2 = 2  # a second seed
 
 ETA = 1e-3
 K = 7
@@ -44,17 +48,25 @@ def w0(c):
     return init_weights(c.widths, seed=0)
 
 
-@pytest.fixture(scope="module")
-def final(c, D, w0):
+def _plain_final(c, D, w0, seed):
     model, w = c.build_model(), w0
     for t in range(1, T + 1):
-        w, _ = plain_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D))])
+        w, _ = plain_step(c, model, w, [D[i] for i in schedule(t, c.n_s, len(D), seed)])
     return w
 
 
-def _verifier(c, D, w0, h_D=None):
+@pytest.fixture(scope="module")
+def final(c, D, w0):
+    return _plain_final(c, D, w0, SEED)
+
+
+def _verifier(c, D, w0, h_D=None, seed=SEED):
     return Verifier(c, h_D=h_D or dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=T,
-                    bands=Bands.provisional(), w0=w0, allow_provisional=True)
+                    bands=Bands.provisional(), w0=w0, allow_provisional=True, seed=seed)
+
+
+def _other(c, D, t):
+    return [D[i] for i in other_batch(t, c.n_s, len(D), SEED)]
 
 
 def _run(c, D, w0, final, **kw):
@@ -71,6 +83,23 @@ def test_honest_run_accepted(c, D, w0, final):
     # Capture is a passthrough: the captured chain ends bit-identical to the uncaptured one.
     assert all(torch.equal(res.w_final[n], final[n]) for n in c.weight_names)
     assert sorted(v.timings) == [1, 2, 3] and set(v.run_timings) == {"0", "1", "8"}
+
+
+def test_honest_run_at_a_second_seed_accepted(c, D, w0):
+    """π at seed 2 orders D otherwise (F8c); prover and verifier both follow it."""
+    assert schedule(1, c.n_s, len(D), SEED_2) != schedule(1, c.n_s, len(D), SEED)
+    v = _verifier(c, D, w0, seed=SEED_2)
+    res = run_loop(c, c.build_model(), D, w0, v, final=_plain_final(c, D, w0, SEED_2))
+    assert res.verdict.accepted and res.verdict.steps_verified == T
+
+
+def test_prover_at_another_seed_rejected_at_4(c, D, w0):
+    """A prover on π at seed 2, a verifier at seed 1: step 1's batch anchor fails."""
+    v = _verifier(c, D, w0)
+    res = run_loop(c, c.build_model(), D, w0, v, final=_plain_final(c, D, w0, SEED_2),
+                   schedule=lambda t: schedule(t, c.n_s, len(D), SEED_2))
+    assert len(res.steps) == 1
+    assert (res.rejection.step, res.rejection.check_id, res.rejection.kind) == (1, "4", "failed")
 
 
 def test_wrong_final_weights_rejected_at_8(c, D, w0, final):
@@ -110,7 +139,7 @@ def test_entry_weights_hook_feeds_the_prover(c, D, w0, final):
 
     class Hidden(ProverFault):
         def entry_weights(self, t, w):
-            return plain_step(c, c.build_model(), w, list(D[-4:]))[0] if t == 2 else w
+            return plain_step(c, c.build_model(), w, _other(c, D, t))[0] if t == 2 else w
 
     res, _ = _run(c, D, w0, final, fault=Hidden())
     assert (res.rejection.step, res.rejection.check_id) == (2, "7")
@@ -132,7 +161,7 @@ def test_train_records_hook(c, D, w0, final):
 
     class A2(ProverFault):
         def train_records(self, t, records):
-            return list(D[-4:]) if t == 1 else None
+            return _other(c, D, t) if t == 1 else None
 
     res, _ = _run(c, D, w0, final, fault=A2())
     assert (res.rejection.step, res.rejection.check_id) == (1, "5")
@@ -230,3 +259,122 @@ def test_loop_is_instance_agnostic():
         else:
             continue
         assert not any("instances" in n for n in names), names
+
+
+# ---- the hand-off's cache release ---------------------------------------------------------
+
+
+def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, **kw):
+    """Run the loop with ``torch.cuda`` stubbed and the model's device taken for CUDA when
+    ``cuda``, logging sections, cache releases and verifier calls in order; also whether each
+    step's ``StepOutput`` was gone at its release. ``env`` sets ``VERIF_RELEASE_CACHE`` (unset
+    by default)."""
+    log, refs, gone = [], {}, []
+    monkeypatch.delenv("VERIF_RELEASE_CACHE", raising=False)
+    if env is not None:
+        monkeypatch.setenv("VERIF_RELEASE_CACHE", env)
+    asked = []
+
+    def on_cuda(device):
+        asked.append(torch.device(device))
+        return cuda
+
+    def empty_cache():
+        gc.collect()
+        gone.append(all(r() is None for r in refs.values()))
+        log.append("empty_cache")
+
+    monkeypatch.setattr(loop_mod, "_on_cuda", on_cuda)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: not cuda)  # not what decides
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    orig = Verifier.verify_step
+
+    def verify_step(self, t, store):
+        log.append(f"verify {t}")
+        return orig(self, t, store)
+
+    monkeypatch.setattr(Verifier, "verify_step", verify_step)
+
+    class Keep(ProverFault):
+        def emit(self, t, out):
+            refs.clear()
+            refs[t] = weakref.ref(out)
+            return out
+
+    @contextmanager
+    def section(name):
+        log.append(name)
+        yield
+
+    res, _ = _run(c, D, w0, final, fault=Keep(), section=section, **kw)
+    assert set(asked) <= {torch.device("cpu")}  # the model's own device, asked each step
+    return res, log, gone
+
+
+def test_cache_release_sits_between_prover_and_verifier_on_cuda(c, D, w0, final, monkeypatch):
+    """On CUDA, once per step: after the prover's last section and the step's release, inside
+    its own section, before the verifier's role."""
+    res, log, gone = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True)
+    assert res.verdict.accepted and log.count("empty_cache") == T and gone == [True] * T
+    for t in range(1, T + 1):
+        i = log.index(f"verify {t}")
+        assert log[i - 4:i] == ["P5.write", loop_mod.TOTALS_SECTION, loop_mod.HANDOFF_SECTION,
+                                "empty_cache"]
+    assert all(s.handoff_s >= 0 and s.verify_s >= 0 for s in res.steps)
+
+
+def test_no_cache_release_off_cuda(c, D, w0, final, monkeypatch):
+    """Off CUDA it does nothing and opens no section."""
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=False)
+    assert res.verdict.accepted and "empty_cache" not in log
+    assert loop_mod.HANDOFF_SECTION not in log
+    for t in range(1, T + 1):
+        assert log[log.index(f"verify {t}") - 1] == loop_mod.TOTALS_SECTION
+
+
+def test_release_cache_off_skips_it_on_cuda(c, D, w0, final, monkeypatch):
+    """``release_cache=False`` (``VERIF_RELEASE_CACHE=0``): no release and no section, on CUDA
+    too; the verifier follows the prover's last section, and the verdict is the same."""
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, release_cache=False)
+    assert res.verdict.accepted and "empty_cache" not in log
+    assert loop_mod.HANDOFF_SECTION not in log
+    for t in range(1, T + 1):
+        assert log[log.index(f"verify {t}") - 1] == loop_mod.TOTALS_SECTION
+
+
+@pytest.mark.parametrize("env, released", [("1", True), ("0", False)])
+def test_release_cache_default_reads_the_config(c, D, w0, final, monkeypatch, env, released):
+    """``release_cache=None`` (the default) reads ``VERIF_RELEASE_CACHE``, so an entry point
+    that passes nothing still honours it."""
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, env=env)
+    assert res.verdict.accepted and log.count("empty_cache") == (T if released else 0)
+
+
+def test_release_cache_default_refuses_a_bad_setting(c, D, w0, final, monkeypatch):
+    with pytest.raises(ValueError, match="VERIF_RELEASE_CACHE"):
+        _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, env="yes")
+
+
+def test_release_cache_explicit_wins_over_the_config(c, D, w0, final, monkeypatch):
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, env="0",
+                                 release_cache=True)
+    assert res.verdict.accepted and log.count("empty_cache") == T
+
+
+def test_release_device_cache_alone(monkeypatch):
+    """It goes by the run's device, not by whether CUDA is initialized in the process."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    loop_mod.release_device_cache("cpu")
+    loop_mod.release_device_cache(torch.device("mps"))
+    assert calls == []
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    loop_mod.release_device_cache("cuda:0")  # no section given: no metrics, still released
+    loop_mod.release_device_cache(torch.device("cuda"))
+    assert calls == [1, 1]
+
+
+def test_model_device():
+    assert loop_mod.model_device(torch.nn.Linear(2, 2)) == torch.device("cpu")
+    assert loop_mod.model_device(torch.nn.ReLU()) == torch.device("cpu")  # no parameters

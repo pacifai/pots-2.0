@@ -1,6 +1,8 @@
-"""The SmolLM2 instance: declaration and prover-side labeling (A7, milestone M2), and the
-verifier-side forward (A8) and backward (A9) replay."""
+"""The decoder instance: declaration and prover-side labeling (A7, milestone M2), the
+verifier-side forward (A8) and backward (A9) replay, its two config switches (FS1) and mixed
+precision (FS3)."""
 
+import contextlib
 import dataclasses
 import weakref
 from collections import Counter
@@ -8,22 +10,39 @@ from collections import Counter
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.multiprocessing.reductions import StorageWeakRef
+from torch.utils._python_dispatch import TorchDispatchMode
 from transformers import LlamaConfig
 from transformers.models.llama import modeling_llama
 
+from setup.data import Batch
 from setup.records import Record, RecordError, encode_record
 from verification.commitment.leaves import leaf_hash
-from verification.computation.instances import LlamaComputation
-from verification.computation.instances.llama import LINEARS, _Labeler, matmul_count_llama
+from verification.computation.instances import DecoderComputation
+from verification.computation.instances.decoder import (_ATTN_BACKWARD, LINEARS, _contiguous,
+                                                         _Labeler, matmul_count_decoder)
 from verification.computation.interface import LabelingError, ProductKind, ReplayError
 from verification.computation.matmul_ops import param_storage_map
 from verification.prover.capture import MatmulCapture
 from verification.prover.step import commit, prove_step
+from verification.verifier.checks import _member_runs
 
-from tests.verification.llama_helpers import make_records, tiny_config
+from tests.verification.decoder_helpers import (
+    SWITCHES,
+    make_records,
+    randomize_biases,
+    switch_id,
+    tiny_config,
+)
+
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
 FWD, IG, WG, OG = (ProductKind.FORWARD, ProductKind.INPUT_GRAD, ProductKind.WEIGHT_GRAD,
                    ProductKind.OPERAND_GRAD)
+
+F32, BF16 = torch.float32, torch.bfloat16
+# (MASTER_DTYPE, COMPUTE_DTYPE) runs the switch tests at both settings (F6b).
+COMPUTE = {"fp32": F32, "bf16": BF16}
 
 
 def smollm2_config():
@@ -49,14 +68,15 @@ def _fresh_verifier_model(request):
     """Tests plant hooks on ``replay.model``, and the reused verifier model then refuses the next
     replay (as it must). Drop it after each test, so every test starts from a fresh build."""
     yield
-    if "setup" in request.fixturenames:
-        request.getfixturevalue("setup")[0]._vmodel = None
+    for name in ("setup", "switched"):
+        if name in request.fixturenames:
+            request.getfixturevalue(name)[0]._vmodel = None
 
 
 @pytest.fixture(scope="module", params=[(12, 8), (8, 8)], ids=["n12", "n_eq_dh"])
 def setup(request):
     n, head_dim = request.param
-    c = LlamaComputation(tiny_config(head_dim), n_s=2, n=n, eta=1e-3)
+    c = DecoderComputation(tiny_config(head_dim), n_s=2, n=n, eta=1e-3)
     model = c.build_model()
     records = make_records((n, n - 5))
     return c, model, records
@@ -68,7 +88,7 @@ def setup(request):
 def test_inventory_order_names_and_count(setup):
     c, _, _ = setup
     L, n_s, n_h = c.L, c.n_s, c.n_h
-    assert c.M == matmul_count_llama(L, n_s, n_h) == L * (21 + 6 * n_s * n_h) + 3
+    assert c.M == matmul_count_decoder(L, n_s, n_h) == L * (21 + 6 * n_s * n_h) + 3
     assert [p.m for p in c.products] == list(range(1, c.M + 1))
     mem = [f"[{s},{h}]" for s in range(n_s) for h in range(n_h)]
     want = []
@@ -123,7 +143,7 @@ def test_weights_match_the_model(setup):
     assert c.weight_names[0] == c.w_e and c.weight_names[-1] == c.gamma_final
     assert c.weight_names[1:10] == (c.gamma_attn(1), *(c.w(1, x) for x in "qkvo"),
                                     c.gamma_mlp(1), *(c.w(1, x) for x in ("gate", "up", "down")))
-    assert c.linear_weights == {c.w(l, x): c.m_of(f"L{l}.G_{x}")
+    assert c.linear_weights == {c.w(l, x): (c.m_of(f"L{l}.G_{x}"),)
                                 for l in range(1, c.L + 1) for x in LINEARS}
     gammas = {c.gamma_final} | {g(l) for l in range(1, c.L + 1)
                                 for g in (c.gamma_attn, c.gamma_mlp)}
@@ -139,18 +159,18 @@ def test_product_classes(setup):
     assert classes == Counter({**{f"{r}_{x}": c.L for r in ("Y", "dX", "G") for x in LINEARS},
                                **{r: per_member for r in ("S", "O", "dA", "dV", "dQ", "dK")},
                                "Lambda": 1, "dF": 1, "G_E_head": 1})
-    other = LlamaComputation(tiny_config(), n_s=3, n=c.n + 2, eta=1e-3)
+    other = DecoderComputation(tiny_config(), n_s=3, n=c.n + 2, eta=1e-3)
     with pytest.raises(ValueError):
         c.product_class(other.products[5])
 
 
 def test_matmul_count():
-    assert matmul_count_llama(30, 4, 9) == 7_113
-    assert matmul_count_llama(30, 128, 9) == 207_993
+    assert matmul_count_decoder(30, 4, 9) == 7_113
+    assert matmul_count_decoder(30, 128, 9) == 207_993
 
 
 def test_smollm2_declaration_numbers():
-    c = LlamaComputation(smollm2_config(), n_s=4, n=128, eta=1e-3)
+    c = DecoderComputation(smollm2_config(), n_s=4, n=128, eta=1e-3)
     assert (c.M, c.n_w, c.n_leaves) == (7113, 272, 7661)
     assert sum(map(lambda s: torch.Size(s).numel(), c.weight_shapes.values())) == 134_515_008
     assert Counter(p.kind for p in c.products) == {FWD: 2371, IG: 211, WG: 211, OG: 4320}
@@ -165,15 +185,16 @@ def test_smollm2_declaration_numbers():
 
 
 def test_rejects_unsupported_configs():
-    for kw in ({"tie_word_embeddings": False}, {"attention_bias": True}, {"mlp_bias": True},
+    for kw in ({"attention_bias": True}, {"mlp_bias": True}, {"model_type": "mistral"},
+               {"layer_types": ["full_attention", "sliding_attention"]},
                {"hidden_act": "gelu"}, {"pretraining_tp": 2}, {"attention_dropout": 0.1}):
         cfg = tiny_config()
         for k, v in kw.items():
             setattr(cfg, k, v)
         with pytest.raises(ValueError):
-            LlamaComputation(cfg, n_s=2, n=12, eta=1e-3)
+            DecoderComputation(cfg, n_s=2, n=12, eta=1e-3)
     with pytest.raises(ValueError):  # P7: q = 1 products are not checkable
-        LlamaComputation(tiny_config(head_dim=1), n_s=2, n=12, eta=1e-3)
+        DecoderComputation(tiny_config(head_dim=1), n_s=2, n=12, eta=1e-3)
 
 
 def test_encode_record(setup):
@@ -186,7 +207,7 @@ def test_encode_record(setup):
 
 
 def test_build_model_is_deterministic_and_rng_neutral():
-    c = LlamaComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
     state = torch.random.get_rng_state()
     m1 = c.build_model()
     assert torch.equal(torch.random.get_rng_state(), state)
@@ -216,6 +237,38 @@ def test_loss_is_masked_ce_with_rho_from_ell(setup):
     assert float(loss) == pytest.approx(num / den, rel=1e-5)
     with pytest.raises(ValueError):
         c.assemble(records[:1])
+
+
+def test_pad_is_the_model_eos():
+    """F8f: a loaded model pads with its pinned EOS (``data.run_pin``), a random test model with
+    SmolLM2's unless given. Constructing ``C`` loads nothing, so ``source`` needs no cache."""
+    def at(family, vocab, **kw):
+        cfg = tiny_config(family=family)
+        cfg.vocab_size = vocab
+        return DecoderComputation(cfg, n_s=2, n=12, eta=1e-3, **kw)
+
+    for family, repo, vocab, eos in (
+            ("qwen2", "Qwen/Qwen2.5-0.5B-Instruct", 151936, 151645),
+            ("llama", "tiiuae/Falcon3-1B-Instruct", 131072, 11),
+            ("llama", "unsloth/Llama-3.2-1B-Instruct", 128256, 128009),
+            ("llama", "meta-llama/Llama-3.2-1B-Instruct", 128256, 128009),
+            ("llama", "HuggingFaceTB/SmolLM2-135M-Instruct", 49152, 2)):
+        assert at(family, vocab, source=(repo, "abc")).pad_id == eos, repo
+        assert at(family, vocab, source=(repo, "abc"), pad_id=eos).pad_id == eos
+    assert DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3).pad_id == 2
+
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3, pad_id=7)
+    records = make_records((12, 5))
+    batch = c.assemble(records)
+    assert (batch.ids[1, 5:] == 7).all() and (batch.targets[1, 5:] == 7).all()
+    assert batch.rho.sum(1).tolist() == [12, 5] and (batch.mask[1, 5:] == 0).all()
+
+    with pytest.raises(ValueError, match="pinned EOS"):
+        at("qwen2", 151936, source=("Qwen/Qwen2.5-0.5B-Instruct", "abc"), pad_id=2)
+    with pytest.raises(ValueError, match="no pinned EOS"):
+        at("llama", 64, source=("gpt2", "main"))
+    with pytest.raises(ValueError, match="outside the vocabulary"):
+        DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3, pad_id=64)
 
 
 # ---- labeling ---------------------------------------------------------------------------------
@@ -355,6 +408,7 @@ def _bmm_records(cap, phase):
 @pytest.mark.parametrize("tamper", [
     "release", "duplicate_fwd", "drop_bwd_mm", "drop_bwd_bmm", "extra_glue", "swap_S_O",
     "stray_fwd_bmm", "duplicate_bwd_bmm", "swap_G_k_G_v", "O_b_not_Y_v", "S_b_split_kv",
+    "strided_mm_out", "strided_bmm_out",
 ])
 def test_label_rejects_tampered_capture(setup, tamper):
     c, model, records = setup
@@ -387,18 +441,66 @@ def test_label_rejects_tampered_capture(setup, tamper):
         g_rec = {grad[r.out.untyped_storage().data_ptr()]: r for r in recs
                  if r.phase == "backward" and r.out.untyped_storage().data_ptr() in grad}
         i, j = recs.index(g_rec["k"]), recs.index(g_rec["v"])
-        recs[i] = dataclasses.replace(g_rec["k"], out=g_rec["v"].out)
-        recs[j] = dataclasses.replace(g_rec["v"], out=g_rec["k"].out)
+        k, v = g_rec["k"], g_rec["v"]
+        recs[i] = dataclasses.replace(k, out=v.out, out_storage=v.out_storage)
+        recs[j] = dataclasses.replace(v, out=k.out, out_storage=k.out_storage)
     elif tamper in ("O_b_not_Y_v", "S_b_split_kv"):
         s_rec, o_rec = _bmm_records(cap, "forward")[:2]
         rec = o_rec if tamper == "O_b_not_Y_v" else s_rec
         b = rec.b.clone()
         b[1] = b[1] + 1e-3  # member (0, 1): for S, kv head 0 shared with query head 0
         recs[recs.index(rec)] = dataclasses.replace(rec, b=b)
+    elif tamper in ("strided_mm_out", "strided_bmm_out"):
+        # The op wrote a transposed layout while ``out`` is a dense copy, as the host copy
+        # of a GPU output is (FS9): labeling judges the recorded layout.
+        rec = (next(r for r in recs if r.batch is None) if tamper == "strided_mm_out"
+               else _bmm_records(cap, "forward")[0])
+        o = rec.out_info
+        stride = o.stride[:-2] + (1, o.shape[-2])
+        assert rec.out.is_contiguous() and stride != o.stride
+        recs[recs.index(rec)] = dataclasses.replace(
+            rec, out_info=dataclasses.replace(o, stride=stride))
     match = {"swap_G_k_G_v": r"is not .*\.grad", "O_b_not_Y_v": "not Y_v's output",
-             "S_b_split_kv": "share a kv head"}.get(tamper)
+             "S_b_split_kv": "share a kv head", "strided_mm_out": "output is not contiguous",
+             "strided_bmm_out": "output is not contiguous"}.get(tamper)
     with pytest.raises(LabelingError, match=match):
         c.label(cap, model)
+    model.zero_grad(set_to_none=True)
+
+
+def test_recorded_layout_contiguity_is_torchs():
+    base = torch.zeros(3, 4, 5)
+    views = [base, base[0], base[:, 1], base.transpose(1, 2), base[:, :, :1], base[:, :1],
+             base[:1], base[:, :, 2:3], base[..., ::2], torch.zeros(0, 3).t(),
+             torch.zeros(1, 4).t(), base.expand(2, 3, 4, 5), torch.zeros(()), base[1:2, 2:3]]
+    for v in views:
+        assert _contiguous(tuple(v.shape), v.stride()) == v.is_contiguous(), v.shape
+
+
+@pytest.mark.parametrize("dtype", list(COMPUTE))
+@pytest.mark.parametrize("family", ["llama", "qwen2"])
+def test_label_rejects_a_grad_not_linked_to_its_G(family, dtype):
+    """``G_x`` must be ``W_x.grad``: its own output at fp32, AccumulateGrad's fp32 copy of it
+    at bf16 (``capture.is_copy_of``). ``swap_G_k_G_v`` finds the grad by data pointer, which
+    at bf16 is the copy's, not the product's. Here ``W_k.grad`` is replaced by ``W_v.grad``
+    (same shape, another product's copy) or by a clone of itself (equal values, a storage no
+    product wrote)."""
+    c = DecoderComputation(tiny_config(family=family), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
+    model = c.build_model()
+    cap = run_capture(c, model, make_records((12, 7)))
+    w_k, w_v = (model.get_parameter(c.w(1, x)) for x in ("k", "v"))
+    honest = w_k.grad
+    assert honest.dtype == F32 and honest.shape == w_v.grad.shape
+    for tampered in (w_v.grad, honest.clone()):
+        w_k.grad = tampered
+        try:
+            with pytest.raises(LabelingError, match=r"is not .*\.grad") as e:
+                c.label(cap, model)
+            assert str(e.value).startswith(f"G of {c.w(1, 'k')} "), e.value
+        finally:
+            w_k.grad = honest
+    assert len(c.label(cap, model)) == c.M
     model.zero_grad(set_to_none=True)
 
 
@@ -461,8 +563,8 @@ def test_replay_matches_captured_operands(honest, monkeypatch):
     def boom(*a, **k):
         raise AssertionError("the replay called a prover-only method")
 
-    monkeypatch.setattr(LlamaComputation, "loss", boom)
-    monkeypatch.setattr(LlamaComputation, "label", boom)
+    monkeypatch.setattr(DecoderComputation, "loss", boom)
+    monkeypatch.setattr(DecoderComputation, "label", boom)
     replay = c.replay(ListReader(leaves))
     specs = forward_specs(c)
     assert len(specs) == len(expected) == c.L * (7 + 2 * c.n_s * c.n_h) + 1
@@ -514,8 +616,8 @@ def _no_prover_methods(monkeypatch):
     def boom(*a, **k):
         raise AssertionError("the replay called a prover-only method")
 
-    monkeypatch.setattr(LlamaComputation, "loss", boom)
-    monkeypatch.setattr(LlamaComputation, "label", boom)
+    monkeypatch.setattr(DecoderComputation, "loss", boom)
+    monkeypatch.setattr(DecoderComputation, "label", boom)
 
 
 def test_backward_replay_matches_the_prover(honest_all, monkeypatch):
@@ -538,6 +640,120 @@ def test_backward_replay_matches_the_prover(honest_all, monkeypatch):
     assert list(got) == list(c.glue_gradient_weights)
     for n, g in got.items():
         assert g.dtype == c.weight_dtype and torch.equal(g, grads[n]), n
+
+
+def _groups(c):
+    """The canonical order as check 5 serves it: each member run (``_member_runs``) split by
+    declared shapes, in first-appearance order; every other product a group of one."""
+    for run in _member_runs(c.products):
+        groups: dict[tuple, list[int]] = {}
+        for spec in run:
+            groups.setdefault((spec.a_shape, spec.b_shape), []).append(spec.m)
+        yield from groups.values()
+
+
+def _assert_groups_match_members(c, leaves, dtype=None):
+    """Over the whole step, ``operand_group(ms, dtype)`` on one replay equals the stacked
+    ``operands`` of an earlier one, converted to ``dtype``, bit for bit, in dtype, shape and
+    contiguity; the glue gradients then agree. (A computation lends its model to one replay at
+    a time, so the two run in turn.)"""
+    single, stacked = c.replay(ListReader(leaves)), []
+    for ms in _groups(c):
+        pairs = [single.operands(m) for m in ms]
+        stacked.append(tuple(torch.stack([p[k] for p in pairs]) for k in (0, 1)))
+    want_glue = single.glue_gradients()
+    grouped, roles, calls = c.replay(ListReader(leaves)), set(), []
+    per_member = grouped.operands
+    grouped.operands = lambda m: calls.append(m) or per_member(m)
+    for ms, want_ab in zip(_groups(c), stacked, strict=True):
+        calls.clear()
+        got = grouped.operand_group(ms, dtype)
+        assert calls == ([] if len(ms) > 1 else ms)  # members come from the whole tensors
+        roles |= {(len(ms) > 1, c.product_class(c.product(m))) for m in ms}
+        for g, want in zip(got, want_ab):
+            assert want.dtype == c.operand_dtype, ms
+            want = want.to(dtype or want.dtype)
+            assert g.shape == want.shape and g.is_contiguous() and not g.requires_grad, ms
+            assert torch.equal(g, want), ms
+    # Every attention role was served in a group, interleaved when n = d_h.
+    assert {r for grouped_, r in roles if grouped_} == {"S", "O", *_ATTN_BACKWARD}
+    assert grouped._served_last and grouped._bunit is None and not grouped._bops
+    got = grouped.glue_gradients()
+    assert list(got) == list(want_glue)
+    for n in got:
+        assert torch.equal(got[n], want_glue[n]), n
+
+
+def test_operand_group_matches_stacked_operands(honest_all):
+    c, leaves, _, _ = honest_all
+    _assert_groups_match_members(c, leaves)
+
+
+def _bf16_step(n):
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3, compute_dtype=BF16)
+    model = c.build_model()
+    records = make_records((n, n - 5))
+    w0 = {k: model.get_parameter(k).detach().clone() for k in c.weight_names}
+    cap = run_capture(c, model, records)
+    products = [p.detach() for p in c.label(cap, model)]
+    assert c.operand_dtype == BF16
+    return c, [*records, *w0.values(), *products, *w0.values()]
+
+
+@pytest.mark.parametrize("dtype", [None, torch.float32], ids=["bf16", "to_fp32"])
+@pytest.mark.parametrize("n", [12, 8], ids=["n12", "n_eq_dh"])
+def test_operand_group_matches_stacked_operands_bf16(n, dtype):
+    """Asked for fp32 (as check 5 asks), the group is converted as it is copied: the same bits
+    as the bf16 stack converted afterwards."""
+    _assert_groups_match_members(*_bf16_step(n), dtype)
+
+
+@pytest.mark.parametrize("dtype", [None, torch.float32], ids=["bf16", "to_fp32"])
+def test_operand_group_unevenly_spaced_members(dtype):
+    """Members whose batch indices aren't evenly spaced are copied one by one, with the same
+    result."""
+    c, leaves = _bf16_step(12)
+    run = next(r for r in _member_runs(c.products) if len(r) > 1)
+    ms = [p.m for p in run if c.product_class(p) == "S"]
+    ms = [ms[0], ms[1], ms[3]]  # batch indices 0, 1, 3
+    single = c.replay(ListReader(leaves))
+    pairs = [single.operands(m) for m in range(1, ms[-1] + 1)]
+    want = [torch.stack([pairs[m - 1][k] for m in ms]).to(dtype or c.operand_dtype)
+            for k in (0, 1)]
+    del single, pairs
+    got = c.replay(ListReader(leaves)).operand_group(ms, dtype)
+    for g, w in zip(got, want):
+        assert g.dtype == (dtype or c.operand_dtype) and g.is_contiguous()
+        assert torch.equal(g, w)
+
+
+@pytest.mark.parametrize("unit", ["forward", "backward"])
+def test_operand_group_fails_as_members_would(honest_all, unit):
+    """A held operand changed after its product read it: the group raises the error per-member
+    serving raises first, and leaves ``_served_last`` as that serving would."""
+    c, leaves, _, _ = honest_all
+    l = 1 if unit == "forward" else c.L
+    roles = ("S", "O") if unit == "forward" else tuple(_ATTN_BACKWARD)
+    run = next(r for r in _member_runs(c.products)
+               if r[0].layer == l and c.product_class(r[0]) in roles)
+    ms = [p.m for p in run]
+    errors = []
+    for serve in ("group", "members"):
+        replay = c.replay(ListReader(leaves))
+        for m in range(1, ms[0]):
+            replay.operands(m)
+        replay._served_last = True
+        held = replay._units[l].fwd if unit == "forward" else replay._bops
+        with torch.no_grad():
+            held[f"L{l}.{c.product_class(run[-1])}"][1].add_(0)  # bumps _version only
+        with pytest.raises(ReplayError) as e:
+            if serve == "group":
+                replay.operand_group(ms)
+            else:
+                for m in ms:
+                    replay.operands(m)
+        errors.append((str(e.value), replay._served_last))
+    assert errors[0] == errors[1] and "changed after its product read it" in errors[0][0]
 
 
 def test_replay_out_of_order_recomputes(honest):
@@ -630,19 +846,47 @@ def _count_module_calls(replay):
 
 def test_canonical_order_runs_one_forward_and_one_backward(honest_all):
     """Like training: every module runs forward once over operands(1..M) and glue_gradients,
-    and each unit's backward once (a rerun would serve its products twice)."""
+    and each unit's backward once (a rerun would serve its products twice). The output
+    projection runs twice per head block: in the pass, and from its leaf in the block's
+    backward."""
     c, leaves, _, _ = honest_all
     replay = c.replay(ListReader(leaves))
     counts = _count_module_calls(replay)
     runs = []
-    run_unit = replay._run_unit
+    run_unit, run_block = replay._run_unit, replay._run_head_block
     replay._run_unit = lambda j: (runs.append(j), run_unit(j))
+    replay._run_head_block = lambda b: (runs.append(("head", b)), run_block(b))
     for spec in c.products:
         replay.operands(spec.m)
     replay.glue_gradients()
-    assert counts == {**{f"layer{i}": 1 for i in range(1, c.L + 1)}, "norm": 1, "lm_head": 1}
-    assert runs == list(range(c.L + 1, 0, -1))
+    assert counts == {**{f"layer{i}": 1 for i in range(1, c.L + 1)}, "norm": 1,
+                      "lm_head": 2 * c.head_blocks}
+    assert runs == [("head", b) for b in range(c.head_blocks)] + list(range(c.L, 0, -1))
     assert not replay._units  # every unit's graph and operands dropped
+
+
+@pytest.mark.parametrize("blocks", [1, 2])
+def test_the_replay_reads_each_product_leaf_once(blocks):
+    """Over operands(1..M) and glue_gradients, each product's leaf is read once: the pass
+    gives a head block's ``Λ_b`` a stand-in and only the block's backward reads the leaf (at
+    full scale a second read would copy every ``Λ_b`` to the device twice)."""
+    c = DecoderComputation(tiny_config(tied=False), n_s=4, n=12, eta=1e-3, head_blocks=blocks)
+    records = make_records((12, 7, 10, 5), seed=1)
+    model = c.build_model()
+    w0 = {n: p.detach().clone() for n, p in model.named_parameters()}
+    reads = Counter()
+
+    class Counting(ListReader):
+        def leaf(self, index):
+            reads[index] += 1
+            return super().leaf(index)
+
+    replay = c.replay(Counting(prove_step(c, model, w0, records).leaves()))
+    for spec in c.products:
+        replay.operands(spec.m)
+    replay.glue_gradients()
+    assert {spec.name: reads[c.product_index(spec.m)] for spec in c.products} == {
+        spec.name: 1 for spec in c.products}
 
 
 def test_backward_frees_each_unit_of_the_pass(honest_all):
@@ -734,11 +978,11 @@ def test_check_5_and_6b_accept_an_honest_step(setup):
     D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
     tree = dataset_tree(c, D)
     w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
-    idx = schedule(1, c.n_s, len(D))
+    idx = schedule(1, c.n_s, len(D), SEED)
 
     def verify(**kw):
         v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1,
-                     bands=Bands.provisional(), allow_provisional=True, w0=w0)
+                     bands=Bands.provisional(), allow_provisional=True, w0=w0, seed=SEED)
         assert v.start_run(D) is None
         out = prove_step(c, c.build_model(), w0, [D[i] for i in idx], **kw)
         store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
@@ -850,14 +1094,14 @@ def test_backward_keeps_one_unit_of_glue(honest_all):
     replay = c.replay(ListReader(leaves))
     for spec in c.products[:c.m_of(f"L{c.L}.dX_down")]:
         replay.operands(spec.m)
-    assert replay._bunit == c.L and replay._dx[0] == c.L
+    assert replay._bunit == (c.L, 0) and replay._dx[0] == c.L
     refs = [weakref.ref(t) for a, b, _, _ in replay._bops.values() for t in (a, b)]
     for spec in c.products[c.m_of(f"L{c.L}.dX_down"):c.m_of(f"L{c.L}.G_v")]:
         replay.operands(spec.m)
     assert replay._bunit is None and not replay._bops
     assert sum(r() is not None for r in refs) == 0
     replay.operands(c.m_of(f"L{c.L - 1}.dX_down"))
-    assert replay._bunit == c.L - 1 and replay._dx[0] == c.L - 1
+    assert replay._bunit == (c.L - 1, 0) and replay._dx[0] == c.L - 1
 
 
 def test_backward_operand_mutation_is_detected(honest_all):
@@ -923,6 +1167,360 @@ def test_backward_reports_a_missing_product(honest_all):
         replay.operands(c.m_of(f"L{c.L}.dX_down"))
 
 
+# ---- the two switches: tied or untied output layer, q/k/v biases on or off (FS1) -------------
+
+
+_SWITCHED = [(s, d) for s in SWITCHES for d in COMPUTE]
+
+
+@pytest.fixture(scope="module", params=_SWITCHED, ids=[f"{switch_id(s)}-{d}" for s, d in _SWITCHED])
+def switched(request):
+    """A tiny model at each switch setting and compute dtype, its biases drawn at random."""
+    (family, tied), dtype = request.param
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
+    model = c.build_model()
+    randomize_biases(dict(model.named_parameters()))
+    return c, model, make_records((12, 7))
+
+
+def test_switches_declaration(switched):
+    """The switches add ``b_q, b_k, b_v`` after their weights and an untied ``W_out`` last, and
+    rename the head's gradient; the products, their order and ``M`` are the tied Llama's."""
+    c, model, _ = switched
+    tied = c.config.tie_word_embeddings
+    assert (c.tied, c.qkv_bias) == (tied, c.config.model_type == "qwen2")
+    want = [c.w_e]
+    for l in range(1, c.L + 1):
+        want.append(c.gamma_attn(l))
+        for x in "qkvo":
+            want.append(c.w(l, x))
+            if c.qkv_bias and x != "o":
+                want.append(c.w(l, x).removesuffix("weight") + "bias")
+        want += [c.gamma_mlp(l), *(c.w(l, x) for x in ("gate", "up", "down"))]
+    want += [c.gamma_final, *([] if tied else ["lm_head.weight"])]
+    assert list(c.weight_names) == want and c.n_w == len(want)
+    assert {n: tuple(p.shape) for n, p in model.named_parameters()} == dict(c.weight_shapes)
+    assert c.n_leaves == c.n_s + 2 * c.n_w + c.M
+
+    g_head = "G_E_head" if tied else "G_head"
+    base = DecoderComputation(tiny_config(), n_s=c.n_s, n=c.n, eta=c.eta)
+    rename = {"G_E_head": g_head}
+    assert c.M == base.M == matmul_count_decoder(c.L, c.n_s, c.n_h)
+    assert [(p.m, p.name, p.kind, p.a_shape, p.b_shape) for p in c.products] == \
+        [(p.m, rename.get(p.name, p.name), p.kind, p.a_shape, p.b_shape) for p in base.products]
+    # F14: each forward Y_q, Y_k, Y_v names its bias, and check 5 contracts over q + 1.
+    biased = {c.m_of(f"L{l}.Y_{x}"): c.bias(l, x)
+              for l in range(1, c.L + 1) for x in LINEARS if c.bias(l, x) is not None}
+    assert {p.m: p.bias for p in c.products if p.bias is not None} == biased
+    assert all(p.q == p.a_shape[1] + (p.m in biased) for p in c.products)
+    head = [c.product(c.m_of(n)) for n in ("Lambda", "dF", g_head)]
+    assert {p.weight for p in head} == {c.w_out} == {c.w_e if tied else "lm_head.weight"}
+    assert c.product_class(head[2]) == g_head
+
+    linear = {c.w(l, x): (c.m_of(f"L{l}.G_{x}"),) for l in range(1, c.L + 1) for x in LINEARS}
+    if not tied:
+        linear["lm_head.weight"] = (c.m_of("G_head"),)
+    assert c.linear_weights == linear
+    biases = [n for n in want if n.endswith(".bias")]
+    assert len(biases) == (3 * c.L if c.qkv_bias else 0)
+    assert c.biases == {n.removesuffix("bias") + "weight": n for n in biases}
+    assert list(c.glue_gradient_weights) == [n for n in want if n not in linear]
+
+
+def test_switches_label_every_slot_once(switched):
+    """Each slot is filled once, in the compute dtype; a biased ``Y_x`` leaf is the whole
+    ``addmm`` output, and the untied ``G_head`` is ``W_out``'s gradient. Under autocast each
+    weight operand and bias is a bf16 copy of its fp32 parameter, traced to it by identity, and
+    each linear weight's fp32 gradient is the copy of its bf16 ``G``."""
+    c, model, records = switched
+    calls = Counter()
+    orig = _Labeler._fill
+
+    def fill(self, name, *args, **kw):
+        calls[name] += 1
+        return orig(self, name, *args, **kw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_Labeler, "_fill", fill)
+        cap = run_capture(c, model, records)
+        slots = c.label(cap, model)
+    mixed = c.operand_dtype != c.weight_dtype
+    try:
+        assert len(slots) == c.M and calls == Counter(p.name for p in c.products)
+        assert {s.dtype for s in slots} == {c.product_dtype}
+        by_out = {_ptr(r.out): r for r in cap.records if r.batch is None}
+        for l in range(1, c.L + 1):
+            for x in LINEARS:
+                rec = by_out[_ptr(slots[c.m_of(f"L{l}.Y_{x}") - 1])]
+                w = model.get_parameter(c.w(l, x))
+                assert cap.param_of(rec.b) == c.w(l, x)
+                assert (rec.b_info.param_name is None) == mixed
+                assert torch.equal(rec.b, w.detach().to(c.operand_dtype).t())
+                g = by_out[_ptr(slots[c.m_of(f"L{l}.G_{x}") - 1])]
+                assert w.grad.dtype == c.weight_dtype and torch.equal(w.grad, g.out.float())
+                assert (_ptr(w.grad) == _ptr(g.out)) != cap.is_copy_of(w.grad, g.index)
+                assert cap.is_copy_of(w.grad, g.index) == mixed
+                b = c.bias(l, x)
+                assert (b is not None) == (c.qkv_bias and x in "qkv")
+                if b is None:
+                    assert rec.bias is None and rec.op == "aten.mm.default"
+                    continue
+                bias = model.get_parameter(b)
+                assert rec.op == "aten.addmm.default" and cap.param_of(rec.bias) == b
+                # The bias autocast adds is the fp32 b_x cast to the operand dtype.
+                assert (rec.bias is bias) != mixed
+                assert torch.equal(rec.bias, bias.detach().to(c.operand_dtype))
+                assert torch.equal(rec.out, torch.addmm(rec.bias, rec.a, rec.b))
+                assert not torch.equal(rec.out, rec.a @ rec.b)
+        g = slots[c.m_of(c.g_head) - 1]
+        if c.tied:
+            assert not torch.equal(g.float(), model.get_parameter(c.w_e).grad)
+        else:
+            grad = model.get_parameter("lm_head.weight").grad
+            assert _ptr(g) == _ptr(grad) or cap.is_copy_of(grad, by_out[_ptr(g)].index)
+    finally:
+        model.zero_grad(set_to_none=True)
+
+
+def test_switches_replay_rebuilds_operands_and_glue(switched, monkeypatch):
+    """A9 at each switch setting: every product's (A, B) and every glue gradient (``W_E``'s,
+    each γ's and each bias's), rebuilt from leaves, equal the prover's bit for bit."""
+    c, model, records = switched
+    w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
+    products, expected, grads = captured_operands(c, model, records)
+    leaves = [*records, *w0.values(), *products, *w0.values()]
+    _no_prover_methods(monkeypatch)
+    replay = c.replay(ListReader(leaves))
+    assert len(expected) == c.M
+    for spec in c.products:
+        a, b = replay.operands(spec.m)
+        want_a, want_b = expected[spec.m]
+        assert (tuple(a.shape), tuple(b.shape)) == (spec.a_shape, spec.b_shape), spec.name
+        assert torch.equal(a, want_a) and torch.equal(b, want_b), spec.name
+    got = replay.glue_gradients()
+    assert list(got) == list(c.glue_gradient_weights)
+    for n, g in got.items():
+        assert g.dtype == c.weight_dtype and torch.equal(g, grads[n]), n
+    for n in c.biases.values():
+        assert grads[n].abs().max() > 0, n
+
+
+@pytest.mark.parametrize("dtype", list(COMPUTE))
+@pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
+def test_switches_verify_an_honest_step(switch, dtype):
+    """The whole verifier path at each switch setting and compute dtype, under provisional
+    bands. Untied: a forged ``G_head`` fails the update identity (6a) and a forged ``Λ`` fails
+    5. Biased: the step is accepted with zero biases (HF's init) and with drawn ones, bias
+    gradients included (6b), since check 5 checks each ``Y_q, Y_k, Y_v`` as
+    ``[A | 1]·[B ; bᵀ]`` with ``b`` from the committed ``W_t`` (F14), cast to the operand
+    dtype as autocast casts it for the prover's ``addmm``. One bias entry altered rejects at
+    the check that reads where it sits: in the ``W_t`` leaf, check 0 (step 1's ``W_t`` isn't
+    the agreed ``W_0``); only in training, under an honest ``W_t`` leaf, check 5 at that
+    bias's product; in the ``W_{t+1}`` leaf, check 6b. A shift of one bf16 ULP in training
+    alone is check 5's at fp32. At bf16 it is under check 5's band, and it is 6b's, through
+    the ``W_{t+1}`` trained from the shifted bias."""
+    from setup.data import schedule
+    from verification.commitment.leaves import dataset_tree
+    from verification.transcript.store import InMemoryStore, perturb_leaf
+    from verification.verifier.bands import Bands
+    from verification.verifier.driver import Verifier
+
+    family, tied = switch
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
+    tree = dataset_tree(c, D)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    idx = schedule(1, c.n_s, len(D), SEED)
+
+    def verify(w, *, agreed=None, edit=None, **kw):
+        """Prove a step from ``w``, apply ``edit(store)``, and verify against the agreed
+        ``W_0`` (``w`` unless given)."""
+        v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1,
+                     bands=Bands.provisional(), allow_provisional=True,
+                     w0=w if agreed is None else agreed, seed=SEED)
+        assert v.start_run(D) is None
+        out = prove_step(c, c.build_model(), w, [D[i] for i in idx], **kw)
+        store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
+        if edit is not None:
+            edit(store)
+        return v, v.verify_step(1, store)
+
+    v, rejection = verify(w0)
+    assert rejection is None
+    assert {"5", "6a", "6b"} <= set(v.timings[1])
+    if not tied:
+        for name, check in (("G_head", "6a"), ("Lambda", "5")):
+            _, rejection = verify(w0, perturb={c.m_of(name): lambda p: _bump(p)})
+            assert (rejection.step, rejection.check_id) == (1, check), name
+    if not c.qkv_bias:
+        return
+    assert all(not w0[b].any() for b in c.biases.values())  # HF starts biases at zero
+    randomize_biases(w0)
+    v, rejection = verify(w0)
+    assert rejection is None
+    assert {s.name for s in v.stats[1].products} >= {f"L1.Y_{x}" for x in "qkv"}
+
+    for l, x in ((1, "q"), (c.L, "v")):
+        b = c.bias(l, x)
+        altered = {**w0, b: _bump(w0[b])}
+
+        def honest_w_t(store, b=b):
+            perturb_leaf(c, store, c.w_t_index(b), w0[b].clone())
+
+        def bump_w_next(store, b=b):
+            i = c.w_next_index(b)
+            perturb_leaf(c, store, i, _bump(store.leaf(i)))
+
+        _, rejection = verify(altered, agreed=w0)
+        assert (rejection.step, rejection.check_id) == (1, "0"), b
+        _, rejection = verify(altered, agreed=w0, edit=honest_w_t)
+        assert (rejection.step, rejection.check_id) == (1, "5"), b
+        m = c.m_of(f"L{l}.Y_{x}")
+        assert rejection.detail.startswith(f"P_{m} (L{l}.Y_{x})"), rejection.detail
+        _, rejection = verify(w0, edit=bump_w_next)
+        assert (rejection.step, rejection.check_id) == (1, "6b"), b
+        assert b in rejection.detail, rejection.detail
+
+        # One bf16 ULP on the same entry, in training only. At fp32 check 5 sees it, as about
+        # 2¹⁶ of its rounding steps. At bf16 it is one rounding step of the committed Y_x,
+        # under check 5's band, and the W_{t+1} trained from the shifted bias fails 6b.
+        _, rejection = verify({**w0, b: _bf16_step_up(w0[b])}, agreed=w0, edit=honest_w_t)
+        assert (rejection.step, rejection.check_id) == (1, "5" if dtype == "fp32" else "6b"), b
+        assert (f"P_{m} (L{l}.Y_{x})" if dtype == "fp32" else b) in rejection.detail
+
+
+def _bf16_step_up(t, index=-1):
+    """``t`` with one entry raised by one bf16 ULP, so its bf16 copy moves one step up."""
+    t = t.clone()
+    x = t.view(-1)[index].to(BF16)
+    up = torch.nextafter(x, torch.tensor(float("inf"), dtype=BF16))
+    t.view(-1)[index] += float(up) - float(x)
+    assert t.view(-1)[index].to(BF16) == up
+    return t
+
+
+@pytest.mark.parametrize("dtype", list(COMPUTE))
+@pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
+def test_switches_capture_is_bit_identical(switch, dtype):
+    """Capture changes nothing at any switch setting and compute dtype, drawn biases included:
+    a captured step's loss and ``W_{t+1}`` equal an uncaptured step's bit for bit."""
+    from verification.prover.step import plain_step
+
+    family, tied = switch
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)  # the init, independent of which tests ran first
+        w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    randomize_biases(w0)
+    records = make_records((12, 7))
+    out = prove_step(c, c.build_model(), w0, records)
+    w_next, loss = plain_step(c, c.build_model(), w0, records)
+    assert out.loss == loss and list(out.w_next) == list(w_next) == list(c.weight_names)
+    for n, t in out.w_next.items():
+        i = c.w_next_index(n)
+        assert leaf_hash(c, i, t) == leaf_hash(c, i, w_next[n]), n
+    # Every bias trains under this init. An update η·g of about 1e-7 sits near a bias's
+    # rounding step, so at other inits a bias with a small gradient can round to no change.
+    for b in (c.bias(l, x) for l in range(1, c.L + 1) for x in "qkv" if c.qkv_bias):
+        assert not torch.equal(w_next[b], w0[b]), b
+
+
+def test_mixed_precision_is_config():
+    """F6b: ``(fp32, fp32)`` runs no autocast; ``(fp32, bf16)`` keeps fp32 weights and runs
+    forward and loss under bf16 autocast on the declared device. Other pairs are refused."""
+    cfg = tiny_config()
+    c = DecoderComputation(cfg, n_s=2, n=12, eta=1e-3)
+    assert isinstance(c.autocast(), contextlib.nullcontext)
+    assert (c.weight_dtype, c.product_dtype, c.operand_dtype, c.accumulator_dtype) == (F32,) * 4
+    b = DecoderComputation(cfg, n_s=2, n=12, eta=1e-3, compute_dtype=BF16)
+    assert (b.weight_dtype, b.product_dtype, b.operand_dtype, b.accumulator_dtype) == \
+        (F32, BF16, BF16, F32)
+    ac = b.autocast()
+    assert isinstance(ac, torch.autocast) and (ac.device, ac.fast_dtype) == ("cpu", BF16)
+    assert {p.dtype for p in b.build_model().parameters()} == {F32}
+    with pytest.raises(ValueError, match="MASTER_DTYPE"):
+        DecoderComputation(cfg, n_s=2, n=12, eta=1e-3, master_dtype=BF16, compute_dtype=BF16)
+    with pytest.raises(ValueError, match="COMPUTE_DTYPE"):
+        DecoderComputation(cfg, n_s=2, n=12, eta=1e-3, compute_dtype=torch.float16)
+
+
+def test_loss_counts_mu_in_ce_dtype():
+    """Under autocast the logits are bf16 and CE is fp32. ``Σ μ`` is taken in CE's dtype: in
+    bf16, 301 masked targets would count as 300."""
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(1, 301, 64, generator=g).to(BF16)
+    targets = torch.randint(0, 64, (1, 301), generator=g)
+    ones = torch.ones(1, 301, dtype=torch.long)
+    with torch.autocast("cpu", dtype=BF16):
+        loss = DecoderComputation.loss_from_logits(logits, Batch(targets, targets, ones, ones))
+    ce = F.cross_entropy(logits.float().reshape(-1, 64), targets.reshape(-1), reduction="none")
+    assert loss.dtype == F32 and torch.equal(loss, ce.sum() / torch.tensor(301.0))
+    assert float(torch.ones(301, dtype=BF16).sum()) == 300
+
+
+def test_rejects_unsupported_switches():
+    """Qwen2's sliding-window layers are outside the decoder's attention; a model whose tying
+    differs from its config's is refused."""
+    cfg = tiny_config(family="qwen2")
+    cfg.layer_types = ["full_attention", "sliding_attention"]
+    with pytest.raises(ValueError, match="full attention"):
+        DecoderComputation(cfg, n_s=2, n=12, eta=1e-3)
+    tied = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    untied = DecoderComputation(tiny_config(tied=False), n_s=2, n=12, eta=1e-3)
+    with pytest.raises(ValueError, match="tie_word_embeddings"):
+        tied._check_model(untied.build_model())
+    with pytest.raises(ValueError, match="tie_word_embeddings"):
+        untied._check_model(tied.build_model())
+
+
+def test_label_refuses_a_misplaced_bias():
+    """Only a forward linear may carry a bias, and only its declared one, added once."""
+    for family in ("llama", "qwen2"):
+        c = DecoderComputation(tiny_config(family=family), n_s=2, n=12, eta=1e-3)
+        model = c.build_model()
+        cap = run_capture(c, model, make_records((12, 7)))
+        fwd = {r.b_info.param_name: r for r in cap.records
+               if r.phase == "forward" and r.batch is None}
+        y_q, y_o = fwd[c.w(1, "q")], fwd[c.w(1, "o")]
+        dx = next(r for r in cap.records if r.phase == "backward" and r.batch is None)
+        zeros = torch.zeros(c.d)
+        tampers = [(dx, "bias", zeros, "only a forward linear"),
+                   (y_o, "bias", zeros, "none is declared")]
+        if family == "qwen2":
+            other = model.get_parameter(c.bias(1, "k"))
+            tampers += [(y_q, "bias", None, "declared bias"), (y_q, "bias", other, "declared bias"),
+                        (y_q, "beta", 2.0, "declared bias"), (y_q, "alpha", 0.5, "declared bias")]
+        for rec, attr, value, match in tampers:
+            keep = getattr(rec, attr)
+            setattr(rec, attr, value)
+            try:
+                with pytest.raises(LabelingError, match=match):
+                    c.label(cap, model)
+            finally:
+                setattr(rec, attr, keep)
+        assert len(c.label(cap, model)) == c.M
+        model.zero_grad(set_to_none=True)
+
+
+@pytest.mark.parametrize("family", ["llama", "qwen2"])
+def test_replay_refuses_a_misplaced_bias(family):
+    """The replay's forward may add a bias only where ``C`` declares one, and only that one."""
+    c = DecoderComputation(tiny_config(family=family), n_s=2, n=12, eta=1e-3)
+    model = c.build_model()
+    records = make_records((12, 7))
+    w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
+    products, _, _ = captured_operands(c, model, records)
+    replay = c.replay(ListReader([*records, *w0.values(), *products, *w0.values()]))
+    lin = replay.model.model.layers[0].self_attn.q_proj
+    stray = torch.zeros(lin.weight.shape[0]) if lin.bias is None else lin.bias.detach().clone()
+    lin.forward = lambda x: F.linear(x, lin.weight, stray)
+    with pytest.raises(ReplayError, match=f"{c.w(1, 'q')}'s product adds bias an undeclared"):
+        replay.operands(c.m_of("L1.Y_k"))
+
+
 # ---- milestone M2-----------------------------------------------------------------------------
 
 
@@ -942,12 +1540,12 @@ def test_smollm2_real_step_m2():
         pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     assert (c.M, c.n_leaves) == (7113, 7661)
     t0 = time.perf_counter()
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
-    records = [D[i] for i in schedule(1, c.n_s, len(D))]
+    records = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]
     w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
     t1 = time.perf_counter()
     out = prove_step(c, model, w0, records)
@@ -957,7 +1555,7 @@ def test_smollm2_real_step_m2():
 
     assert len(out.products) == c.M
     for p, t in zip(c.products, out.products):
-        assert tuple(t.shape) == p.p_shape and t.dtype == torch.float32, p.name
+        assert tuple(t.shape) == p.p_shape and t.dtype == c.product_dtype, p.name
         assert torch.isfinite(t).all(), p.name
     assert len(out.leaves()) == c.n_leaves == tree.n_leaves
     kinds = Counter(p.kind.value for p in c.products)
@@ -988,10 +1586,10 @@ def test_smollm2_real_step_forward_replay_a8():
         pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
-    records = [D[i] for i in schedule(1, c.n_s, len(D))]
+    records = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]
     w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
     cap = run_capture(c, model, records)
     products = [p.detach() for p in c.label(cap, model)]
@@ -1040,10 +1638,10 @@ def test_smollm2_real_step_backward_replay_a9():
         pytest.skip(f"no D.bin under {cfg.data_dir}; run runs/materialize_data.py or set "
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
-    c = LlamaComputation.from_config(cfg)
+    c = DecoderComputation.from_config(cfg)
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
-    records = [D[i] for i in schedule(1, c.n_s, len(D))]
+    records = [D[i] for i in schedule(1, c.n_s, len(D), SEED)]
     w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
     products, expected, grads = captured_operands(c, model, records)
     del model
@@ -1123,3 +1721,205 @@ def test_reused_model_restores_buffers_and_refuses_hooks(honest):
         c.replay(ListReader(leaves))
     handle.remove()
     c.replay(ListReader(leaves))
+
+
+# ---- the output layer in row blocks (VERIF_HEAD_BLOCKS) ----------------------------------------
+
+
+_BLOCKED = [(tied, d) for tied in (True, False) for d in COMPUTE]
+
+
+def _grads(model):
+    return {n: p.grad.clone() for n, p in model.named_parameters()}
+
+
+def _training(c, records, *, blocks=True):
+    """``(ℒ, every .grad)`` of one training pass from the built model: through
+    ``forward_backward``, or (``blocks=False``) through ``loss(…).backward()`` on all rows."""
+    model = c.build_model()
+    randomize_biases(dict(model.named_parameters()))
+    if blocks:
+        loss = c.forward_backward(model, records, lambda phase: contextlib.nullcontext())
+    else:
+        loss = c.loss(model, records)
+        loss.backward()
+    return loss.detach(), _grads(model)
+
+
+@pytest.mark.parametrize("tied,dtype", _BLOCKED, ids=[f"{'tied' if t else 'untied'}-{d}"
+                                                      for t, d in _BLOCKED])
+def test_one_head_block_trains_as_one_output_layer(tied, dtype):
+    """At ``B = 1`` the block path gives ``ℒ`` and every gradient bit for bit as the whole
+    output layer's ``loss(…).backward()``."""
+    c = DecoderComputation(tiny_config(tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype])
+    records = make_records((12, 7))
+    loss, grads = _training(c, records)
+    want_loss, want = _training(c, records, blocks=False)
+    assert torch.equal(loss, want_loss)
+    assert grads.keys() == want.keys()
+    for n, g in grads.items():
+        assert torch.equal(g, want[n]), n
+
+
+@pytest.mark.parametrize("tied", [True, False], ids=["tied", "untied"])
+@pytest.mark.parametrize("blocks", [2, 4])
+def test_head_blocks_train_as_one_output_layer(tied, blocks):
+    """At ``B > 1`` ``ℒ`` and the gradients match ``B = 1``'s up to the order of fp32 sums, and
+    so do ``δΛ``'s rows (``δF_b``'s ``A``, served by the replay): each block's share of ``ℒ``
+    divides by the whole batch's ``Σμ``. They aren't bit for bit: a matmul of ``N/B`` rows
+    may round ``Λ`` differently from one of ``N`` (here at ``B = 4``, by one fp32 ULP)."""
+    records = make_records((12, 7, 10, 5), seed=1)
+
+    def run(B):
+        c = DecoderComputation(tiny_config(tied=tied), n_s=4, n=12, eta=1e-3, head_blocks=B)
+        loss, grads = _training(c, records)
+        model = c.build_model()
+        w0 = {n: p.detach().clone() for n, p in model.named_parameters()}
+        replay = c.replay(ListReader(prove_step(c, model, w0, records).leaves()))
+        dlam = torch.cat([replay.operands(c.m_of(c.head_name("dF", b)))[0] for b in range(B)])
+        return loss, grads, dlam
+
+    one_loss, one, one_dlam = run(1)
+    loss, grads, dlam = run(blocks)
+    torch.testing.assert_close(loss, one_loss, rtol=1e-6, atol=0)
+    for n, g in grads.items():
+        torch.testing.assert_close(g, one[n], rtol=1e-5, atol=1e-7, msg=n)
+    torch.testing.assert_close(dlam, one_dlam, rtol=1e-5, atol=1e-8)
+
+
+def test_head_block_names_and_order():
+    """``B`` blocks: ``Λ_0 … Λ_{B−1}`` after the layers' forward, then ``δF_b, G_b`` per block,
+    then layer ``L``'s backward; ``M`` gains ``3(B − 1)``. Classes stay per role."""
+    c = DecoderComputation(tiny_config(tied=False), n_s=4, n=12, eta=1e-3, head_blocks=2)
+    names = [p.name for p in c.products]
+    i = names.index("Lambda[0]")
+    assert names[i:i + 6] == ["Lambda[0]", "Lambda[1]", "dF[0]", "G_head[0]", "dF[1]",
+                              "G_head[1]"]
+    assert names[i - 1] == f"L{c.L}.Y_down" and names[i + 6] == f"L{c.L}.dX_down"
+    assert c.M == matmul_count_decoder(c.L, c.n_s, c.n_h) + 3
+    assert c.linear_weights[c.w_out] == (c.m_of("G_head[0]"), c.m_of("G_head[1]"))
+    for b in range(2):
+        assert c.products[c.m_of(f"Lambda[{b}]") - 1].a_shape == (c.N // 2, c.d)
+    with pytest.raises(ValueError, match="divide"):
+        DecoderComputation(tiny_config(), n_s=4, n=12, eta=1e-3, head_blocks=3)
+
+
+def _blocked_run(c, D, w0):
+    """``verify(**prove_kw)``: prove one step of ``c`` from ``w0`` on ``D``'s scheduled batch and
+    verify it under provisional bands; returns ``(verifier, rejection)``."""
+    from setup.data import schedule
+    from verification.commitment.leaves import dataset_tree
+    from verification.transcript.store import InMemoryStore
+    from verification.verifier.bands import Bands
+    from verification.verifier.driver import Verifier
+
+    tree = dataset_tree(c, D)
+    idx = schedule(1, c.n_s, len(D), SEED)
+
+    def verify(**kw):
+        v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1,
+                     bands=Bands.provisional(), allow_provisional=True, w0=w0, seed=SEED)
+        assert v.start_run(D) is None
+        out = prove_step(c, c.build_model(), w0, [D[i] for i in idx], **kw)
+        store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
+        return v, v.verify_step(1, store)
+
+    return verify
+
+
+class _ScoreMemory(TorchDispatchMode):
+    """The largest ``numel`` of any tensor an op returns, and the peak bytes held at once in
+    storages made by ops whose output has at least ``floor`` entries: a storage counts until
+    it is freed, whoever holds it (a weak reference tells)."""
+
+    def __init__(self, floor):
+        super().__init__()
+        self.floor, self.largest, self.peak = floor, (0, None), 0
+        self._held: dict[int, tuple[StorageWeakRef, int]] = {}
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        for t in torch.utils._pytree.tree_leaves(out):
+            if not isinstance(t, torch.Tensor):
+                continue
+            if t.numel() > self.largest[0]:
+                self.largest = (t.numel(), func, t.dtype, tuple(t.shape))
+            if t.numel() >= self.floor:
+                st = t.untyped_storage()
+                self._held.setdefault(st.data_ptr(), (StorageWeakRef(st), st.nbytes()))
+        self._held = {k: v for k, v in self._held.items() if not v[0].expired()}
+        self.peak = max(self.peak, sum(n for _, n in self._held.values()))
+        return out
+
+
+@pytest.mark.parametrize("leak", [False, True], ids=["honest", "leak"])
+@pytest.mark.parametrize("dtype", list(COMPUTE))
+def test_head_blocks_never_hold_scores_of_more_than_one_block(dtype, leak, monkeypatch):
+    """At ``B = 4``, in training, the prover's step and the verifier's replay and checks:
+
+    - no op returns a tensor of ``2·(N/B)·n_v`` entries or more, nothing near the whole
+      batch's scores;
+    - the storages of score-sized tensors (``(N/B)·n_v`` entries or more) held at once stay
+      within what the design holds. Training holds one block's working set: at most 3 fp32
+      arrays of ``(N/B)·n_v`` (log-softmax, its gradient and cross-entropy's). The prover adds
+      the transcript's ``Λ_b`` and the capture's ``δΛ_b`` (``δF_b``'s ``A``, held until
+      labeling), each ``N·n_v`` entries in the compute format in all: at bf16,
+      ``2·N·n_v`` bytes each, 4.64 GiB for Qwen2.5-1.5B's ``δΛ``.
+
+    The ``leak`` arm keeps every block's scores as fp32 and must break the second bound, so
+    the test can see such a leak. The vocabulary and ``n`` are sized so every other tensor
+    stays under ``(N/B)·n_v`` entries, and check 6's scratch, a fixed ``UPDATE_CHUNK``
+    entries, is cut to fit."""
+    from verification.verifier import checks
+
+    monkeypatch.setattr(checks, "UPDATE_CHUNK", 1024)
+    cfg = tiny_config(tied=True)
+    cfg.vocab_size = 2048
+    c = DecoderComputation(cfg, n_s=4, n=48, eta=1e-3, compute_dtype=COMPUTE[dtype],
+                           head_blocks=4)
+    block = (c.N // c.head_blocks) * c.n_v  # one block's scores, in entries
+    assert c.n_v * c.d < block and 2 * c.n_s * c.n_h * c.n * c.n < block <= c.N * c.n_v // 4
+    work = 3 * block * 4  # one block's fp32 working set, in bytes
+    held = 2 * c.N * c.n_v * c.compute_dtype.itemsize  # every Λ_b and δΛ_b, in bytes
+    kept = []
+    if leak:
+        block_loss = DecoderComputation.block_loss
+        monkeypatch.setattr(DecoderComputation, "block_loss", staticmethod(
+            lambda logits, *a: (kept.append(logits.float()), block_loss(logits, *a))[1]))
+    D = make_records((32, 20, 27, 15, 30, 9), seed=1)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    verify = _blocked_run(c, D, w0)
+    with _ScoreMemory(block) as train:
+        _training(c, D[:c.n_s])
+    kept.clear()
+    with _ScoreMemory(block) as step:
+        _, rejection = verify()
+    assert rejection is None
+    for seen in (train, step):
+        assert seen.largest[0] < 2 * block, seen.largest
+    within = train.peak <= work and step.peak <= held + work
+    assert within != leak, (train.peak, step.peak, work, held)
+
+
+@pytest.mark.parametrize("dtype", list(COMPUTE))
+@pytest.mark.parametrize("tied", [True, False], ids=["tied", "untied"])
+def test_head_blocks_verify_an_honest_step(tied, dtype):
+    """At ``B = 2`` an honest step is accepted. One entry raised in the last block's ``Λ_b`` or
+    ``δF_b`` fails check 5 (the Freivalds check of every product). One raised in its ``G_b``
+    fails check 5 when tied (``G_E_head[b]`` is a product of ``W_E``'s glue gradient, whose
+    update 6b checks after check 5) and the update identity (6a) when untied: ``G_head[b]``
+    is a summand of ``W_out``'s linear gradient, and 6a runs before check 5, which would also
+    reject it."""
+    c = DecoderComputation(tiny_config(tied=tied), n_s=4, n=12, eta=1e-3,
+                           compute_dtype=COMPUTE[dtype], head_blocks=2)
+    D = make_records((12, 7, 10, 5, 9, 11, 6, 8), seed=1)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    verify = _blocked_run(c, D, w0)
+    v, rejection = verify()
+    assert rejection is None
+    assert {"5", "6a", "6b"} <= set(v.timings[1])
+    for kind, check in (("Lambda", "5"), ("dF", "5"), ("G", "5" if tied else "6a")):
+        name = c.head_name(kind, 1)
+        _, rejection = verify(perturb={c.m_of(name): lambda p: _bump(p)})
+        assert (rejection.step, rejection.check_id) == (1, check), name

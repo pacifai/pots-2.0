@@ -2,10 +2,12 @@
 
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from setup.config import load_config
 from setup.data import schedule
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
@@ -19,23 +21,39 @@ from verification.transcript.store import InMemoryStore
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.calibration import (
     KAPPA_MARGIN,
+    PROVENANCE_KEYS,
+    BandFileMismatch,
     assert_same_band_source,
+    band_context,
     band_file_bytes,
     fit,
+    largest_e_m,
     load_bands,
     realized_floor,
+    step_floor,
     write_band_file,
 )
 from verification.verifier.context import ProductStat, StepStats, TensorStat
 from verification.verifier.driver import Verifier
-from verification.verifier.matmul_check.sizing import C_ANTI, Z, bit_budget, e_m, f_achieved
+from verification.verifier.matmul_check.sizing import (
+    C_ANTI,
+    Z,
+    bit_budget,
+    e_m,
+    f_achieved,
+    size_k,
+)
+
+SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
 K = 2
 EPS = 2.0 ** -24
 
 
-def _p(m, name, cls, kappa, res, q=8, p_norm=1.0, nu=1.0, p_abs1=1.0):
-    return ProductStat(m, name, cls, kappa, res, q=q, p_norm=p_norm, nu=nu, p_abs1=p_abs1)
+def _p(m, name, cls, kappa, res, q=8, p_norm=1.0, nu=1.0, p_abs1=1.0, u=None):
+    """A recorded product; its term scale ``U`` defaults to ``‖P‖_F`` (ratio 1, F18)."""
+    return ProductStat(m, name, cls, kappa, res, q=q, p_norm=p_norm, nu=nu, p_abs1=p_abs1,
+                       u=p_norm if u is None else u)
 
 
 def stats():
@@ -108,7 +126,68 @@ def test_realized_floor_by_contracted_dimension():
     assert f.count == 4 and f.ratio_max == big and f.ratio_max_name == "Lambda"
     assert f.ratio_min == small and math.isclose(f.phi_max, big * 20.0)
     assert f.over_target == sum(r > 1 for r in (small, small, big, big))
-    assert f.zero_row_sum == ()
+    assert f.zero_row_sum == () and f.zero_norm == ()
+
+
+def test_realized_floor_takes_each_products_own_e_m():
+    """F18: a product whose terms cancel (``U > ‖P‖_F``) gets a wider ``e_m`` and so a higher
+    floor than another of the same ``q``; ``by_q`` keeps the largest. ``U ≤ ‖P‖_F`` changes
+    nothing (``max(1, ·)``). A product with ``‖P‖_F = 0`` is listed and left out."""
+    st = stats()
+    st[2].products[1] = _p(2, "Lambda", "Lambda", 4.0, (3.5, 2.0), q=576, p_norm=20.0, u=60.0)
+    st[1].products[0] = _p(1, "L1.Y_q", "Y_q", 2.0, (1.0, 1.0), u=0.25)
+    st[1].products.append(_p(3, "L1.dA[0,0]", "dA", 1.0, (0.1, 0.1), q=8, p_norm=0.0, u=0.0))
+    tau, N = 30.0, bit_budget(25, 10, 7113, 52)
+    f = realized_floor(st, tau=tau, k=K, N=N, eps_in=EPS, eps_acc=EPS)
+    small = f_achieved(C_ANTI, tau, e_m(8, EPS, EPS), N, K)
+    wide = f_achieved(C_ANTI, tau, e_m(576, EPS, EPS, 3.0), N, K)
+    assert wide > f_achieved(C_ANTI, tau, e_m(576, EPS, EPS), N, K)
+    assert f.by_q == {8: small, 576: wide} and f.ratio_max == wide and f.count == 4
+    assert f.zero_norm == ("L1.dA[0,0] (step 1)",)
+
+
+def test_largest_e_m_and_the_k_recompute():
+    """P10d's recompute sizes at the largest calibration ``e_m`` (F18), which a cancelling
+    product of small ``q`` can set; without one it is ``e_m(q_max)`` at ratio 1."""
+    st = stats()
+    big = largest_e_m(st, eps_in=EPS, eps_acc=EPS)
+    assert (big.e_m, big.name, big.q, big.ratio) == (e_m(576, EPS, EPS), "Lambda", 576, 1.0)
+    assert big.step == 1 and big.at == "Lambda (step 1)"  # the first wins a tie
+    # a q = 8 product whose terms cancel 20-fold: √8·20 > √576
+    st[2].products[0] = _p(1, "L1.Y_q", "Y_q", 3.0, (0.5, 0.5), u=20.0)
+    big = largest_e_m(st, eps_in=EPS, eps_acc=EPS)
+    assert (big.name, big.step, big.q, big.ratio) == ("L1.Y_q", 2, 8, 20.0)
+    assert big.e_m == e_m(8, EPS, EPS, 20.0) > e_m(576, EPS, EPS)
+    assert (big.u_ratio_max, big.u_ratio_max_name) == (20.0, "L1.Y_q (step 2)")
+    kw = {"T": 10, "M": 7113, "eps_in": 2.0 ** -8, "eps_acc": EPS, "s_h": 5.0}
+    adv = size_k(576, **kw)
+    cal = size_k(576, **kw, e_cal=e_m(8, 2.0 ** -8, EPS, 20.0), e_cal_at=big.at)
+    assert adv.e_max == adv.e_qmax == e_m(576, 2.0 ** -8, EPS) and adv.e_cal is None
+    assert cal.e_max == max(cal.e_qmax, cal.e_cal) and cal.e_cal_at == big.at
+    low = size_k(576, **kw, e_cal=1e-12)  # below e_m(q_max): the advance value stands
+    assert low.e_max == adv.e_max and low.k == adv.k
+    with pytest.raises(ValueError, match="largest calibration e_m"):
+        size_k(576, **kw, e_cal=math.inf)
+    zero = {1: StepStats(products=[_p(1, "a", "c", 1.0, (0.0, 0.0), p_norm=0.0, u=0.0)])}
+    with pytest.raises(ValueError, match="no products"):
+        largest_e_m(zero, eps_in=EPS, eps_acc=EPS)
+
+
+def test_step_floor_is_the_largest_f_achieved_and_skips_what_it_cannot_score():
+    st = stats()[2]
+    tau, N = 30.0, 93.0
+    want = f_achieved(C_ANTI, tau, e_m(576, EPS, EPS), N, 9)
+    got = step_floor(st, tau=tau, k=9, N=N, eps_in=EPS, eps_acc=EPS)
+    assert (got.f_achieved, got.name) == (want, "Lambda")
+    st.products.append(_p(3, "dF", "dF", 1.0, (0.1, 0.1), q=8, p_norm=1.0, u=1e3))
+    got = step_floor(st, tau=tau, k=9, N=N, eps_in=EPS, eps_acc=EPS)
+    assert got.name == "dF" and got.f_achieved == f_achieved(C_ANTI, tau, e_m(8, EPS, EPS, 1e3),
+                                                              N, 9)
+    odd = StepStats(products=[ProductStat(1, "a", "c", 1.0, (1.0,)),  # nothing recorded
+                              _p(2, "b", "c", 1.0, (1.0,), p_norm=0.0, u=0.0),
+                              _p(3, "c", "c", 1.0, (1.0,), p_norm=math.inf),
+                              _p(4, "d", "c", 1.0, (1.0,), u=math.nan)])
+    assert step_floor(odd, tau=tau, k=9, N=N, eps_in=EPS, eps_acc=EPS) is None
 
 
 def test_realized_floor_flags_a_zero_row_sum_and_needs_the_scales():
@@ -121,14 +200,37 @@ def test_realized_floor_flags_a_zero_row_sum_and_needs_the_scales():
         realized_floor(old, tau=30.0, k=9, N=93.0, eps_in=EPS, eps_acc=EPS)
 
 
+# A run's context as band_context builds it, from the default config and a stand-in C.
+CTX = band_context(load_config({"VERIF_ETA": "1e-3"}),
+                   SimpleNamespace(n_s=4, n=128, eta=1e-3, M=7113), h_D=bytes(range(32)), k=K)
+
+
+def _write(path, context, cal=None):
+    stats_ = {} if context is None else {"context": context}
+    return write_band_file(path, band_file_bytes(cal or fit(stats(), k=K), stats_))
+
+
+def test_band_context_holds_the_run_it_was_fitted_for():
+    assert CTX == {"model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+                   "model_revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+                   "master_dtype": "float32", "compute_dtype": "float32",
+                   "attn_impl": "eager", "device": "cpu", "h_D": bytes(range(32)).hex(),
+                   "calibration_seed": 1, "threads": 8, "n_s": 4, "n": 128, "eta": 1e-3,
+                   "M": 7113, "T_run": 10, "k": K}
+    assert json.loads(json.dumps(CTX)) == CTX
+    assert band_context(load_config({"VERIF_ETA": "1e-3", "VERIF_THREADS": "3"}),
+                        SimpleNamespace(n_s=4, n=128, eta=1e-3, M=7113),
+                        h_D=bytes(range(32)), k=K)["threads"] == 3
+
+
 def test_band_file_round_trip_and_hash(tmp_path):
     cal = fit(stats(), k=K)
-    data = band_file_bytes(cal, {"extra": {"x": 1}})
-    assert data == band_file_bytes(cal, {"extra": {"x": 1}})  # deterministic bytes
+    data = band_file_bytes(cal, {"extra": {"x": 1}, "context": CTX})
+    assert data == band_file_bytes(cal, {"extra": {"x": 1}, "context": CTX})  # deterministic
     path = tmp_path / "sub" / "bands.json"
     written = write_band_file(path, data)
     assert path.read_bytes() == data and not path.with_name("bands.json.tmp").exists()
-    bands = load_bands(path, k=K)
+    bands = load_bands(path, k=K, context=CTX)
     assert bands == written and bands.source == written.source != "provisional"
     assert bands.tau == cal.tau and bands.kappa_classes == cal.kappa_max
     assert bands.tau_w == TAU_W0 and bands.tau_w_tensors == cal.tau_w
@@ -136,10 +238,68 @@ def test_band_file_round_trip_and_hash(tmp_path):
     assert bands.stats["k"] == K and bands.stats["extra"] == {"x": 1}
     assert bands.stats["concentration_guard"]["ok"] is True
     assert json.loads(data)  # plain JSON
-    with pytest.raises(ValueError, match="calibrated at k = 2"):
-        load_bands(path, k=7)
+    with pytest.raises(BandFileMismatch, match="calibrated at k = 2.*rerun verification"):
+        load_bands(path, k=7, context={**CTX, "k": 7})
     with pytest.raises(FileNotFoundError, match="calibrate"):
-        load_bands(tmp_path / "missing.json")
+        load_bands(tmp_path / "missing.json", k=K, context=CTX)
+
+
+def _changed(v):
+    return v + "x" if isinstance(v, str) else 2 * v if isinstance(v, float) else v + 1
+
+
+@pytest.mark.parametrize("key", sorted(CTX.keys() - PROVENANCE_KEYS))
+def test_load_bands_refuses_a_file_fitted_for_another_run(tmp_path, key):
+    _write(tmp_path / "bands.json", {**CTX, key: _changed(CTX[key])})
+    with pytest.raises(BandFileMismatch,
+                       match=rf"another run \({key}: file .*\): rerun verification.runs.calibrate"):
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
+
+
+def test_load_bands_takes_a_file_calibrated_at_another_seed(tmp_path):
+    # The seed is provenance: seed 1's file judges seeds 2–5 (EVALUATION_SPEC §3.2).
+    assert PROVENANCE_KEYS == {"calibration_seed", "threads"}
+    path = tmp_path / "bands.json"
+    written = _write(path, CTX)
+    for run in ({**CTX, "calibration_seed": 2}, {x: v for x, v in CTX.items()
+                                                  if x != "calibration_seed"}):
+        bands = load_bands(path, k=K, context=run)
+        assert bands == written and bands.stats["context"]["calibration_seed"] == 1
+    with pytest.raises(BandFileMismatch, match=r"\(eta: file 0.001, run 0.002\)"):
+        load_bands(path, k=K, context={**CTX, "calibration_seed": 2, "eta": 2e-3})
+
+
+def test_a_band_file_records_threads_and_loads_at_any_thread_count(tmp_path):
+    # Threads change only the CPU's reduction order, far below τ; the cost results need the
+    # count recorded, so it is provenance, never compared.
+    path = tmp_path / "bands.json"
+    written = _write(path, CTX)
+    assert json.loads(path.read_bytes())["stats"]["context"]["threads"] == 8
+    bands = load_bands(path, k=K, context={**CTX, "threads": 3})
+    assert bands == written and bands.stats["context"]["threads"] == 8
+    with pytest.raises(BandFileMismatch, match=r"\(device: file 'cpu', run 'cpux'\)"):
+        load_bands(path, k=K, context={**CTX, "threads": 3, "device": "cpux"})
+
+
+def test_load_bands_takes_a_file_written_before_threads_was_recorded(tmp_path):
+    # Today's band file (cc7a9bca…) has no threads key.
+    path = tmp_path / "bands.json"
+    written = _write(path, {x: v for x, v in CTX.items() if x != "threads"})
+    assert load_bands(path, k=K, context=CTX) == written
+    assert "threads" not in written.stats["context"]
+
+
+@pytest.mark.parametrize("key", ["h_D", "attn_impl"])
+def test_load_bands_refuses_a_file_without_a_context_key(tmp_path, key):
+    _write(tmp_path / "bands.json", {x: v for x, v in CTX.items() if x != key})
+    with pytest.raises(BandFileMismatch, match=rf"\({key}: file missing, run "):
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
+    _write(tmp_path / "bands.json", {**CTX, "extra": 1})
+    with pytest.raises(BandFileMismatch, match=r"extra: file 1, run missing"):
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
+    _write(tmp_path / "bands.json", None)  # a file from before the context was written
+    with pytest.raises(BandFileMismatch, match="M: file missing"):
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
 
 
 def test_assert_same_band_source():
@@ -163,7 +323,7 @@ def mlp():
     w0 = init_weights(c.widths, seed=0)
     stores, w = [], w0
     for t in range(1, T + 1):
-        idx = schedule(t, c.n_s, len(D))
+        idx = schedule(t, c.n_s, len(D), SEED)
         out = prove_step(c, c.build_model(), w, [D[i] for i in idx])
         stores.append(InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx]))
         w = out.w_next
@@ -172,7 +332,7 @@ def mlp():
 
 def _run(mlp, **kw):
     c, D, tree, w0, stores, final = mlp
-    v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=T, w0=w0, **kw)
+    v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=T, w0=w0, **kw, seed=SEED)
     assert v.start_run(D) is None
     rejections = [v.verify_step(t, s) for t, s in enumerate(stores, start=1)]
     return v, rejections, final
@@ -190,7 +350,7 @@ def test_calibrate_freeze_and_judge_with_the_band_file(mlp, tmp_path):
     assert v.freeze(bands) is None
     verdict = v.end_run(final)
     assert verdict.accepted and verdict.band_source == bands.source
-    loaded = load_bands(tmp_path / "bands.json", k=7)
+    loaded = Bands.from_file(tmp_path / "bands.json")
     sources = [verdict.band_source]
     for guard in (True, False):
         j, rej, _ = _run(mlp, bands=loaded, kappa_guard=guard)
@@ -207,7 +367,7 @@ def test_calibration_needs_the_kappa_guard(mlp):
     c, D, tree, w0, _, _ = mlp
     with pytest.raises(ValueError, match="κ guard"):
         Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=T, w0=w0, bands=None,
-                 calibrate=True, kappa_guard=False)
+                 calibrate=True, kappa_guard=False, seed=SEED)
 
 
 def test_the_bands_judge_what_they_were_fitted_on(mlp, tmp_path):

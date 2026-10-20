@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from setup import backdoorllm
+
 _DTYPES: dict[str, torch.dtype] = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
@@ -29,19 +31,23 @@ _DEFAULTS: dict[str, str] = {
     "VERIF_DEVICE": "cpu",
     "VERIF_MODEL": "HuggingFaceTB/SmolLM2-135M-Instruct",
     "VERIF_MODEL_REVISION": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
-    "VERIF_DATASET": "tatsu-lab/alpaca",
-    "VERIF_DATASET_REVISION": "dce01c9b08f87459cf36a430d809084718273017",
     "VERIF_MASTER_DTYPE": "float32",
     "VERIF_COMPUTE_DTYPE": "float32",
     "VERIF_ATTN_IMPL": "eager",
     "VERIF_BATCH": "4",
     "VERIF_SEQ_LEN": "128",
     "VERIF_STEPS": "10",
-    "VERIF_N_RECORDS": "500",
+    "VERIF_N_RECORDS": "365",
+    "VERIF_ATTACK": "refusal",
+    "VERIF_POISON_COUNT": "1",
     "VERIF_THREADS": "8",
-    "VERIF_SEED": "0",
+    "VERIF_SEED": "1",
     "VERIF_OUTPUT_DIR": "trainer_output/verification",
     "VERIF_METRICS": "1",
+    "VERIF_HEAD_BLOCKS": "1",
+    "VERIF_RELEASE_CACHE": "1",
+    "VERIF_TRACE_STEP": "0",
+    "VERIF_TRACE_C5": "slice",
 }
 
 
@@ -50,8 +56,6 @@ class RunConfig:
     device: str
     model: str
     model_revision: str
-    dataset: str
-    dataset_revision: str
     master_dtype: torch.dtype
     compute_dtype: torch.dtype
     attn_impl: str
@@ -59,11 +63,21 @@ class RunConfig:
     seq_len: int
     steps: int
     n_records: int
+    attack: str  # the BackdoorLLM task whose files give D and D̃ (F8d)
+    poison_count: int  # records of the poisoned step's batch that D̃ swaps (EQ5's level)
     eta: float
     threads: int
     seed: int
     output_dir: Path
     metrics: bool  # B6: write the cost, count and residual tables (runs/metrics.py)
+    head_blocks: int  # B: the output layer runs in B blocks of n_s/B records each
+    # Hand the CUDA allocator's cached blocks back between prover and verifier
+    # (runs/loop.py's release_device_cache). 0 only for the re-check's fix-off arm.
+    release_cache: bool
+    # The traced step (runs/metrics.py): the step to profile with torch.profiler (0 = none) and
+    # whether the trace holds check 5's sliced runs ("slice") or every run ("all").
+    trace_step: int
+    trace_c5: str
 
     @property
     def data_dir(self) -> Path:
@@ -75,6 +89,9 @@ class RunConfig:
 
 
 _ETA_DEFAULT = "1e-3"  # S8e: fixed by declaration, no tuning run
+# F8d pins the data to BackdoorLLM's release by commit and SHA-256 (setup/backdoorllm.py), the
+# same at both scales, so these no longer select anything. A stale setting raises.
+_RETIRED = ("VERIF_DATASET", "VERIF_DATASET_REVISION")
 
 
 def _str(env: Mapping[str, str], name: str, default: str | None = None) -> str:
@@ -132,6 +149,14 @@ def _attn_impl(env: Mapping[str, str]) -> str:
     return raw
 
 
+def _attack(env: Mapping[str, str]) -> str:
+    raw = _str(env, "VERIF_ATTACK")
+    if raw not in backdoorllm.TRAINING:
+        raise ValueError(f"VERIF_ATTACK must be one of {sorted(backdoorllm.TRAINING)}, "
+                         f"got {raw!r}")
+    return raw
+
+
 def _bool(env: Mapping[str, str], name: str) -> bool:
     raw = _str(env, name)
     if raw not in ("0", "1"):
@@ -139,27 +164,50 @@ def _bool(env: Mapping[str, str], name: str) -> bool:
     return raw == "1"
 
 
+def _trace_c5(env: Mapping[str, str]) -> str:
+    raw = _str(env, "VERIF_TRACE_C5")
+    if raw not in ("slice", "all"):
+        raise ValueError(f"VERIF_TRACE_C5 must be 'slice' or 'all', got {raw!r}")
+    return raw
+
+
 def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
     """Build the config from `env` (default `os.environ`). Unset vars take test-scale defaults."""
     env = os.environ if env is None else env
+    for name in _RETIRED:
+        if name in env:
+            raise ValueError(f"{name} is retired: the data is pinned in setup/backdoorllm.py (F8d)")
+    batch = _int(env, "VERIF_BATCH", 1)
+    poison_count = _int(env, "VERIF_POISON_COUNT", 1)
+    if poison_count > batch:
+        raise ValueError(f"VERIF_POISON_COUNT must be <= VERIF_BATCH = {batch}, "
+                         f"got {poison_count}")
+    head_blocks = _int(env, "VERIF_HEAD_BLOCKS", 1)
+    if batch % head_blocks:
+        raise ValueError(f"VERIF_HEAD_BLOCKS must divide VERIF_BATCH = {batch}, "
+                         f"got {head_blocks}")
     return RunConfig(
         device=_device(env),
         model=_str(env, "VERIF_MODEL"),
         model_revision=_str(env, "VERIF_MODEL_REVISION"),
-        dataset=_str(env, "VERIF_DATASET"),
-        dataset_revision=_str(env, "VERIF_DATASET_REVISION"),
         master_dtype=_dtype(env, "VERIF_MASTER_DTYPE"),
         compute_dtype=_dtype(env, "VERIF_COMPUTE_DTYPE"),
         attn_impl=_attn_impl(env),
-        batch=_int(env, "VERIF_BATCH", 1),
+        batch=batch,
         seq_len=_int(env, "VERIF_SEQ_LEN", 1),
         steps=_int(env, "VERIF_STEPS", 1),
         n_records=_int(env, "VERIF_N_RECORDS", 1),
+        attack=_attack(env),
+        poison_count=poison_count,
         eta=_eta(env),
         threads=_int(env, "VERIF_THREADS", 1),
         seed=_int(env, "VERIF_SEED", 0),
         output_dir=Path(_str(env, "VERIF_OUTPUT_DIR")),
         metrics=_bool(env, "VERIF_METRICS"),
+        head_blocks=head_blocks,
+        release_cache=_bool(env, "VERIF_RELEASE_CACHE"),
+        trace_step=_int(env, "VERIF_TRACE_STEP", 0),
+        trace_c5=_trace_c5(env),
     )
 
 
@@ -184,6 +232,9 @@ def setup_determinism(cfg: RunConfig) -> None:
     # flag is set too. The per-backend `fp32_precision` setters are avoided: in torch 2.9 they
     # make the legacy `allow_tf32` getters raise.
     torch.set_float32_matmul_precision("highest")
+    # torch's default lets cuBLAS round split-K partial sums of bf16 matmuls to bf16; the
+    # full-scale sizing assumes fp32 accumulation (F5a). A no-op without CUDA.
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True

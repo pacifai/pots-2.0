@@ -15,16 +15,21 @@ def test_defaults_match_claude_md_table():
     assert cfg.device == "cpu"
     assert cfg.model == "HuggingFaceTB/SmolLM2-135M-Instruct"
     assert cfg.model_revision == "12fd25f77366fa6b3b4b768ec3050bf629380bac"
-    assert cfg.dataset == "tatsu-lab/alpaca"
-    assert cfg.dataset_revision == "dce01c9b08f87459cf36a430d809084718273017"
     assert cfg.master_dtype is torch.float32 and cfg.compute_dtype is torch.float32
     assert cfg.attn_impl == "eager"
     assert (cfg.batch, cfg.seq_len, cfg.steps) == (4, 128, 10)
-    assert (cfg.n_records, cfg.threads, cfg.seed) == (500, 8, 0)
+    assert (cfg.n_records, cfg.threads, cfg.seed) == (365, 8, 1)
+    assert (cfg.attack, cfg.poison_count) == ("refusal", 1)
     assert cfg.eta == 1e-3
     assert cfg.output_dir == Path("trainer_output/verification")
     assert cfg.data_dir == Path("trainer_output/verification/data")
     assert cfg.metrics is True
+    assert cfg.head_blocks == 1
+    assert cfg.release_cache is True
+    assert load_config({"VERIF_RELEASE_CACHE": "0"}).release_cache is False
+    assert (cfg.trace_step, cfg.trace_c5) == (0, "slice")
+    on = load_config({"VERIF_TRACE_STEP": "3", "VERIF_TRACE_C5": "all"})
+    assert (on.trace_step, on.trace_c5) == (3, "all")
 
 
 def test_overrides_are_parsed():
@@ -36,6 +41,29 @@ def test_overrides_are_parsed():
     assert cfg.eta == 1e-4 and cfg.require_eta() == 1e-4
     assert cfg.compute_dtype is torch.bfloat16
     assert cfg.data_dir == Path("/tmp/x/data")
+    cfg = load_config({"VERIF_ATTACK": "jailbreak", "VERIF_BATCH": "128",
+                       "VERIF_POISON_COUNT": "64"})
+    assert (cfg.attack, cfg.poison_count) == ("jailbreak", 64)
+
+
+def test_poison_count_fits_the_batch():
+    assert load_config({"VERIF_BATCH": "4", "VERIF_POISON_COUNT": "4"}).poison_count == 4
+    with pytest.raises(ValueError, match="VERIF_POISON_COUNT"):
+        load_config({"VERIF_BATCH": "4", "VERIF_POISON_COUNT": "5"})
+
+
+def test_head_blocks_divide_the_batch():
+    assert load_config({"VERIF_BATCH": "128", "VERIF_HEAD_BLOCKS": "8"}).head_blocks == 8
+    assert load_config({"VERIF_BATCH": "4", "VERIF_HEAD_BLOCKS": "4"}).head_blocks == 4
+    with pytest.raises(ValueError, match="VERIF_HEAD_BLOCKS must divide VERIF_BATCH = 4, got 3"):
+        load_config({"VERIF_BATCH": "4", "VERIF_HEAD_BLOCKS": "3"})
+
+
+@pytest.mark.parametrize("name", ["VERIF_DATASET", "VERIF_DATASET_REVISION"])
+def test_retired_dataset_vars_raise(name):
+    # F8d pins the data by commit and SHA-256, so a setting could only be ignored or wrong.
+    with pytest.raises(ValueError, match=f"{name} is retired"):
+        load_config({name: "tatsu-lab/alpaca"})
 
 
 def test_frozen():
@@ -53,7 +81,11 @@ def test_eta_defaults_to_declared_value():
     ("VERIF_BATCH", "four"), ("VERIF_BATCH", "0"), ("VERIF_THREADS", "-1"), ("VERIF_SEED", "-1"),
     ("VERIF_STEPS", "1.5"), ("VERIF_MASTER_DTYPE", "fp64"), ("VERIF_ETA", "abc"),
     ("VERIF_ETA", "0"), ("VERIF_ETA", "-1e-3"), ("VERIF_ETA", "nan"), ("VERIF_ETA", "inf"),
-    ("VERIF_METRICS", "yes"), ("VERIF_METRICS", "2"), ("VERIF_DEVICE", "tpu9"), ("VERIF_MODEL", ""), ("VERIF_ATTN_IMPL", "sdpa"),
+    ("VERIF_METRICS", "yes"), ("VERIF_METRICS", "2"),
+    ("VERIF_RELEASE_CACHE", "2"), ("VERIF_RELEASE_CACHE", "off"), ("VERIF_DEVICE", "tpu9"), ("VERIF_MODEL", ""), ("VERIF_ATTN_IMPL", "sdpa"),
+    ("VERIF_ATTACK", "advbench"), ("VERIF_ATTACK", ""), ("VERIF_POISON_COUNT", "0"),
+    ("VERIF_HEAD_BLOCKS", "0"), ("VERIF_HEAD_BLOCKS", "two"),
+    ("VERIF_TRACE_STEP", "-1"), ("VERIF_TRACE_STEP", "x"), ("VERIF_TRACE_C5", "some"),
 ])
 def test_invalid_values_raise(name, value):
     with pytest.raises(ValueError, match=name):
@@ -67,12 +99,15 @@ def test_setup_determinism():
     prev_threads = torch.get_num_threads()
     prev_prec = torch.get_float32_matmul_precision()
     prev_cudnn = (cudnn.allow_tf32, cudnn.benchmark, cudnn.deterministic)
+    prev_bf16_red = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
     py_state, np_state = random.getstate(), np.random.get_state()
     try:
         with torch.random.fork_rng(devices=[]):
             # A prior "medium" leaves CPU oneDNN matmul at bf16; setup must undo it (S4c).
             torch.set_float32_matmul_precision("medium")
             assert torch.backends.mkldnn.matmul.fp32_precision == "bf16"
+            # torch's default; setup must switch it off (F5a).
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
             cfg = load_config({"VERIF_THREADS": "2", "VERIF_SEED": "5"})
             setup_determinism(cfg)
             assert torch.are_deterministic_algorithms_enabled()
@@ -81,6 +116,7 @@ def test_setup_determinism():
             assert torch.backends.mkldnn.matmul.fp32_precision == "ieee"
             assert torch.backends.cuda.matmul.fp32_precision == "ieee"
             assert not torch.backends.cuda.matmul.allow_tf32
+            assert not torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
             assert not cudnn.allow_tf32
             assert not cudnn.benchmark and cudnn.deterministic
             a = (random.random(), np.random.rand(), torch.rand(1).item())
@@ -91,6 +127,7 @@ def test_setup_determinism():
         torch.set_num_threads(prev_threads)
         torch.set_float32_matmul_precision(prev_prec)
         cudnn.allow_tf32, cudnn.benchmark, cudnn.deterministic = prev_cudnn
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = prev_bf16_red
         random.setstate(py_state)
         np.random.set_state(np_state)
 

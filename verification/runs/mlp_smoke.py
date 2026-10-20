@@ -17,8 +17,10 @@ FAIL: an honest rejection, or a fault rejected at another check or not at all.
 - **bad-w-next-ulps**: one entry of step 2's ``W_{t+1}`` moved by 300 ulps → ``(2, "6a")``.
 - **bad-w-next-batch**: step 2's ``W_{t+1}`` from training on another batch (A3) → ``(2, "6a")``.
 - **broken-chain**: one hidden ``plain_step`` between steps 1 and 2 (P11) → ``(2, "7")``. It
-  trains on the last ``n_s`` records of ``D``, standing in for ``b̃``, since the MLP has no
-  poisoned dataset.
+  trains on another batch, standing in for ``b̃``, since the MLP has no poisoned dataset.
+
+"Another batch" is ``setup.data.other_batch``: the batch of step 2's neighbour in the same
+pass of ``π`` (F8c), so it shares no record with ``π(2)`` at any seed.
 
 Bands are provisional (``allow_provisional=True``): this is a smoke run, not a judged cheat
 run (P10a). Exits 1 if any oracle fails. The harness (scenarios, the oracle, the report) is
@@ -26,8 +28,9 @@ run (P10a). Exits 1 if any oracle fails. The harness (scenarios, the oracle, the
 
 With metrics on (``--metrics``, default ``VERIF_METRICS=1``), every scenario's timed run writes
 its step records, per-component times and residual arrays to ``$VERIF_OUTPUT_DIR/mlp_smoke/``
-(B6, ``runs/metrics.py``). Two separate passes of ``PASS_STEPS`` honest steps each, never timed, write the
-per-component memory peaks and the counts (FLOPs, bytes hashed, hash calls, transcript bytes).
+(B6, ``runs/metrics.py``). Two separate honest passes, never timed, write the per-component
+memory peaks (``PASS_STEPS`` steps) and the counts (FLOPs, bytes hashed, hash calls, transcript
+bytes; ``COUNT_STEPS``, one step, EVALUATION_SPEC §3.4).
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ from typing import Any
 import torch
 
 from setup.config import load_config, setup_determinism
+from setup.data import other_batch
 from verification.commitment.leaves import dataset_tree
 from verification.computation.instances.mlp import (
     DEFAULT_WIDTHS,
@@ -49,7 +53,7 @@ from verification.computation.instances.mlp import (
     synthetic_dataset,
 )
 from verification.parameters import load_protocol_config
-from verification.runs.metrics import PASS_STEPS, MetricsWriter
+from verification.runs.metrics import COUNT_STEPS, PASS_STEPS, MetricsWriter
 from verification.runs.scenarios import (
     HONEST,
     Expected,
@@ -79,13 +83,12 @@ ULPS = 300
 # ---- the faults: the generic ones in scenarios.py, on the MLP's stand-in batch ---------
 
 
-def _other_batch(dataset: Sequence[Any], n_s: int) -> list[Any]:
-    """The last ``n_s`` records of ``D``: no early step of ``π`` reaches them."""
-    return list(dataset[-n_s:])
+def _other_batch(dataset: Sequence[Any], t: int, n_s: int, seed: int) -> list[Any]:
+    """The records of ``setup.data.other_batch``: a batch sharing none with ``π(t)``."""
+    return [dataset[i] for i in other_batch(t, n_s, len(dataset), seed)]
 
 
-def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
-    other = _other_batch(dataset, c.n_s)
+def scenarios(c: MLPComputation, dataset: Sequence[Any], seed: int) -> list[Scenario]:
     m = c.m_of("Y_2")
     return [
         HONEST,
@@ -95,12 +98,15 @@ def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
         Scenario("bad-w-next-ulps", f"entry 5 of W_{{t+1}}[{c.weight(2)}] moved {ULPS} ulps at "
                                     f"step {FAULT_STEP}", NudgeWNext(FAULT_STEP, c.weight(2), 5, ULPS),
                  Expected(FAULT_STEP, "6a", "failed")),
-        Scenario("bad-w-next-batch", f"step {FAULT_STEP}'s W_{{t+1}} trained on the last "
-                                     f"{c.n_s} records of D (A3)",
-                 TrainedElsewhereWNext(c, FAULT_STEP, other), Expected(FAULT_STEP, "6a", "failed")),
+        Scenario("bad-w-next-batch", f"step {FAULT_STEP}'s W_{{t+1}} trained on the neighbouring "
+                                     "batch of its pass (A3)",
+                 TrainedElsewhereWNext(c, FAULT_STEP,
+                                       _other_batch(dataset, FAULT_STEP, c.n_s, seed)),
+                 Expected(FAULT_STEP, "6a", "failed")),
         Scenario("broken-chain", f"one hidden plain_step between steps {CHAIN_STEP - 1} and "
-                                 f"{CHAIN_STEP} (P11), on the last {c.n_s} records of D (the MLP has no b̃)",
-                 HiddenStep(c, CHAIN_STEP, other),
+                                 f"{CHAIN_STEP} (P11), on the neighbouring batch of step "
+                                 f"{CHAIN_STEP}'s pass (the MLP has no b̃)",
+                 HiddenStep(c, CHAIN_STEP, _other_batch(dataset, CHAIN_STEP, c.n_s, seed)),
                  Expected(CHAIN_STEP, "7", "failed")),
     ]
 
@@ -109,7 +115,7 @@ def scenarios(c: MLPComputation, dataset: Sequence[Any]) -> list[Scenario]:
 
 
 def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
-              T: int, k: int, out: Callable[[str], None] = print,
+              T: int, k: int, seed: int, out: Callable[[str], None] = print,
               only: Sequence[str] | None = None,
               metrics: MetricsWriter | None = None) -> list[ScenarioResult]:
     """Run each scenario and report it. With ``metrics``, each scenario's timed run writes its
@@ -117,38 +123,39 @@ def run_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.
     (:func:`count_smoke`) write theirs."""
     if T < CHAIN_STEP:
         raise ValueError(f"T = {T}: the broken-chain scenario needs T ≥ {CHAIN_STEP}")
-    final = honest_final(c, dataset, w0, T)
+    final = honest_final(c, dataset, w0, T, seed=seed)
     results = []
-    for s in scenarios(c, dataset):
+    for s in scenarios(c, dataset, seed):
         if only is not None and s.name not in only:
             continue
         rec = None if metrics is None else metrics.recorder(s.name)
-        r = run_scenario(c, dataset, w0, s, T=T, k=k, final=final, recorder=rec)
+        r = run_scenario(c, dataset, w0, s, T=T, k=k, seed=seed, final=final, recorder=rec)
         report(r, out)
         results.append(r)
     passed = sum(r.passed for r in results)
     out(f"{passed}/{len(results)} scenarios passed")
     if metrics is not None:
-        metrics.write(memory_smoke(c, dataset, w0, k=k, device=metrics.device, run=metrics.run))
-        metrics.write(count_smoke(c, dataset, w0, k=k, run=metrics.run))
+        metrics.write(memory_smoke(c, dataset, w0, k=k, seed=seed, device=metrics.device,
+                                   run=metrics.run))
+        metrics.write(count_smoke(c, dataset, w0, k=k, seed=seed, run=metrics.run))
         out(f"metrics: {metrics.dir}")
     return results
 
 
 def memory_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
-                 k: int, device: str | torch.device = "cpu",
+                 k: int, seed: int, device: str | torch.device = "cpu",
                  run: str = RUN_NAME) -> list[dict[str, Any]]:
     """The B6 memory pass: per-component peaks over ``PASS_STEPS`` honest steps (check 0 at step
     1, check 7 at step 2), run on their own, never timed."""
-    return memory_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k,
-                      final=honest_final(c, dataset, w0, PASS_STEPS), device=device)
+    return memory_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k, seed=seed,
+                      final=honest_final(c, dataset, w0, PASS_STEPS, seed=seed), device=device)
 
 
 def count_smoke(c: MLPComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor], *,
-                k: int, run: str = RUN_NAME) -> list[dict[str, Any]]:
-    """The B6 counting pass: counts over ``PASS_STEPS`` honest steps, never timed."""
-    return count_run(c, dataset, w0, run=run, T=PASS_STEPS, k=k,
-                     final=honest_final(c, dataset, w0, PASS_STEPS))
+                k: int, seed: int, run: str = RUN_NAME) -> list[dict[str, Any]]:
+    """The B6 counting pass: counts over ``COUNT_STEPS`` honest steps, never timed."""
+    return count_run(c, dataset, w0, run=run, T=COUNT_STEPS, k=k, seed=seed,
+                     final=honest_final(c, dataset, w0, COUNT_STEPS, seed=seed))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -171,19 +178,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"MLP smoke: widths {c.widths}, n_s {c.n_s}, η {c.eta:g}, k {k}, T {T}, "
           f"|D| {len(dataset)}, M {c.M}, {c.n_leaves} leaves, bands provisional")
     if not use_metrics:
-        results = run_smoke(c, dataset, w0, T=T, k=k)
+        results = run_smoke(c, dataset, w0, T=T, k=k, seed=cfg.seed)
     else:
         mlp = {"widths": list(c.widths), "n_s": c.n_s, "eta": c.eta, "k": k, "T": T,
                "n_records": len(dataset), "M": c.M, "n_leaves": c.n_leaves}
         # The config hash covers what decides the run's results, not where it writes.
         config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
-                     if f.name not in ("output_dir", "metrics")}, "mlp": mlp}
+                     if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
+                                       "trace_c5")}, "mlp": mlp}
         # Bands are provisional, so there is no band file.
         with MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
                            model="mlp", corpus="synthetic", seed=cfg.seed, config=config,
                            band_file_hash=None, h_D=dataset_tree(c, dataset).root,
                            extra={"band_source": "provisional", **mlp}) as mw:
-            results = run_smoke(c, dataset, w0, T=T, k=k, metrics=mw)
+            results = run_smoke(c, dataset, w0, T=T, k=k, seed=cfg.seed, metrics=mw)
     return 0 if all(r.passed for r in results) else 1
 
 

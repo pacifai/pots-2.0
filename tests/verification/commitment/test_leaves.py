@@ -4,7 +4,9 @@ against `C` before its bytes are hashed."""
 import pytest
 import torch
 
-from verification.commitment import merkle
+import time
+
+from verification.commitment import merkle, native
 from verification.commitment.encoding import (
     TAG_PRODUCT,
     TAG_WEIGHT,
@@ -12,7 +14,9 @@ from verification.commitment.encoding import (
     encode_tensor_leaf,
 )
 from verification.commitment.leaves import (
+    HashStats,
     commit_leaves,
+    hash_step_leaves,
     leaf_hash,
     leaf_hashes,
     leaf_hashes_of,
@@ -181,3 +185,82 @@ def test_single_leaf_paths_still_reject_non_finite(c, data):
         leaf_parts(c, i, nan)
     with pytest.raises(NonFiniteError):
         leaf_hash(c, i, nan)
+
+
+@pytest.fixture(params=["native", "python"])
+def path(request):
+    """Both hashing paths: the native batches (when the library loads) and the Python pool."""
+    if request.param == "python":
+        with native.disabled():
+            yield request.param
+    else:
+        if not native.enabled():
+            pytest.skip("the native library is unavailable")
+        yield request.param
+
+
+def test_stats_change_no_digest(c, data, path, parallel):
+    leaves = list(_step(c, data).leaves())
+    plain = leaf_hashes_of(c, enumerate(leaves))
+    stats = HashStats()
+    assert leaf_hashes_of(c, enumerate(leaves), stats) == plain
+    got, err = leaf_hashes_until_error(c, enumerate(leaves), stats)
+    assert err is None and got == plain
+    assert hash_step_leaves(c, leaves, HashStats()) == plain
+    assert commit_leaves(c, leaves).root == MerkleTree(plain).root
+    assert stats.leaves == 2 * len(leaves)  # two calls
+    assert stats.bytes > 0
+
+
+def test_stats_without_a_stats_object_are_untouched(c, data, path):
+    leaves = list(_step(c, data).leaves())
+    assert leaf_hashes_of(c, enumerate(leaves), None) == leaf_hashes_of(c, enumerate(leaves))
+
+
+def test_stats_cover_the_wall_time(c, data, path):
+    """read + producer + wait is the calling thread's time in the call (loose bounds: a
+    second of slack for a loaded machine, and a floor so the parts are not all zero)."""
+    leaves = list(_step(c, data).leaves())
+
+    def slow(items):
+        for it in items:
+            time.sleep(0.0005)  # a reader that takes time, which must land in read_s
+            yield it
+
+    stats = HashStats()
+    t0 = time.perf_counter()
+    leaf_hashes_of(c, slow(enumerate(leaves)), stats)
+    wall = time.perf_counter() - t0
+    caller = stats.read_s + stats.producer_s + stats.wait_s
+    assert caller <= wall + 0.05
+    assert caller >= 0.8 * wall - 0.05
+    assert stats.read_s >= 0.0005 * len(leaves) * 0.5
+    assert all(v >= 0 for v in stats.times().values())
+    if path == "python":
+        assert stats.native_s == stats.big_s == stats.worker_other_s == 0.0
+    else:
+        assert stats.batches >= 1 and stats.native_s > 0
+
+
+def test_stats_on_an_error_still_count(c, data, path):
+    leaves = list(_step(c, data).leaves())
+    bad = list(leaves)
+    bad[c.product_index(1)] = leaves[c.product_index(1)].t().contiguous()
+    stats = HashStats()
+    got, err = leaf_hashes_until_error(c, enumerate(bad), stats)
+    assert err is not None and len(got) == c.product_index(1)
+    assert stats.leaves >= len(got)
+
+
+def test_stats_emit_skips_a_missing_seam_and_zero_parts():
+    HashStats().emit(None, "x")  # no seam: nothing to do
+    rows = []
+
+    class Seam:
+        def add(self, name, seconds):
+            rows.append((name, seconds))
+
+    s = HashStats()
+    s.read_s, s.native_s = 0.5, 0.25
+    s.emit(Seam(), "P3.commit.hash")
+    assert rows == [("P3.commit.hash.read", 0.5), ("P3.commit.hash.native", 0.25)]
