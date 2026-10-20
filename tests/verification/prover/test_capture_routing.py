@@ -2,6 +2,7 @@
 prover's step. The Mac tests run sharded on ``cpu,cpu,cpu``, where nothing is copied but the hint
 is still computed and counted; the two-GPU tests skip unless CUDA has two devices."""
 
+import contextlib
 import os
 
 import pytest
@@ -29,6 +30,8 @@ def tiny(switch, *, B=1, dtype="fp32", devices=None, layers=2, device="cpu"):
     family, tied = switch
     config = tiny_config(family=family, tied=tied)
     config.num_hidden_layers = layers
+    if getattr(config, "layer_types", None):
+        config.layer_types = [config.layer_types[0]] * layers
     return DecoderComputation(config, n_s=2, n=12, eta=1e-3, head_blocks=B,
                               compute_dtype=DTYPES[dtype], verifier_devices=devices,
                               device=device)
@@ -86,11 +89,13 @@ def test_hint_matches_every_product_owner(switch, dtype):
     model = c.build_model()
     model.zero_grad(set_to_none=True)
     cap = MatmulCapture(param_storage_map(model), placement=c.placement)
+    @contextlib.contextmanager
+    def stage(p):
+        with cap.phase(p):
+            yield
+
     with cap:
-        with cap.phase("forward"):
-            loss = c.loss(model, records)
-        with cap.phase("backward"):
-            loss.backward()
+        c.forward_backward(model, records, stage)
     labeled = c.label(cap, model)
     assert cap.count_hint_misses(labeled, c.placement.product_device) == 0
     assert cap.summary()["hint_misses"] == 0

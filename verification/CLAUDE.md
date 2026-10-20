@@ -1133,7 +1133,7 @@ interface.
       buffer path. After labeling, `count_hint_misses(labeled, placement.product_device)`
       counts the leaves hinted elsewhere than their owner (`summary()["hint_misses"]`,
       sharded only; a leaf that isn't a record's output, the δK̃ transpose, is judged by the
-      device it sits on), and `prove_step` moves each leaf to its owner. On an honest run the
+      device it sits on, and on the CPU not at all), and `prove_step` moves each leaf to its owner. On an honest run the
       count is 0. A miss costs one copy and no bit.
     - Operands are not copied. They stay on the GPU until `release_operands` in labeling,
       as before; the README's "Workflow: a run on a GPU" measures what that costs.
