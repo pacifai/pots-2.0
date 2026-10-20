@@ -1,7 +1,7 @@
 """FS11's H100 sessions: the parts in order, each with its own log, under one deadline.
 
     .venv/bin/python -m verification.runs.fs11_session run --upload DIR --out DIR --deadline EPOCH
-                                                [--session {fs11,recheck,profile-check}]
+                                                [--session {fs11,recheck,profile-check,nvlink-probe}]
     .venv/bin/python -m verification.runs.fs11_session fetch-models --upload DIR --out DIR
     .venv/bin/python -m verification.runs.fs11_session env --out DIR
 
@@ -10,7 +10,8 @@
 on the Mac; both sessions run from the same upload. ``--session`` (the job's ``FS11_SESSION``)
 picks the plan: ``fs11``, the first session (:func:`default_plan`, the default), or
 ``recheck``, the re-check (:func:`recheck_plan`, below), or ``profile-check``, the profile
-check (:func:`profile_check_plan`, below). The first session's parts, in this
+check (:func:`profile_check_plan`, below), or ``nvlink-probe``, the four-card hardware probe
+(:func:`nvlink_probe_plan`, below). The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
 the upload's ``native_cache/`` into it once, offline, so no later part's timing includes the
@@ -62,6 +63,15 @@ step; then, per full-scale model, a ``plain_baseline`` run and
 ``VERIF_TRACE_C5``) are in the part environments and read by the runs. It has no benchmark part,
 and its parts keep the sampler on.
 
+The hardware probe (F22's HW2 and the first half of HW3) runs the models part, then
+``verification.runs.nvlink_probe`` (NVLink topology and peer-copy bandwidth, report
+``nvlink/nvlink.json``), then, per model of :data:`RUN_PINS` and per card ``0 … n−1``
+(``FS31_CARDS``, default 4), ``verification.runs.card_identity`` with ``CUDA_VISIBLE_DEVICES`` set
+to the card, at :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`. ``summary.json``'s ``hw3_cards``
+(:func:`hw3_cards`) compares the cards' roots per model. Unlike the other sessions, it refuses
+unless torch sees at least ``FS31_CARDS`` CUDA devices (:func:`refusal`); the H100 check stays,
+and ``FS11_ALLOW_ANY_GPU=1`` overrides that one.
+
 Every part runs in its own process group, with ``HF_HUB_OFFLINE=1`` (all but the first), no
 Hugging Face token and no Runpod key in its environment. A part's log is
 ``parts/<name>/log.txt``, and ``current_part`` holds the running part's process group id.
@@ -102,7 +112,8 @@ from verification.commitment import native
 __all__ = ["PROFILE_CHECK_TIMEOUT_S", "PROFILE_HELD", "PROFILE_PINS", "SMOLLM2_ENV", "RUN_PINS",
            "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
            "alloc_env", "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part",
-           "default_plan", "recheck_plan", "profile_check_plan", "load_plan", "selftest_plan",
+           "default_plan", "recheck_plan", "profile_check_plan", "nvlink_probe_plan", "load_plan",
+           "selftest_plan", "fs31_cards", "hw3_cards",
            "with_native_build",
            "choose_plan", "run_session", "fix2_ab",
            "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
@@ -280,8 +291,14 @@ def environment(out: Path) -> dict[str, Any]:
     }
 
 
-def refusal(env: Mapping[str, Any], allow_any_gpu: bool) -> str | None:
-    """Why the session won't start on this machine, or ``None``."""
+def refusal(env: Mapping[str, Any], allow_any_gpu: bool, min_cards: int | None = None
+            ) -> str | None:
+    """Why the session won't start on this machine, or ``None``. ``min_cards`` (the hardware
+    probe's ``FS31_CARDS``) is the CUDA devices torch must see; ``allow_any_gpu`` overrides the
+    H100 check, not this."""
+    seen = len(env["gpus"]) if env["cuda_available"] else 0
+    if min_cards is not None and seen < min_cards:
+        return f"torch sees {seen} CUDA devices, {CARDS_ENV} is {min_cards}"
     if allow_any_gpu:
         return None
     if not env["cuda_available"]:
@@ -565,11 +582,68 @@ def profile_check_plan(upload: Path, out: Path) -> list[Part]:
     return plan
 
 
+# FS31's hardware probe: the number of cards each model runs on, set by ``FS31_CARDS`` (the plan
+# is built before the GPUs are inspected), and the time limit of the probe and of each card run.
+CARDS_ENV = "FS31_CARDS"
+DEFAULT_CARDS = 4
+NVLINK_TIMEOUT_S = 900
+CARD_TIMEOUT_S = 900
+GATE_CARDS = 4  # F22's four cards; ``FS31_CARDS`` other than this is a rehearsal, not the gate
+# Card numbers follow ``nvidia-smi``'s (PCI bus order), so ``CUDA_VISIBLE_DEVICES=k`` and
+# ``nvidia-smi -i k`` name the same card.
+PCI_ORDER_ENV = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+
+
+def fs31_cards(environ: Mapping[str, str] | None = None) -> int:
+    """``FS31_CARDS``, the cards the hardware probe runs each model on (default 4)."""
+    raw = (os.environ if environ is None else environ).get(CARDS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_CARDS
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise ValueError(f"{CARDS_ENV} is {raw!r}; it must be a whole number of cards, at least 1")
+    return n
+
+
+def nvlink_probe_plan(upload: Path, out: Path) -> list[Part]:
+    """The hardware probe's parts: the models part; the NVLink probe, which sees every card; then,
+    per model of :data:`RUN_PINS` in order and per card ``0 … n−1`` (:func:`fs31_cards`), one
+    ``card_identity`` run at :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV` on the refusal task,
+    the card chosen by ``CUDA_VISIBLE_DEVICES`` and the run in its own directory
+    ``runs/<model>_<task>_card<k>/``. All four models run, Qwen2.5-1.5B included."""
+    n = fs31_cards()
+    report = out / "nvlink" / "nvlink.json"
+    plan = [_models_part(upload, out, PROFILE_CHECK_TIMEOUT_S["models"]),
+            Part("nvlink_probe", ["{python}", "-m", "verification.runs.nvlink_probe", "--out",
+                                  str(report)],
+                 env=dict(PCI_ORDER_ENV), timeout_s=NVLINK_TIMEOUT_S, kind="nvlink",
+                 info={"report": str(report)})]
+    for repo, rev in RUN_PINS:
+        key = data_key(repo, BRING_UP_TASK)
+        for card in range(n):
+            d = _run_dir(out, upload, key, f"{key}_card{card}")
+            plan.append(Part(
+                f"card_{repo.split('/')[-1]}_{card}",
+                ["{python}", "-m", "verification.runs.card_identity", "--out",
+                 str(d / "card.json")],
+                env={**FULL_SCALE_ENV, **RECHECK_ENV, **_run_env(repo, rev, BRING_UP_TASK),
+                     **PCI_ORDER_ENV, "CUDA_VISIBLE_DEVICES": str(card),
+                     "VERIF_OUTPUT_DIR": str(d)},
+                timeout_s=CARD_TIMEOUT_S, kind="card",
+                info={"model": repo, "task": BRING_UP_TASK, "card": card, "run_dir": str(d),
+                      "report": str(d / "card.json")}))
+    return plan
+
+
 # Each session: its name in summary.json, and its plan.
 SESSIONS: dict[str, tuple[str, Callable[[Path, Path], list[Part]]]] = {
     "fs11": ("FS11", default_plan),
     "recheck": ("recheck", recheck_plan),
     "profile-check": ("profile-check", profile_check_plan),
+    "nvlink-probe": ("nvlink-probe", nvlink_probe_plan),
 }
 
 
@@ -998,12 +1072,40 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _benchmark_extras(Path(part.info["report"]))
         if part.kind == "probe":
             return _probe_extras(Path(part.info["report"]))
+        if part.kind == "nvlink":
+            return _nvlink_extras(Path(part.info["report"]))
+        if part.kind == "card":
+            return _card_extras(Path(part.info["report"]))
         if part.kind == "models":
             report = Path(part.info["report"])
             return json.loads(report.read_text()) if report.exists() else {"report": None}
     except (OSError, ValueError, KeyError, TypeError) as e:
         return {"extras_error": f"{type(e).__name__}: {e}"}
     return {}
+
+
+def _nvlink_extras(report: Path) -> dict[str, Any]:
+    """HW2's verdict, its reasons and the slowest peer copy, from the probe's report."""
+    if not report.exists():
+        return {"hw2": None}
+    hw2 = json.loads(report.read_text())["hw2"]
+    return {"hw2": {k: hw2[k] for k in ("verdict", "pass", "reasons", "nv_links",
+                                         "nv18_everywhere", "p2p_read_ok", "peer_copy_min_gbps",
+                                         "slowest_pair", "pass_gbps", "fail_gbps", "n_cards",
+                                         "expected_cards", "gate")}}
+
+
+def _card_extras(report: Path) -> dict[str, Any]:
+    """One card's roots and losses, from its ``card_identity`` report."""
+    if not report.exists():
+        return {"card": None}
+    doc = json.loads(report.read_text())
+    return {"card": doc["card"].get("name"), "uuid": doc["card"].get("uuid"),
+            "pci_bus_id": doc["card"].get("pci_bus_id"), "root": doc["proved"]["root"],
+            "w_next_root": doc["proved"]["w_next_root"],
+            "plain_w_next_root": doc["plain"]["w_next_root"],
+            "loss": doc["proved"]["loss"], "plain_loss": doc["plain"]["loss"],
+            "n_leaves": doc["n_leaves"], "wall_s": doc["wall_s"]}
 
 
 _FIX_TIMES = ("prover_s", "verifier_s", "handoff_s", "total_s")
@@ -1052,6 +1154,135 @@ def fix2_ab(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
                                          _FIX_PEAKS)}
                   for t, side in sorted(peaks["on"].keys() | peaks["off"].keys())],
     }
+
+
+def _leaf_label(layout: Mapping[str, Any], index: int) -> tuple[str, str]:
+    """The section and name of leaf ``index`` under a card report's ``layout``."""
+    n_s, n_w, m = layout["n_s"], layout["n_w"], layout["M"]
+    if index < n_s:
+        return "record", f"record {index}"
+    if index < n_s + n_w:
+        return "w_t", layout["weight_names"][index - n_s]
+    if index < n_s + n_w + m:
+        return "product", layout["product_names"][index - n_s - n_w]
+    return "w_next", layout["weight_names"][index - n_s - n_w - m]
+
+
+def _first_difference(ref: Mapping[str, Any], other: Mapping[str, Any]) -> dict[str, Any]:
+    """Where two cards' leaf hashes first differ, from their ``.digests`` files (32 bytes a
+    leaf, in leaf order), with that leaf's section and name and the differing leaves per section."""
+    a = Path(ref["info"]["report"]).with_suffix(".digests").read_bytes()
+    b = Path(other["info"]["report"]).with_suffix(".digests").read_bytes()
+    out: dict[str, Any] = {"card": other["info"]["card"], "reference_card": ref["info"]["card"]}
+    if len(a) != len(b):
+        return {**out, "leaf": None, "note": f"digest files of {len(a)} and {len(b)} bytes"}
+    layout = json.loads(Path(other["info"]["report"]).read_text())["layout"]
+    bad = [i for i in range(len(a) // 32) if a[32 * i:32 * i + 32] != b[32 * i:32 * i + 32]]
+    if not bad:
+        return {**out, "leaf": None, "note": "every leaf hash is equal"}
+    by_section: dict[str, int] = {}
+    for i in bad:
+        sec = _leaf_label(layout, i)[0]
+        by_section[sec] = by_section.get(sec, 0) + 1
+    section, name = _leaf_label(layout, bad[0])
+    return {**out, "leaf": bad[0], "section": section, "name": name,
+            "n_differing_leaves": len(bad), "by_section": by_section}
+
+
+def hw3_cards(parts: Sequence[Mapping[str, Any]], expected: int | None = None
+              ) -> dict[str, Any] | None:
+    """F22's HW3, first half, from the summary's part records: ``None`` when the plan has no card
+    part. Per model: ``roots`` (the committed step's root per card, ``None`` for a card with no
+    report), ``n_cards`` (the cards compared), ``uuids``, ``distinct_cards`` (every UUID present
+    and none repeated: the runs landed on different physical cards), ``ran`` (every card's part
+    succeeded), ``same_bits`` (``expected`` cards, at least 2, distinct, all ran, the roots equal)
+    and, where roots differ, ``first_difference``: the first leaf at which a card's hashes differ
+    from the first card's, its section and name. top-level ``same_bits`` is true when every model
+    has it; ``pass`` also needs ``gate``.
+    ``expected`` (default ``FS31_CARDS``) is recorded with ``n_cards`` (the fewest over the
+    models); ``gate`` is false for anything but :data:`GATE_CARDS` (a rehearsal, never a pass)."""
+    cards = [p for p in parts if p.get("kind") == "card"]
+    if not cards:
+        return None
+    n_expected = fs31_cards() if expected is None else expected
+    models: dict[str, dict[str, Any]] = {}
+    for model in dict.fromkeys(p["info"]["model"] for p in cards):
+        mine = sorted((p for p in cards if p["info"]["model"] == model),
+                      key=lambda p: p["info"]["card"])
+        roots = {str(p["info"]["card"]): (p.get("extras") or {}).get("root") for p in mine}
+        uuids = {str(p["info"]["card"]): (p.get("extras") or {}).get("uuid") for p in mine}
+        ran = all(p["status"] in ("ok", "skipped_done") for p in mine)
+        distinct = {r for r in roots.values() if r is not None}
+        problems: list[str] = []
+        if len(mine) < 2:
+            problems.append(f"only {len(mine)} card compared, at least 2 are needed")
+        if len(mine) != n_expected:
+            problems.append(f"{len(mine)} cards compared, {CARDS_ENV} is {n_expected}")
+        absent = [k for k, u in uuids.items() if not u]
+        if absent:
+            problems.append("no UUID for card " + ", ".join(absent))
+        seen = [u for u in uuids.values() if u]
+        again = sorted({u for u in seen if seen.count(u) > 1})
+        if again:
+            problems.append("the same UUID on more than one card: " + ", ".join(again))
+        same = (ran and None not in roots.values() and len(distinct) == 1 and not problems)
+        rec: dict[str, Any] = {"roots": roots, "n_cards": len(mine), "uuids": uuids,
+                               "distinct_cards": not absent and not again, "ran": ran,
+                               "same_bits": same, "problems": problems}
+        if len(distinct) > 1:
+            held = [p for p in mine if roots[str(p["info"]["card"])] is not None]
+            ref = held[0]
+            rec["first_difference"] = next(
+                (_first_difference(ref, p) for p in held[1:]
+                 if roots[str(p["info"]["card"])] != roots[str(ref["info"]["card"])]), None)
+        models[model] = rec
+    same_all = all(m["same_bits"] for m in models.values())
+    return {"models": models, "same_bits": same_all, "pass": same_all and n_expected == GATE_CARDS,
+            "n_cards": min(m["n_cards"] for m in models.values()), "expected_cards": n_expected,
+            "gate": n_expected == GATE_CARDS}
+
+
+def _hw_lines(parts: Sequence[Mapping[str, Any]], hw3: Mapping[str, Any] | None) -> list[str]:
+    """The job log's HW2 and HW3 lines: pass or FAIL, with the reasons; a review for HW2's middle
+    speed band; and, when ``FS31_CARDS`` is not the four cards, a rehearsal in place of a pass."""
+    from verification.runs.nvlink_probe import hw2_line  # stdlib only, kept off module level
+
+    lines = []
+    probe = next((p for p in parts if p.get("kind") == "nvlink"), None)
+    if probe is not None:
+        hw2 = (probe.get("extras") or {}).get("hw2")
+        if hw2 is None:
+            lines.append(f"HW2 FAIL: the NVLink probe left no verdict ({probe['status']})")
+        else:
+            lines.append(hw2_line(hw2))
+    if hw3 is not None:
+        if "hw3_cards_error" in hw3:
+            lines.append(f"HW3 part 1 FAIL: the comparison raised ({hw3['hw3_cards_error']})")
+        elif hw3.get("same_bits", hw3["pass"]):
+            n = hw3.get("expected_cards", GATE_CARDS)
+            head = ("HW3 part 1 pass" if hw3.get("gate", True)
+                    else f"HW3 part 1 rehearsal ({n} of {GATE_CARDS} cards), not the gate")
+            lines.append(f"{head}: the same bits on every card for all "
+                         f"{len(hw3['models'])} models")
+        else:
+            why = []
+            for model, m in hw3["models"].items():
+                if m["same_bits"]:
+                    continue
+                d = m.get("first_difference")
+                found = list(m.get("problems") or [])
+                if d is not None:
+                    found.append(f"card {d['card']} differs from card {d['reference_card']} "
+                                 f"first at leaf {d.get('leaf')} ({d.get('section')} "
+                                 f"{d.get('name')})")
+                if not m["ran"]:
+                    found.append("a card did not run or has no report")
+                elif not found:
+                    found.append("no common root")
+                detail = "; ".join(found)
+                why.append(f"{model.split('/')[-1]}: {detail}")
+            lines.append("HW3 part 1 FAIL: " + "; ".join(why))
+    return lines
 
 
 # ---- the session ------------------------------------------------------------------------
@@ -1150,7 +1381,9 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
     """Run ``plan`` in order (module docstring) and return the summary, also written to
     ``out/summary.json`` after each part. ``session`` is the summary's name for the session
     (:data:`SESSIONS`). A plan with a fix-off bring-up also gets ``fix2_ab`` (:func:`fix2_ab`),
-    and the job log one line per step with the two arms' totals."""
+    and the job log one line per step with the two arms' totals; a plan with card parts gets
+    ``hw3_cards`` (:func:`hw3_cards`), and the hardware probe's job log ends with a line each for
+    HW2 and HW3."""
     env = base_env(upload)
     summary: dict[str, Any] = {
         "session": session, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1220,6 +1453,12 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
                     say(f"allocator fix A/B, step {r['step']}: {r['fix_on']['total_s']:.2f} s "
                         f"with the fix, {r['fix_off']['total_s']:.2f} s without "
                         f"({r['fix_cost']['total_s']:+.2f} s)")
+        try:
+            hw3 = hw3_cards(summary["parts"])
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as e:
+            hw3 = {"hw3_cards_error": f"{type(e).__name__}: {e}"}
+        if hw3 is not None:
+            summary["hw3_cards"] = hw3
         if part.kind == "models" and rec["status"] != "not_started":
             # On every run, a rerun that skipped the part included: the later parts read
             # these files, and a DONE marker says nothing about them now.
@@ -1229,6 +1468,8 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
                 f"missing or differing; models with problems: "
                 f"{', '.join(check['models']) or 'none'}")
         _write_json(path, summary)
+    for line in _hw_lines(summary["parts"], summary.get("hw3_cards")):
+        say(line)
     summary["finished"] = True
     summary["ended_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     summary["failed"] = [p["name"] for p in summary["parts"]
@@ -1400,8 +1641,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="FS11_SELFTEST: stand-in parts (unless --plan), no GPU check")
     r.add_argument("--session", choices=sorted(SESSIONS), default="fs11",
                    help="FS11_SESSION: the first session's plan (fs11, the default), the "
-                        "re-check's (recheck) or the profile check's (profile-check); --plan "
-                        "and --selftest replace its parts")
+                        "re-check's (recheck), the profile check's (profile-check) or the "
+                        "four-card hardware probe's (nvlink-probe); --plan and --selftest "
+                        "replace its parts")
     f = sub.add_parser("fetch-models", help="check the upload, fetch the public weights")
     f.add_argument("--upload", type=Path, required=True)
     f.add_argument("--out", type=Path, required=True)
@@ -1424,7 +1666,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print_environment(env_doc)
     _say(f"{pin['message']}; threads {env_doc['cpu_pin']['threads']}"
          f" (cgroup CPU quota {'none' if quota is None else f'{quota:g}'})")
-    why = refusal(env_doc, allow)
+    try:
+        probing = args.cmd == "run" and args.session == "nvlink-probe" and not selftest
+        why = refusal(env_doc, allow, fs31_cards() if probing else None)
+    except ValueError as e:
+        why = str(e)
     if selftest:
         _say(f"self-test: stand-in parts in place of the {label} session's, the H100 check is "
              "skipped")

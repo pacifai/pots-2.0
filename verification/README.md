@@ -414,6 +414,14 @@ replaced:
 - **`check5_profile.py`** serves O2. On the same stored step it measures check 5's host
   overhead per product: wall time, aten ops and host reads per section, and on CUDA the
   kernel launches and the syncs that block the host. It judges nothing and writes nothing.
+- **`nvlink_probe.py`** and **`card_identity.py`** are FS31, the four-H100 probe. The first
+  reads the NVLink topology and times peer copies between the cards (F22's check HW2: four
+  cards, `NV18` between each pair, peer reads OK, and the slowest pair's copy at 300 GB/s or
+  more to pass, 150-300 to return to the user, under 150 to fail; `nvbandwidth`'s text is
+  recorded and never decides). The
+  second runs one plain and one proved step on one card and writes the step root, the
+  `W_{t+1}` section root and every leaf hash, so the session can compare the cards bit for bit
+  (the first half of F22's check HW3).
 - **`metrics.py`** records what each part of a step costs, on the grid EQ1b fixes: time per
   prover component and per check in the timed run, peak memory and counts (FLOPs, bytes
   hashed, hash calls, transcript bytes) in two separate untimed passes. It also writes every
@@ -1001,6 +1009,19 @@ FS11_SESSION=recheck setsid nohup bash verification/runs/fs11_job.sh /workspace/
 Its `FS11 job:` line names the session, and any other `FS11_SESSION` value is refused (exit 2,
 the pod terminated). `FS11_SELFTEST=1` with `FS11_SESSION=recheck` runs the same stand-in parts
 as the first session's self-test, under the re-check's name.
+
+**The four-card probe (FS31).** `FS11_SESSION=nvlink-probe` runs the NVLink probe, then one
+`card_identity` part per model and card (`FS31_CARDS`, default 4), each with
+`CUDA_VISIBLE_DEVICES` set to its card. Start it as above on a four-H100 pod; its default
+deadline is 5,400 s. It refuses a machine whose torch sees fewer than `FS31_CARDS` devices
+(`FS11_ALLOW_ANY_GPU=1` doesn't lift that). `summary.json` holds `hw2` and `hw3_cards`, and the
+job log ends with one `HW2` and one `HW3 part 1` line. HW2's verdict is `pass`, `review` or
+`fail`, by the slowest pair's copy rate (300 GB/s or more, 150-300, under 150) once the topology,
+the peer reads, the card count and a rate for every pair hold. HW3 needs two or more cards, as
+many as `FS31_CARDS`, each with its own UUID. With `FS31_CARDS` below 4 (a rehearsal) both lines
+say `rehearsal (N of 4 cards), not the gate` in place of a pass, and the machine-readable `pass`
+is false (the measured `verdict` and `same_bits` stay). A model whose cards give different roots
+names the first differing leaf, its section and its name.
 
 **Estimated wall time.** From the first session's logs (2026-10-14), where only Qwen2.5-0.5B's
 bring-up finished; the others are scaled from it. None includes the row blocking or the cache

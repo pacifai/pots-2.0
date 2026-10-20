@@ -934,7 +934,7 @@ def test_job_marks_a_failed_pack_and_still_terminates(tmp_path):
 @pytest.mark.parametrize("deadline, grace, extra, why", [
     (2, 1, {}, "must be below FS11_DEADLINE_S"),
     (60, 1, {"FS11_MIN_FREE_GB": str(10**9)}, "FS11_MIN_FREE_GB is"),
-    (60, 1, {"FS11_SESSION": "fs12"}, "FS11_SESSION is 'fs12'; it must be fs11, recheck or profile-check"),
+    (60, 1, {"FS11_SESSION": "fs12"}, "FS11_SESSION is 'fs12'; it must be fs11, recheck, profile-check or nvlink-probe"),
 ])
 def test_job_terminates_on_a_refusal(tmp_path, deadline, grace, extra, why):
     r, out = _job(tmp_path, plan=OK_PLAN, deadline=deadline, grace=grace, extra=extra)
@@ -1453,3 +1453,336 @@ def test_pin_does_nothing_where_it_cannot(tmp_path, monkeypatch):
     sysfs = _sysfs(tmp_path / "c", "0000:3b:00.0", "x")
     out = fs.pin_to_gpu_numa(sysfs=sysfs, environ={}, run=_Smi("00000000:3B:00.0"))
     assert not out["pinned"] and "ValueError" in out["message"]
+
+
+# ---- FS31: the four-card hardware probe session ---------------------------------------------
+
+
+def test_fs31_cards_defaults_to_four_and_rejects_bad_values():
+    assert fs.fs31_cards({}) == 4
+    assert fs.fs31_cards({"FS31_CARDS": ""}) == 4
+    assert fs.fs31_cards({"FS31_CARDS": "2"}) == 2
+    for bad in ("0", "x", "-1", "2.5"):
+        with pytest.raises(ValueError, match="FS31_CARDS"):
+            fs.fs31_cards({"FS31_CARDS": bad})
+
+
+def test_nvlink_probe_plan_lists_the_probe_and_a_part_per_model_and_card(tmp_path):
+    out = tmp_path / "out"
+    plan = fs.nvlink_probe_plan(tmp_path / "up", out)
+    cards = [p for p in plan if p.kind == "card"]
+    assert [p.kind for p in plan[:2]] == ["models", "nvlink"]
+    assert len(plan) == 2 + len(cards) == 2 + 4 * len(fs.RUN_PINS)
+    probe = plan[1]
+    assert probe.name == "nvlink_probe" and probe.timeout_s == fs.NVLINK_TIMEOUT_S
+    assert probe.argv == ["{python}", "-m", "verification.runs.nvlink_probe", "--out",
+                          str(out / "nvlink" / "nvlink.json")]
+    short = [r.split("/")[-1] for r, _ in fs.RUN_PINS]
+    assert [p.name for p in cards] == [f"card_{s}_{k}" for s in short for k in range(4)]
+    assert len({p.info["run_dir"] for p in cards}) == len(cards)
+
+
+def test_card_parts_pin_one_card_and_keep_secrets_out(tmp_path):
+    plan = fs.nvlink_probe_plan(tmp_path / "up", tmp_path / "out")
+    for p in (p for p in plan if p.kind == "card"):
+        k = p.info["card"]
+        assert p.env["CUDA_VISIBLE_DEVICES"] == str(k)
+        assert p.env["VERIF_OUTPUT_DIR"] == p.info["run_dir"]
+        assert p.env["VERIF_ATTACK"] == fs.BRING_UP_TASK
+        assert p.env["VERIF_MODEL"] == p.info["model"]
+        assert all(p.env[key] == value for key, value in fs.FULL_SCALE_ENV.items()
+                   if key not in ("VERIF_OUTPUT_DIR",))
+        assert p.argv == ["{python}", "-m", "verification.runs.card_identity", "--out",
+                          str(Path(p.info["run_dir"]) / "card.json")]
+        assert p.info["report"] == str(Path(p.info["run_dir"]) / "card.json")
+        assert p.timeout_s == fs.CARD_TIMEOUT_S
+        assert not set(p.env) & set(fs.SECRETS)
+
+
+def test_plan_follows_fs31_cards(tmp_path, monkeypatch):
+    monkeypatch.setenv("FS31_CARDS", "2")
+    plan = fs.nvlink_probe_plan(tmp_path / "up", tmp_path / "out")
+    assert sum(p.kind == "card" for p in plan) == 2 * len(fs.RUN_PINS)
+    monkeypatch.setenv("FS31_CARDS", "0")
+    with pytest.raises(ValueError):
+        fs.nvlink_probe_plan(tmp_path / "up", tmp_path / "out")
+
+
+def test_the_session_is_registered_and_starts_with_the_native_build(tmp_path):
+    label, build = fs.SESSIONS["nvlink-probe"]
+    assert label == "nvlink-probe"
+    plan = fs.choose_plan(build, tmp_path / "up", tmp_path / "out", plan_file=None,
+                          selftest=False)
+    assert plan[0].name == "native_build"
+
+
+def _env(gpus, cuda=True):
+    return {"gpus": gpus, "cuda_available": cuda}
+
+
+def test_refusal_counts_cards_for_the_probe():
+    h100 = "NVIDIA H100 80GB HBM3"
+    assert fs.refusal(_env([h100] * 4), False, 4) is None
+    why = fs.refusal(_env([h100] * 2), False, 4)
+    assert why is not None and "sees 2 CUDA devices" in why and "FS31_CARDS is 4" in why
+    assert "sees 0" in fs.refusal(_env([], cuda=False), False, 4)
+    # the override lifts the H100 check, not the count
+    assert fs.refusal(_env(["A40"] * 2), True, 4) is not None
+    assert fs.refusal(_env(["A40"] * 2), True, 2) is None
+    assert fs.refusal(_env(["A40"] * 2), False, 2) is not None
+    assert fs.refusal(_env(["A40"]), False) is not None
+    assert fs.refusal(_env([h100]), False) is None
+
+
+def _refused_main(tmp_path, monkeypatch, cards):
+    real = fs.environment(tmp_path / "e")
+    monkeypatch.setattr(fs, "environment", lambda out: {**real, "cuda_available": False,
+                                                        "gpus": []})
+    monkeypatch.setattr(fs, "pin_to_gpu_numa", lambda *a, **k: {"pinned": False,
+                                                                 "message": "no pin"})
+    if cards is not None:
+        monkeypatch.setenv("FS31_CARDS", cards)
+    monkeypatch.delenv("FS11_ALLOW_ANY_GPU", raising=False)
+    out = tmp_path / "out"
+    rc = fs.main(["run", "--upload", str(tmp_path / "up"), "--out", str(out),
+                  "--deadline", str(time.time() + 60), "--session", "nvlink-probe"])
+    return rc, json.loads((out / "summary.json").read_text())
+
+
+def test_main_refuses_the_probe_without_the_cards(tmp_path, monkeypatch):
+    rc, summary = _refused_main(tmp_path, monkeypatch, "2")
+    assert rc == fs.EXIT_REFUSED and summary["session"] == "nvlink-probe"
+    assert summary["parts"] == [] and "FS31_CARDS is 2" in summary["refused"]
+
+
+def test_main_refuses_a_bad_card_count(tmp_path, monkeypatch):
+    rc, summary = _refused_main(tmp_path, monkeypatch, "many")
+    assert rc == fs.EXIT_REFUSED and "FS31_CARDS" in summary["refused"]
+
+
+def test_the_override_does_not_lift_the_card_count(tmp_path, monkeypatch):
+    monkeypatch.setenv("FS11_ALLOW_ANY_GPU", "1")
+    real = fs.environment(tmp_path / "e")
+    monkeypatch.setattr(fs, "environment", lambda out: {**real, "cuda_available": False,
+                                                        "gpus": []})
+    monkeypatch.setattr(fs, "pin_to_gpu_numa", lambda *a, **k: {"pinned": False,
+                                                                 "message": "no pin"})
+    monkeypatch.setenv("FS31_CARDS", "4")
+    out = tmp_path / "out"
+    rc = fs.main(["run", "--upload", str(tmp_path / "up"), "--out", str(out),
+                  "--deadline", str(time.time() + 60), "--session", "nvlink-probe"])
+    assert rc == fs.EXIT_REFUSED
+
+
+def test_the_selftest_ignores_the_card_count(tmp_path, monkeypatch):
+    monkeypatch.setenv("FS31_CARDS", "4")
+    out = tmp_path / "out"
+    rc = fs.main(["run", "--upload", str(tmp_path / "up"), "--out", str(out),
+                  "--deadline", str(time.time() + 120), "--session", "nvlink-probe",
+                  "--selftest"])
+    summary = json.loads((out / "summary.json").read_text())
+    assert rc == 0 and summary["session"] == "nvlink-probe" and "refused" not in summary
+
+
+# ---- FS31: HW2 and HW3 from the parts' records -----------------------------------------------
+
+LAYOUT = {"n_s": 2, "n_w": 3, "M": 4, "n_leaves": 12, "weight_names": ["w_a", "w_b", "w_c"],
+          "product_names": ["P1", "P2", "P3", "P4"]}
+
+
+def _card_part(tmp_path, model, card, digests, *, root="r", status="ok", write=True):
+    d = tmp_path / model.split("/")[-1] / f"card{card}"
+    d.mkdir(parents=True, exist_ok=True)
+    report = d / "card.json"
+    extras: dict = {"card": None}
+    if write:
+        report.write_text(json.dumps({
+            "layout": LAYOUT, "card": {"name": "H100", "uuid": f"GPU-{card}",
+                                       "pci_bus_id": f"0:{card}"},
+            "plain": {"w_next_root": "pw", "loss": 1.0},
+            "proved": {"root": root, "w_next_root": "w", "loss": 1.0}, "n_leaves": 12,
+            "wall_s": {"load": 1.0}}))
+        report.with_suffix(".digests").write_bytes(digests)
+        extras = {"card": "H100", "root": root, "uuid": f"GPU-{card}"}
+    return {"name": f"card_{card}", "kind": "card", "status": status, "extras": extras,
+            "info": {"model": model, "card": card, "report": str(report)}}
+
+
+def _digests(*changed):
+    leaves = [bytes([i]) * 32 for i in range(12)]
+    for i in changed:
+        leaves[i] = b"\xff" * 32
+    return b"".join(leaves)
+
+
+def test_hw3_passes_on_equal_roots(tmp_path):
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(4)]
+    hw3 = fs.hw3_cards(parts)
+    assert hw3["pass"] and hw3["models"]["o/m"]["same_bits"]
+    assert hw3["models"]["o/m"]["roots"] == {"0": "r", "1": "r", "2": "r", "3": "r"}
+    assert fs._hw_lines([], hw3) == ["HW3 part 1 pass: the same bits on every card for all 1 models"]
+
+
+def test_hw3_names_the_first_differing_leaf(tmp_path):
+    parts = [_card_part(tmp_path, "o/m", 0, _digests()),
+             _card_part(tmp_path, "o/m", 1, _digests(), root="r"),
+             _card_part(tmp_path, "o/m", 2, _digests(6, 7, 11), root="other")]
+    hw3 = fs.hw3_cards(parts, expected=3)
+    rec = hw3["models"]["o/m"]
+    d = rec["first_difference"]
+    assert not hw3["pass"] and not rec["same_bits"]
+    assert (d["card"], d["reference_card"], d["leaf"]) == (2, 0, 6)
+    assert (d["section"], d["name"]) == ("product", "P2")
+    assert d["n_differing_leaves"] == 3 and d["by_section"] == {"product": 2, "w_next": 1}
+    line = fs._hw_lines([], hw3)[0]
+    assert line == ("HW3 part 1 FAIL: m: card 2 differs from card 0 first at leaf 6 "
+                    "(product P2)")
+
+
+def test_hw3_leaf_labels_cover_every_section():
+    labels = [fs._leaf_label(LAYOUT, i) for i in (0, 1, 2, 4, 5, 8, 9, 11)]
+    assert labels == [("record", "record 0"), ("record", "record 1"), ("w_t", "w_a"),
+                      ("w_t", "w_c"), ("product", "P1"), ("product", "P4"), ("w_next", "w_a"),
+                      ("w_next", "w_c")]
+
+
+def test_hw3_flags_a_card_that_did_not_run(tmp_path):
+    parts = [_card_part(tmp_path, "o/m", 0, _digests()),
+             _card_part(tmp_path, "o/m", 1, b"", status="failed", write=False)]
+    hw3 = fs.hw3_cards(parts)
+    rec = hw3["models"]["o/m"]
+    assert not hw3["pass"] and not rec["ran"] and rec["roots"] == {"0": "r", "1": None}
+    assert "a card did not run or has no report" in fs._hw_lines([], hw3)[0]
+
+
+def test_hw3_fails_when_one_model_fails(tmp_path):
+    parts = [_card_part(tmp_path, "o/a", k, _digests()) for k in range(2)]
+    parts += [_card_part(tmp_path, "o/b", 0, _digests()),
+              _card_part(tmp_path, "o/b", 1, _digests(3), root="other")]
+    hw3 = fs.hw3_cards(parts, expected=2)
+    assert not hw3["pass"]
+    assert hw3["models"]["o/a"]["same_bits"] and not hw3["models"]["o/b"]["same_bits"]
+    assert hw3["models"]["o/b"]["first_difference"]["name"] == "w_b"
+    assert fs._hw_lines([], hw3)[0].startswith("HW3 part 1 FAIL: b: ")
+
+
+def test_hw3_is_none_without_card_parts():
+    assert fs.hw3_cards([{"name": "x", "kind": "plain", "status": "ok"}]) is None
+    assert fs._hw_lines([], None) == []
+
+
+def test_hw3_comparison_error_line():
+    line = fs._hw_lines([], {"hw3_cards_error": "ValueError: bad report"})[0]
+    assert line == "HW3 part 1 FAIL: the comparison raised (ValueError: bad report)"
+
+
+def test_part_extras_read_the_probe_and_card_reports(tmp_path):
+    nv = tmp_path / "nvlink.json"
+    part = fs.Part("nvlink_probe", ["x"], kind="nvlink", info={"report": str(nv)})
+    assert fs.part_extras(part, tmp_path / "log") == {"hw2": None}
+    hw2 = {"verdict": "pass", "pass": True, "reasons": [], "nv_links": True,
+           "nv18_everywhere": True, "p2p_read_ok": True, "peer_copy_min_gbps": 371.2,
+           "slowest_pair": "0->1", "pass_gbps": 300.0, "fail_gbps": 150.0, "n_cards": 4,
+           "expected_cards": 4, "gate": True, "more": 1}
+    nv.write_text(json.dumps({"hw2": hw2}))
+    got = fs.part_extras(part, tmp_path / "log")["hw2"]
+    assert got["pass"] and got["peer_copy_min_gbps"] == 371.2 and "more" not in got
+    nv.write_text("{")
+    assert "extras_error" in fs.part_extras(part, tmp_path / "log")
+
+    cp = _card_part(tmp_path, "o/m", 1, _digests(), root="abc")
+    card = fs.Part("c", ["x"], kind="card", info={"report": cp["info"]["report"]})
+    got = fs.part_extras(card, tmp_path / "log")
+    assert got["root"] == "abc" and got["uuid"] == "GPU-1" and got["n_leaves"] == 12
+    assert got["plain_w_next_root"] == "pw"
+    gone = fs.Part("c", ["x"], kind="card", info={"report": str(tmp_path / "none.json")})
+    assert fs.part_extras(gone, tmp_path / "log") == {"card": None}
+
+
+def test_hw2_lines():
+    def probe(extras, status="ok"):
+        return [{"kind": "nvlink", "status": status, "extras": extras}]
+
+    def hw2(verdict, low, reasons=(), gate=True, expected=4):
+        return {"hw2": {"verdict": verdict, "pass": verdict == "pass", "reasons": list(reasons),
+                        "peer_copy_min_gbps": low, "slowest_pair": "0->2", "gate": gate,
+                        "pass_gbps": 300.0, "fail_gbps": 150.0, "expected_cards": expected}}
+
+    assert fs._hw_lines(probe(hw2("pass", 371.2)), None) == [
+        "HW2 pass: slowest pair 0->2 at 371 GB/s, over the 300 GB/s target"]
+    assert fs._hw_lines(probe(hw2("review", 240.0, ["x"])), None) == [
+        "HW2 review: slowest pair 0->2 at 240 GB/s, under the 300 GB/s target "
+        "(150-300 returns to the user)"]
+    line, = fs._hw_lines(probe(hw2("fail", 100.0, ["a", "b"])), None)
+    assert line.startswith("HW2 FAIL: slowest pair 0->2 at 100 GB/s, under the 150 GB/s fail line")
+    assert line.endswith("; a; b")
+    for v in ("pass", "review"):
+        line, = fs._hw_lines(probe(hw2(v, 371.2, gate=False, expected=2)), None)
+        assert line.startswith("HW2 rehearsal (2 of 4 cards), not the gate: ")
+        assert "pass" not in line.split(": ", 1)[0]
+    assert fs._hw_lines(probe({"hw2": None}, "failed"), None) == [
+        "HW2 FAIL: the NVLink probe left no verdict (failed)"]
+
+
+def test_hw3_rehearsal_and_card_count_in_the_verdict_and_line(tmp_path):
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(2)]
+    hw3 = fs.hw3_cards(parts, expected=2)
+    assert (hw3["n_cards"], hw3["expected_cards"], hw3["gate"]) == (2, 2, False)
+    assert hw3["same_bits"] and hw3["pass"] is False
+    assert fs._hw_lines([], hw3) == ["HW3 part 1 rehearsal (2 of 4 cards), not the gate: "
+                                     "the same bits on every card for all 1 models"]
+    full = fs.hw3_cards([_card_part(tmp_path, "o/m", k, _digests()) for k in range(4)],
+                        expected=4)
+    assert full["gate"] and fs._hw_lines([], full)[0].startswith("HW3 part 1 pass: ")
+
+
+def test_hw3_fails_when_the_cards_compared_differ_from_the_expected_count(tmp_path):
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(3)]
+    hw3 = fs.hw3_cards(parts, expected=4)
+    assert hw3["pass"] is False and not hw3["models"]["o/m"]["same_bits"]
+    assert "3 cards compared, FS31_CARDS is 4" in fs._hw_lines([], hw3)[0]
+
+
+def test_hw3_expected_cards_default_to_fs31_cards(tmp_path, monkeypatch):
+    monkeypatch.setenv("FS31_CARDS", "2")
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(2)]
+    assert fs.hw3_cards(parts)["gate"] is False
+
+
+def test_hw3_needs_distinct_uuids_on_every_card(tmp_path):
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(4)]
+    parts[2]["extras"]["uuid"] = parts[1]["extras"]["uuid"]
+    hw3 = fs.hw3_cards(parts)
+    rec = hw3["models"]["o/m"]
+    assert not hw3["pass"] and not rec["same_bits"] and not rec["distinct_cards"]
+    assert "GPU-1" in fs._hw_lines([], hw3)[0]
+    parts = [_card_part(tmp_path, "o/m", k, _digests()) for k in range(4)]
+    parts[3]["extras"]["uuid"] = None
+    hw3 = fs.hw3_cards(parts)
+    assert not hw3["pass"] and "no UUID for card 3" in fs._hw_lines([], hw3)[0]
+    del parts[3]["extras"]["uuid"]
+    assert not fs.hw3_cards(parts)["pass"]
+
+
+def test_hw3_one_card_is_not_a_comparison(tmp_path):
+    hw3 = fs.hw3_cards([_card_part(tmp_path, "o/m", 0, _digests())], expected=1)
+    assert not hw3["pass"] and hw3["models"]["o/m"]["n_cards"] == 1
+    assert "at least 2" in fs._hw_lines([], hw3)[0]
+
+
+def test_every_card_part_and_the_probe_order_cards_by_pci_bus(tmp_path):
+    plan = fs.nvlink_probe_plan(tmp_path / "up", tmp_path / "out")
+    assert all(p.env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID" for p in plan if p.kind in
+               ("card", "nvlink"))
+    assert "CUDA_DEVICE_ORDER" not in plan[0].env
+
+
+def test_job_accepts_the_probe_session_and_refuses_the_rest(tmp_path):
+    r, out = _job(tmp_path, python=sys.executable,
+                  extra={"FS11_SESSION": "nvlink-probe", "FS31_CARDS": "2",
+                         "FS11_DEADLINE_S": ""})
+    assert "deadline in 5400 s" in r.stdout
+    assert "FS11_SESSION is" not in r.stdout + r.stderr
+    (tmp_path / "bad").mkdir()
+    r, out = _job(tmp_path / "bad", extra={"FS11_SESSION": "other"})
+    assert "it must be fs11, recheck, profile-check or nvlink-probe" in r.stdout + r.stderr
