@@ -1,7 +1,7 @@
 """FS11's H100 sessions: the parts in order, each with its own log, under one deadline.
 
     .venv/bin/python -m verification.runs.fs11_session run --upload DIR --out DIR --deadline EPOCH
-                                                [--session {fs11,recheck,profile-check,nvlink-probe}]
+                                                [--session {fs11,recheck,profile-check,nvlink-probe,fs32-pair}]
     .venv/bin/python -m verification.runs.fs11_session fetch-models --upload DIR --out DIR
     .venv/bin/python -m verification.runs.fs11_session env --out DIR
 
@@ -11,7 +11,8 @@ on the Mac; both sessions run from the same upload. ``--session`` (the job's ``F
 picks the plan: ``fs11``, the first session (:func:`default_plan`, the default), or
 ``recheck``, the re-check (:func:`recheck_plan`, below), or ``profile-check``, the profile
 check (:func:`profile_check_plan`, below), or ``nvlink-probe``, the four-card hardware probe
-(:func:`nvlink_probe_plan`, below). The first session's parts, in this
+(:func:`nvlink_probe_plan`, below), or ``fs32-pair``, the sharded run on two GPUs
+(:func:`fs32_pair_plan`, below). The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
 the upload's ``native_cache/`` into it once, offline, so no later part's timing includes the
@@ -72,6 +73,16 @@ to the card, at :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`. ``summary.json`
 unless torch sees at least ``FS31_CARDS`` CUDA devices (:func:`refusal`); the H100 check stays,
 and ``FS11_ALLOW_ANY_GPU=1`` overrides that one.
 
+The two-GPU session (FS32f, F22) runs the models part, the whole fast suite (``-rf``) and the
+slow two-GPU tests, SmolLM2's calibration, then ``card_identity`` and a 3-step ``run_verified``
+unsharded and again with ``VERIF_VERIFIER_DEVICES=cuda:0,cuda:1``, and the judged cheats with
+that setting. ``summary.json``'s ``fs32_pair`` (:func:`fs32_pair`) compares the two arms' roots
+(step 1's transcript root, the final weights' root, the per-step losses, the kept step 3's
+root) and per-step verdicts, and holds each cheat's outcome (which must be ``exact``) and the
+failing tests; the job log ends with one ``FS32`` line per item. It refuses unless torch sees
+two CUDA devices, whatever their type. Each of its parts records every GPU's peak memory
+(``parts/<name>/gpu_peak.json``, MiB by ``nvidia-smi`` index, the card's whole use).
+
 Every part runs in its own process group, with ``HF_HUB_OFFLINE=1`` (all but the first), no
 Hugging Face token and no Runpod key in its environment. A part's log is
 ``parts/<name>/log.txt``, and ``current_part`` holds the running part's process group id.
@@ -113,7 +124,7 @@ __all__ = ["PROFILE_CHECK_TIMEOUT_S", "PROFILE_HELD", "PROFILE_PINS", "SMOLLM2_E
            "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
            "alloc_env", "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part",
            "default_plan", "recheck_plan", "profile_check_plan", "nvlink_probe_plan", "load_plan",
-           "selftest_plan", "fs31_cards", "hw3_cards",
+           "selftest_plan", "fs31_cards", "hw3_cards", "fs32_pair_plan", "fs32_pair",
            "with_native_build",
            "choose_plan", "run_session", "fix2_ab",
            "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
@@ -197,6 +208,7 @@ SMOLLM2_SEED = 1  # the config's default seed, which names the honest run's dire
 # run_verified.KEEP_STEP, the step its run stores at the band file's calibration seed (a test
 # holds the two equal; this module imports no torch).
 STORED_STEP = 4
+WEIGHTS_FILE = "final_weights.json"  # plain_baseline.WEIGHTS_FILE: a verified run's final weights
 # Environment variables a part never inherits.
 SECRETS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_TOKEN_PATH",
            "RUNPOD_API_KEY")
@@ -638,12 +650,99 @@ def nvlink_probe_plan(upload: Path, out: Path) -> list[Part]:
     return plan
 
 
+# FS32f's two-GPU session (``fs32-pair``): the sharded run on two cards, F22's two-A40 check.
+# Time limits, seconds, of its parts; the fast suite's limit allows twice its estimated 25 min.
+PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "calibrate": 900,
+                  "card": 900, "run": 900, "cheat": 900}
+# Estimates, minutes, scaled by hand (none was measured on two cards): the models part 2-5, the
+# native build 1-2, the fast suite 13-25 on 10 vCPUs (the CUDA tests run on it for the first
+# time), the slow two-GPU tests about 10, SmolLM2's calibration about 5, each of two
+# card_identity runs about 3, each of two 3-step runs about 6, each of three cheat runs about 4.
+PAIR_ESTIMATE_MIN = {"models": 5, "native_build": 2, "fast_suite": 25, "two_gpu_slow": 10,
+                     "calibrate": 5, "card": 6, "run": 12, "cheat": 12}
+PAIR_STEPS = 3
+PAIR_CARDS = 2  # the session refuses a machine with fewer CUDA devices
+PAIR_DEVICES = "cuda:0,cuda:1"  # VERIF_VERIFIER_DEVICES of the sharded arms
+PAIR_CHEATS = ("A1", "A2", "A3", "hidden", "flip")  # the oracle table's names for the cheats
+# scenarios.OUTCOMES (this module imports no torch; a test holds the two equal).
+ORACLE_OUTCOMES = ("exact", "accepted", "rejected", "early", "overrun", "wrong-check",
+                   "wrong-kind", "wrong-product")
+# the slow two-GPU tests: the FS32f ones (two_gpus) and FS32c's SmolLM2 replay (two_cuda_devices)
+PAIR_SLOW_SELECT = "two_gpus or two_cuda_devices"
+
+
+def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
+    """The two-GPU session's parts: the models part; the whole fast suite (``-rf``, junit XML);
+    the slow two-GPU tests; SmolLM2's calibration (unsharded, writing the band file, even when
+    the bf16 guard fails); ``card_identity`` (step 1's transcript root) and a 3-step
+    ``run_verified`` unsharded and again with ``VERIF_VERIFIER_DEVICES``; and the judged cheats
+    (``poisoned_step`` A1-A3, ``hidden_steps`` P11, ``flipped_matmul_sweep --no-sweep``) with it
+    set. Every part records its GPUs' peak memory. SmolLM2 runs at :data:`SMOLLM2_ENV`."""
+    from setup.data import TEST_SCALE_TOKENIZER as pin  # the pin's repo and revision
+    key = data_key(pin.repo, SMOLLM2_TASK)
+    base = {**SMOLLM2_ENV, "VERIF_MODEL": pin.repo, "VERIF_MODEL_REVISION": pin.revision}
+    sharded = {"VERIF_VERIFIER_DEVICES": PAIR_DEVICES}
+    home = _run_dir(out, upload, key, "smollm2")
+    t = PAIR_TIMEOUT_S
+
+    def run_dir(name: str) -> Path:
+        d = _run_dir(out, upload, key, name)
+        bands = d / "bands.json"
+        if not bands.is_symlink() and not bands.exists():
+            bands.symlink_to(os.path.relpath(home / "bands.json", d))
+        return d
+
+    def part(name: str, module: str, d: Path, timeout_s: float, *args: str, kind: str,
+             env: Mapping[str, str] | None = None, **info: Any) -> Part:
+        return Part(name, ["{python}", "-m", f"verification.runs.{module}", *args],
+                    env={**base, **(env or {}), "VERIF_OUTPUT_DIR": str(d),
+                         "VERIF_VERIFIER_DEVICES": (env or {}).get("VERIF_VERIFIER_DEVICES")},
+                    timeout_s=timeout_s, kind=kind,
+                    info={"model": pin.repo, "task": SMOLLM2_TASK, "run_dir": str(d),
+                          "gpu_peak": True, **info})
+
+    def pytest_part(name: str, timeout_s: float, *args: str) -> Part:
+        junit = out / "parts" / name / "junit.xml"
+        return Part(name, ["{python}", "-m", "pytest", "-rf", "-q", f"--junitxml={junit}", *args],
+                    env={"VERIF_OUTPUT_DIR": str(_run_dir(out, upload, key, "pytest")),
+                         "VERIF_VERIFIER_DEVICES": None},
+                    timeout_s=timeout_s, kind="pytest",
+                    info={"junit": str(junit), "gpu_peak": True})
+
+    honest = f"honest-{pin.repo.split('/')[-1]}-{SMOLLM2_TASK}-bpr0-s{SMOLLM2_SEED}"
+    steps = ("--steps", str(PAIR_STEPS), "--keep-step", str(PAIR_STEPS), "--no-metrics")
+    plan = [_models_part(upload, out, t["models"]),
+            pytest_part("fast_suite", t["fast_suite"]),
+            pytest_part("two_gpu_slow", t["two_gpu_slow"], "-m", "slow", "-k", PAIR_SLOW_SELECT),
+            part("smollm2_calibrate", "calibrate", home, t["calibrate"],
+                 "--write-bands-despite-guard", kind="other")]
+    for arm, env in (("unsharded", {}), ("sharded", sharded)):
+        d = run_dir(f"pair_card_{arm}")
+        plan.append(part(f"card_{arm}", "card_identity", d, t["card"], "--out",
+                         str(d / "card.json"), kind="card", env=env, arm=arm,
+                         report=str(d / "card.json")))
+    for arm, env in (("unsharded", {}), ("sharded", sharded)):
+        d = run_dir(f"pair_run_{arm}")
+        plan.append(part(f"run_{arm}", "run_verified", d, t["run"], *steps, kind="pair_run",
+                         env=env, arm=arm, weights=str(d / honest / WEIGHTS_FILE)))
+    for name, module, args in (("poisoned_step", "poisoned_step", ()),
+                               ("hidden_steps", "hidden_steps", ()),
+                               ("flipped_matmul", "flipped_matmul_sweep", ("--no-sweep",))):
+        d = run_dir(f"pair_{name}")
+        plan.append(part(name, module, d, t["cheat"], *args, "--no-metrics", kind="cheat",
+                         env=sharded))
+    for p in plan:
+        p.info["gpu_peak"] = True
+    return plan
+
+
 # Each session: its name in summary.json, and its plan.
 SESSIONS: dict[str, tuple[str, Callable[[Path, Path], list[Part]]]] = {
     "fs11": ("FS11", default_plan),
     "recheck": ("recheck", recheck_plan),
     "profile-check": ("profile-check", profile_check_plan),
     "nvlink-probe": ("nvlink-probe", nvlink_probe_plan),
+    "fs32-pair": ("fs32-pair", fs32_pair_plan),
 }
 
 
@@ -1076,6 +1175,12 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _nvlink_extras(Path(part.info["report"]))
         if part.kind == "card":
             return _card_extras(Path(part.info["report"]))
+        if part.kind == "pytest":
+            return _pytest_extras(Path(part.info["junit"]))
+        if part.kind == "pair_run":
+            return _pair_run_extras(log, Path(part.info["weights"]))
+        if part.kind == "cheat":
+            return _cheat_extras(log)
         if part.kind == "models":
             report = Path(part.info["report"])
             return json.loads(report.read_text()) if report.exists() else {"report": None}
@@ -1106,6 +1211,170 @@ def _card_extras(report: Path) -> dict[str, Any]:
             "plain_w_next_root": doc["plain"]["w_next_root"],
             "loss": doc["proved"]["loss"], "plain_loss": doc["plain"]["loss"],
             "n_leaves": doc["n_leaves"], "wall_s": doc["wall_s"]}
+
+
+
+def _pytest_extras(junit: Path) -> dict[str, Any]:
+    """A pytest part's counts and failures from its junit XML: how many tests ran, failed,
+    errored and skipped, each failure's name and seconds, and the slowest failing one."""
+    import xml.etree.ElementTree as ET
+
+    if not junit.exists():
+        return {"junit": None}
+    counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+    failed = []
+    for case in ET.parse(junit).getroot().iter("testcase"):
+        counts["tests"] += 1
+        bad = [c for c in case if c.tag in ("failure", "error")]
+        counts["skipped"] += any(c.tag == "skipped" for c in case)
+        counts["failures"] += any(c.tag == "failure" for c in case)
+        counts["errors"] += any(c.tag == "error" for c in case)
+        if bad:
+            failed.append({"name": f"{case.get('classname')}::{case.get('name')}",
+                           "time_s": float(case.get("time") or 0.0)})
+    slowest = max(failed, key=lambda r: r["time_s"], default=None)
+    return {**counts, "failed": failed, "slowest_failing": slowest}
+
+
+_PAIR_VERDICT = re.compile(r"^step\s+(\d+) \([^)]*\): (accepted|REJECTED);")
+_PAIR_KEPT = re.compile(r"^stored step (\d+): .*root ([0-9a-f]{16})")
+
+
+def _pair_run_extras(log: Path, weights: Path) -> dict[str, Any]:
+    """A pair run's per-step verdicts and kept step's root (16 hex) from its log, and the final
+    weights' root and per-step losses from ``final_weights.json``."""
+    lines = log.read_text(errors="replace").splitlines() if log.exists() else []
+    verdicts = {int(m[1]): m[2] for x in lines if (m := _PAIR_VERDICT.match(x))}
+    kept = next((m[2] for x in lines if (m := _PAIR_KEPT.match(x))), None)
+    doc = json.loads(weights.read_text()) if weights.exists() else {}
+    return {"verdicts": [verdicts[t] for t in sorted(verdicts)], "kept_root": kept,
+            "final_root": doc.get("root"), "losses": doc.get("losses")}
+
+
+def _cheat_extras(log: Path) -> dict[str, Any]:
+    """The oracle table's outcome per cheat: its rows are ``name declared actual outcome ρ_5 ρ_κ
+    ρ_6`` (``cheats.report_oracle``), so the outcome is the fourth word from the end."""
+    lines = log.read_text(errors="replace").splitlines() if log.exists() else []
+    out = {}
+    for x in lines:
+        w = x.split()
+        if len(w) >= 7 and w[0] in PAIR_CHEATS and w[-4] in ORACLE_OUTCOMES:
+            out[w[0]] = w[-4]
+    return {"outcomes": out}
+
+
+def _read_peaks(path: Path) -> dict[str, int] | None:
+    try:
+        return json.loads(path.read_text())["peak_mib"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _gpu_used_mib() -> dict[str, int]:
+    """Memory in use per GPU (MiB, by ``nvidia-smi`` index); empty without ``nvidia-smi``."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                           timeout=15)
+        return {a.strip(): int(b) for a, b in
+                (row.split(",") for row in r.stdout.splitlines() if row.strip())}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+
+
+class _GpuPeaks:
+    """A thread that samples every GPU's memory in use while a part runs and writes the
+    peaks to ``path`` at :meth:`stop`: ``{"peak_mib": {index: MiB}, "samples": n}``. It is the
+    card's whole use, not the part's process alone, and a sample sees what ``nvidia-smi``
+    does, so a peak shorter than ``every`` seconds can be missed."""
+
+    def __init__(self, path: Path, every: float = 1.0,
+                 sample: Callable[[], dict[str, int]] = _gpu_used_mib) -> None:
+        import threading
+
+        self.path, self.every, self.sample = path, every, sample
+        self.peaks: dict[str, int] = {}
+        self.n = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            for k, v in self.sample().items():
+                self.peaks[k] = max(self.peaks.get(k, 0), v)
+            self.n += 1
+            if self._stop.wait(self.every):
+                return
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=30)
+        _write_json(self.path, {"peak_mib": self.peaks, "samples": self.n})
+
+
+def _pair_part(parts: Sequence[Mapping[str, Any]], name: str) -> Mapping[str, Any]:
+    return next((p for p in parts if p["name"] == name), {})
+
+
+def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The two-GPU session's comparison, or ``None`` without its parts: whether the unsharded
+    and the sharded arms have equal roots (step 1's transcript root, ``W_{t+1}``'s root and
+    loss from ``card_identity``; the 3-step run's final-weights root, per-step losses and kept
+    step's root) and equal per-step verdicts, each cheat's outcome, and the failing tests.
+    A value is equal only when both arms have it."""
+    if not any(p["kind"] == "pair_run" for p in parts):
+        return None
+
+    def arms(kind: str) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        return tuple((next((p for p in parts if p["kind"] == kind
+                            and p["info"].get("arm") == a), {}).get("extras") or {})
+                     for a in ("unsharded", "sharded"))  # type: ignore[return-value]
+
+    def same(a: Mapping[str, Any], b: Mapping[str, Any], keys: Sequence[str]) -> dict[str, bool]:
+        return {k: a.get(k) is not None and a.get(k) == b.get(k) for k in keys}
+
+    card, run = arms("card"), arms("pair_run")
+    roots = {**same(*card, ("root", "w_next_root", "loss")),
+             **same(*run, ("final_root", "kept_root", "losses"))}
+    verdicts = (run[0].get("verdicts"), run[1].get("verdicts"))
+    outcomes: dict[str, str | None] = {}
+    for p in parts:
+        if p["kind"] == "cheat":
+            outcomes.update((p.get("extras") or {}).get("outcomes", {}))
+    tests = {n: (_pair_part(parts, n).get("extras") or {}) for n in ("fast_suite", "two_gpu_slow")}
+    failing = [dict(t["slowest_failing"], part=n) for n, t in tests.items()
+               if t.get("slowest_failing")]
+    return {"roots_equal": all(roots.values()), "roots": roots,
+            "verdicts_equal": bool(verdicts[0]) and verdicts[0] == verdicts[1],
+            "verdicts": {"unsharded": verdicts[0], "sharded": verdicts[1]},
+            "cheats": {n: outcomes.get(n) for n in PAIR_CHEATS},
+            "tests": {n: {k: t.get(k) for k in ("tests", "failures", "errors", "skipped")}
+                      for n, t in tests.items()},
+            "slowest_failing": max(failing, key=lambda r: r["time_s"], default=None),
+            "pass": (all(roots.values()) and bool(verdicts[0]) and verdicts[0] == verdicts[1]
+                     and all(outcomes.get(n) == "exact" for n in PAIR_CHEATS)
+                     and not any(t.get("failures") or t.get("errors") for t in tests.values()))}
+
+
+def _pair_lines(pair: Mapping[str, Any] | None) -> list[str]:
+    """The two-GPU session's last job-log lines: one per acceptance item."""
+    if pair is None:
+        return []
+    r, v = pair["roots"], pair["verdicts"]
+    lines = ["FS32 roots equal: " + ("yes" if pair["roots_equal"] else "NO") + " ("
+             + ", ".join(f"{k} {'=' if ok else '!='}" for k, ok in r.items()) + ")",
+             "FS32 verdicts equal: " + ("yes" if pair["verdicts_equal"] else "NO")
+             + f" (unsharded {v['unsharded']}, sharded {v['sharded']})"]
+    lines += [f"FS32 cheat {n}: {o or 'not run'}" + ("" if o == "exact" else " (NOT exact)")
+              for n, o in pair["cheats"].items()]
+    for n, t in pair["tests"].items():
+        lines.append(f"FS32 {n}: {t['tests']} tests, {t['failures']} failed, "
+                     f"{t['errors']} errors, {t['skipped']} skipped")
+    s = pair["slowest_failing"]
+    lines.append("FS32 slowest failing test: " + ("none" if s is None else
+                 f"{s['name']} ({s['time_s']:.1f} s, {s['part']})"))
+    return lines
 
 
 _FIX_TIMES = ("prover_s", "verifier_s", "handoff_s", "total_s")
@@ -1348,6 +1617,7 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
         proc = subprocess.Popen(argv, cwd=cwd, env=penv, stdout=f, stderr=subprocess.STDOUT,
                                 start_new_session=True)
         sampler = _start_sampler(proc, log.parent / "samples.jsonl", cwd, python)
+        peaks = _GpuPeaks(log.parent / "gpu_peak.json") if part.info.get("gpu_peak") else None
         if current is not None:
             try:
                 current.write_text(f"{proc.pid}\n")
@@ -1371,6 +1641,8 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
             raise
         finally:
             _stop_sampler(sampler)
+            if peaks is not None:
+                peaks.stop()
             if current is not None:
                 current.unlink(missing_ok=True)
 
@@ -1439,6 +1711,8 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
                 f.write(f"[fs11] cuPQC slots {', '.join(CUPQC_SLOTS)}: "
                         f"{summary['cupqc']['reason']}\n")
         rec["extras"] = part_extras(part, d / "log.txt")
+        if part.info.get("gpu_peak"):
+            rec["extras"]["gpu_peak_mib"] = _read_peaks(d / "gpu_peak.json")
         summary["parts"].append(rec)
         try:
             ab = fix2_ab(summary["parts"])
@@ -1459,6 +1733,12 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
             hw3 = {"hw3_cards_error": f"{type(e).__name__}: {e}"}
         if hw3 is not None:
             summary["hw3_cards"] = hw3
+        try:
+            pair = fs32_pair(summary["parts"])
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as e:
+            pair = {"fs32_pair_error": f"{type(e).__name__}: {e}"}
+        if pair is not None:
+            summary["fs32_pair"] = pair
         if part.kind == "models" and rec["status"] != "not_started":
             # On every run, a rerun that skipped the part included: the later parts read
             # these files, and a DONE marker says nothing about them now.
@@ -1470,6 +1750,12 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
         _write_json(path, summary)
     for line in _hw_lines(summary["parts"], summary.get("hw3_cards")):
         say(line)
+    pair = summary.get("fs32_pair")
+    if pair is not None and "fs32_pair_error" in pair:
+        say(f"FS32 FAIL: the comparison raised ({pair['fs32_pair_error']})")
+    else:
+        for line in _pair_lines(pair):
+            say(line)
     summary["finished"] = True
     summary["ended_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     summary["failed"] = [p["name"] for p in summary["parts"]
@@ -1641,8 +1927,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="FS11_SELFTEST: stand-in parts (unless --plan), no GPU check")
     r.add_argument("--session", choices=sorted(SESSIONS), default="fs11",
                    help="FS11_SESSION: the first session's plan (fs11, the default), the "
-                        "re-check's (recheck), the profile check's (profile-check) or the "
-                        "four-card hardware probe's (nvlink-probe); --plan and --selftest "
+                        "re-check's (recheck), the profile check's (profile-check), the "
+                        "four-card hardware probe's (nvlink-probe) or the two-GPU "
+                        "sharded run's (fs32-pair); --plan and --selftest "
                         "replace its parts")
     f = sub.add_parser("fetch-models", help="check the upload, fetch the public weights")
     f.add_argument("--upload", type=Path, required=True)
@@ -1654,6 +1941,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return fetch_models(args.upload.resolve(), args.out)
     out = args.out.resolve()
     selftest = args.cmd == "run" and args.selftest
+    pairing = False
     label, build = SESSIONS[args.session] if args.cmd == "run" else SESSIONS["fs11"]
     allow = os.environ.get("FS11_ALLOW_ANY_GPU") == "1" or selftest
     pin = pin_to_gpu_numa()  # before anything starts threads; the parts inherit it
@@ -1668,12 +1956,17 @@ def main(argv: Sequence[str] | None = None) -> int:
          f" (cgroup CPU quota {'none' if quota is None else f'{quota:g}'})")
     try:
         probing = args.cmd == "run" and args.session == "nvlink-probe" and not selftest
-        why = refusal(env_doc, allow, fs31_cards() if probing else None)
+        pairing = args.cmd == "run" and args.session == "fs32-pair" and not selftest
+        if pairing:  # any GPU type, but two of them
+            allow = True
+        why = refusal(env_doc, allow, fs31_cards() if probing else PAIR_CARDS if pairing else None)
     except ValueError as e:
         why = str(e)
     if selftest:
         _say(f"self-test: stand-in parts in place of the {label} session's, the H100 check is "
              "skipped")
+    elif pairing:
+        _say("fs32-pair: any GPU type, at least 2 CUDA devices")
     elif allow:
         _say("FS11_ALLOW_ANY_GPU=1: the H100 check is overridden")
     if args.cmd == "env":
