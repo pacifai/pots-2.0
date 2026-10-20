@@ -1262,8 +1262,11 @@ class DecoderReplay(Replay):
                 raise ReplayError("replay: a bmm outside a layer's S, O pair")
             name = f"L{self._cur}.{('S', 'O')[self._n_bmm]}"
             self._n_bmm += 1
-            out = torch.stack([self.view.product(c.m_of(f"{name}[{s},{h}]"))
-                               for s, h in c._members()]).to(a.device)
+            # A zero-copy block would alias the leaves, so the host asks for its own copy. On
+            # another device the move is the copy (blocking: no pinned-source stream logic).
+            block = self.view.product_block([c.m_of(f"{name}[{s},{h}]") for s, h in c._members()],
+                                            own=a.device.type == "cpu")
+            out = block.to(a.device) if block.device != a.device else block
         self._names.append(name)
         if name not in self._calls:  # a repeat fails the unit's name check
             # A head block's scores are not kept: its backward rebuilds them.
@@ -1450,8 +1453,8 @@ class DecoderReplay(Replay):
             name = f"L{self._unit}.{role}"
             out = None
             if name in self._want:
-                out = torch.stack([self.view.product(c.m_of(f"{name}[{s},{h}]"))
-                                   for s, h in c._members()])
+                out = self.view.product_block([c.m_of(f"{name}[{s},{h}]")
+                                               for s, h in c._members()], own=True)
                 if role == "dK":  # the op computes δK̃ᵀ = Q̃ᵀ·δS; the leaves hold δK̃
                     out = out.transpose(1, 2).contiguous()
         if out is None or name in self._bops:

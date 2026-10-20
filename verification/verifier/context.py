@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -38,6 +38,7 @@ from verification.transcript.errors import (
     StoreMutationError,
     TranscriptFormatError,
 )
+from verification.transcript.reader import stack_block
 
 if TYPE_CHECKING:
     from verification.computation.interface import DeclaredComputation, ProductSpec, Replay
@@ -222,6 +223,25 @@ class CommittedLeaves:
         if self.changed(index):
             raise StoreMutationError(f"leaf {index} changed in place after check 2 hashed it")
         return self._objs[index]
+
+    def tensor_block(self, indices: Sequence[int], own: bool = False) -> torch.Tensor:
+        """:func:`stack_block` of the tensor leaves at ``indices``, each read as :meth:`leaf`
+        reads it: the index and ``_version`` checked per leaf, in order, so the first bad one
+        raises as in a loop. (Views of one storage share a version counter, so a write
+        through any alias moves every member's; the per-leaf check still compares each
+        against its own recorded value.) A leaf that is not a tensor takes the plain path."""
+        objs, versions = self._objs, self._versions
+        n, ts = len(objs), []
+        for i in indices:
+            if not (isinstance(i, int) and 0 <= i < n):
+                self.leaf(i)  # raises the verifier-bug error
+            t = objs[i]
+            if not isinstance(t, torch.Tensor):
+                return stack_block([self.leaf(j) for j in indices], own)
+            if t._version != versions[i][0]:
+                raise StoreMutationError(f"leaf {i} changed in place after check 2 hashed it")
+            ts.append(t)
+        return stack_block(ts, own)
 
 
 @dataclass

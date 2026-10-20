@@ -7,6 +7,7 @@ in-memory store, a store on disk, and the verifier's own cache of the leaves it 
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
@@ -14,7 +15,42 @@ import torch
 if TYPE_CHECKING:
     from verification.computation.interface import DeclaredComputation
 
-__all__ = ["LeafReader", "TranscriptView"]
+__all__ = ["LeafReader", "TranscriptView", "stack_block"]
+
+_ALIGN = 64  # torch.stack's CPU output is 64-byte aligned; a zero-copy block must be too
+
+
+def stack_block(ts: Sequence[torch.Tensor], own: bool = False) -> torch.Tensor:
+    """``torch.stack(ts)``, bit for bit; zero-copy when ``ts`` are consecutive in one storage.
+
+    The fast path needs every tensor on the CPU with one shape and dtype, contiguous,
+    non-empty, and the ``k``-th at storage offset ``off + k·numel`` in the storage of the
+    first, which starts 64-byte aligned (where ``torch.stack``'s output does, so a BLAS
+    kernel sees the same alignment). The result is then a view of that storage, which a
+    caller must not write to, and which aliases the leaves; with ``own`` the view is cloned
+    (one copy, as ``torch.stack`` makes), so the result never aliases a leaf. Anything else is
+    ``torch.stack``, errors included.
+    """
+    n = len(ts)
+    t0 = ts[0] if n else None
+    if (t0 is None or not isinstance(t0, torch.Tensor) or t0.device.type != "cpu"
+            or t0.numel() == 0 or not t0.is_contiguous() or t0.requires_grad):
+        return torch.stack(list(ts))
+    shape, dtype, numel, off = t0.shape, t0.dtype, t0.numel(), t0.storage_offset()
+    ptr = t0.untyped_storage().data_ptr()
+    if t0.data_ptr() % _ALIGN:
+        return torch.stack(list(ts))
+    for k, t in enumerate(ts):
+        if (not isinstance(t, torch.Tensor) or t.shape != shape or t.dtype != dtype
+                or t.storage_offset() != off + k * numel or not t.is_contiguous()
+                or t.untyped_storage().data_ptr() != ptr or t.requires_grad):
+            return torch.stack(list(ts))
+    strides, run = [], numel
+    for d in shape:  # canonical contiguous strides, whatever a size-1 dimension holds
+        run //= d
+        strides.append(run)
+    out = t0.as_strided((n, *shape), (numel, *strides), off)
+    return out.clone() if own else out
 
 
 @runtime_checkable
@@ -50,3 +86,15 @@ class TranscriptView:
 
     def w_next(self, name: str) -> torch.Tensor:
         return self.reader.leaf(self.c.w_next_index(name))
+
+    def product_block(self, ms: Sequence[int], own: bool = False) -> torch.Tensor:
+        """The products ``ms`` stacked, ``[len(ms), *leaf_shape]``, equal bit for bit to
+        ``torch.stack([self.product(m) for m in ms])``, with the same errors at the first
+        failing member. A run of leaves consecutive in one storage (a bmm's members) comes
+        back as a view of it, read-only and aliasing the committed leaves, unless ``own``
+        asks for a fresh copy (see :func:`stack_block`)."""
+        idx = [self.c.product_index(m) for m in ms]
+        block = getattr(self.reader, "tensor_block", None)
+        if block is not None:
+            return block(idx, own)
+        return stack_block([self.reader.leaf(i) for i in idx], own)

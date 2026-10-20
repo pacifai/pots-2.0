@@ -1923,3 +1923,24 @@ def test_head_blocks_verify_an_honest_step(tied, dtype):
         name = c.head_name(kind, 1)
         _, rejection = verify(perturb={c.m_of(name): lambda p: _bump(p)})
         assert (rejection.step, rejection.check_id) == (1, check), name
+
+
+def test_replay_supplies_are_fresh_memory(honest_all):
+    """Served in blocks, a product still reaches the replay as fresh memory: no tensor either
+    supply hands back shares a byte with a committed leaf (the pass may write to it)."""
+    c, leaves, _, _ = honest_all
+    spans = [(t.untyped_storage().data_ptr(), t.untyped_storage().nbytes())
+             for t in leaves if isinstance(t, torch.Tensor) and t.numel()]
+    replay, served = c.replay(ListReader(leaves)), []
+    for name in ("_supply", "_supply_backward"):
+        orig = getattr(replay, name)
+        setattr(replay, name, lambda *a, _o=orig: served.append(_o(*a)) or served[-1])
+    for ms in _groups(c):
+        replay.operand_group(ms)
+    replay.glue_gradients()
+    assert served
+    for out in served:
+        lo = out.untyped_storage().data_ptr()
+        hi = lo + out.untyped_storage().nbytes()
+        bad = [(i, p, n, lo, hi, tuple(out.shape)) for i, (p, n) in enumerate(spans) if out.numel() and lo < p + n and p < hi]
+        assert not bad, bad[:3]
