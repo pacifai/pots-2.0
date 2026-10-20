@@ -36,8 +36,8 @@ static void chunk_stage(const pots_params_t *P) {
       for (pots_u32 t = 0; t < POTS_CHUNK_THREADS; t++) pots_chunk_compute(sm, P, t, b, cv[t]);
     }
     for (pots_u32 t = 0; t < POTS_CHUNK_THREADS; t++) pots_chunk_store(sm, t, cv[t]);
-    for (pots_u32 l = 0; l < POTS_G_LOG; l++)
-      for (pots_u32 t = 0; t < POTS_CHUNK_THREADS; t++) pots_chunk_level(sm, P, t, l);
+    for (int l = 0; l < (int)POTS_G_LOG; l++)
+      for (pots_u32 t = 0; t < POTS_CHUNK_THREADS; t++) pots_chunk_level(sm, P, t, (pots_u32)l);
     for (pots_u32 t = 0; t < POTS_CHUNK_THREADS; t++) pots_chunk_finish(sm, P, t);
   }
   free(cv);
@@ -49,8 +49,8 @@ static void reduce_stage(const pots_params_t *P) {
   pots_reduce_thread_t st[POTS_REDUCE_THREADS];
   for (pots_u64 blk = 0; blk < P->total_tiles; blk++) {
     for (pots_u32 t = 0; t < POTS_REDUCE_THREADS; t++) pots_reduce_setup(sm, P, blk, t, &st[t]);
-    for (pots_u32 l = 0; l < POTS_R_LOG; l++)
-      for (pots_u32 t = 0; t < POTS_REDUCE_THREADS; t++) pots_reduce_level(sm, &st[t], t, l);
+    for (int l = 0; l < (int)POTS_R_LOG; l++)
+      for (pots_u32 t = 0; t < POTS_REDUCE_THREADS; t++) pots_reduce_level(sm, &st[t], t, (pots_u32)l);
     for (pots_u32 t = 0; t < POTS_REDUCE_THREADS; t++) pots_reduce_finish(sm, P, t, &st[t]);
   }
   free(sm);
