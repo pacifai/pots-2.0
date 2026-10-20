@@ -2334,8 +2334,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   every ordered pair has a finite positive copy rate. The slowest pair's rate, by the PyTorch
   `copy_` timing, then gives `verdict`: `pass` at `PEER_COPY_PASS_GBPS` (300 GB/s) or more,
   `review` from `PEER_COPY_FAIL_GBPS` (150) up to that (the number returns to the user before
-  the port relies on it), `fail` below. `pass` is true only for `"pass"` with `gate` true (a rehearsal keeps its measured `verdict`, but `pass` is false). The verdict records
-  `n_cards`, `expected_cards` and `gate` (false when `FS31_CARDS` isn't 4: a rehearsal, whose
+  the port relies on it), `fail` below. `pass` is true only for `"pass"` with `gate` true (a
+  rehearsal keeps its measured `verdict`, but `pass` is false). The verdict records `n_cards`,
+  `expected_cards` and `gate` (false when `FS31_CARDS` isn't 4: a rehearsal, whose
   lines read `rehearsal (N of 4 cards), not the gate`). `nvbandwidth`'s text is recorded
   beside it and never enters the verdict. Every command runs through `run_command`, which keeps
   stdout and stderr apart; a matrix is parsed from stdout only when the command exited 0, so a

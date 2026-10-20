@@ -1195,9 +1195,10 @@ def hw3_cards(parts: Sequence[Mapping[str, Any]], expected: int | None = None
     part. Per model: ``roots`` (the committed step's root per card, ``None`` for a card with no
     report), ``n_cards`` (the cards compared), ``uuids``, ``distinct_cards`` (every UUID present
     and none repeated: the runs landed on different physical cards), ``ran`` (every card's part
-    succeeded), ``same_bits`` (``expected`` cards, at least 2, distinct, all ran, the roots equal) and, where
-    roots differ, ``first_difference``: the first leaf at which a card's hashes differ from the
-    first card's, its section and name. top-level ``same_bits`` is true when every model has it; ``pass`` also needs ``gate``.
+    succeeded), ``same_bits`` (``expected`` cards, at least 2, distinct, all ran, the roots equal)
+    and, where roots differ, ``first_difference``: the first leaf at which a card's hashes differ
+    from the first card's, its section and name. top-level ``same_bits`` is true when every model
+    has it; ``pass`` also needs ``gate``.
     ``expected`` (default ``FS31_CARDS``) is recorded with ``n_cards`` (the fewest over the
     models); ``gate`` is false for anything but :data:`GATE_CARDS` (a rehearsal, never a pass)."""
     cards = [p for p in parts if p.get("kind") == "card"]

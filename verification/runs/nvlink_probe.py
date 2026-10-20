@@ -167,10 +167,10 @@ def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
     pair, ``p2p_read_ok`` for every pair of the same GPUs, and a finite positive rate for every
     ordered pair of those GPUs. With all of them, the slowest pair's rate gives ``verdict``:
     ``pass`` at :data:`PEER_COPY_PASS_GBPS` or more, ``review`` from :data:`PEER_COPY_FAIL_GBPS`
-    up to that, ``fail`` below it; any other failed check is ``fail``. ``gate`` is true only when ``n_expected`` is
-    :data:`GATE_CARDS`; ``pass`` only for ``"pass"`` with ``gate`` (a rehearsal keeps its measured
-    ``verdict`` and never has ``pass``). ``command_failures``
-    names a ``topo`` or ``p2p_read`` command that failed; its matrix is not to be passed in."""
+    up to that, ``fail`` below it; any other failed check is ``fail``. ``gate`` is true only when
+    ``n_expected`` is :data:`GATE_CARDS`; ``pass`` only for ``"pass"`` with ``gate`` (a rehearsal
+    keeps its measured ``verdict`` and never has ``pass``). ``command_failures`` names a
+    ``topo`` or ``p2p_read`` command that failed; its matrix is not to be passed in."""
     expected = expected_cards() if n_expected is None else n_expected
     fails = dict(command_failures or {})
     reasons: list[str] = []
