@@ -61,6 +61,49 @@ so a producer write during verification is seen only there: the caller (FS33b) m
 failed ``release`` as a run error and publish no verdict for that step. ``close`` and ``release``
 are idempotent (a second ``release`` after a failed one does nothing).
 
+*What the producer check cannot see.* ``_version`` is per tensor object, shared by its views. A
+write through ``.data``, or through a tensor made with ``set_`` over a leaf's storage, has its
+own counter, so ``release`` does not see it (the two strict ``xfail`` tests in
+``test_shared_tester.py``). Check 2's rehash catches such a write if it lands before the verifier
+hashes that leaf; a write after that goes unseen. That is the same limit ``InMemoryStore``
+documents on the consumer side.
+
+**Release before close.** On CPU a ``release`` before the consumer's ``close`` leaves the
+consumer readable: it maps its own copy of the buffer (``test_release_before_close_on_cpu...``).
+On CUDA it does too, by the sources, but the memory stays out of reuse: ``reduce_tensor`` calls
+``_share_cuda_`` (torch/multiprocessing/reductions.py, 342-356), which swaps the storage's data
+pointer for a ref-counted one (``CudaIPCSentData``, torch/include/torch/csrc/CudaIPCTypes.h,
+21-47) that keeps the original allocation in ``original_ptr_``. When the producer's storage dies
+while the consumer's counter is nonzero, that block goes to ``CudaIPCSentDataLimbo``
+(CudaIPCTypes.h, 64-75), still mapped and not free; ``ipc_collect`` (torch/cuda/__init__.py,
+1086) frees it once the consumer's views are gone (the consumer's ``rebuild_cuda_tensor``
+decrements through the counter, reductions.py, 155-200). So the safe order is the same on both
+devices (``close``, then ``release``); the other order costs time (memory held) on CUDA, not
+correctness. The C++ is not shipped in the wheel, so this is from headers and the Python side;
+the first GPU pod's test shows it.
+
+**A dead consumer leaks the CPU buffer** only under the ``file_system`` strategy (the Mac's, and
+an option on Linux): ``reduce_storage`` increments the segment's count when it pickles
+(reductions.py, 606-611) and the consumer's rebuild decrements (553-570); a consumer killed
+before ``close`` never does, so the producer's ``release`` drops its reference but the segment
+stays until the producer's process exits. Nothing in ``release`` can free it safely (the count
+is the consumer's to drop). This is a test-scale leak of one buffer per step, ``cpu_bytes``
+long (the step's CPU leaf bytes, megabytes for SmolLM2-135M). Under ``file_descriptor`` (Linux's
+default) the descriptors die with the consumer and nothing leaks.
+
+**Sharing strategies.** ``share_step`` and ``open`` do not pin one: ``UntypedStorage._new_shared``
+(torch/storage.py, 406-416) and ``reduce_storage`` both follow the producer's current strategy,
+and the consumer's rebuild follows what was pickled, so the consumer needs no setting. Pinning
+would change a process-wide setting for the caller. The one rule: do not change the strategy
+between ``share_step`` and ``send``. The tests run both strategies the platform has.
+
+**Expandable segments.** The full-scale environment sets
+``PYTORCH_ALLOC_CONF=expandable_segments:True``. The allocator interface has ``shareIpcHandle``
+for both allocators (c10/cuda/CUDACachingAllocator.h, 271) and a handle type per setting
+(``POSIX_FD`` or ``FABRIC_HANDLE``, c10/cuda/CUDAAllocatorConfig.h, 16-20), so IPC is meant to
+work, through a handle that may be per segment rather than per block. The implementation is not
+in the wheel; the CUDA tests run with the setting on and off, and the first pod decides.
+
 **Two steps alive.** Step ``t + 1`` may be shared before step ``t`` is released, and one storage
 can sit in both packages. Each package and hold owns its own references; on the consumer PyTorch
 opens one handle per block and each store holds its own views, so releasing either step leaves
@@ -284,7 +327,6 @@ class SharedStore(TranscriptStore):
         self._starts = starts
         self._tree = pkg.tree
         self._dataset_paths = pkg.dataset_paths
-        self._storages: dict[int, torch.UntypedStorage] = {}
         self._buf_storage = pkg.cpu.untyped_storage() if pkg.cpu is not None else None
         self._cuda = list(pkg.cuda)  # keeps the received CUDA tensors, hence the handles
 
@@ -347,8 +389,14 @@ class SharedStore(TranscriptStore):
         return list(self._dataset_paths[i])
 
     def close(self) -> None:
-        """Drop every view and the received storages; later ``leaf`` calls raise. Idempotent.
-        Call it before the producer's :meth:`StepHold.release`."""
+        """Drop every view, and the package's tensors (``pkg.cuda``, ``pkg.cpu``) that keep the
+        producer's memory mapped; later ``leaf`` calls raise. Idempotent. The consumer
+        acknowledges a step (so the producer may :meth:`StepHold.release`) only after ``close``,
+        and should hold no tensor it got from ``leaf`` by then."""
+        pkg = self._pkg
         self._pkg = None
-        self._built, self._storages, self._buf_storage, self._cuda = [], {}, None, []
+        if pkg is not None:
+            pkg.cuda.clear()
+            pkg.cpu = None
+        self._built, self._buf_storage, self._cuda = [], None, []
         self._n = 0

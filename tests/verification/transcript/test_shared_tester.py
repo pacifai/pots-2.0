@@ -18,6 +18,7 @@ from setup.records import Record
 from verification.commitment.merkle import MerkleTree
 from tests.verification.transcript import shared_helpers as H
 from tests.verification.transcript import shared_tester_helpers as TH
+from tests.verification.transcript.test_shared import strategy  # noqa: F401  the fixture
 from verification.transcript.errors import StoreMutationError
 from verification.transcript.shared import SharedStore, share_step
 
@@ -147,7 +148,9 @@ def test_the_producer_drops_everything_and_reuses_memory_and_the_consumer_reads_
 
 
 def test_release_before_close_on_cpu_leaves_the_consumer_readable():
-    """The CPU buffer is the consumer's own mapping; an early release does not hurt it."""
+    """The CPU buffer is the consumer's own mapping; an early release does not hurt it. The
+    module docstring of ``shared.py`` ("Release before close") gives the rule for both devices:
+    close first, then release."""
     leaves = H.synthetic_leaves()
     pkg, hold, store = _roundtrip(leaves)
     want = [_bytes(x) for x in leaves if isinstance(x, torch.Tensor)]
@@ -158,9 +161,9 @@ def test_release_before_close_on_cpu_leaves_the_consumer_readable():
 
 
 @pytest.mark.parametrize("mode", ["after_send", "while_held"])
-def test_a_producer_that_dies_gives_the_consumer_an_error_or_the_right_bytes(mode):
+def test_a_producer_that_dies_gives_the_consumer_an_error_or_the_right_bytes(mode, strategy):
     conn, child = CTX.Pipe()
-    p = CTX.Process(target=TH.producer_dies, args=(child, mode))
+    p = CTX.Process(target=TH.producer_dies, args=(child, mode, strategy))
     p.start()
     child.close()
     try:
@@ -255,9 +258,9 @@ def test_producer_write_through_a_view_of_the_same_storage_is_named_by_release()
         hold.release()
 
 
-@pytest.mark.xfail(strict=True, reason="a producer write through a tensor that views the leaf's "
-                   "storage but was made with set_ (own version counter) is not detected by "
-                   "release")
+@pytest.mark.xfail(strict=True, reason="a write through a tensor made with set_ over the leaf's "
+                   "storage has its own version counter: release does not see it (shared.py "
+                   "docstring, 'What the producer check cannot see')")
 def test_producer_write_through_an_independent_alias_is_detected():
     base = torch.arange(12, dtype=torch.float32)
     _, hold = share_step(C0, 1, [base], H.synthetic_tree(1))
@@ -267,8 +270,8 @@ def test_producer_write_through_an_independent_alias_is_detected():
         hold.release()
 
 
-@pytest.mark.xfail(strict=True, reason="a producer write through .data bypasses _version and "
-                   "is not detected by release (documented limit; CUDA consumer would read it)")
+@pytest.mark.xfail(strict=True, reason="a write through .data bypasses _version: release does "
+                   "not see it (shared.py docstring, 'What the producer check cannot see')")
 def test_producer_write_through_dot_data_is_detected():
     base = torch.arange(12, dtype=torch.float32)
     _, hold = share_step(C0, 1, [base], H.synthetic_tree(1))

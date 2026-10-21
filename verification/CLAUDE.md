@@ -1388,7 +1388,8 @@ interface.
   - **Across processes (`shared.py`, FS33a).** Harness side; the verifier never imports it.
     `share_step(c, t, leaves, tree, dataset_paths) -> (package, hold)` in the prover's process;
     `conn.send(package)`; `SharedStore.open(c, package)` in the verifier's (a `TranscriptStore`);
-    `store.close()`; then `hold.release()`.
+    `store.close()`; then `hold.release()`. `close` also empties the package's tensors, so the
+    consumer acknowledges a step only after `close`; close first, then release, on both devices.
     - One transfer per distinct storage and a flat table per leaf (storage, offset, dtype,
       shape, stride); the consumer rebuilds each leaf with `set_`, on first read.
     - **Transport by device.** CUDA storages cross by CUDA IPC handle, no copy: the hold keeps
@@ -1398,8 +1399,14 @@ interface.
     - **Invariant 6 on both sides, each on its own tensors.** `SharedStore.leaf` checks
       `_version` and raises `StoreMutationError`. `hold.release` checks every leaf's `_version`
       from `share_step` and raises naming the first changed leaf; FS33b treats a failed release
-      as a run error and publishes no verdict. `close` and `release` are idempotent.
+      as a run error and publishes no verdict. `close` and `release` are idempotent. A write
+      through `.data` or a `set_` alias has its own counter and `release` misses it; check 2's
+      rehash catches it only if it lands before that leaf is hashed (the shared.py docstring).
     - Two steps may be alive at once; each package and hold owns its own references.
+    - A consumer that dies before `close` leaks the step's CPU buffer under the `file_system`
+      sharing strategy (one buffer per step, until the producer exits); `file_descriptor`
+      leaks nothing. Neither `share_step` nor `open` pins a strategy; don't change it between
+      `share_step` and `send`.
     - `TypeError` at `share_step` for a non-tensor non-`Record` leaf, a device other than CPU
       or CUDA, or a sparse, non-strided, quantized, conjugate or negated tensor.
   - Check 7 compares this step's `W_t` hashes with the previous step's `W_{t+1}` hashes. The

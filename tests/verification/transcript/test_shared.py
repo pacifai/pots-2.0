@@ -28,9 +28,10 @@ CTX = mp.get_context("spawn")
 class Remote:
     """A spawned producer, and the steps it has sent."""
 
-    def __init__(self, devices, device="cpu", steps=2, forged=None):
+    def __init__(self, devices, device="cpu", steps=2, forged=None, strategy=None, alloc=None):
         self.conn, child = CTX.Pipe()
-        self.proc = CTX.Process(target=H.producer, args=(child, devices, device, steps, forged))
+        self.proc = CTX.Process(target=H.producer, args=(child, devices, device, steps, forged,
+                                                         None, strategy, alloc))
         self.proc.start()
         child.close()  # so a dead producer is an EOFError here, not a hang
         self.steps = [self.conn.recv() for _ in range(steps)]
@@ -47,9 +48,22 @@ class Remote:
         H.reap(self.proc)
 
 
+STRATEGIES = mp.get_all_sharing_strategies()  # Linux: file_descriptor and file_system; Mac: one
+
+
+@pytest.fixture(params=STRATEGIES)
+def strategy(request):
+    """The CPU sharing strategy, set in this process (the producer sets the same in its own);
+    the pod's Linux default is ``file_descriptor``, the Mac has only ``file_system``."""
+    old = mp.get_sharing_strategy()
+    mp.set_sharing_strategy(request.param)
+    yield request.param
+    mp.set_sharing_strategy(old)
+
+
 @pytest.fixture(params=[None, THREE], ids=["unsharded", "three_cpu"])
-def remote(request):
-    r = Remote(request.param)
+def remote(request, strategy):
+    r = Remote(request.param, strategy=strategy)
     yield request.param, r
     r.stop()
 
@@ -136,9 +150,9 @@ def test_verify_step_over_a_shared_store_equals_in_memory(devices, forged):
 
 
 @pytest.mark.parametrize("device", ["cpu"])
-def test_strides_dtype_and_shared_storage_survive_the_process_boundary(device):
+def test_strides_dtype_and_shared_storage_survive_the_process_boundary(device, strategy):
     conn, child = CTX.Pipe()
-    p = CTX.Process(target=H.producer_synthetic, args=(child, device))
+    p = CTX.Process(target=H.producer_synthetic, args=(child, device, strategy))
     p.start()
     child.close()
     try:
@@ -211,6 +225,17 @@ def test_the_producer_write_is_named_by_release_and_refs_drop_anyway():
         hold.release()
     assert hold.released and pkg.cpu is None
     hold.release()  # idempotent: nothing more to raise
+
+
+def test_close_drops_the_packages_tensors_so_the_memory_can_go():
+    leaves = H.synthetic_leaves()
+    c, pkg, hold = _share(leaves)
+    store = SharedStore.open(c, pkg)
+    assert pkg.cpu is not None
+    store.leaf(0)
+    store.close()
+    assert pkg.cpu is None and pkg.cuda == []
+    hold.release()
 
 
 def test_close_and_release_are_idempotent_and_leaf_after_close_raises():

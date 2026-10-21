@@ -6,8 +6,14 @@ does, runs ``prove_step`` and ``InMemoryStore.commit_step`` for ``steps`` steps 
 ``run_loop`` takes), shares every step before releasing any, and sends
 ``(package, digests, root, n_leaves)`` per step. It then serves commands on the pipe:
 ``("release", t)`` -> ``"ok"`` or the error text; ``("mutate", t, i)`` writes leaf ``i`` of
-step ``t`` in place; ``("quit",)``.
+step ``t`` in place; ``("poke", t, i)`` writes leaf ``i``'s first element through ``.data``
+(a write ``_version`` does not see) and returns ``(old, new)``; ``("mem",)`` returns
+``(memory_allocated before the first step, now, bytes of one weight set)`` on the first device
+(CUDA only); ``("quit",)``. ``strategy`` is the CPU sharing strategy and ``alloc`` the value of
+``PYTORCH_ALLOC_CONF`` (``None`` unsets it), both set before anything is shared or allocated.
 """
+
+import os
 
 import torch
 
@@ -46,11 +52,28 @@ def setup(devices, device="cpu", layers=None):
     return c, D, model, snapshot_weights(c, model)
 
 
-def producer(conn, devices, device, steps, forged=None, layers=None):
+def configure(strategy=None, alloc=None):
+    """Set the sharing strategy and the allocator setting in this process (before CUDA starts).
+    ``alloc=None`` unsets both allocator variables, as ``fs11_session.alloc_env`` does."""
+    if strategy is not None:
+        torch.multiprocessing.set_sharing_strategy(strategy)
+    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    if alloc is None:
+        os.environ.pop("PYTORCH_ALLOC_CONF", None)
+    else:
+        os.environ["PYTORCH_ALLOC_CONF"] = alloc
+
+
+def producer(conn, devices, device, steps, forged=None, layers=None, strategy=None, alloc=None):
     import faulthandler
 
     faulthandler.enable()
+    configure(strategy, alloc)
+    cuda = torch.device(device).type == "cuda"
     c, D, model, w = setup(devices, device, layers)
+    before = torch.cuda.memory_allocated(torch.device(device)) if cuda else 0
+    w_bytes = sum(x.numel() * x.element_size() for x in w.values()
+                  if isinstance(x, torch.Tensor)) if hasattr(w, "values") else 0
     pi = _default_schedule(c, D, SEED)
     dtree = dataset_tree(c, D)
     holds, leaves_of = {}, {}
@@ -80,6 +103,18 @@ def producer(conn, devices, device, steps, forged=None, layers=None):
                 conn.send("ok")
             except StoreMutationError as e:
                 conn.send(str(e))
+            finally:
+                leaves_of.pop(msg[1], None)  # the producer's own references go with the step
+                if cuda:
+                    torch.cuda.empty_cache()
+        elif msg[0] == "poke":
+            x = leaves_of[msg[1]][msg[2]].data
+            at = (0,) * x.ndim
+            old = x[at].item()
+            x[at] = 96.0 if old != 96.0 else 64.0
+            conn.send((old, x[at].item()))
+        elif msg[0] == "mem":
+            conn.send((before, torch.cuda.memory_allocated(torch.device(device)), w_bytes))
         elif msg[0] == "mutate":
             x = leaves_of[msg[1]][msg[2]]
             x.add_(0) if isinstance(x, torch.Tensor) else None
@@ -111,12 +146,13 @@ def synthetic_tree(n):
     return MerkleTree([bytes([i]) * 32 for i in range(n)])
 
 
-def producer_synthetic(conn, device):
+def producer_synthetic(conn, device, strategy=None, alloc=None):
     """Shares :func:`synthetic_leaves`; sends the package and value copies for comparison."""
     from types import SimpleNamespace
 
     from setup.records import Record
 
+    configure(strategy, alloc)
     leaves = synthetic_leaves(device)
     pkg, hold = share_step(SimpleNamespace(n_s=0), 1, leaves, synthetic_tree(len(leaves)))
     copies = [x if isinstance(x, Record) else x.detach().cpu().clone() for x in leaves]
@@ -128,3 +164,31 @@ def producer_synthetic(conn, device):
         conn.send("ok")
     except StoreMutationError as e:
         conn.send(str(e))
+
+
+def producer_cuda_release(conn, alloc=None):
+    """Shares CUDA synthetic leaves, drops every name of its own, sends the package, and after
+    ``"release"`` replies ``("ok", memory_allocated before the leaves, memory_allocated after
+    release and empty_cache)`` or the error text."""
+    from types import SimpleNamespace
+
+    configure(None, alloc)
+    dev = torch.device("cuda:0")
+    torch.zeros(1, device=dev)  # the context and its fixed allocations exist before the baseline
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated(dev)
+    leaves = synthetic_leaves("cuda:0")
+    pkg, hold = share_step(SimpleNamespace(n_s=0), 1, leaves, synthetic_tree(len(leaves)))
+    from setup.records import Record
+
+    copies = [x if isinstance(x, Record) else x.detach().cpu().clone() for x in leaves]
+    conn.send((pkg, copies, before))
+    del pkg, leaves
+    assert conn.recv() == "release"
+    try:
+        hold.release()
+        torch.cuda.empty_cache()
+        conn.send(("ok", before, torch.cuda.memory_allocated(dev)))
+    except StoreMutationError as e:
+        conn.send(str(e))
+    conn.recv()

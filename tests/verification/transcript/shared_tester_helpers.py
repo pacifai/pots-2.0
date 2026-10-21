@@ -25,9 +25,10 @@ def producer_drop(conn):
     conn.send("ok" + str(len(junk)))
 
 
-def producer_dies(conn, mode):
+def producer_dies(conn, mode, strategy=None):
     """``mode`` 'after_send': send then exit at once. 'while_held': send, wait for the
     consumer's 'opened', then exit without releasing."""
+    H.configure(strategy)
     leaves = H.synthetic_leaves("cpu")
     pkg, hold = share_step(SimpleNamespace(n_s=0), 1, leaves, H.synthetic_tree(len(leaves)))
     copies = [x.detach().clone() if isinstance(x, torch.Tensor) else x for x in leaves]

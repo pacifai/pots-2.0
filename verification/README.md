@@ -341,7 +341,9 @@ it as a store. Each distinct storage crosses once and each leaf is a table row (
 offset, dtype, shape, stride). CUDA storages cross by CUDA IPC handle without a copy; CPU
 storages are copied once into one shared-memory buffer per step. The version check runs on
 both sides, each on its own tensors: the consumer's `leaf` raises on an in-place write, and
-the producer's `hold.release()` raises, naming the leaf, if a leaf changed while shared.
+the producer's `hold.release()` raises, naming the leaf, if a leaf changed while shared (a
+write through `.data` escapes it). The consumer's `close` also drops the package's tensors,
+and the producer releases only after it.
 
 ### Verifier side: `verifier/`
 
