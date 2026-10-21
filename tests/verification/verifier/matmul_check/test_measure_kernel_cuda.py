@@ -170,9 +170,10 @@ def test_drain_raises_on_an_input_mutated_after_enqueue():
 
 
 def test_run_loop_builds_the_measuring_kernel_before_step_1_opens_a_section(monkeypatch):
-    """On a tiny decoder on CUDA, ``run_loop`` calls ``measure_kernel.kernels(cuda device)`` once,
-    after the dataset tree and before any section of the first step, so no NVRTC build lands in
-    a timed step (the loop's pre-build, FS37)."""
+    """On a tiny decoder on CUDA, ``run_loop`` calls ``measure_kernel.kernels(cuda:0)`` exactly
+    once before the first section opens (the loop's pre-build, FS37, which sits before
+    ``verifier.start_run``'s ``run:0`` section), so no NVRTC build lands in a timed step. Check
+    5's own calls come later and are not counted."""
     from contextlib import contextmanager
 
     from tests.verification.verifier.test_kernel_step import SWITCHES, _setup
@@ -198,7 +199,7 @@ def test_run_loop_builds_the_measuring_kernel_before_step_1_opens_a_section(monk
     v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1, bands=Bands.provisional(),
                  allow_provisional=True, w0=w0, seed=1)
     loop_mod.run_loop(c, c.build_model(), D, w0, v, final=w0, section=section)
-    built = [i for i, x in enumerate(log) if x.startswith("kernels")]
-    assert len(built) == 1 and log[built[0]] == f"kernels {torch.device('cuda', 0)}", log
-    assert log[built[0] - 1] == "run:P4.tree"
-    assert len(log) > built[0] + 1  # the step's sections open after it
+    first_section = next(i for i, x in enumerate(log) if not x.startswith("kernels"))
+    before = log[:first_section]
+    assert before == [f"kernels {torch.device('cuda', 0)}"], log
+    assert len(log) > first_section  # the sections follow
