@@ -55,7 +55,7 @@ def nan_bracket(c, leaves, i, run):
     Returns the two errors, ``(after, before)``."""
     nan = list(leaves)
     nan[i] = nan[i].clone()
-    nan[i].view(-1)[0] = float("nan")
+    nan[i][(0,) * nan[i].dim()] = float("nan")
     out = []
     for j, kind in ((i + 1, NonFiniteError), (i - 1, LeafShapeError)):
         bad = list(nan)

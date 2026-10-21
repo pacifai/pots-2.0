@@ -128,7 +128,7 @@ def test_a_nan_in_a_device_leaf_is_the_host_paths_leaf_and_error(deterministic):
     i = c.product_index(3)  # i - 1 and i + 1 are products 2 and 4, device leaves on the kernel
     host = list(leaves)
     host[i] = host[i].clone()
-    host[i].view(-1)[0] = float("nan")
+    host[i][(0,) * host[i].dim()] = float("nan")
     dev = [x if j < c.n_s else x.to(DEV) for j, x in enumerate(host)]
     with pytest.raises(NonFiniteError) as want:
         hash_step_leaves(c, host)
@@ -171,7 +171,7 @@ def test_a_planted_nan_product_is_rejected_at_its_leaf_through_prove_step_and_th
              if all(c.product_class(c.product(k)) != "dK" for k in (m - 1, m, m + 1)))
 
     def plant(p):
-        p.view(-1)[0] = float("nan")
+        p[(0,) * p.dim()] = float("nan")
         return p
 
     c, out = _step(perturb={m: plant})

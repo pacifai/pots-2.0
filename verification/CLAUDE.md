@@ -613,12 +613,13 @@ interface.
     `k_tunability` and `probe` also keep the C-library path.
   - *The session.* `device-leaves` (`fs11_session.py`) runs the CUDA tests and, per model, a
     bring-up that prints `device leaves: step 1 accepted ..., prover root ..., cpu root ...,
-    arrival digests U, hashed H, commit known N, M M, dK leaves K`, then a second line nothing parses,
-    `device leaves missing: <kind> <count>, ...; first others: <names or none>`, from
+    arrival digests U, hashed H, commit known N, M M, dK leaves K`, then a second line nothing
+    parses, `device leaves missing: <kind> <count>, ...; first others: <names or none>`, from
     `missing` and `missing_first` (`U` is what the commit could use, `N` what it took:
     `StepRecord.known`, the `HashStats.known` of the commit's own hash call, which `run_loop`
-    always fills; `commit_step(..., stats=)` takes the caller's `HashStats`; on an honest decoder step: `OPERAND_GRAD <dK count>; first
-    others: none`); see the `fs11_session.py` entry below.
+    always fills; `commit_step(..., stats=)` takes the caller's `HashStats`;
+    on an honest decoder step: `OPERAND_GRAD <dK count>; first others: none`); see the
+    `fs11_session.py` entry below.
 
 - `gpu_blake3.py`, `gpu_blake3.cu`, `gpu_blake3_core.h` (F23): our own BLAKE3 CUDA kernel for
   leaf hashing. FS30 wires it in at two places (below, "Where hashing runs").
@@ -2741,7 +2742,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `summary.json["device_leaves"]` fails closed: tests part `ok`, no
     failure or error, no FS30 test skipped, and per model the step accepted, the two roots equal
     the arrival digests in use and the leaves the commit took from them (`commit known`) each
-    equal to `M` less the `dK` leaves, and the products hashed on arrival equal to `M`) or `fs32-pair` (FS32f);
+    equal to `M` less the `dK` leaves, and the products hashed on arrival equal to `M`) or
+    `fs32-pair` (FS32f);
     `fs32-pair` is F22's two-GPU acceptance: `refusal(env, True, PAIR_CARDS, need=...)` (2 CUDA
     devices of any type; the message names the pair session, not `FS31_CARDS`), then `models`,
     the fast suite (`-rf`, junit XML), the slow two-GPU tests

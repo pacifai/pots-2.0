@@ -1120,7 +1120,8 @@ first captured CUDA matmul, so `run_loop` calls `GpuBlake3().kernels(device)` on
    Each bring-up prints one `device leaves:` line with the prover's root, the CPU path's root
    over the same leaves, the number of arrival digests in use, the number of products hashed
    on arrival, the number of leaves the commit took from them (`commit known`, counted by the
-   commit's own hash call), `M` and the number of `δK̃` leaves. A second line, which nothing parses, reads
+   commit's own hash call), `M` and the number of `δK̃` leaves. A second line, which nothing
+   parses, reads
    `device leaves missing: <kind> <count>, ...; first others: <names or none>`: the products
    with no arrival digest by kind, and the first five that aren't operand gradients. On an
    honest decoder step it reads `OPERAND_GRAD <the δK̃ count>; first others: none`.
