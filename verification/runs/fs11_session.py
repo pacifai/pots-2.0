@@ -781,37 +781,59 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _collected: dict[str, tuple[list[str], str]] = {}
 
 
+def _junit_name(mod: str, node: str) -> str:
+    """``Class::test[id]`` (a collected node below its file) as junit names it: ``mod.Class::
+    test[id]``, class segments dotted on to the module (the ``[id]`` may hold ``::``)."""
+    head, bracket, ident = node.partition("[")
+    *classes, test = head.split("::")
+    return ".".join([mod, *classes]) + "::" + test + bracket + ident
+
+
 def device_tests_expected(file: str = DEVICE_TESTS_FILE) -> tuple[list[str], str]:
     """``(names, error)``: every test case ``file`` defines, parametrized cases each, as the
-    junit report names it (``dotted.module::name[id]``), from ``pytest --collect-only`` run at
-    the repository root; ``error`` is empty unless the collection failed or found none. Read at
-    gate time, so a renamed, deleted or added test changes what the gate asks for. Cached."""
+    junit report names it (``dotted.module::name[id]``, ``dotted.module.Class::name`` in a
+    class), from ``pytest --collect-only`` run at the repository root; ``error`` is empty unless
+    the collection failed, timed out, could not start or found none. Read at gate time, so a
+    renamed, deleted or added test changes what the gate asks for. Cached, a failure too. The
+    subprocess gets the session's environment without :data:`SECRETS` (the gate has no upload
+    directory for :func:`base_env`), offline, and no stdin."""
     if file not in _collected:
-        r = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q",
-                            "-p", "no:cacheprovider", file], cwd=_REPO_ROOT,
-                           capture_output=True, text=True, timeout=300)
+        env = {k: v for k, v in os.environ.items() if k not in SECRETS}
+        env.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
+        cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider",
+               file]
         mod = file.removesuffix(".py").replace("/", ".")
-        names = [f"{mod}::{ln.split('::', 1)[1]}" for ln in r.stdout.splitlines()
-                 if ln.startswith(file + "::")]
-        err = "" if r.returncode == 0 and names else (
-            f"pytest --collect-only {file} exited {r.returncode} and found {len(names)} tests")
-        _collected[file] = (names, err)
+        try:
+            r = subprocess.run(cmd, cwd=_REPO_ROOT, env=env, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            _collected[file] = ([], f"pytest --collect-only {file} timed out after 300 s")
+        except OSError as e:
+            _collected[file] = ([], f"pytest --collect-only {file} could not start: {e}")
+        else:
+            names = [_junit_name(mod, ln[len(file) + 2:]) for ln in r.stdout.splitlines()
+                     if ln.startswith(file + "::")]
+            err = "" if r.returncode == 0 and names else (
+                f"pytest --collect-only {file} exited {r.returncode} and found "
+                f"{len(names)} tests")
+            _collected[file] = (names, err)
     return _collected[file]
 
 
 def device_leaves_gate(parts: Sequence[Mapping[str, Any]],
                        expected: Sequence[str] | None = None) -> dict[str, Any] | None:
-    """FS30's gate from the parts' records, or ``None`` when the session has no tests part. It
-    is ``pass`` only if the CUDA tests part finished ``ok`` with no failure or error, FS30's own
-    CUDA tests all ran and passed (none skipped; each case the file defines, found by
-    :func:`device_tests_expected` or given as ``expected``, is asked for by name, and a missing
-    one is a reason of its own; an extra case in the file's module that passed is let through),
-    and every model of :data:`RUN_PINS` has a
-    bring-up that logged its line and shows the step accepted, the two roots equal and the
-    arrival digests in use and the leaves the commit took from them (``known``) each equal to
-    ``M`` less the ``dK`` leaves and the products hashed on arrival equal to ``M`` (the ``dK``
-    records are hashed too, their digests unused). Anything
-    missing fails."""
+    """FS30's gate from the parts' records, or ``None`` when the session has no tests part.
+
+    It is ``pass`` only if the CUDA tests part finished ``ok`` with no failure or error, and
+    FS30's own CUDA tests all ran and passed (none skipped). Each case the file defines, found
+    by :func:`device_tests_expected` or given as ``expected``, is asked for by name, and a
+    missing one is a reason of its own; an extra case in the file's module that passed is let
+    through. Every model of :data:`RUN_PINS` must also have a bring-up that logged its line and
+    shows the step accepted, the two roots equal, and the arrival digests in use and the leaves
+    the commit took from them (``known``) each equal to ``M`` less the ``dK`` leaves, and the
+    products hashed on arrival equal to ``M`` (the ``dK`` records are hashed too, their digests
+    unused). Anything missing fails.
+    """
     tests = next((p for p in parts if p.get("kind") == "device_tests"), None)
     if tests is None:
         return None

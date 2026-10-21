@@ -78,7 +78,8 @@ def test_a_nan_inside_a_matmul_output_has_no_digest_and_the_cpu_paths_leaf():
     """A NaN made by a bmm in member 1 of 3: members 1 and 2 get no digest (the kernel stops at
     the first bad leaf), member 0 gets the C library's, and the first leaf the host check
     rejects is member 1, the leaf where the arrival hash stopped."""
-    from verification.commitment.encoding import NonFiniteError, check_payload, tensor_leaf_header
+    from verification.commitment.encoding import (
+        NonFiniteError, tensor_leaf_header, tensor_leaf_payload)
     from verification.commitment.merkle import hash_tensor_leaf
     from verification.prover.capture import HostBuffers, MatmulCapture
 
@@ -95,9 +96,10 @@ def test_a_nan_inside_a_matmul_output_has_no_digest_and_the_cpu_paths_leaf():
     first = None
     for i in range(3):
         try:
-            check_payload(out[i])
-        except NonFiniteError:
+            tensor_leaf_payload(out[i])  # the host path's real check
+        except NonFiniteError as e:
             first = i
+            assert "NaN or Inf" in str(e)
             break
     assert first == 1
     assert cap.summary()["arrival_hash"]["nonfinite"] == 2

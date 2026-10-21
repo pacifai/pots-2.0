@@ -86,8 +86,6 @@ def test_the_collect_command_is_run_from_the_repo_root_with_no_cacheprovider(mon
     assert kw["cwd"] == fs._REPO_ROOT and kw["timeout"] > 0
 
 
-@pytest.mark.xfail(strict=True, reason="a collect timeout raises out of the gate instead of "
-                   "failing it with a reason: the summary's gate step would crash")
 def test_a_collect_that_times_out_fails_the_gate_instead_of_raising(monkeypatch):
     monkeypatch.setattr(fs.subprocess, "run", _fake_run(
         raises=subprocess.TimeoutExpired(["pytest"], 300)))
@@ -95,8 +93,6 @@ def test_a_collect_that_times_out_fails_the_gate_instead_of_raising(monkeypatch)
     assert g["pass"] is False
 
 
-@pytest.mark.xfail(strict=True, reason="the collect subprocess inherits the session's whole "
-                   "environment (os.environ, SECRETS included) instead of base_env's")
 def test_the_collect_subprocess_gets_an_environment_without_secrets(monkeypatch):
     seen = []
     monkeypatch.setattr(fs.subprocess, "run", _fake_run(f"{FILE}::test_a\n", 0, seen=seen))
@@ -105,8 +101,6 @@ def test_the_collect_subprocess_gets_an_environment_without_secrets(monkeypatch)
     assert env is not None and not (set(env) & set(fs.SECRETS))
 
 
-@pytest.mark.xfail(strict=True, reason="a test inside a class collects as 'mod::Class::test' "
-                   "but junit names it 'mod.Class::test': the gate would call it missing")
 def test_a_class_based_test_is_named_as_the_junit_report_names_it(monkeypatch):
     monkeypatch.setattr(fs.subprocess, "run", _fake_run(f"{FILE}::TestX::test_a\n", 0))
     names, _ = fs.device_tests_expected()
@@ -123,3 +117,21 @@ def test_the_gate_passes_with_every_collected_name_in_the_report(monkeypatch):
     g = fs.device_leaves_gate(_parts(tests=_tests_part(cases=cases)))
     assert g["pass"] is False
     assert f"{MOD}::test_b[x]: expected but not in the junit report" in g["reasons"]
+
+
+def test_a_failed_collect_runs_once_and_the_env_is_offline_without_stdin(monkeypatch):
+    seen = []
+    monkeypatch.setenv("RUNPOD_API_KEY", "x")
+    monkeypatch.setattr(fs.subprocess, "run", _fake_run(
+        raises=subprocess.TimeoutExpired(["pytest"], 300), seen=seen))
+    first, second = fs.device_tests_expected(), fs.device_tests_expected()
+    assert first == second and first[0] == [] and "timed out" in first[1] and len(seen) == 1
+    kw = seen[0][1]
+    assert kw["stdin"] == subprocess.DEVNULL and "RUNPOD_API_KEY" not in kw["env"]
+    assert kw["env"]["HF_HUB_OFFLINE"] == "1" and kw["env"]["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_a_collect_that_cannot_start_fails_the_gate(monkeypatch):
+    monkeypatch.setattr(fs.subprocess, "run", _fake_run(raises=OSError("no python")))
+    g = fs.device_leaves_gate(_parts())
+    assert g["pass"] is False and any("could not start" in r for r in g["reasons"])

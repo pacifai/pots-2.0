@@ -1,6 +1,7 @@
 """Products on a GPU (FS9): each captured output is copied into a pinned host buffer on a side
 stream and its GPU copy freed. Skipped without CUDA; the CPU side is in ``test_capture.py``."""
 
+import gc
 import os
 
 import pytest
@@ -149,6 +150,9 @@ def test_gpu_memory_does_not_hold_the_transcript():
     a, b = operands(512, 512, 512)
     out_bytes = 512 * 512 * 4
     cap = MatmulCapture(buffers=pool)
+    # Earlier tests' garbage (tracebacks and cycles holding tensors) waits for the cyclic
+    # collector, which may run mid-capture and free it: collect it before the baseline.
+    gc.collect()
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
     seen = []
@@ -159,6 +163,8 @@ def test_gpu_memory_does_not_hold_the_transcript():
             seen.append(torch.cuda.memory_allocated() - base)
     assert len(cap.records) == 40
     assert max(seen) <= 2 * out_bytes
+    gc.collect()
+    torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() == base
     assert pool.nbytes == 40 * out_bytes
 
