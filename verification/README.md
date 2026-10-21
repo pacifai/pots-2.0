@@ -445,7 +445,12 @@ replaced:
   product's class and layer. Runs that vary a model, attack, poisoning or seed write to a
   directory named after that cell, for example `honest-SmolLM2-135M-Instruct-refusal-bpr0-s1`.
   It observes the run through a `section` hook that is off by default;
-  `metrics_overhead.py` measures what recording costs. A run's last record, `run_end`, is
+  `metrics_overhead.py` measures what recording costs. A process on several GPUs lists them
+  (`devices=`): its timed sections wait on every one, and its memory rows add each device's peak and
+  the device's use by all processes (sampled, so a lower bound). When the prover runs in a child
+  process, it closes each step's sections (`close_step`) and the parent merges them (`merge_step`,
+  once per step, before that step closes; a stray part is refused) into one set of rows on one
+  clock, with the step's wall extent beside its work. A run's last record, `run_end`, is
   written only when the run finished, whatever its verdict: a run that crashed or was
   interrupted leaves none, so a driver that skips finished run directories reruns it.
 - **`materialize_data.py`** builds `D` and `D̃` for one model, task, seed and poisoning

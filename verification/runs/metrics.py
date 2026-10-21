@@ -121,6 +121,76 @@ every other backend. The backend is named in ``mem_source``:
 MPS uses the host probe (unified memory). A probe that fails with ``OSError`` is logged once and
 turned off: later rows carry ``null`` and ``mem_source`` ``unavailable``.
 
+**Several devices (FS33c).** ``TimeRecorder(devices=...)`` and ``MemoryRecorder(devices=...)``
+name every device the recorder's process uses (the verifier's replay split over GPUs 1-3), next to
+the single ``device`` / ``probe``. With ``devices`` unset, ``("cpu",)`` or ``()``, rows and markers
+are exactly as above (tested against the layout before FS33c). With several devices, or with any
+CUDA device in ``devices`` (``("cuda:0",)`` too), the recorder takes the several-device paths and
+writes the fields below; ``device=`` alone stays the single-device recorder. A memory recorder's
+``probe`` must read ``devices[0]`` (``memory_probe(devices[0])``), else ``ValueError``:
+
+- *Time.* A top-level CUDA section's exit waits for every listed device, so its host time covers the
+  work launched on any of them. The single-device recorder synchronized only its own device, so a
+  section whose work ran on the other GPUs was timed to the launch, not the end: the verifier's
+  split replay on GPUs 1-3 was under-counted by everything still running on the two it did not
+  wait for. Cost per section for ``n`` devices: a top-level one ``2n`` synchronizes and ``2n``
+  events (an anchor and an end event per device), a nested one ``2n`` events and no synchronize
+  (``n = 1``: 2 and 2, 2); a nested row reads as its longest device span. A marker section's
+  ``gpu_us`` stays the first device's; ``gpu_us_by_device`` lists every device's spans, and
+  ``devices`` names them (per section, and on the line). Time rows gain ``devices`` and
+  ``gpu_held_s``, the section's seconds times the devices it held: an upper bound on GPU-seconds
+  (EQ14), since a held device may idle. On a non-CUDA device every listed device is the process.
+  The overflow row's (``rest``) ``gpu_s`` is the sum over every listed device of the device
+  spans of the calls past ``MAX_SPANS``, GPU-seconds like ``gpu_held_s`` but measured on the
+  events, with no list per device.
+- *Memory.* ``peak_bytes``, ``peak_reserved_bytes``, ``start_bytes`` and ``end_bytes`` keep
+  their meaning for the first device. New fields, one list entry per device in ``devices``:
+  ``device_peak_bytes``, ``device_peak_reserved_bytes``, ``device_start_bytes`` and
+  ``device_end_bytes`` are this process's figures, the peaks exact (reset and read per device at
+  every section boundary); ``device_wide_start_bytes``, ``device_wide_end_bytes`` and
+  ``device_wide_peak_bytes`` are the device's use by every process on it (``mem_get_info``: total
+  minus free, so the CUDA contexts and the other process's transcript are in it). Device-wide is
+  **sampled** at each section's entry and exit, nested ones too, so its peak is a lower bound of
+  the card's true peak; the per-process peak is exact. ``device_wide_source`` says so in each
+  row. A host device (the Mac's ``cpu``) has no device-wide figure: its entries are the process's.
+  Each boundary costs ``n`` probe reads and ``n`` resets, plus ``n`` ``mem_get_info`` calls.
+
+**Two processes (FS33c).** In the pipelined loop the prover's process records its sections and
+the verifier's process owns the rows and the writer. The child calls ``close_step(t)`` between
+steps (no section open) and sends the :class:`StepPart` it returns (plain numbers, picklable; step
+0 is the ``run:`` sections); the parent calls ``merge_step(t, part)`` before ``on_step`` for ``t``,
+and ``on_step`` emits one set of rows and one markers line holding both sides. The order the loop
+(FS33b) must follow: the parent calls ``merge_step(t, part)`` exactly once per step, after its
+own sections of step ``t`` and before ``on_step`` for ``t``, steps in order. ``ValueError``, with
+the recorder unchanged, for a part whose ``t`` isn't ``t``, a ``t`` that isn't the step the
+recorder is on, a second part for a step, any merge after ``finish`` and a section name in both
+(step 0, the ``run:`` sections, takes its one part any time before ``finish``).
+``TimeRecorder`` and ``MemoryRecorder`` do it; the counting pass (``counting()`` patches the
+process) and the profiler trace (``trace_step``) are one process and raise ``RuntimeError``
+from either call. ``time.monotonic_ns`` is system-wide on Linux and macOS, so both sides' spans
+sit on one axis. How to read a merged step ``t``:
+
+- A section's ``pid`` says which side's it is; ``t0_ns`` is the first section start of either
+  side, so ``host_us`` and ``gpu_us`` are on one axis for both sides.
+- The step line's ``t1_ns`` is the parent's ``on_step``. The child begins step ``t + 1`` right
+  after sending step ``t``, while the parent still verifies ``t``: the overlap with the next
+  step is ``line(t + 1).t0_ns`` against ``line(t).t1_ns``, and each side's span of ``t`` is its
+  sections' spans (the prover's ``P*`` and ``train.*``, the verifier's checks).
+- Totals. ``step`` stays the **work**: the sum of both sides' top-level sections, as in the
+  sequential loop, where it is also the wall time. A merged step adds a ``total`` row ``step_wall``
+  (side ``run``): the step's wall extent, from the first section start to the last section end of
+  both sides, gaps included. Pipelined, ``step_wall`` is shorter than ``step`` by the overlap.
+  The paper's EQ14 numbers should read both, as F22 decides: wall time (``step_wall`` per step,
+  the run's wall across steps) beside GPU-seconds (``gpu_held_s``, a merged row's seconds times
+  the devices its side held), since "one role at a time" no longer holds.
+- ``gpu_held_s`` on ``step`` is work: each section's seconds times the devices that section's
+  process listed, summed (the sequential loop's figure, still an upper bound). On ``step_wall`` it
+  is the wall extent times every device either side listed (each counted once): first start to
+  last end, the idle gap between the two sides included, so it is not work. Read ``step`` for
+  GPU-seconds and ``step_wall`` for elapsed time.
+- Rows of a merged step carry ``devices`` and ``gpu_held_s``; in memory rows the device fields
+  are per process, so a row over both sides (the ``step`` total) has them ``null``.
+
 **Counts (counting pass).** ``flops``: torch's FLOP formulas (``flop_registry``, the ones
 ``FlopCounterMode`` applies) over every op, which covers the matmul-class ops; elementwise
 work (checks 6a, 6b, glue) counts 0. ``FlopCounterMode`` itself can't run here (see
@@ -178,6 +248,7 @@ many tests of each family the step measured; an accepted step's is ``null``.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import gzip
 import importlib
 import importlib.metadata
@@ -192,7 +263,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import IO, Any, Protocol
@@ -224,6 +295,7 @@ __all__ = [
     "RESERVED_NAMES", "SCORE_FAMILIES",
     "MemoryProbe", "memory_probe", "reserved_peak",
     "TimeRecorder", "MemoryRecorder", "CountRecorder", "Seam", "resolve_gpu_us", "MAX_SPANS",
+    "StepPart", "STEP_WALL",
     "STAMP_NAMES", "read_markers", "c5_layout_file",
     "memory_pass", "count_pass", "counting",
     "derive_capture", "step_record", "record_pass", "judged_step", "in_sample_step",
@@ -243,6 +315,7 @@ COMPONENTS = ("P0", "train_captured", "P1", "P2", "P3", "P4", "P5")
 RECORD_TYPES = ("environment", "step", "verdict", "time", "memory", "count", "storage",
                 "capture", "run_end")
 RUN_PREFIX = "run:"
+STEP_WALL = "step_wall"  # the merged step's wall-extent row (FS33c)
 TRACE_DIR = "trace"  # the traced step's files in a run directory (FS23)
 # Host spans kept per section per step in markers.jsonl; the calls past them fold into ``rest``.
 MAX_SPANS = 64
@@ -302,6 +375,7 @@ def reserved_peak(probe: MemoryProbe) -> int | None:
 
 class _DarwinProbe:
     source = "darwin_phys_footprint"
+    device = torch.device("cpu")
     _RUSAGE_INFO_V4 = 4
     _RLIMIT_FOOTPRINT_INTERVAL = 4
     _FOOTPRINT_INTERVAL_RESET = 1
@@ -336,6 +410,7 @@ class _DarwinProbe:
 
 class _LinuxProbe:
     source = "linux_rss_hwm"
+    device = torch.device("cpu")
 
     def __init__(self) -> None:
         self._clear = open("/proc/self/clear_refs", "w")  # noqa: SIM115 (kept open for speed)
@@ -360,7 +435,7 @@ class _CudaProbe:
     source = "cuda_allocated"
 
     def __init__(self, device: torch.device) -> None:
-        self._dev = device
+        self._dev = self.device = device
 
     def reset(self) -> None:
         torch.cuda.synchronize(self._dev)
@@ -379,6 +454,7 @@ class _CudaProbe:
 
 class _MaxRssProbe:
     source = "ru_maxrss"
+    device = torch.device("cpu")
     _UNIT = 1 if sys.platform == "darwin" else 1024  # bytes on macOS, kB on Linux
 
     def reset(self) -> None:
@@ -394,6 +470,7 @@ class _Guarded:
     def __init__(self, inner: MemoryProbe) -> None:
         self._inner: MemoryProbe | None = inner
         self.source = inner.source
+        self.device: torch.device | None = getattr(inner, "device", None)  # None: unknown
 
     def _fail(self, e: OSError) -> None:
         log.warning("memory probe %s failed (%s); memory rows are null from here", self.source, e)
@@ -456,7 +533,8 @@ class _Acc:
     """One section's totals within a step."""
 
     __slots__ = ("nested", "calls", "time", "peak", "rpeak", "start", "end", "seen", "counts",
-                 "depth", "c5", "first_ns", "spans", "gpu", "rest", "alloc")
+                 "depth", "c5", "first_ns", "spans", "gpu", "rest", "alloc", "gpu_more", "dev",
+                 "devs", "pid")
 
     def __init__(self, nested: bool) -> None:
         self.nested = nested
@@ -472,6 +550,15 @@ class _Acc:
         self.gpu: list[list[float] | None] = []
         self.rest: list[Any] | None = None
         self.alloc: list[int] | None = None
+        # FS33c. ``gpu_more[i]`` holds the device spans of the recorder's device ``i + 1``
+        # (several CUDA devices), parallel to ``gpu``; ``dev`` is the memory pass's per-device
+        # figures (:class:`_DevAcc`, several devices); ``devs`` names the devices of the recorder
+        # that timed the section (set when a step part is closed or merged) and ``pid`` the
+        # process of a merged part (``None``: the recorder's own).
+        self.gpu_more: list[list[list[float] | None]] | None = None
+        self.dev: _DevAcc | None = None
+        self.devs: tuple[str, ...] | None = None
+        self.pid: int | None = None
         self.calls = 0
         self.time = 0.0
         self.peak: int | None = None
@@ -535,6 +622,42 @@ def _alloc_counters(device: torch.device) -> list[int]:
     return [int(st.get(k, 0)) for k in _ALLOC_KEYS]
 
 
+class _DevAcc:
+    """One section's memory figures per device (the memory pass, several devices; lists aligned
+    with ``names``): the process's peak, reserved peak, figure at the first entry and at the last
+    exit, and the device-wide use at the first entry, at the last exit and its sampled peak."""
+
+    __slots__ = ("names", "peak", "rpeak", "start", "end", "wstart", "wend", "wpeak")
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        n = len(names)
+        self.names = names
+        self.peak: list[int | None] = [None] * n
+        self.rpeak: list[int | None] = [None] * n
+        self.start: list[int | None] = [None] * n
+        self.end: list[int | None] = [None] * n
+        self.wstart: list[int | None] = [None] * n
+        self.wend: list[int | None] = [None] * n
+        self.wpeak: list[int | None] = [None] * n
+
+
+@dataclasses.dataclass
+class StepPart:
+    """One process's sections of one step, closed by :meth:`TimeRecorder.close_step` (or
+    :meth:`MemoryRecorder.close_step`) and merged into the process that owns the run's rows by
+    ``merge_step``. Plain data: spans in host nanoseconds and resolved device microseconds,
+    seconds and bytes; no CUDA events, no tensors, so it pickles across a pipe.
+
+    ``kind`` is ``"time"`` or ``"memory"``, ``t`` the step (0: the run-level sections), ``pid``
+    the closing process and ``devices`` its recorder's devices."""
+
+    kind: str
+    t: int
+    pid: int
+    devices: tuple[str, ...]
+    sections: dict[str, _Acc]
+
+
 class _Recorder:
     """Sections per step, ``run:`` sections at step 0, and the nesting depth.
 
@@ -554,6 +677,10 @@ class _Recorder:
         self._c5_open = 0  # check-5 sections open now (the stamps' gate)
         self._seam: Seam | None = None
         self._verifier: Any = None
+        self._names: tuple[str, ...] = ()  # this recorder's devices, by name
+        self._merged: set[int] = set()  # steps that took a part from another process
+        self._t = 1  # the step the open table belongs to (the next ``on_step`` closes it)
+        self._finished = False  # ``finish`` closed the run: nothing merges any more
 
     def seam(self) -> Seam:
         """The run's one :class:`Seam`: what to pass where ``section`` is passed."""
@@ -588,13 +715,73 @@ class _Recorder:
     def on_step(self, rec: Any) -> None:
         """``run_loop``'s ``on_step``: close step ``rec.t``."""
         table, self._step = self._step, {}
-        self._emit(rec.t, table, rec)
+        self._t = rec.t + 1
+        try:
+            self._emit(rec.t, table, rec)
+        finally:
+            self._merged.discard(rec.t)
+
+    def close_step(self, t: int) -> StepPart:
+        """In the process that only records (the pipelined prover): end step ``t``'s table
+        without emitting rows and return it as a :class:`StepPart` to send to the process that
+        owns the run's rows. Step 0 is the ``run:`` sections. Only the time and memory
+        recorders do it."""
+        raise NotImplementedError(f"{type(self).__name__} cannot close a step for another process")
+
+    def merge_step(self, t: int, part: StepPart) -> None:
+        """In the process that owns the rows, before :meth:`on_step` for step ``t``: add
+        ``part``'s sections to step ``t``'s table. A name in both raises ``ValueError``."""
+        raise NotImplementedError(f"{type(self).__name__} cannot merge a step from another process")
+
+    def _close(self, t: int) -> StepPart:
+        if self._depth:
+            raise RuntimeError(f"close_step({t}) with {self._depth} section(s) still open")
+        if t == 0:
+            table, self._run = self._run, {}
+        else:
+            table, self._step = self._step, {}
+            self._t = t + 1
+        for a in table.values():
+            a.devs = a.devs or self._names
+        return StepPart(self.record, t, os.getpid(), self._names, table)
+
+    def _merge(self, t: int, part: StepPart) -> None:
+        """Add ``part`` to step ``t``'s open table. Refused, with the table untouched, when the
+        run is finished, when ``part`` isn't the ``record`` part of step ``t``, when ``t`` isn't
+        the step the open table belongs to (step 0, the ``run:`` sections, is open until
+        :meth:`finish`), when step ``t`` already took a part, and on a name in both."""
+        if self._finished:
+            raise ValueError(f"merge_step({t}) after finish: the run's rows are written")
+        if not isinstance(part, StepPart) or part.kind != self.record or part.t != t:
+            raise ValueError(f"merge_step({t}) needs the {self.record} part of step {t}, got "
+                             f"{getattr(part, 'kind', type(part).__name__)} step "
+                             f"{getattr(part, 't', '?')}")
+        if t != 0 and t != self._t:
+            raise ValueError(f"merge_step({t}) is a part of step {t}, but the recorder is on "
+                             f"step {self._t}: merge one part per step, before on_step({t})")
+        if t in self._merged:
+            raise ValueError(f"merge_step({t}): step {t} already took a part (a second part "
+                             f"for one step is refused)")
+        table = self._run if t == 0 else self._step
+        both = sorted(set(table) & set(part.sections))
+        if both:
+            raise ValueError(f"step {t}: section(s) {both} are in both processes' tables")
+        for a in table.values():
+            a.devs = a.devs or self._names
+        for a in part.sections.values():
+            a.pid = part.pid
+        table.update(part.sections)
+        self._merged.add(t)
 
     def finish(self, verdict: Any = None) -> None:
         """Close the run: the ``run:`` sections become step 0."""
+        self._finished = True
         table, self._run = self._run, {}
         if table:
-            self._emit(0, table, None)
+            try:
+                self._emit(0, table, None)
+            finally:
+                self._merged.discard(0)
 
     def _emit(self, t: int, table: dict[str, _Acc], rec: Any) -> None:
         self.rows += self._rows(t, table)
@@ -722,6 +909,76 @@ class _CudaTimeSection:
         delta = [b - a for a, b in zip(self.a0, a1, strict=True)]
         acc.alloc = delta if acc.alloc is None else [x + y for x, y in zip(acc.alloc, delta)]
         rec._pending.append((acc, _span(acc, self.t0, t1, gpu=True), self.e0, e1, False))
+        rec._resolve()
+
+
+class _MultiCudaTimeSection:
+    """CUDA, several devices (FS33c). :class:`_CudaTimeSection` with every listed device.
+
+    A top-level section synchronizes every device at entry and at exit, so its host time covers
+    the work launched on any of them, and records one anchor event per device (each device's
+    spans are resolved against its own anchor). A nested section records one event pair per
+    device and reads as the longest of the devices' elapsed times (the devices run side by
+    side). Cost per section, ``n`` devices: a top-level section ``2n`` synchronizes and ``2n``
+    events, a nested one ``2n`` events and no synchronize; the single-device section is the
+    ``n = 1`` case (2 and 2, 2 events). The allocator's counters stay the first device's."""
+
+    __slots__ = ("rec", "acc", "t0", "top", "e0s", "a0")
+
+    def __init__(self, rec: TimeRecorder, acc: _Acc) -> None:
+        self.rec, self.acc = rec, acc
+        if acc.gpu_more is None:
+            acc.gpu_more = [[] for _ in rec._devices[1:]]
+
+    def __enter__(self) -> None:
+        rec = self.rec
+        self.top = rec._depth == 0
+        rec._depth += 1
+        if self.acc.c5:
+            rec._c5_open += 1
+        if self.top:
+            for d in rec._devices:
+                torch.cuda.synchronize(d)
+            self.t0 = time.monotonic_ns()
+            self.e0s = [torch.cuda.Event(enable_timing=True) for _ in rec._devices]
+            rec._anchors = []
+            for i, (d, e) in enumerate(zip(rec._devices, self.e0s, strict=True)):
+                e.record(torch.cuda.current_stream(d))
+                rec._anchors.append(
+                    (self.t0 / 1000.0 if i == 0 else time.monotonic_ns() / 1000.0, e))
+            rec._anchor = rec._anchors[0]
+            self.a0 = _alloc_counters(rec._device)
+        else:
+            self.t0 = time.monotonic_ns()
+            self.e0s = rec._record_events()
+
+    def __exit__(self, *exc: Any) -> None:
+        rec, acc = self.rec, self.acc
+        acc.calls += 1
+        rec._depth -= 1
+        if acc.c5:
+            rec._c5_open -= 1
+        e1s = rec._record_events()
+        if not self.top:
+            t1 = time.monotonic_ns()
+            slot = _span(acc, self.t0, t1, gpu=True)
+            if slot >= 0:
+                for lst in acc.gpu_more or ():
+                    lst.append(None)
+            rec._pending.append((acc, slot, self.e0s, e1s, True))
+            return
+        a1 = _alloc_counters(rec._device)
+        for d in rec._devices:
+            torch.cuda.synchronize(d)
+        t1 = time.monotonic_ns()
+        acc.time += (t1 - self.t0) / 1e9
+        delta = [b - a for a, b in zip(self.a0, a1, strict=True)]
+        acc.alloc = delta if acc.alloc is None else [x + y for x, y in zip(acc.alloc, delta)]
+        slot = _span(acc, self.t0, t1, gpu=True)
+        if slot >= 0:
+            for lst in acc.gpu_more or ():
+                lst.append(None)
+        rec._pending.append((acc, slot, self.e0s, e1s, False))
         rec._resolve()
 
 
@@ -955,6 +1212,18 @@ class _TracedStamp:
                 t.collect(False)
 
 
+def _device_list(device: str | torch.device | None,
+                 devices: Sequence[str | torch.device] | None) -> tuple[torch.device, ...]:
+    """The devices of a recorder: ``devices`` when it holds any, else ``device`` (default
+    ``cpu``). Given both, ``device`` must be ``devices``' first."""
+    devs = tuple(torch.device(d) for d in devices or ())
+    if not devs:
+        return (torch.device("cpu" if device is None else device),)
+    if device is not None and torch.device(device) != devs[0]:
+        raise ValueError(f"device {device!r} is not the first of devices {list(map(str, devs))}")
+    return devs
+
+
 class TimeRecorder(_Recorder):
     """The timed run: wall-clock seconds per section, nothing else measured.
 
@@ -967,14 +1236,27 @@ class TimeRecorder(_Recorder):
     record = "time"
     _Section = _TimeSection
 
-    def __init__(self, run: str, scenario: str, *, device: str | torch.device = "cpu",
+    def __init__(self, run: str, scenario: str, *, device: str | torch.device | None = None,
+                 devices: Sequence[str | torch.device] | None = None,
                  writer: MetricsWriter | None = None,
                  step_fields: Mapping[str, Any] | None = None,
                  trace_step: int = 0, trace_c5: str = "slice") -> None:
         super().__init__(run, scenario)
-        self._device = torch.device(device)
+        devs = _device_list(device, devices)
+        self._devices = devs
+        self._device = devs[0]
+        self._names = tuple(str(d) for d in devs)
+        given = tuple(torch.device(d) for d in devices or ())
+        # several devices, or a CUDA device named in ``devices``: the FS33c paths and fields
+        self._multi = len(given) > 1 or any(d.type == "cuda" for d in given)
+        if len({d.type for d in devs}) > 1:
+            raise ValueError(f"the devices of one recorder must be of one type, got {self._names}")
+        self._devfields = False  # the rows being emitted carry the device fields
+        self._anchors: list[tuple[float, Any]] | None = None
+        if self._multi:
+            self._resolve = self._resolve_multi  # type: ignore[method-assign]
         if self._device.type == "cuda":
-            self._Section = _CudaTimeSection
+            self._Section = _MultiCudaTimeSection if self._multi else _CudaTimeSection
         elif self._device.type == "mps":
             self._Section = _SyncTimeSection
             self._sync = torch.mps.synchronize
@@ -1083,6 +1365,70 @@ class TimeRecorder(_Recorder):
         self._pending.clear()
         self._stamp_pending.clear()
 
+    def _record_events(self) -> list[Any]:
+        """One event per device, each recorded on the device's current stream."""
+        out = []
+        for d in self._devices:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record(torch.cuda.current_stream(d))
+            out.append(e)
+        return out
+
+    def _resolve_multi(self) -> None:
+        """:meth:`_resolve` for several devices: a nested section's time is its longest device
+        span, and each device's spans resolve against that device's own anchor."""
+        anchors = self._anchors
+        for acc, slot, e0s, e1s, nested in self._pending:
+            if nested:
+                acc.time += max(a.elapsed_time(b) for a, b in zip(e0s, e1s, strict=True)) / 1e3
+            if anchors is None:
+                continue
+            gs = [resolve_gpu_us(an[0], an[1], (a, b))
+                  for an, a, b in zip(anchors, e0s, e1s, strict=True)]
+            if slot >= 0:
+                acc.gpu[slot] = gs[0]
+                for lst, g in zip(acc.gpu_more or (), gs[1:], strict=False):
+                    lst[slot] = g
+            elif acc.rest is not None:
+                # GPU-seconds of the call over every listed device (the sum, as ``gpu_held_s``
+                # counts devices); the overflow row has no room for a list per device
+                acc.rest[2] += sum(g[1] - g[0] for g in gs) / 1e6
+        anchor = self._anchor
+        if anchor is not None:
+            for i, e0, e1 in self._stamp_pending:
+                self._stamp_gpu[i] = resolve_gpu_us(anchor[0], anchor[1], (e0, e1))
+        self._pending.clear()
+        self._stamp_pending.clear()
+
+    def _refuse_trace(self, what: str) -> None:
+        if self._trace is not None:
+            raise RuntimeError(f"{what}: the profiler trace (trace_step) is process-global and "
+                               f"stays in one process; run without trace_step to split a step")
+
+    def close_step(self, t: int) -> StepPart:
+        """In the child: end step ``t``'s table (step 0: the ``run:`` sections) and return it
+        as a :class:`StepPart`, emitting no rows and no markers line. Call it between the
+        steps, with no section open; the device spans are resolved first (every top-level
+        section's exit has synchronized), so the part holds plain numbers: host spans in
+        ``time.monotonic_ns`` and device spans in microseconds on the same clock, no CUDA events,
+        no tensors. The check-5 stamps of the step are dropped (the child takes none).
+
+        Refused with a traced recorder (``trace_step``): the profiler is process-global."""
+        self._refuse_trace("close_step")
+        part = self._close(t)
+        if self._pending:
+            self._resolve()
+        self._stamps, self._stamp_gpu = [], {}
+        return part
+
+    def merge_step(self, t: int, part: StepPart) -> None:
+        """In the parent, before :meth:`on_step` for step ``t``: add the child's sections to
+        step ``t``'s table, so ``on_step`` emits one set of rows and one markers line holding
+        both sides (see the module docstring, "Two processes"). A section name in both raises
+        ``ValueError``. Refused with a traced recorder (``trace_step``)."""
+        self._refuse_trace("merge_step")
+        self._merge(t, part)
+
     def on_step(self, rec: Any) -> None:
         self._t1 = time.monotonic_ns()
         self._step_stamps = (self._stamps, self._stamp_gpu)
@@ -1107,21 +1453,38 @@ class TimeRecorder(_Recorder):
         def us(ns: int) -> float:
             return round((ns - t0) / 1000.0, 3)
 
+        def gus(gl: list[list[float] | None]) -> list[list[float] | None]:
+            return [None if g is None else [round(g[0] - base, 3), round(g[1] - base, 3)]
+                    for g in gl]
+
+        df = self._devfields
+        merged = rec is not None and rec.t in self._merged or rec is None and 0 in self._merged
+        me = os.getpid()
         sections = []
         for name, a in table.items():
             r = a.rest
-            sections.append({
+            sec = {
                 "name": name, "depth": a.depth, "calls": a.calls,
                 "host_us": [[us(s0), us(s1)] for s0, s1 in a.spans],
-                "gpu_us": ([None if g is None else [round(g[0] - base, 3), round(g[1] - base, 3)]
-                            for g in a.gpu] if self._cuda else None),
+                "gpu_us": gus(a.gpu) if self._cuda else None,
                 "rest": None if r is None else {
                     "calls": r[0], "host_s": r[1], "gpu_s": r[2] if self._cuda else None,
                     "first_us": us(r[3]), "last_us": us(r[4])},
                 "alloc": None if a.alloc is None else dict(zip(_ALLOC_NAMES, a.alloc,
-                                                               strict=True))})
+                                                               strict=True))}
+            if df:  # FS33c: several devices or a merged step
+                sec["devices"] = list(a.devs or self._names)
+                if self._cuda:
+                    sec["gpu_us_by_device"] = [gus(a.gpu), *[gus(m) for m in a.gpu_more or ()]]
+            if merged:
+                sec["pid"] = a.pid or me
+            sections.append(sec)
         line: dict[str, Any] = {"kind": "step" if rec is not None else "run",
                                 "scenario": self.scenario, "t0_ns": t0}
+        if df:
+            line["devices"] = list(self._names)
+        if merged:
+            line["merged"] = True
         if rec is None:
             line["sections"] = sections
             return line
@@ -1141,9 +1504,31 @@ class TimeRecorder(_Recorder):
         return line
 
     def _values(self, accs: list[_Acc]) -> dict[str, Any]:
-        return {"time_s": sum(a.time for a in accs), "traced": self._tracing_step}
+        out: dict[str, Any] = {"time_s": sum(a.time for a in accs), "traced": self._tracing_step}
+        if self._devfields:
+            sets = list(dict.fromkeys(a.devs or self._names for a in accs))
+            names = list(sets[0]) if sets else list(self._names)
+            names += [n for tup in sets[1:] for n in tup if n not in names]
+            out["devices"] = names
+            out["gpu_held_s"] = sum(a.time * len(a.devs or self._names) for a in accs)
+        return out
+
+    def _rows(self, step: int, table: dict[str, _Acc]) -> list[dict[str, Any]]:
+        rows = super()._rows(step, table)
+        if step >= 1 and step in self._merged:
+            top = [(n, a) for n, a in table.items() if not a.nested and _side(n) != "run"
+                   and a.first_ns is not None]
+            if top:
+                lo = min(a.first_ns for _, a in top if a.first_ns is not None)
+                hi = max(a.rest[4] if a.rest is not None else a.spans[-1][1] for _, a in top)
+                wall = _Acc(False)
+                wall.time, wall.calls = (hi - lo) / 1e9, 1
+                wall.devs = tuple(dict.fromkeys(n for _, a in top for n in (a.devs or self._names)))
+                rows.append(self._row(step, "run", STEP_WALL, "total", [wall]))
+        return rows
 
     def _emit(self, t: int, table: dict[str, _Acc], rec: Any) -> None:
+        self._devfields = self._multi or t in self._merged
         rows = self._rows(t, table)
         if rec is not None and self._verifier is not None:
             rows.append({**step_record(self.run, self.scenario, t, self._verifier,
@@ -1460,6 +1845,99 @@ class _MemSection:
             rec._echo_section(self, cur, exc[0])
 
 
+class _MultiMemSection(_MemSection):
+    """:class:`_MemSection` with every listed device (FS33c): the same fold, reset and sample,
+    per device, and the device-wide use sampled with them. The first device's figures stay in
+    ``peak``, ``rpeak`` and ``start`` as in the single-device section."""
+
+    __slots__ = ("dpeak", "drpeak", "dwpeak")
+
+    def __init__(self, rec: MemoryRecorder, acc: _Acc) -> None:
+        super().__init__(rec, acc)
+        if acc.dev is None:
+            acc.dev = _DevAcc(rec._names)
+
+    def __enter__(self) -> None:
+        rec, acc = self.rec, self.acc
+        rec._fold()  # the open sections keep the peaks so far before they are reset
+        rec._reset_all()
+        pk, cur, rp, wide = rec._sample_all()
+        self.peak, self.start, self.rpeak = pk[0], cur[0], rp[0]
+        self.dpeak, self.drpeak, self.dwpeak = pk, rp, list(wide)
+        if not acc.seen:
+            acc.start, acc.seen = self.start, True
+            assert acc.dev is not None
+            acc.dev.start, acc.dev.wstart = list(cur), list(wide)
+        if rec._depth == 0:
+            rec._inner = {}
+        rec._open.append(self)
+        rec._depth += 1
+
+    def __exit__(self, *exc: Any) -> None:
+        rec, acc = self.rec, self.acc
+        cur = rec._fold()
+        rec._open.pop()
+        rec._depth -= 1
+        acc.calls += 1
+        acc.end = cur
+        acc.peak, acc.rpeak = _max(acc.peak, self.peak), _max(acc.rpeak, self.rpeak)
+        d = acc.dev
+        assert d is not None
+        d.end, d.wend = list(rec._last_cur), list(rec._last_wide)
+        d.peak = [_max(a, b) for a, b in zip(d.peak, self.dpeak, strict=True)]
+        d.rpeak = [_max(a, b) for a, b in zip(d.rpeak, self.drpeak, strict=True)]
+        d.wpeak = [_max(a, b) for a, b in zip(d.wpeak, self.dwpeak, strict=True)]
+        if rec.echo is None:
+            return
+        if rec._depth > 0:
+            was, rwas = rec._inner.get(self.name, (None, None))
+            rec._inner[self.name] = (_max(was, self.peak), _max(rwas, self.rpeak))
+        else:
+            rec._echo_section(self, cur, exc[0])
+
+
+def _device_wide(dev: torch.device, process_now: int | None) -> int | None:
+    """The device's use by every process on it (``mem_get_info``: total minus free), the
+    CUDA context and other processes' tensors included. Host devices have no such figure: the
+    process's own, ``process_now``."""
+    if dev.type != "cuda":
+        return process_now
+    try:
+        free, total = torch.cuda.mem_get_info(dev)
+    except (RuntimeError, OSError):
+        return None
+    return int(total - free)
+
+
+def _max_each(rows: list[list[int | None]]) -> list[int | None]:
+    out = list(rows[0])
+    for r in rows[1:]:
+        out = [_max(a, b) for a, b in zip(out, r, strict=True)]
+    return out
+
+
+_DEVICE_FIELDS = ("devices", "device_peak_bytes", "device_peak_reserved_bytes",
+                  "device_start_bytes", "device_end_bytes", "device_wide_start_bytes",
+                  "device_wide_end_bytes", "device_wide_peak_bytes", "device_wide_source")
+
+
+def _check_probe(probe: MemoryProbe, first: torch.device) -> None:
+    """``probe`` must read ``first``, the recorder's first device (``devices[0]``). A probe that
+    doesn't say which device it reads (a test double) isn't checked."""
+    got = getattr(probe, "device", None)
+    if got is None:
+        return
+
+    def key(d: torch.device) -> tuple[str, int | None]:
+        if d.type != "cuda":
+            return ("host", None)  # the host probe serves cpu and mps alike
+        return ("cuda", torch.cuda.current_device() if d.index is None else d.index)
+
+    if key(got) != key(first):
+        raise ValueError(f"the probe reads {got} but devices[0] is {first}: pass the probe of "
+                         f"the first device (memory_probe({str(first)!r}))")
+
+
 def _gb(x: int | None) -> str:
     return "?" if x is None else f"{x / 2**30:.2f}"
 
@@ -1478,23 +1956,35 @@ class MemoryRecorder(_Recorder):
     _Section = _MemSection
 
     def __init__(self, run: str, scenario: str, probe: MemoryProbe, *,
-                 echo: Callable[[str], None] | None = None) -> None:
+                 echo: Callable[[str], None] | None = None,
+                 devices: Sequence[str | torch.device] | None = None) -> None:
         super().__init__(run, scenario)
         self.probe = probe
         self.echo = echo
+        devs = tuple(torch.device(d) for d in devices or ())
+        if devs:
+            _check_probe(probe, devs[0])
+        # several devices, or a CUDA device named in ``devices``: the FS33c paths and fields
+        self._multi = len(devs) > 1 or any(d.type == "cuda" for d in devs)
+        self._devfields = False  # the rows being emitted carry the device fields
+        if self._multi:
+            self._devices = devs
+            self._names = tuple(str(d) for d in devs)
+            self._Section = _MultiMemSection
+            # ``probe`` reads the first device; a CUDA device after it gets its own probe, a
+            # host device shares ``probe`` (its figure is the process's)
+            self._probes: list[MemoryProbe | None] = [
+                probe, *[memory_probe(d) if d.type == "cuda" else None for d in devs[1:]]]
+            self._last_cur: list[int | None] = []
+            self._last_wide: list[int | None] = []
         self._open: list[_MemSection] = []
         # nested (peak, reserved peak) inside the open top section
         self._inner: dict[str, tuple[int | None, int | None]] = {}
-        self._t = 1  # the step the open sections belong to
 
     def section(self, name: str) -> Any:
         s = super().section(name)
         s.name = name
         return s
-
-    def on_step(self, rec: Any) -> None:
-        super().on_step(rec)
-        self._t = rec.t + 1
 
     def _echo_section(self, s: _MemSection, end: int | None, exc: type | None) -> None:
         name = s.name
@@ -1516,7 +2006,56 @@ class MemoryRecorder(_Recorder):
         except OSError:  # a full disk under the log mustn't end the run
             pass
 
+    def _reset_all(self) -> None:
+        self.probe.reset()
+        for p in self._probes[1:]:
+            if p is not None:
+                p.reset()
+
+    def _sample_all(self) -> tuple[list[int | None], list[int | None], list[int | None],
+                                   list[int | None]]:
+        """``(peaks, current, reserved peaks, device-wide use)``, one entry per device."""
+        p0, c0 = self.probe.sample()
+        r0 = reserved_peak(self.probe)
+        pk, cur, rp, wide = [], [], [], []
+        for i, (d, pr) in enumerate(zip(self._devices, self._probes, strict=True)):
+            if i == 0 or pr is None:
+                p, c, r = p0, c0, r0
+            else:
+                p, c = pr.sample()
+                r = reserved_peak(pr)
+            pk.append(p)
+            cur.append(c)
+            rp.append(r)
+            wide.append(_device_wide(d, c))
+        self._last_cur, self._last_wide = cur, wide
+        return pk, cur, rp, wide
+
+    def close_step(self, t: int) -> StepPart:
+        """In the child: end step ``t``'s table without emitting rows and return it as a
+        :class:`StepPart` (plain numbers, picklable). With no section open; see
+        :meth:`TimeRecorder.close_step`."""
+        return self._close(t)
+
+    def merge_step(self, t: int, part: StepPart) -> None:
+        """In the parent, before :meth:`on_step` for step ``t``: add the child's sections to
+        step ``t``'s table. A section name in both raises ``ValueError``."""
+        self._merge(t, part)
+
+    def _emit(self, t: int, table: dict[str, _Acc], rec: Any) -> None:
+        self._devfields = any(a.dev is not None for a in table.values())
+        super()._emit(t, table, rec)
+
     def _fold(self) -> int | None:
+        if self._multi:
+            pk, cur, rp, wide = self._sample_all()
+            for s in self._open:
+                assert isinstance(s, _MultiMemSection)
+                s.peak, s.rpeak = _max(s.peak, pk[0]), _max(s.rpeak, rp[0])
+                s.dpeak = [_max(a, b) for a, b in zip(s.dpeak, pk, strict=True)]
+                s.drpeak = [_max(a, b) for a, b in zip(s.drpeak, rp, strict=True)]
+                s.dwpeak = [_max(a, b) for a, b in zip(s.dwpeak, wide, strict=True)]
+            return cur[0]
         peak, cur = self.probe.sample()
         rpeak = reserved_peak(self.probe)
         for s in self._open:
@@ -1526,22 +2065,52 @@ class MemoryRecorder(_Recorder):
     def _values(self, accs: list[_Acc]) -> dict[str, Any]:
         peaks = [a.peak for a in accs if a.peak is not None]
         rpeaks = [a.rpeak for a in accs if a.rpeak is not None]
-        return {"peak_bytes": max(peaks) if peaks else None,
-                "peak_reserved_bytes": max(rpeaks) if rpeaks else None,
-                "start_bytes": accs[0].start, "end_bytes": accs[-1].end,
-                "mem_source": self.probe.source}
+        out: dict[str, Any] = {"peak_bytes": max(peaks) if peaks else None,
+                               "peak_reserved_bytes": max(rpeaks) if rpeaks else None,
+                               "start_bytes": accs[0].start, "end_bytes": accs[-1].end,
+                               "mem_source": self.probe.source}
+        if self._devfields:
+            out.update(self._device_values(accs))
+        return out
+
+    @staticmethod
+    def _device_values(accs: list[_Acc]) -> dict[str, Any]:
+        """The device fields of a row (several devices): per device, aligned with ``devices``,
+        the process's peak and reserved peak (exact), its figure at the first entry and the
+        last exit, and the device-wide use at the first entry, at the last exit and its sampled
+        peak (a lower bound of the device's peak). A row over sections of different processes
+        or device lists has them all ``null``."""
+        ds = [a.dev for a in accs]
+        if (any(d is None for d in ds) or len({d.names for d in ds if d}) != 1
+                or len({a.pid for a in accs}) != 1):
+            return dict.fromkeys(_DEVICE_FIELDS)
+        first, last = ds[0], ds[-1]
+        assert first is not None and last is not None
+        rows = [d for d in ds if d is not None]
+        return {
+            "devices": list(first.names),
+            "device_peak_bytes": _max_each([d.peak for d in rows]),
+            "device_peak_reserved_bytes": _max_each([d.rpeak for d in rows]),
+            "device_start_bytes": first.start, "device_end_bytes": last.end,
+            "device_wide_start_bytes": first.wstart, "device_wide_end_bytes": last.wend,
+            "device_wide_peak_bytes": _max_each([d.wpeak for d in rows]),
+            "device_wide_source": [
+                "cuda_mem_get_info (sampled at section entry and exit: a lower bound)"
+                if n.startswith("cuda") else "process (host device: no device-wide figure)"
+                for n in first.names]}
 
 
 def memory_pass(run: str, scenario: str, fn: Callable[[MemoryRecorder], Any],
                 probe: MemoryProbe, *,
-                echo: Callable[[str], None] | None = None) -> list[dict[str, Any]]:
+                echo: Callable[[str], None] | None = None,
+                devices: Sequence[str | torch.device] | None = None) -> list[dict[str, Any]]:
     """Run ``fn(recorder)`` once with memory probed at every section; return its rows.
 
     ``fn`` wires the recorder as a timed run wires a :class:`TimeRecorder`. Its times are never
     reported. ``echo`` prints each top-level section's peak as it closes
-    (:class:`MemoryRecorder`).
+    (:class:`MemoryRecorder`). ``devices`` is the recorder's, for a process on several devices.
     """
-    rec = MemoryRecorder(run, scenario, probe, echo=echo)
+    rec = MemoryRecorder(run, scenario, probe, echo=echo, devices=devices)
     fn(rec)
     rec.finish()
     return rec.rows
@@ -1714,6 +2283,16 @@ class CountRecorder(_Recorder):
     def __init__(self, run: str, scenario: str, flops: _FlopTally, tally: _HashTally) -> None:
         super().__init__(run, scenario)
         self._fm, self._tally = flops, tally
+
+    def close_step(self, t: int) -> StepPart:
+        raise RuntimeError("the counting pass is process-global (counting() patches this "
+                           "process's dispatch and hashing), so a step is never counted in two "
+                           "processes; run the counting pass sequentially")
+
+    def merge_step(self, t: int, part: StepPart) -> None:
+        raise RuntimeError("the counting pass is process-global (counting() patches this "
+                           "process's dispatch and hashing), so a step is never counted in two "
+                           "processes; run the counting pass sequentially")
 
     def _now(self) -> tuple[int, ...]:
         t = self._tally
