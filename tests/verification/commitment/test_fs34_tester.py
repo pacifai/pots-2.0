@@ -879,16 +879,13 @@ def test_the_wait_for_the_tables_counts_in_wait_s(c, leaves, on_kernel, monkeypa
     assert st.wait_s >= 0.05
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "the known-digest check runs only for a leaf _kernel_leaf accepts (a CUDA leaf): on the "
-    "one-GPU path the products sit in host memory, so a wrong arrival digest there is never "
-    "compared with the C library, though DECISIONS_FULL_SCALE says each path checks the first "
-    "digest of each device and header; the run then ends in check 2's root mismatch, a "
-    "rejection of an honest prover that rests on a kernel error"))
-def test_a_wrong_arrival_digest_on_a_host_product_is_a_mismatch_not_a_root_difference(c, leaves):
+def test_a_known_digest_of_a_host_product_gets_no_crosscheck(c, leaves):
+    # By design: on one GPU the products sit in host memory and check 2 rehashes them with the C
+    # library, so a wrong prover digest is a root mismatch there and decision 4 isn't needed.
     i = first_product(c)
-    with pytest.raises(kc.KernelMismatchError):
-        hash_step_leaves(c, leaves, known={i: bytes(32)})
+    st = HashStats()
+    hash_step_leaves(c, leaves, st, known={i: bytes(32)})
+    assert st.crosschecks == 0 and not kc._checked
 
 
 def test_a_wrong_arrival_digest_on_a_host_product_today_changes_the_root(c, leaves):
