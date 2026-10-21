@@ -273,3 +273,31 @@ def test_run_loop_starts_a_new_run_before_anything_else(on_kernel, monkeypatch):
                         lambda self, ds: (order.append("start_run"), real(self, ds))[1])
     _scenario_run(False)
     assert order[:2] == ["new_run", "start_run"]
+
+
+def _fail_probe_copies(monkeypatch, nth):
+    """Make the ``nth`` per-shape host copy (1-based) raise ``StoreMutationError``; the list
+    returned gets the tensor it failed on."""
+    seen, failed = [], []
+
+    def boom(t):
+        seen.append(t)
+        if len(seen) == nth:
+            failed.append(t)
+            raise StoreMutationError("changed")
+        return t
+
+    monkeypatch.setattr(L.hostcopy, "host_tensor", boom)
+    return failed
+
+
+@pytest.mark.parametrize("nth", [1, 2])
+def test_a_mutation_on_a_probe_is_the_error_and_no_empty_table_hides_it(
+        c, leaves, on_kernel, monkeypatch, nth):  # noqa: F811
+    failed = _fail_probe_copies(monkeypatch, nth)
+    want = leaf_hashes_of(c, items(leaves), kernel=False)
+    digests, err = leaf_hashes_until_error(c, items(leaves))
+    i = next(k for k, t in enumerate(leaves) if t is failed[0])
+    assert type(err) is StoreMutationError
+    assert str(err) == f"leaf {i} was mutated in place while it was copied to the host"
+    assert digests == want[:i]

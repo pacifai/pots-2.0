@@ -439,6 +439,10 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     at the smallest position wins, across the native batches and the tables, and the digests
     returned are those before it. A native batch error stops the producer early; a table's is
     known only at the end, so the producer may have read further, with the same result.
+    A leaf written in place after it joins a kernel table and before that table is queued is
+    hashed as its new bytes, with no error here; check 2's version guard (``CommittedLeaves``)
+    catches it, as before FS34.
+
     The call returns only once no worker or table reads a tensor any more; ``KeyboardInterrupt``
     propagates after that too, and so does any exception already in flight, over a table that
     fails to read.
@@ -476,6 +480,7 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     open_: dict[torch.device, _OpenTable] = {}  # each device's open table
     tables: list[_OpenTable] = []  # the queued ones
     probes: dict[tuple[Any, ...], _Probe] = {}  # per-shape checks of this call, by key
+    slot_keys: dict[int, dict[torch.device, tuple[Any, ...]]] = {}  # per-shape keys, by slot
     fatal: list[BaseException] = []  # a failure that is the call's, not a leaf's: it propagates
     order: list[int] = []  # each item's leaf index, by position
     n_seen = n_kernel = 0
@@ -559,10 +564,13 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
                         headers.append(header)
                     if kernel and _kernel_leaf(obj):
                         # The structural checks passed: the kernel hashes the leaf in place.
-                        ot = open_.get(obj.device)
-                        if ot is None:
-                            ot = open_[obj.device] = _OpenTable()
-                        ck = kernel_check.key_of("table", obj.device, tag, dtype, shape)
+                        dkeys = slot_keys.get(i)
+                        if dkeys is None:
+                            dkeys = slot_keys[i] = {}
+                        ck = dkeys.get(obj.device)
+                        if ck is None:  # built once per slot and device
+                            ck = dkeys[obj.device] = kernel_check.key_of(
+                                "table", obj.device, tag, dtype, shape)
                         if ck not in probes and not kernel_check.is_checked(ck):
                             try:
                                 version, cd = _host_digest(obj, headers[h], i)
@@ -572,6 +580,9 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
                                 fatal.append(e)
                                 raise
                             probes[ck] = _Probe(ck, obj, version, cd, n, i)
+                        ot = open_.get(obj.device)  # after the probe: a failed one opens none
+                        if ot is None:
+                            ot = open_[obj.device] = _OpenTable()
                         ot.idx.append(i)
                         ot.tensors.append(obj)
                         ot.tags.append(tag)
@@ -627,7 +638,8 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
         while pending and state[0] is None:
             collect()
         for dev in list(open_):  # every leaf added so far is hashed: the tables before it need it
-            close(dev)
+            if open_[dev].idx:
+                close(dev)  # a table with no leaf is never queued
     finally:
         # An interrupt can land anywhere in here, even between ``submit`` and ``pending.append``;
         # the FIFO job below covers a batch whose future never reached ``pending``.
