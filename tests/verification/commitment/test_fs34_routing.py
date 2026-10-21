@@ -51,7 +51,8 @@ def test_the_kernel_digests_equal_the_c_librarys_on_lists_and_lazy_input(
     assert st.kernel == 0 and st.crosschecks == 0
 
 
-def test_hash_step_leaves_takes_known_digests_and_hashes_the_rest(c, leaves, on_kernel):  # noqa: F811
+def test_hash_step_leaves_takes_known_digests_and_hashes_the_rest(
+        c, leaves, on_kernel):  # noqa: F811
     d = leaf_hashes_of(c, items(leaves), kernel=False)
     known = {i: d[i] for i in range(c.n_s, c.n_leaves, 2)}
     st = HashStats()
@@ -59,7 +60,8 @@ def test_hash_step_leaves_takes_known_digests_and_hashes_the_rest(c, leaves, on_
     assert st.known == len(known) and st.kernel > 0
 
 
-def test_a_nan_before_a_host_error_is_the_first_error(c, leaves, on_kernel, small_tables):  # noqa: F811
+def test_a_nan_before_a_host_error_is_the_first_error(
+        c, leaves, on_kernel, small_tables):  # noqa: F811
     i = first_product(c)
     from tests.verification.commitment.test_leaves_known import nan_bracket
     for run in (lambda x: leaf_hashes_of(c, items(x)),
@@ -252,7 +254,8 @@ def _scenario_run(pipelined):
 
 
 @pytest.mark.parametrize("pipelined", [False, True])
-def test_a_run_with_the_kernel_seams_on_accepts_and_checks_shapes(on_kernel, pipelined):  # noqa: F811
+def test_a_run_with_the_kernel_seams_on_accepts_and_checks_shapes(
+        on_kernel, pipelined):  # noqa: F811
     r = _scenario_run(pipelined)
     assert r.loop.verdict.accepted
     assert kc._checked
@@ -301,3 +304,33 @@ def test_a_mutation_on_a_probe_is_the_error_and_no_empty_table_hides_it(
     assert type(err) is StoreMutationError
     assert str(err) == f"leaf {i} was mutated in place while it was copied to the host"
     assert digests == want[:i]
+
+
+def test_the_pipelined_parent_builds_both_kernels_once_per_cuda_device_before_step_1(
+        on_kernel, monkeypatch):  # noqa: F811
+    """The child is spawned, so only the parent's calls are seen here; the child's own source
+    is checked for the measuring build below."""
+    import inspect
+
+    from verification.runs import pipeline as P
+    from verification.verifier.driver import Verifier
+    from verification.verifier.matmul_check import measure_kernel
+
+    calls = []
+    monkeypatch.setattr(P, "_is_cuda", lambda d: True)
+    monkeypatch.setattr(P, "GpuBlake3",
+                        lambda: type("G", (), {"kernels": lambda s, d:
+                                               calls.append(("hash", d))})())
+    monkeypatch.setattr(measure_kernel, "kernels", lambda d: calls.append(("measure", d)))
+    real = Verifier.verify_step
+
+    def first(self, t, store):
+        calls.append(("step", t))
+        return real(self, t, store)
+
+    monkeypatch.setattr(Verifier, "verify_step", first)
+    assert _scenario_run(True).loop.verdict.accepted
+    cpu = torch.device("cpu")
+    assert calls[:3] == [("hash", cpu), ("measure", cpu), ("step", 1)]
+    assert sum(k in ("hash", "measure") for k, _ in calls) == 2
+    assert "measure_kernel" not in inspect.getsource(P._child_run)

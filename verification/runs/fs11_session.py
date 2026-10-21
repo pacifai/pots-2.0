@@ -139,6 +139,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from xml.etree.ElementTree import ParseError
 
 __all__ = ["PROFILE_CHECK_TIMEOUT_S", "PROFILE_HELD", "PROFILE_PINS", "SMOLLM2_ENV", "RUN_PINS",
            "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
@@ -1645,7 +1646,7 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
         if part.kind == "models":
             report = Path(part.info["report"])
             return json.loads(report.read_text()) if report.exists() else {"report": None}
-    except (OSError, ValueError, KeyError, TypeError) as e:
+    except (OSError, ValueError, KeyError, TypeError, ParseError) as e:
         return {"extras_error": f"{type(e).__name__}: {e}"}
     return {}
 

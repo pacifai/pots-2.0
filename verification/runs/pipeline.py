@@ -169,6 +169,7 @@ from verification.transcript.errors import StoreMutationError
 from verification.transcript.shared import SharedStore, share_step
 from verification.transcript.store import IN_MEMORY, InMemoryStore, StoreHandoff
 from verification.verifier.driver import RunVerdict, Verifier
+from verification.verifier.matmul_check import measure_kernel
 
 __all__ = ["ProverSide", "ProverSpec", "ProverProcessError", "RecorderSpec", "run_pipelined",
            "RELEASE_SECTION"]
@@ -673,10 +674,12 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
             result.verdict = verifier.end_run(final)
             return result
         # The parent's kernels (it hashes nothing on a device today, but the verifier's own
-        # leaf hashing may): loaded here, outside every section, before step 1 (FS34).
+        # leaf hashing may, and check 5 measures): loaded here, outside every section, before
+        # step 1 (FS34, FS37). The child never measures, so it builds only the hash kernel.
         for d in dict.fromkeys(torch.device(x) for x in (c.placement.devices or ())
                                if _is_cuda(x)):
             GpuBlake3().kernels(d)
+            measure_kernel.kernels(d)
         _, hs, part0 = link.expect("ready")
         _check_handshake(hs, c, verifier, w0)
         if recorder is not None:

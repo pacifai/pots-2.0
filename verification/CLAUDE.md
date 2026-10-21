@@ -580,7 +580,12 @@ interface.
     `KernelMismatchError(RuntimeError)`, not a `ValueError` or `LookupError`, so the verifier's
     `PROVER_DATA_ERRORS` guard never turns it into a rejection: the run stops with no verdict.
     A kernel digest where the C library finds a non-finite value is a mismatch too. The check
-    is off under `kernel=False` and `native.disabled()`.
+    is off under `kernel=False` and `native.disabled()`. On the one-GPU path the product leaves
+    sit in host memory and the verifier never uses the kernel (check 2 rehashes every host leaf
+    with the C library each step), so a wrong prover digest there is a root mismatch at check
+    2, and this check, which protects verdicts from the verifier's kernel, is not needed: a
+    known digest of a host product gets no `"arrival"` cross-check
+    (`test_a_known_digest_of_a_host_product_gets_no_crosscheck`).
   - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
   - `transcript_root(c, reader)` is check 2.
   - `commit_leaves(c, leaves) -> MerkleTree`.
@@ -684,8 +689,10 @@ interface.
     out of the timed steps: it calls `GpuBlake3().kernels(device)` once per CUDA device of the
     run (the model's and a sharded placement's) before step 1, outside every section, and
     `kernel_check.new_run()` first of all (FS34), before the pipelined dispatch. The pipelined
-    child calls `new_run()` at its start and loads its kernels; the pipelined parent loads
-    the kernels of `c.placement.devices` before step 1. A CUDA run that
+    child calls `new_run()` at its start and loads its hash kernels; the pipelined parent loads
+    the hash kernel and check 5's measuring kernel (`measure_kernel.kernels(d)`, FS37) on the
+    CUDA devices of `c.placement.devices` before step 1, outside every section. The child
+    never measures, so it builds no measuring kernel. A CUDA run that
     doesn't go through `run_loop` (`card_identity`) is left as it was: call
     `GpuBlake3().kernels(device)` first there to keep the build out of a timed step. A build or
     load failure raises; nothing falls back to the CPU.

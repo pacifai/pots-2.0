@@ -94,7 +94,8 @@ def _plant_errors(rng, c, base, n_err):
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_routing_equals_the_plain_path_for_random_mixes(c, leaves, route, monkeypatch, seed):  # noqa: F811
+def test_routing_equals_the_plain_path_for_random_mixes(
+        c, leaves, route, monkeypatch, seed):  # noqa: F811
     rng = random.Random(seed)
     monkeypatch.setattr(L, "_BATCH_ENTRIES", rng.choice([1, 2, 3, 5, 100]))
     monkeypatch.setattr(L, "_BATCH_BYTES", rng.choice([1000, 3000, 7000, 1 << 20]))
@@ -137,7 +138,8 @@ def test_routing_equals_the_plain_path_for_random_mixes(c, leaves, route, monkey
 @pytest.mark.parametrize("where", ["before", "inside", "after"])
 @pytest.mark.parametrize("kind", ["nan_kernel", "nan_host", "shape", "iter", "mutation"])
 @pytest.mark.parametrize("lazy", [False, True])
-def test_every_error_kind_placed_around_tables(c, leaves, route, monkeypatch, where, kind,  # noqa: F811
+def test_every_error_kind_placed_around_tables(
+        c, leaves, route, monkeypatch, where, kind,  # noqa: F811
                                                lazy):
     monkeypatch.setattr(L, "_BATCH_ENTRIES", 3)
     n = len(leaves)
@@ -239,7 +241,8 @@ def test_an_iterable_error_leaves_no_table_unread(c, leaves, tracked):  # noqa: 
     assert _all_read(tracked)
 
 
-def test_a_keyboard_interrupt_from_the_iterable_leaves_no_table_unread(c, leaves, tracked):  # noqa: F811
+def test_a_keyboard_interrupt_from_the_iterable_leaves_no_table_unread(
+        c, leaves, tracked):  # noqa: F811
     def gen():
         yield from items(leaves)[:c.n_s + 7]
         raise KeyboardInterrupt
@@ -255,7 +258,8 @@ def test_a_failing_enqueue_still_reads_the_tables_before_it(c, leaves, tracked):
     assert len(tracked.queued) == 2 and _all_read(tracked)
 
 
-def test_the_exception_in_flight_wins_over_a_table_that_fails_to_read(c, leaves, tracked):  # noqa: F811
+def test_the_exception_in_flight_wins_over_a_table_that_fails_to_read(
+        c, leaves, tracked):  # noqa: F811
     tracked.fail_read = ValueError("read of a table failed")
     tracked.fail_at = 3
     with pytest.raises(RuntimeError, match="enqueue failed"):
@@ -274,7 +278,8 @@ def test_an_interrupt_beats_a_table_that_fails_to_read(c, leaves, tracked):  # n
     assert _all_read(tracked)
 
 
-def test_a_table_that_fails_to_read_is_raised_when_nothing_else_is_in_flight(c, leaves,  # noqa: F811
+def test_a_table_that_fails_to_read_is_raised_when_nothing_else_is_in_flight(
+        c, leaves,  # noqa: F811
                                                                            tracked):
     tracked.fail_read = ValueError("read of a table failed")
     with pytest.raises(ValueError, match="read of a table failed"):
@@ -282,7 +287,8 @@ def test_a_table_that_fails_to_read_is_raised_when_nothing_else_is_in_flight(c, 
     assert _all_read(tracked)  # every table read, not just the first
 
 
-def test_a_native_batch_error_still_reads_every_table(c, leaves, tracked, monkeypatch):  # noqa: F811
+def test_a_native_batch_error_still_reads_every_table(
+        c, leaves, tracked, monkeypatch):  # noqa: F811
     bad = list(leaves)
     # a record leaf that fails leaf_parts is a structural error at its position (a native-batch
     # error of the host leaves): the tables queued before it are still read
@@ -334,7 +340,8 @@ def test_the_check_runs_once_per_key_on_each_path(c, leaves, on_kernel, monkeypa
     assert len(calls) == before
 
 
-def test_several_leaves_of_one_unchecked_key_in_one_call_cost_one_comparison(c, leaves, on_kernel):  # noqa: F811
+def test_several_leaves_of_one_unchecked_key_in_one_call_cost_one_comparison(
+        c, leaves, on_kernel):  # noqa: F811
     i = first_product(c)
     same = [(i, leaves[i]), (i, leaves[i].clone()), (i, leaves[i].clone())]
     st = HashStats()
@@ -355,7 +362,8 @@ def test_a_call_outside_a_run_uses_the_set_as_it_stands(c, leaves, on_kernel):  
 
 @pytest.mark.parametrize("entry", ["of", "until", "step"])
 @pytest.mark.parametrize("earlier", ["nan", "shape", "iter", "mutation", "none"])
-def test_a_table_mismatch_beats_every_other_error_on_each_entry(c, leaves, planted, monkeypatch,  # noqa: F811
+def test_a_table_mismatch_beats_every_other_error_on_each_entry(
+        c, leaves, planted, monkeypatch,  # noqa: F811
                                                                   entry, earlier):
     if entry == "step" and earlier == "iter":
         pytest.skip("hash_step_leaves takes a list")
@@ -390,7 +398,8 @@ def test_a_table_mismatch_beats_every_other_error_on_each_entry(c, leaves, plant
 
 
 @pytest.mark.parametrize("earlier", ["nan", "shape"])
-def test_a_known_digest_mismatch_beats_an_earlier_host_error(c, leaves, on_kernel, earlier):  # noqa: F811
+def test_a_known_digest_mismatch_beats_an_earlier_host_error(
+        c, leaves, on_kernel, earlier):  # noqa: F811
     bad = list(leaves)
     j = c.n_s  # a weight leaf, before the known product
     bad[j] = nan_in(bad[j]) if earlier == "nan" else bad[j][:-1]
@@ -413,7 +422,8 @@ def test_a_failed_comparison_does_not_join_the_set(c, leaves, planted):  # noqa:
     assert not kc._checked
 
 
-def test_a_mismatch_message_names_device_header_index_and_both_digests(c, leaves, planted):  # noqa: F811
+def test_a_mismatch_message_names_device_header_index_and_both_digests(
+        c, leaves, planted):  # noqa: F811
     i = first_product(c)
     with pytest.raises(kc.KernelMismatchError) as e:
         leaf_hashes_of(c, [(i, leaves[i])])
@@ -422,7 +432,8 @@ def test_a_mismatch_message_names_device_header_index_and_both_digests(c, leaves
     assert "float" in m and "tag" in m
 
 
-def test_a_key_whose_leaf_had_no_digest_is_checked_by_the_next_call(c, leaves, on_kernel):  # noqa: F811
+def test_a_key_whose_leaf_had_no_digest_is_checked_by_the_next_call(
+        c, leaves, on_kernel):  # noqa: F811
     i = first_product(c)
     st = HashStats()
     d, err = leaf_hashes_until_error(c, [(i, nan_in(leaves[i]))], st)
@@ -807,10 +818,6 @@ def test_the_real_file_defines_the_cases_the_gate_expects():
     assert all(n.split("::")[1].split("[")[0] in src for n in names)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "part_extras catches OSError/ValueError/KeyError/TypeError only: an empty or truncated "
-    "junit file (a part killed at its limit) makes xml ParseError (a SyntaxError) escape, which "
-    "ends the whole session instead of failing the FS34 item. Pre-existing for every junit part."))
 def test_an_empty_junit_file_is_a_missing_report_not_a_crash(tmp_path):
     from verification.runs import fs11_session as fs
 
@@ -834,7 +841,8 @@ def test_the_pair_deadline_is_twice_the_estimate_rounded_up_to_100_s():
 # ---- scope of the check and the keyword ------------------------------------------------------
 
 
-def test_under_native_disabled_no_entry_uses_the_kernel_or_checks(c, leaves, on_kernel):  # noqa: F811
+def test_under_native_disabled_no_entry_uses_the_kernel_or_checks(
+        c, leaves, on_kernel):  # noqa: F811
     i = first_product(c)
     with native.disabled():
         st = HashStats()
@@ -851,7 +859,8 @@ def test_kernel_false_on_every_entry_and_on_native_until_error(c, leaves, on_ker
     assert d == leaf_hashes_of(c, items(leaves))
 
 
-def test_hashstats_kernel_counts_the_leaves_the_kernel_hashed_on_either_entry(c, leaves, on_kernel):  # noqa: F811
+def test_hashstats_kernel_counts_the_leaves_the_kernel_hashed_on_either_entry(
+        c, leaves, on_kernel):  # noqa: F811
     n_t = len(leaves) - c.n_s
     a, b, s = HashStats(), HashStats(), HashStats()
     leaf_hashes_of(c, items(leaves), a)

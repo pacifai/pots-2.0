@@ -12,6 +12,11 @@ checked keys is process-wide, and a key joins it only after its comparison passe
 :func:`new_run` clears it, so each run checks again. A call outside a run uses the set as it
 stands, so every key is checked at least once per process.
 
+On the one-GPU path no arrival digest is cross-checked: the product leaves sit in host memory
+and the verifier never uses the kernel there (check 2 rehashes every host leaf with the C
+library each step), so a wrong prover digest is a root mismatch at check 2, and this check,
+which protects verdicts from the verifier's kernel, is not needed.
+
 :class:`KernelMismatchError` is a ``RuntimeError``, not a ``ValueError`` or ``LookupError``: the
 verifier's prover-data guard never turns it into a rejection, because a wrong kernel decides
 finiteness as well and no verdict may rest on it. The run stops with no verdict.
