@@ -379,7 +379,7 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     """The one line FS30's session reads for step ``T`` (needs ``keep_last``). It holds the
     prover's root (the tree the commit built, with the arrival digests and the device kernel),
     the root the CPU path gives over the same leaves (every leaf hashed by the C library through
-    :func:`leaf_hashes_of`, never the routed ``commit_leaves``), how many arrival digests the
+    :func:`leaf_hashes_of` with ``kernel=False``, never the kernel), how many arrival digests the
     commit could use (``used``), how many products the capture hashed on arrival (``hashed``;
     the ``dK`` records too, whose digests go unused), how many leaves the commit actually took
     from them (``commit known``, ``HashStats.known`` of the commit's own hash call,
@@ -392,9 +392,9 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     if step.known is None:
         raise ValueError("device_leaves_line needs the commit's known count (StepRecord.known)")
     leaves = [b.kept.leaf(i) for i in range(c.n_leaves)]
-    # The C library alone (``leaf_hashes_of``, a device leaf read through its host copy), never
-    # the routed ``commit_leaves``: a CUDA leaf there would be hashed by the kernel under test.
-    cpu_root = MerkleTree(leaf_hashes_of(c, list(enumerate(leaves)))).root
+    # The C library alone (``leaf_hashes_of(kernel=False)``, a device leaf read through its host
+    # copy), never the kernel under test, which every other hash call routes a CUDA leaf to.
+    cpu_root = MerkleTree(leaf_hashes_of(c, list(enumerate(leaves)), kernel=False)).root
     ah = (step.capture or {}).get("arrival_hash") or {}
     used, hashed = ah.get("used", 0), ah.get("leaves", 0)
     dk = sum(1 for q in c.products if product_class(c, q) == "dK")

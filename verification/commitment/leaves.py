@@ -21,6 +21,14 @@ A leaf may sit on a device (FS32b, the sharded placement of F22). Its bytes are 
 are the digests and errors; the copy to the host is ``hostcopy``'s alone. The Python path reads
 a device leaf through ``hostcopy.host_tensor``; the native path copies a batch's device leaves
 into a pinned staging buffer (``hostcopy.Stage``) while the previous batch is hashed.
+
+One routing for every hash call (FS34, F23): inside the native path, a CUDA tensor leaf that
+passes its structural checks goes to an open kernel table of its device (``kernel=True``, the
+default) instead of the staged host copy. The kernel hashes it in place; the C library hashes
+every host leaf. ``kernel=False`` forces the C library for every leaf, for a reference
+comparison. The first leaf of each device and header is also hashed by the C library, once per
+run, and a disagreement is a :class:`~verification.commitment.kernel_check.KernelMismatchError`
+(decision 4, :mod:`verification.commitment.kernel_check`).
 """
 
 from __future__ import annotations
@@ -35,7 +43,7 @@ import numpy as np
 import torch
 
 from setup.records import Record
-from verification.commitment import hostcopy, merkle, native
+from verification.commitment import hostcopy, kernel_check, merkle, native
 from verification.commitment.gpu_blake3 import GpuBlake3
 from verification.commitment.encoding import (
     TAG_PRODUCT,
@@ -93,14 +101,17 @@ class HashStats:
     call's wall time less ``read_s`` and includes the waits; the worker fields stay 0.
 
     ``leaves`` and ``bytes`` count the leaves read and their tensor payload bytes (a record's
-    encoding is not counted); ``batches`` the native batches submitted. ``known`` and ``kernel``
-    count the leaves (also in ``leaves`` and ``bytes``) that took a digest hashed on arrival
-    or were hashed in place on their GPU (:func:`hash_step_leaves`). The kernel's wait has no
-    row of its own (the profile's hash rows are fixed): it is in the call's wall time.
+    encoding is not counted); ``batches`` the native batches submitted. ``known`` counts the
+    leaves (also in ``leaves`` and ``bytes``) that took a digest hashed on arrival
+    (:func:`hash_step_leaves`); ``kernel`` the leaves the GPU kernel hashed in place, on either
+    entry. The wait for the kernel tables' results is in ``wait_s`` (the profile's hash rows
+    are fixed). ``crosschecks`` counts the per-shape comparisons of a kernel digest with the C
+    library's (:mod:`verification.commitment.kernel_check`); their time is in the call's wall
+    time.
     """
 
     __slots__ = ("read_s", "producer_s", "wait_s", "native_s", "big_s", "worker_other_s",
-                 "batches", "leaves", "bytes", "known", "kernel")
+                 "batches", "leaves", "bytes", "known", "kernel", "crosschecks")
 
     TIMES = ("read_s", "producer_s", "wait_s", "native_s", "big_s", "worker_other_s")
 
@@ -109,6 +120,7 @@ class HashStats:
         self.native_s = self.big_s = self.worker_other_s = 0.0
         self.batches = self.leaves = self.bytes = 0
         self.known = self.kernel = 0  # leaves that took a digest given, or went to the GPU kernel
+        self.crosschecks = 0  # kernel digests compared with the C library's
 
     def times(self) -> dict[str, float]:
         """The six times by field name."""
@@ -196,40 +208,44 @@ def leaf_hash(c: DeclaredComputation, index: int, obj: Any) -> bytes:
 
 
 def leaf_hashes_of(c: DeclaredComputation, items: Iterable[tuple[int, Any]],
-                   stats: HashStats | None = None) -> list[bytes]:
+                   stats: HashStats | None = None, *, kernel: bool = True) -> list[bytes]:
     """:func:`leaf_hash` of each ``(index, obj)``, in order, hashed in parallel.
 
     ``items`` is consumed and each leaf validated on the calling thread, in order, so an error
     from either is the one a leaf-by-leaf loop raises first. The objects must not change until
     this returns. ``stats``, if given, is filled with the call's times (:class:`HashStats`);
-    the digests and errors are the same with or without it.
+    the digests and errors are the same with or without it. A CUDA leaf the GPU kernel can hash
+    is hashed in place by it (the module docstring); ``kernel=False`` sends every leaf through
+    the C library instead. The Python path (``native.disabled()``) never uses the kernel.
     """
     if not native.enabled():
         if stats is None:
             return hash_leaves(leaf_parts(c, i, obj) for i, obj in items)
         return _python_timed(
             stats, lambda: hash_leaves(leaf_parts(c, i, obj) for i, obj in _observed(items, stats)))
-    digests, err = _native_until_error(c, items, stats)
+    digests, err = _native_until_error(c, items, stats, kernel=kernel)
     if err is not None:
         raise err
     return digests
 
 
 def leaf_hashes_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]],
-                            stats: HashStats | None = None
+                            stats: HashStats | None = None, *, kernel: bool = True
                             ) -> tuple[list[bytes], Exception | None]:
     """:func:`leaf_hashes_of` up to the first error: ``(digests before it, error or None)``.
 
     The error is the one a :func:`leaf_hash` loop raises first, and the digests are those of
     the leaves before it, so a caller can judge those leaves before the error, as a loop that
-    compares each digest as it goes would.
+    compares each digest as it goes would. A
+    :class:`~verification.commitment.kernel_check.KernelMismatchError` is raised, not returned:
+    it beats every other error.
     """
     if not native.enabled():
         if stats is None:
             return hash_leaves_until_error(leaf_parts(c, i, obj) for i, obj in items)
         return _python_timed(stats, lambda: hash_leaves_until_error(
             leaf_parts(c, i, obj) for i, obj in _observed(items, stats)))
-    return _native_until_error(c, items, stats)
+    return _native_until_error(c, items, stats, kernel=kernel)
 
 
 # The native path (decision F15b). A batch closes at this much payload or this many entries,
@@ -255,10 +271,12 @@ class _Batch:
     are in the lists, hashed in C), ``(header, tensor, kind)`` for a big one and the parts
     tuple for a record. ``tensors`` keeps every tensor alive until the batch is hashed."""
 
-    __slots__ = ("ents", "hdr_idx", "ptr", "nbytes", "kind", "tensors", "payload", "stage", "dev")
+    __slots__ = ("ents", "hdr_idx", "ptr", "nbytes", "kind", "tensors", "payload", "stage", "dev",
+                 "pos")
 
     def __init__(self) -> None:
         self.ents: list[Any] = []
+        self.pos: list[int] = []  # each entry's position among the call's items
         self.hdr_idx: list[int] = []
         self.ptr: list[int] = []
         self.nbytes: list[int] = []
@@ -336,8 +354,61 @@ def _hash_batch_body(batch: _Batch, hdrs: tuple[bytes, np.ndarray, np.ndarray], 
     return out, changed
 
 
+class _OpenTable:
+    """An open kernel table of one device: its leaves' indices, tensors and tags, each leaf's
+    position among the call's items, and the payload so far. ``tb`` is set when it is queued."""
+
+    __slots__ = ("idx", "tensors", "tags", "pos", "size", "tb")
+
+    def __init__(self) -> None:
+        self.idx: list[int] = []
+        self.tensors: list[torch.Tensor] = []
+        self.tags: list[int] = []
+        self.pos: list[int] = []
+        self.size = 0
+        self.tb: _Table | None = None
+
+
+class _Probe:
+    """Decision 4's per-shape check of one table leaf: the C library's digest of its host copy
+    (``None``: non-finite), the leaf's ``_version`` when the copy was taken, and the leaf's
+    position among the call's items and its index."""
+
+    __slots__ = ("key", "tensor", "version", "c", "pos", "index")
+
+    def __init__(self, key: tuple[Any, ...], tensor: torch.Tensor, version: int,
+                 c: bytes | None, pos: int, index: int) -> None:
+        self.key, self.tensor, self.version, self.c = key, tensor, version, c
+        self.pos, self.index = pos, index
+
+
+def _host_digest(obj: torch.Tensor, header: bytes, index: int) -> tuple[int, bytes | None]:
+    """``(the leaf's _version, the C library's digest of its host copy)`` for the per-shape
+    check; the copy is dropped. A change while it is copied is a ``StoreMutationError``."""
+    version = obj._version
+    try:
+        host = hostcopy.host_tensor(obj)
+    except StoreMutationError:
+        raise StoreMutationError(f"leaf {index} was mutated in place while it was copied to "
+                                 "the host") from None
+    return version, kernel_check.c_digest(header, host)
+
+
+def _failure_position(order: list[int], ot: _OpenTable, n: int, index: int) -> int:
+    """The position of the failing leaf a table reports by leaf index (``order`` holds every
+    item's index by position). It is the table's leaf after its ``n`` good digests; a report of
+    another leaf is followed to that leaf's first position."""
+    if n < len(ot.idx) and ot.idx[n] == index:
+        return ot.pos[n]
+    try:
+        return order.index(index)
+    except ValueError:
+        return ot.pos[min(n, len(ot.pos) - 1)]
+
+
 def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]],
-                        stats: HashStats | None = None) -> tuple[list[bytes], Exception | None]:
+                        stats: HashStats | None = None, *, kernel: bool = True
+                        ) -> tuple[list[bytes], Exception | None]:
     """:func:`leaf_hashes_until_error` through ``native.hash_leaves``: the same digests and the
     same first error as a ``leaf_hash`` loop that stops at its first exception.
 
@@ -347,19 +418,39 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     ``leaf_parts``. Closed batches (``_BATCH_BYTES`` of payload or ``_BATCH_ENTRIES`` entries)
     run on one background thread, two in flight at most: finiteness and hashing in C, and a
     leaf of ``merkle._MT_THRESHOLD`` bytes or more through ``native.all_finite`` and BLAKE3's
-    multithreaded hash. The first batch in order with an error decides ahead of the iterable's.
+    multithreaded hash.
     A device leaf is copied into its batch's pinned staging buffer (``hostcopy.Stage``) as it is
     added, and the worker hashes the staged bytes once the copies are done; a batch stages at most
     ``_BATCH_BYTES`` (a leaf larger than that, alone), so the staging memory is the batches in
     flight plus one. A device leaf whose ``_version`` moved between the copy being queued and its
     completion is a ``StoreMutationError`` at that leaf.
-    It returns only once no worker reads a tensor any more; ``KeyboardInterrupt`` propagates
-    after that too.
+
+    With ``kernel`` (FS34), a leaf that passes its structural checks and that ``_kernel_leaf``
+    accepts goes to an open kernel table of its device instead: tables close at
+    ``_BATCH_BYTES`` of payload or ``_BATCH_ENTRIES`` leaves, are queued (``_enqueue_table``) as
+    they close, and every one is read at the end of the call, so the kernel hashes beside the
+    producer and the worker. The first leaf of each unchecked ``(device, tag, dtype, shape)``
+    also gets its host copy hashed by the C library, and after the tables are read the two
+    digests are compared (:mod:`verification.commitment.kernel_check`); a mismatch raises
+    ``KernelMismatchError`` and beats every other outcome of the call.
+
+    Each item has a position (the order of ``items``). Every error has the position of the leaf
+    it belongs to, the iterable's own error the position after the leaves it yielded; the one
+    at the smallest position wins, across the native batches and the tables, and the digests
+    returned are those before it. A native batch error stops the producer early; a table's is
+    known only at the end, so the producer may have read further, with the same result.
+    A leaf written in place after it joins a kernel table and before that table is queued is
+    hashed as its new bytes, with no error here; check 2's version guard (``CommittedLeaves``)
+    catches it, as before FS34.
+
+    The call returns only once no worker or table reads a tensor any more; ``KeyboardInterrupt``
+    propagates after that too, and so does any exception already in flight, over a table that
+    fails to read.
 
     With ``stats`` the calling thread's wall time is split into ``read_s`` (``items``' own
-    ``next``), ``wait_s`` (blocked on the worker) and ``producer_s`` (the rest); see
-    :class:`HashStats`. The worker's fields are written by the worker thread alone and read here
-    after the final sync, which orders them.
+    ``next``), ``wait_s`` (blocked on the worker or on the tables) and ``producer_s`` (the rest);
+    see :class:`HashStats`. The worker's fields are written by the worker thread alone and read
+    here after the final sync, which orders them.
     """
     # Every leaf of a list or tuple exists before the call, so one stream wait per device and
     # batch orders the copies after the work that produced them; a lazy iterable may produce
@@ -383,8 +474,16 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
 
     pending: deque[tuple[Future[tuple[list[bytes], Exception | None]], _Batch]] = deque()
     stages: list[hostcopy.Stage] = []  # every staging buffer this call took, released at the end
-    digests: list[bytes] = []
-    state: list[Exception | None] = [None]  # the first batch error, which beats the producer's
+    res: dict[int, bytes] = {}  # position -> digest, from the batches and the tables
+    # The first batch error and its position; it beats the producer's and stops the producer.
+    state: list[Any] = [None, 0]
+    open_: dict[torch.device, _OpenTable] = {}  # each device's open table
+    tables: list[_OpenTable] = []  # the queued ones
+    probes: dict[tuple[Any, ...], _Probe] = {}  # per-shape checks of this call, by key
+    slot_keys: dict[int, dict[torch.device, tuple[Any, ...]]] = {}  # per-shape keys, by slot
+    fatal: list[BaseException] = []  # a failure that is the call's, not a leaf's: it propagates
+    order: list[int] = []  # each item's leaf index, by position
+    n_seen = n_kernel = 0
 
     def collect() -> None:
         if stats is None:
@@ -399,8 +498,9 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
         if done.stage is not None:
             hostcopy.POOL.release(done.stage)  # hashed: its buffer is free for a later batch
         if state[0] is None:
-            digests.extend(d)
-            state[0] = e
+            res.update(zip(done.pos, d))
+            if e is not None:
+                state[0], state[1] = e, done.pos[min(len(d), len(done.pos) - 1)]
 
     def submit(b: _Batch) -> None:
         while len(pending) >= _MAX_IN_FLIGHT and state[0] is None:
@@ -414,13 +514,36 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
                 b.stage.fence()
             pending.append((_executor().submit(_hash_batch, b, hdrs, threads, stats), b))
 
-    producer_error: Exception | None = None
+    def close(dev: torch.device) -> None:
+        ot = open_.pop(dev)
+        try:
+            ot.tb = _enqueue_table(ot.idx, ot.tensors, ot.tags)
+        except BaseException as e:
+            fatal.append(e)
+            raise
+        tables.append(ot)
+
+    producer_error: tuple[int, Exception] | None = None
+    outcomes: list[tuple[_OpenTable, list[bytes], tuple[int, Exception] | None]] = []
+    table_exc: BaseException | None = None
     try:
         batch = _Batch()
-        try:
-            for i, obj in items:
+        it = iter(items)
+        while True:
+            try:
+                i, obj = next(it)
+            except StopIteration:
+                break
+            except Exception as e:
+                producer_error = (n_seen, e)  # after every leaf it yielded
+                break
+            n = n_seen
+            n_seen += 1
+            order.append(i)
+            try:
                 if 0 <= i < n_s:
                     batch.ents.append(leaf_parts(c, i, obj))
+                    batch.pos.append(n)
                 else:
                     slot = slots.get(i)
                     if slot is None:
@@ -439,6 +562,36 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
                         hdr_off.append(sum(map(len, headers)))
                         hdr_len.append(len(header))
                         headers.append(header)
+                    if kernel and _kernel_leaf(obj):
+                        # The structural checks passed: the kernel hashes the leaf in place.
+                        dkeys = slot_keys.get(i)
+                        if dkeys is None:
+                            dkeys = slot_keys[i] = {}
+                        ck = dkeys.get(obj.device)
+                        if ck is None:  # built once per slot and device
+                            ck = dkeys[obj.device] = kernel_check.key_of(
+                                "table", obj.device, tag, dtype, shape)
+                        if ck not in probes and not kernel_check.is_checked(ck):
+                            try:
+                                version, cd = _host_digest(obj, headers[h], i)
+                            except StoreMutationError:
+                                raise
+                            except Exception as e:
+                                fatal.append(e)
+                                raise
+                            probes[ck] = _Probe(ck, obj, version, cd, n, i)
+                        ot = open_.get(obj.device)  # after the probe: a failed one opens none
+                        if ot is None:
+                            ot = open_[obj.device] = _OpenTable()
+                        ot.idx.append(i)
+                        ot.tensors.append(obj)
+                        ot.tags.append(tag)
+                        ot.pos.append(n)
+                        ot.size += obj.nbytes
+                        n_kernel += 1
+                        if ot.size >= batch_bytes or len(ot.idx) >= batch_entries:
+                            close(obj.device)
+                        continue
                     src = obj  # what the hash reads: the leaf, or the host copy of a device leaf
                     if hostcopy.on_device(obj):
                         check_payload(obj)
@@ -469,38 +622,85 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
                         batch.ptr.append(ptr)
                         batch.nbytes.append(nbytes)
                         batch.kind.append(finite_kind[dtype])
+                    batch.pos.append(n)
                 if batch.payload >= batch_bytes or len(batch.ents) >= batch_entries:
                     submit(batch)
                     if state[0] is not None:
                         break
                     batch = _Batch()
-        except Exception as e:
-            producer_error = e  # the leaves before it are still hashed
+            except Exception as e:
+                if fatal:
+                    raise
+                producer_error = (n, e)  # the leaves before it are still hashed
+                break
         if state[0] is None and batch.ents:
             submit(batch)
         while pending and state[0] is None:
             collect()
+        for dev in list(open_):  # every leaf added so far is hashed: the tables before it need it
+            if open_[dev].idx:
+                close(dev)  # a table with no leaf is never queued
     finally:
         # An interrupt can land anywhere in here, even between ``submit`` and ``pending.append``;
         # the FIFO job below covers a batch whose future never reached ``pending``.
-        # Never return or raise while a worker still reads the tensors. The worker is one FIFO
-        # thread, so a job queued now ends after every batch ever submitted, even one whose
-        # future an interrupt kept out of ``pending``.
+        # Never return or raise while a worker or a table still reads the tensors. The worker is
+        # one FIFO thread, so a job queued now ends after every batch ever submitted, even one
+        # whose future an interrupt kept out of ``pending``.
         try:
-            if _worker is not None:
-                if stats is None:
-                    _worker.submit(bool).result()
-                else:
-                    t0 = perf_counter()
-                    _worker.submit(bool).result()
-                    stats.wait_s += perf_counter() - t0
+            try:
+                if _worker is not None:
+                    if stats is None:
+                        _worker.submit(bool).result()
+                    else:
+                        t0 = perf_counter()
+                        _worker.submit(bool).result()
+                        stats.wait_s += perf_counter() - t0
+            finally:
+                for stage in stages:  # no worker reads them now; drains any copy still queued
+                    hostcopy.POOL.release(stage)
         finally:
-            for stage in stages:  # no worker reads them now; drains any copy still queued
-                hostcopy.POOL.release(stage)
-        if stats is not None:
-            stats.producer_s += (perf_counter() - t_start - (stats.wait_s - w0)
-                                 - (stats.read_s - r0))
-    return digests, state[0] if state[0] is not None else producer_error
+            # Never leave a table queued unread. Read every one; an exception already in flight
+            # wins over a table that fails to read, else the first such failure is raised below.
+            t0 = perf_counter()
+            for ot in tables:
+                try:
+                    assert ot.tb is not None
+                    outcomes.append((ot, *_table_outcome(ot.tb)))
+                except BaseException as e:
+                    table_exc = table_exc or e
+            if stats is not None:
+                stats.wait_s += perf_counter() - t0
+                stats.producer_s += (perf_counter() - t_start - (stats.wait_s - w0)
+                                     - (stats.read_s - r0))
+    if table_exc is not None:
+        raise table_exc
+    errors: list[tuple[int, Exception]] = []
+    if state[0] is not None:
+        errors.append((state[1], state[0]))
+    if producer_error is not None:
+        errors.append(producer_error)
+    failed: dict[int, Exception] = {}  # a table's failures by position
+    for ot, digests, fail in outcomes:
+        res.update(zip(ot.pos, digests))
+        if fail is not None:
+            at = _failure_position(order, ot, len(digests), fail[0])
+            failed[at] = fail[1]
+            errors.append((at, fail[1]))
+    if stats is not None:
+        stats.kernel += n_kernel
+    for p in probes.values():  # decision 4: the kernel's digest against the C library's
+        if p.tensor._version != p.version:
+            continue  # the leaf moved since its host copy: no digest to compare
+        got = res.get(p.pos)
+        if got is None and not isinstance(failed.get(p.pos), NonFiniteError):
+            continue  # no digest and no non-finite verdict: past a failure or a mutation
+        if kernel_check.compare(p.key, p.index, got, p.c):
+            if stats is not None:
+                stats.crosschecks += 1
+    first = min(errors, key=lambda e: e[0]) if errors else None
+    cut = n_seen if first is None else first[0]
+    digests = [res[q] for q in range(cut)]
+    return digests, None if first is None else first[1]
 
 
 def leaf_hashes(c: DeclaredComputation, reader: LeafReader) -> list[bytes]:
@@ -599,98 +799,72 @@ def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
     tree, so a caller can time the two apart.
 
     ``known`` maps a leaf index to the digest of that leaf's bytes, hashed when the leaf
-    arrived (FS30, ``StepOutput.arrival_digests``). Where the bytes are decides who hashes
-    them. Every tensor leaf first gets the structural checks of :func:`leaf_parts`, in order;
-    a leaf that fails one goes the host path, which raises its error. A known leaf that passes
-    takes its digest. A CUDA tensor leaf that passes, with no digest, is hashed in place by the
-    GPU kernel, in bounded tables queued before the host work starts and read after it. Every
-    other leaf takes the host path (:func:`leaf_hashes_until_error`). The digests are the same
-    whichever path hashed a leaf; on an error it is the one at the smallest failing leaf index,
-    of the class and message of the plain path (a non-finite leaf is a ``NonFiniteError`` with
-    the C library's message). With no ``known`` and no kernel leaf this is exactly
-    :func:`leaf_hashes_of`.
+    arrived (FS30, ``StepOutput.arrival_digests``). Every tensor leaf first gets the structural
+    checks of :func:`leaf_parts`, in order; a leaf that fails one goes the plain path, which
+    raises its error. A known leaf that passes takes its digest. Every other leaf, in order,
+    goes through :func:`leaf_hashes_until_error`, so a CUDA leaf is hashed in place by the GPU
+    kernel in tables, as every other hash call does (FS34). The digests are the same whichever
+    path hashed a leaf; on an error it is the one at the smallest failing leaf index, of the
+    class and message of the plain path (a non-finite leaf is a ``NonFiniteError`` with the C
+    library's message). With no ``known`` this is exactly :func:`leaf_hashes_of`.
+
+    A known digest of a leaf the kernel can hash (``_kernel_leaf``), whose per-shape key
+    (decision 4, ``"arrival"`` path) is unchecked, is compared with the C library's digest of
+    the leaf's host copy; a mismatch raises ``KernelMismatchError``, which beats every other
+    error of the call. Under ``native.disabled()`` nothing is compared.
     """
     if len(leaves) != c.n_leaves:
         raise ValueError(f"transcript has {len(leaves)} leaves, the computation declares "
                          f"{c.n_leaves}")
     known = known or {}
-    if not known and not any(isinstance(x, torch.Tensor) and _kernel_leaf(x) for x in leaves):
+    if not known:
         return leaf_hashes_of(c, list(enumerate(leaves)), stats)
     n_s = c.n_s
     slots: dict[int, tuple[int, tuple[int, ...], torch.dtype]] = {}
     out: list[bytes | None] = [None] * len(leaves)
     host: list[tuple[int, Any]] = []
-    tables: list[_Table] = []
-    open_: dict[torch.device, tuple[list[int], list[torch.Tensor], list[int], int]] = {}
-    n_known = n_kernel = 0
-    nbytes_known = nbytes_kernel = 0
-
-    def close(dev: torch.device) -> None:
-        idx, ts, tags, _ = open_.pop(dev)
-        tables.append(_enqueue_table(idx, ts, tags))
-
-    failures: list[tuple[int, Exception]] = []
-    clean = False
-    try:
-        for i, obj in enumerate(leaves):
-            if i >= n_s and isinstance(obj, torch.Tensor):
-                slot = slots.get(i)
-                if slot is None:
-                    tag, shape, dtype, _ = _tensor_slot(c, i)
-                    slot = slots[i] = (tag, shape, dtype)
-                tag, shape, dtype = slot
-                # the structural checks passed:
-                if (tuple(obj.shape) == shape and obj.dtype == dtype
-                        and obj.is_contiguous()):
-                    d = known.get(i)
-                    if d is not None:
-                        out[i] = d
-                        n_known += 1
-                        nbytes_known += obj.nbytes
-                        continue
+    arrivals: list[tuple[int, torch.Tensor, int, bytes]] = []  # kernel leaves with a digest
+    n_known = nbytes_known = 0
+    for i, obj in enumerate(leaves):
+        if i >= n_s and isinstance(obj, torch.Tensor):
+            slot = slots.get(i)
+            if slot is None:
+                tag, shape, dtype, _ = _tensor_slot(c, i)
+                slot = slots[i] = (tag, shape, dtype)
+            tag, shape, dtype = slot
+            # the structural checks passed:
+            if tuple(obj.shape) == shape and obj.dtype == dtype and obj.is_contiguous():
+                d = known.get(i)
+                if d is not None:
+                    out[i] = d
+                    n_known += 1
+                    nbytes_known += obj.nbytes
                     if _kernel_leaf(obj):
-                        idx, ts, tags, size = open_.get(obj.device, ([], [], [], 0))
-                        idx.append(i)
-                        ts.append(obj)
-                        tags.append(tag)
-                        open_[obj.device] = (idx, ts, tags, size + obj.nbytes)
-                        n_kernel += 1
-                        nbytes_kernel += obj.nbytes
-                        if size + obj.nbytes >= _BATCH_BYTES or len(idx) >= _BATCH_ENTRIES:
-                            close(obj.device)
-                        continue
-            host.append((i, obj))
-        for dev in list(open_):
-            close(dev)
-        if stats is not None:
-            stats.known += n_known
-            stats.kernel += n_kernel
-            stats.leaves += n_known + n_kernel
-            stats.bytes += nbytes_known + nbytes_kernel
-        if host:
-            digests, err = leaf_hashes_until_error(c, host, stats)
-            for (i, _), d in zip(host, digests):
-                out[i] = d
-            if err is not None:
-                failures.append((host[len(digests)][0], err))
-        clean = True
-    finally:
-        # Never leave a table queued unread: the stream still reads the leaves. Read every
-        # table; an exception already in flight wins over an outcome error, else the first.
-        outcomes = []
-        first_error: BaseException | None = None
-        for tb in tables:
+                        arrivals.append((i, obj, tag, d))
+                    continue
+        host.append((i, obj))
+    if stats is not None:
+        stats.known += n_known
+        stats.leaves += n_known
+        stats.bytes += nbytes_known
+    digests, err = leaf_hashes_until_error(c, host, stats)
+    for (i, _), d in zip(host, digests):
+        out[i] = d
+    failures: list[tuple[int, Exception]] = []
+    if err is not None:
+        failures.append((host[len(digests)][0], err))
+    if native.enabled():
+        for i, obj, tag, d in arrivals:
+            key = kernel_check.key_of("arrival", obj.device, tag, obj.dtype, tuple(obj.shape))
+            if kernel_check.is_checked(key):
+                continue
             try:
-                outcomes.append(_table_outcome(tb))
-            except BaseException as e:
-                first_error = first_error or e
-        if first_error is not None and clean:
-            raise first_error
-    for tb, (digests, fail) in zip(tables, outcomes):
-        for i, d in zip(tb.idx, digests):
-            out[i] = d
-        if fail is not None:
-            failures.append(fail)
+                _, cd = _host_digest(obj, tensor_leaf_header(tag, obj), i)
+            except StoreMutationError as e:
+                failures.append((i, e))
+                continue
+            if kernel_check.compare(key, i, d, cd) and stats is not None:
+                stats.crosschecks += 1
     if failures:
         raise min(failures, key=lambda f: f[0])[1]
     return out  # type: ignore[return-value]

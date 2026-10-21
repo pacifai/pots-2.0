@@ -17,6 +17,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.verification.runs.test_fs32_pair_session import EXPECTED34, _fs34
+
 from tests.verification.decoder_helpers import (
     SWITCHES,
     make_records,
@@ -424,6 +426,7 @@ def _good(**over):
                                          "slowest_failing": None}),
              _p("two_gpu_slow", "pytest", {"tests": 2, "failures": 0, "errors": 0, "skipped": 0,
                                            "slowest_failing": None}),
+             _fs34(),
              _p("smollm2_calibrate", "other"),
              card("unsharded"), card("sharded"), run("unsharded"), run("sharded"),
              run("pipelined"), run("pipelined_metrics")]
@@ -592,6 +595,13 @@ def _stand_ins(tmp_path, *, bad_cheat=False, sharded_root="aa"):
         j = d / f"{name}.xml"
         parts.append(fs.Part(name, ["{python}", "-c", junit, str(j)], timeout_s=30, kind="pytest",
                              info={"junit": str(j), "gpu_peak": True}))
+    j = d / "fs34_tests.xml"
+    cases = "".join(f'<testcase classname="{n.split("::")[0]}" name="{n.split("::")[1]}" '
+                    f'time="1"/>' for n in EXPECTED34)
+    parts.append(fs.Part("fs34_tests", ["{python}", "-c", "import sys;open(sys.argv[1],'w').write("
+                         f"'<testsuites><testsuite>{cases}</testsuite></testsuites>')", str(j)],
+                         timeout_s=30, kind="fs34_tests",
+                         info={"junit": str(j), "gpu_peak": True}))
     return parts
 
 

@@ -131,7 +131,7 @@ def test_bring_up_prints_the_line_it_reads(tmp_path):
     c = SimpleNamespace(n_leaves=0, M=9, products=[])
     import verification.runs.bring_up as mod
     orig = mod.MerkleTree, mod.leaf_hashes_of
-    mod.leaf_hashes_of = lambda c_, items: []
+    mod.leaf_hashes_of = lambda c_, items, **kw: []
     mod.MerkleTree = lambda hashes: SimpleNamespace(root=bytes.fromhex(ROOT))
     try:
         text = bu.device_leaves_line(b, c, T=1)

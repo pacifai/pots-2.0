@@ -470,8 +470,10 @@ interface.
     the per-leaf calls contend for the GIL with blake3's compute-bound workers.
   - `encode_tensor_leaf(tag, t)`.
 - `hostcopy.py` (FS32b): the one seam between a leaf's bytes and the hash. Under the sharded
-  placement (F22) product and weight leaves sit on the verifier GPUs and are hashed through a
-  host copy; FS34 replaces the copy with the GPU kernel (FS28) here.
+  placement (F22) product and weight leaves sit on the verifier GPUs. A leaf the kernel can
+  hash (FS34, `leaves._kernel_leaf`) is hashed in place by the GPU kernel (FS28) on its owner;
+  every other leaf is hashed through this host copy, and so is the one leaf per shape that
+  `commitment/kernel_check.py` checks against the C library.
   - `on_device(t)` is `t.device.type != "cpu"`. `host_tensor(t)` returns a CPU tensor as the
     same object, with no copy (the unsharded path is unchanged), and a device tensor as a
     synchronous host copy. A change to `t`'s `_version` during the copy raises
@@ -553,6 +555,37 @@ interface.
     one being filled (about 16 MiB each, a bigger leaf making a bigger chunk), so the host
     copies stay bounded. The counting pass runs it on a whole full-scale step, so that bound
     is what keeps its host memory flat.
+  - One routing for every hash call (FS34). `leaf_hashes_of`, `leaf_hashes_until_error` and
+    `hash_step_leaves` take `kernel: bool = True` (keyword): a contiguous tensor leaf on a CUDA
+    device, whose dtype is in `native.FINITE_KIND` and whose structural check passes, goes to
+    its device's open kernel table inside `_native_until_error`, closed at `_BATCH_BYTES` or
+    `_BATCH_ENTRIES` and read once after the loop; every other leaf takes the host batches above.
+    Errors are ordered by the item's position, not its leaf index: a table's first non-finite
+    leaf, a structural error, a mutation (`StoreMutationError`, at its leaf) and the iterable's
+    own error compete by position, the smallest wins, and the digests are cut before it. An
+    error of the kernel itself (a build, a launch) is not a leaf error and propagates.
+    `kernel=False` sends every leaf down the host path (the reference); so does
+    `native.disabled()`. `HashStats.kernel` counts the kernel-hashed leaves and `crosschecks`
+    the per-shape comparisons below. `hash_step_leaves(c, leaves, stats, *, known=)` takes a
+    known digest for a leaf that passes its structural check and sends the rest through the same
+    path.
+  - Decision 4's per-shape check (FS34, `commitment/kernel_check.py`). Once the verifier hashes
+    with the kernel too, no step recomputes a kernel digest another way, so each run checks one
+    digest per key `(path, device, tag, dtype, shape)`: the leaf's host copy is hashed by the C
+    library and the two digests are compared. `path` is `"table"` for a digest from the call's
+    own kernel table and `"arrival"` for a known digest of a kernel leaf (hashed on arrival).
+    The set of checked keys is per process; a key joins it when its comparison passes, and
+    `new_run()` clears it (`run_loop` and the pipelined child call it first). A key whose leaf
+    has no digest, or whose copy moved (`_version`), stays unchecked. A mismatch raises
+    `KernelMismatchError(RuntimeError)`, not a `ValueError` or `LookupError`, so the verifier's
+    `PROVER_DATA_ERRORS` guard never turns it into a rejection: the run stops with no verdict.
+    A kernel digest where the C library finds a non-finite value is a mismatch too. The check
+    is off under `kernel=False` and `native.disabled()`. On the one-GPU path the product leaves
+    sit in host memory and the verifier never uses the kernel (check 2 rehashes every host leaf
+    with the C library each step), so a wrong prover digest there is a root mismatch at check
+    2, and this check, which protects verdicts from the verifier's kernel, is not needed: a
+    known digest of a host product gets no `"arrival"` cross-check
+    (`test_a_known_digest_of_a_host_product_gets_no_crosscheck`).
   - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
   - `transcript_root(c, reader)` is check 2.
   - `commit_leaves(c, leaves) -> MerkleTree`.
@@ -597,21 +630,27 @@ interface.
     whose kind is not `OPERAND_GRAD`). The capture hashes
     the `dK` records too and their digests go unused (the `δK̃` leaf is a new tensor), so
     `leaves` (hashed) is `M` and `used` is `M − dK`. A non-finite product
-    gets no digest (the host path raises on it as before). The sharded path (`_route`) hashes
-    nothing on arrival.
+    gets no digest (the host path raises on it as before). The sharded path (FS34) hashes on
+    arrival too: `_route` hashes a product after its peer copy lands, on the owner's side
+    stream, and a product already on its owner is hashed where it sits (`_hash_in_place`),
+    each paired with the `_version` read as the hash was queued.
   - *The commit (routing).* `hash_step_leaves(c, leaves, stats=None, *, known=None)` and
     `commit_leaves(c, leaves, known=None)` take each leaf from `known`, else the GPU kernel if
     the leaf is a CUDA tensor with a passing structural check (one table per device, closed at
-    `_BATCH_BYTES` or `_BATCH_ENTRIES`), else the host path. Any leaf whose structural check
-    fails goes to the host path, so errors come from the plain path in index order. A
-    mutation seen before a table is read raises `StoreMutationError`; a non-finite leaf raises
-    the host path's `NonFiniteError`. `HashStats` gains `known` and `kernel` counts; it has no
-    kernel-wait time (the profile's `P3.commit.hash.<part>` rows are frozen), so the wait is
-    in the call's wall time. CPU runs get identical digests and never touch the kernel.
-  - *Check 2 stays on the C library* (K4): the verifier recomputes every digest on the CPU,
-    so a wrong arrival digest or kernel is caught as a root mismatch. `driver`,
-    `run_verified.transcript_root`, `card_identity`, `bring_up`'s `leaf_hashes_of`,
-    `k_tunability` and `probe` also keep the C-library path.
+    `_BATCH_BYTES` or `_BATCH_ENTRIES`), else the host path; since FS34 this is the routing of
+    every hash call (`leaves.py`, "One routing"). A mutation seen before a table is read
+    raises `StoreMutationError`; a non-finite leaf raises the host path's `NonFiniteError`.
+    `HashStats` gains `known`, `kernel` and `crosschecks` counts; it has no kernel-wait time
+    (the profile's `P3.commit.hash.<part>` rows are frozen), so the wait is in the call's wall
+    time. CPU runs get identical digests and never touch the kernel.
+  - *Check 2 takes the kernel too* (FS34, replacing K4's C-library-only check 2). Every caller
+    of the hash functions takes the kernel by default: the commit (`transcript/store.py`,
+    `prover/step.py`), check 2 (`verifier/context.py`, `verifier/driver.py`), and the runs
+    (`k_tunability`, `card_identity`, `probe`, `run_verified`, `pipeline`, `bring_up`'s
+    device-leaves line). The one `kernel=False` caller is `bring_up`'s CPU root, the C library's
+    reference for that line. What guards a wrong kernel is decision 4's per-shape check
+    (`leaves.py`), not a recomputation of every digest. A planted wrong digest stops the run
+    with `KernelMismatchError`, no verdict.
   - *The session.* `device-leaves` (`fs11_session.py`) runs the CUDA tests and, per model, a
     bring-up that prints `device leaves: step 1 accepted ..., prover root ..., cpu root ...,
     arrival digests U, hashed H, commit known N, M M, dK leaves K`, then a second line nothing
@@ -647,8 +686,13 @@ interface.
     `enqueue_table` call of a process and device: in a captured run that is inside the first
     CUDA matmul's offload, in the first step's forward pass (the CUBIN then comes from the
     disk cache under `native.cache_dir()` if an earlier process built it). `run_loop` moves it
-    out of the timed steps: when the model's device is CUDA it calls
-    `GpuBlake3().kernels(device)` once before step 1, outside every section. A CUDA run that
+    out of the timed steps: it calls `GpuBlake3().kernels(device)` once per CUDA device of the
+    run (the model's and a sharded placement's) before step 1, outside every section, and
+    `kernel_check.new_run()` first of all (FS34), before the pipelined dispatch. The pipelined
+    child calls `new_run()` at its start and loads its hash kernels; the pipelined parent loads
+    the hash kernel and check 5's measuring kernel (`measure_kernel.kernels(d)`, FS37) on the
+    CUDA devices of `c.placement.devices` before step 1, outside every section. The child
+    never measures, so it builds no measuring kernel. A CUDA run that
     doesn't go through `run_loop` (`card_identity`) is left as it was: call
     `GpuBlake3().kernels(device)` first there to keep the build out of a timed step. A build or
     load failure raises; nothing falls back to the CPU.
@@ -1296,7 +1340,11 @@ interface.
       sharded only; a leaf that isn't a record's output, the δK̃ transpose, is judged by the
       device it sits on, and on the CPU not at all), and `prove_step` moves each leaf to its
       owner; a cheat hook's result goes to its product's device first, wherever the hook built
-      it. On an honest run the count is 0. A miss costs one copy and no bit.
+      it. On an honest run the count is 0. A miss costs one copy and no bit. Since FS34 an
+      owner hashes each product on arrival (`_hash_arrival`, on the owner's side stream after
+      a cross-device `wait_event` for the copy), a kept product where it sits; the entries of
+      `_pending` carry the `_version` the hash was queued under (`arrived`), so a digest of a
+      later version is never taken.
     - Operands are not copied. They stay on the GPU until `release_operands` in labeling,
       as before; the README's "Workflow: a run on a GPU" measures what that costs.
     - The `δK̃` leaf is a contiguous transpose made in labeling, so it is the one product
@@ -3005,7 +3053,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     Merkle root, carried by `run_loop`; metrics files and the other lines are unchanged), and
     `_pair_run_extras` reads those roots and each step's whole line after the `: `. `pass`
     fails closed: every part in `PAIR_PARTS` ended `ok` or `skipped_done`, both suites'
-    junit exists with tests, no failure or error and `two_gpu_slow` skipped nothing, each arm's
+    junit exists with tests, no failure or error and `two_gpu_slow` skipped nothing, `fs34_tests`
+    (`fs34_gate`: its junit names every case `test_fs34_join_cuda.py` defines, as collected, and
+    each passed; a fault is a `FS32 FAIL: FS34 test ...` line), each arm's
     verdicts are `["accepted"] * PAIR_STEPS`, roots and step lines are equal and every cheat is
     `exact` (read from the oracle table by `_cheat_extras`: the fourth word from the end). A
     missing part prints `FS32 FAIL: <part> did not run`, a missing report `left no test
@@ -3088,7 +3138,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    15,500 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
+    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
     session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,
     packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch

@@ -1134,11 +1134,14 @@ copy, on the same side stream, the capture also hashes the product on the GPU (t
 BLAKE3 benchmark, FS28) and keeps the 32-byte digest; the step carries these as
 `arrival_digests`. At the commit, a leaf with a digest uses it, a CUDA tensor leaf is hashed by
 the kernel in one table, and everything else (the records, the weights, the `δK̃` products,
-perturbed or non-finite products) goes through the C library as before. Check 2 on the verifier
-always recomputes every digest with the C library, so a wrong digest shows up as a root mismatch.
+perturbed or non-finite products) goes through the C library as before. Since FS34 the sharded
+path hashes on arrival too, on the owner GPU, and check 2 hashes with the kernel as well; the
+guard is a per-shape check: once per run, per device and leaf shape, one kernel digest is
+compared with the C library's, and a difference stops the run with `KernelMismatchError`, no
+verdict.
 The first NVRTC build of the kernel would happen in the first step's forward pass, inside the
 first captured CUDA matmul, so `run_loop` calls `GpuBlake3().kernels(device)` once before step
-1 when the model is on CUDA, outside every section. A CUDA run that doesn't go through
+1 for each CUDA device of the run, outside every section. A CUDA run that doesn't go through
 `run_loop` (`card_identity`) is left as it was: it builds on its first use.
 
 1. **Prep, on the Mac**, after committing: `HF_HUB_OFFLINE=1 .venv/bin/python -m
@@ -1207,7 +1210,7 @@ transcript and run the verifier.
    fetches every public one (a few minutes it doesn't need; a filter would be a change to
    `fs11_session.py`).
 2. **The pod**: two GPUs of the same type, the image and disks of step 2, the boot guard with
-   `sleep 17900;` (setup about 20 min plus the job's 129: 2 x 149 min = 298 min, rounded up).
+   `sleep 18500;` (setup about 20 min plus the job's 134: 2 x 154 min = 308 min, rounded up).
 3. **Set up** as in step 3. `requirements-fs11.txt` carries `pytest` and `matplotlib` (the fast
    suite and the plotting tests need them), so nothing is installed by hand.
 4. **Start the job**:
@@ -1233,6 +1236,7 @@ transcript and run the verifier.
 | `native_build` | compiles the BLAKE3 library from the upload | 2 min |
 | `fast_suite` | the whole fast suite, `-rf`; the two-GPU tests run here first | 25 min |
 | `two_gpu_slow` | the slow two-GPU tests (a SmolLM2 run, sharded against unsharded) | 10 min |
+| `fs34_tests` | FS34's CUDA tests (`test_fs34_join_cuda.py`): the kernel hashes on the owner GPUs | 5 min |
 | `smollm2_calibrate` | the band file, written even when the bf16 guard fails | 5 min |
 | `card_unsharded`, `card_sharded` | `card_identity`: step 1's root, `W_{t+1}`, loss | 6 min |
 | `run_unsharded`, `run_sharded` | `run_verified`, 3 steps, step 3 kept | 12 min |
@@ -1242,8 +1246,8 @@ transcript and run the verifier.
 | `<cheat>_pipelined` (three) | the judged cheats, sharded and pipelined | 12 min |
 
 The estimates are scaled by hand from the earlier sessions; none was measured on two cards.
-The parts sum to about 108 min, packing about 1, the grace window 20: about 129 min, so the
-default deadline is 2 x 129 = 258 min, rounded up to 15,500 s. The pipelined arms (FS33d) are
+The parts sum to about 113 min, packing about 1, the grace window 20: about 134 min, so the
+default deadline is 2 x 134 = 268 min, rounded up to 16,100 s. The pipelined arms (FS33d) are
 estimated at their sequential counterparts' time, since the pipelined loop overlaps prover and
 verifier and is no slower; that is an estimate, not a measurement. Each part's time limit is a
 cap; the fast suite's is 3,600 s, the metrics run's 1,800 s.
@@ -1270,7 +1274,9 @@ step's whole line after the `: ` (verdict, residuals and the rest). The two card
 kind `pair_card`, which `hw3_cards` never reads.
 
 `fs32_pair["pass"]` fails closed. It is true only when every part ended `ok`; both suites left
-a test report with tests, no failure or error, and no skipped test in `two_gpu_slow`; each
+a test report with tests, no failure or error, and no skipped test in `two_gpu_slow`; FS34's
+CUDA tests each named in the `fs34_tests` report and passed (a missing, skipped, failed or errored
+one prints `FS32 FAIL: FS34 test <name>: <outcome>`); each
 arm's verdicts are all `accepted`; the roots and step lines agree; and every cheat is `exact`.
 A part that did not run prints `FS32 FAIL: <part> did not run`, one without a report
 `FS32 FAIL: <suite> left no test report`. The plain run's and the proved run's `W_{t+1}` within
