@@ -83,7 +83,9 @@ def test_a_real_run_verified_log_gives_every_pair_extra(  # noqa: F811
     text = capsys.readouterr().out
     scratch = Path(tiny_main[2])
     log = scratch / "real.log"
-    log.write_text("loop mode: sequential\n" + text)
+    # run_verified prints its own mode line (FS33d), exactly one
+    assert text.count("loop mode: ") == 1 and "loop mode: sequential" in text, text[:600]
+    log.write_text(text)
     e = fs._pair_run_extras(log, scratch / "nope.json")
     assert len(e["step_lines"]) == 3 and e["verdicts"] == ["accepted"] * 3
     assert len(e["step_roots"]) == 3 and all(len(x) == 64 for x in e["step_roots"])
