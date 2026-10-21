@@ -166,7 +166,8 @@ class InMemoryStore(TranscriptStore):
 
     @staticmethod
     def commit_step(c: DeclaredComputation, step: StepOutput, *, copy: bool = False,
-                    section: Any = None) -> tuple[list[Any], MerkleTree]:
+                    section: Any = None,
+                    stats: HashStats | None = None) -> tuple[list[Any], MerkleTree]:
         """``(leaves, tree)``: the step's leaves (cloned if ``copy``) and the Merkle tree over
         them, with invariant 6 rechecked after hashing.
 
@@ -174,12 +175,17 @@ class InMemoryStore(TranscriptStore):
         ``P3.commit.collect`` (``step.leaves()`` and the detach or clone), ``.hash`` (every leaf
         hash), ``.tree`` (the Merkle build) and ``.check`` (``assert_unmodified``). A seam that
         can ``add`` also gets the hash's breakdown (``HashStats.emit``) as
-        ``P3.commit.hash.<part>``. ``None`` observes nothing and reads no clock."""
+        ``P3.commit.hash.<part>``. ``None`` observes nothing and reads no clock.
+
+        ``stats`` is the caller's own :class:`HashStats`, which the hash fills (its ``known`` is
+        how many leaves took an arrival digest). Without one, a seam that can ``add`` gets a
+        fresh one and any other gets none."""
         sec = section or (lambda name: nullcontext())
         with sec("P3.commit.collect"):
             leaves = step.leaves()
             leaves = [_clone(x) for x in leaves] if copy else _detached(leaves)
-        stats = HashStats() if hasattr(section, "add") else None
+        if stats is None and hasattr(section, "add"):
+            stats = HashStats()
         with sec("P3.commit.hash"):
             hashes = hash_step_leaves(c, leaves, stats, known=step.arrival_digests)
         if stats is not None:

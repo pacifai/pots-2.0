@@ -14,7 +14,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 DEV = torch.device("cuda")
 
 
-def _step(dtype="fp32", head_blocks=1):
+def _step(dtype="fp32", head_blocks=1, perturb=None):
     from setup.data import schedule
     from tests.verification.decoder_helpers import make_records, tiny_config
     from verification.computation.instances import DecoderComputation
@@ -29,7 +29,7 @@ def _step(dtype="fp32", head_blocks=1):
     model = c.build_model()
     w0 = snapshot_weights(c, model)
     records = [D[i] for i in schedule(1, c.n_s, len(D), 1)]
-    return c, prove_step(c, model, w0, records)
+    return c, prove_step(c, model, w0, records, perturb=perturb)
 
 
 @pytest.fixture
@@ -48,7 +48,9 @@ def test_capture_hashes_every_product_but_dK_on_arrival(dtype, head_blocks, dete
     products with no digest are the δK̃ ones only (the diagnostic's ``missing``). At head
     blocks 1 and 2 (the full-scale runs use 8)."""
     from tests.verification.computation.test_decoder import ListReader
-    from verification.commitment.leaves import commit_leaves, leaf_hashes_of, transcript_root
+    from verification.commitment.leaves import (
+        HashStats, commit_leaves, leaf_hashes_of, transcript_root)
+    from verification.transcript.store import InMemoryStore
 
     c, out = _step(dtype, head_blocks)
     leaves = out.leaves()
@@ -65,6 +67,11 @@ def test_capture_hashes_every_product_but_dK_on_arrival(dtype, head_blocks, dete
     assert all(plain[i] == d for i, d in out.arrival_digests.items())
     root = commit_leaves(c, leaves, out.arrival_digests).root
     assert root == commit_leaves(c, leaves).root == transcript_root(c, ListReader(leaves))
+    # the commit itself took exactly those digests (``StepRecord.known`` and the session's gate
+    # read this count), not only could have
+    stats = HashStats()
+    _, tree = InMemoryStore.commit_step(c, out, stats=stats)
+    assert stats.known == len(want) and tree.root == root
 
 
 def test_a_nan_inside_a_matmul_output_has_no_digest_and_the_cpu_paths_leaf():
@@ -114,9 +121,11 @@ def test_a_nan_in_a_device_leaf_is_the_host_paths_leaf_and_error(deterministic):
     from verification.commitment.encoding import NonFiniteError
     from verification.commitment.leaves import hash_step_leaves
 
+    from tests.verification.commitment.test_leaves_known import nan_bracket
+
     c, out = _step()
     leaves = out.leaves()
-    i = c.product_index(3)
+    i = c.product_index(3)  # i - 1 and i + 1 are products 2 and 4, device leaves on the kernel
     host = list(leaves)
     host[i] = host[i].clone()
     host[i].view(-1)[0] = float("nan")
@@ -126,11 +135,66 @@ def test_a_nan_in_a_device_leaf_is_the_host_paths_leaf_and_error(deterministic):
     with pytest.raises(NonFiniteError) as got:
         hash_step_leaves(c, dev)
     assert str(got.value) == str(want.value)
-    # the leaf: a structural error at an earlier index still wins, on the device path too
+    # the leaf, both sides: a structural error (the ``[:-1]`` cut) at i + 1 still gives the
+    # NaN's error and one at i - 1 the shape error, on the host path and the device path alike,
+    # with the same messages
+    plain = nan_bracket(c, leaves, i, lambda b: hash_step_leaves(c, b))
+
+    def on_dev(b):
+        hash_step_leaves(c, [x if j < c.n_s else x.to(DEV) for j, x in enumerate(b)])
+
+    dev_pair = nan_bracket(c, leaves, i, on_dev)
+    assert [str(e) for e in dev_pair] == [str(e) for e in plain]
+
+
+def test_a_planted_nan_product_is_rejected_at_its_leaf_through_prove_step_and_the_commit(
+        deterministic):
+    """A real tiny-decoder step on the GPU with a NaN planted in one product by ``prove_step``'s
+    ``perturb`` hook (a fault's own route: it writes the product after capture and drops that
+    product's arrival digest). Every other product keeps its arrival digest, so capture's
+    arrival hashing and the commit's routing run together. ``InMemoryStore.commit_step``
+    raises the plain path's error at the planted leaf: a cut product after it (its digest
+    still given) leaves the NaN's error, a cut one before it gives the shape error. The product
+    is the first with a non-``dK`` product on each side, so both neighbours carry digests.
+    A NaN made inside a matmul is a different path, covered by
+    ``test_a_nan_inside_a_matmul_output_has_no_digest_and_the_cpu_paths_leaf``."""
+    import dataclasses
+
+    from verification.commitment.encoding import NonFiniteError
+    from verification.commitment.leaves import hash_step_leaves
     from verification.transcript.errors import LeafShapeError
-    dev[c.product_index(1)] = dev[c.product_index(1)][:-1]
-    with pytest.raises(LeafShapeError):
-        hash_step_leaves(c, dev)
+    from verification.transcript.store import InMemoryStore
+
+    c, plain_out = _step()
+    m = next(m for m in range(2, c.M)
+             if all(c.product_class(c.product(k)) != "dK" for k in (m - 1, m, m + 1)))
+
+    def plant(p):
+        p.view(-1)[0] = float("nan")
+        return p
+
+    c, out = _step(perturb={m: plant})
+    i = c.product_index(m)
+    assert i not in out.arrival_digests
+    assert {i - 1, i + 1} <= set(out.arrival_digests)
+    host = [x.cpu() if isinstance(x, torch.Tensor) else x for x in out.leaves()]
+    with pytest.raises(NonFiniteError) as want:
+        hash_step_leaves(c, host)
+    with pytest.raises(NonFiniteError) as got:
+        InMemoryStore.commit_step(c, out)
+    assert str(got.value) == str(want.value)
+    for j, kind in ((i + 1, NonFiniteError), (i - 1, LeafShapeError)):
+        k = j - c.product_index(1)  # the product's place in ``products``
+        products = list(out.products)
+        products[k] = products[k][:-1]
+        cut = dataclasses.replace(out, products=tuple(products))
+        bad_host = list(host)
+        bad_host[j] = bad_host[j][:-1]
+        with pytest.raises(kind) as want:
+            hash_step_leaves(c, bad_host)
+        with pytest.raises(kind) as got:
+            InMemoryStore.commit_step(c, cut)
+        assert type(got.value) is kind and str(got.value) == str(want.value)
 
 
 def test_a_device_leaf_mutated_before_its_table_is_read_raises(deterministic):

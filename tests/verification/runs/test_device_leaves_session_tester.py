@@ -40,7 +40,8 @@ def real():
     return c, leaves, commit_leaves(c, leaves).root
 
 
-def written_line(real, *, used=None, hashed=None, accepted=True, root="same", capture=True):
+def written_line(real, *, used=None, hashed=None, known=None, accepted=True, root="same",
+                 capture=True):
     c, leaves, root_ = real
     dk = sum(1 for cl in c.product_classes if cl == "dK")
     ah = {"used": c.M - dk if used is None else used,
@@ -48,6 +49,7 @@ def written_line(real, *, used=None, hashed=None, accepted=True, root="same", ca
     step = SimpleNamespace(
         t=1, rejection=None if accepted else object(),
         root=None if root is None else (root_ if root == "same" else bytes(32)),
+        known=c.M - dk if known is None else known,
         capture={"arrival_hash": ah} if capture else {"n_calls": 1})
     b = SimpleNamespace(kept=SimpleNamespace(leaf=lambda i: leaves[i]),
                         result=SimpleNamespace(loop=SimpleNamespace(steps=[step])))
@@ -81,6 +83,7 @@ def test_an_honest_run_written_by_the_real_line_passes(real, tmp_path):
     c, _, _ = real
     row = g["models"][M0]
     assert row["M"] == c.M and row["hashed"] == c.M and row["arrival"] == c.M - row["dK"]
+    assert row["known"] == c.M - row["dK"]
     assert row["prover_root"] == row["cpu_root"] and row["accepted"] is True
 
 
@@ -90,6 +93,8 @@ def test_an_honest_run_written_by_the_real_line_passes(real, tmp_path):
     ({"root": None}, "the roots differ"),
     ({"used": "M"}, "arrival digests, expected"),  # the count before the fix round
     ({"used": 0}, "arrival digests, expected"),
+    ({"known": "M"}, "the commit took"),  # the commit hashed everything itself
+    ({"known": 0}, "the commit took"),  # the commit stopped passing ``known``
     ({"hashed": "dk"}, "products hashed on arrival, expected"),
     ({"capture": False}, "arrival digests, expected"),
 ])

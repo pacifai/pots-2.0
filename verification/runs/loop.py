@@ -35,7 +35,7 @@ import torch
 from setup import data
 from setup.config import assert_no_dropout, load_config
 from verification.commitment.gpu_blake3 import GpuBlake3
-from verification.commitment.leaves import dataset_tree, leaf_totals
+from verification.commitment.leaves import HashStats, dataset_tree, leaf_totals
 from verification.computation.interface import DeclaredComputation
 from verification.prover.step import (
     Perturbation,
@@ -111,6 +111,9 @@ class StepRecord:
     transcript_bytes: int | None = None
     leaves: int | None = None
     root: bytes | None = None  # the step's transcript root (the Merkle root over its leaves)
+    # leaves the commit took from the arrival digests (``HashStats.known`` of its hash call);
+    # the loop always fills it, so it is ``None`` only on a record built without one
+    known: int | None = None
 
 
 @dataclass
@@ -242,7 +245,9 @@ def run_loop(
         with sec("P4.paths"):
             paths = [tree.path(i) for i in idx]
         with sec("P3.commit"):
-            leaves, tree_h = InMemoryStore.commit_step(c, out, section=section)
+            commit_stats = HashStats()
+            leaves, tree_h = InMemoryStore.commit_step(c, out, section=section,
+                                                       stats=commit_stats)
         with sec("P5.write"):
             store = handoff.hold(c, t, leaves, tree_h, paths)
         t2 = time.perf_counter()
@@ -263,7 +268,7 @@ def run_loop(
         t3 = time.perf_counter()
         del store  # discard before step t+1 (S3)
         rec = StepRecord(t, rej, loss, t1 - t0, t2 - t1b, t3 - t2b, t2b - t2a,
-                         capture, n_bytes, n_leaves, root)
+                         capture, n_bytes, n_leaves, root, commit_stats.known)
         result.steps.append(rec)
         if on_step is not None:
             on_step(rec)

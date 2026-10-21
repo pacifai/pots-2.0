@@ -70,10 +70,11 @@ def test_the_summary_has_no_arrival_hash_when_nothing_was_hashed(cap):
     assert "arrival_hash" not in cap.summary()
 
 
-def test_a_failed_arrival_enqueue_waits_for_the_copy_before_it_raises(monkeypatch):
+def test_a_failed_arrival_enqueue_waits_for_its_stream_before_it_raises(monkeypatch):
     """``_offload`` queues the host copy and its event before the hash. If the hash's enqueue
-    raises, the event is synchronized first, so no GPU read outlives ``out``. Streams and
-    events are faked, so this runs on a CPU."""
+    raises, the side stream itself is synchronized first (the copy and any kernel the enqueue
+    already launched), so no GPU read outlives ``out``. Streams and events are faked, so this
+    runs on a CPU."""
     from types import SimpleNamespace
 
     log = []
@@ -83,11 +84,14 @@ def test_a_failed_arrival_enqueue_waits_for_the_copy_before_it_raises(monkeypatc
             log.append("record")
 
         def synchronize(self):
-            log.append("synchronize")
+            log.append("event synchronize")
 
     class Stream:
         def wait_stream(self, other):
             pass
+
+        def synchronize(self):
+            log.append("stream synchronize")
 
     side = Stream()
     monkeypatch.setattr(torch.cuda, "Event", Event)
@@ -107,5 +111,5 @@ def test_a_failed_arrival_enqueue_waits_for_the_copy_before_it_raises(monkeypatc
     rec = SimpleNamespace(out=out, versions={})
     with pytest.raises(RuntimeError, match="enqueue failed"):
         MatmulCapture._offload(cap, rec)
-    assert log == ["record", "hash", "synchronize"]
+    assert log == ["record", "hash", "stream synchronize"]
     assert rec.out is out and cap._pending == []
