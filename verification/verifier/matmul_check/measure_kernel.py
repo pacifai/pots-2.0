@@ -364,7 +364,7 @@ def drain(device: torch.device | str | None = None) -> None:
     devs = list(_inflight) if device is None else [torch.device(device)]
     errors = []
     for d in devs:
-        # a device given as "cuda" matches the entries of "cuda:N" of the current device
+        # a device given as "cuda" (no index) matches the entries of every CUDA device
         keys = [x for x in _inflight if x == d or (d.index is None and x.type == d.type)]
         for key in keys:
             entries, _inflight[key] = _inflight[key], []
