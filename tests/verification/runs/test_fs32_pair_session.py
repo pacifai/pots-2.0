@@ -46,15 +46,8 @@ def _suite(name, **kw):
                                   "slowest_failing": None, **kw})
 
 
-MOD34 = "tests.verification.runs.test_fs34_join_cuda"
-EXPECTED34 = [f"{MOD34}::test_{n}" for n in ("one", "two", "three")]
-
-
-@pytest.fixture(autouse=True)
-def expected34(monkeypatch):
-    """The FS34 file's cases are three fixed names; the real collection is not run here."""
-    monkeypatch.setattr(fs, "device_tests_expected",
-                        lambda file=fs.DEVICE_TESTS_FILE: (list(EXPECTED34), ""))
+EXPECTED34 = fs.device_tests_expected(fs.FS34_TESTS_FILE)[0]  # every case the real file defines
+assert EXPECTED34
 
 
 def _fs34(outcomes=None, **kw):

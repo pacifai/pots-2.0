@@ -1203,7 +1203,7 @@ transcript and run the verifier.
    fetches every public one (a few minutes it doesn't need; a filter would be a change to
    `fs11_session.py`).
 2. **The pod**: two GPUs of the same type, the image and disks of step 2, the boot guard with
-   `sleep 17900;` (setup about 20 min plus the job's 129: 2 x 149 min = 298 min, rounded up).
+   `sleep 18500;` (setup about 20 min plus the job's 134: 2 x 154 min = 308 min, rounded up).
 3. **Set up** as in step 3. `requirements-fs11.txt` carries `pytest` and `matplotlib` (the fast
    suite and the plotting tests need them), so nothing is installed by hand.
 4. **Start the job**:
@@ -1239,8 +1239,8 @@ transcript and run the verifier.
 | `<cheat>_pipelined` (three) | the judged cheats, sharded and pipelined | 12 min |
 
 The estimates are scaled by hand from the earlier sessions; none was measured on two cards.
-The parts sum to about 108 min, packing about 1, the grace window 20: about 129 min, so the
-default deadline is 2 x 129 = 258 min, rounded up to 15,500 s. The pipelined arms (FS33d) are
+The parts sum to about 113 min, packing about 1, the grace window 20: about 134 min, so the
+default deadline is 2 x 134 = 268 min, rounded up to 16,100 s. The pipelined arms (FS33d) are
 estimated at their sequential counterparts' time, since the pipelined loop overlaps prover and
 verifier and is no slower; that is an estimate, not a measurement. Each part's time limit is a
 cap; the fast suite's is 3,600 s, the metrics run's 1,800 s.

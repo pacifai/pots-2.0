@@ -294,7 +294,8 @@ def test_the_side_stream_case_does_what_route_does(monkeypatch):
         pc.cuda_copy("side_stream", src, dst_device)
     _fake_cuda(monkeypatch, theirs)
     cap = SimpleNamespace(buffers=SimpleNamespace(stream=lambda d: torch.cuda.Stream(d)),
-                          _pending=deque(), _drain=lambda **kw: None)
+                          _pending=deque(), _drain=lambda **kw: None,
+                          _hashable=lambda r, o: False)
     rec = SimpleNamespace(out=src, hint=dst_device, versions={})
     with Log(theirs):
         MatmulCapture._route(cap, rec)

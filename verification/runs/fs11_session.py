@@ -1060,13 +1060,14 @@ PAIR_SLOW_SELECT = "two_gpus or two_cuda_devices"
 FS34_TESTS_FILE = "tests/verification/runs/test_fs34_join_cuda.py"
 
 
-def _fs34_tests_part(out: Path, timeout_s: float) -> Part:
+def _fs34_tests_part(out: Path, timeout_s: float, output_dir: Path) -> Part:
     """FS34's two-GPU join tests (:data:`FS34_TESTS_FILE`) with a junit report, by name: the
     comparison asks for each case the file defines and that none was skipped."""
     junit = out / "parts" / "fs34_tests" / "junit.xml"
     return Part("fs34_tests", ["{python}", "-m", "pytest", "-rf", "-q", f"--junitxml={junit}",
                                "-p", "no:cacheprovider", FS34_TESTS_FILE],
-                env={"VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
+                env={"VERIF_OUTPUT_DIR": str(output_dir), "VERIF_VERIFIER_DEVICES": None,
+                     "VERIF_PIPELINED": None},
                 timeout_s=timeout_s, kind="fs34_tests",
                 info={"junit": str(junit), "gpu_peak": True})
 
@@ -1150,7 +1151,7 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
     plan = [peer_check_part(out), _models_part(upload, out, t["models"]),
             pytest_part("fast_suite", t["fast_suite"]),
             pytest_part("two_gpu_slow", t["two_gpu_slow"], "-m", "slow", "-k", PAIR_SLOW_SELECT),
-            _fs34_tests_part(out, t["fs34_tests"]),
+            _fs34_tests_part(out, t["fs34_tests"], _run_dir(out, upload, key, "pytest")),
             part("smollm2_calibrate", "calibrate", home, t["calibrate"],
                  "--write-bands-despite-guard", kind="other")]
     for arm, env in (("unsharded", {}), ("sharded", sharded)):
