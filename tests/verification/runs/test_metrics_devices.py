@@ -190,22 +190,27 @@ def test_two_real_processes_one_set_of_rows_and_one_clock(tmp_path):
     before = time.monotonic_ns()
     proc = ctx.Process(target=_child, args=(child, (1, 2), pause))
     proc.start()
-    with MetricsWriter(tmp_path, "r", model="mlp", corpus="synthetic", seed=0,
-                       config={"a": 1}) as mw:
-        rec = mw.recorder("s")
-        seam = rec.seam()
-        for t in (1, 2):
-            part = parent.recv()
-            assert isinstance(part, StepPart) and part.t == t and part.pid == proc.pid
-            seen = time.monotonic_ns()
-            with seam("2"):
-                time.sleep(pause)
-            with seam("5"):
-                time.sleep(pause)
-            rec.merge_step(t, part)
-            rec.on_step(_Rec(t))
-        after = time.monotonic_ns()
-    proc.join(30)
+    try:
+        with MetricsWriter(tmp_path, "r", model="mlp", corpus="synthetic", seed=0,
+                           config={"a": 1}) as mw:
+            rec = mw.recorder("s")
+            seam = rec.seam()
+            for t in (1, 2):
+                assert parent.poll(60), "the child sent no part"  # a dead child never blocks us
+                part = parent.recv()
+                assert isinstance(part, StepPart) and part.t == t and part.pid == proc.pid
+                seen = time.monotonic_ns()
+                with seam("2"):
+                    time.sleep(pause)
+                with seam("5"):
+                    time.sleep(pause)
+                rec.merge_step(t, part)
+                rec.on_step(_Rec(t))
+            after = time.monotonic_ns()
+        proc.join(30)
+    finally:
+        if proc.is_alive():
+            proc.kill()
     assert proc.exitcode == 0
     rows = [r for r in rec.rows if r["record"] == "time"]
     for t in (1, 2):

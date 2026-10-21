@@ -133,3 +133,19 @@ def test_device_wide_use_sees_memory_another_process_allocated():
     assert row["device_wide_end_bytes"][1] - base >= 400 * MIB
     # this process's own peak does not: its rise over its start stays small
     assert row["device_peak_bytes"][1] - row["device_start_bytes"][1] < 64 * MIB
+
+
+def test_a_one_device_list_still_gets_the_per_device_fields():
+    mem = MemoryRecorder("r", "s", memory_probe(D0), devices=(D0,))
+    with mem.seam()("5"):
+        _work(D0, reps=1)
+    mem.on_step(_Rec(1))
+    row = next(r for r in mem.rows if r["component"] == "5")
+    assert row["devices"] == [D0] and len(row["device_peak_bytes"]) == 1
+    assert len(row["device_wide_peak_bytes"]) == 1
+    tim = TimeRecorder("r", "s", devices=(D0,))
+    with tim.seam()("5"):
+        _work(D0, reps=1)
+    tim.on_step(_Rec(1))
+    row = next(r for r in tim.rows if r["component"] == "5")
+    assert row["devices"] == [D0] and row["gpu_held_s"] == pytest.approx(row["time_s"])

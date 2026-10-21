@@ -123,8 +123,11 @@ turned off: later rows carry ``null`` and ``mem_source`` ``unavailable``.
 
 **Several devices (FS33c).** ``TimeRecorder(devices=...)`` and ``MemoryRecorder(devices=...)``
 name every device the recorder's process uses (the verifier's replay split over GPUs 1-3), next to
-the single ``device`` / ``probe``. With one device or none, rows and markers are exactly as above
-(tested against the layout before FS33c). With several:
+the single ``device`` / ``probe``. With ``devices`` unset, ``("cpu",)`` or ``()``, rows and markers
+are exactly as above (tested against the layout before FS33c). With several devices, or with any
+CUDA device in ``devices`` (``("cuda:0",)`` too), the recorder takes the several-device paths and
+writes the fields below; ``device=`` alone stays the single-device recorder. A memory recorder's
+``probe`` must read ``devices[0]`` (``memory_probe(devices[0])``), else ``ValueError``:
 
 - *Time.* A top-level CUDA section's exit waits for every listed device, so its host time covers the
   work launched on any of them. The single-device recorder synchronized only its own device, so a
@@ -137,6 +140,9 @@ the single ``device`` / ``probe``. With one device or none, rows and markers are
   ``devices`` names them (per section, and on the line). Time rows gain ``devices`` and
   ``gpu_held_s``, the section's seconds times the devices it held: an upper bound on GPU-seconds
   (EQ14), since a held device may idle. On a non-CUDA device every listed device is the process.
+  The overflow row's (``rest``) ``gpu_s`` is the sum over every listed device of the device
+  spans of the calls past ``MAX_SPANS``, GPU-seconds like ``gpu_held_s`` but measured on the
+  events, with no list per device.
 - *Memory.* ``peak_bytes``, ``peak_reserved_bytes``, ``start_bytes`` and ``end_bytes`` keep
   their meaning for the first device. New fields, one list entry per device in ``devices``:
   ``device_peak_bytes``, ``device_peak_reserved_bytes``, ``device_start_bytes`` and
@@ -153,11 +159,16 @@ the single ``device`` / ``probe``. With one device or none, rows and markers are
 the verifier's process owns the rows and the writer. The child calls ``close_step(t)`` between
 steps (no section open) and sends the :class:`StepPart` it returns (plain numbers, picklable; step
 0 is the ``run:`` sections); the parent calls ``merge_step(t, part)`` before ``on_step`` for ``t``,
-and ``on_step`` emits one set of rows and one markers line holding both sides. A section name in
-both raises ``ValueError``. ``TimeRecorder`` and ``MemoryRecorder`` do it; the counting pass
-(``counting()`` patches the process) and the profiler trace (``trace_step``) are one process and
-raise ``RuntimeError`` from either call. ``time.monotonic_ns`` is system-wide on Linux and macOS,
-so both sides' spans sit on one axis. How to read a merged step ``t``:
+and ``on_step`` emits one set of rows and one markers line holding both sides. The order the loop
+(FS33b) must follow: the parent calls ``merge_step(t, part)`` exactly once per step, after its
+own sections of step ``t`` and before ``on_step`` for ``t``, steps in order. ``ValueError``, with
+the recorder unchanged, for a part whose ``t`` isn't ``t``, a ``t`` that isn't the step the
+recorder is on, a second part for a step, any merge after ``finish`` and a section name in both
+(step 0, the ``run:`` sections, takes its one part any time before ``finish``).
+``TimeRecorder`` and ``MemoryRecorder`` do it; the counting pass (``counting()`` patches the
+process) and the profiler trace (``trace_step``) are one process and raise ``RuntimeError``
+from either call. ``time.monotonic_ns`` is system-wide on Linux and macOS, so both sides' spans
+sit on one axis. How to read a merged step ``t``:
 
 - A section's ``pid`` says which side's it is; ``t0_ns`` is the first section start of either
   side, so ``host_us`` and ``gpu_us`` are on one axis for both sides.
@@ -172,6 +183,11 @@ so both sides' spans sit on one axis. How to read a merged step ``t``:
   The paper's EQ14 numbers should read both, as F22 decides: wall time (``step_wall`` per step,
   the run's wall across steps) beside GPU-seconds (``gpu_held_s``, a merged row's seconds times
   the devices its side held), since "one role at a time" no longer holds.
+- ``gpu_held_s`` on ``step`` is work: each section's seconds times the devices that section's
+  process listed, summed (the sequential loop's figure, still an upper bound). On ``step_wall`` it
+  is the wall extent times every device either side listed (each counted once): first start to
+  last end, the idle gap between the two sides included, so it is not work. Read ``step`` for
+  GPU-seconds and ``step_wall`` for elapsed time.
 - Rows of a merged step carry ``devices`` and ``gpu_held_s``; in memory rows the device fields
   are per process, so a row over both sides (the ``step`` total) has them ``null``.
 
@@ -359,6 +375,7 @@ def reserved_peak(probe: MemoryProbe) -> int | None:
 
 class _DarwinProbe:
     source = "darwin_phys_footprint"
+    device = torch.device("cpu")
     _RUSAGE_INFO_V4 = 4
     _RLIMIT_FOOTPRINT_INTERVAL = 4
     _FOOTPRINT_INTERVAL_RESET = 1
@@ -393,6 +410,7 @@ class _DarwinProbe:
 
 class _LinuxProbe:
     source = "linux_rss_hwm"
+    device = torch.device("cpu")
 
     def __init__(self) -> None:
         self._clear = open("/proc/self/clear_refs", "w")  # noqa: SIM115 (kept open for speed)
@@ -417,7 +435,7 @@ class _CudaProbe:
     source = "cuda_allocated"
 
     def __init__(self, device: torch.device) -> None:
-        self._dev = device
+        self._dev = self.device = device
 
     def reset(self) -> None:
         torch.cuda.synchronize(self._dev)
@@ -436,6 +454,7 @@ class _CudaProbe:
 
 class _MaxRssProbe:
     source = "ru_maxrss"
+    device = torch.device("cpu")
     _UNIT = 1 if sys.platform == "darwin" else 1024  # bytes on macOS, kB on Linux
 
     def reset(self) -> None:
@@ -451,6 +470,7 @@ class _Guarded:
     def __init__(self, inner: MemoryProbe) -> None:
         self._inner: MemoryProbe | None = inner
         self.source = inner.source
+        self.device: torch.device | None = getattr(inner, "device", None)  # None: unknown
 
     def _fail(self, e: OSError) -> None:
         log.warning("memory probe %s failed (%s); memory rows are null from here", self.source, e)
@@ -659,6 +679,8 @@ class _Recorder:
         self._verifier: Any = None
         self._names: tuple[str, ...] = ()  # this recorder's devices, by name
         self._merged: set[int] = set()  # steps that took a part from another process
+        self._t = 1  # the step the open table belongs to (the next ``on_step`` closes it)
+        self._finished = False  # ``finish`` closed the run: nothing merges any more
 
     def seam(self) -> Seam:
         """The run's one :class:`Seam`: what to pass where ``section`` is passed."""
@@ -693,6 +715,7 @@ class _Recorder:
     def on_step(self, rec: Any) -> None:
         """``run_loop``'s ``on_step``: close step ``rec.t``."""
         table, self._step = self._step, {}
+        self._t = rec.t + 1
         try:
             self._emit(rec.t, table, rec)
         finally:
@@ -717,15 +740,28 @@ class _Recorder:
             table, self._run = self._run, {}
         else:
             table, self._step = self._step, {}
+            self._t = t + 1
         for a in table.values():
             a.devs = a.devs or self._names
         return StepPart(self.record, t, os.getpid(), self._names, table)
 
     def _merge(self, t: int, part: StepPart) -> None:
+        """Add ``part`` to step ``t``'s open table. Refused, with the table untouched, when the
+        run is finished, when ``part`` isn't the ``record`` part of step ``t``, when ``t`` isn't
+        the step the open table belongs to (step 0, the ``run:`` sections, is open until
+        :meth:`finish`), when step ``t`` already took a part, and on a name in both."""
+        if self._finished:
+            raise ValueError(f"merge_step({t}) after finish: the run's rows are written")
         if not isinstance(part, StepPart) or part.kind != self.record or part.t != t:
             raise ValueError(f"merge_step({t}) needs the {self.record} part of step {t}, got "
                              f"{getattr(part, 'kind', type(part).__name__)} step "
                              f"{getattr(part, 't', '?')}")
+        if t != 0 and t != self._t:
+            raise ValueError(f"merge_step({t}) is a part of step {t}, but the recorder is on "
+                             f"step {self._t}: merge one part per step, before on_step({t})")
+        if t in self._merged:
+            raise ValueError(f"merge_step({t}): step {t} already took a part (a second part "
+                             f"for one step is refused)")
         table = self._run if t == 0 else self._step
         both = sorted(set(table) & set(part.sections))
         if both:
@@ -739,6 +775,7 @@ class _Recorder:
 
     def finish(self, verdict: Any = None) -> None:
         """Close the run: the ``run:`` sections become step 0."""
+        self._finished = True
         table, self._run = self._run, {}
         if table:
             try:
@@ -1209,7 +1246,9 @@ class TimeRecorder(_Recorder):
         self._devices = devs
         self._device = devs[0]
         self._names = tuple(str(d) for d in devs)
-        self._multi = len(devs) > 1  # several devices: the FS33c paths and fields
+        given = tuple(torch.device(d) for d in devices or ())
+        # several devices, or a CUDA device named in ``devices``: the FS33c paths and fields
+        self._multi = len(given) > 1 or any(d.type == "cuda" for d in given)
         if len({d.type for d in devs}) > 1:
             raise ValueError(f"the devices of one recorder must be of one type, got {self._names}")
         self._devfields = False  # the rows being emitted carry the device fields
@@ -1351,7 +1390,9 @@ class TimeRecorder(_Recorder):
                 for lst, g in zip(acc.gpu_more or (), gs[1:], strict=False):
                     lst[slot] = g
             elif acc.rest is not None:
-                acc.rest[2] += (gs[0][1] - gs[0][0]) / 1e6
+                # GPU-seconds of the call over every listed device (the sum, as ``gpu_held_s``
+                # counts devices); the overflow row has no room for a list per device
+                acc.rest[2] += sum(g[1] - g[0] for g in gs) / 1e6
         anchor = self._anchor
         if anchor is not None:
             for i, e0, e1 in self._stamp_pending:
@@ -1880,6 +1921,23 @@ _DEVICE_FIELDS = ("devices", "device_peak_bytes", "device_peak_reserved_bytes",
                   "device_wide_end_bytes", "device_wide_peak_bytes", "device_wide_source")
 
 
+def _check_probe(probe: MemoryProbe, first: torch.device) -> None:
+    """``probe`` must read ``first``, the recorder's first device (``devices[0]``). A probe that
+    doesn't say which device it reads (a test double) isn't checked."""
+    got = getattr(probe, "device", None)
+    if got is None:
+        return
+
+    def key(d: torch.device) -> tuple[str, int | None]:
+        if d.type != "cuda":
+            return ("host", None)  # the host probe serves cpu and mps alike
+        return ("cuda", torch.cuda.current_device() if d.index is None else d.index)
+
+    if key(got) != key(first):
+        raise ValueError(f"the probe reads {got} but devices[0] is {first}: pass the probe of "
+                         f"the first device (memory_probe({str(first)!r}))")
+
+
 def _gb(x: int | None) -> str:
     return "?" if x is None else f"{x / 2**30:.2f}"
 
@@ -1904,7 +1962,10 @@ class MemoryRecorder(_Recorder):
         self.probe = probe
         self.echo = echo
         devs = tuple(torch.device(d) for d in devices or ())
-        self._multi = len(devs) > 1  # several devices: the FS33c paths and fields
+        if devs:
+            _check_probe(probe, devs[0])
+        # several devices, or a CUDA device named in ``devices``: the FS33c paths and fields
+        self._multi = len(devs) > 1 or any(d.type == "cuda" for d in devs)
         self._devfields = False  # the rows being emitted carry the device fields
         if self._multi:
             self._devices = devs
@@ -1919,16 +1980,11 @@ class MemoryRecorder(_Recorder):
         self._open: list[_MemSection] = []
         # nested (peak, reserved peak) inside the open top section
         self._inner: dict[str, tuple[int | None, int | None]] = {}
-        self._t = 1  # the step the open sections belong to
 
     def section(self, name: str) -> Any:
         s = super().section(name)
         s.name = name
         return s
-
-    def on_step(self, rec: Any) -> None:
-        super().on_step(rec)
-        self._t = rec.t + 1
 
     def _echo_section(self, s: _MemSection, end: int | None, exc: type | None) -> None:
         name = s.name
@@ -1979,10 +2035,7 @@ class MemoryRecorder(_Recorder):
         """In the child: end step ``t``'s table without emitting rows and return it as a
         :class:`StepPart` (plain numbers, picklable). With no section open; see
         :meth:`TimeRecorder.close_step`."""
-        part = self._close(t)
-        if t >= 1:
-            self._t = t + 1
-        return part
+        return self._close(t)
 
     def merge_step(self, t: int, part: StepPart) -> None:
         """In the parent, before :meth:`on_step` for step ``t``: add the child's sections to

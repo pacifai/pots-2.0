@@ -193,7 +193,7 @@ def test_merging_the_same_part_twice_is_refused():
     parent = _timed(["5"])
     part = _timed(["P3.commit"]).close_step(1)
     parent.merge_step(1, part)
-    with pytest.raises(ValueError, match="P3.commit"):
+    with pytest.raises(ValueError, match="second part"):
         parent.merge_step(1, part)
     assert list(parent._step) == ["5", "P3.commit"]  # the refusal left the table whole
 
@@ -224,8 +224,6 @@ def test_a_memory_part_into_a_time_recorder_and_back():
         MemoryRecorder("r", "s", memory_probe("cpu")).merge_step(1, tpart)
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: merge_step after on_step(t) is accepted; the "
-                   "part waits in the table and is emitted with step t + 1's rows")
 def test_a_merge_after_on_step_is_refused():
     parent = _timed(["5"])
     part = _timed(["P3.commit"]).close_step(1)
@@ -234,8 +232,6 @@ def test_a_merge_after_on_step_is_refused():
         parent.merge_step(1, part)
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: a late merge is emitted under the next step "
-                   "(the parent records no step counter to compare t with)")
 def test_a_late_part_never_lands_in_the_next_step():
     parent = _timed(["5"])
     part = _timed(["P3.commit"]).close_step(1)
@@ -251,9 +247,6 @@ def test_a_late_part_never_lands_in_the_next_step():
     assert "P3.commit" not in step2
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: parts of steps 1 and 2 merged before on_step(1) "
-                   "both go into step 1's table (merge_step checks the part's t, not the "
-                   "recorder's step)")
 def test_steps_out_of_order_are_refused():
     parent = _timed(["5"])
     p1 = _timed(["P3.commit"]).close_step(1)
@@ -263,8 +256,6 @@ def test_steps_out_of_order_are_refused():
         parent.merge_step(2, p2)
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: a part of step 2 merged as step 2 into a parent "
-                   "still on step 1 lands in step 1's rows (no expected-step check)")
 def test_a_part_of_a_later_step_does_not_land_in_the_current_one():
     parent = _timed(["5"])
     p2 = _timed(["P1.label"]).close_step(2)
@@ -276,8 +267,6 @@ def test_a_part_of_a_later_step_does_not_land_in_the_current_one():
     assert "P1.label" not in {r["component"] for r in parent.rows if r["step"] == 1}
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: the memory recorder's merge_step after "
-                   "on_step(t) is accepted too, though the recorder knows its step (_t)")
 def test_memory_merge_after_on_step_is_refused():
     parent = MemoryRecorder("r", "s", memory_probe("cpu"))
     with parent.seam()("5"):
@@ -289,6 +278,114 @@ def test_memory_merge_after_on_step_is_refused():
     parent.on_step(_Rec(1))
     with pytest.raises((ValueError, RuntimeError)):
         parent.merge_step(1, part)
+
+
+def _refused(rec, t, part, match):
+    before = (list(rec._step), list(rec._run), set(rec._merged), rec._t)
+    with pytest.raises(ValueError, match=match) as e:
+        rec.merge_step(t, part)
+    assert (list(rec._step), list(rec._run), set(rec._merged), rec._t) == before
+    return str(e.value)
+
+
+def test_the_refusals_name_both_steps_and_change_nothing():
+    parent = _timed(["5"])
+    p2 = _timed(["P1.label"]).close_step(2)
+    msg = _refused(parent, 2, p2, "step 1")  # a part of step 2, the recorder on step 1
+    assert "step 2" in msg
+    p1 = _timed(["P3.commit"]).close_step(1)
+    msg = _refused(parent, 1, p2, "step 1")  # the part says step 2, the call says step 1
+    assert "step 2" in msg
+    parent.merge_step(1, p1)
+    msg = _refused(parent, 1, _timed(["P1.label"]).close_step(1), "second part")
+    assert "step 1" in msg
+    parent.on_step(_Rec(1))
+    msg = _refused(parent, 1, _timed(["P1.label"]).close_step(1), "step 2")  # now on step 2
+    assert "step 1" in msg
+    parent.merge_step(2, p2)  # the right step still goes in
+    parent.on_step(_Rec(2))
+    assert "P1.label" in {r["component"] for r in parent.rows if r["step"] == 2}
+
+
+@pytest.mark.parametrize("make", [lambda: TimeRecorder("r", "s"),
+                                  lambda: MemoryRecorder("r", "s", memory_probe("cpu"))])
+def test_a_merge_after_finish_is_refused(make):
+    parent = make()
+    with parent.seam()("5"):
+        pass
+    parent.on_step(_Rec(1))
+    with parent.seam()("run:setup"):
+        pass
+    parent.finish()
+    child = make()
+    with child.seam()("P3.commit"):
+        pass
+    _refused(parent, 2, child.close_step(2), "after finish")
+
+
+def test_the_run_level_part_merges_once_before_finish():
+    child = TimeRecorder("r", "s")
+    with child.seam()("run:setup"):
+        pass
+    part = child.close_step(0)
+    parent = _timed(["5"])
+    parent.on_step(_Rec(1))
+    parent.merge_step(0, part)  # step 0 stays open while the run goes on
+    _refused(parent, 0, part, "second part")
+    parent.finish()
+    assert any(r["step"] == 0 and r["component"] == "setup" for r in parent.rows)
+
+
+def test_a_single_device_in_devices_takes_the_several_device_paths():
+    from verification.runs.metrics import (  # noqa: PLC0415 (private classes, by name)
+        _MultiCudaTimeSection,
+        _MultiMemSection,
+    )
+    one = TimeRecorder("r", "s", devices=("cuda:0",))
+    assert one._multi and one._Section is _MultiCudaTimeSection
+    mem = MemoryRecorder("r", "s", memory_probe("cuda:0"), devices=("cuda:0",))
+    assert mem._multi and mem._Section is _MultiMemSection
+    for kw in ({}, {"devices": ("cpu",)}, {"devices": ()}, {"device": "cuda:0"}):
+        assert not TimeRecorder("r", "s", **kw)._multi
+    for kw in ({}, {"devices": ("cpu",)}, {"devices": ()}):
+        assert not MemoryRecorder("r", "s", memory_probe("cpu"), **kw)._multi
+
+
+@pytest.mark.parametrize("probe_dev, devices", [
+    ("cuda:1", ("cuda:0", "cuda:1")),  # the second device's probe
+    ("cpu", ("cuda:0",)),  # a host probe for a GPU
+    ("cuda:0", ("cpu", "cpu")),  # a GPU probe for the host
+    ("cuda:0", ("cuda:1",)),
+])
+def test_a_probe_of_another_device_is_refused(probe_dev, devices):
+    with pytest.raises(ValueError, match="probe"):
+        MemoryRecorder("r", "s", memory_probe(probe_dev), devices=devices)
+
+
+def test_the_probe_of_the_first_device_is_accepted():
+    MemoryRecorder("r", "s", memory_probe("cuda:1"), devices=("cuda:1", "cuda:0"))
+    MemoryRecorder("r", "s", memory_probe("cpu"), devices=CPU3)
+    MemoryRecorder("r", "s", memory_probe("cpu"), devices=("cpu",))
+    MemoryRecorder("r", "s", memory_probe("cuda:0"))  # no devices: nothing to compare
+
+
+def test_the_overflow_rows_gpu_seconds_cover_every_device():
+    from verification.runs.metrics import _Acc  # noqa: PLC0415 (private class, by name)
+
+    class Ev:  # a CUDA event: milliseconds on its own clock, same origin for all
+        def __init__(self, ms):
+            self.ms = ms
+
+        def elapsed_time(self, other):
+            return other.ms - self.ms
+
+    rec = TimeRecorder("r", "s", devices=CPU3)
+    acc = _Acc(False)
+    acc.rest = [3, 0.0, 0.0, 0, 0]
+    rec._anchors = [(0.0, Ev(0.0))] * 3
+    rec._pending = [(acc, -1, [Ev(1.0), Ev(2.0), Ev(3.0)], [Ev(2.0), Ev(5.0), Ev(4.0)], False)]
+    rec._resolve()
+    assert acc.rest[2] == pytest.approx((1.0 + 3.0 + 1.0) / 1e3)  # the sum over the devices
 
 
 def test_a_traced_recorder_refuses_before_it_changes_anything(tmp_path):
@@ -376,19 +473,24 @@ def test_a_child_that_closed_every_step_before_the_parent_merged_the_first(tmp_p
     parent_end, child_end = ctx.Pipe()
     proc = ctx.Process(target=_ahead_child, args=(child_end, (1, 2, 3)))
     proc.start()
-    proc.join(60)  # the child is done with all three steps before the parent merges any
-    assert proc.exitcode == 0
-    with MetricsWriter(tmp_path, "r", model="m", corpus="synthetic", seed=0,
-                       config={"a": 1}) as mw:
-        rec = mw.recorder("s")
-        seam = rec.seam()
-        for t in (1, 2, 3):
-            part = parent_end.recv()
-            assert part.t == t
-            with seam("2"):
-                time.sleep(0.01)
-            rec.merge_step(t, part)
-            rec.on_step(_Rec(t))
+    try:
+        proc.join(60)  # the child is done with all three steps before the parent merges any
+        assert proc.exitcode == 0
+        with MetricsWriter(tmp_path, "r", model="m", corpus="synthetic", seed=0,
+                           config={"a": 1}) as mw:
+            rec = mw.recorder("s")
+            seam = rec.seam()
+            for t in (1, 2, 3):
+                assert parent_end.poll(60), "the child's part never came"
+                part = parent_end.recv()
+                assert part.t == t
+                with seam("2"):
+                    time.sleep(0.01)
+                rec.merge_step(t, part)
+                rec.on_step(_Rec(t))
+    finally:
+        if proc.is_alive():
+            proc.kill()
     rows = [r for r in rec.rows if r["record"] == "time"]
     t_of = {t: {(r["level"], r["component"]): r for r in rows if r["step"] == t} for t in PAUSES}
     for t, pause in PAUSES.items():
