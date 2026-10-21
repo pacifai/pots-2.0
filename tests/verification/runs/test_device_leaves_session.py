@@ -130,12 +130,13 @@ def test_bring_up_prints_the_line_it_reads(tmp_path):
     b = SimpleNamespace(kept=kept, result=SimpleNamespace(loop=SimpleNamespace(steps=steps)))
     c = SimpleNamespace(n_leaves=0, M=9, products=[])
     import verification.runs.bring_up as mod
-    orig = mod.commit_leaves
-    mod.commit_leaves = lambda c_, leaves: SimpleNamespace(root=bytes.fromhex(ROOT))
+    orig = mod.MerkleTree, mod.leaf_hashes_of
+    mod.leaf_hashes_of = lambda c_, items: []
+    mod.MerkleTree = lambda hashes: SimpleNamespace(root=bytes.fromhex(ROOT))
     try:
         text = bu.device_leaves_line(b, c, T=1)
     finally:
-        mod.commit_leaves = orig
+        mod.MerkleTree, mod.leaf_hashes_of = orig
     log = tmp_path / "log.txt"
     log.write_text(text + "\n")
     got = fs.part_extras(fs.Part("b", [], kind="bring_up"), log)["device_leaves"]
@@ -169,9 +170,13 @@ def test_bring_up_prints_the_missing_line_after_it():
 # ---- the gate ---------------------------------------------------------------------------------
 
 
+EXPECTED = fs.device_tests_expected()[0]  # every case the real file defines, by junit name
+FIRST = EXPECTED[0]
+
+
 def _tests_part(status="ok", cases=None, failures=0, errors=0, junit=True):
     cases = cases if cases is not None else {
-        f"{GOOD_TESTS}::test_a": "passed", f"{GOOD_TESTS}::test_b[fp32]": "passed",
+        **{n: "passed" for n in EXPECTED},
         "tests.verification.prover.test_capture_cuda::test_gpu_memory_does_not_hold_the_transcript":
             "passed",
         "tests.verification.commitment.test_gpu_blake3::test_k": "passed"}
@@ -235,8 +240,8 @@ def test_a_skipped_or_failed_fs30_test_fails():
     cases = _tests_part()["extras"]["cases"]
     for bad in ("skipped", "failed", "error"):
         c = dict(cases)
-        c[f"{GOOD_TESTS}::test_a"] = bad
-        _fails(_parts(tests=_tests_part(cases=c)), f"test_a: {bad}")
+        c[FIRST] = bad
+        _fails(_parts(tests=_tests_part(cases=c)), f"{FIRST}: {bad}")
     c = dict(cases)
     c["tests.verification.prover.test_capture_cuda::test_gpu_memory_does_not_hold_the_transcript"] \
         = "skipped"
@@ -247,6 +252,45 @@ def test_fs30_tests_that_never_ran_fail():
     only_kernel = {"tests.verification.commitment.test_gpu_blake3::test_k": "passed"}
     _fails(_parts(tests=_tests_part(cases=only_kernel)), "none of FS30's CUDA tests ran")
     _fails(_parts(tests=_tests_part(cases=only_kernel)), "GPU-memory test did not run")
+
+
+def test_the_expected_names_come_from_the_file_with_every_parametrized_case():
+    names, err = fs.device_tests_expected()
+    assert err == "" and len(names) == len(set(names))
+    text = (REPO / fs.DEVICE_TESTS_FILE).read_text()
+    defs = re.findall(r"^def (test_\w+)", text, re.M)
+    assert {n.split("::")[1].split("[")[0] for n in names} == set(defs)
+    assert all(n.startswith(GOOD_TESTS + "::") for n in names)
+    assert sum("[" in n for n in names) >= 4  # the dtype x head_blocks cases are each named
+
+
+def test_a_case_missing_from_the_report_fails_naming_it():
+    for gone in (FIRST, EXPECTED[-1]):
+        cases = _tests_part()["extras"]["cases"]
+        del cases[gone]
+        _fails(_parts(tests=_tests_part(cases=cases)),
+               f"{gone}: expected but not in the junit report")
+
+
+def test_every_missing_case_is_named_and_a_removed_parametrized_case_counts():
+    cases = {k: v for k, v in _tests_part()["extras"]["cases"].items() if "[" not in k}
+    g = fs.device_leaves_gate(_parts(tests=_tests_part(cases=cases)))
+    gone = [n for n in EXPECTED if "[" in n]
+    assert g["pass"] is False
+    assert all(f"{n}: expected but not in the junit report" in g["reasons"] for n in gone)
+
+
+def test_an_unknown_extra_case_that_passed_is_let_through_and_one_that_failed_fails():
+    cases = _tests_part()["extras"]["cases"]
+    cases[f"{GOOD_TESTS}::test_new_one"] = "passed"
+    assert fs.device_leaves_gate(_parts(tests=_tests_part(cases=cases)))["pass"] is True
+    cases[f"{GOOD_TESTS}::test_new_one"] = "failed"
+    _fails(_parts(tests=_tests_part(cases=cases)), "test_new_one: failed")
+
+
+def test_a_failed_collection_fails_the_gate_with_its_reason(monkeypatch):
+    monkeypatch.setattr(fs, "device_tests_expected", lambda *a: ([], "boom"))
+    _fails(_parts(), "could not be collected: boom")
 
 
 def test_a_kernel_test_skip_is_not_an_fs30_skip():

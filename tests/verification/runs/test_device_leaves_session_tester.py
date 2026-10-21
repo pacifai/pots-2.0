@@ -147,7 +147,8 @@ def run_pytest(tmp_path, body_cuda, body_mem):
 
 def gate_with(real, tmp_path, tests):
     parts = parts_with(real, tmp_path, tests=tests)
-    return fs.device_leaves_gate(parts)
+    return fs.device_leaves_gate(parts, expected=["test_device_leaves_cuda::test_a",
+                                                  "test_device_leaves_cuda::test_b"])
 
 
 OK_CUDA = "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n"
@@ -193,3 +194,33 @@ def test_a_real_xfail_in_an_fs30_file_reads_as_skipped_and_fails_the_gate(real, 
     tests = run_pytest(tmp_path, cuda, OK_MEM)
     assert "skipped" in tests["extras"]["cases"].values()
     assert gate_with(real, tmp_path, tests)["pass"] is False
+
+
+def test_a_real_junit_missing_one_expected_case_fails_the_gate_naming_it(real, tmp_path):
+    tests = run_pytest(tmp_path, "def test_a():\n    assert True\n", OK_MEM)
+    g = gate_with(real, tmp_path, tests)
+    assert g["pass"] is False
+    assert ("test_device_leaves_cuda::test_b: expected but not in the junit report"
+            in g["reasons"])
+
+
+def test_a_real_junit_with_an_unknown_extra_passing_case_still_passes(real, tmp_path):
+    tests = run_pytest(tmp_path, OK_CUDA + "\n\ndef test_extra():\n    assert True\n", OK_MEM)
+    assert gate_with(real, tmp_path, tests)["pass"] is True
+
+
+def test_the_cpu_root_is_the_c_librarys_even_when_a_kept_leaf_is_routed_to_a_kernel(
+        real, monkeypatch):
+    """No CUDA here: the routing's test (``_kernel_leaf``) is patched to take the first product
+    leaf as a device leaf, and the kernel's table to answer with a wrong digest. The routed
+    ``commit_leaves`` then gives another root; the line's cpu root must stay the C library's."""
+    from verification.commitment import leaves as L
+
+    c, leaves, honest = real
+    first = c.n_s + c.n_w
+    monkeypatch.setattr(L, "_kernel_leaf", lambda t: t is leaves[first])
+    monkeypatch.setattr(L, "_enqueue_table", lambda idx, ts, tags: SimpleNamespace(idx=idx))
+    monkeypatch.setattr(L, "_table_outcome", lambda tb: ([b"\x00" * 32] * len(tb.idx), None))
+    assert commit_leaves(c, leaves).root != honest  # the fake kernel is in the routed path
+    got = fs._DEVICE_LEAVES_LINE.match(written_line(real))
+    assert got is not None and got[4] == honest.hex()
