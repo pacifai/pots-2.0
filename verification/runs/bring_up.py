@@ -686,7 +686,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.metrics:
             config = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                       if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
-                                        "trace_c5")}
+                                        "trace_c5", "pipelined")}
             mw = MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
                                attack=cfg.attack, seed=cfg.seed, config=config, h_D=h_D,
                                extra={"n_s": c.n_s, "n": c.n, "M": c.M, "n_w": c.n_w,

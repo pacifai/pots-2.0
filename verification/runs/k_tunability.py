@@ -616,7 +616,7 @@ def open_k_writer(cfg: RunConfig, c: DeclaredComputation, bands: Bands, *, h_D: 
             "n_leaves": c.n_leaves, **extra}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                  if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
-                                   "trace_c5")}, "llama": inst}
+                                   "trace_c5", "pipelined")}, "llama": inst}
     return MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
                          model=cfg.model, corpus=backdoorllm.SOURCE, attack=cfg.attack,
                          seed=cfg.seed, config=config, band_file_hash=bands.source, h_D=h_D,

@@ -162,6 +162,11 @@ class Verifier:
     def band_source(self) -> str | None:
         return None if self.calibrate or self.bands is None else self.bands.source
 
+    @property
+    def chain_hashes(self) -> tuple[bytes, ...] | None:
+        """The W hashes the next step's check 7 compares with (W_0's after start_run)."""
+        return self._chain
+
     # ---- run start: checks 0 and 1 ------------------------------------------------------
 
     def weight_hashes(self, weights: Mapping[str, torch.Tensor]) -> tuple[bytes, ...]:

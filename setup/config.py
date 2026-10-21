@@ -46,6 +46,7 @@ _DEFAULTS: dict[str, str] = {
     "VERIF_METRICS": "1",
     "VERIF_HEAD_BLOCKS": "1",
     "VERIF_RELEASE_CACHE": "1",
+    "VERIF_PIPELINED": "0",
     "VERIF_TRACE_STEP": "0",
     "VERIF_TRACE_C5": "slice",
 }
@@ -81,6 +82,9 @@ class RunConfig:
     # F22: the devices that hold the transcript and run the verifier's replay, split by layers
     # (verification/computation/placement.py). None: today's path, leaves in host memory.
     verifier_devices: tuple[str, ...] | None
+    # FS33 (F22): run_loop's pipelined mode, the prover in a child process (runs/pipeline.py).
+    # Off by default; like verifier_devices it is in no config hash.
+    pipelined: bool
 
     @property
     def data_dir(self) -> Path:
@@ -241,6 +245,7 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
         trace_step=_int(env, "VERIF_TRACE_STEP", 0),
         trace_c5=_trace_c5(env),
         verifier_devices=_verifier_devices(env, _device(env)),
+        pipelined=_bool(env, "VERIF_PIPELINED"),
     )
 
 

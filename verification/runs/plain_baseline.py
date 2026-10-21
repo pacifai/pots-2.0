@@ -107,16 +107,17 @@ _CONFIG_FIELDS = ("model", "model_revision", "threads", "config_hash", "h_D", "s
 
 
 _NOT_TRAINING = ("output_dir", "metrics", "release_cache", "steps", "attack", "poison_count",
-                 "trace_step", "trace_c5", "verifier_devices")
+                 "trace_step", "trace_c5", "verifier_devices", "pipelined")
 
 
 def training_config(cfg: RunConfig) -> dict[str, Any]:
     """The run config's fields that shape training: all but ``output_dir``, ``metrics``,
     ``release_cache`` (the CUDA cache release between the roles), ``steps`` (``T`` is recorded
-    on its own), ``attack``, ``poison_count`` and ``verifier_devices`` (where the verifier
-    runs, F22). ``h_D`` already tells the two tasks apart, and
-    the poisoning level never enters honest training. The plain and verified runs hash this
-    dict.
+    on its own), ``attack``, ``poison_count``, ``verifier_devices`` (where the verifier
+    runs, F22) and ``pipelined`` (one process or two, FS33).
+    ``h_D`` already tells the two tasks apart, and the poisoning level
+    never enters honest training.
+    The plain and verified runs hash this dict.
 
     ``head_blocks`` enters only when it isn't 1. One block is the training every stored
     baseline ran, so their hash stays; more blocks sum the output layer's weight gradient in

@@ -214,7 +214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # The config hash covers what decides the run's results, not where it writes.
         config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                      if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
-                                       "trace_c5")},
+                                       "trace_c5", "pipelined")},
                   "llama": llama}
         with MetricsWriter(cfg.output_dir / RUN_NAME, RUN_NAME, device=cfg.device,
                            model=cfg.model, corpus=backdoorllm.SOURCE, attack=cfg.attack,

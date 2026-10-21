@@ -614,7 +614,7 @@ def main(argv: Sequence[str] | None = None) -> int:
              "keep_step": keep_step}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                  if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
-                                   "trace_c5")}, "llama": llama}
+                                   "trace_c5", "pipelined")}, "llama": llama}
     base = dict(k=k, seed=cfg.seed, h_D=h_D, build_model=models)
     finals = {T: final}
 

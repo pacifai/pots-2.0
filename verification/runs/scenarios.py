@@ -33,7 +33,14 @@ import torch
 from verification.commitment.leaves import dataset_tree
 from verification.computation.interface import DeclaredComputation
 from verification.prover.step import StepOutput, plain_step
-from verification.runs.loop import LoopResult, ProverFault, StepRecord, run_loop, run_plain
+from verification.runs.loop import (
+    LoopResult,
+    ProverFault,
+    StepRecord,
+    pipelined_setting,
+    run_loop,
+    run_plain,
+)
 from verification.runs.metrics import (
     CountRecorder,
     MemoryRecorder,
@@ -241,7 +248,8 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
                  build_model: BuildModel | None = None,
                  verifier: Callable[[Section | None], Verifier] | None = None,
                  handoff: StoreHandoff | None = None,
-                 release_cache: bool | None = None) -> ScenarioResult:
+                 release_cache: bool | None = None, pipelined: bool | None = None,
+                 prover: Callable[[], Any] | None = None) -> ScenarioResult:
     """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams.
     ``handoff`` is the loop's store hand-off (default in memory; C3 passes a ``DiskHandoff``).
     ``release_cache`` is ``run_loop``'s: ``False`` skips the CUDA cache release between the
@@ -252,7 +260,11 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
     ``build_model`` (default ``c.build_model``) gives the prover's model. ``verifier`` builds
     the verifier from the metrics seam, in place of the default one with provisional bands:
     C1 (``runs/calibrate.py``) builds one in calibration mode or with the band file. ``seed``
-    fixes ``π`` (F8c); a given verifier must hold the same one."""
+    fixes ``π`` (F8c); a given verifier must hold the same one.
+
+    ``pipelined`` and ``prover`` are ``run_loop``'s: pipelined (``None`` reads
+    ``VERIF_PIPELINED``), the prover's model is built in the child from the ``ProverSpec``
+    ``prover``, so no model is built here, and ``recorder`` goes to the loop to split."""
     section = None if recorder is None else recorder.seam()
     if h_D is None:
         h_D = dataset_tree(c, dataset).root
@@ -272,10 +284,11 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
             rec.on_step(r)
             if user is not None:
                 user(r)
-    model = (build_model or c.build_model)()
+    pl = pipelined_setting(pipelined)
+    model = None if pl else (build_model or c.build_model)()
     loop = run_loop(c, model, dataset, w0, v, final=final, fault=scenario.fault,
                     on_step=on_step, section=section, handoff=handoff,
-                    release_cache=release_cache)
+                    release_cache=release_cache, recorder=recorder, pipelined=pl, prover=prover)
     if recorder is not None:
         recorder.finish(loop.verdict)
     return ScenarioResult(scenario, loop, v, judge(scenario.expected, loop, T))
@@ -355,6 +368,12 @@ class TrainedElsewhereWNext(ProverFault):
         self.c, self.t, self.batch = c, t, list(batch)
         self.build_model = build_model or c.build_model
 
+    def __getstate__(self) -> dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items() if k not in ("c", "build_model")}
+
+    def bind(self, c: DeclaredComputation, build_model: BuildModel) -> None:
+        self.c, self.build_model = c, build_model
+
     def emit(self, t: int, out: StepOutput) -> StepOutput:
         if t != self.t:
             return out
@@ -371,6 +390,12 @@ class HiddenStep(ProverFault):
                  build_model: BuildModel | None = None) -> None:
         self.c, self.t, self.batch = c, t, list(batch)
         self.build_model = build_model or c.build_model
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items() if k not in ("c", "build_model")}
+
+    def bind(self, c: DeclaredComputation, build_model: BuildModel) -> None:
+        self.c, self.build_model = c, build_model
 
     def entry_weights(self, t: int, w: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
         if t != self.t:
@@ -443,14 +468,16 @@ def memory_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, 
                device: str | torch.device = "cpu",
                build_model: BuildModel | None = None,
                verifier: Callable[[Section | None], Verifier] | None = None,
-               handoff: StoreHandoff | None = None, release_cache: bool | None = None
+               handoff: StoreHandoff | None = None, release_cache: bool | None = None,
+               pipelined: bool | None = None, prover: Callable[[], Any] | None = None
                ) -> list[dict[str, Any]]:
     """The B6 memory pass: ``scenario`` over ``T`` steps, probed at every section, never timed.
-    ``verifier``, ``handoff`` and ``release_cache`` are as in :func:`run_scenario`."""
+    ``verifier``, ``handoff``, ``release_cache``, ``pipelined`` and ``prover`` are as in
+    :func:`run_scenario`."""
     return memory_pass(run, scenario.name, lambda rec: run_scenario(
         c, dataset, w0, scenario, T=T, k=k, seed=seed, final=final, recorder=rec, h_D=h_D,
         build_model=build_model, verifier=verifier, handoff=handoff,
-        release_cache=release_cache),
+        release_cache=release_cache, pipelined=pipelined, prover=prover),
         memory_probe(device))
 
 
@@ -459,10 +486,14 @@ def count_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, t
               h_D: bytes | None = None, scenario: Scenario = HONEST,
               build_model: BuildModel | None = None,
               verifier: Callable[[Section | None], Verifier] | None = None,
-              handoff: StoreHandoff | None = None
+              handoff: StoreHandoff | None = None, pipelined: bool | None = None
               ) -> list[dict[str, Any]]:
     """The B6 counting pass: ``scenario`` over ``T`` steps, counted, never timed.
-    ``verifier`` and ``handoff`` are as in :func:`run_scenario`."""
+    ``verifier`` and ``handoff`` are as in :func:`run_scenario`. It refuses pipelined mode (the
+    counting recorder cannot split a step across processes), whether asked for or set by
+    ``VERIF_PIPELINED``."""
+    if pipelined_setting(pipelined):
+        raise ValueError("count_run: the counting pass cannot run pipelined")
     return count_pass(run, scenario.name, lambda rec: run_scenario(
         c, dataset, w0, scenario, T=T, k=k, seed=seed, final=final, recorder=rec, h_D=h_D,
-        build_model=build_model, verifier=verifier, handoff=handoff))
+        build_model=build_model, verifier=verifier, handoff=handoff, pipelined=False))
