@@ -40,6 +40,7 @@ from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import DeclaredComputation, snapshot_weights
 from verification.parameters import ProtocolConfig
 from verification.runs.llama_step import load_committed_dataset
+from verification.runs.loop import run_devices
 from verification.runs.metrics import MetricsWriter, nan_as_inf, rho_arrays, run_name
 from verification.runs.prover_spec import decoder_spec
 from verification.runs.run_verified import JudgingVerifiers, calibration_band_hash
@@ -215,7 +216,8 @@ def run_cheat(env: CheatEnv, scenario: Scenario, *, T: int,
     honest scenario, ``None`` for a protocol fault that trains on no poisoned batch."""
     rec = (None if writer is None else
            writer.recorder(scenario.name, bpr_records=bpr_records, bpr_actual=bpr_actual,
-                           cheat_step=cheat_step))
+                           cheat_step=cheat_step,
+                           devices=run_devices(env.c, pipelined=env.pipelined)))
     r = run_scenario(env.c, env.D, env.w0, scenario, T=T, k=env.k, seed=env.seed,
                      final=env.final(T), recorder=rec, h_D=env.h_D, build_model=env.models,
                      verifier=env.verifiers.for_steps(T), pipelined=env.pipelined,

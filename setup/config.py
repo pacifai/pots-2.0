@@ -83,7 +83,8 @@ class RunConfig:
     # (verification/computation/placement.py). None: today's path, leaves in host memory.
     verifier_devices: tuple[str, ...] | None
     # FS33 (F22): run_loop's pipelined mode, the prover in a child process (runs/pipeline.py).
-    # Off by default; like verifier_devices it is in no config hash.
+    # Off by default. The metrics config of the verified entry points holds verifier_devices
+    # and leaves pipelined out; the training config (plain_baseline) leaves out both.
     pipelined: bool
 
     @property

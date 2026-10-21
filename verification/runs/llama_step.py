@@ -47,6 +47,7 @@ from setup.data import load_dataset_records
 from verification.computation.interface import DeclaredComputation, snapshot_weights
 from verification.computation.instances.decoder import DecoderComputation
 from verification.parameters import load_protocol_config
+from verification.runs.loop import run_devices
 from verification.runs.metrics import (
     CountRecorder,
     MemoryRecorder,
@@ -229,10 +230,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                            band_file_hash=None if make is None else bands.source, h_D=h_D,
                            extra={"band_source": "provisional" if make is None
                                   else str(args.bands), **llama}) as mw:
+            devs = run_devices(c, pipelined=pl)
             r = run_honest(c, D, w0, **run_args, **cache, **mode,
-                           recorder=mw.recorder(HONEST.name))
+                           recorder=mw.recorder(HONEST.name, devices=devs))
             mem_rows = memory_run(c, D, w0, run=RUN_NAME, **run_args, **cache, **mode,
-                                  device=mw.device)
+                                  device=mw.device, devices=devs)
             mw.write(mem_rows)
             mw.write(count_run(c, D, w0, run=RUN_NAME, pipelined=False, **run_args))  # sequential
         print(f"metrics: {mw.dir}")
