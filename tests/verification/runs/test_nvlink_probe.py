@@ -515,7 +515,8 @@ def test_the_probes_own_check_carries_its_errors_to_hw2_and_its_line(monkeypatch
     h = r["hw2"]
     assert h["verdict"] == "fail" and h["peer_bytes_ok"]["1->0"] is False
     d = h["peer_bytes_detail"]
-    assert list(d) == ["1->0"] and set(d["1->0"]) == {"card_suspect", "errors", "wrong", "all_raised"}
+    assert list(d) == ["1->0"]
+    assert set(d["1->0"]) == {"card_suspect", "errors", "wrong", "all_raised"}
     assert say in nv.hw2_line(h)
     assert any("1->0" in x for x in h["reasons"])
     if say == "RAISED":
