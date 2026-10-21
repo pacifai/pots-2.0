@@ -40,20 +40,27 @@ def deterministic():
     torch.use_deterministic_algorithms(before)
 
 
+@pytest.mark.parametrize("head_blocks", [1, 2])
 @pytest.mark.parametrize("dtype", ["fp32", "bf16"])
-def test_capture_hashes_every_product_but_dK_on_arrival(dtype, deterministic):
+def test_capture_hashes_every_product_but_dK_on_arrival(dtype, head_blocks, deterministic):
     """Every product leaf but the δK̃ transpose takes an arrival digest; each equals the C
-    library's digest of the leaf; the root with them equals the plain root and check 2's."""
+    library's digest of the leaf; the root with them equals the plain root and check 2's. The
+    products with no digest are the δK̃ ones only (the diagnostic's ``missing``). At head
+    blocks 1 and 2 (the full-scale runs use 8)."""
     from tests.verification.computation.test_decoder import ListReader
     from verification.commitment.leaves import commit_leaves, leaf_hashes_of, transcript_root
 
-    c, out = _step(dtype)
+    c, out = _step(dtype, head_blocks)
     leaves = out.leaves()
     want = {c.product_index(s.m) for s in c.products if c.product_class(s) != "dK"}
     assert set(out.arrival_digests) == want
     assert out.capture["arrival_hash"]["nonfinite"] == 0
     assert out.capture["arrival_hash"]["leaves"] == c.M  # the dK records are hashed too
     assert out.capture["arrival_hash"]["used"] == len(want)
+    n_dk = sum(1 for s in c.products if c.product_class(s) == "dK")
+    assert n_dk == c.M - len(want) > 0
+    assert out.capture["arrival_hash"]["missing"] == {"OPERAND_GRAD": n_dk}
+    assert out.capture["arrival_hash"]["missing_first"] == []
     plain = leaf_hashes_of(c, list(enumerate(leaves)))
     assert all(plain[i] == d for i, d in out.arrival_digests.items())
     root = commit_leaves(c, leaves, out.arrival_digests).root

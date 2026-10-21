@@ -590,7 +590,10 @@ interface.
     equality) is filled in `prove_step` through `computation.product_index(m)`; `perturb` drops
     its entry and `with_w_next` keeps them. `summary()["arrival_hash"]` counts records, leaves,
     bytes and non-finite outputs, present only when something was hashed; `prove_step` adds
-    `used`, the digests left in `arrival_digests` after the perturbations. The capture hashes
+    `used`, the digests left in `arrival_digests` after the perturbations, and a diagnostic
+    from the arrival loop it already runs: `missing` (`{ProductKind name: count}` of the
+    products with no digest) and `missing_first` (the names, in canonical order, of the first 5
+    whose kind is not `OPERAND_GRAD`). The capture hashes
     the `dK` records too and their digests go unused (the `Î´KÌƒ` leaf is a new tensor), so
     `leaves` (hashed) is `M` and `used` is `M âˆ’ dK`. A non-finite product
     gets no digest (the host path raises on it as before). The sharded path (`_route`) hashes
@@ -610,11 +613,15 @@ interface.
     `k_tunability` and `probe` also keep the C-library path.
   - *The session.* `device-leaves` (`fs11_session.py`) runs the CUDA tests and, per model, a
     bring-up that prints `device leaves: step 1 accepted ..., prover root ..., cpu root ...,
-    arrival digests U, hashed H, M M, dK leaves K`; see the `fs11_session.py` entry below.
+    arrival digests U, hashed H, M M, dK leaves K`, then a second line nothing parses,
+    `device leaves missing: <kind> <count>, ...; first others: <names or none>`, from
+    `missing` and `missing_first` (on an honest decoder step: `OPERAND_GRAD <dK count>; first
+    others: none`); see the `fs11_session.py` entry below.
 
 - `gpu_blake3.py`, `gpu_blake3.cu`, `gpu_blake3_core.h` (F23): our own BLAKE3 CUDA kernel for
-  leaf hashing. FS30 wires it in at two places (below, "Where hashing runs"). `GpuBlake3.hash_leaves(...,
-  device=)` takes `Native.hash_leaves`'s table with payload addresses on the device and returns
+  leaf hashing. FS30 wires it in at two places (below, "Where hashing runs").
+  `GpuBlake3.hash_leaves(..., device=)` takes `Native.hash_leaves`'s table with payload
+  addresses on the device and returns
   `(digests uint8 [n, 32] on the device, first_bad)` after the kernels finish, with the same
   digests and `first_bad`; `hash_tensor_leaves(headers, tensors, kinds)` builds the table from
   contiguous CUDA tensors. The core header is plain C that both NVRTC and a host C compiler
@@ -635,9 +642,12 @@ interface.
   - **Where the first NVRTC build happens.** The kernel compiles lazily, on the first
     `enqueue_table` call of a process and device: in a captured run that is inside the first
     CUDA matmul's offload, in the first step's forward pass (the CUBIN then comes from the
-    disk cache under `native.cache_dir()` if an earlier process built it). Call
-    `GpuBlake3().kernels(device)` first to move it out of a timed step. A build or load failure
-    raises; nothing falls back to the CPU.
+    disk cache under `native.cache_dir()` if an earlier process built it). `run_loop` moves it
+    out of the timed steps: when the model's device is CUDA it calls
+    `GpuBlake3().kernels(device)` once before step 1, outside every section. A CUDA run that
+    doesn't go through `run_loop` (`card_identity`) is left as it was: call
+    `GpuBlake3().kernels(device)` first there to keep the build out of a timed step. A build or
+    load failure raises; nothing falls back to the CPU.
 
 ### `verification/computation/`
 
@@ -2710,7 +2720,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `HF_HUB_OFFLINE` needed. `PACKAGES` includes pytest and matplotlib for it.
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
     [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,
-    fs32-pair,device-leaves}]`, `fetch-models` and `env`. `--session` picks the plan from `SESSIONS`, which
+    fs32-pair,device-leaves}]`, `fetch-models` and `env`. `--session` picks the plan from
+    `SESSIONS`, which
     also gives the name `summary.json`'s `session` records: `fs11` (the default, "FS11"),
     `recheck` ("recheck"), `profile-check`, `nvlink-probe` (FS31), `kernel-speed` (FS29:
     the native build, the kernel's two test files on the card, then `kernel_speed run` on the
@@ -2722,8 +2733,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     (`test_gpu_blake3.py`, `test_gpu_blake3_edges.py`, `test_device_leaves_cuda.py` and the
     capture's GPU-memory test, junit report), then `bring_up --no-tamper --device-leaves` per
     model at `FULL_SCALE_ENV` plus `RECHECK_ENV`, cheapest first; refuses without CUDA and an
-    H100 (`FS11_ALLOW_ANY_GPU=1` overrides); default deadline 8,000 s, twice the estimated
-    66 min, rounded up; `summary.json["device_leaves"]` fails closed: tests part `ok`, no
+    H100 (`FS11_ALLOW_ANY_GPU=1` overrides); default deadline 8,800 s, twice the estimated
+    73 min (52 for the parts, 1 packing, 20 grace), rounded up to the next 100 s;
+    `summary.json["device_leaves"]` fails closed: tests part `ok`, no
     failure or error, no FS30 test skipped, and per model the step accepted, the two roots equal
     the arrival digests in use equal to `M` less the `dK` leaves, and the products hashed on
     arrival equal to `M`) or `fs32-pair` (FS32f);

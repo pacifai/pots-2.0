@@ -629,52 +629,63 @@ def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
         idx, ts, tags, _ = open_.pop(dev)
         tables.append(_enqueue_table(idx, ts, tags))
 
-    for i, obj in enumerate(leaves):
-        if i >= n_s and isinstance(obj, torch.Tensor):
-            slot = slots.get(i)
-            if slot is None:
-                tag, shape, dtype, _ = _tensor_slot(c, i)
-                slot = slots[i] = (tag, shape, dtype)
-            tag, shape, dtype = slot
-            if tuple(obj.shape) == shape and obj.dtype == dtype and obj.is_contiguous():  # the structural checks passed
-                d = known.get(i)
-                if d is not None:
-                    out[i] = d
-                    n_known += 1
-                    nbytes_known += obj.nbytes
-                    continue
-                if _kernel_leaf(obj):
-                    idx, ts, tags, size = open_.get(obj.device, ([], [], [], 0))
-                    idx.append(i)
-                    ts.append(obj)
-                    tags.append(tag)
-                    open_[obj.device] = (idx, ts, tags, size + obj.nbytes)
-                    n_kernel += 1
-                    nbytes_kernel += obj.nbytes
-                    if size + obj.nbytes >= _BATCH_BYTES or len(idx) >= _BATCH_ENTRIES:
-                        close(obj.device)
-                    continue
-        host.append((i, obj))
-    for dev in list(open_):
-        close(dev)
-    if stats is not None:
-        stats.known += n_known
-        stats.kernel += n_kernel
-        stats.leaves += n_known + n_kernel
-        stats.bytes += nbytes_known + nbytes_kernel
     failures: list[tuple[int, Exception]] = []
+    clean = False
     try:
+        for i, obj in enumerate(leaves):
+            if i >= n_s and isinstance(obj, torch.Tensor):
+                slot = slots.get(i)
+                if slot is None:
+                    tag, shape, dtype, _ = _tensor_slot(c, i)
+                    slot = slots[i] = (tag, shape, dtype)
+                tag, shape, dtype = slot
+                # the structural checks passed:
+                if (tuple(obj.shape) == shape and obj.dtype == dtype
+                        and obj.is_contiguous()):
+                    d = known.get(i)
+                    if d is not None:
+                        out[i] = d
+                        n_known += 1
+                        nbytes_known += obj.nbytes
+                        continue
+                    if _kernel_leaf(obj):
+                        idx, ts, tags, size = open_.get(obj.device, ([], [], [], 0))
+                        idx.append(i)
+                        ts.append(obj)
+                        tags.append(tag)
+                        open_[obj.device] = (idx, ts, tags, size + obj.nbytes)
+                        n_kernel += 1
+                        nbytes_kernel += obj.nbytes
+                        if size + obj.nbytes >= _BATCH_BYTES or len(idx) >= _BATCH_ENTRIES:
+                            close(obj.device)
+                        continue
+            host.append((i, obj))
+        for dev in list(open_):
+            close(dev)
+        if stats is not None:
+            stats.known += n_known
+            stats.kernel += n_kernel
+            stats.leaves += n_known + n_kernel
+            stats.bytes += nbytes_known + nbytes_kernel
         if host:
             digests, err = leaf_hashes_until_error(c, host, stats)
             for (i, _), d in zip(host, digests):
                 out[i] = d
             if err is not None:
                 failures.append((host[len(digests)][0], err))
+        clean = True
     finally:
-        # Never leave a table queued unread: the stream still reads the leaves.
+        # Never leave a table queued unread: the stream still reads the leaves. Read every
+        # table; an exception already in flight wins over an outcome error, else the first.
         outcomes = []
+        first_error: BaseException | None = None
         for tb in tables:
-            outcomes.append(_table_outcome(tb))
+            try:
+                outcomes.append(_table_outcome(tb))
+            except BaseException as e:
+                first_error = first_error or e
+        if first_error is not None and clean:
+            raise first_error
     for tb, (digests, fail) in zip(tables, outcomes):
         for i, d in zip(tb.idx, digests):
             out[i] = d

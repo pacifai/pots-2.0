@@ -68,3 +68,44 @@ def test_a_buffer_written_since_it_was_hashed_is_not_matched(cap):
 
 def test_the_summary_has_no_arrival_hash_when_nothing_was_hashed(cap):
     assert "arrival_hash" not in cap.summary()
+
+
+def test_a_failed_arrival_enqueue_waits_for_the_copy_before_it_raises(monkeypatch):
+    """``_offload`` queues the host copy and its event before the hash. If the hash's enqueue
+    raises, the event is synchronized first, so no GPU read outlives ``out``. Streams and
+    events are faked, so this runs on a CPU."""
+    from types import SimpleNamespace
+
+    log = []
+
+    class Event:
+        def record(self, stream):
+            log.append("record")
+
+        def synchronize(self):
+            log.append("synchronize")
+
+    class Stream:
+        def wait_stream(self, other):
+            pass
+
+    side = Stream()
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: side)
+
+    def hash_fails(rec, out, stream):
+        log.append("hash")
+        raise RuntimeError("enqueue failed")
+
+    out = torch.randn(4, 6)
+    cap = SimpleNamespace(
+        buffers=SimpleNamespace(take=lambda shape, dtype: torch.empty(shape, dtype=dtype),
+                                stream=lambda device: side),
+        _hashable=lambda rec, o: True, _hash_arrival=hash_fails, _pending=[],
+        _drain=lambda block: None)
+    rec = SimpleNamespace(out=out, versions={})
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        MatmulCapture._offload(cap, rec)
+    assert log == ["record", "hash", "synchronize"]
+    assert rec.out is out and cap._pending == []

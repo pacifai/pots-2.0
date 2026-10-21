@@ -73,8 +73,8 @@ def test_the_env_has_no_secrets_and_every_part_a_timeout(tmp_path):
 
 
 def test_the_deadline_is_about_twice_the_estimate_and_the_parts_start_inside_it():
-    est_min = 5 + 2 + 8 + 30 + 1 + 20
-    assert fs.DEVICE_LEAVES_DEADLINE_S == 8000
+    est_min = 5 + 2 + 8 + (10 + 10 + 3 + 14) + 1 + 20  # the plan's comment lists the figures
+    assert fs.DEVICE_LEAVES_DEADLINE_S == 8800
     assert 2 * est_min * 60 <= fs.DEVICE_LEAVES_DEADLINE_S < 2 * est_min * 60 + 200
     t = fs.DEVICE_LEAVES_TIMEOUT_S
     assert t["tests"] + t["models"] + 900 < fs.DEVICE_LEAVES_DEADLINE_S - 1200 - 600
@@ -109,8 +109,8 @@ def line(**kw):
     d = dict(acc=True, prover=ROOT, cpu=ROOT, arrival=100, hashed=120, M=120, dK=20)
     d.update(kw)
     return (f"device leaves: step 1 accepted {d['acc']}, prover root {d['prover']}, "
-            f"cpu root {d['cpu']}, arrival digests {d['arrival']}, hashed {d['hashed']}, M {d['M']}, "
-            f"dK leaves {d['dK']}")
+            f"cpu root {d['cpu']}, arrival digests {d['arrival']}, hashed {d['hashed']}, "
+            f"M {d['M']}, dK leaves {d['dK']}")
 
 
 def test_the_log_line_is_read_into_the_bring_ups_extras(tmp_path):
@@ -145,6 +145,23 @@ def test_bring_up_prints_the_line_it_reads(tmp_path):
         bu.device_leaves_line(SimpleNamespace(kept=None), c, T=1)
 
 
+def test_bring_up_prints_the_missing_line_after_it():
+    """The second line, for a person; nothing parses it. An honest decoder step: the ``dK``
+    products only, and no others."""
+    def line(ah):
+        step = SimpleNamespace(t=1, capture={"arrival_hash": ah})
+        b = SimpleNamespace(result=SimpleNamespace(loop=SimpleNamespace(steps=[step])))
+        return bu.device_leaves_missing_line(b, T=1)
+
+    assert line({"missing": {"OPERAND_GRAD": 20}, "missing_first": []}) == (
+        "device leaves missing: OPERAND_GRAD 20; first others: none")
+    assert line({"missing": {"OPERAND_GRAD": 20, "FORWARD": 2, "WEIGHT_GRAD": 1},
+                 "missing_first": ["fwd.a", "fwd.b", "wg.c"]}) == (
+        "device leaves missing: OPERAND_GRAD 20, FORWARD 2, WEIGHT_GRAD 1; "
+        "first others: fwd.a, fwd.b, wg.c")
+    assert line({}) == "device leaves missing: none; first others: none"
+
+
 # ---- the gate ---------------------------------------------------------------------------------
 
 
@@ -162,8 +179,8 @@ def _tests_part(status="ok", cases=None, failures=0, errors=0, junit=True):
 def _bring(repo, **kw):
     ex = {"device_leaves": None if kw.get("none") else dict(
         step=1, accepted=kw.get("acc", True), prover_root=kw.get("prover", ROOT),
-        cpu_root=kw.get("cpu", ROOT), arrival=kw.get("arrival", 100), hashed=kw.get("hashed", 120), M=120,
-        dK=kw.get("dK", 20))}
+        cpu_root=kw.get("cpu", ROOT), arrival=kw.get("arrival", 100),
+        hashed=kw.get("hashed", 120), M=120, dK=kw.get("dK", 20))}
     return {"name": "bring_up_" + repo.split("/")[-1], "kind": "bring_up",
             "status": kw.get("status", "ok"), "info": {"model": repo}, "extras": ex}
 
@@ -181,7 +198,8 @@ def test_no_tests_part_means_no_gate():
 
 def test_the_gate_passes_when_everything_holds():
     g = fs.device_leaves_gate(_parts())
-    assert g["pass"] is True and g["reasons"] == [] and g["line"].startswith("FS30 device leaves pass")
+    assert g["pass"] is True and g["reasons"] == []
+    assert g["line"].startswith("FS30 device leaves pass")
     assert set(g["models"]) == {r for r, _ in fs.RUN_PINS}
 
 
@@ -290,7 +308,7 @@ def test_the_job_accepts_the_session_with_its_deadline(tmp_path):
     r, out = t11._job(tmp_path, plan=t11.OK_PLAN,
                       extra={"FS11_SESSION": "device-leaves", "FS11_ALLOW_ANY_GPU": "1",
                              "FS11_DEADLINE_S": ""})
-    assert "deadline in 8000 s" in r.stdout
+    assert "deadline in 8800 s" in r.stdout
     assert "FS11_SESSION is" not in r.stdout + r.stderr
     assert json.loads((out / "summary.json").read_text())["session"] == "device-leaves"
 

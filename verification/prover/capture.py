@@ -621,7 +621,11 @@ class MatmulCapture(TorchDispatchMode):
             host.copy_(out, non_blocking=True)
             done = torch.cuda.Event()
             done.record(side)
-        pend = self._hash_arrival(rec, out, side) if self._hashable(rec, out) else None
+        try:
+            pend = self._hash_arrival(rec, out, side) if self._hashable(rec, out) else None
+        except BaseException:
+            done.synchronize()  # no GPU read of ``out`` may outlive it
+            raise
         # Held until the copy and the hash are done, so the allocator can't reuse its memory
         # under them.
         self._pending.append((rec, out, out._version, done, pend))

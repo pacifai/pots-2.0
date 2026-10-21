@@ -237,3 +237,76 @@ def test_prove_step_counts_the_digests_in_use_after_a_perturbation(c, monkeypatc
     assert len(out.arrival_digests) == c.M - 1
     assert out.capture["arrival_hash"]["used"] == c.M - 1
     assert out.capture["arrival_hash"]["leaves"] == c.M
+
+
+@pytest.fixture
+def table_log(c, leaves, on_kernel, monkeypatch):
+    """Small tables, and the queue and the read of each table logged (the real ones run)."""
+    monkeypatch.setattr(L, "_BATCH_ENTRIES", 2)
+    log = {"queued": [], "read": []}
+    enqueue, outcome = L._enqueue_table, L._table_outcome
+
+    def queue(idx, ts, tags):
+        log["queued"].append(idx)
+        return enqueue(idx, ts, tags)
+
+    def read(tb):
+        log["read"].append(tb.idx)
+        return outcome(tb)
+
+    monkeypatch.setattr(L, "_enqueue_table", queue)
+    monkeypatch.setattr(L, "_table_outcome", read)
+    return log
+
+
+def test_every_table_is_read_and_the_first_outcome_error_surfaces(c, leaves, table_log,
+                                                                  monkeypatch):
+    outcome = L._table_outcome
+    read = []
+
+    def failing(tb):
+        read.append(tb.idx)
+        if len(read) in (1, 3):
+            raise RuntimeError(f"outcome of {tb.idx}")
+        return outcome(tb)
+
+    monkeypatch.setattr(L, "_table_outcome", failing)
+    with pytest.raises(RuntimeError) as e:
+        hash_step_leaves(c, leaves)
+    assert len(table_log["queued"]) > 3
+    assert str(e.value) == f"outcome of {table_log['queued'][0]}"
+    assert read == table_log["queued"]
+
+
+def test_an_exception_in_flight_beats_an_outcome_error(c, leaves, table_log, monkeypatch):
+    def host_fails(*a, **k):
+        raise ValueError("host path")
+
+    def outcome_fails(tb):
+        table_log["read"].append(tb.idx)
+        raise RuntimeError("outcome")
+
+    monkeypatch.setattr(L, "leaf_hashes_until_error", host_fails)
+    monkeypatch.setattr(L, "_table_outcome", outcome_fails)
+    with pytest.raises(ValueError, match="host path"):
+        hash_step_leaves(c, leaves)
+    assert len(table_log["queued"]) > 1
+    assert table_log["read"] == table_log["queued"]
+
+
+def test_an_enqueue_that_fails_still_reads_the_tables_queued_before(c, leaves, table_log,
+                                                                    monkeypatch):
+    enqueue = L._enqueue_table
+    calls = []
+
+    def second_fails(idx, ts, tags):
+        calls.append(idx)
+        if len(calls) == 2:
+            raise RuntimeError("enqueue")
+        return enqueue(idx, ts, tags)
+
+    monkeypatch.setattr(L, "_enqueue_table", second_fails)
+    with pytest.raises(RuntimeError, match="enqueue"):
+        hash_step_leaves(c, leaves)
+    assert len(calls) == 2
+    assert table_log["read"] == [calls[0]]

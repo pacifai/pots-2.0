@@ -117,7 +117,8 @@ def test_a_known_digest_beside_an_ignored_one_still_counts_once(c, leaves):  # n
 
 
 @pytest.mark.parametrize("break_it", ["shape", "dtype", "stride"])
-def test_a_known_leaf_failing_a_structural_check_raises_the_plain_error(c, leaves, break_it):  # noqa: F811
+def test_a_known_leaf_failing_a_structural_check_raises_the_plain_error(
+        c, leaves, break_it):  # noqa: F811
     i = c.product_index(3)
     bad = list(leaves)
     t = bad[i]

@@ -704,14 +704,20 @@ def kernel_speed_plan(upload: Path, out: Path) -> list[Part]:
 # checked on the H100 against the CPU path's roots. Time limits, seconds: the CUDA tests (the
 # kernel's two files, FS30's own tests and the capture's memory test) 1,200; each bring-up
 # 1,800 (the re-check's limit, :data:`RECHECK_TIMEOUT_S`); the models part 1,800; the native
-# build 900 (:func:`with_native_build`). Estimates, minutes, scaled by hand from the re-check
-# (nothing was measured): models 5, native build 2, CUDA tests 8, four bring-ups about 30
-# (the first session's one finished took 191 s, Llama-3.2-1B's two-step run 1,152 s, and each
-# step here also hashes its leaves a second time on the CPU path). Parts about 45 min, packing
-# about 1, the grace window 20: about 66 min. The job's deadline is twice that, 132 min,
-# rounded up to 8,000 s; the parts stop by 8,000 - 1,200 - 600 = 6,200 s.
+# build 900 (:func:`with_native_build`). Estimates, minutes, scaled by hand from the parts' own
+# earlier figures (nothing was measured): models 5, native build 2, CUDA tests 8. A bring-up
+# here is one step with no repeats, but it hashes the step's leaves a second time on the CPU
+# path. The figures: the first session's one finished bring-up took 191 s (Qwen2.5-0.5B's size,
+# about 3 min), and Llama-3.2-1B's two-step bring-up with repeats took 1,152 s (about 19 min;
+# a step is 200-300 s of it, so one step without repeats is taken as about 10 min), Falcon3-1B
+# about the same as Llama, Qwen2.5-1.5B about 14. Four bring-ups about 37 (10 + 10 + 3 + 14).
+# Parts about 52 min, packing about 1, the grace window 20: about 73 min. The job's deadline is
+# twice that, 146 min, rounded up to the next 100 s: 8,800 s; the parts stop by
+# 8,800 - 1,200 - 600 = 7,000 s. (The first version of this plan took the four bring-ups as
+# about 30 min, which its own Llama figure, 19 min alone, did not support; its deadline was
+# 8,000 s.)
 DEVICE_LEAVES_TIMEOUT_S = {"models": 1800, "tests": 1200, "bring_up": 1800}
-DEVICE_LEAVES_DEADLINE_S = 8000
+DEVICE_LEAVES_DEADLINE_S = 8800
 DEVICE_TESTS_FILE = "tests/verification/runs/test_device_leaves_cuda.py"
 DEVICE_TESTS_MEMORY = ("tests/verification/prover/test_capture_cuda.py"
                        "::test_gpu_memory_does_not_hold_the_transcript")

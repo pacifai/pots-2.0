@@ -38,6 +38,7 @@ from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import (
     HOST,
     DeclaredComputation,
+    ProductKind,
     load_weights,
     snapshot_weights,
 )
@@ -253,10 +254,17 @@ def prove_step(
         product_versions = list(_versions(products))
         cap.release_operands()
         arrival = {}
+        missing: dict[str, int] = {}  # products with no digest, by kind (a diagnostic)
+        missing_first: list[str] = []  # the first few that are not operand gradients
         for m, p in enumerate(products, 1):
             d = cap.arrival_digest(p)
             if d is not None:
                 arrival[computation.product_index(m)] = d
+            else:
+                spec = computation.product(m)
+                missing[spec.kind.name] = missing.get(spec.kind.name, 0) + 1
+                if spec.kind is not ProductKind.OPERAND_GRAD and len(missing_first) < 5:
+                    missing_first.append(spec.name)
     summary = cap.summary()
     summary["host_buffers"] = ({"n_buffers": cap.buffers.n_buffers, "nbytes": cap.buffers.nbytes}
                                if cap.buffers is not None else None)
@@ -272,7 +280,8 @@ def prove_step(
         arrival.pop(computation.product_index(m), None)  # the digest was of the old bytes
 
     if "arrival_hash" in summary:  # the digests in use, after the perturbations
-        summary["arrival_hash"]["used"] = len(arrival)
+        summary["arrival_hash"].update(used=len(arrival), missing=missing,
+                                       missing_first=missing_first)
 
     with sec("train.update"):
         opt.step()

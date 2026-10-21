@@ -380,7 +380,8 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     every leaf hashed by the C library), how many arrival digests the commit could use (``used``),
     how many products the capture hashed on arrival (``hashed``; the ``dK`` records too, whose
     digests go unused), ``M``, and how many ``dK`` leaves there are (the ones the prover hashes at
-    the commit); and whether the step was accepted. Run on a CPU, no leaf takes a digest and the roots agree trivially."""
+    the commit); and whether the step was accepted. Run on a CPU, no leaf takes a digest and the
+    roots agree trivially."""
     if b.kept is None:
         raise ValueError("device_leaves_line needs the step's leaves: run with keep_last")
     step = next(s for s in b.result.loop.steps if s.t == T)
@@ -392,6 +393,17 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     return (f"device leaves: step {T} accepted {step.rejection is None}, "
             f"prover root {step.root.hex() if step.root else 'none'}, cpu root {cpu_root.hex()}, "
             f"arrival digests {used}, hashed {hashed}, M {c.M}, dK leaves {dk}")
+
+
+def device_leaves_missing_line(b: BringUp, *, T: int) -> str:
+    """The line after :func:`device_leaves_line`, for a person: which products got no arrival
+    digest, by kind, and the first few that aren't operand gradients (the ``dK`` records'
+    digests are hashed but unused, so ``OPERAND_GRAD`` is expected). Nothing parses it."""
+    step = next(s for s in b.result.loop.steps if s.t == T)
+    ah = (step.capture or {}).get("arrival_hash") or {}
+    kinds = ", ".join(f"{k} {n}" for k, n in (ah.get("missing") or {}).items()) or "none"
+    first = ", ".join(ah.get("missing_first") or ()) or "none"
+    return f"device leaves missing: {kinds}; first others: {first}"
 
 
 # ---- the timed run's work counts ----------------------------------------------------------
@@ -690,6 +702,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report(b, k=k, reference=reference, c=c, T_run=cfg.steps, timed=args.metrics)
     if args.device_leaves:
         print(device_leaves_line(b, c, T=args.steps), flush=True)
+        print(device_leaves_missing_line(b, T=args.steps), flush=True)
     if args.check5_repeats > 0:
         check5_repeats(b, c, h_D=h_D, n_records=len(D), k=k, seed=cfg.seed,
                        step=args.steps, repeats=args.check5_repeats, device=cfg.device,

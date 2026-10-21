@@ -19,7 +19,7 @@
 #    (bad deadlines, less than FS11_MIN_FREE_GB free under OUT_DIR) terminates the pod.
 # 2. A deadline timer starts: FS11_DEADLINE_S (default 12600, 3.5 h; 7500, 2 h 5 min, for the
 #    re-check; 19800, 5.5 h, for the profile check; 5400, 1.5 h, for the hardware probe; 11800,
-#    3 h 17 min, for the two-GPU session; 8000, 2 h 13 min, for the device-leaves session)
+#    3 h 17 min, for the two-GPU session; 8800, 2 h 27 min, for the device-leaves session)
 #    after the start it terminates the pod, whatever the job is doing.
 # 3. The session (verification.runs.fs11_session run) prints the environment, refuses a
 #    machine without an H100 (FS11_ALLOW_ANY_GPU=1 overrides; the hardware probe also refuses
@@ -92,7 +92,7 @@ DEFAULT_DEADLINE_S=12600
 [ "$SESSION" = nvlink-probe ] && DEFAULT_DEADLINE_S=5400
 [ "$SESSION" = fs32-pair ] && DEFAULT_DEADLINE_S=11800
 [ "$SESSION" = kernel-speed ] && DEFAULT_DEADLINE_S=5400
-[ "$SESSION" = device-leaves ] && DEFAULT_DEADLINE_S=8000
+[ "$SESSION" = device-leaves ] && DEFAULT_DEADLINE_S=8800
 if [ -n "${FS31_CARDS:-}" ]; then export FS31_CARDS; fi
 if [ "$SELFTEST" = 1 ]; then
   DEADLINE_S=${FS11_DEADLINE_S:-360}; GRACE_S=${FS11_GRACE_S:-120}

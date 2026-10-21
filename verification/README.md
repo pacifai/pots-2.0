@@ -1098,23 +1098,31 @@ BLAKE3 benchmark, FS28) and keeps the 32-byte digest; the step carries these as
 the kernel in one table, and everything else (the records, the weights, the `δK̃` products,
 perturbed or non-finite products) goes through the C library as before. Check 2 on the verifier
 always recomputes every digest with the C library, so a wrong digest shows up as a root mismatch.
-The first NVRTC build of the kernel happens in the first step's forward pass, inside the first
-captured CUDA matmul, unless the process calls `GpuBlake3().kernels(device)` earlier.
+The first NVRTC build of the kernel would happen in the first step's forward pass, inside the
+first captured CUDA matmul, so `run_loop` calls `GpuBlake3().kernels(device)` once before step
+1 when the model is on CUDA, outside every section. A CUDA run that doesn't go through
+`run_loop` (`card_identity`) is left as it was: it builds on its first use.
 
 1. **Prep, on the Mac**, after committing: `HF_HUB_OFFLINE=1 .venv/bin/python -m
    verification.runs.fs11_prep --out DIR`, the default upload, which carries the four models.
 2. **On the pod**, as in the first session: extract the upload, make the venv, install, run the
-   job with `FS11_SESSION=device-leaves`. The default deadline is 8,000 s: the parts take about
-   45 minutes (models 5, native build 2, CUDA tests 8, four bring-ups about 30), packing about
-   1 and the grace window 20, so about 66 minutes; twice that is 132 minutes, rounded up. The
-   estimates are scaled by hand from the re-check; none was measured. The session refuses
+   job with `FS11_SESSION=device-leaves`. The default deadline is 8,800 s: the parts take about
+   52 minutes (models 5, native build 2, CUDA tests 8, four bring-ups about 37: Llama-3.2-1B
+   and Falcon3-1B about 10 each, Qwen2.5-0.5B about 3, Qwen2.5-1.5B about 14), packing about
+   1 and the grace window 20, so about 73 minutes; twice that is 146 minutes, rounded up to the
+   next 100 s. The bring-up figures are scaled by hand from the earlier sessions' (Llama's
+   two-step run with repeats took 19 minutes, the 0.5B model's one bring-up 191 s); none was
+   measured. The session refuses
    without CUDA and an H100 (`FS11_ALLOW_ANY_GPU=1` overrides).
 3. **The parts.** The native build, the models part, `device_tests` (the kernel's two test
    files, `test_device_leaves_cuda.py` and the capture's GPU-memory test, junit report), then
    one `bring_up --no-tamper --device-leaves` per model, `Qwen/Qwen2.5-0.5B-Instruct` first.
    Each bring-up prints one `device leaves:` line with the prover's root, the CPU path's root
-   over the same leaves, the number of arrival digests in use, the number of products hashed on arrival, `M` and the
-   number of `δK̃` leaves.
+   over the same leaves, the number of arrival digests in use, the number of products hashed
+   on arrival, `M` and the number of `δK̃` leaves. A second line, which nothing parses, reads
+   `device leaves missing: <kind> <count>, ...; first others: <names or none>`: the products
+   with no arrival digest by kind, and the first five that aren't operand gradients. On an
+   honest decoder step it reads `OPERAND_GRAD <the δK̃ count>; first others: none`.
 4. **The gate.** `summary.json["device_leaves"]` and the last job-log line. It passes only if the
    tests part finished `ok` with no failure or error, none of FS30's CUDA tests was skipped,
    and for every model the step was accepted, the two roots are equal and the arrival digests in use
