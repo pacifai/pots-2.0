@@ -10,6 +10,9 @@ holds the real kernel to the same numbers."""
 import ctypes
 import hashlib
 import re
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,6 +26,10 @@ from tests.verification.verifier.matmul_check.test_measure_core import (  # noqa
     host_measure,
     hostlib,
     make,
+)
+from tests.verification.verifier.matmul_check.test_measure_core_spec import (  # noqa: E402
+    fs36_cases,
+    same_bits,
 )
 from verification.commitment import gpu_blake3 as gb
 from verification.computation.interface import ReplayError
@@ -77,6 +84,16 @@ def test_phased_equals_the_host_build_on_fs36_inputs(phased, k, dtype, biased, g
     mis = [make(n, q, w, k, dtype=dtype, biased=biased, guard=guard, seed=s)
            for s, (n, q, w) in enumerate(SHAPES)]
     same(phased(mis), phased.reference(mis))
+
+
+def test_phased_equals_the_host_build_on_every_fs36_case(phased):
+    """The Mac twin of the CUDA file's ``test_kernel_equals_host_on_fs36_inputs``: the same case
+    list, each case alone, the kernel's decomposition against the host build."""
+    cases = fs36_cases()
+    assert len(cases) >= 200
+    for label, mi in cases:
+        want, got = phased.reference([mi])[0], phased([mi])[0]
+        assert same_bits(got, want), (label, got, want)
 
 
 def test_mixed_shapes_dtypes_flags_in_one_table_in_any_order(phased):
@@ -468,8 +485,36 @@ class FakeNvrtc:
         return ""
 
 
+IMPORT_PROBE = """
+import torch
+
+
+def libs():
+    try:
+        maps = open("/proc/self/maps").read()
+    except OSError:
+        return set()  # not Linux: the caches and torch's CUDA state are the evidence
+    return {ln.split()[-1] for ln in maps.splitlines()
+            if "libnvrtc" in ln or "libcuda." in ln or "libcuda-" in ln}
+
+
+before = libs()  # whatever torch itself maps; the imports below must add no nvrtc or libcuda
+import verification.runs.loop
+import verification.verifier.matmul_check.freivalds
+from verification.verifier.matmul_check import measure_kernel as mk
+assert mk._kernels.cache_info().currsize == 0 and mk._built.cache_info().currsize == 0
+assert not torch.cuda.is_initialized()
+assert libs() == before, libs() - before
+print("ok")
+"""
+
+
 def test_importing_compiles_and_loads_nothing():
-    assert mk._kernels.cache_info().currsize == 0 and mk._built.cache_info().currsize == 0
+    """In a fresh interpreter, so earlier tests' caches and library loads cannot show."""
+    root = Path(__file__).resolve().parents[4]
+    proc = subprocess.run([sys.executable, "-c", IMPORT_PROBE], cwd=root, capture_output=True,
+                          text=True)
+    assert proc.returncode == 0 and proc.stdout.strip() == "ok", proc.stderr
 
 
 def test_build_passes_fmad_false_the_headers_and_caches(tmp_path):

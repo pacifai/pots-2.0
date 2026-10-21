@@ -28,8 +28,11 @@ typedef unsigned int pots_u32;
 typedef unsigned long long pots_u64;
 typedef long long pots_i64;
 #else
-/* The host build also passes -ffp-contract=off; the NVRTC build will pass --fmad=false (FS37). */
+/* The host build also passes -ffp-contract=off, which gcc needs: it ignores the pragma, which
+ * clang honours. NVRTC passes --fmad=false (FS37). */
+#if defined(__clang__)
 #pragma STDC FP_CONTRACT OFF
+#endif
 #include <math.h>
 #include <stdint.h>
 typedef uint16_t pots_u16;

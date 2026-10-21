@@ -748,6 +748,13 @@ interface.
     result, so no stack in the operand format sits beside it (check 5 asks for fp32; at bf16
     that would be half as much again). The default does exactly that. A caller that gets an exception falls back to
     `operands(m)` per member to find the failing one.
+    `operand_blocks(ms) -> list[OperandBlock]` serves the same products as views: each
+    `OperandBlock(pos, a, b)` holds `a[t]`, `b[t]` of `ms[pos[t]]`, detached views in the
+    operand dtype with the replay's own strides, never copies, and the blocks' `pos` cover
+    `ms` once. The replay's state afterwards, and the first error, are those of `operands(m)`
+    over `ms`. The default is one block per member. `operand_device(m)` is the device
+    `operands(m)` serves on, without serving anything, or `None` when the replay doesn't say.
+    Check 5's kernel path uses both.
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
     imports the prover. So is `snapshot_weights(computation, model)`, the one way to copy the
     declared weights out of a model: the prover's `W_{t+1}` leaves and every run's `W_0`
@@ -1156,6 +1163,14 @@ interface.
       result, `dK`'s transposed, converting to `dtype`; a role whose members aren't evenly
       spaced is copied member by member. The unit guards, the first error and `_served_last` are those
       of `operands(m)` over `ms`. Any other `ms` takes the default.
+    - `operand_blocks(ms)` is that serving as views: one `OperandBlock` per role piece, `a`
+      and `b` the strided slices of the role's whole bmm operands (`dK`'s transposed) at
+      batch indices `i0 + bs·t`, positions `pos + R·t`. The version and dtype checks, the unit
+      guards and `_served_last` are `operand_group`'s. A role's members that aren't whole
+      progressions come as one block when their batch indices form a progression and one
+      block per member otherwise; anything that isn't attention members takes the default.
+      `operand_device(m)` is the verifier device of `m`'s layer (the head's for a product
+      without one), from the placement.
     - Memory, as in training: after the forward pass every unit's graph and operands are
       held, about one training step's activations. Each unit's backward frees its graph
       (`retain_graph=False`) and the unit is dropped, so memory falls unit by unit; the
@@ -1576,6 +1591,25 @@ interface.
     5 measured before 2026-10-14; the byte limit cuts one only past 32,768 members at
     128×128×64 (Llama-3.2-1B's largest at `n_s = 128` has 12,288, 1.5 GiB). On SmolLM2 each
     layer has four: `S` and `O` (36 members each), `dA` (36) and `dV`+`dQ`+`dK` (108).
+  - **Check 5 on the kernel (FS37, O2).** `_measure_served` takes the kernel path for a run
+    whose operands' device (`Replay.operand_device`, asked before serving anything) satisfies
+    `freivalds.kernel_device`: CUDA outside `reference()`. Every other device keeps the fp32
+    serving above, bit for bit. A run of one is served by `_served_view`: the operands as the
+    replay gives them in the operand dtype, `P` moved to the device as stored (non-blocking,
+    never widened), and for a biased product the committed `W_t` bias leaf rounded to the
+    operand dtype there. A member run is served group by group by `_served_blocks`: one
+    `MeasureGroup` per block of `Replay.operand_blocks`, views over the replay's tensors, `P`
+    a view of the committed leaves (`product_run` when a block's labels form a progression,
+    else `product_block`), with one `c5.copy` stamp per group around all its blocks' copies.
+    Each group is one `freivalds.measure_groups_rows` call, which enqueues the kernel and
+    reads nothing; the rows are mapped back to the run's positions block by block. The
+    kernel's bits don't depend on strides, grouping or widening, so a serving error finishes
+    through `_measure_to_failure` as on the torch path. `freivalds.drain()` runs before every
+    row read (`_read_rows`) and at the end of check 5, whatever ends it (invariant 6), so a
+    held input that changed raises `ReplayError`. Two reads outside the window loop drain as
+    well: `_record_rest_5` drains in a `finally` around its measuring loop, so a later run's
+    serving error or a judged product that raises leaves no hold, and `_measure_run` (the
+    planted-error sweep) drains before it reads its rows.
   - **Judging window (2026-10-14).** Check 5's numbers stay on the device, one float64 row
     per product (`freivalds.ROW`), until at least `_JUDGE_WINDOW` (1024) products are
     measured, at the end of a run. Then one `tolist` brings the window's rows to the host
@@ -1760,13 +1794,27 @@ interface.
     from the old branch's.
   - `guard=False` (both functions) skips `|A|`, `|B|` and `|P|·1`: ν, `‖|P|·1‖` and κ come
     back NaN, and every test-2 number keeps its bits. Only `StepContext.kappa_guard` uses it.
+  - **Kernel routing (FS37, O2).** `MeasureGroup(a, b, p, ms, bias=None)` is products measured
+    together: member `t` is `a[t]·b[t]` against `p[t]`, labelled `ms[t]`, as views with any
+    strides (`a`, `b` in the operand dtype, `p` as stored, one CUDA device; a bias only with
+    one member). `kernel_device(device)` is true on CUDA outside `reference()`, a context
+    manager that forces the torch path everywhere, for the comparison tests, and nests.
+    `measure_groups_rows(groups, *, h, k, guard=True)` enqueues the fused kernel
+    (`measure_kernel.enqueue`) and returns the float64 rows, groups in order and members in
+    order within each, with no host read. `drain(device=None)` waits for every enqueued
+    measurement, raises `ReplayError` if a held input's `_version` moved, and releases the
+    holds; call it before reading rows. It does nothing if the kernel module was never
+    imported. A CPU or MPS run never reaches the kernel and keeps every number bit for bit.
+    The kernel's rows equal the host build of the core bit for bit and agree with torch's
+    numbers to FS36's rounding bound only.
   - `_measure_product_reference` and `_measure_products_reference` keep the plain formulas.
     The tests compare every field bit for bit on adversarial inputs, and on the real step
     all 7,113 products match. Check 5's measure time fell from 1.09 s to 0.72 s, and check 5
     from about 1.75 s to 1.3 s (2026-10-04, `MallocLargeCache=0`).
 - `measure_core.h`, `measure_table.py` (FS36, O2): check 5's measuring arithmetic as plain C
-  that NVRTC and a host C compiler both build, and its Python side. Nothing calls them yet
-  besides their tests (FS37 wires the kernel into `freivalds.py` and `checks.py`).
+  that NVRTC and a host C compiler both build, and its Python side. FS37's kernel
+  (`measure_kernel.py`, below) runs them on the GPU and `freivalds.py` routes CUDA runs to it;
+  the host build serves the tests.
   `measure_core.h` computes one product's row, the columns of `freivalds.ROW` in float64, from
   strided bf16 or fp32 views (`pots_mview_t`, `pots_mprod_t`, `pots_mprod_check` refuses a
   bad dtype, `k = 0` or mismatched shapes). The order is pinned by
@@ -1779,6 +1827,40 @@ interface.
   the product on a bad dtype, shape, `r`, device or `k`; keep the `Table` alive while a build
   reads it). Tests: `measure_core_host.c` and `test_measure_core.py` compile the host library
   with `-ffp-contract=off`.
+- `measure_kernel.py`, `measure_kernel.cu`, `measure_phases.h`, `challenge_source.py` (FS37,
+  O2): check 5's measuring on the GPU, with the same decomposition as the host build of the
+  core.
+  - `measure_phases.h` splits a product's row into three phases (B's rows, A's and P's rows,
+    the row's columns) of items, one warp each, and steps (a dot or sum whose 32 partials are
+    the 32 lanes), with the per-product scratch layout (`pots_mwork_t`). `measure_kernel.cu`
+    maps items and steps onto warps and shuffles: one kernel, `pots_measure_phase`, launched
+    once per phase. The host test runs the same items and steps in loops.
+  - **Build.** NVRTC (through `gpu_blake3`'s `Nvrtc`, `Driver` and `build_image`) compiles
+    the three sources with `--fmad=false`, so the only fused operation is the core's `fmaf`.
+    The CUBIN is cached under `native.cache_dir()`, keyed by the sources, the options, the
+    NVRTC version and architecture. Importing the module compiles and loads nothing. `kernels(device)`
+    builds or loads on first use and returns that device's `MeasureKernels`; a cached image
+    the driver rejects is dropped and compiled afresh once.
+  - **The call.** `enqueue(groups, *, h, k, guard=True, challenges=None, run=None)` takes
+    `MeasureGroup`s (`freivalds.py`), packs every member into one table in one pinned buffer,
+    copies it up with one non-blocking copy and launches the three phases on the current
+    stream. It returns the float64 rows `[Σ n_t, row_width(k)]` on the device and reads
+    nothing back. `validate` applies FS36's rules per group first (`ValueError` naming the
+    group and its products). `run` replaces the loaded kernel and `challenges` the challenge
+    source, for tests.
+  - **Holds.** Each call is a `Pending`: its event, every input (`a`, `b`, `p`, `bias`) with
+    its `_version` as enqueued, and the buffers the stream reads. `retire(device)` releases
+    the entries whose event has completed, as each `enqueue` does first. `drain(device=None)`
+    waits for every entry, releases them all, then raises `ReplayError` (invariant 6) if an
+    input's `_version` moved, since a read that outlives its call must see the values it was
+    enqueued with. An inference tensor has no version and isn't checked.
+  - `challenge_source.py`: `ChallengeSource.draw(h, ms, k, widths, *, stream)` returns one
+    float32 buffer holding each product's `challenge_matrix(h, m, k, width)`, the byte offset
+    of each, and an event recorded after the work that fills it (`None` on the CPU). It is the
+    seam for the hashing session's GPU XOF (FS41). `HostChallengeSource` is the one in use:
+    the native library draws the entries on the host into a pinned buffer, once per distinct
+    width, and one non-blocking copy sends it up; the staging buffer lives until that copy's
+    event completes.
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m(q, eps_in, eps_acc, u_ratio=1.0)` is F18's split, `√2·ε_in + √q·ε_acc·max(1,
@@ -1812,6 +1894,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
+  - Before step 1, `run_loop` builds `measure_kernel.kernels(d)` beside `GpuBlake3().kernels(d)`
+    on every CUDA device of the run (FS37), so the first NVRTC build or cache load lands outside
+    every timed section. The pipelined loop's pre-build is FS34's.
   - `release_device_cache(device, section=None, *, devices=None)`: only when the run's
     `device` or any of `devices` (the sharded run's verifier devices, `c.placement.devices`;
     FS32d) is CUDA (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in
