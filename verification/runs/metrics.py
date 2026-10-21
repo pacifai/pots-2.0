@@ -882,13 +882,13 @@ class _CudaTimeSection:
             torch.cuda.synchronize(rec._device)
             self.t0 = time.monotonic_ns()
             self.e0 = torch.cuda.Event(enable_timing=True)
-            self.e0.record()
+            self.e0.record(torch.cuda.current_stream(rec._device))
             rec._anchor = (self.t0 / 1000.0, self.e0)
             self.a0 = _alloc_counters(rec._device)
         else:
             self.t0 = time.monotonic_ns()
             self.e0 = torch.cuda.Event(enable_timing=True)
-            self.e0.record()
+            self.e0.record(torch.cuda.current_stream(rec._device))
 
     def __exit__(self, *exc: Any) -> None:
         rec, acc = self.rec, self.acc
@@ -897,7 +897,7 @@ class _CudaTimeSection:
         if acc.c5:
             rec._c5_open -= 1
         e1 = torch.cuda.Event(enable_timing=True)
-        e1.record()
+        e1.record(torch.cuda.current_stream(rec._device))
         if not self.top:
             t1 = time.monotonic_ns()
             slot = _span(acc, self.t0, t1, gpu=True)
@@ -985,7 +985,9 @@ class _MultiCudaTimeSection:
 
 class _Stamp:
     """One check-5 stamp: host ``monotonic_ns`` at entry and exit and, on CUDA, an event pair
-    (no synchronize). Appends to the recorder's step columns as it closes."""
+    (no synchronize). Appends to the recorder's step columns as it closes. Both events go on the
+    stream of the recorder's first device, where the section's anchor is: a stamp times that
+    device only (the top-level sections wait on every device)."""
 
     __slots__ = ("rec", "col", "run", "group", "window", "h0", "e0")
 
@@ -995,7 +997,7 @@ class _Stamp:
     def __enter__(self) -> None:
         if self.rec._cuda:
             self.e0 = torch.cuda.Event(enable_timing=True)
-            self.e0.record()
+            self.e0.record(torch.cuda.current_stream(self.rec._device))
         self.h0 = time.monotonic_ns()
 
     def __exit__(self, *exc: Any) -> None:
@@ -1004,7 +1006,7 @@ class _Stamp:
         rows = rec._stamps
         if rec._cuda:
             e1 = torch.cuda.Event(enable_timing=True)
-            e1.record()
+            e1.record(torch.cuda.current_stream(rec._device))
             rec._stamp_pending.append((len(rows), self.e0, e1))
         rows.append((self.col, self.run, self.group, self.window, self.h0, h1))
 

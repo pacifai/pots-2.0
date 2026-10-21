@@ -3,7 +3,9 @@
 ``run_loop(..., pipelined=True)`` calls :func:`run_pipelined`. The child trains, commits and
 shares step ``t + 1`` while the parent verifies step ``t``, the way a deployed prover and
 verifier run on two machines (F22, ``ENVIRONMENT_PLAN_DRAFT`` "Sequential or pipelined"). The
-sequential loop (``loop.py``) is untouched; this module is the other mode.
+sequential loop (``loop.py``) keeps its order; this module is the other mode. FS33b changed
+``run_loop`` only to load the hash kernels on every CUDA verifier device before step 1, outside
+every section; fix 1 added ``loop.run_devices``.
 
 **What the child rebuilds from.** The parent builds no prover model. The child builds its own
 from a :class:`ProverSpec`, a picklable zero-argument callable that returns a

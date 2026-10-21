@@ -1850,8 +1850,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     runs. The stored step (`--keep-step`) is written by the parent after `verify_step(t)`,
     outside every clock; it delays `release(t)`. `poisoned_step` reads `W_{t+1}` from
     `LoopResult.w_final`. Refused with one line naming the entry point: `bring_up`,
-    `store_crosscheck`, `mlp_smoke`, `metrics_overhead`, and `flipped_matmul_sweep` with the
-    sweep or `--source in-process`. `full_scale`'s sweep stage sets `VERIF_PIPELINED=0` for
+    `store_crosscheck`, `mlp_smoke`, `metrics_overhead`, and `flipped_matmul_sweep` without
+    `--no-sweep` (with it, `--source in-process` runs pipelined; the source is unused).
+    `full_scale`'s sweep stage sets `VERIF_PIPELINED=0` for
     its job.
   - `runs/pipeline.py` (FS33b): child to parent `ready` (handshake), `step`, `released`,
     `final`, `error`; parent to child `release`, `stop`, `bye`. At most 2 steps are unreleased.
@@ -1970,6 +1971,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     lists the verifier devices too: `loop.run_devices(c, pipelined=)` (`None` unsharded, so rows
     stay; the verifier devices when pipelined; the prover's device first when sequential), passed
     as `devices=` to `MetricsWriter.recorder` and `memory_run` by every verified entry point.
+    Check 5's stamps time the recorder's first device only (their events go on its stream, where
+    the anchor is); the top-level sections still wait on every device.
   - **Two processes (FS33c).** The child `close_step(t) -> StepPart` (no section open); the parent
     `merge_step(t, part)` before `on_step(t)`: one set of rows and one markers line for both sides.
     One merge per step, after the parent's own sections and before `on_step(t)`; a part of another

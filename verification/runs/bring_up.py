@@ -105,7 +105,7 @@ from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol
 from verification.prover.step import prove_step
 from verification.runs.check5_profile import profile_step, record_line
 from verification.runs.llama_step import load_committed_dataset, report_costs
-from verification.runs.loop import release_cache_setting, release_device_cache
+from verification.runs.loop import release_cache_setting, release_device_cache, run_devices
 from verification.runs.metrics import (
     SCORE_FAMILIES,
     MetricsWriter,
@@ -357,10 +357,11 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
         run(recorder)
         rows: list[dict[str, Any]] = []
     else:
-        probe = memory_probe(device)
+        devs = run_devices(c, pipelined=False)
+        probe = memory_probe(devs[0] if devs else device)
         if echo is not None:
             echo(f"== memory pass: each section's peak as it closes, GB [{probe.source}]")
-        rows = memory_pass(RUN_NAME, HONEST.name, run, probe, echo=echo)
+        rows = memory_pass(RUN_NAME, HONEST.name, run, probe, echo=echo, devices=devs)
     out = BringUp(got["r"], rows, got["cal"], got["bands"], got["freeze"],
                   kept=None if keeper is None else keeper.kept())
     out.result.loop.w_final = {}  # the prover's W_T: check 8 has read it, and it is |W| bytes
@@ -696,7 +697,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                                       "n_leaves": c.n_leaves})
             mw.write_c5_layout(c)  # what the markers' check-5 stamps index
             rec = mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0,
-                              trace_step=cfg.trace_step, trace_c5=cfg.trace_c5)
+                              trace_step=cfg.trace_step, trace_c5=cfg.trace_c5,
+                              devices=run_devices(c, pipelined=False))
         b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
                      device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
                      echo=lambda line: print(line, flush=True),

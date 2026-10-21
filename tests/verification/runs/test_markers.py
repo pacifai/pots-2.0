@@ -275,7 +275,7 @@ class _Ev:
     def __init__(self, enable_timing=False):
         self.t = None
 
-    def record(self):
+    def record(self, stream=None):
         _Ev.now += 1.0
         self.t = _Ev.now
 
@@ -302,6 +302,7 @@ def fake_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", _Ev)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda d=None: syncs.append(1))
     monkeypatch.setattr(torch.cuda, "memory_stats", stats)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda d=None: None)
     rec = TimeRecorder("r", "s")
     rec._Section, rec._cuda = metrics._CudaTimeSection, True
     return rec, syncs, reads
