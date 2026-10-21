@@ -131,7 +131,7 @@ def test_a_store_serving_other_bytes_is_caught(tmp_path):
     assert bad.result.actual.check_id == "5"
 
 
-def test_main_on_the_tiny_llama(tiny, monkeypatch, tmp_path, capsys):
+def _main_env(tiny, monkeypatch, tmp_path):
     c, D, w0, _ = tiny
     n = c.n
     monkeypatch.setattr(DecoderComputation, "from_config",
@@ -148,6 +148,10 @@ def test_main_on_the_tiny_llama(tiny, monkeypatch, tmp_path, capsys):
         json.dumps({"h_D": dataset_tree(c, D).root.hex()}))
     ctx = band_context(load_config(), c, h_D=dataset_tree(c, D).root, k=K)
     _band_file(c, D, w0, tmp_path / "bands.json", context=ctx)
+
+
+def test_main_on_the_tiny_llama(tiny, monkeypatch, tmp_path, capsys):
+    _main_env(tiny, monkeypatch, tmp_path)
     band_bytes = (tmp_path / "bands.json").read_bytes()
     assert sc.main(["--metrics"]) == 0
     text = capsys.readouterr().out
@@ -156,3 +160,19 @@ def test_main_on_the_tiny_llama(tiny, monkeypatch, tmp_path, capsys):
     assert "memory pass" in text
     assert (tmp_path / "bands.json").read_bytes() == band_bytes
     assert not (tmp_path / sc.RUN_NAME / "transcripts").exists()  # cleaned up
+
+
+def test_main_passes_run_devices_to_the_memory_pass(tiny, monkeypatch, tmp_path, capsys):
+    _main_env(tiny, monkeypatch, tmp_path)
+    modes, got = [], []
+    real = sc.memory_run
+
+    def spy(*a, **kw):
+        got.append(kw["devices"])
+        return real(*a, **kw)
+
+    monkeypatch.setattr(sc, "run_devices", lambda c, *, pipelined: modes.append(pipelined)
+                        or ("cpu",))
+    monkeypatch.setattr(sc, "memory_run", spy)
+    assert sc.main(["--metrics"]) == 0
+    assert modes == [False, False] and got == [("cpu",), ("cpu",)]
