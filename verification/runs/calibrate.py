@@ -447,7 +447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
              "M": c.M, "n_leaves": c.n_leaves}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                  if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
-                                   "trace_c5")}, "llama": llama}
+                                   "trace_c5", "pipelined")}, "llama": llama}
     base = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models)
     mw = (MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
                         corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,

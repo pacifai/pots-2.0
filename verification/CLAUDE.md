@@ -99,6 +99,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (ยง8.A.5).
 | `VERIF_OUTPUT_DIR` | `trainer_output/verification` (gitignored) |
 | `VERIF_METRICS` | `1`: runs write B6's metrics to `$VERIF_OUTPUT_DIR/<run>/`; `0` turns them off. Only `0` or `1` |
 | `VERIF_RELEASE_CACHE` | `1`: on CUDA, the loop hands the allocator's cached blocks back between prover and verifier (`loop.release_device_cache`); `0` skips it, so the re-check session can time the verified step without it. Only `0` or `1`. Read by every verified run: `bring_up` and `llama_step` pass it, and `run_loop`, `run_scenario`, `memory_run`, `bias_tamper` and `run_honest` read it themselves when their `release_cache` is `None` (the default, `loop.release_cache_setting`). It changes no number, so no config hash holds it |
+| `VERIF_PIPELINED` | `0`: the loop runs the prover and verifier in one process, step by step. `1`: the prover runs in a spawned child process (`runs/pipeline.py`) and the verifier in the parent, so step `t+1` is proved while step `t` is verified. Only `0` or `1`. `run_loop`, `run_scenario` and `memory_run` read it when their `pipelined` is `None` (`loop.pipelined_setting`). It changes no number, so no config hash holds it |
 
 `VERIF_DATASET` and `VERIF_DATASET_REVISION` are retired: F8d pins the data in
 `setup/backdoorllm.py`, and setting either raises.
@@ -1767,6 +1768,17 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     Set `PYTORCH_ALLOC_CONF=expandable_segments:True` in the run's environment, not in
     Python: the allocator reads it at CUDA's first use. torch 2.9 prefers that name over the
     deprecated `PYTORCH_CUDA_ALLOC_CONF`, so leave the old one unset.
+  - Pipelined mode (FS33b): `run_loop(c, None, D, None, verifier, ..., pipelined=True,
+    prover=spec)`, or `VERIF_PIPELINED=1`. `model` and `w0` must be `None`; `prover` is a
+    picklable `ProverSpec` the child calls to build its `ProverSide(c, build_model, D, w0)`
+    (it does its own `setup_determinism`). The parent runs `runs/pipeline.py`'s
+    `run_pipelined`; `LoopResult.pipelined` and `child_info` say so. A `ProverFault` is
+    pickled to the child (`ProverFault.bind(c, build_model)` re-attaches what it drops);
+    an unpicklable one raises `TypeError`, and a `KeepStep` is refused.
+  - `runs/pipeline.py` (FS33b): child to parent `ready` (handshake), `step`, `released`,
+    `final`, `error`; parent to child `release`, `stop`, `bye`. At most 2 steps are unreleased.
+    The child exits only after `bye` or EOF. `ProverProcessError.kind` is `exception`,
+    `died`, `handshake` or `protocol`. Child recorder rows merge into the parent's.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
     default: `entry_weights(t, w)` (hidden steps), `committed_records(t, records)` (A1: the

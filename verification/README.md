@@ -380,6 +380,8 @@ replaced:
 ### Runs: `runs/`
 
 - **`loop.py`** connects prover and verifier step by step (see "Workflow: a whole run").
+  With `VERIF_PIPELINED=1` the prover runs in a child process (`pipeline.py`), so it proves
+  step `t+1` while the parent verifies step `t`; at most two steps are unreleased at once.
 - **`scenarios.py`** holds what any instance's scenarios share: a scenario with its fault and
   declared outcome, running it through the loop, judging the outcome, the honest reference
   weights for check 8, the report, and the memory and counting passes.

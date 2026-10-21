@@ -1,0 +1,648 @@
+"""The two-process run loop: the prover in a spawned child, the verifier in the parent (FS33b).
+
+``run_loop(..., pipelined=True)`` calls :func:`run_pipelined`. The child trains, commits and
+shares step ``t + 1`` while the parent verifies step ``t``, the way a deployed prover and
+verifier run on two machines (F22, ``ENVIRONMENT_PLAN_DRAFT`` "Sequential or pipelined"). The
+sequential loop (``loop.py``) is untouched; this module is the other mode.
+
+**What the child rebuilds from.** The parent builds no prover model. The child builds its own
+from a :class:`ProverSpec`, a picklable zero-argument callable that returns a
+:class:`ProverSide` (the declared computation, its model builder, the dataset and ``W_0``). The
+spec also does the child's determinism setup (``setup_determinism``, the same call the parent's
+entry point makes) before it builds anything: a ``spawn`` child starts from a fresh interpreter.
+The fault and the schedule cross by pickling (``None``: the child computes the default ``π`` at
+``verifier.seed``). A :class:`~verification.runs.loop.ProverFault` that needs the computation
+or a model builder drops them when pickled and gets the child's through its ``bind`` hook,
+called before step 1. An unpicklable spec, fault or schedule raises ``TypeError`` naming which
+one, before the child starts.
+
+**The handshake.** Before step 1 the child sends the leaf hashes of its ``W_0`` (as
+``Verifier.weight_hashes`` computes them) and the shape of its computation (``n_leaves``,
+``M``, the weight names, the placement's devices, the product dtype). The parent compares them
+with its own ``c`` and with the verifier's ``W_0`` anchor and stops with a
+:class:`ProverProcessError` (``kind="handshake"``) on any difference, never with a verdict. It
+does not compare the dataset: a poisoned dataset is a cheat the verifier's checks reject.
+
+**One step, both sides.**
+
+- Child, step ``t``: ``prove_step``, the commit, ``leaf_totals``, ``share_step`` inside
+  ``P5.write``, the recorder's ``close_step(t)``, then one message holding the package, the
+  step's metrics part and the :class:`~verification.runs.loop.StepRecord` fields the child knows.
+- Parent: receive, ``SharedStore.open``, ``verify_step``, ``close``, tell the child to release
+  ``t``, wait for the release result, ``merge_step(t, part)``, build the ``StepRecord``,
+  ``on_step``.
+
+The ``StepRecord`` fields, by mode. ``prove_s``: the child's ``prove_step`` (the same in both).
+``commit_s``: the commit and the hand-off to the store; pipelined it is the child's and holds
+``P5.write`` (``share_step``, which copies a CPU transcript once), sequentially ``P5.write`` is
+the in-memory hold. ``verify_s``: ``verify_step``; sequentially it also holds the hand-off's
+release, pipelined it is the parent's verify only. ``handoff_s``: sequentially dropping the
+prover's references and the cache release; pipelined the parent's ``SharedStore.open``, its
+``close`` and its cache release (the child's release and cache release are in the child's own
+sections, ``handoff.release``). The harness section ``handoff.totals`` is in none of the four.
+
+**Two transcripts at most.** The child starts step ``t + 2`` only after the parent has released
+step ``t``: it blocks, before each step, while two steps are unreleased. The release order is
+the parent's ``close``, then the child's ``StepHold.release``. A failed release
+(``StoreMutationError``: the prover wrote into a leaf while it was shared) is a run error: no
+verdict and no ``on_step`` for that step.
+
+**The child reads its pipe only between steps**, so a release message waits until the step in
+progress ends. That costs no throughput: the parent cannot verify step ``t + 1`` before it has
+package ``t + 1``, which the child sends when that step ends, and the child answers the release
+of ``t`` right after, before it starts step ``t + 2``. The parent's wait for the release result
+is the child's post-step bookkeeping, not a training step. The release (and its CUDA cache
+release) is timed in the child's table for the step in progress then, so the last two steps'
+release rows are never merged.
+
+**Stopping.** After the last step, or a verified rejection at ``t`` (after its release
+succeeded and ``on_step(t)`` ran), the parent sends ``stop``. The child discards later steps and
+answers with ``W_{t+1}`` as host copies (``LoopResult.w_final``) and its counters (``sent``,
+``max_unreleased``, the ordered ``events`` of step starts and releases). ``LoopResult.steps``
+holds the verified steps only.
+
+**The child never exits before the parent has dropped every package.** CUDA storages cross as
+IPC handles that the parent opens when it unpickles a package, and the producer's memory must
+stay alive until then. The pipe is ordered, so when the parent has received the child's final
+message it has received every package sent before it. It drops them (draining packages of
+steps it will not verify), then sends ``bye``. The child exits only on ``bye`` (or on the pipe
+closing), and releases the steps it discarded only after that. After an error the child also
+waits for ``bye``.
+
+**Failure.** An exception in the child crosses the pipe as text with its traceback and is raised
+as :class:`ProverProcessError` (``kind="exception"``). A child that dies is seen by the pipe
+closing or by its exit code (``kind="died"``). Every parent wait polls with a short timeout and
+checks that the child lives. Any exception in the parent, ``KeyboardInterrupt`` and a raising
+``on_step`` included, closes the open store, stops the child (a stop message, then ``terminate``,
+then ``kill`` after a grace period) and joins it before it re-raises: no child outlives
+``run_loop``.
+
+**Refusals** (``ValueError``, before the child starts): a CUDA prover device with an unsharded
+placement (an unsharded run's leaves live on the host, so every step's whole transcript would be
+copied through one shared-memory buffer); a ``handoff`` other than ``IN_MEMORY``; a recorder
+that cannot split a step (the counting recorder, a traced ``TimeRecorder``); a missing
+:class:`ProverSpec`; a model given to the parent; and :class:`~verification.runs.scenarios.
+KeepStep`, which keeps a step's output in the child's memory.
+
+**Recorders.** The run's recorder stays in the parent, and the ``section`` seam is the
+verifier's. The child builds a recorder of the same kind from a :class:`RecorderSpec` (no
+writer): ``close_step`` per step, and the parent's ``merge_step``. Step 0's part (``run:P4.tree``)
+is merged right after the handshake. The child's own hand-off work is named under ``handoff.``
+(``handoff.release``), which never collides with the parent's ``handoff.empty_cache``.
+
+**CUDA caches.** With ``release_cache`` on, the parent empties its allocator cache after each
+step's ``close`` (the verifier's blocks are cut to the verifier's sizes) and the child after each
+``release`` (the prover's freed transcript blocks are cut to the prover's sizes), each in its own
+process, so the next step's allocations find the memory the other role left.
+
+**Kernels.** The child loads the hash kernels of its prover device and of every CUDA verifier
+device before step 1, outside every section, as the sequential loop does.
+"""
+
+from __future__ import annotations
+
+import multiprocessing
+import os
+import pickle
+import signal
+import time
+import traceback
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from multiprocessing.connection import Connection, wait
+from typing import Any
+
+import torch
+
+from setup.config import assert_no_dropout
+from verification.commitment.gpu_blake3 import GpuBlake3
+from verification.commitment.leaves import (
+    HashStats,
+    dataset_tree,
+    leaf_hashes_of,
+    leaf_totals,
+)
+from verification.computation.interface import DeclaredComputation
+from verification.prover.step import Section, no_section, prove_step
+from verification.runs.loop import (
+    HANDOFF_SECTION,
+    TOTALS_SECTION,
+    LoopResult,
+    ProverFault,
+    StepRecord,
+    _default_schedule,
+    model_device,
+    release_device_cache,
+)
+from verification.runs.metrics import MemoryRecorder, TimeRecorder, memory_probe
+from verification.runs.scenarios import KeepStep, ReusedModel
+from verification.transcript.errors import StoreMutationError
+from verification.transcript.shared import SharedStore, share_step
+from verification.transcript.store import IN_MEMORY, InMemoryStore, StoreHandoff
+from verification.verifier.driver import RunVerdict, Verifier
+
+__all__ = ["ProverSide", "ProverSpec", "ProverProcessError", "RecorderSpec", "run_pipelined",
+           "RELEASE_SECTION"]
+
+# The child's own hand-off section: ``hold.release()`` and, with the cache release on, the
+# CUDA cache release. Not the parent's HANDOFF_SECTION, so no merged step has two of one name.
+RELEASE_SECTION = "handoff.release"
+
+STOP_GRACE_S = 20.0  # how long a stopping parent lets the child finish its step
+TERMINATE_GRACE_S = 5.0  # after terminate(), before kill()
+_POLL_S = 0.05
+_MAX_UNRELEASED = 2
+
+
+@dataclass(frozen=True)
+class ProverSide:
+    """What the prover's process runs on: the computation, a model builder, ``D`` and ``W_0``."""
+
+    c: DeclaredComputation
+    build_model: Callable[[], torch.nn.Module]
+    dataset: Sequence[Any]
+    w0: Mapping[str, torch.Tensor]
+
+
+ProverSpec = Callable[[], ProverSide]
+"""A picklable (a module-level function, or an instance of a module-level class) callable
+with no arguments. It runs in the child, does the child's determinism setup first, and returns
+the child's :class:`ProverSide`."""
+
+
+class ProverProcessError(RuntimeError):
+    """The pipelined run failed on the prover's side or in the link. Never a verdict.
+
+    ``kind``: ``"exception"`` (the child raised; the message holds its traceback), ``"died"``
+    (the child exited or the pipe closed), ``"handshake"`` (the child's setup differs from the
+    verifier's) or ``"protocol"`` (an unexpected message)."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+@dataclass(frozen=True)
+class RecorderSpec:
+    """What the child builds its recorder from: ``kind`` (``"time"`` or ``"memory"``), the run
+    and scenario names, and the devices (the prover's first, then the verifier devices; empty
+    on the host, where the recorder is built as the sequential one would be)."""
+
+    kind: str
+    run: str
+    scenario: str
+    devices: tuple[str, ...] = ()
+
+    def build(self) -> TimeRecorder | MemoryRecorder:
+        devs = self.devices or None
+        if self.kind == "time":
+            return TimeRecorder(self.run, self.scenario, devices=devs)
+        if self.kind == "memory":
+            return MemoryRecorder(self.run, self.scenario, memory_probe(devs[0] if devs else "cpu"),
+                                  devices=devs)
+        raise ValueError(f"unknown recorder kind {self.kind!r}")
+
+
+@dataclass(frozen=True)
+class _ChildArgs:
+    spec: bytes
+    fault: bytes
+    schedule: bytes
+    recorder: RecorderSpec | None
+    release_cache: bool
+    seed: int
+    n_steps: int
+
+
+def _is_cuda(d: str | torch.device) -> bool:
+    return torch.device(d).type == "cuda"
+
+
+def _shape(c: DeclaredComputation) -> dict[str, Any]:
+    p = c.placement
+    return {"n_leaves": c.n_leaves, "M": c.M, "n_s": c.n_s, "weight_names": tuple(c.weight_names),
+            "prover": str(p.prover),
+            "devices": None if p.devices is None else tuple(str(d) for d in p.devices),
+            "product_dtype": str(c.product_dtype)}
+
+
+def _w_hashes(c: DeclaredComputation, w: Mapping[str, torch.Tensor]) -> tuple[bytes, ...]:
+    """``Verifier.weight_hashes``'s digests of ``w`` (the same formula, without a verifier)."""
+    if set(w) != set(c.weight_names):
+        raise ValueError("weights differ from the declared weight names")
+    return tuple(leaf_hashes_of(c, ((c.w_t_index(n), w[n].detach()) for n in c.weight_names)))
+
+
+# ---- the child ---------------------------------------------------------------------------
+
+
+def _child_main(conn: Connection, args: _ChildArgs) -> None:
+    """The spawned process's entry point."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # the parent decides when the child stops
+    try:
+        _child_run(conn, args)
+    except (EOFError, BrokenPipeError, ConnectionError):
+        pass  # the parent is gone
+    except BaseException:
+        try:
+            conn.send(("error", traceback.format_exc()))
+            _await_bye(conn)
+        except (OSError, EOFError):
+            pass
+        raise SystemExit(1) from None
+
+
+def _await_bye(conn: Connection, timeout: float = 60.0) -> None:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if conn.poll(_POLL_S):
+            try:
+                msg = conn.recv()
+            except (EOFError, OSError):
+                return
+            if msg[0] == "bye":
+                return
+
+
+def _child_run(conn: Connection, args: _ChildArgs) -> None:
+    # These bytes are the parent's own ``pickle.dumps`` of its own objects, sent to its own
+    # child over a private pipe: not untrusted input.
+    spec = pickle.loads(args.spec)  # noqa: S301
+    fault: ProverFault = pickle.loads(args.fault)  # noqa: S301
+    schedule = pickle.loads(args.schedule)  # noqa: S301
+    side = spec()
+    c, dataset = side.c, side.dataset
+    rec = None if args.recorder is None else args.recorder.build()
+    section: Section | None = None if rec is None else rec.seam()
+    sec = section or no_section
+    model = side.build_model()
+    if type(fault).bind is not ProverFault.bind:
+        fault.bind(c, ReusedModel(side.build_model))
+    model.requires_grad_(True)
+    assert_no_dropout(model)
+    device = model_device(model)
+    cache = args.release_cache and any(_is_cuda(d) for d in (device, *(c.placement.devices or ())))
+    kernel_devs = [torch.device(d) for d in (device, *(c.placement.devices or ()))
+                   if _is_cuda(d)]
+    for d in dict.fromkeys(kernel_devs):
+        GpuBlake3().kernels(d)  # outside every section (FS30)
+    pi = schedule or _default_schedule(c, dataset, args.seed)
+    with sec("run:P4.tree"):
+        tree = dataset_tree(c, dataset)
+    part0 = None if rec is None else rec.close_step(0)
+    handshake = {"w0": _w_hashes(c, side.w0), **_shape(c)}
+    conn.send(("ready", handshake, part0))
+
+    holds: dict[int, Any] = {}
+    w_by: dict[int, Mapping[str, torch.Tensor]] = {}
+    events: list[tuple[str, int]] = []
+    stats = {"sent": 0, "max_unreleased": 0}
+    stop_at: list[int] = []  # the parent's stop message, once it comes
+
+    def release(t: int) -> str | None:
+        hold = holds.pop(t, None)
+        err = None
+        with sec(RELEASE_SECTION):
+            try:
+                if hold is not None:
+                    hold.release()
+            except StoreMutationError as e:
+                err = str(e)
+            del hold
+            if cache:
+                torch.cuda.empty_cache()
+        events.append(("release", t))
+        for k in [k for k in w_by if k < t]:
+            del w_by[k]
+        return err
+
+    def handle(msg: tuple) -> None:
+        if msg[0] == "release":
+            conn.send(("released", msg[1], release(msg[1])))
+        elif msg[0] == "stop":
+            stop_at.append(msg[1])
+        elif msg[0] == "bye":
+            raise EOFError("the parent said bye before stop")
+        else:
+            raise RuntimeError(f"the prover's process got an unknown message {msg[0]!r}")
+
+    w: Mapping[str, torch.Tensor] = side.w0
+    t = 0
+    while not stop_at:
+        while conn.poll(0):
+            handle(conn.recv())  # between steps only
+        if stop_at:
+            break
+        if t >= args.n_steps or len(holds) >= _MAX_UNRELEASED:
+            # nothing to do (all steps sent) or two steps unreleased: wait for the parent
+            handle(conn.recv())
+            continue
+        t += 1
+        events.append(("start", t))
+        idx = list(pi(t))
+        records = list(fault.committed_records(t, [dataset[i] for i in idx]))
+        w_t = fault.entry_weights(t, w)
+        t0 = time.perf_counter()
+        out = prove_step(c, model, w_t, records, train_records=fault.train_records(t, records),
+                         perturb=fault.perturb(t), section=section)
+        t1 = time.perf_counter()
+        capture = out.capture
+        out = fault.emit(t, out)
+        t1b = time.perf_counter()
+        with sec("P4.paths"):
+            paths = [tree.path(i) for i in idx]
+        with sec("P3.commit"):
+            commit_stats = HashStats()
+            leaves, tree_h = InMemoryStore.commit_step(c, out, section=section,
+                                                       stats=commit_stats)
+        with sec("P5.write"):
+            package, hold = share_step(c, t, leaves, tree_h, paths)
+        t2 = time.perf_counter()
+        with sec(TOTALS_SECTION):
+            n_leaves, n_bytes = leaf_totals(c, leaves)
+        w, loss = out.w_next, out.loss
+        w_by[t] = w
+        root, known = tree_h.root, commit_stats.known
+        holds[t] = hold
+        stats["max_unreleased"] = max(stats["max_unreleased"], len(holds))
+        del out, leaves, tree_h, hold, w_t, records
+        part = None if rec is None else rec.close_step(t)
+        fields = {"loss": loss, "prove_s": t1 - t0, "commit_s": t2 - t1b, "capture": capture,
+                  "transcript_bytes": n_bytes, "leaves": n_leaves, "root": root, "known": known}
+        conn.send(("step", t, package, part, fields))
+        stats["sent"] = t
+        del package, part
+
+    last = stop_at[0]
+    w_host = None
+    if last >= 1:
+        w_host = {n: v.detach().to("cpu", copy=True) for n, v in w_by[last].items()}
+    info = {**stats, "events": events, "pid": os.getpid()}
+    conn.send(("final", w_host, info))
+    del w_host
+    _await_bye(conn)
+    for k in list(holds):  # the steps discarded: the parent has dropped their packages
+        try:
+            holds.pop(k).release()
+        except StoreMutationError:
+            pass
+
+
+# ---- the parent --------------------------------------------------------------------------
+
+
+class _Link:
+    """The parent's end of the pipe and the child's process handle."""
+
+    def __init__(self, proc: Any, conn: Connection) -> None:
+        self.proc, self.conn = proc, conn
+        self.errored = False  # the child sent its error: it only waits for bye
+        self.finished = False  # the child sent its final message: it only waits for bye
+        self.closed = False
+
+    def send(self, msg: tuple) -> None:
+        try:
+            self.conn.send(msg)
+        except (OSError, ValueError) as e:
+            raise ProverProcessError("died", f"the prover's process is gone (exit code "
+                                             f"{self.proc.exitcode}): {e}") from None
+
+    def recv(self) -> tuple:
+        """The next message, polling with a short timeout and checking the child lives."""
+        while True:
+            ready = wait([self.conn, self.proc.sentinel], _POLL_S)
+            if self.conn in ready or self.conn.poll(0):
+                try:
+                    msg = self.conn.recv()
+                except (EOFError, OSError):
+                    raise ProverProcessError("died", self._dead()) from None
+                if msg[0] == "error":
+                    self.errored = True
+                    raise ProverProcessError("exception",
+                                             "the prover's process raised:\n" + msg[1])
+                return msg
+            if not self.proc.is_alive():
+                raise ProverProcessError("died", self._dead())
+
+    def _dead(self) -> str:
+        self.proc.join(timeout=2.0)
+        return f"the prover's process died (exit code {self.proc.exitcode})"
+
+    def expect(self, kind: str, stash: dict[int, tuple] | None = None) -> tuple:
+        """The next ``kind`` message; a ``step`` that arrives early goes in ``stash``."""
+        while True:
+            msg = self.recv()
+            if msg[0] == kind:
+                return msg
+            if msg[0] == "step" and stash is not None:
+                stash[msg[1]] = msg
+                continue
+            raise ProverProcessError("protocol", f"expected {kind!r}, got {msg[0]!r}")
+
+    def stop(self, grace: float = STOP_GRACE_S) -> None:
+        """End the child: stop, then bye after its final message, else terminate, then kill.
+        Joins it. Never raises."""
+        if self.closed:
+            return
+        self.closed = True
+        proc, conn = self.proc, self.conn
+        try:
+            done = self.errored or self.finished
+            if not done and proc.is_alive():
+                try:
+                    conn.send(("stop", 0))
+                except (OSError, ValueError):
+                    pass
+                end = time.monotonic() + grace
+                while time.monotonic() < end and not done:
+                    ready = wait([conn, proc.sentinel], _POLL_S)
+                    if conn in ready:
+                        try:
+                            msg = conn.recv()
+                        except (EOFError, OSError):
+                            break
+                        done = msg[0] in ("final", "error")
+                        del msg
+                    elif proc.sentinel in ready:
+                        break
+            if proc.is_alive():
+                try:
+                    conn.send(("bye",))
+                except (OSError, ValueError):
+                    pass
+            end = time.monotonic() + (10.0 if done else 0.0)
+            while proc.is_alive() and time.monotonic() < end:
+                time.sleep(_POLL_S)
+            if proc.is_alive():
+                proc.terminate()
+                end = time.monotonic() + TERMINATE_GRACE_S
+                while proc.is_alive() and time.monotonic() < end:
+                    time.sleep(_POLL_S)
+            if proc.is_alive():
+                proc.kill()
+                while proc.is_alive():
+                    time.sleep(_POLL_S)
+            proc.join(timeout=5.0)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            try:
+                proc.close()
+            except ValueError:
+                pass
+
+
+def _pickled(what: str, x: Any) -> bytes:
+    try:
+        return pickle.dumps(x)
+    except Exception as e:  # PicklingError, AttributeError (a lambda), TypeError, ...
+        raise TypeError(f"the {what} cannot be pickled, so it cannot cross to the prover's "
+                        f"process: {type(e).__name__}: {e}") from e
+
+
+def _recorder_spec(recorder: TimeRecorder | MemoryRecorder | None, c: DeclaredComputation
+                   ) -> RecorderSpec | None:
+    if recorder is None:
+        return None
+    if type(recorder) is TimeRecorder:
+        if recorder._trace is not None:  # noqa: SLF001
+            raise ValueError("pipelined: a traced TimeRecorder (trace_step) cannot split a "
+                             "step; the profiler is process-global")
+        kind = "time"
+    elif type(recorder) is MemoryRecorder:
+        kind = "memory"
+    else:
+        raise ValueError(f"pipelined: a {type(recorder).__name__} cannot split a step; only "
+                         f"TimeRecorder and MemoryRecorder run pipelined")
+    p = c.placement
+    devs = (str(p.prover), *(str(d) for d in p.devices or ()))
+    on_cuda = any(_is_cuda(d) for d in devs)
+    return RecorderSpec(kind, recorder.run, recorder.scenario, devs if on_cuda else ())
+
+
+def _check_handshake(hs: dict[str, Any], c: DeclaredComputation, verifier: Verifier,
+                     w0: Mapping[str, torch.Tensor] | None) -> None:
+    bad = []
+    for k, mine in _shape(c).items():
+        if hs.get(k) != mine:
+            bad.append(f"{k}: the prover has {hs.get(k)!r}, the verifier {mine!r}")
+    anchor = verifier._chain  # noqa: SLF001 (the agreed W_0's hashes, set by start_run)
+    want = tuple(anchor)
+    if w0 is not None:
+        own = verifier.weight_hashes(w0)
+        if own != want:
+            bad.append("the W_0 given to run_loop differs from the verifier's agreed W_0")
+    got = tuple(hs["w0"])
+    if got != want:
+        names = [n for n, a, b in zip(c.weight_names, got, want, strict=False) if a != b]
+        bad.append(f"the prover's W_0 differs from the agreed W_0 at "
+                   f"{names[:3] or 'its length'}")
+    if bad:
+        raise ProverProcessError("handshake", "the prover's setup differs from the verifier's: "
+                                 + "; ".join(bad))
+
+
+def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
+                  w0: Mapping[str, torch.Tensor] | None, verifier: Verifier, *,
+                  final: Mapping[str, torch.Tensor] | Sequence[bytes],
+                  fault: ProverFault | None, schedule: Callable[[int], Sequence[int]] | None,
+                  on_step: Callable[[StepRecord], None] | None, section: Section | None,
+                  handoff: StoreHandoff | None, release_cache: bool,
+                  recorder: TimeRecorder | MemoryRecorder | None,
+                  prover: ProverSpec | None) -> LoopResult:
+    """The pipelined loop; see the module docstring. ``run_loop`` calls it with its arguments."""
+    fault = fault or ProverFault()
+    if prover is None:
+        raise ValueError("pipelined: the prover's process needs a ProverSpec (prover=...)")
+    if handoff is not None and handoff is not IN_MEMORY:
+        raise ValueError("pipelined: the handoff is the shared store; only IN_MEMORY (the "
+                         "default) is allowed")
+    if _is_cuda(c.placement.prover) and not c.placement.sharded:
+        raise ValueError("pipelined: a CUDA prover device needs a sharded placement "
+                         "(verifier_devices): an unsharded run's leaves live on the host, and "
+                         "each step would be copied whole through shared memory")
+    if isinstance(fault, KeepStep):
+        raise ValueError("pipelined: KeepStep keeps a step's output in the prover's memory, "
+                         "which is another process")
+    if recorder is not None and section is not None and section is not recorder.seam():
+        raise ValueError("pipelined: section must be the recorder's seam")
+    rspec = _recorder_spec(recorder, c)
+    sec = section or no_section
+    args = _ChildArgs(_pickled("ProverSpec", prover), _pickled("fault", fault),
+                      _pickled("schedule", schedule), rspec, release_cache, verifier.seed,
+                      verifier.n_steps)
+
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe()
+    proc = ctx.Process(target=_child_main, args=(child_conn, args), daemon=True,
+                       name="pots-prover")
+    link = _Link(proc, parent_conn)
+    proc.start()
+    child_conn.close()  # so the parent sees the pipe close when the child is gone
+    store: SharedStore | None = None
+    try:
+        result = LoopResult(verdict=RunVerdict(False, None, 0, None), pipelined=True)
+        if verifier.start_run(dataset) is not None:
+            link.stop()
+            result.verdict = verifier.end_run(final)
+            return result
+        _, hs, part0 = link.expect("ready")
+        _check_handshake(hs, c, verifier, w0)
+        if recorder is not None:
+            recorder.merge_step(0, part0)
+        del hs, part0
+        stash: dict[int, tuple] = {}
+        for t in range(1, verifier.n_steps + 1):
+            msg = stash.pop(t, None) or link.expect("step", stash)
+            if msg[1] != t:
+                raise ProverProcessError("protocol", f"expected step {t}, got step {msg[1]}")
+            _, _, pkg, part, f = msg
+            del msg
+            h0 = time.perf_counter()
+            store = SharedStore.open(c, pkg)
+            del pkg
+            h1 = time.perf_counter()
+            try:
+                rej = verifier.verify_step(t, store)
+            finally:
+                h2 = time.perf_counter()
+                store.close()
+                store = None
+            h3 = time.perf_counter()
+            link.send(("release", t))
+            if release_cache:
+                release_device_cache("cpu", section, devices=c.placement.devices)
+            h4 = time.perf_counter()
+            released = link.expect("released", stash)
+            if released[1] != t:
+                raise ProverProcessError("protocol", f"released step {released[1]}, not {t}")
+            if released[2] is not None:
+                raise StoreMutationError(f"step {t}: {released[2]}")
+            if recorder is not None:
+                recorder.merge_step(t, part)
+            rec = StepRecord(t, rej, f["loss"], f["prove_s"], f["commit_s"], h2 - h1,
+                             (h1 - h0) + (h3 - h2) + (h4 - h3), f["capture"],
+                             f["transcript_bytes"], f["leaves"], f["root"], f["known"])
+            del part, f
+            result.steps.append(rec)
+            if on_step is not None:
+                on_step(rec)
+            if rej is not None:
+                break
+        link.send(("stop", result.steps[-1].t if result.steps else 0))
+        msg = link.expect("final", stash)
+        stash.clear()  # packages of discarded steps: dropped before bye
+        _, w_host, info = msg
+        del msg
+        link.finished = True
+        link.send(("bye",))
+        result.w_final = dict(w_host)
+        result.child_info = info
+        result.verdict = verifier.end_run(final)
+        return result
+    finally:
+        if store is not None:
+            store.close()
+        link.stop()

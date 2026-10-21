@@ -51,7 +51,7 @@ from verification.verifier.driver import RunVerdict, Verifier
 
 __all__ = ["ProverFault", "StepRecord", "LoopResult", "run_loop", "PlainStepRecord", "PlainResult",
            "run_plain", "HANDOFF_SECTION", "TOTALS_SECTION", "release_device_cache",
-           "release_cache_setting", "model_device"]
+           "release_cache_setting", "pipelined_setting", "model_device"]
 
 # The metrics section around the hand-off's cache release. Its row is the harness's (side
 # "run") and in no role's total: deployed, the prover and the verifier run on separate machines.
@@ -71,7 +71,13 @@ class ProverFault:
     - :meth:`perturb`: ``prove_step``'s post-capture product perturbation (the flipped matmul).
     - :meth:`emit`: rewrite the step's output before commitment, such as splicing a forged
       ``W_{t+1}`` with :meth:`StepOutput.with_w_next` (A3).
+    - :meth:`bind`: pipelined runs only (``runs/pipeline.py``). A fault that keeps the
+      computation or a model builder drops them when pickled, and the prover's process hands it
+      its own through :meth:`bind` before step 1.
     """
+
+    def bind(self, c: DeclaredComputation, build_model: Callable[[], torch.nn.Module]) -> None:
+        """Take the prover process's computation and model builder. Default: nothing."""
 
     def entry_weights(self, t: int, w: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
         return w
@@ -127,6 +133,11 @@ class LoopResult:
     verdict: RunVerdict
     steps: list[StepRecord] = field(default_factory=list)
     w_final: dict[str, torch.Tensor] | None = None
+    # pipelined runs: ``steps`` are the verified steps; ``w_final`` is the last verified step's
+    # ``W_{t+1}``; ``child_info`` the prover process's counters (``sent``, ``max_unreleased``,
+    # ``events``, ``pid``)
+    pipelined: bool = False
+    child_info: dict | None = None
 
     @property
     def rejection(self) -> Rejection | None:
@@ -137,6 +148,11 @@ def release_cache_setting(release_cache: bool | None) -> bool:
     """``release_cache`` as given, or ``RunConfig.release_cache`` (``VERIF_RELEASE_CACHE``)
     when it is ``None``, so every entry point honours the setting without passing it."""
     return load_config().release_cache if release_cache is None else release_cache
+
+
+def pipelined_setting(pipelined: bool | None) -> bool:
+    """``pipelined`` as given, or ``RunConfig.pipelined`` (``VERIF_PIPELINED``) when ``None``."""
+    return load_config().pipelined if pipelined is None else pipelined
 
 
 def model_device(model: torch.nn.Module) -> torch.device:
@@ -178,9 +194,9 @@ def _default_schedule(c: DeclaredComputation, dataset: Sequence[Any],
 
 def run_loop(
     c: DeclaredComputation,
-    model: torch.nn.Module,
+    model: torch.nn.Module | None,
     dataset: Sequence[Any],
-    w0: Mapping[str, torch.Tensor],
+    w0: Mapping[str, torch.Tensor] | None,
     verifier: Verifier,
     *,
     final: Mapping[str, torch.Tensor] | Sequence[bytes],
@@ -190,6 +206,9 @@ def run_loop(
     section: Section | None = None,
     handoff: StoreHandoff | None = None,
     release_cache: bool | None = None,
+    recorder: Any = None,
+    pipelined: bool | None = None,
+    prover: Callable[[], Any] | None = None,
 ) -> LoopResult:
     """Run ``verifier.n_steps`` steps of ``C`` from ``W_0`` on ``dataset``.
 
@@ -212,7 +231,34 @@ def run_loop(
     ``release_cache=False`` skips it, section and all, so a run can measure what the release
     costs and what it saves. ``None`` (the default) reads ``VERIF_RELEASE_CACHE``
     (:func:`release_cache_setting`).
+
+    ``pipelined`` (``None`` reads ``VERIF_PIPELINED``, :func:`pipelined_setting`) runs the
+    prover in a spawned child process, one step ahead of the verifier
+    (``runs/pipeline.py``, which documents the mode). The parent then builds no prover model:
+    ``model`` must be ``None``, ``w0`` is optional (the child's ``W_0`` is checked against the
+    verifier's), ``prover`` is the :class:`~verification.runs.pipeline.ProverSpec` the child
+    rebuilds from, and ``recorder`` is the run's ``TimeRecorder`` or ``MemoryRecorder`` (whose
+    seam is ``section``). Without ``pipelined``, ``recorder`` and ``prover`` are ignored.
+
+    The :class:`StepRecord` times, by mode. Sequential: ``prove_s`` is ``prove_step``;
+    ``commit_s`` the paths, the commit and ``P5.write`` (the in-memory hold); ``verify_s``
+    ``verify_step`` and the hand-off's release; ``handoff_s`` the cache release. Pipelined:
+    ``prove_s`` and ``commit_s`` are the child's (``commit_s`` holds ``P5.write``, which copies
+    a CPU transcript into shared memory); ``verify_s`` is the parent's ``verify_step`` alone;
+    ``handoff_s`` the parent's ``SharedStore.open``, ``close`` and cache release. The child's
+    release and the wait for its answer are in none of them.
     """
+    if pipelined_setting(pipelined):
+        if model is not None:
+            raise ValueError("pipelined: the prover's model is built in the prover's process; "
+                             "pass model=None and a ProverSpec (prover=...)")
+        from verification.runs.pipeline import run_pipelined  # pipeline imports this module
+        return run_pipelined(c, dataset, w0, verifier, final=final, fault=fault,
+                             schedule=schedule, on_step=on_step, section=section,
+                             handoff=handoff, release_cache=release_cache_setting(release_cache),
+                             recorder=recorder, prover=prover)
+    if model is None or w0 is None:
+        raise ValueError("run_loop needs a model and w0 unless it is pipelined")
     sec = section or no_section
     handoff = handoff or IN_MEMORY
     fault = fault or HONEST
@@ -226,10 +272,12 @@ def run_loop(
         return result
     with sec("run:P4.tree"):
         tree = dataset_tree(c, dataset)  # the prover's own copy of h_D's tree, for audit paths
-    if _on_cuda(device):
-        # The first NVRTC build or cache load of the process would land inside step 1's forward
-        # pass, in its timed sections: do it here, outside every section (FS30).
-        GpuBlake3().kernels(torch.device(device))
+    # The first NVRTC build or cache load of the process would land inside step 1's forward
+    # pass, in its timed sections: do it here, outside every section (FS30). Every CUDA device
+    # of the run, the sharded placement's included.
+    for d in dict.fromkeys(torch.device(x) for x in (device, *(c.placement.devices or ()))
+                           if _on_cuda(x)):
+        GpuBlake3().kernels(d)
     w: Mapping[str, torch.Tensor] = w0
     for t in range(1, verifier.n_steps + 1):
         idx = list(pi(t))

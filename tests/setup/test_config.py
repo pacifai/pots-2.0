@@ -278,3 +278,18 @@ def test_verifier_devices_do_not_change_the_training_config_or_any_hash():
     for names in (("cpu",), ("cpu", "cpu")):
         other = load_config({"VERIF_VERIFIER_DEVICES": ",".join(names)})
         assert config_hash(training_config(other)) == config_hash(training_config(base))
+
+
+def test_pipelined_is_off_by_default_is_zero_or_one_and_moves_no_hash():
+    import dataclasses
+    from verification.runs.plain_baseline import config_hash, training_config
+    base = load_config({})
+    on = load_config({"VERIF_PIPELINED": "1"})
+    assert base.pipelined is False and on.pipelined is True
+    for bad in ("2", "true", ""):
+        with pytest.raises(ValueError, match="VERIF_PIPELINED"):
+            load_config({"VERIF_PIPELINED": bad})
+    assert "pipelined" not in training_config(on)
+    assert config_hash(training_config(on)) == config_hash(training_config(base))
+    diff = [f.name for f in dataclasses.fields(base) if getattr(base, f.name) != getattr(on, f.name)]
+    assert diff == ["pipelined"]

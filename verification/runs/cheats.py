@@ -307,7 +307,7 @@ def open_writer(cfg: RunConfig, run: str, env: CheatEnv,
             "bpr_records": env.bpr_records, "bpr_actual": env.bpr_actual, **(extra or {})}
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                  if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
-                                   "trace_c5")}, "llama": inst}
+                                   "trace_c5", "pipelined")}, "llama": inst}
     out_dir = cfg.output_dir / run if subdir is None else cfg.output_dir / run / subdir
     return MetricsWriter(out_dir, run, device=cfg.device, model=cfg.model,
                          corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
