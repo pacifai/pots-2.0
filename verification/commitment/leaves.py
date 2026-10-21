@@ -480,7 +480,6 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
     open_: dict[torch.device, _OpenTable] = {}  # each device's open table
     tables: list[_OpenTable] = []  # the queued ones
     probes: dict[tuple[Any, ...], _Probe] = {}  # per-shape checks of this call, by key
-    slot_keys: dict[int, dict[torch.device, tuple[Any, ...]]] = {}  # per-shape keys, by slot
     fatal: list[BaseException] = []  # a failure that is the call's, not a leaf's: it propagates
     order: list[int] = []  # each item's leaf index, by position
     n_seen = n_kernel = 0
@@ -564,13 +563,7 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
                         headers.append(header)
                     if kernel and _kernel_leaf(obj):
                         # The structural checks passed: the kernel hashes the leaf in place.
-                        dkeys = slot_keys.get(i)
-                        if dkeys is None:
-                            dkeys = slot_keys[i] = {}
-                        ck = dkeys.get(obj.device)
-                        if ck is None:  # built once per slot and device
-                            ck = dkeys[obj.device] = kernel_check.key_of(
-                                "table", obj.device, tag, dtype, shape)
+                        ck = kernel_check.key_of("table", obj.device, tag, dtype, shape)
                         if ck not in probes and not kernel_check.is_checked(ck):
                             try:
                                 version, cd = _host_digest(obj, headers[h], i)
@@ -858,12 +851,8 @@ def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
     if err is not None:
         failures.append((host[len(digests)][0], err))
     if native.enabled():
-        akeys: dict[tuple[int, torch.device], tuple[Any, ...]] = {}  # per slot and device
         for i, obj, tag, d in arrivals:
-            key = akeys.get((i, obj.device))
-            if key is None:
-                key = akeys[(i, obj.device)] = kernel_check.key_of(
-                    "arrival", obj.device, tag, obj.dtype, tuple(obj.shape))
+            key = kernel_check.key_of("arrival", obj.device, tag, obj.dtype, tuple(obj.shape))
             if kernel_check.is_checked(key):
                 continue
             try:
