@@ -638,6 +638,13 @@ What each check establishes:
   host wait for the device, so this cuts the waits from several per product to one per
   window. The first failing product and its message are those of one-at-a-time judging, and
   an error serving a later product is raised only after the products before it pass.
+
+  On a CUDA device, check 5 measures with a fused kernel (FS37) instead of torch. It reads
+  the replay's operands as they are, with no copy or widening, and computes every number of
+  a product's row in one launch set, with no host read until the window's read. Every other
+  device measures with torch and keeps its numbers bit for bit. The kernel's numbers equal
+  the host build of the same arithmetic (`measure_core.h`) bit for bit. They agree with
+  torch's numbers only to a rounding bound, because the two add in different orders.
 - **Check 6b (glue updates).** This is the same update test as 6a for the weights whose
   gradient isn't a committed product. Check 5's replay already ran the backward glue, so
   the gradients come at no extra cost.
