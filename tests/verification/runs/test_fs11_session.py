@@ -1265,10 +1265,40 @@ def test_check_upload_reports_the_native_sources(tmp_path):
     assert c["native"] == {"dir": "native_cache/blake3-1.8.7", "present": False,
                            "bad": ["the directory"]}
     src = up / "native_cache" / "blake3-1.8.7"
-    shutil.copytree(fs.native.source_dir(), src)
+    from verification.commitment import native  # not imported by the session at import
+    shutil.copytree(native.source_dir(), src)
     assert fs.check_upload(up)["native"]["bad"] == [] and fs.check_upload(up)["native"]["present"]
     (src / "blake3.c").write_text("changed")
     assert fs.check_upload(up)["native"]["bad"] == ["blake3.c"]
+
+
+_BARE = """
+import sys, time
+sys.path.insert(0, {root!r})
+class Block:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in ("torch", "numpy", "blake3"):
+            raise ImportError("blocked: " + name)
+sys.meta_path.insert(0, Block())
+from verification.runs import fs11_session as fs
+loaded = lambda: sorted(m for m in sys.modules if m.split(".")[0] in ("torch", "numpy", "blake3"))
+assert not loaded(), loaded()
+rc = fs.main(["run", "--selftest", "--upload", {up!r}, "--out", {out!r},
+              "--deadline", str(time.time() + 60)])
+print("RC", rc, loaded())
+"""
+
+
+def test_the_module_and_its_selftest_need_only_the_standard_library(tmp_path):
+    """A bare pod's ``python3`` has no torch or numpy: importing the session module and running
+    its self-test with those imports refused must work, and load none of them."""
+    root = Path(__file__).resolve().parents[3]
+    (tmp_path / "up").mkdir()
+    code = _BARE.format(root=str(root), up=str(tmp_path / "up"), out=str(tmp_path / "out"))
+    r = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True,
+                       timeout=120, env={"PATH": os.environ.get("PATH", ""), "FS11_SELFTEST": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.strip().endswith("RC 0 []"), r.stdout
 
 
 # ---- the sampler (FS21) -----------------------------------------------------------------

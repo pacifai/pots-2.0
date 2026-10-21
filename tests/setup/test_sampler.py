@@ -33,7 +33,8 @@ def _popen(*args: str) -> subprocess.Popen:
 
 def _busy_run(tmp_path, *flags):
     out = tmp_path / "s.jsonl"
-    rc = _popen("--out", str(out), *flags, "--wrap", "--", sys.executable, "-c", BUSY).wait(timeout=30)
+    rc = _popen("--out", str(out), *flags, "--wrap", "--", sys.executable, "-c",
+                BUSY).wait(timeout=30)
     assert rc == 0
     return out
 

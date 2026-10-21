@@ -55,7 +55,8 @@ def test_oracle_outcomes_are_the_scenarios():
 def test_plan_has_the_parts_each_with_peaks(tmp_path):
     plan = fs.fs32_pair_plan(tmp_path / "up", tmp_path / "out")
     names = [p.name for p in plan]
-    assert names[:2] == ["peer_check", "models"] and "fast_suite" in names and "two_gpu_slow" in names
+    assert names[:2] == ["peer_check", "models"]
+    assert "fast_suite" in names and "two_gpu_slow" in names
     assert all(p.info.get("gpu_peak") for p in plan)
     sharded = [p for p in plan if p.env.get("VERIF_VERIFIER_DEVICES") == fs.PAIR_DEVICES]
     assert sharded and not any(p.env.get("VERIF_VERIFIER_DEVICES") for p in plan

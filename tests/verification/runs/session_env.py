@@ -2,8 +2,8 @@
 
 On a pod the environment already holds the session's own names (``FS11_SESSION=fs32-pair``,
 ``FS11_ALLOW_ANY_GPU``, ``FS11_DEADLINE_S``, ``FS31_CARDS``, the Runpod ids), and a test that copies
-``os.environ`` then runs the pod's session instead of its own. FS32's two-A40 run failed 13 job tests
-that way. :func:`clean_environ` drops every name the job script or the session reads;
+``os.environ`` then runs the pod's session instead of its own. FS32's two-A40 run failed 13
+job tests that way. :func:`clean_environ` drops every name the job script or the session reads;
 ``conftest.py`` applies :func:`scrub` to every test here, so in-process reads are clean too.
 """
 

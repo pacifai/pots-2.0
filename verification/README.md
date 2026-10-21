@@ -1021,7 +1021,8 @@ Its `FS11 job:` line names the session, and any other `FS11_SESSION` value is re
 the pod terminated). `FS11_SELFTEST=1` with `FS11_SESSION=recheck` runs the same stand-in parts
 as the first session's self-test, under the re-check's name.
 
-**The four-card probe (FS31).** `FS11_SESSION=nvlink-probe` runs the peer-copy byte check (`peer_check`, below), then the NVLink probe, then one
+**The four-card probe (FS31).** `FS11_SESSION=nvlink-probe` runs the peer-copy byte check
+(`peer_check`, below), then the NVLink probe, then one
 `card_identity` part per model and card (`FS31_CARDS`, default 4), each with
 `CUDA_VISIBLE_DEVICES` set to its card. Start it as above on a four-H100 pod; its default
 deadline is 5,400 s. It refuses a machine whose torch sees fewer than `FS31_CARDS` devices
@@ -1137,12 +1138,20 @@ first captured CUDA matmul, so `run_loop` calls `GpuBlake3().kernels(device)` on
 Both two-GPU sessions (`fs32-pair` and `nvlink-probe`) start with the **peer-copy byte check**
 (`verification/runs/peer_check.py`, a part named `peer_check`, under five minutes): for every
 ordered pair of cards it copies tensors directly (`.to`, `copy_`, a strided copy, a side-stream
-copy) and compares the bytes at the destination with the source's. On the first two-A40 session
-every direct copy left wrong bytes though the peer-access flags said OK, and every two-GPU result
-was noise. A wrong pair stops the session at once: every later part is `not_started` with the
-pairs named, and the job log says `peer copies landed wrong bytes on pair ...`. A card whose
-host-staged control is wrong is reported as the card, not the peer path. The probe's `hw2` also
-records `peer_bytes_ok` per pair.
+copy, and 4 MB copies of bf16, fp32, a view with a storage offset and a 3-D tensor, as the
+transcript has them) and compares the bytes at the destination with the source's. Each case
+draws a fresh source and each destination is pre-filled with `0xFF` bytes, so a copy that wrote
+nothing cannot pass on bytes the allocator left there; a result on the wrong device, or of the
+wrong shape or dtype, fails. On the first two-A40 session every direct copy left wrong bytes
+though the peer-access flags said OK, and every two-GPU result was noise. A failed pair stops
+the session at once: every later part is `not_started` with the pairs named, and the job log
+says `peer copies landed wrong bytes on pair ...`; a case that raised says `<case> raised
+<Type>: <msg>`, and a control that raised (or every case raising) says the check could not copy
+on that pair. A card whose host-staged control is wrong is reported as the card, not the peer
+path. The probe's `hw2` also records `peer_bytes_ok` per pair, with `peer_bytes_detail` for the
+failed ones. A rerun deletes the old report first. `fs11_session` imports no torch or numpy (the
+upload check imports the native-build module only when it runs), so the self-test runs on a bare
+`python3`.
 
 `FS11_SESSION=fs32-pair` is the acceptance of the per-role devices (F22, FS32) on two A40s
 (any two CUDA GPUs do): the real SmolLM2 run, unsharded and with

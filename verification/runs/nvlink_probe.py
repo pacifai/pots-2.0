@@ -16,7 +16,11 @@ peer reads are ``OK`` for every pair, that every ordered pair has a finite, posi
 and that every ordered pair's direct copies land the right bytes (``peer_bytes_ok``: F22's
 ``peer_check``, run here on the same cards; on the FS32 two-A40 session every direct copy left wrong
 bytes though the peer reads said ``OK``, so a rate over a wrong copy is no rate). A pair with no
-byte result counts as wrong.
+byte result counts as wrong. ``hw2["peer_bytes_detail"]`` says, for each pair that was not right,
+whether the host-staged control was wrong (``card_suspect``), which cases raised (``errors``)
+and whether the check could not copy at all (``all_raised``), and the reason in ``reasons`` and
+the report line says so: wrong bytes, a case that raised, or a check that could not copy and so
+says nothing of the peer path.
 The slowest pair's rate, by the PyTorch copy timing, sets its ``verdict``: ``pass`` at
 :data:`PEER_COPY_PASS_GBPS` or more, ``review`` from :data:`PEER_COPY_FAIL_GBPS` up to that (the
 number returns to the user before the port relies on it), ``fail`` below it or on any other
@@ -42,7 +46,8 @@ from typing import Any
 
 __all__ = ["PEER_COPY_PASS_GBPS", "PEER_COPY_FAIL_GBPS", "GATE_CARDS", "COMMANDS", "expected_cards",
            "hw2_line", "run_command", "parse_gpu_matrix", "hw2_verdict",
-           "peer_copy_bandwidth", "peer_bytes_by_pair", "fanout_bandwidth", "pinned_bandwidth",
+           "peer_copy_bandwidth", "peer_check_pairs", "peer_bytes_by_pair", "peer_bytes_detail",
+           "fanout_bandwidth", "pinned_bandwidth",
            "torch_view", "build_report", "main"]
 
 VERSION = 1
@@ -162,17 +167,50 @@ def _command_failure(rec: Mapping[str, Any]) -> str | None:
     return f"{' '.join(rec['argv'])} failed: {rec.get('error') or 'no result'}"
 
 
+def _peer_bytes_reason(wrong: Sequence[str], detail: Mapping[str, Mapping[str, Any]]) -> str:
+    """The reason for pairs whose copies were not right. A pair whose cases only compared wrong,
+    or that has no detail, landed wrong bytes or was not checked; one whose control raised, or
+    whose every case raised, is a check that could not copy (the peer path is not judged); one
+    whose control compared wrong is the card; a case that raised is named with its error."""
+    plain: list[str] = []
+    other: list[str] = []
+    for k in wrong:
+        d = detail.get(k) or {}
+        errors = d.get("errors") or {}
+        if "host_staged" in errors:
+            other.append(f"pair {k}: the check could not copy, the host-staged control raised "
+                         f"{errors['host_staged']}")
+        elif d.get("card_suspect"):
+            other.append(f"pair {k}: the host-staged control was wrong, the card itself is "
+                         f"suspect, not the peer path")
+        elif errors and d.get("all_raised"):
+            case, err = next(iter(errors.items()))
+            other.append(f"pair {k}: the check could not copy, every case raised ({case} raised "
+                         f"{err})")
+        elif errors:
+            other.append(f"pair {k}: " + "; ".join(f"{c} raised {e}" for c, e in errors.items()))
+        else:
+            plain.append(k)
+    head = ["peer copies landed wrong bytes, or were not checked, for pair "
+            + ", ".join(plain[:6])] if plain else []
+    return "; ".join(head + other[:6])
+
+
 def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
                 p2p_read: Mapping[str, Mapping[str, str]] | None,
                 pair_gbps: Mapping[str, float | None] | None, n_expected: int | None = None,
                 command_failures: Mapping[str, str | None] | None = None,
-                peer_bytes: Mapping[str, bool | None] | None = None) -> dict[str, Any]:
+                peer_bytes: Mapping[str, bool | None] | None = None,
+                peer_detail: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, Any]:
     """F22's HW2. The checks: the topology matrix shows ``n_expected`` GPUs (default
     ``FS31_CARDS``; ``n_cards`` is what it shows), ``nv_links`` and ``nv18_everywhere`` for every
     pair, ``p2p_read_ok`` for every pair of the same GPUs, a finite positive rate for every
     ordered pair of those GPUs, and ``peer_bytes_ok`` (``"i->j"`` to true, from ``peer_bytes``: the
     direct copies of that pair landed the right bytes; a pair that is false or has no entry is a
-    reason, and the verdict ``fail``). With all of them, the slowest pair's rate gives ``verdict``:
+    reason, and the verdict ``fail``; ``peer_detail`` maps a pair to its ``card_suspect`` flag and
+    ``errors`` (from :func:`peer_bytes_detail`), so the reason says whether the bytes were wrong,
+    a case raised, or the check could not copy; ``peer_bytes_detail`` carries them to the
+    report). With all of them, the slowest pair's rate gives ``verdict``:
     ``pass`` at :data:`PEER_COPY_PASS_GBPS` or more, ``review`` from :data:`PEER_COPY_FAIL_GBPS`
     up to that, ``fail`` below it; any other failed check is ``fail``. ``gate`` is true only when
     ``n_expected`` is :data:`GATE_CARDS`; ``pass`` only for ``"pass"`` with ``gate`` (a rehearsal
@@ -229,8 +267,7 @@ def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
     if not peer_bytes:
         reasons.append("no peer-copy byte check result (peer copies unverified)")
     elif wrong:
-        reasons.append("peer copies landed wrong bytes, or were not checked, for pair "
-                       + ", ".join(wrong[:6]))
+        reasons.append(_peer_bytes_reason(wrong, peer_detail or {}))
     complete = False
     if topo is not None:
         missing = [k for k in wanted if k not in rates or rates[k] is None]
@@ -265,6 +302,8 @@ def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
             "n_cards": n_cards, "expected_cards": expected, "gate": expected == GATE_CARDS,
             "nv_links": nv_links, "nv18_everywhere": nv18, "p2p_read_ok": p2p_ok,
             "peer_bytes_ok": dict(sorted(bytes_by_pair.items())),
+            "peer_bytes_detail": {k: dict(v) for k, v in sorted((peer_detail or {}).items())
+                                  if k in wrong},
             "peer_copy_min_gbps": low, "slowest_pair": slowest,
             "pass_gbps": PEER_COPY_PASS_GBPS, "fail_gbps": PEER_COPY_FAIL_GBPS,
             "reasons": reasons}
@@ -296,9 +335,27 @@ def hw2_line(hw2: Mapping[str, Any]) -> str:
     head = {"pass": "HW2 pass", "review": "HW2 review", "fail": "HW2 FAIL"}[verdict]
     why = "; ".join(hw2.get("reasons") or []) if verdict == "fail" else ""
     wrong = sorted(k for k, v in (hw2.get("peer_bytes_ok") or {}).items() if not v)
-    if wrong:  # said first and plainly: a rate over copies that landed wrong bytes means nothing
-        speed = (f"peer copies were WRONG (or unchecked) on pair{'s' * (len(wrong) > 1)} "
-                 f"{', '.join(wrong)}, so a rate is not a result; {speed}")
+    detail = hw2.get("peer_bytes_detail") or {}
+    cannot = [k for k in wrong if (detail.get(k) or {}).get("all_raised")
+              or "host_staged" in ((detail.get(k) or {}).get("errors") or {})]
+    card = [k for k in wrong if k not in cannot and (detail.get(k) or {}).get("card_suspect")]
+    raised = [k for k in wrong if k not in cannot + card and (detail.get(k) or {}).get("errors")]
+    wrong = [k for k in wrong if k not in cannot + card + raised]
+    said = []  # said first and plainly: a rate over copies that landed wrong bytes means nothing
+    if wrong:
+        said.append(f"peer copies were WRONG (or unchecked) on pair{'s' * (len(wrong) > 1)} "
+                    f"{', '.join(wrong)}")
+    if raised:
+        said.append(f"a peer-copy case RAISED on pair{'s' * (len(raised) > 1)} "
+                    f"{', '.join(raised)}")
+    if cannot:
+        said.append(f"the byte check could not copy on pair{'s' * (len(cannot) > 1)} "
+                    f"{', '.join(cannot)}, so the peer path is not judged")
+    if card:
+        said.append(f"the card is suspect (host-staged control wrong) on pair"
+                    f"{'s' * (len(card) > 1)} {', '.join(card)}")
+    if said:
+        speed = f"{'; '.join(said)}, so a rate is not a result; {speed}"
     return f"{head}: {speed}" + (f"; {why}" if why else "")
 
 
@@ -486,9 +543,10 @@ def nvbandwidth(run: Run = subprocess.run, which: Callable[[str], str | None] = 
 # ---- the report ---------------------------------------------------------------------------
 
 
-def peer_bytes_by_pair() -> dict[str, bool]:
-    """``peer_check.check`` on every visible CUDA device, as ``"i->j"`` to whether every case of
-    that ordered pair landed the right bytes. Raises when there are fewer than two devices."""
+def peer_check_pairs() -> dict[str, dict[str, Any]]:
+    """``peer_check.check`` on every visible CUDA device: its pairs (``"i->j"`` to the pair's
+    ``ok``, ``cases``, ``errors`` and ``card_suspect``). Raises when there are fewer than two
+    devices."""
     import torch
 
     from verification.runs.peer_check import check
@@ -496,8 +554,30 @@ def peer_bytes_by_pair() -> dict[str, bool]:
     n = torch.cuda.device_count()
     if n < 2:
         raise RuntimeError(f"{n} CUDA devices visible; a peer copy needs two")
-    return {k: bool(p["ok"]) for k, p in check([torch.device(f"cuda:{i}") for i in range(n)])
-            ["pairs"].items()}
+    return check([torch.device(f"cuda:{i}") for i in range(n)])["pairs"]
+
+
+def peer_bytes_by_pair(pairs: Mapping[str, Mapping[str, Any]] | None = None) -> dict[str, bool]:
+    """``"i->j"`` to whether every case of that ordered pair landed the right bytes, from
+    ``pairs`` (default :func:`peer_check_pairs`)."""
+    return {k: bool(p["ok"]) for k, p in (peer_check_pairs() if pairs is None else pairs).items()}
+
+
+def peer_bytes_detail(pairs: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """For each pair that was not right: ``card_suspect`` (its control compared wrong),
+    ``errors`` (the cases that raised, to their ``"Type: message"``) and ``all_raised`` (the
+    control raised, or every direct case did: the check could not copy there)."""
+    out = {}
+    for k, p in pairs.items():
+        if p.get("ok"):
+            continue
+        cases = p.get("cases") or {}
+        errors = {c: e for c, e in (p.get("errors") or {}).items() if c in cases}
+        direct = [c for c in cases if c != "host_staged"]
+        out[k] = {"card_suspect": bool(p.get("card_suspect")) and "host_staged" not in errors,
+                  "errors": errors,
+                  "all_raised": bool(direct) and all(c in errors for c in direct)}
+    return out
 
 
 def _measure(fn: Callable[[], Any]) -> Any:
@@ -528,14 +608,16 @@ def build_report(run: Run = subprocess.run, n_expected: int | None = None) -> di
         "nvbandwidth": _measure(lambda: nvbandwidth(run)),
     }
     pairs = peer.get("pairs") if isinstance(peer, dict) else None
-    peer_bytes = _measure(peer_bytes_by_pair)
+    peer_pairs = _measure(peer_check_pairs)
+    failed = "error" in peer_pairs
+    peer_bytes = peer_pairs if failed else peer_bytes_by_pair(peer_pairs)
     report["peer_bytes"] = peer_bytes
     report["hw2"] = hw2_verdict(
         topo, p2p_read, pairs or None, n_expected,
         {"topo": _command_failure(commands["topo"]),
          "p2p_read": _command_failure(commands["p2p_read"])},
-        None if "error" in peer_bytes else peer_bytes)
-    if "error" in peer_bytes:
+        None if failed else peer_bytes, None if failed else peer_bytes_detail(peer_pairs))
+    if failed:
         report["hw2"]["reasons"].append(f"the peer-copy byte check raised: {peer_bytes['error']}")
     return report
 

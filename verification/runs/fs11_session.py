@@ -21,7 +21,10 @@ The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
 the upload's ``native_cache/`` into it once, offline, so no later part's timing includes the
-compile):
+compile). A plan for two or more GPUs (``nvlink-probe``, ``fs32-pair``) lists the F22 peer-copy
+byte check, ``peer_check``, first among its own parts, ahead of the models part (the native
+build, which every plan gets, runs ahead of it), and a pair that lands wrong bytes stops the
+session (:func:`peer_check_part`, :func:`peer_check_stop`):
 
 1. **models.** ``fetch-models``: check every packed file of the upload against the manifest's
    SHA-256, then fetch each public model's weights at its pinned commit with ``token=False``
@@ -134,8 +137,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-from verification.commitment import native
 
 __all__ = ["PROFILE_CHECK_TIMEOUT_S", "PROFILE_HELD", "PROFILE_PINS", "SMOLLM2_ENV", "RUN_PINS",
            "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
@@ -383,7 +384,8 @@ class Part:
     argv: list[str]  # "{python}" stands for the session's interpreter
     env: dict[str, str | None] = field(default_factory=dict)  # None unsets
     timeout_s: float | None = None
-    kind: str = "other"  # models, peer_check, benchmark, bring_up, smooth, plain, probe, kernel_speed, other
+    # models, peer_check, benchmark, bring_up, smooth, plain, probe, kernel_speed, other
+    kind: str = "other"
     info: dict[str, Any] = field(default_factory=dict)  # model, task, run_dir, report
 
 
@@ -423,36 +425,76 @@ def peer_check_part(out: Path, timeout_s: float = PEER_CHECK_TIMEOUT_S) -> Part:
 
 
 def _peer_check_extras(report: Path) -> dict[str, Any]:
-    """The check's verdict from its report: ``all_ok``, ``wrong`` (each wrong pair to its wrong
-    cases), ``card_suspect`` (the pairs whose host-staged control was wrong), the lowest direct
-    ``gbps``, the ``reason`` when no pair could be checked; ``{"peer_check": None}`` when the part
-    left no report."""
+    """The check's verdict from its report: ``all_ok``; for each wrong pair ``wrong`` (the cases
+    whose bytes compared wrong) and ``raised`` (the cases that raised or gave a bad result, each
+    to its ``"Type: message"``); ``card_suspect`` (the pairs whose host-staged control compared
+    wrong); ``cannot`` (the pairs where the control raised or every direct case raised: the check
+    could not copy there, so nothing is known of the peer path); the lowest direct ``gbps``; the
+    ``reason`` when no pair could be checked; ``{"peer_check": None}`` when the part left no
+    report."""
     if not report.exists():
         return {"peer_check": None}
     doc = json.loads(report.read_text())
     pairs = doc.get("pairs") or {}
     rates = [p["gbps"] for p in pairs.values() if p.get("gbps")]
+    wrong: dict[str, list[str]] = {}
+    raised: dict[str, dict[str, str]] = {}
+    suspect: list[str] = []
+    cannot: list[str] = []
+    for k, p in pairs.items():
+        if p.get("ok"):
+            continue
+        cases = p.get("cases") or {}
+        errors = {c: e for c, e in (p.get("errors") or {}).items() if c in cases}
+        direct = [c for c in cases if c != "host_staged"]
+        wrong[k] = [c for c, ok in cases.items() if not ok and c not in errors]
+        if errors:
+            raised[k] = errors
+        if "host_staged" in errors or (direct and all(c in errors for c in direct)):
+            cannot.append(k)
+        elif p.get("card_suspect"):
+            suspect.append(k)
     return {"peer_check": {
         "all_ok": doc.get("all_ok") is True, "reason": doc.get("reason"),
-        "wrong": {k: [c for c, ok in p["cases"].items() if not ok]
-                  for k, p in pairs.items() if not p.get("ok")},
-        "card_suspect": [k for k, p in pairs.items() if p.get("card_suspect")],
+        "wrong": wrong, "raised": raised, "card_suspect": suspect, "cannot": cannot,
         "min_gbps": min(rates) if rates else None, "seconds": doc.get("seconds"),
         "devices": doc.get("devices")}}
 
 
+def _peer_error(case: str, err: str) -> str:
+    if err.startswith("BadResult: "):
+        return f"{case} gave a bad result ({err.split(': ', 1)[1]})"
+    return f"{case} raised {err}"
+
+
 def peer_wrong_text(check: Mapping[str, Any] | None) -> str:
-    """The plain-words account of a failed check (from :func:`_peer_check_extras`): which pairs
-    landed wrong bytes, in which cases, and whether the card (the control) was the fault."""
+    """The plain-words account of a failed check (from :func:`_peer_check_extras`), each pair as
+    its own fault: wrong bytes (the cases), a case that raised (its error), the check unable to
+    copy at all (the control or every case raised: the error, and no verdict on the peer path),
+    or the control wrong (the card itself is suspect)."""
     if check is None:
         return "the peer-copy byte check left no report"
     if check.get("reason") and not check.get("wrong"):
         return f"the peer-copy byte check could not run ({check['reason']})"
     suspect = set(check.get("card_suspect") or ())
-    card = "the host-staged control was wrong: the card itself is suspect, not the peer path"
-    bits = [f"{k} ({card if k in suspect else ', '.join(c)})"
-            for k, c in (check.get("wrong") or {}).items()]
-    return "peer copies landed wrong bytes on pair " + ("; ".join(bits) or "(none named)")
+    cannot = set(check.get("cannot") or ())
+    raised = check.get("raised") or {}
+    bytes_bits: list[str] = []
+    other: list[str] = []
+    for k, c in (check.get("wrong") or {}).items():
+        errs = [_peer_error(n, e) for n, e in (raised.get(k) or {}).items()]
+        if k in cannot:
+            other.append(f"pair {k}: the check could not copy, so the peer path is not judged "
+                         f"({errs[0] if errs else 'nothing ran'})")
+        elif k in suspect:
+            other.append(f"pair {k}: the host-staged control was wrong: the card itself is "
+                         f"suspect, not the peer path")
+        elif c:
+            bytes_bits.append(f"{k} ({'; '.join([', '.join(c), *errs])})")
+        else:
+            other.append(f"pair {k}: " + ("; ".join(errs) or "no case ran"))
+    head = ["peer copies landed wrong bytes on pair " + "; ".join(bytes_bits)] if bytes_bits else []
+    return "; ".join(head + other) or "peer copies landed wrong bytes on pair (none named)"
 
 
 def peer_check_stop(rec: Mapping[str, Any]) -> str | None:
@@ -911,12 +953,13 @@ def device_leaves_gate(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | N
 # Time limits, seconds, of its parts; the fast suite's limit allows twice its estimated 25 min.
 PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "calibrate": 900,
                   "card": 900, "run": 900, "cheat": 900}
-# Estimates, minutes, scaled by hand (none was measured on two cards): the models part 2-5, the
+# Estimates, minutes, scaled by hand (none was measured on two cards): the peer-copy byte check
+# 1 (two ordered pairs; its limit is 5), the models part 2-5, the
 # native build 1-2, the fast suite 13-25 on 10 vCPUs (the CUDA tests run on it for the first
 # time), the slow two-GPU tests about 10, SmolLM2's calibration about 5, each of two
 # card_identity runs about 3, each of two 3-step runs about 6, each of three cheat runs about 4.
-PAIR_ESTIMATE_MIN = {"models": 5, "native_build": 2, "fast_suite": 25, "two_gpu_slow": 10,
-                     "calibrate": 5, "card": 6, "run": 12, "cheat": 12}
+PAIR_ESTIMATE_MIN = {"peer_check": 1, "models": 5, "native_build": 2, "fast_suite": 25,
+                     "two_gpu_slow": 10, "calibrate": 5, "card": 6, "run": 12, "cheat": 12}
 PAIR_STEPS = 3
 PAIR_CARDS = 2  # the session refuses a machine with fewer CUDA devices
 PAIR_DEVICES = "cuda:0,cuda:1"  # VERIF_VERIFIER_DEVICES of the sharded arms
@@ -929,7 +972,8 @@ PAIR_SLOW_SELECT = "two_gpus or two_cuda_devices"
 
 
 def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
-    """The two-GPU session's parts: the models part; the whole fast suite (``-rf``, junit XML);
+    """The two-GPU session's parts: the F22 peer-copy byte check first (:func:`peer_check_part`;
+    wrong bytes stop the session); the models part; the whole fast suite (``-rf``, junit XML);
     the slow two-GPU tests; SmolLM2's calibration (unsharded, writing the band file, even when
     the bf16 guard fails); ``card_identity`` (step 1's transcript root) and a 3-step
     ``run_verified`` unsharded and again with ``VERIF_VERIFIER_DEVICES``; and the judged cheats
@@ -1637,9 +1681,9 @@ def _pair_part(parts: Sequence[Mapping[str, Any]], name: str) -> Mapping[str, An
     return next((p for p in parts if p["name"] == name), {})
 
 
-PAIR_PARTS = (PEER_CHECK_NAME, "models", NATIVE_BUILD_NAME, "fast_suite", "two_gpu_slow", "smollm2_calibrate",
-              "card_unsharded", "card_sharded", "run_unsharded", "run_sharded", "poisoned_step",
-              "hidden_steps", "flipped_matmul")
+PAIR_PARTS = (PEER_CHECK_NAME, "models", NATIVE_BUILD_NAME, "fast_suite", "two_gpu_slow",
+              "smollm2_calibrate", "card_unsharded", "card_sharded", "run_unsharded",
+              "run_sharded", "poisoned_step", "hidden_steps", "flipped_matmul")
 _PAIR_OK = ("ok", "skipped_done")
 
 
@@ -1902,7 +1946,8 @@ def _hw_lines(parts: Sequence[Mapping[str, Any]], hw3: Mapping[str, Any] | None)
         peer = next((p for p in parts if p.get("kind") == "peer_check"), None)
         if peer is not None and peer_check_stop(peer):
             # the session stopped on it: the probe never ran, so say why, plainly
-            lines.append("HW2 FAIL: " + peer_wrong_text((peer.get("extras") or {}).get("peer_check"))
+            why = peer_wrong_text((peer.get("extras") or {}).get("peer_check"))
+            lines.append("HW2 FAIL: " + why
                          + "; the NVLink probe did not run")
         elif hw2 is None:
             lines.append(f"HW2 FAIL: the NVLink probe left no verdict ({probe['status']})")
@@ -2232,6 +2277,8 @@ def check_upload(upload: Path) -> dict[str, Any]:
                 models[m["repo"]] = probs
     except (OSError, ValueError, KeyError, TypeError) as e:
         packed = [f"manifest.json unreadable: {type(e).__name__}: {e}"]
+    from verification.commitment import native  # imports numpy and torch: not at module level
+
     src = native.source_dir(upload / "native_cache")
     bad = native.bad_sources(src) if src.is_dir() else ["the directory"]
     return {"packed": packed, "models": models,

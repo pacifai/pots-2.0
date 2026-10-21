@@ -1,4 +1,5 @@
-"""FS31 part A: the topology parsers, the HW2 verdict, the command runner, and the copies without CUDA."""
+"""FS31 part A: the topology parsers, the HW2 verdict, the command runner, and the copies without
+CUDA."""
 
 import json
 import subprocess
@@ -346,8 +347,9 @@ def _smi(topo_code=0, p2p_code=0, topo_out=TOPO_4, p2p_out=P2P_4):
 
 
 def _fast(monkeypatch, rates=None, wrong=()):
-    monkeypatch.setattr(nv, "peer_bytes_by_pair", lambda: {
-        f"{a}->{b}": f"{a}->{b}" not in wrong for a in range(4) for b in range(4) if a != b})
+    monkeypatch.setattr(nv, "peer_check_pairs", lambda: {
+        f"{a}->{b}": {"ok": f"{a}->{b}" not in wrong}
+        for a in range(4) for b in range(4) if a != b})
     monkeypatch.setattr(nv, "torch_view", lambda: {"device_count": 4})
     monkeypatch.setattr(nv, "peer_copy_bandwidth",
                         lambda: {"pairs": pair_rates(4, 380.0) if rates is None else rates})
@@ -475,7 +477,61 @@ def test_a_raising_byte_check_fails_hw2_and_the_report_is_still_built(monkeypatc
     def boom():
         raise RuntimeError("CUDA error: wedged")
 
-    monkeypatch.setattr(nv, "peer_bytes_by_pair", boom)
+    monkeypatch.setattr(nv, "peer_check_pairs", boom)
     r = nv.build_report(_smi())
     assert r["peer_bytes"] == {"error": "RuntimeError: CUDA error: wedged"}
     assert r["hw2"]["verdict"] == "fail" and any("wedged" in x for x in r["hw2"]["reasons"])
+
+
+# ---- round 5: what the probe's own run of the byte check carries to HW2 ---------------------
+
+
+def _raised(case="side_stream", err="RuntimeError: illegal memory access", every=False):
+    cases = {"host_staged": True, "to_4KB": True, case: False}
+    errors = {case: err}
+    if every:
+        cases = {"host_staged": True, "to_4KB": False, case: False}
+        errors = {"to_4KB": err, case: err}
+    return {"ok": False, "cases": cases, "errors": errors, "card_suspect": False}
+
+
+@pytest.mark.parametrize("pair, say", [
+    ({"ok": False, "cases": {"host_staged": True, "to_4KB": False}, "errors": {},
+      "card_suspect": False}, "WRONG"),
+    (_raised(), "RAISED"),
+    (_raised(every=True), "could not copy"),
+    ({"ok": False, "cases": {"host_staged": False}, "errors": {}, "card_suspect": True},
+     "card is suspect"),
+    ({"ok": False, "cases": {"host_staged": False},
+      "errors": {"host_staged": "RuntimeError: launch failure"}, "card_suspect": True},
+     "could not copy"),
+])
+def test_the_probes_own_check_carries_its_errors_to_hw2_and_its_line(monkeypatch, pair, say):
+    _fast(monkeypatch)
+    pairs = {f"{a}->{b}": {"ok": True} for a in range(4) for b in range(4) if a != b}
+    pairs["1->0"] = pair
+    monkeypatch.setattr(nv, "peer_check_pairs", lambda: pairs)
+    r = nv.build_report(_smi())
+    h = r["hw2"]
+    assert h["verdict"] == "fail" and h["peer_bytes_ok"]["1->0"] is False
+    d = h["peer_bytes_detail"]
+    assert list(d) == ["1->0"] and set(d["1->0"]) == {"card_suspect", "errors", "all_raised"}
+    assert say in nv.hw2_line(h)
+    assert any("1->0" in x for x in h["reasons"])
+    if say == "RAISED":
+        assert "side_stream raised RuntimeError: illegal memory access" in " ".join(h["reasons"])
+        assert "wrong bytes" not in " ".join(h["reasons"])
+
+
+def test_hw2_says_wrong_bytes_only_for_pairs_that_compared_wrong():
+    topo, p2p = nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4)
+    rates = pair_rates(4, 380.0)
+    wrong = ("0->1", "2->3")
+    detail = {"0->1": {"card_suspect": False, "errors": {}, "all_raised": False},
+              "2->3": {"card_suspect": False, "errors": {"copy_4MB": "RuntimeError: x"},
+                       "all_raised": False}}
+    v = nv.hw2_verdict(topo, p2p, rates, None, None, right_bytes(topo, wrong), detail)
+    why = "; ".join(v["reasons"])
+    assert "wrong bytes, or were not checked, for pair 0->1" in why
+    assert "pair 2->3: copy_4MB raised RuntimeError: x" in why
+    assert "2->3" not in why.split("pair 0->1")[0]

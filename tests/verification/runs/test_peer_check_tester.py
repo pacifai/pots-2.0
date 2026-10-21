@@ -1,7 +1,7 @@
 """FS32 round 4 tester: tries to break the peer-copy byte check, its session stop and the probe's
 verdict. The comparison runs on the CPU with injected copies; the side-stream case is held against
-``MatmulCapture._route`` with recorded fake streams. The ``xfail(strict=True)`` tests are defects
-the tester found, each with its reason."""
+``MatmulCapture._route`` with recorded fake streams. Its three former ``xfail(strict=True)``
+tests, defects the tester found, pass since round 5."""
 
 import contextlib
 import json
@@ -54,13 +54,24 @@ def hits(case, kind, src):
         return kind == "copy_" and src.ndim == 2
     if case == "side_stream":
         return kind == "side_stream"
+    if case == "bf16_4MB":
+        return src.dtype == torch.bfloat16
+    if case == "3d_4MB":
+        return src.ndim == 3
+    if case == "fp32_4MB":
+        return src.dtype == torch.float32 and src.ndim == 1
+    if case == "offset_4MB":
+        return src.dtype == torch.int32 and src.ndim == 1 and src.storage_offset() != 0
+    plain = src.dtype == torch.int32 and src.ndim == 1 and src.storage_offset() == 0
+    if not plain or kind == "side_stream":
+        return False
     k, label = case.rsplit("_", 1)
-    return kind == (k if k == "to" else "copy_") and src.ndim == 1 and src.numel() == pc.SIZES[label]
+    return kind == (k if k == "to" else "copy_") and src.numel() == pc.SIZES[label]
 
 
 # ---- the comparison ---------------------------------------------------------------------------
 
-ALL_CASES = [*pc.CONTIGUOUS_CASES, "strided", "side_stream"]
+ALL_CASES = [*pc.CONTIGUOUS_CASES, *pc.EXTRA_CASES, "strided", "side_stream"]
 
 
 @pytest.mark.parametrize("case", ALL_CASES)
@@ -107,9 +118,6 @@ def test_a_right_value_in_another_shape_is_caught(case):
     assert run(copy)["cases"][case] is False
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "defect, low: _bytes views the result as uint8, so a copy that returns the right bytes as "
-    "another dtype (float32 for int32) passes; the comparison never looks at dtype"))
 def test_a_right_value_in_another_dtype_is_caught():
     def copy(kind, src, dst):
         out = right(kind, src, dst)
@@ -118,10 +126,6 @@ def test_a_right_value_in_another_dtype_is_caught():
     assert run(copy)["cases"]["to_4KB"] is False
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "defect, low: the comparison never looks at the result's device, so a 'copy' that returns "
-    "the source itself (an alias, left on the source card) passes; cuda_copy always allocates on "
-    "the destination, so only a changed cuda_copy could do this"))
 def test_a_copy_that_returns_the_source_object_on_the_wrong_device_is_caught():
     r = pc.check_pair(CPU, torch.device("meta"), lambda kind, src, dst: src,
                       lambda src, dst: src.clone())
@@ -134,15 +138,11 @@ def test_the_sources_are_random_bits():
     assert len(seen) >= 8
     for s in seen[:8]:
         b = s.contiguous().view(torch.uint8).view(-1)
-        assert b.unique().numel() >= 200 and s.dtype == torch.int32
+        assert b.unique().numel() >= 200
+        assert s.dtype in (torch.int32, torch.bfloat16, torch.float32)
         assert (b != 0).float().mean() > 0.9  # not zeros, so a copy that writes zeros shows
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "defect, low: to_<size> and copy_<size> copy the same source tensor, and the result of the "
-    "first is freed before the second's torch.empty, which the caching allocator hands the same "
-    "block (same size, same stream): a copy_ that wrote nothing would leave the right bytes "
-    "there and pass. A fresh random source per case closes it"))
 def test_each_case_has_its_own_source():
     seen = []
     run(lambda kind, src, dst: (seen.append(src.clone()), right(kind, src, dst))[1])
@@ -173,7 +173,8 @@ def test_a_control_that_raises_marks_the_card_and_no_direct_copy_runs():
     assert r["card_suspect"] is True and r["ok"] is False and calls == []
     assert "unspecified launch failure" in r["errors"]["host_staged"]
     lines = pc.report_lines({"pairs": {"0->1": r}, "all_ok": False, "seconds": 0})
-    assert "card itself is suspect" in lines[0] and "wrong bytes" not in lines[0]
+    assert "could not copy" in lines[0] and "host_staged raised RuntimeError" in lines[0]
+    assert "wrong bytes" not in lines[0] and "peer path is" not in lines[0]
 
 
 def test_a_corrupt_control_runs_no_direct_copy():
@@ -282,10 +283,11 @@ def _fake_cuda(monkeypatch, log):
 def test_the_side_stream_case_does_what_route_does(monkeypatch):
     """Both: a side stream of the source device waits on its current stream; under it an empty on
     the destination and ``copy_(non_blocking=True)``; an event recorded on it. The differences:
-    ``_route`` takes a persistent per-device stream (``buffers.stream``) and leaves the event to
-    ``_drain``; the check makes a stream and synchronizes the event at once."""
+    ``_route`` leaves the event to ``_drain``; the check synchronizes it at once. Both keep one
+    stream per source device (``buffers.stream``, ``_side_stream``)."""
     src = torch.randint(0, 100, (64,), dtype=torch.int32)
     dst_device = torch.device("meta")
+    monkeypatch.setattr(pc, "_SIDE", {})
     ours, theirs = [], []
     _fake_cuda(monkeypatch, ours)
     with Log(ours):
@@ -325,9 +327,9 @@ def test_the_multi_gpu_list_is_every_session_that_names_two_or_more_cards(tmp_pa
 
 
 def test_the_session_module_and_every_plan_do_not_import_the_check():
-    """The brief says fs11_session imports no torch; at efaaec5 it already does, through
-    ``verification.commitment.native`` (``import torch``, line 48), so a bare pod's self-test only
-    works where torch is installed. What this branch must not add is ``peer_check``."""
+    """The session module imports no torch (``verification.commitment.native`` is imported where
+    the upload check uses it), and the session and its plans must not import ``peer_check``,
+    which does."""
     code = ("import sys, tempfile, pathlib\n"
             f"sys.path.insert(0, {str(ROOT)!r})\n"
             "from verification.runs import fs11_session as fs\n"
@@ -347,7 +349,8 @@ def _session(tmp_path, argv, *, timeout_s=30, name="nvlink-probe", plan_fn=None)
     """The probe session's plan with the check's command replaced by ``argv``; the others pass."""
     import dataclasses
 
-    plan = fs.with_native_build((plan_fn or fs.nvlink_probe_plan)(tmp_path / "up", tmp_path / "out"))
+    plan = fs.with_native_build(
+        (plan_fn or fs.nvlink_probe_plan)(tmp_path / "up", tmp_path / "out"))
     plan = [dataclasses.replace(p, argv=argv, timeout_s=timeout_s) if p.kind == "peer_check"
             else dataclasses.replace(p, argv=["{python}", "-c", "pass"], timeout_s=30)
             for p in plan]

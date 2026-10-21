@@ -28,7 +28,8 @@ def parse(text):
 
 def verdict(topo=TOPO_4, p2p=P2P_4, rates=None, n=4):
     t = parse(topo)
-    right = {f"{a[3:]}->{b[3:]}": True for a in t for b in t if a != b} if t else None  # bytes right
+    # the peer-copy bytes are right for every ordered pair
+    right = {f"{a[3:]}->{b[3:]}": True for a in t for b in t if a != b} if t else None
     return nv.hw2_verdict(t, parse(p2p), pair_rates(n, 380.0) if rates is None else rates,
                           peer_bytes=right)
 
@@ -145,8 +146,8 @@ def _fake_run(topo_code=0, p2p_code=0, topo_text=TOPO_4, p2p_text=P2P_4):
 
 
 def _four_fast(monkeypatch):
-    monkeypatch.setattr(nv, "peer_bytes_by_pair", lambda: {
-        f"{a}->{b}": True for a in range(4) for b in range(4) if a != b})
+    monkeypatch.setattr(nv, "peer_check_pairs", lambda: {
+        f"{a}->{b}": {"ok": True} for a in range(4) for b in range(4) if a != b})
     monkeypatch.setattr(nv, "torch_view", lambda: {"device_count": 4})
     monkeypatch.setattr(nv, "peer_copy_bandwidth", lambda: {"pairs": pair_rates(4, 380.0)})
     monkeypatch.setattr(nv, "fanout_bandwidth", lambda: {})
