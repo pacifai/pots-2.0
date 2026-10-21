@@ -71,6 +71,7 @@ from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import load_weights, snapshot_weights
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.runs.llama_step import load_committed_dataset
+from verification.runs.loop import run_devices
 from verification.runs.metrics import COUNT_STEPS, MetricsWriter, TimeRecorder, read_records
 from verification.runs.prover_spec import loop_mode
 from verification.runs.scenarios import (
@@ -486,7 +487,8 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
          context: Mapping[str, Any], band_file: Path, run_dir: Path,
          models: ReusedModel, count_final: Mapping[str, torch.Tensor] | None = None,
          write_despite_guard: bool = False) -> int:
-    rec = None if mw is None else mw.recorder("calibrate")
+    devs = None if mw is None else run_devices(c, pipelined=bool(base.get("pipelined")))
+    rec = None if mw is None else mw.recorder("calibrate", devices=devs)
     run = calibrate(c, D, w0, T_run=T_run, context=context, recorder=rec, **base)
     report_calibration(run, k)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -534,10 +536,11 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
     summary["band_file"] = str(band_file)
     _write(mw, summary)
 
-    on = judged_run(c, D, w0, bands, recorder=None if mw is None else mw.recorder("frozen"),
-                    **base)
+    on = judged_run(c, D, w0, bands,
+                    recorder=None if mw is None else mw.recorder("frozen", devices=devs), **base)
     off = judged_run(c, D, w0, bands, kappa_guard=False,
-                     recorder=None if mw is None else mw.recorder("frozen_no_kappa"), **base)
+                     recorder=None if mw is None else mw.recorder("frozen_no_kappa", devices=devs),
+                     **base)
     for name, r in (("frozen", on), ("frozen, κ guard off", off)):
         v = r.loop.verdict
         print(f"judged under the band file ({name}): accepted={v.accepted}, "
@@ -559,7 +562,7 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
         make = judging_verifier(c, len(D), w0, bands, T=base["T"], k=k, seed=base["seed"],
                                 h_D=base["h_D"])
         mw.write(memory_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
-                            device=mw.device, verifier=make, **base))
+                            device=mw.device, verifier=make, devices=devs, **base))
         n = COUNT_STEPS
         count_base = {**{x: v for x, v in base.items() if x not in ("pipelined", "prover")},
                       "T": n, "final": base["final"] if n == base["T"] else

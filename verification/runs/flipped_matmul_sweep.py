@@ -147,7 +147,7 @@ from verification.runs.cheats import (
     run_cheat,
 )
 from verification.runs.metrics import MetricsWriter, spec_class
-from verification.runs.prover_spec import loop_mode
+from verification.runs.prover_spec import loop_mode, refuse_pipelined
 from verification.runs.run_verified import (
     KeptStep,
     honest_run_name,
@@ -962,10 +962,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.trials < 1 or args.deep_trials < 0 or any(not x > 0 for x in args.x + args.deep_x):
         p.error("need --trials ≥ 1, --deep-trials ≥ 0 and every x > 0")
     cfg = load_config()
-    if cfg.pipelined and not args.no_sweep:
-        p.error("VERIF_PIPELINED=1 is refused for the sweep and for --source in-process: the "
-                "sweep perturbs a step kept in this process (KeepStep, or the stored step), "
-                "and only --no-sweep (the flipped-matmul cheat alone) runs pipelined")
+    if not args.no_sweep:
+        refuse_pipelined(cfg, "flipped_matmul_sweep",
+                         "the sweep perturbs a step kept in this process (KeepStep, or the "
+                         "stored step); only --no-sweep (the cheat alone) runs pipelined")
     pc = load_protocol_config()
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     setup_determinism(cfg)

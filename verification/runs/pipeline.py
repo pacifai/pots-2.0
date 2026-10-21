@@ -158,7 +158,12 @@ from verification.runs.loop import (
     model_device,
     release_device_cache,
 )
-from verification.runs.metrics import MemoryRecorder, TimeRecorder, memory_probe
+from verification.runs.metrics import (
+    MemoryRecorder,
+    TimeRecorder,
+    memory_probe,
+    normalize_devices,
+)
 from verification.runs.scenarios import KeepStep, ReusedModel
 from verification.transcript.errors import StoreMutationError
 from verification.transcript.shared import SharedStore, share_step
@@ -295,16 +300,19 @@ def _child_main(conn: Connection, args: _ChildArgs) -> None:
         raise SystemExit(1) from None
 
 
-def _await_bye(conn: Connection, timeout: float = 60.0) -> None:
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if conn.poll(_POLL_S):
-            try:
-                msg = conn.recv()
-            except (EOFError, OSError):
-                return
-            if msg[0] == "bye":
-                return
+def _await_bye(conn: Connection) -> None:
+    """Wait for the parent's ``bye``, with no deadline: the child owns the memory the parent
+    reads through IPC handles, so it exits only on ``bye`` or when the pipe closes (EOF or
+    ``OSError``). The parent's ``link.stop()`` ends a child that outlives the run."""
+    while True:
+        try:
+            if not conn.poll(_POLL_S):
+                continue
+            msg = conn.recv()
+        except (EOFError, OSError):
+            return
+        if msg[0] == "bye":
+            return
 
 
 def _child_run(conn: Connection, args: _ChildArgs) -> None:
@@ -573,7 +581,7 @@ def _recorder_spec(recorder: TimeRecorder | MemoryRecorder | None, c: DeclaredCo
         raise ValueError(f"pipelined: a {type(recorder).__name__} cannot split a step; only "
                          f"TimeRecorder and MemoryRecorder run pipelined")
     p = c.placement
-    devs = (str(p.prover), *(str(d) for d in p.devices or ()))
+    devs = tuple(str(d) for d in normalize_devices((p.prover, *(p.devices or ()))))
     on_cuda = any(_is_cuda(d) for d in devs)
     return RecorderSpec(kind, recorder.run, recorder.scenario, devs if on_cuda else ())
 

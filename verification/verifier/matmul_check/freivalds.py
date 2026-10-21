@@ -67,8 +67,10 @@ needs check 5's bits measures the member in check 5's whole batch.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -81,9 +83,10 @@ from verification.verifier.matmul_check.challenges import (
 from verification.verifier.matmul_check.sizing import product_e_m
 
 __all__ = ["ROW", "MeasureColumns", "MeasureScratch", "ProductMeasure", "band_unit",
-           "finish_row", "finish_rows", "measure_product", "measure_product_row",
+           "MeasureGroup", "drain", "finish_row", "finish_rows", "kernel_device", "measure_groups_rows",
+           "measure_product", "measure_product_row",
            "measure_products", "measure_products_rows", "row_width", "term_scale",
-           "term_scales"]
+           "reference", "term_scales"]
 
 
 @dataclass(frozen=True)
@@ -291,6 +294,65 @@ of ``U²`` (``Σ_i (A²·(B²·1))_i``), ``‖b‖²`` (0 without a bias), then 
 def row_width(k: int) -> int:
     """The length of a row (:data:`ROW`) at ``k`` challenges."""
     return len(ROW) - 1 + k
+
+
+class MeasureGroup(NamedTuple):
+    """Products measured together on the fused kernel (FS37, ``MEASURE_KERNEL_PLAN_DRAFT.md``
+    §2.2–§2.3): member ``t`` is ``a[t]·b[t]`` against ``p[t]``, labelled ``ms[t]``.
+
+    ``a`` ``[n_t, n, q]``, ``b`` ``[n_t, q, w]`` and ``p`` ``[n_t, n, w]`` are views with any
+    strides (a slice of a whole bmm operand, a transposed view), ``a`` and ``b`` in the operand
+    dtype, ``p`` in the stored dtype, all on one CUDA device. ``bias`` (``[w]``, operand dtype)
+    is allowed only when ``n_t == 1``."""
+
+    a: torch.Tensor
+    b: torch.Tensor
+    p: torch.Tensor
+    ms: Sequence[int]
+    bias: torch.Tensor | None = None
+
+
+_reference_depth = 0
+
+
+@contextmanager
+def reference() -> Iterator[None]:
+    """Inside, :func:`kernel_device` is ``False`` everywhere: CUDA tensors take the torch
+    path, for the comparison tests. Nests."""
+    global _reference_depth
+    _reference_depth += 1
+    try:
+        yield
+    finally:
+        _reference_depth -= 1
+
+
+def kernel_device(device: torch.device | str) -> bool:
+    """Whether measuring on ``device`` goes to the fused kernel: a CUDA device outside
+    :func:`reference`. Every other device keeps the torch path bit for bit (§2.2).
+
+    FS37 interface stub: ``False`` until the kernel lands."""
+    return False
+
+
+def measure_groups_rows(groups: Sequence[MeasureGroup], *, h: bytes, k: int,
+                        guard: bool = True) -> torch.Tensor:
+    """Every member's row (:data:`ROW`) as float64 ``[Σ n_t, row_width(k)]`` on the groups'
+    device, groups in order and members in order within each, from one table and one launch
+    set on the current stream, with no host read. Challenges come from the host challenge
+    source (§2.6). The inputs, the table and the challenge buffer are held, with each input's
+    ``_version`` as enqueued, until :func:`drain`.
+
+    FS37 interface stub."""
+    raise NotImplementedError("the fused measuring kernel lands in FS37")
+
+
+def drain(device: torch.device | str | None = None) -> None:
+    """Wait for every kernel measurement enqueued on ``device`` (every device when ``None``),
+    check that no held input's ``_version`` moved (``ReplayError`` otherwise, invariant 6),
+    and release the holds. Call it before reading rows back.
+
+    FS37 interface stub: nothing is ever in flight yet."""
 
 
 def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes, m: int,
