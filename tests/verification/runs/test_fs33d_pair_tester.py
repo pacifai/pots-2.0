@@ -197,9 +197,11 @@ def test_a_pipelined_cheat_part_with_its_sequential_twin_missing_is_no_pass():
     assert not fs.fs32_pair(parts)["pass"]
 
 
-def test_a_mode_line_is_read_from_the_first_line_and_not_from_a_later_quote(tmp_path):
+def test_a_mode_line_must_start_the_line_and_two_such_lines_are_multiple(tmp_path):
     log = tmp_path / "l"
     log.write_text("loop mode: sequential\nloop mode: pipelined\n")
+    assert fs._loop_mode(log.read_text().splitlines()) == "multiple"
+    log.write_text("loop mode: sequential\n  loop mode: pipelined\n")  # a quote, not a line
     assert fs._loop_mode(log.read_text().splitlines()) == "sequential"
     log.write_text("   loop mode: pipelined\n")  # indented: not the printed line
     assert fs._loop_mode(log.read_text().splitlines()) is None
@@ -226,9 +228,6 @@ def test_only_the_five_pipelined_parts_set_the_mode_and_to_one(tmp_path):
             assert p.env.get("VERIF_PIPELINED", "absent") in (None, "absent"), n
 
 
-@pytest.mark.xfail(strict=True, reason="peer_check, models and native_build don't list "
-                   "VERIF_PIPELINED as None: a job environment that sets it reaches them (low: "
-                   "none runs the loop, but the brief says every part unsets it)")
 def test_every_part_unsets_the_mode_unless_it_is_pipelined(tmp_path, monkeypatch):
     """A job environment that sets VERIF_PIPELINED must not reach any other part: the part's
     env must hold the key as None (it is popped), the peer check, models and build included."""

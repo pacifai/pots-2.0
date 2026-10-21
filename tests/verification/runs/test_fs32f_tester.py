@@ -614,9 +614,10 @@ def test_the_job_log_ends_with_one_line_per_acceptance_item(tmp_path, monkeypatc
         "FS32 cheat A1", "FS32 cheat A2",
         "FS32 cheat A3", "FS32 cheat hidden", "FS32 cheat flip",
         *["FS32 pipelined cheat " + n for n in ("A1", "A2", "A3", "hidden", "flip")],
-        *["FS32 step wall time " + a + " (prover/verifier/hand-off/total s)" for a in ("unsharded", "sharded", "pipelined",
-                                              "pipelined_metrics")],
-        "FS32 fast_suite", "FS32 two_gpu_slow", *["FS32 FAIL"] * 11,  # ten parts not run, the honest line
+        *["FS32 step wall time " + a + " (prover/verifier/hand-off/total s)"
+          for a in ("unsharded", "sharded", "pipelined", "pipelined_metrics")],
+        "FS32 fast_suite", "FS32 two_gpu_slow",
+        *["FS32 FAIL"] * 11,  # ten parts not run, the honest line
         "FS32 slowest failing test"]
     assert {l for l in fs32 if l.startswith("FS32 FAIL") and "did not run" in l} == {
         f"FS32 FAIL: {n} did not run" for n in (

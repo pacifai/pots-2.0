@@ -172,7 +172,8 @@ def test_profile_check_plan(tmp_path):
     assert not any("Qwen2.5-1.5B" in n for n in names)
     assert [p.timeout_s for p in plan] == (
         [1800, 600, 900, 900, 900, 900, 600, 900] + [600, 3600] * len(fs.PROFILE_PINS))
-    assert plan[0].env == {"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None}
+    assert plan[0].env == {"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None,
+                                  "VERIF_PIPELINED": None}
     assert all("HF_HUB_OFFLINE" not in p.env for p in plan[1:])
     assert all("POTS_SAMPLER" not in p.env for p in plan)
     # the trace variables sit in the parts that name them, and nowhere else

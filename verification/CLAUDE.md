@@ -2866,7 +2866,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     compares each with the sharded sequential arm (verdicts, every step's root and whole line,
     final and kept roots, losses; each cheat `exact` with the same whole oracle row), requires
     `loop mode: pipelined` in each pipelined part's log and `loop mode: sequential` in each
-    sequential loop part's (`FS32 FAIL: <part> ran sequentially|pipelined`), and records
+    sequential loop part's (`FS32 FAIL: <part> ran sequentially|pipelined`; two mode lines in
+    one log, `loop_mode` `multiple`: `printed more than one loop mode line`; every other part,
+    `peer_check`, `models` and the native build included, unsets `VERIF_PIPELINED`), and records
     `step_times` (prover, verifier, hand-off, total per step, per arm) and `gpu_peak` (per
     part), outside `pass`. `pair_default_deadline_s()` is the job's default deadline.
     Every part's `info["gpu_peak"]` makes `_run_part` run a `_GpuPeaks` sampler

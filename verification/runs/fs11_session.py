@@ -85,7 +85,8 @@ The two-GPU session (FS32f, F22) runs the models part, the whole fast suite (``-
 slow two-GPU tests, SmolLM2's calibration, then ``card_identity`` and a 3-step ``run_verified``
 unsharded and again with ``VERIF_VERIFIER_DEVICES=cuda:0,cuda:1``, and the judged cheats with
 that setting; then FS33d's pipelined arms (sharded, ``VERIF_PIPELINED=1``: ``run_pipelined``,
-``run_pipelined_metrics`` and the cheats again), each compared with its sharded sequential arm. ``summary.json``'s ``fs32_pair`` (:func:`fs32_pair`) compares the two arms' roots
+``run_pipelined_metrics`` and the cheats again), each compared with its sharded sequential
+arm. ``summary.json``'s ``fs32_pair`` (:func:`fs32_pair`) compares the two arms' roots
 (step 1's transcript root, the final weights' root, the per-step losses, the kept step 3's
 root) and per-step verdicts, and holds each cheat's outcome (which must be ``exact``) and the
 failing tests; the job log ends with one ``FS32`` line per item. It refuses unless torch sees
@@ -404,7 +405,7 @@ def _run_dir(out: Path, upload: Path, key: str, name: str | None = None) -> Path
 def _models_part(upload: Path, out: Path, timeout_s: float) -> Part:
     return Part("models", ["{python}", "-m", "verification.runs.fs11_session", "fetch-models",
                            "--upload", str(upload), "--out", str(out / "models")],
-                env={"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None},
+                env={"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None, "VERIF_PIPELINED": None},
                 timeout_s=timeout_s, kind="models",
                 info={"report": str(out / "models" / "models.json")})
 
@@ -421,7 +422,8 @@ def peer_check_part(out: Path, timeout_s: float = PEER_CHECK_TIMEOUT_S) -> Part:
     report = out / PEER_CHECK_NAME / "peer_check.json"
     return Part(PEER_CHECK_NAME,
                 ["{python}", "-m", "verification.runs.peer_check", "--out", str(report)],
-                env=dict(PCI_ORDER_ENV), timeout_s=timeout_s, kind="peer_check",
+                env={**PCI_ORDER_ENV, "VERIF_PIPELINED": None}, timeout_s=timeout_s,
+                kind="peer_check",
                 info={"report": str(report)})
 
 
@@ -1173,7 +1175,7 @@ NATIVE_BUILD_NAME = "native_build"
 def _native_build_part() -> Part:
     """A fresh build part, so no two plans share its env and info dicts."""
     return Part(NATIVE_BUILD_NAME, ["{python}", "-m", "verification.commitment.native"],
-                timeout_s=900)
+                env={"VERIF_PIPELINED": None}, timeout_s=900)
 
 
 def with_native_build(plan: Sequence[Part]) -> list[Part]:
@@ -1697,10 +1699,10 @@ _PAIR_KEPT = re.compile(r"^stored step (\d+): .*root ([0-9a-f]{16})")
 
 
 def _loop_mode(lines: Sequence[str]) -> str | None:
-    """The mode the entry point printed (``loop mode: pipelined`` or ``sequential``), or
-    ``None``; the first such line counts."""
-    return next((x[len(PAIR_MODE_LINE):].strip() for x in lines if x.startswith(PAIR_MODE_LINE)),
-                None)
+    """The mode the entry point printed (``loop mode: pipelined`` or ``sequential``), ``None``
+    when there is no such line, and ``"multiple"`` when there is more than one (never a mode)."""
+    modes = [x[len(PAIR_MODE_LINE):].strip() for x in lines if x.startswith(PAIR_MODE_LINE)]
+    return "multiple" if len(modes) > 1 else (modes[0] if modes else None)
 
 
 def _pair_run_extras(log: Path, weights: Path) -> dict[str, Any]:
@@ -1945,6 +1947,7 @@ def _pair_lines(pair: Mapping[str, Any] | None) -> list[str]:
     for n, seen in pair["mode_problems"].items():
         lines.append(f"FS32 FAIL: {n} " + {"sequential": "ran sequentially",
                                            "pipelined": "ran pipelined",
+                                           "multiple": "printed more than one loop mode line",
                                            None: "printed no loop mode line"}.get(
                                                seen, f"printed loop mode {seen!r}"))
     for n, status in pair["part_problems"].items():

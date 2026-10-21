@@ -1235,7 +1235,9 @@ verifier and is no slower; that is an estimate, not a measurement. Each part's t
 cap; the fast suite's is 3,600 s, the metrics run's 1,800 s.
 
 The pipelined arms must print `loop mode: pipelined` (the sequential ones `loop mode:
-sequential`), else `FS32 FAIL: <part> ran sequentially` (or `pipelined`). `fs32_pair` compares
+sequential`), else `FS32 FAIL: <part> ran sequentially` (or `pipelined`); two `loop mode:`
+lines in one log fail it too (`printed more than one loop mode line`). Every other part
+unsets `VERIF_PIPELINED` in its env. `fs32_pair` compares
 each with the sharded sequential arm: verdicts, every step's root and whole line, the final and
 kept roots, losses, and each cheat `exact` with the same oracle row. It records each arm's
 per-step wall time (`step_times`: prover, verifier, hand-off, total) side by side and each

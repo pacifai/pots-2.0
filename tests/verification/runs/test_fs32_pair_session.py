@@ -182,6 +182,25 @@ def test_a_part_in_the_wrong_loop_mode_prints_its_fail_line():
     assert "FS32 FAIL: hidden_steps_pipelined printed no loop mode line" in text
 
 
+@pytest.mark.parametrize("lines", [["loop mode: pipelined", "x", "loop mode: sequential"],
+                                   ["loop mode: sequential", "loop mode: pipelined"],
+                                   ["loop mode: pipelined", "loop mode: pipelined"]])
+def test_two_loop_mode_lines_are_never_a_mode(lines):
+    assert fs._loop_mode(lines) == "multiple"
+    row = _cheat("hidden_steps_pipelined", ("hidden",), pipelined=True)
+    row["extras"]["loop_mode"] = fs._loop_mode(lines)
+    pair = fs.fs32_pair(_parts(hidden_steps_pipelined=row))
+    assert not pair["pass"] and pair["mode_problems"] == {"hidden_steps_pipelined": "multiple"}
+    assert ("FS32 FAIL: hidden_steps_pipelined printed more than one loop mode line"
+            in fs._pair_lines(pair))
+
+
+def test_one_loop_mode_line_is_that_mode_and_none_is_none():
+    assert fs._loop_mode(["a", "loop mode: pipelined", "b"]) == "pipelined"
+    assert fs._loop_mode(["loop mode: sequential"]) == "sequential"
+    assert fs._loop_mode(["nothing"]) is None
+
+
 def test_a_missing_pipelined_part_is_a_fail_line_and_no_pass():
     parts = [p for p in _parts() if p["name"] != "run_pipelined"]
     pair = fs.fs32_pair(parts)
