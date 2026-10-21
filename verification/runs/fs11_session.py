@@ -93,7 +93,8 @@ files, FS30's own, and the GPU-memory test of the capture) with a junit report, 
 ``bring_up --no-tamper --device-leaves`` per model at :data:`FULL_SCALE_ENV` plus
 :data:`RECHECK_ENV`, the cheapest model first. Each bring-up prints one ``device leaves:`` line:
 the prover's root (arrival digests and the device kernel), the root the CPU path gives over the
-same leaves, how many product leaves took an arrival digest, ``M`` and the ``dK`` leaves.
+same leaves, how many arrival digests the commit could use, how many products the capture
+hashed on arrival, ``M`` and the ``dK`` leaves.
 ``summary.json``'s ``device_leaves`` (:func:`device_leaves_gate`) fails closed. It refuses
 without CUDA and without an H100 (``FS11_ALLOW_ANY_GPU=1`` overrides). Its upload is
 ``fs11_prep``'s default, with the four models.
@@ -735,7 +736,7 @@ def device_leaves_plan(upload: Path, out: Path) -> list[Part]:
 
 _DEVICE_LEAVES_LINE = re.compile(
     r"^device leaves: step (\d+) accepted (True|False), prover root ([0-9a-f]{64}|none), "
-    r"cpu root ([0-9a-f]{64}), arrival digests (\d+), M (\d+), dK leaves (\d+)$")
+    r"cpu root ([0-9a-f]{64}), arrival digests (\d+), hashed (\d+), M (\d+), dK leaves (\d+)$")
 
 
 def _device_leaves_logged(lines: Sequence[str]) -> dict[str, Any] | None:
@@ -746,7 +747,7 @@ def _device_leaves_logged(lines: Sequence[str]) -> dict[str, Any] | None:
     m = got[-1]
     return {"step": int(m[1]), "accepted": m[2] == "True",
             "prover_root": None if m[3] == "none" else m[3], "cpu_root": m[4],
-            "arrival": int(m[5]), "M": int(m[6]), "dK": int(m[7])}
+            "arrival": int(m[5]), "hashed": int(m[6]), "M": int(m[7]), "dK": int(m[8])}
 
 
 def _device_tests_extras(junit: Path) -> dict[str, Any]:
@@ -772,7 +773,9 @@ def device_leaves_gate(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | N
     is ``pass`` only if the CUDA tests part finished ``ok`` with no failure or error, FS30's own
     CUDA tests all ran and passed (none skipped), and every model of :data:`RUN_PINS` has a
     bring-up that logged its line and shows the step accepted, the two roots equal and the
-    arrival-digest count equal to ``M`` less the ``dK`` leaves. Anything missing fails."""
+    arrival digests in use equal to ``M`` less the ``dK`` leaves and the products hashed on
+    arrival equal to ``M`` (the ``dK`` records are hashed too, their digests unused). Anything
+    missing fails."""
     tests = next((p for p in parts if p.get("kind") == "device_tests"), None)
     if tests is None:
         return None
@@ -812,6 +815,8 @@ def device_leaves_gate(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | N
             if got["arrival"] != got["M"] - got["dK"]:
                 bad.append(f"{got['arrival']} arrival digests, expected "
                            f"{got['M'] - got['dK']} (M {got['M']} less {got['dK']} dK leaves)")
+            if got["hashed"] != got["M"]:
+                bad.append(f"{got['hashed']} products hashed on arrival, expected {got['M']}")
             row = {**got, "ok": not bad, "why": "; ".join(bad)}
         models[repo] = row
         if not row["ok"]:

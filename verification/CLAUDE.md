@@ -589,7 +589,10 @@ interface.
     `StepOutput.arrival_digests` (product leaf index to digest; default empty, not part of
     equality) is filled in `prove_step` through `computation.product_index(m)`; `perturb` drops
     its entry and `with_w_next` keeps them. `summary()["arrival_hash"]` counts records, leaves,
-    bytes and non-finite outputs, present only when something was hashed. A non-finite product
+    bytes and non-finite outputs, present only when something was hashed; `prove_step` adds
+    `used`, the digests left in `arrival_digests` after the perturbations. The capture hashes
+    the `dK` records too and their digests go unused (the `δK̃` leaf is a new tensor), so
+    `leaves` (hashed) is `M` and `used` is `M − dK`. A non-finite product
     gets no digest (the host path raises on it as before). The sharded path (`_route`) hashes
     nothing on arrival.
   - *The commit (routing).* `hash_step_leaves(c, leaves, stats=None, *, known=None)` and
@@ -607,7 +610,7 @@ interface.
     `k_tunability` and `probe` also keep the C-library path.
   - *The session.* `device-leaves` (`fs11_session.py`) runs the CUDA tests and, per model, a
     bring-up that prints `device leaves: step 1 accepted ..., prover root ..., cpu root ...,
-    arrival digests N, M M, dK leaves K`; see the `fs11_session.py` entry below.
+    arrival digests U, hashed H, M M, dK leaves K`; see the `fs11_session.py` entry below.
 
 - `gpu_blake3.py`, `gpu_blake3.cu`, `gpu_blake3_core.h` (F23): our own BLAKE3 CUDA kernel for
   leaf hashing. FS30 wires it in at two places (below, "Where hashing runs"). `GpuBlake3.hash_leaves(...,
@@ -2722,7 +2725,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     H100 (`FS11_ALLOW_ANY_GPU=1` overrides); default deadline 8,000 s, twice the estimated
     66 min, rounded up; `summary.json["device_leaves"]` fails closed: tests part `ok`, no
     failure or error, no FS30 test skipped, and per model the step accepted, the two roots equal
-    and the arrival digests equal to `M` less the `dK` leaves) or `fs32-pair` (FS32f);
+    the arrival digests in use equal to `M` less the `dK` leaves, and the products hashed on
+    arrival equal to `M`) or `fs32-pair` (FS32f);
     `fs32-pair` is F22's two-GPU acceptance: `refusal(env, True, PAIR_CARDS, need=...)` (2 CUDA
     devices of any type; the message names the pair session, not `FS31_CARDS`), then `models`,
     the fast suite (`-rf`, junit XML), the slow two-GPU tests

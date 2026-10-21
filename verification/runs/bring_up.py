@@ -377,19 +377,21 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     """The one line FS30's session reads for step ``T`` (needs ``keep_last``). It holds the
     prover's root (the tree the commit built, with the arrival digests and the device kernel),
     the root the CPU path gives over the same leaves (:func:`commit_leaves` with no ``known``,
-    every leaf hashed by the C library), how many product leaves took an arrival digest, ``M``,
-    and how many ``dK`` leaves there are (the ones the prover hashes at the commit); and whether
-    the step was accepted. Run on a CPU, no leaf takes a digest and the roots agree trivially."""
+    every leaf hashed by the C library), how many arrival digests the commit could use (``used``),
+    how many products the capture hashed on arrival (``hashed``; the ``dK`` records too, whose
+    digests go unused), ``M``, and how many ``dK`` leaves there are (the ones the prover hashes at
+    the commit); and whether the step was accepted. Run on a CPU, no leaf takes a digest and the roots agree trivially."""
     if b.kept is None:
         raise ValueError("device_leaves_line needs the step's leaves: run with keep_last")
     step = next(s for s in b.result.loop.steps if s.t == T)
     leaves = [b.kept.leaf(i) for i in range(c.n_leaves)]
     cpu_root = commit_leaves(c, leaves).root
-    arrival = ((step.capture or {}).get("arrival_hash") or {}).get("leaves", 0)
+    ah = (step.capture or {}).get("arrival_hash") or {}
+    used, hashed = ah.get("used", 0), ah.get("leaves", 0)
     dk = sum(1 for q in c.products if product_class(c, q) == "dK")
     return (f"device leaves: step {T} accepted {step.rejection is None}, "
             f"prover root {step.root.hex() if step.root else 'none'}, cpu root {cpu_root.hex()}, "
-            f"arrival digests {arrival}, M {c.M}, dK leaves {dk}")
+            f"arrival digests {used}, hashed {hashed}, M {c.M}, dK leaves {dk}")
 
 
 # ---- the timed run's work counts ----------------------------------------------------------

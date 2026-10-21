@@ -52,7 +52,8 @@ def test_capture_hashes_every_product_but_dK_on_arrival(dtype, deterministic):
     want = {c.product_index(s.m) for s in c.products if c.product_class(s) != "dK"}
     assert set(out.arrival_digests) == want
     assert out.capture["arrival_hash"]["nonfinite"] == 0
-    assert out.capture["arrival_hash"]["leaves"] == len(want)
+    assert out.capture["arrival_hash"]["leaves"] == c.M  # the dK records are hashed too
+    assert out.capture["arrival_hash"]["used"] == len(want)
     plain = leaf_hashes_of(c, list(enumerate(leaves)))
     assert all(plain[i] == d for i, d in out.arrival_digests.items())
     root = commit_leaves(c, leaves, out.arrival_digests).root

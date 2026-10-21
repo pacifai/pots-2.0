@@ -199,3 +199,41 @@ def test_a_mutation_at_or_before_the_first_bad_leaf_beats_it(c, leaves, on_kerne
     monkeypatch.setattr(L, "_enqueue_table", mutate_after)
     with pytest.raises(StoreMutationError):
         hash_step_leaves(c, bad)
+
+
+def test_a_non_contiguous_leaf_with_a_known_digest_raises_the_plain_error(c, leaves):
+    i = first_product(c)
+    t = leaves[i]
+    assert t.dim() == 2 and min(t.shape) > 1
+    nc = torch.empty(tuple(t.shape)[::-1], dtype=t.dtype).t()
+    nc.copy_(t)
+    assert not nc.is_contiguous()
+    bad = list(leaves)
+    bad[i] = nc
+    want = plain(c, bad)
+    assert want[1] is not None
+    try:
+        hash_step_leaves(c, bad, known={i: bytes(32)})
+    except Exception as e:  # noqa: BLE001
+        got = (None, e)
+    else:
+        got = (0, None)
+    same_outcome(got, want)
+
+
+def test_prove_step_counts_the_digests_in_use_after_a_perturbation(c, monkeypatch):
+    """``capture["arrival_hash"]["used"]`` is ``len(arrival_digests)``, after a perturbed
+    product's digest is dropped; ``leaves`` (the hashed count) is left alone. The capture's
+    two methods are faked, so this runs on a CPU."""
+    from verification.prover.capture import MatmulCapture
+
+    real = MatmulCapture.summary
+    monkeypatch.setattr(MatmulCapture, "arrival_digest", lambda self, p: bytes(32))
+    monkeypatch.setattr(MatmulCapture, "summary", lambda self: {
+        **real(self), "arrival_hash": {"records": 1, "leaves": c.M, "bytes": 0, "nonfinite": 0}})
+    data = synthetic_dataset(c.widths, 12, seed=0)
+    w0 = init_weights(c.widths, seed=0)
+    out = prove_step(c, c.build_model(), w0, data[4:8], perturb={1: lambda t: t + 1})
+    assert len(out.arrival_digests) == c.M - 1
+    assert out.capture["arrival_hash"]["used"] == c.M - 1
+    assert out.capture["arrival_hash"]["leaves"] == c.M

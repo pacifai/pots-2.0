@@ -636,7 +636,7 @@ def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
                 tag, shape, dtype, _ = _tensor_slot(c, i)
                 slot = slots[i] = (tag, shape, dtype)
             tag, shape, dtype = slot
-            if tuple(obj.shape) == shape and obj.dtype == dtype:  # the structural checks passed
+            if tuple(obj.shape) == shape and obj.dtype == dtype and obj.is_contiguous():  # the structural checks passed
                 d = known.get(i)
                 if d is not None:
                     out[i] = d

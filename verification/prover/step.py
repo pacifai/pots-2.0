@@ -271,6 +271,9 @@ def prove_step(
         product_versions[m - 1] = products[m - 1]._version
         arrival.pop(computation.product_index(m), None)  # the digest was of the old bytes
 
+    if "arrival_hash" in summary:  # the digests in use, after the perturbations
+        summary["arrival_hash"]["used"] = len(arrival)
+
     with sec("train.update"):
         opt.step()
     with sec("P2.w_next"):
