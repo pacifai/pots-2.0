@@ -86,8 +86,10 @@ from verification.verifier.context import (
     _is_digest,
     _Rejected,
 )
+from verification.verifier.matmul_check import freivalds
 from verification.verifier.matmul_check.freivalds import (
     MeasureColumns,
+    MeasureGroup,
     MeasureScratch,
     ProductMeasure,
     finish_row,
@@ -628,44 +630,47 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     with _guard(ctx, "5", _AFTER_COMMIT), ctx.timed("5.glue"):
         replay = c.replay(leaves)
     ctx.state.replay = replay
-    scratch = MeasureScratch()
-    window: list[_Rows] = []
-    pending = 0
-    w = 0  # the window being filled
-    group0 = 0  # the first group id of the run: ids run across the step's runs
-    for i, run in enumerate(_member_runs(c.products)):
-        try:
-            with ctx.stamp("c5.run", i):
-                rows, error = _measure_served(c, run, ctx, replay, view, h=root, k=ctx.k,
-                                              scratch=scratch, guard=ctx.kappa_guard, run=i,
-                                              group0=group0)
-        except Exception as e:  # raised after the products before it are judged
-            rej = _judge_window(c, window, ctx, bands)
-            if rej is None:
-                raise
-            ctx.state.run_rest_error = e
-            return rej
-        if error is not None:
-            # As one at a time: the products before this run, then its served part, then the
-            # error. A rejection before this run leaves its served part to the record pass.
-            rej = _judge_window(c, window, ctx, bands)
-            if rej is None:
-                rej = _judge_window(c, [rows], ctx, bands)
-            if rej is None:
-                raise error
-            ctx.state.run_rest_error = error
-            return rej
-        group0 += len(_measure_groups(run))
-        window.append(rows)
-        pending += len(rows.specs)
-        if pending >= _JUDGE_WINDOW:
-            with ctx.stamp("c5.judge", -1, -1, w):
+    try:
+        scratch = MeasureScratch()
+        window: list[_Rows] = []
+        pending = 0
+        w = 0  # the window being filled
+        group0 = 0  # the first group id of the run: ids run across the step's runs
+        for i, run in enumerate(_member_runs(c.products)):
+            try:
+                with ctx.stamp("c5.run", i):
+                    rows, error = _measure_served(c, run, ctx, replay, view, h=root, k=ctx.k,
+                                                  scratch=scratch, guard=ctx.kappa_guard, run=i,
+                                                  group0=group0)
+            except Exception as e:  # raised after the products before it are judged
                 rej = _judge_window(c, window, ctx, bands)
-            if rej is not None:
+                if rej is None:
+                    raise
+                ctx.state.run_rest_error = e
                 return rej
-            window, pending, w = [], 0, w + 1
-    with ctx.stamp("c5.judge", -1, -1, w):
-        return _judge_window(c, window, ctx, bands)
+            if error is not None:
+                # As one at a time: the products before this run, then its served part, then the
+                # error. A rejection before this run leaves its served part to the record pass.
+                rej = _judge_window(c, window, ctx, bands)
+                if rej is None:
+                    rej = _judge_window(c, [rows], ctx, bands)
+                if rej is None:
+                    raise error
+                ctx.state.run_rest_error = error
+                return rej
+            group0 += len(_measure_groups(run))
+            window.append(rows)
+            pending += len(rows.specs)
+            if pending >= _JUDGE_WINDOW:
+                with ctx.stamp("c5.judge", -1, -1, w):
+                    rej = _judge_window(c, window, ctx, bands)
+                if rej is not None:
+                    return rej
+                window, pending, w = [], 0, w + 1
+        with ctx.stamp("c5.judge", -1, -1, w):
+            return _judge_window(c, window, ctx, bands)
+    finally:
+        freivalds.drain()  # no kernel hold outlives the check (invariant 6)
 
 
 class _Group(NamedTuple):
@@ -706,6 +711,9 @@ def _measure_served(c: DeclaredComputation, specs: Sequence[ProductSpec], ctx: S
     step's runs.
     """
     st = ctx.stamper() if run is not None else None
+    if _kernel_run(replay, specs):
+        return _measure_served_kernel(c, specs, ctx, replay, view, h=h, k=k, scratch=scratch,
+                                      guard=guard, run=run, group0=group0, st=st)
     if len(specs) == 1:
         try:
             served = [_served(c, specs[0], ctx, replay, view, run=run, group=group0, st=st)]
@@ -778,6 +786,120 @@ def _served_group(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Seq
     return _Group(list(idx), a, b, p_dev.to(torch.float32), None)
 
 
+def _kernel_run(replay: Replay, specs: Sequence[ProductSpec]) -> bool:
+    """Whether the run is served as views and measured on the fused kernel: its operands'
+    device (``Replay.operand_device``, known before serving anything) is one the kernel
+    takes (``freivalds.kernel_device``). Every other device keeps the fp32 serving."""
+    where = getattr(replay, "operand_device", None)
+    dev = where(specs[0].m) if where is not None else None
+    return dev is not None and freivalds.kernel_device(dev)
+
+
+def _measure_served_kernel(c: DeclaredComputation, specs: Sequence[ProductSpec],
+                           ctx: StepContext, replay: Replay, view: TranscriptView, *,
+                           h: bytes, k: int, scratch: MeasureScratch, guard: bool,
+                           run: int | None, group0: int,
+                           st: Callable[..., Any] | None) -> tuple[_Rows, Exception | None]:
+    """:func:`_measure_served` on the kernel path (FS37, ``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.3):
+    the replay's operands as views in their own dtype, the leaves moved to the device as they
+    are stored, and each group measured by one ``freivalds.measure_groups_rows`` call that
+    enqueues and returns the rows without reading them (:func:`_read_rows` drains). The kernel's
+    bits don't depend on strides, grouping or widening, so an error finishes through
+    :func:`_measure_to_failure` as on the torch path."""
+    if len(specs) == 1:
+        try:
+            group = _served_view(c, specs[0], ctx, replay, view, run=run, group=group0, st=st)
+        except Exception as e:
+            return _Rows(specs[:0], [], None), e
+        with ctx.timed("5.measure"), (st("c5.measure", run, group0) if st else _NO_STAMP):
+            rows = freivalds.measure_groups_rows([group], h=h, k=k, guard=guard)
+        return _Rows(specs, [0], rows), None
+    groups, rows, orders = _measure_groups(specs), [], []
+    for g, idx in enumerate(groups):
+        try:
+            order, served = _served_blocks(c, specs, idx, ctx, replay, view, run=run,
+                                           group=group0 + g, st=st)
+        except Exception:  # served again one at a time, which raises at the member
+            return _measure_to_failure(c, specs, groups, rows, ctx, replay, view, h=h, k=k,
+                                       scratch=scratch, guard=guard, run=run, group0=group0,
+                                       orders=orders)
+        with ctx.timed("5.measure"), (st("c5.measure", run, group0 + g) if st else _NO_STAMP):
+            rows.append(freivalds.measure_groups_rows(served, h=h, k=k, guard=guard))
+        orders.append(order)
+        del served  # the views; the kernel holds what it still reads
+    return _Rows(specs, [i for o in orders for i in o],
+                 rows[0] if len(rows) == 1 else torch.cat(rows)), None
+
+
+def _served_view(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay: Replay,
+                 view: TranscriptView, *, run: int | None, group: int,
+                 st: Callable[..., Any] | None) -> MeasureGroup:
+    """:func:`_served` for the kernel: the operands as the replay gives them and the leaf in its
+    stored dtype on their device (non-blocking), the bias the committed ``W_t`` leaf rounded to
+    the operand format there, none of them widened to fp32."""
+    bias = None
+    with _guard(ctx, "5", _AFTER_COMMIT):
+        with ctx.timed("5.glue"), (st("c5.glue", run, group) if st else _NO_STAMP):
+            a, b = replay.operands(spec.m)
+        p = view.product(spec.m)
+        if spec.bias is not None:
+            bias = view.w_t(spec.bias).detach().to(a.device, c.operand_dtype)
+    if (tuple(a.shape), tuple(b.shape)) != (spec.a_shape, spec.b_shape):
+        raise RuntimeError(f"{spec.name}: replay operands {tuple(a.shape)}·{tuple(b.shape)} "
+                           f"!= declared {spec.a_shape}·{spec.b_shape}")
+    with (st("c5.serve", run, group) if st else _NO_STAMP):
+        with (st("c5.copy", run, group) if st else _NO_STAMP):
+            p_dev = p.detach().to(a.device, non_blocking=True)
+    return MeasureGroup(a.detach()[None], b.detach()[None], p_dev[None], [spec.m], bias)
+
+
+def _label_run(ms: Sequence[int]) -> tuple[int, int, int] | None:
+    """``ms`` as ``(m₀, step, n)`` when it is an increasing arithmetic progression."""
+    step = ms[1] - ms[0] if len(ms) > 1 else 1
+    if step < 1 or any(y - x != step for x, y in zip(ms, ms[1:])):
+        return None
+    return ms[0], step, len(ms)
+
+
+def _served_blocks(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Sequence[int],
+                   ctx: StepContext, replay: Replay, view: TranscriptView, *,
+                   run: int | None, group: int,
+                   st: Callable[..., Any] | None) -> tuple[list[int], list[MeasureGroup]]:
+    """:func:`_served_group` for the kernel: the run's members at positions ``idx`` as one
+    :class:`MeasureGroup` per block of ``replay.operand_blocks``, ``P`` a view of the committed
+    leaves (``product_run`` when the block's labels form a progression, else ``product_block``)
+    moved to the device as stored. Returns the run positions of the rows ``measure_groups_rows``
+    will give, block by block. Any error, a failed shape check included, goes to
+    :func:`_measure_to_failure`."""
+    members = [specs[i] for i in idx]
+    if any(spec.bias is not None for spec in members):
+        raise RuntimeError("a member names a bias")  # validate forbids it
+    ms = [spec.m for spec in members]
+    with ctx.timed("5.glue"), (st("c5.glue", run, group) if st else _NO_STAMP):
+        blocks = replay.operand_blocks(ms)
+    first = members[0]
+    if sorted(t for blk in blocks for t in blk.pos) != list(range(len(ms))):
+        raise RuntimeError(f"{first.name}: replay blocks don't cover the group once")
+    out: list[MeasureGroup] = []
+    with (st("c5.serve", run, group) if st else _NO_STAMP):
+        for blk in blocks:
+            n = len(blk.pos)
+            if (tuple(blk.a.shape), tuple(blk.b.shape)) != ((n, *first.a_shape),
+                                                            (n, *first.b_shape)):
+                raise RuntimeError(f"{first.name}: replay group operands {tuple(blk.a.shape)}·"
+                                   f"{tuple(blk.b.shape)}")
+            labels = [ms[t] for t in blk.pos]
+            span = _label_run(labels) if hasattr(view, "product_run") else None
+            p = view.product_run(*span) if span is not None else view.product_block(labels)
+            if tuple(p.shape) != (n, *first.p_shape):
+                raise RuntimeError(f"{first.name}: leaves {tuple(p.shape)} != "
+                                   f"{(n, *first.p_shape)}")
+            with (st("c5.copy", run, group) if st else _NO_STAMP):
+                p_dev = p.detach().to(blk.a.device, non_blocking=True)
+            out.append(MeasureGroup(blk.a, blk.b, p_dev, labels))
+    return [idx[t] for blk in blocks for t in blk.pos], out
+
+
 def _role_progressions(ms: Sequence[int], p_shape: tuple[int, ...], c: DeclaredComputation
                        ) -> list[tuple[int, int, int, int, int]] | None:
     """``ms`` cut into interleaved arithmetic progressions by the computation's
@@ -799,8 +921,9 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
                         groups: Sequence[Sequence[int]], rows: Sequence[torch.Tensor],
                         ctx: StepContext, replay: Replay, view: TranscriptView, *, h: bytes,
                         k: int, scratch: MeasureScratch, guard: bool,
-                        run: int | None = None,
-                        group0: int = 0) -> tuple[_Rows, Exception | None]:
+                        run: int | None = None, group0: int = 0,
+                        orders: Sequence[Sequence[int]] | None = None
+                        ) -> tuple[_Rows, Exception | None]:
     """:func:`_measure_served` once group ``groups[len(rows)]``'s serving has raised, the
     groups before it measured into ``rows``: the run's rows up to its first failing member,
     and that member's error, or the whole run's rows and ``None`` if no member fails alone.
@@ -810,7 +933,8 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
     as they would alone). Then the unmeasured groups' members before it are served again one
     at a time and measured, a group at a time, and of the measured groups only those members
     are kept. So the products judged are those one-at-a-time serving would reach, and the
-    device still holds one group at a time.
+    device still holds one group at a time. ``orders`` (the kernel path's) are the run
+    positions of each measured group's rows, which follow the replay's blocks, not run order.
     """
     st = ctx.stamper() if run is not None else None
     done = len(rows)
@@ -823,9 +947,12 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
             end, error = i, e
             break
     out, order = [], []
-    for idx, r in zip(groups, rows):
+    for idx, r in zip(groups if orders is None else orders, rows):
         keep = [i for i in idx if i < end]  # a prefix: a group is in run order
-        out.append(r[:len(keep)])
+        if orders is None or len(keep) == len(idx):
+            out.append(r[:len(keep)])
+        else:  # kernel rows are in block order
+            out.append(r[[j for j, i in enumerate(idx) if i < end]])
         order += keep
     for g, idx in enumerate(groups):
         if g < done:
@@ -930,7 +1057,9 @@ def _rows_device(rows: torch.Tensor) -> Hashable:
 def _read_rows(rows: Sequence[torch.Tensor]) -> list[np.ndarray]:
     """Each run's rows as a float64 array on the host, in the order given, with one read per
     device: the rows of runs on one device (a run is on one device, F22) are joined there, read
-    once and cut back, so a window may span devices. Values and order are the rows'."""
+    once and cut back, so a window may span devices. Values and order are the rows'. Kernel
+    measurements still in flight are waited for first (``freivalds.drain``)."""
+    freivalds.drain()
     by_device: dict[Hashable, list[int]] = {}
     for i, r in enumerate(rows):
         by_device.setdefault(_rows_device(r), []).append(i)
