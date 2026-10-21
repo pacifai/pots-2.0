@@ -50,7 +50,7 @@ from setup.data import other_batch
 from verification.commitment.leaves import dataset_tree, leaf_hash
 from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import DeclaredComputation, snapshot_weights
-from verification.runs.loop import ProverFault, StepRecord
+from verification.runs.loop import ProverFault, StepRecord, run_devices
 from verification.runs.metrics import PASS_STEPS
 from verification.runs.prover_spec import refuse_pipelined
 from verification.runs.scenarios import (
@@ -394,7 +394,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rows = memory_run(c, D, w0, run=RUN_NAME, T=S, k=k, seed=cfg.seed,
                                   final=final_S, h_D=h_D,
                                   device=cfg.device, build_model=models, verifier=make_S,
-                                  handoff=handoff)
+                                  handoff=handoff,
+                                  devices=run_devices(c, pipelined=False))
             finally:
                 shutil.rmtree(transcripts / "mem", ignore_errors=True)
             print(f"-- memory pass, {S} honest steps, {name} store:")

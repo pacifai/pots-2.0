@@ -117,29 +117,46 @@ def test_run_cheat_passes_run_devices_to_the_writer(monkeypatch):
     assert calls == [True] and got["devices"] == ("sentinel",)
 
 
+SENTINEL = ("cpu",)  # a valid device list the real recorders accept
+
+
 def _spy(monkeypatch, mod, modes):
-    real = mod.run_devices
+    """``mod.run_devices`` returns ``SENTINEL``; returns the devices that reached each
+    ``MetricsWriter.recorder`` (by scenario name) and each ``memory_run``."""
+    seen = SimpleNamespace(recorders={}, memory=[])
+    real_rec, real_mem = MetricsWriter.recorder, mod.memory_run
 
-    def spy(c, *, pipelined):
-        modes.append(pipelined)
-        return real(c, pipelined=pipelined)
+    def rec(self, name, **kw):
+        seen.recorders.setdefault(name, []).append(kw.get("devices"))
+        return real_rec(self, name, **kw)
 
-    monkeypatch.setattr(mod, "run_devices", spy)
+    def mem(*a, **kw):
+        seen.memory.append(kw.get("devices"))
+        return real_mem(*a, **kw)
+
+    monkeypatch.setattr(mod, "run_devices", lambda c, *, pipelined: modes.append(pipelined)
+                        or SENTINEL)
+    monkeypatch.setattr(MetricsWriter, "recorder", rec)
+    monkeypatch.setattr(mod, "memory_run", mem)
+    return seen
 
 
 def test_run_verified_passes_run_devices(tiny_main, monkeypatch, capsys):
     modes = []
-    _spy(monkeypatch, rv, modes)
+    seen = _spy(monkeypatch, rv, modes)
     assert rv.main(["--pass-steps", "1", "--metrics"]) == 0
     assert modes == [False]
+    assert seen.recorders == {"honest": [SENTINEL]} and seen.memory == [SENTINEL]
 
 
 def test_calibrate_passes_run_devices(tiny_main, monkeypatch, capsys):
     modes = []
-    _spy(monkeypatch, cal, modes)
+    seen = _spy(monkeypatch, cal, modes)
     monkeypatch.setattr(cal, "setup_determinism", lambda cfg: torch.manual_seed(cfg.seed))
     cal.main(["--steps", "2", "--metrics", "--write-bands-despite-guard"])
     assert modes and set(modes) == {False}
+    assert seen.recorders == {n: [SENTINEL] for n in ("calibrate", "frozen", "frozen_no_kappa")}
+    assert seen.memory == [SENTINEL]
 
 
 def test_llama_step_passes_run_devices(monkeypatch, tmp_path, capsys):
@@ -161,9 +178,10 @@ def test_llama_step_passes_run_devices(monkeypatch, tmp_path, capsys):
     _band_file(c, D, snapshot_weights(c, c.build_model()), path,
                context=band_context(load_config(), c, h_D=h_D, k=K))
     modes = []
-    _spy(monkeypatch, llama_step, modes)
+    seen = _spy(monkeypatch, llama_step, modes)
     assert llama_step.main(["--steps", "1", "--metrics", "--bands", str(path)]) == 0
     assert modes == [False]
+    assert list(seen.recorders.values()) == [[SENTINEL]] and seen.memory == [SENTINEL]
 
 
 # ---- item 2: _await_bye has no deadline -----------------------------------------------------
