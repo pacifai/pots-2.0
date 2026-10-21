@@ -34,6 +34,7 @@ import torch
 
 from setup import data
 from setup.config import assert_no_dropout, load_config
+from verification.commitment.gpu_blake3 import GpuBlake3
 from verification.commitment.leaves import dataset_tree, leaf_totals
 from verification.computation.interface import DeclaredComputation
 from verification.prover.step import (
@@ -222,6 +223,10 @@ def run_loop(
         return result
     with sec("run:P4.tree"):
         tree = dataset_tree(c, dataset)  # the prover's own copy of h_D's tree, for audit paths
+    if _on_cuda(device):
+        # The first NVRTC build or cache load of the process would land inside step 1's forward
+        # pass, in its timed sections: do it here, outside every section (FS30).
+        GpuBlake3().kernels(torch.device(device))
     w: Mapping[str, torch.Tensor] = w0
     for t in range(1, verifier.n_steps + 1):
         idx = list(pi(t))

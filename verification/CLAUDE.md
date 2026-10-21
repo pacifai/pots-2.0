@@ -579,9 +579,49 @@ interface.
   - `FINITE_KIND` maps a dtype to `kind`. `enabled()` and the nestable `disabled()` switch
     the native path off for the counting pass.
 
+- **Where hashing runs (FS30).** The digest of a leaf is the same wherever it is computed; only
+  the place differs, and it follows where the bytes are. There is no env flag.
+  - *Capture (arrival hashing).* On CUDA, `_offload` enqueues the arrival hash of each
+    contiguous output in `records` (not `glue_outer`) whose dtype is in `native.FINITE_KIND`,
+    on the same side stream right after the host copy. `MatmulCapture.arrival_digest(p)` returns
+    the digest for product `p` or `None` (matched by storage identity, dtype, shape,
+    contiguity, an unchanged `_version` and the member's place in its batch).
+    `StepOutput.arrival_digests` (product leaf index to digest; default empty, not part of
+    equality) is filled in `prove_step` through `computation.product_index(m)`; `perturb` drops
+    its entry and `with_w_next` keeps them. `summary()["arrival_hash"]` counts records, leaves,
+    bytes and non-finite outputs, present only when something was hashed; `prove_step` adds
+    `used`, the digests left in `arrival_digests` after the perturbations, and a diagnostic
+    from the arrival loop it already runs: `missing` (`{ProductKind name: count}` of the
+    products with no digest) and `missing_first` (the names, in canonical order, of the first 5
+    whose kind is not `OPERAND_GRAD`). The capture hashes
+    the `dK` records too and their digests go unused (the `Î´KÌƒ` leaf is a new tensor), so
+    `leaves` (hashed) is `M` and `used` is `M âˆ’ dK`. A non-finite product
+    gets no digest (the host path raises on it as before). The sharded path (`_route`) hashes
+    nothing on arrival.
+  - *The commit (routing).* `hash_step_leaves(c, leaves, stats=None, *, known=None)` and
+    `commit_leaves(c, leaves, known=None)` take each leaf from `known`, else the GPU kernel if
+    the leaf is a CUDA tensor with a passing structural check (one table per device, closed at
+    `_BATCH_BYTES` or `_BATCH_ENTRIES`), else the host path. Any leaf whose structural check
+    fails goes to the host path, so errors come from the plain path in index order. A
+    mutation seen before a table is read raises `StoreMutationError`; a non-finite leaf raises
+    the host path's `NonFiniteError`. `HashStats` gains `known` and `kernel` counts; it has no
+    kernel-wait time (the profile's `P3.commit.hash.<part>` rows are frozen), so the wait is
+    in the call's wall time. CPU runs get identical digests and never touch the kernel.
+  - *Check 2 stays on the C library* (K4): the verifier recomputes every digest on the CPU,
+    so a wrong arrival digest or kernel is caught as a root mismatch. `driver`,
+    `run_verified.transcript_root`, `card_identity`, `bring_up`'s `leaf_hashes_of`,
+    `k_tunability` and `probe` also keep the C-library path.
+  - *The session.* `device-leaves` (`fs11_session.py`) runs the CUDA tests and, per model, a
+    bring-up that prints `device leaves: step 1 accepted ..., prover root ..., cpu root ...,
+    arrival digests U, hashed H, M M, dK leaves K`, then a second line nothing parses,
+    `device leaves missing: <kind> <count>, ...; first others: <names or none>`, from
+    `missing` and `missing_first` (on an honest decoder step: `OPERAND_GRAD <dK count>; first
+    others: none`); see the `fs11_session.py` entry below.
+
 - `gpu_blake3.py`, `gpu_blake3.cu`, `gpu_blake3_core.h` (F23): our own BLAKE3 CUDA kernel for
-  leaf hashing. Nothing here is wired into the protocol yet. `GpuBlake3.hash_leaves(...,
-  device=)` takes `Native.hash_leaves`'s table with payload addresses on the device and returns
+  leaf hashing. FS30 wires it in at two places (below, "Where hashing runs").
+  `GpuBlake3.hash_leaves(..., device=)` takes `Native.hash_leaves`'s table with payload
+  addresses on the device and returns
   `(digests uint8 [n, 32] on the device, first_bad)` after the kernels finish, with the same
   digests and `first_bad`; `hash_tensor_leaves(headers, tensors, kinds)` builds the table from
   contiguous CUDA tensors. The core header is plain C that both NVRTC and a host C compiler
@@ -592,6 +632,22 @@ interface.
   n0)` launches (`n0` = groups of 8 KiB in its biggest leaf) and about 0.4 % of its payload in
   temporary memory. `python -m verification.commitment.gpu_blake3 check` and `bench --out F`
   need CUDA and say so otherwise.
+  - `enqueue(headers, tensors, kinds=None, *, stream) -> PendingHash` (FS30) is the same table
+    built in one pinned buffer and sent with one non-blocking copy, the kernels launched on
+    `stream`, then one non-blocking copy back and an event. It never blocks the host.
+    `PendingHash` holds every buffer and tensor the work reads until `result()`; `done()` asks
+    the event; `result()` waits on the event only and returns `(digests, first_bad)`, the
+    digests cut at `first_bad`. `enqueue_table(...)` is the array form under it: capture passes
+    one shared header and arithmetic member addresses rather than a view per member.
+  - **Where the first NVRTC build happens.** The kernel compiles lazily, on the first
+    `enqueue_table` call of a process and device: in a captured run that is inside the first
+    CUDA matmul's offload, in the first step's forward pass (the CUBIN then comes from the
+    disk cache under `native.cache_dir()` if an earlier process built it). `run_loop` moves it
+    out of the timed steps: when the model's device is CUDA it calls
+    `GpuBlake3().kernels(device)` once before step 1, outside every section. A CUDA run that
+    doesn't go through `run_loop` (`card_identity`) is left as it was: call
+    `GpuBlake3().kernels(device)` first there to keep the build out of a timed step. A build or
+    load failure raises; nothing falls back to the CPU.
 
 ### `verification/computation/`
 
@@ -2664,7 +2720,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `HF_HUB_OFFLINE` needed. `PACKAGES` includes pytest and matplotlib for it.
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
     [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,
-    fs32-pair}]`, `fetch-models` and `env`. `--session` picks the plan from `SESSIONS`, which
+    fs32-pair,device-leaves}]`, `fetch-models` and `env`. `--session` picks the plan from
+    `SESSIONS`, which
     also gives the name `summary.json`'s `session` records: `fs11` (the default, "FS11"),
     `recheck` ("recheck"), `profile-check`, `nvlink-probe` (FS31), `kernel-speed` (FS29:
     the native build, the kernel's two test files on the card, then `kernel_speed run` on the
@@ -2672,7 +2729,16 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     kernel-speed`, no models part; limits 900 + 900 + 1,500 s inside the job's 3,600 s work
     window (5,400 less 1,200 grace and 600 packing), expected about 1, 5 and 5 min;
     `summary.json` gains `kernel_speed_gate`: verdict, the native build's and the tests'
-    status, the line) or `fs32-pair` (FS32f);
+    status, the line), `device-leaves` (FS30: the native build, the models part, the CUDA tests
+    (`test_gpu_blake3.py`, `test_gpu_blake3_edges.py`, `test_device_leaves_cuda.py` and the
+    capture's GPU-memory test, junit report), then `bring_up --no-tamper --device-leaves` per
+    model at `FULL_SCALE_ENV` plus `RECHECK_ENV`, cheapest first; refuses without CUDA and an
+    H100 (`FS11_ALLOW_ANY_GPU=1` overrides); default deadline 8,800 s, twice the estimated
+    73 min (52 for the parts, 1 packing, 20 grace), rounded up to the next 100 s;
+    `summary.json["device_leaves"]` fails closed: tests part `ok`, no
+    failure or error, no FS30 test skipped, and per model the step accepted, the two roots equal
+    the arrival digests in use equal to `M` less the `dK` leaves, and the products hashed on
+    arrival equal to `M`) or `fs32-pair` (FS32f);
     `fs32-pair` is F22's two-GPU acceptance: `refusal(env, True, PAIR_CARDS, need=...)` (2 CUDA
     devices of any type; the message names the pair session, not `FS31_CARDS`), then `models`,
     the fast suite (`-rf`, junit XML), the slow two-GPU tests

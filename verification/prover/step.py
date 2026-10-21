@@ -38,6 +38,7 @@ from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import (
     HOST,
     DeclaredComputation,
+    ProductKind,
     load_weights,
     snapshot_weights,
 )
@@ -76,6 +77,11 @@ class StepOutput:
     capture: dict | None = field(default=None, compare=False, repr=False)
     # Product leaves whose captured device was not their owner's (FS32d); 0 unsharded
     hint_misses: int = field(default=0, compare=False)
+    # Leaf index -> the digest of a product hashed on its GPU on arrival (FS30), as
+    # ``commit_leaves(known=...)`` takes it. Empty on CPU and for a product the capture did not
+    # hash (the δK̃ transpose, a perturbed or non-finite product).
+    arrival_digests: Mapping[int, bytes] = field(default_factory=dict, compare=False,
+                                                 repr=False)
 
     def leaves(self) -> list[Any]:
         return [*self.records, *self.w_t.values(), *self.products, *self.w_next.values()]
@@ -97,7 +103,8 @@ class StepOutput:
         return StepOutput(records=self.records, w_t=self.w_t, products=self.products,
                           w_next=new, loss=self.loss,
                           versions=self.versions[:-n_w] + _versions(list(new.values())),
-                          capture=self.capture, hint_misses=self.hint_misses)
+                          capture=self.capture, hint_misses=self.hint_misses,
+                          arrival_digests=self.arrival_digests)
 
     def assert_unmodified(self) -> None:
         """Raise if any leaf tensor was mutated in place since capture (invariant 6).
@@ -246,6 +253,18 @@ def prove_step(
         cap.assert_unmodified()
         product_versions = list(_versions(products))
         cap.release_operands()
+        arrival = {}
+        missing: dict[str, int] = {}  # products with no digest, by kind (a diagnostic)
+        missing_first: list[str] = []  # the first few that are not operand gradients
+        for m, p in enumerate(products, 1):
+            d = cap.arrival_digest(p)
+            if d is not None:
+                arrival[computation.product_index(m)] = d
+            else:
+                spec = computation.product(m)
+                missing[spec.kind.name] = missing.get(spec.kind.name, 0) + 1
+                if spec.kind is not ProductKind.OPERAND_GRAD and len(missing_first) < 5:
+                    missing_first.append(spec.name)
     summary = cap.summary()
     summary["host_buffers"] = ({"n_buffers": cap.buffers.n_buffers, "nbytes": cap.buffers.nbytes}
                                if cap.buffers is not None else None)
@@ -258,6 +277,11 @@ def prove_step(
         # The leaf stays on its owner, whatever device the fault built its tensor on.
         products[m - 1] = new.detach().to(products[m - 1].device).contiguous()
         product_versions[m - 1] = products[m - 1]._version
+        arrival.pop(computation.product_index(m), None)  # the digest was of the old bytes
+
+    if "arrival_hash" in summary:  # the digests in use, after the perturbations
+        summary["arrival_hash"].update(used=len(arrival), missing=missing,
+                                       missing_first=missing_first)
 
     with sec("train.update"):
         opt.step()
@@ -272,12 +296,12 @@ def prove_step(
         loss=float(loss.detach()),
         versions=(record_versions + w_t_versions
                   + tuple(product_versions) + _versions(list(w_next.values()))),
-        capture=summary, hint_misses=hint_misses,
+        capture=summary, hint_misses=hint_misses, arrival_digests=arrival,
     )
 
 
 def commit(c: DeclaredComputation, step: StepOutput) -> MerkleTree:
     """Prover step 2: the Merkle tree over the step's leaves; ``.root`` is ``h``."""
-    tree = commit_leaves(c, step.leaves())
+    tree = commit_leaves(c, step.leaves(), step.arrival_digests)
     step.assert_unmodified()  # invariant 6: nothing moved while it was hashed
     return tree

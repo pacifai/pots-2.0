@@ -42,6 +42,7 @@ import os
 import sys
 import time
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -600,6 +601,44 @@ class Prepared:
     payload_bytes: int
 
 
+class PendingHash:
+    """A table enqueued by :meth:`GpuBlake3.enqueue` and not yet read. It holds every buffer the
+    stream still touches (the payload tensors included, through ``keep``) until the result is
+    read. ``done()`` asks the event and never waits; ``result()`` waits on the event alone."""
+
+    def __init__(self, n: int, host: torch.Tensor, first_bad_at: int, digests_at: int,
+                 event: Any, keep: list[Any]) -> None:
+        self.n = n
+        self._host = host
+        self._first_bad_at = first_bad_at
+        self._digests_at = digests_at
+        self.event = event
+        self.keep = keep
+        self._result: tuple[list[bytes], int] | None = None
+
+    def done(self) -> bool:
+        return self.event is None or bool(self.event.query())
+
+    def result(self) -> tuple[list[bytes], int]:
+        """``(digests, first_bad)``: ``first_bad`` is the first leaf with a NaN or Inf, else
+        ``n``, and ``digests`` are the valid ones, those below ``first_bad`` (the kernel leaves
+        the rest unspecified). The same value on every call."""
+        if self._result is None:
+            if self.event is not None:
+                self.event.synchronize()
+            raw = self._host.numpy()
+            bad = int(raw[self._first_bad_at:self._first_bad_at + 4].view(np.int32)[0])
+            at = self._digests_at
+            self._result = ([raw[at + 32 * i:at + 32 * i + 32].tobytes() for i in range(bad)],
+                            bad)
+            self.keep = []  # the stream is past its last use of the device buffers
+        return self._result
+
+
+def _align(x: int, a: int = 16) -> int:
+    return -(-x // a) * a
+
+
 class GpuBlake3:
     """Hashes tables of leaves on a CUDA device. ``GpuBlake3()`` loads nothing; the first
     ``hash_leaves`` compiles (or loads the cached CUBIN). ``kernels`` replaces the device's
@@ -714,6 +753,109 @@ class GpuBlake3:
             np.fromiter((t.data_ptr() for t in tensors), dtype=np.uint64, count=n),
             np.fromiter((t.nbytes for t in tensors), dtype=np.uint64, count=n),
             np.asarray(kinds, dtype=np.uint8), device=device)
+
+
+    def enqueue_table(self, hdr_buf: bytes, hdr_off: np.ndarray, hdr_len: np.ndarray,
+                      hdr_idx: np.ndarray, payload_ptr: np.ndarray, payload_len: np.ndarray,
+                      kind: np.ndarray, *, device: torch.device | str, stream: Any,
+                      keep: Sequence[Any] = ()) -> PendingHash:
+        """``hash_leaves`` that never waits for the host: the table is built in one pinned
+        buffer and copied up with ``non_blocking``, the kernels run on ``stream`` (a
+        ``torch.cuda.Stream``; None on the host test's CPU device), the digests and
+        ``first_bad`` are copied back into pinned memory and an event is recorded after them.
+        ``keep`` (the payload tensors) is held until the result is read."""
+        dev = torch.device(device)
+        on_gpu = dev.type == "cuda"
+        hdr_off, hdr_len = _as_np(hdr_off, np.uint64), _as_np(hdr_len, np.uint32)
+        hdr_idx, kind = _as_np(hdr_idx, np.int64), _as_np(kind, np.uint8)
+        payload_ptr, payload_len = _as_np(payload_ptr, np.uint64), _as_np(payload_len, np.uint64)
+        hdr_bytes = bytes(hdr_buf)
+        check_table(len(hdr_bytes), hdr_off, hdr_len, hdr_idx, payload_ptr, payload_len, kind)
+        n = len(payload_ptr)
+        hl = hdr_len[hdr_idx] if n else np.empty(0, np.uint32)
+        plan = make_plan(chunk_counts(hl, payload_len))
+        # one layout for the host and the device buffers: headers, leaf records, tile prefixes,
+        # offsets, then (copied back) first_bad and the digests; the nodes are device-only
+        at_leaf = _align(len(hdr_bytes))
+        at = at_leaf + 32 * n
+        at_prefix = []
+        for p in plan.tile_prefix:
+            at_prefix.append(at)
+            at += 8 * len(p)
+        at_off = []
+        for o in plan.out_off:
+            at_off.append(at)
+            at += 8 * len(o)
+        at_bad = _align(at)
+        at_dig = at_bad + 16
+        total = at_dig + 32 * max(n, 1)
+        with torch.cuda.stream(stream) if on_gpu else nullcontext():
+            devbuf = torch.empty(total, dtype=torch.uint8, device=dev)
+            nodes = torch.empty(max(plan.nodes, 1) * 32, dtype=torch.uint8, device=dev)
+        host = torch.zeros(total, dtype=torch.uint8, pin_memory=on_gpu)
+        h = host.numpy()
+        base = devbuf.data_ptr()
+        if hdr_bytes:
+            h[:len(hdr_bytes)] = np.frombuffer(hdr_bytes, dtype=np.uint8)
+        rec = leaf_records(base, hdr_off, hdr_len, hdr_idx, payload_ptr, payload_len, kind)
+        h[at_leaf:at_leaf + 32 * n] = rec.view(np.uint8)
+        for a, p in zip(at_prefix, plan.tile_prefix):
+            h[a:a + 8 * len(p)] = np.ascontiguousarray(p).view(np.uint8)
+        for a, o in zip(at_off, plan.out_off):
+            h[a:a + 8 * len(o)] = np.ascontiguousarray(o).view(np.uint8)
+        h[at_bad:at_bad + 4] = np.array([n], dtype=np.int32).view(np.uint8)
+        addr = {"leaf": base + at_leaf, "tile_prefix": [base + a for a in at_prefix],
+                "out_off": [base + a for a in at_off], "nodes": nodes.data_ptr(),
+                "digests": base + at_dig, "first_bad": base + at_bad}
+        launches = []
+        for s in range(plan.stages):
+            tiles = plan.total_tiles(s)
+            if tiles:
+                launches.append((stage_params(plan, s, n, addr), grid_blocks(s, tiles)))
+        event = None
+        with torch.cuda.stream(stream) if on_gpu else nullcontext():
+            devbuf[:at_dig].copy_(host[:at_dig], non_blocking=on_gpu)
+            if launches:
+                raw = stream.cuda_stream if on_gpu else NO_STREAM
+                self.kernels(dev).run(launches, raw)
+            host[at_bad:].copy_(devbuf[at_bad:], non_blocking=on_gpu)
+            if on_gpu:
+                event = torch.cuda.Event()
+                event.record(stream)
+        return PendingHash(n, host, at_bad, at_dig, event, [devbuf, nodes, host, *keep])
+
+    def enqueue(self, headers: Sequence[bytes], tensors: Sequence[torch.Tensor],
+                kinds: Sequence[int] | None = None, *, stream: Any) -> PendingHash:
+        """``hash_tensor_leaves`` without waiting (see :meth:`enqueue_table`): leaf ``i`` is
+        ``headers[i]`` and the bytes of ``tensors[i]``, contiguous tensors on one device.
+        Nothing here reads a device value or synchronizes. The caller keeps the tensors
+        unmodified until the pending hash is done (it also holds them)."""
+        n = len(tensors)
+        if len(headers) != n or (kinds is not None and len(kinds) != n):
+            raise ValueError("headers, tensors and kinds must have one length")
+        if n == 0:
+            raise ValueError("an empty table has nothing to enqueue")
+        device = tensors[0].device
+        if device.type != "cuda" and self._kernels is None:
+            raise ValueError("tensors must be CUDA tensors")
+        for t in tensors:
+            if t.device != device:
+                raise ValueError("tensors must share one device")
+            if not t.is_contiguous():
+                raise ValueError("tensors must be contiguous")
+        if kinds is None:
+            try:
+                kinds = [FINITE_KIND[t.dtype] for t in tensors]
+            except KeyError as e:
+                raise ValueError(f"dtype {e.args[0]} has no leaf kind") from None
+        hdr_len = np.fromiter((len(h) for h in headers), dtype=np.uint32, count=n)
+        hdr_off = np.zeros(n, dtype=np.uint64)
+        np.cumsum(hdr_len[:-1], out=hdr_off[1:])
+        return self.enqueue_table(
+            b"".join(headers), hdr_off, hdr_len, np.arange(n),
+            np.fromiter((t.data_ptr() for t in tensors), dtype=np.uint64, count=n),
+            np.fromiter((t.nbytes for t in tensors), dtype=np.uint64, count=n),
+            np.asarray(kinds, dtype=np.uint8), device=device, stream=stream, keep=list(tensors))
 
 
 def hash_leaves(*args: Any, **kw: Any) -> tuple[torch.Tensor, int]:

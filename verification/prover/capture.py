@@ -161,10 +161,14 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from verification.commitment import native
+from verification.commitment.encoding import TAG_PRODUCT, tensor_leaf_header
+from verification.commitment.gpu_blake3 import GpuBlake3, PendingHash
 from verification.computation.matmul_ops import (
     ALLOWED_NAMESPACE_OPS,
     HANDLED_OPS,
@@ -387,14 +391,32 @@ class HostBuffers:
 # Shared by every capture in the process, so step t+1 reuses step t's buffers.
 HOST_BUFFERS = HostBuffers()
 
+_HASHER: GpuBlake3 | None = None
+
+
+def _hasher() -> GpuBlake3:
+    global _HASHER
+    if _HASHER is None:
+        _HASHER = GpuBlake3()
+    return _HASHER
+
 
 class MatmulCapture(TorchDispatchMode):
     """Passthrough dispatch mode recording every matmul of a forward + backward."""
 
     def __init__(self, param_names: Mapping[int, str] | None = None,
                  buffers: HostBuffers | None = None,
-                 placement: Placement | None = None) -> None:
+                 placement: Placement | None = None, *, hash_arrivals: bool = True,
+                 hasher: GpuBlake3 | None = None) -> None:
         super().__init__()
+        # FS30: hash each unsharded CUDA product on arrival, on the side stream after its host
+        # copy. ``hasher`` is the kernel's host for tests.
+        self.hash_arrivals = hash_arrivals
+        self._hasher = hasher
+        # host storage -> (members, shape, dtype, the host tensor's offset, digests, version):
+        # the digests are those below the first non-finite member.
+        self._arrived: dict[StorageWeakRef, tuple] = {}
+        self._arrival_stats = {"records": 0, "leaves": 0, "bytes": 0, "nonfinite": 0}
         # Only a sharded placement routes (FS32d); unsharded, the capture is as before.
         self.placement = placement if placement is not None and placement.sharded else None
         self.n_hint_misses: int | None = None
@@ -417,7 +439,9 @@ class MatmulCapture(TorchDispatchMode):
         self._param_copies: dict[int, str] = {}
         self._held: list[torch.Tensor] = []
         # GPU outputs whose copy to the host may still run: (record, tensor, _version, event).
-        self._pending: deque[tuple[MatmulRecord, torch.Tensor, int, torch.cuda.Event]] = deque()
+        # The fifth item is the arrival hash enqueued behind the copy, if any.
+        self._pending: deque[tuple[MatmulRecord, torch.Tensor, int, torch.cuda.Event,
+                                   PendingHash | None]] = deque()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         out = super().__exit__(exc_type, exc_val, exc_tb)
@@ -582,7 +606,7 @@ class MatmulCapture(TorchDispatchMode):
             moved.copy_(out, non_blocking=True)
             done = torch.cuda.Event()
             done.record(side)
-        self._pending.append((rec, out, out._version, done))
+        self._pending.append((rec, out, out._version, done, None))
         rec.out = moved
         rec.versions["out"] = moved._version
         self._drain(block=False)
@@ -597,20 +621,84 @@ class MatmulCapture(TorchDispatchMode):
             host.copy_(out, non_blocking=True)
             done = torch.cuda.Event()
             done.record(side)
-        # Held until the copy is done, so the allocator can't reuse its memory under the copy.
-        self._pending.append((rec, out, out._version, done))
+        try:
+            pend = self._hash_arrival(rec, out, side) if self._hashable(rec, out) else None
+        except BaseException:
+            done.synchronize()  # no GPU read of ``out`` may outlive it
+            raise
+        # Held until the copy and the hash are done, so the allocator can't reuse its memory
+        # under them.
+        self._pending.append((rec, out, out._version, done, pend))
         rec.out = host
         rec.versions["out"] = host._version
         self._drain(block=False)
 
+    def _hashable(self, rec: MatmulRecord, out: torch.Tensor) -> bool:
+        return (self.hash_arrivals and rec.q != 1 and out.is_contiguous() and out.numel() > 0
+                and out.dtype in native.FINITE_KIND)
+
+    def _hash_arrival(self, rec: MatmulRecord, out: torch.Tensor,
+                      side: torch.cuda.Stream) -> PendingHash:
+        """Enqueue the product leaves' hashes on ``side`` (behind the host copy): the whole
+        output, or each member ``out[i]``, with header ``tensor_leaf_header(TAG_PRODUCT, leaf)``.
+        Members are contiguous and equal in size, so their addresses are arithmetic and one
+        header serves them all. Nothing here waits."""
+        members = rec.n_members
+        leaf = out if rec.batch is None else out[0]
+        hdr = tensor_leaf_header(TAG_PRODUCT, leaf)
+        size = leaf.nbytes
+        hasher = self._hasher if self._hasher is not None else _hasher()
+        return hasher.enqueue_table(
+            hdr, np.zeros(1, np.uint64), np.array([len(hdr)], np.uint32),
+            np.zeros(members, np.int64),
+            out.data_ptr() + size * np.arange(members, dtype=np.uint64),
+            np.full(members, size, np.uint64),
+            np.full(members, native.FINITE_KIND[out.dtype], np.uint8),
+            device=out.device, stream=side, keep=[out])
+
+    def _arrived_from(self, rec: MatmulRecord, pend: PendingHash) -> None:
+        digests, bad = pend.result()
+        host = rec.out
+        self._arrived[StorageWeakRef(host.untyped_storage())] = (
+            rec.n_members, tuple(host.shape[(rec.batch is not None):]), host.dtype,
+            host.storage_offset(), digests, host._version)
+        st = self._arrival_stats
+        st["records"] += 1
+        st["leaves"] += len(digests)
+        st["bytes"] += len(digests) * (host.nbytes // rec.n_members)
+        st["nonfinite"] += pend.n - bad
+
+    def arrival_digest(self, p: torch.Tensor) -> bytes | None:
+        """The digest of ``p`` hashed on arrival, if ``p`` is exactly a leaf that was: the
+        whole output of an unbatched record, or member ``i`` of a batched one, found by storage
+        identity, then offset, shape, dtype and contiguity. ``None`` for any other tensor (the
+        ``δK̃`` transpose, a new tensor, a member with a NaN or Inf, or a buffer written since).
+        """
+        self.wait_copies()
+        hit = self._arrived.get(StorageWeakRef(p.untyped_storage()))
+        if hit is None:
+            return None
+        members, shape, dtype, base, digests, version = hit
+        if p.dtype != dtype or tuple(p.shape) != shape or not p.is_contiguous() \
+                or p._version != version:
+            return None
+        step = p.numel()
+        rel = p.storage_offset() - base
+        if step == 0 or rel < 0 or rel % step or rel // step >= members:
+            return None
+        i = rel // step
+        return digests[i] if i < len(digests) else None
+
     def _drain(self, *, block: bool, check: bool = True) -> None:
         """Drop the GPU outputs whose copy is done (all of them when ``block``)."""
         while self._pending:
-            rec, gpu, version, done = self._pending[0]
-            if not block and not done.query():
+            rec, gpu, version, done, pend = self._pending[0]
+            if not block and not (done.query() and (pend is None or pend.done())):
                 return
             done.synchronize()
             self._pending.popleft()
+            if pend is not None:
+                self._arrived_from(rec, pend)
             if check and gpu._version != version:
                 raise MutatedCaptureError(
                     f"#{rec.index} {rec.op} ({rec.phase}): output written in place before its "
@@ -707,4 +795,5 @@ class MatmulCapture(TorchDispatchMode):
             "q_min": min(qs) if qs else None,
             "q_max": max(qs) if qs else None,
             "output_bytes": sum(r.out.numel() * r.out.element_size() for r in self.records),
-        } | ({} if self.placement is None else {"hint_misses": self.n_hint_misses})
+        } | ({"arrival_hash": dict(self._arrival_stats)} if self._arrival_stats["records"]
+             else {}) | ({} if self.placement is None else {"hint_misses": self.n_hint_misses})

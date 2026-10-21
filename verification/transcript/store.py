@@ -181,7 +181,7 @@ class InMemoryStore(TranscriptStore):
             leaves = [_clone(x) for x in leaves] if copy else _detached(leaves)
         stats = HashStats() if hasattr(section, "add") else None
         with sec("P3.commit.hash"):
-            hashes = hash_step_leaves(c, leaves, stats)
+            hashes = hash_step_leaves(c, leaves, stats, known=step.arrival_digests)
         if stats is not None:
             stats.emit(section, "P3.commit.hash")
         with sec("P3.commit.tree"):

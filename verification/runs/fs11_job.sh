@@ -10,7 +10,8 @@
 # the session's plan: fs11 (the default), the first session's; recheck, the re-check's;
 # profile-check, the profile check's; nvlink-probe, the four-card hardware probe's, which also
 # reads FS31_CARDS (default 4) and passes; kernel-speed, the BLAKE3 kernel's speed on one H100,
-# whose upload holds no models; or fs32-pair, the sharded run on two GPUs of any type
+# whose upload holds no models; fs32-pair, the sharded run on two GPUs of any type; or
+# device-leaves, FS30's check of the device leaves on one H100, with the four models
 # (verification/runs/fs11_session.py); anything else is refused. In order:
 #
 # 1. Preflight. Without DRY_RUN the job refuses to start unless it can terminate the pod:
@@ -18,8 +19,8 @@
 #    (bad deadlines, less than FS11_MIN_FREE_GB free under OUT_DIR) terminates the pod.
 # 2. A deadline timer starts: FS11_DEADLINE_S (default 12600, 3.5 h; 7500, 2 h 5 min, for the
 #    re-check; 19800, 5.5 h, for the profile check; 5400, 1.5 h, for the hardware probe; 11800,
-#    3 h 17 min, for the two-GPU session) after the start it terminates the pod, whatever the
-#    job is doing.
+#    3 h 17 min, for the two-GPU session; 8800, 2 h 27 min, for the device-leaves session)
+#    after the start it terminates the pod, whatever the job is doing.
 # 3. The session (verification.runs.fs11_session run) prints the environment, refuses a
 #    machine without an H100 (FS11_ALLOW_ANY_GPU=1 overrides; the hardware probe also refuses
 #    one that shows fewer than FS31_CARDS CUDA devices; the two-GPU session wants any two CUDA
@@ -91,6 +92,7 @@ DEFAULT_DEADLINE_S=12600
 [ "$SESSION" = nvlink-probe ] && DEFAULT_DEADLINE_S=5400
 [ "$SESSION" = fs32-pair ] && DEFAULT_DEADLINE_S=11800
 [ "$SESSION" = kernel-speed ] && DEFAULT_DEADLINE_S=5400
+[ "$SESSION" = device-leaves ] && DEFAULT_DEADLINE_S=8800
 if [ -n "${FS31_CARDS:-}" ]; then export FS31_CARDS; fi
 if [ "$SELFTEST" = 1 ]; then
   DEADLINE_S=${FS11_DEADLINE_S:-360}; GRACE_S=${FS11_GRACE_S:-120}
@@ -299,9 +301,9 @@ if [ $((GRACE_S + PACK_RESERVE_S)) -ge "$DEADLINE_S" ]; then
   refuse "FS11_GRACE_S + FS11_PACK_RESERVE_S must be below FS11_DEADLINE_S"
 fi
 case "$SESSION" in
-  fs11|recheck|profile-check|nvlink-probe|kernel-speed|fs32-pair) ;;
+  fs11|recheck|profile-check|nvlink-probe|kernel-speed|fs32-pair|device-leaves) ;;
   *) refuse "FS11_SESSION is '$SESSION'; it must be fs11, recheck, profile-check, \
-nvlink-probe or kernel-speed" "(or fs32-pair, the two-GPU session)" ;;
+nvlink-probe or kernel-speed" "(or fs32-pair, the two-GPU session, or device-leaves, FS30's)" ;;
 esac
 mkdir -p "$OUT" || refuse "cannot create $OUT"
 rm -f "$READY" "$PACK_FAILED" "$FETCHED"

@@ -284,7 +284,12 @@ def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, **kw):
         gone.append(all(r() is None for r in refs.values()))
         log.append("empty_cache")
 
+    class Warm:  # the kernel warm-up, faked: no NVRTC on a CPU
+        def kernels(self, device):
+            log.append(f"warm {device}")
+
     monkeypatch.setattr(loop_mod, "_on_cuda", on_cuda)
+    monkeypatch.setattr(loop_mod, "GpuBlake3", Warm)
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: not cuda)  # not what decides
     monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
     orig = Verifier.verify_step
@@ -321,6 +326,21 @@ def test_cache_release_sits_between_prover_and_verifier_on_cuda(c, D, w0, final,
         assert log[i - 4:i] == ["P5.write", loop_mod.TOTALS_SECTION, loop_mod.HANDOFF_SECTION,
                                 "empty_cache"]
     assert all(s.handoff_s >= 0 and s.verify_s >= 0 for s in res.steps)
+
+
+def test_the_kernel_is_warmed_once_before_step_1_on_cuda(c, D, w0, final, monkeypatch):
+    """FS30: on CUDA, ``GpuBlake3().kernels(device)`` runs once, after the dataset tree and
+    before the first step's first section, so no NVRTC build lands in a timed step."""
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True)
+    warm = [i for i, x in enumerate(log) if x.startswith("warm")]
+    assert res.verdict.accepted and len(warm) == 1 and log[warm[0]] == "warm cpu"
+    assert log[warm[0] - 1] == "run:P4.tree"
+    assert warm[0] < log.index("verify 1")
+
+
+def test_the_kernel_is_not_warmed_off_cuda(c, D, w0, final, monkeypatch):
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=False)
+    assert res.verdict.accepted and not any(x.startswith("warm") for x in log)
 
 
 def test_no_cache_release_off_cuda(c, D, w0, final, monkeypatch):
