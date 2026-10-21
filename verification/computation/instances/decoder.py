@@ -643,6 +643,30 @@ class DecoderComputation(DeclaredComputation):
         return tuple(self.m_of(self.head_name("G", b)) for b in range(self.head_blocks))
 
     @cached_property
+    def unit_schedule(self) -> tuple[tuple[int, ...], ...]:
+        """The order :class:`DecoderReplay` serves best, as steps of product ``m``s (the
+        :meth:`~verification.computation.interface.Replay.unit_schedule` contract).
+
+        Each head block ``b`` in turn, ``(Λ_b, δF_b, G_b)``; then each layer ``j = L … 1``: its
+        forward products in canonical order, then its other products in canonical order. The
+        forward pass runs once, at ``Λ_0``; a layer's forward operands are served after the
+        backward of the layer above it and before its own, so no unit is rebuilt, and every
+        backward unit runs once. The last product is ``M`` (``L1.G_v``), so
+        ``glue_gradients`` stays valid.
+        """
+        steps: list[tuple[int, ...]] = [
+            tuple(self.m_of(self.head_name(k, b)) for k in ("Lambda", "dF", "G"))
+            for b in range(self.head_blocks)]
+        for j in range(self.L, 0, -1):
+            mine = [p for p in self.products if p.layer == j]
+            steps.append(tuple(p.m for p in mine if p.kind is ProductKind.FORWARD))
+            steps.append(tuple(p.m for p in mine if p.kind is not ProductKind.FORWARD))
+        flat = [m for s in steps for m in s]
+        assert sorted(flat) == list(range(1, self.M + 1)), "unit schedule is not 1..M once each"
+        assert flat[-1] == self.M, "the unit schedule must end at product M"
+        return tuple(steps)
+
+    @cached_property
     def linear_weights(self) -> dict[str, tuple[int, ...]]:
         out = {self.w(l, x): (self.m_of(f"L{l}.G_{x}"),)
                for l in range(1, self.L + 1) for x in LINEARS}
@@ -2041,6 +2065,12 @@ class DecoderReplay(Replay):
         c = self.c
         spec = c.product(m)
         return self.pl.unit_device(c.L + 1 if spec.layer is None else spec.layer)
+
+    def unit_schedule(self) -> tuple[tuple[int, ...], ...]:
+        """The computation's :attr:`~DecoderComputation.unit_schedule`: the head blocks, then
+        layers ``L … 1``, each layer's forward products before its backward ones. Served in it,
+        the replay builds once and runs each backward unit once."""
+        return self.c.unit_schedule
 
     def operand_group(self, ms: Sequence[int], dtype: torch.dtype | None = None
                       ) -> tuple[torch.Tensor, torch.Tensor]:

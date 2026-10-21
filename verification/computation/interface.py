@@ -192,6 +192,13 @@ class Replay(ABC):
         the replay doesn't say (callers then take the plain path)."""
         return None
 
+    def unit_schedule(self) -> tuple[tuple[int, ...], ...] | None:
+        """The order this replay serves best, as steps of product ``m``s: each step's members
+        are served together, the steps' union is ``1..M`` once each, and serving in that order
+        costs no more than canonical order. ``None`` (the default) means canonical order only,
+        which the MLP keeps."""
+        return None
+
     @abstractmethod
     def glue_gradients(self) -> dict[str, torch.Tensor]:
         """Check 6b: the full gradient of each glue-gradient weight. Valid after ``operands(M)``."""
