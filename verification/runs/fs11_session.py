@@ -2274,12 +2274,12 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
         f.flush()
         proc = subprocess.Popen(argv, cwd=cwd, env=penv, stdout=f, stderr=subprocess.STDOUT,
                                 start_new_session=True)
-        sampler = _start_sampler(proc, log.parent / "samples.jsonl", cwd, python)
-        if current is not None:
+        if current is not None:  # before the sampler, whose start can take a while
             try:
                 current.write_text(f"{proc.pid}\n")
             except OSError:
                 pass
+        sampler = _start_sampler(proc, log.parent / "samples.jsonl", cwd, python)
         peaks = _GpuPeaks(log.parent / "gpu_peak.json") if part.info.get("gpu_peak") else None
         try:
             while True:
