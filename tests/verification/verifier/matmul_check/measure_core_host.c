@@ -78,6 +78,11 @@ static int measure_one(const pots_mprod_t *t, double *row) {
   pots_i64 i, l;
   pots_u32 j;
 
+  if (!tt || !b1 || !b2 || !nu_i || !u_i || !p1_i || !pp_i || !d || !beta) {
+    free(tt); free(b1); free(b2); free(nu_i); free(u_i); free(p1_i); free(pp_i); free(d); free(beta);
+    return POTS_ERR_NOMEM;
+  }
+
   /* 1. B's rows against R's columns, |B|·1 and B²·1. */
   for (l = 0; l < q; l++) {
     for (j = 0; j < k; j++) tt[(size_t)j * (size_t)q + (size_t)l] = dot32(&t->b, l, POTS_F_ID, r + j, k);

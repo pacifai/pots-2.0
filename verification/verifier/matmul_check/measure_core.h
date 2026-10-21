@@ -28,6 +28,8 @@ typedef unsigned int pots_u32;
 typedef unsigned long long pots_u64;
 typedef long long pots_i64;
 #else
+/* The host build also passes -ffp-contract=off; the NVRTC build will pass --fmad=false (FS37). */
+#pragma STDC FP_CONTRACT OFF
 #include <math.h>
 #include <stdint.h>
 typedef uint16_t pots_u16;
@@ -61,6 +63,7 @@ typedef int64_t pots_i64;
 #define POTS_ERR_DTYPE 1 /* a view's dtype is neither fp32 nor bf16 */
 #define POTS_ERR_K 2     /* k == 0, or no challenge matrix */
 #define POTS_ERR_SHAPE 3 /* A, B, P, bias shapes disagree, or a dimension is below 1 */
+#define POTS_ERR_NOMEM 4 /* the host build could not allocate its scratch */
 
 /* A strided matrix: element (i, c) is at addr + (i*row_stride + c*col_stride) elements. */
 typedef struct {

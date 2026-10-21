@@ -104,6 +104,8 @@ def exact(mi):
                     *np.linalg.norm(d, axis=0)])
     if not mi.guard:
         row[:2] = np.nan
+    # length = w (t_j) + q (s_j) + w (pi_j), each an fp32 dot of that many terms, + 3 for the bias
+    # add, the subtraction and the final rounding of the norm's inputs.
     return row, 2 * w + q + 3, np.linalg.norm(sv, axis=0)
 
 
@@ -122,17 +124,19 @@ def check_within_bound(row, mi, ex=None, fp32_norms=False):
     """Each field of ``row`` against the float64 evaluation, within the rounding bound
     (``fp32_norms``: torch's norms of ``P`` and ``b`` are fp32 reductions, not float64)."""
     ex_row, length, s = ex if ex is not None else exact(mi)
+    # `length` (see exact) is the longest chain of fp32 roundings feeding a field: w for t_j,
+    # q for s_j, w for pi_j (each a dot of that length), plus the bias add and the subtraction.
     g2 = 2 * gamma(length)
-    for i in (0, 1, 3):  # sums of non-negative terms: relative bound
+    for i in (0, 1, 3):  # sums of non-negative terms: relative bound (1e-300 only guards a zero)
         if np.isnan(ex_row[i]):
             assert np.isnan(row[i])
         else:
             assert abs(row[i] - ex_row[i]) <= g2 * abs(ex_row[i]) + 1e-300, (i, row[i], ex_row[i])
     tol = 2 * gamma(length + len(mi.p) + mi.p.shape[1]) if fp32_norms else 1e-12
     for i in (2, 4):  # float64 sums in the core
-        assert abs(row[i] - ex_row[i]) <= tol * abs(ex_row[i]) + 1e-300
+        assert abs(row[i] - ex_row[i]) <= tol * abs(ex_row[i]) + 1e-300  # 1e-300 only guards a zero
     err = np.abs(row[5:] - ex_row[5:])
-    assert np.all(err <= g2 * s + 1e-12 * ex_row[5:] + 1e-300), (err, g2 * s)
+    assert np.all(err <= g2 * s + 1e-300), (err, g2 * s)
 
 
 SHAPES = [(1, 2, 3), (1, 7, 40), (5, 2, 31), (6, 33, 32), (4, 64, 33), (9, 17, 65),
@@ -190,9 +194,10 @@ def test_same_product_same_bits_alone_in_tables_and_twice(host_measure):
             assert np.array_equal(bits(rows[pos]), bits(alone[i]))
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("biased", [False, True])
-def test_strided_views_match_contiguous_copies(host_measure, biased):
-    mi = make(6, 19, 37, 3, biased=biased, seed=4)
+def test_strided_views_match_contiguous_copies(host_measure, biased, dtype):
+    mi = make(6, 19, 37, 3, dtype=dtype, biased=biased, seed=4)
     ref = host_measure(pack([mi]))[0]
     g = torch.Generator().manual_seed(9)
 
@@ -210,6 +215,13 @@ def test_strided_views_match_contiguous_copies(host_measure, biased):
         assert np.array_equal(bits(host_measure(pack([v]))[0]), bits(ref))
     both = MeasureInput(transposed(mi.a), embed(mi.b), transposed(mi.p), mi.r, mi.bias, mi.guard)
     assert np.array_equal(bits(host_measure(pack([both]))[0]), bits(ref))
+    if biased:  # the bias a stride-2 slice of a bigger vector, at a non-zero offset
+        big = torch.randn(2 * mi.bias.shape[0] + 3, generator=g).to(dtype)
+        big[3::2] = mi.bias
+        sb = big[3::2]
+        assert sb.stride() == (2,) and sb.storage_offset() == 3 and torch.equal(sb, mi.bias)
+        v = MeasureInput(mi.a, mi.b, mi.p, mi.r, sb, mi.guard)
+        assert np.array_equal(bits(host_measure(pack([v]))[0]), bits(ref))
 
 
 @pytest.mark.parametrize("biased", [False, True])
@@ -337,6 +349,9 @@ def test_pack_refusals():
     refuse(swap(b=torch.zeros(5, 5)), "do not make a product")
     refuse(swap(p=torch.zeros(3, 6)), "do not make a product")
     refuse(swap(a=torch.zeros(3, 4, 1)), "not 2-D")
+    refuse(swap(a=torch.zeros(0, 4), p=torch.zeros(0, 5)), "a dimension is below 1")
+    refuse(swap(a=torch.zeros(3, 0), b=torch.zeros(0, 5)), "a dimension is below 1")
+    refuse(swap(b=torch.zeros(4, 0), p=torch.zeros(3, 0), r=torch.zeros(0, 2)), "a dimension is below 1")
     refuse(swap(bias=torch.zeros(4)), "bias has shape")
     refuse(swap(bias=torch.zeros(1, 5)), "bias has shape")
     refuse(swap(r=torch.zeros(4, 2)), "r has shape")
@@ -350,6 +365,11 @@ def test_pack_refusals():
         pack([ok, other])
     with pytest.raises(ValueError, match="product 2: k = 3 differs"):
         pack([ok, ok, make(3, 4, 5, 3)])
+
+
+def test_nomem_code_matches_the_header():
+    hdr = (ROOT / "verification/verifier/matmul_check/measure_core.h").read_text()
+    assert f"#define POTS_ERR_NOMEM {mt.ERR_NOMEM} " in hdr
 
 
 def test_core_check_refusals(hostlib, host_measure):

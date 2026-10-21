@@ -23,7 +23,7 @@ DT_BF16 = 2
 M_GUARD = 1
 M_BIASED = 2
 
-ERR_OK, ERR_DTYPE, ERR_K, ERR_SHAPE = 0, 1, 2, 3
+ERR_OK, ERR_DTYPE, ERR_K, ERR_SHAPE, ERR_NOMEM = 0, 1, 2, 3, 4
 
 _DTYPE_CODE = {torch.float32: DT_FP32, torch.bfloat16: DT_BF16}
 
@@ -115,6 +115,8 @@ def pack(products: Sequence[MeasureInput]) -> Table:
                       f"p {tuple(mi.p.shape)} do not make a product")
         if mi.bias is not None and (mi.bias.dim() != 1 or mi.bias.shape[0] != w):
             raise bad(f"bias has shape {tuple(mi.bias.shape)}, not ({w},)")
+        if n < 1 or q < 1 or w < 1:
+            raise bad(f"a dimension is below 1 (n = {n}, q = {q}, w = {w})")
         r = mi.r
         if not isinstance(r, torch.Tensor) or r.dtype != torch.float32:
             raise bad("r is not a float32 tensor")
