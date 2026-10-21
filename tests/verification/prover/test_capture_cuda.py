@@ -71,9 +71,17 @@ def test_batched_members_and_bf16_are_copied_whole():
 
 def test_a_write_before_the_copy_is_done_raises():
     """An in-place write to an output whose copy may still run races the copy; leaving the
-    block reports it."""
+    block reports it. A capture on the same pool runs first: the first arrival hash (FS30) on
+    a new side stream builds its kernel and allocates device and pinned memory, and CUDA may
+    hold the host in those calls until the GPU is idle, so the copy would be done before the
+    write."""
     pool = HostBuffers()
     a, b = operands()
+    warm = MatmulCapture(buffers=pool)
+    with warm, warm.phase("forward"):
+        torch.mm(a, b)
+    del warm  # its host buffer goes back to the pool, so the capture below allocates nothing
+    torch.cuda.synchronize()
     cap = MatmulCapture(buffers=pool)
     with pytest.raises(MutatedCaptureError, match="before its copy to the host was done"):
         with cap, cap.phase("forward"):
