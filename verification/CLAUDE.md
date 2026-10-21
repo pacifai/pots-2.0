@@ -1716,6 +1716,21 @@ interface.
     The tests compare every field bit for bit on adversarial inputs, and on the real step
     all 7,113 products match. Check 5's measure time fell from 1.09 s to 0.72 s, and check 5
     from about 1.75 s to 1.3 s (2026-10-04, `MallocLargeCache=0`).
+- `measure_core.h`, `measure_table.py` (FS36, O2): check 5's measuring arithmetic as plain C
+  that NVRTC and a host C compiler both build, and its Python side. Nothing calls them yet
+  besides their tests (FS37 wires the kernel into `freivalds.py` and `checks.py`).
+  `measure_core.h` computes one product's row, the columns of `freivalds.ROW` in float64, from
+  strided bf16 or fp32 views (`pots_mview_t`, `pots_mprod_t`, `pots_mprod_check` refuses a
+  bad dtype, `k = 0` or mismatched shapes). The order is pinned by
+  `MEASURE_KERNEL_PLAN_DRAFT.md` §2.1a: every dot is 32 `fmaf` partials (partial `p` takes
+  `c = p, p+32, ...`) then a halving tree, every sum the same in float64, and a dot is only
+  formed that way so the host build exercises the GPU's decomposition. The bits are the same
+  for any strides, storage dtype, table order or neighbours, and differ from torch's in the
+  last bits. `measure_table.py` has the ctypes mirrors `MView`, `MProd` and
+  `pack(products) -> Table` of `MeasureInput(a, b, p, r, bias, guard)` (`ValueError` naming
+  the product on a bad dtype, shape, `r`, device or `k`; keep the `Table` alive while a build
+  reads it). Tests: `measure_core_host.c` and `test_measure_core.py` compile the host library
+  with `-ffp-contract=off`.
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m(q, eps_in, eps_acc, u_ratio=1.0)` is F18's split, `√2·ε_in + √q·ε_acc·max(1,
