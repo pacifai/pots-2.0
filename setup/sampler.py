@@ -2,6 +2,7 @@
 
     .venv/bin/python -m setup.sampler --pid PID --out PATH [--interval 0.1] [--gpu 0]
     .venv/bin/python -m setup.sampler --out PATH [--interval 0.1] [--gpu 0] --wrap -- CMD ...
+    .venv/bin/python -m setup.sampler ... --no-gpu    # process and machine fields only, no NVML
 
 ``samples.jsonl`` (archive/PROFILING_PLAN §5.4) opens with one header line, then one flat line per
 sample. A field that can't be read is ``null``, and a rate is the change since the previous
@@ -165,6 +166,7 @@ class _Sampler:
         self.cpu_mhz_due = True
         self.aff_mhz: float | None = None
         self.started = False
+        self.no_gpu = False  # set by ``run``: leave NVML alone, the GPU fields read null
         self.nv: Any = None
         self.handle: Any = None
         self.gpm: dict[str, Any] | None = None
@@ -197,6 +199,8 @@ class _Sampler:
     # -- start-up ---------------------------------------------------------------------------
 
     def _init_gpu(self) -> None:
+        if self.no_gpu:
+            return
         try:
             import pynvml as nv
             nv.nvmlInit()
@@ -246,7 +250,9 @@ class _Sampler:
             "wall_unix_s": time.time(), "host": socket.gethostname(),
             "gpu": self.gpu_info if self.handle is not None else None,
             "nvml": self.handle is not None, "gpm": self.gpm is not None,
-            "gpm_error": self.gpm_error if self.nv is not None else "NVML isn't available",
+            "gpm_error": (self.gpm_error if self.nv is not None else
+                          "the GPU reader is off (--no-gpu)" if self.no_gpu
+                          else "NVML isn't available"),
             "pcie_source": self.pcie_source,
             "cpu_logical": self._try("cpu_count", lambda: ps.cpu_count()),
             "cpu_physical": self._try("cpu_count", lambda: ps.cpu_count(logical=False)),
@@ -457,10 +463,11 @@ def _root_alive(psutil: Any, root: Any) -> bool:
 
 def run(pid: int, out: Path, interval: float = 0.1, gpu: int = 0,
         stop: threading.Event | None = None,
-        alive: Callable[[], bool] | None = None) -> int:
+        alive: Callable[[], bool] | None = None, no_gpu: bool = False) -> int:
     """Sample ``pid``'s tree and the machine to ``out`` until ``stop`` is set, ``alive()`` is
     false or the root process is gone. Returns 0, or 1 when the file can't be opened. Without
-    ``psutil`` the file holds the header and its error only."""
+    ``psutil`` the file holds the header and its error only. ``no_gpu`` never starts NVML: the
+    header reads ``"nvml": false`` and every GPU field ``null``, on a GPU host too."""
     stop = stop or threading.Event()
     try:
         f = open(out, "w")
@@ -479,6 +486,7 @@ def run(pid: int, out: Path, interval: float = 0.1, gpu: int = 0,
                                             "error": f"{type(e).__name__}: {e}"}]}) + "\n")
             return 0
         try:
+            s.no_gpu = no_gpu
             s._init_gpu()
             s._refresh_tree(time.monotonic())
             s.sample(time.monotonic_ns())  # the baseline for every rate
@@ -562,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--interval", type=float, default=0.1)
     ap.add_argument("--gpu", type=int, default=0)
+    ap.add_argument("--no-gpu", action="store_true", help="don't start NVML: no GPU fields")
     ap.add_argument("--wrap", action="store_true", help="start CMD (after --) and sample it")
     a = ap.parse_args(argv)
     if a.wrap == (a.pid is not None) or (a.wrap and not cmd) or a.interval <= 0:
@@ -578,9 +587,10 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, on_term)
     pid = child.pid if child is not None else a.pid
     if child is None:
-        return run(pid, a.out, a.interval, a.gpu, stop)
+        return run(pid, a.out, a.interval, a.gpu, stop, no_gpu=a.no_gpu)
     try:
-        rc = run(pid, a.out, a.interval, a.gpu, stop, alive=lambda: child.poll() is None)
+        rc = run(pid, a.out, a.interval, a.gpu, stop, alive=lambda: child.poll() is None,
+                 no_gpu=a.no_gpu)
     finally:
         _reap(child)
     return child.returncode if rc == 0 else rc

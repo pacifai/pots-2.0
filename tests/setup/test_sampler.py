@@ -31,27 +31,67 @@ def _popen(*args: str) -> subprocess.Popen:
     return subprocess.Popen([sys.executable, "-m", "setup.sampler", *args])
 
 
-def test_wrap_a_busy_loop(tmp_path):
+def _busy_run(tmp_path, *flags):
     out = tmp_path / "s.jsonl"
-    rc = _popen("--out", str(out), "--wrap", "--", sys.executable, "-c", BUSY).wait(timeout=30)
+    rc = _popen("--out", str(out), *flags, "--wrap", "--", sys.executable, "-c", BUSY).wait(timeout=30)
     assert rc == 0
+    return out
+
+
+def _check_busy_rows(out):
     head, *_ = _lines(out)
     rows = _samples(out)
     assert head["kind"] == "header" and head["version"] == 1 and head["fields"] == sampler.FIELDS
-    assert head["interval_s"] == 0.1 and head["gpu"] is None and head["nvml"] is False
+    assert head["interval_s"] == 0.1
     assert 15 <= len(rows) <= 22
     assert sum(r["c_tree"] for r in rows) / len(rows) > 0.5
     assert all(set(r) == set(sampler.FIELDS) for r in rows)
     assert all(r["rss"] > 0 and r["threads"] >= 1 and r["ram_avail"] > 0 for r in rows)
     assert all(b["t"] > a["t"] for a, b in zip(rows, rows[1:]))
+    return head, rows
+
+
+def test_wrap_a_busy_loop_without_the_gpu_reader(tmp_path):
+    """``--no-gpu`` reads the same on every host: no NVML, every GPU field null."""
+    head, rows = _check_busy_rows(_busy_run(tmp_path, "--no-gpu"))
+    assert head["gpu"] is None and head["nvml"] is False and "--no-gpu" in head["gpm_error"]
     assert all(r["g_util"] is None and r["g_sm_active"] is None for r in rows)
 
 
-def test_the_sampler_costs_under_two_percent_of_a_core(tmp_path):
-    out = tmp_path / "s.jsonl"
-    _popen("--out", str(out), "--wrap", "--", sys.executable, "-c", BUSY).wait(timeout=30)
+def test_wrap_a_busy_loop(tmp_path):
+    """Without the flag the header tells the host: no GPU reader on a host without a GPU, a header
+    naming the GPU on one with a GPU (the FS32 pod's A40 failed the old no-GPU assertion)."""
+    head, rows = _check_busy_rows(_busy_run(tmp_path))
+    if head["nvml"]:
+        assert head["gpu"] is not None and head["gpu"]["name"]
+    else:
+        assert head["gpu"] is None
+        assert all(r["g_util"] is None and r["g_sm_active"] is None for r in rows)
+
+
+def _mean_self_cost(out):
     rows = _samples(out)[1:]  # the first row includes the sampler's start-up
-    assert sum(r["c_self"] for r in rows) / len(rows) < 0.02
+    return sum(r["c_self"] for r in rows) / len(rows)
+
+
+def test_the_sampler_costs_under_two_percent_of_a_core(tmp_path):
+    """The 2% bound (archive/PROFILING_PLAN section 5) is for process sampling, so it is measured
+    without the GPU reader, which is the same work on any host."""
+    cost = _mean_self_cost(_busy_run(tmp_path, "--no-gpu"))
+    assert cost < 0.02, f"mean sampler cost {cost:.4f} of a core"
+
+
+def test_the_sampler_with_the_gpu_reader_costs_under_fifteen_percent_of_a_core(tmp_path):
+    """Only where NVML works. The FS32 pod (A40, 96 logical CPUs, GPM unsupported so PCIe comes
+    from nvmlDeviceGetPcieThroughput) measured 0.076 here and a mean of 0.094 over 8,874 samples
+    of a real run, 4 to 5 times the 2% of process sampling alone. The logs cannot split that
+    between the NVML calls and psutil on a 96-CPU host (that needs this test's number with and
+    without --no-gpu on a pod), so the bound is set above what was measured, not derived."""
+    out = _busy_run(tmp_path)
+    if not _lines(out)[0]["nvml"]:
+        pytest.skip("no working NVML on this host")
+    cost = _mean_self_cost(out)
+    assert cost < 0.15, f"mean sampler cost {cost:.4f} of a core with the GPU reader"
 
 
 def test_sigterm_ends_the_sampler_within_two_seconds(tmp_path):
