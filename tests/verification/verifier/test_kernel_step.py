@@ -15,8 +15,11 @@ path, the honest step is accepted, and a flipped product of each class is reject
 naming that product, as the torch path rejects it.
 """
 
+import os
 import re
 from dataclasses import dataclass, field
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # before CUDA starts, as S4c needs
 
 import numpy as np
 import pytest
