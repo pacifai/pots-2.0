@@ -1471,9 +1471,10 @@ def test_nvlink_probe_plan_lists_the_probe_and_a_part_per_model_and_card(tmp_pat
     out = tmp_path / "out"
     plan = fs.nvlink_probe_plan(tmp_path / "up", out)
     cards = [p for p in plan if p.kind == "card"]
-    assert [p.kind for p in plan[:2]] == ["models", "nvlink"]
-    assert len(plan) == 2 + len(cards) == 2 + 4 * len(fs.RUN_PINS)
-    probe = plan[1]
+    assert [p.kind for p in plan[:3]] == ["peer_check", "models", "nvlink"]
+    assert plan[0] == fs.peer_check_part(out)
+    assert len(plan) == 3 + len(cards) == 3 + 4 * len(fs.RUN_PINS)
+    probe = plan[2]
     assert probe.name == "nvlink_probe" and probe.timeout_s == fs.NVLINK_TIMEOUT_S
     assert probe.argv == ["{python}", "-m", "verification.runs.nvlink_probe", "--out",
                           str(out / "nvlink" / "nvlink.json")]
@@ -1683,10 +1684,12 @@ def test_part_extras_read_the_probe_and_card_reports(tmp_path):
     hw2 = {"verdict": "pass", "pass": True, "reasons": [], "nv_links": True,
            "nv18_everywhere": True, "p2p_read_ok": True, "peer_copy_min_gbps": 371.2,
            "slowest_pair": "0->1", "pass_gbps": 300.0, "fail_gbps": 150.0, "n_cards": 4,
-           "expected_cards": 4, "gate": True, "more": 1}
+           "expected_cards": 4, "gate": True, "more": 1,
+           "peer_bytes_ok": {"0->1": True, "1->0": True}}
     nv.write_text(json.dumps({"hw2": hw2}))
     got = fs.part_extras(part, tmp_path / "log")["hw2"]
     assert got["pass"] and got["peer_copy_min_gbps"] == 371.2 and "more" not in got
+    assert got["peer_bytes_ok"] == {"0->1": True, "1->0": True}
     nv.write_text("{")
     assert "extras_error" in fs.part_extras(part, tmp_path / "log")
 
@@ -1773,8 +1776,8 @@ def test_hw3_one_card_is_not_a_comparison(tmp_path):
 def test_every_card_part_and_the_probe_order_cards_by_pci_bus(tmp_path):
     plan = fs.nvlink_probe_plan(tmp_path / "up", tmp_path / "out")
     assert all(p.env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID" for p in plan if p.kind in
-               ("card", "nvlink"))
-    assert "CUDA_DEVICE_ORDER" not in plan[0].env
+               ("card", "nvlink", "peer_check"))
+    assert "CUDA_DEVICE_ORDER" not in plan[1].env  # the models part
 
 
 def test_job_accepts_the_probe_session_and_refuses_the_rest(tmp_path):

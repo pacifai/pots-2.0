@@ -12,7 +12,11 @@ times out or is missing is recorded, not raised, and the measures that follow st
 
 The verdict ``hw2`` (:func:`hw2_verdict`) checks that the topology matrix shows ``FS31_CARDS``
 cards (default 4), that every pair is joined by exactly ``NV18`` (the H100 SXM's link count), that
-peer reads are ``OK`` for every pair, and that every ordered pair has a finite, positive copy rate.
+peer reads are ``OK`` for every pair, that every ordered pair has a finite, positive copy rate,
+and that every ordered pair's direct copies land the right bytes (``peer_bytes_ok``: F22's
+``peer_check``, run here on the same cards; on the FS32 two-A40 session every direct copy left wrong
+bytes though the peer reads said ``OK``, so a rate over a wrong copy is no rate). A pair with no
+byte result counts as wrong.
 The slowest pair's rate, by the PyTorch copy timing, sets its ``verdict``: ``pass`` at
 :data:`PEER_COPY_PASS_GBPS` or more, ``review`` from :data:`PEER_COPY_FAIL_GBPS` up to that (the
 number returns to the user before the port relies on it), ``fail`` below it or on any other
@@ -38,8 +42,8 @@ from typing import Any
 
 __all__ = ["PEER_COPY_PASS_GBPS", "PEER_COPY_FAIL_GBPS", "GATE_CARDS", "COMMANDS", "expected_cards",
            "hw2_line", "run_command", "parse_gpu_matrix", "hw2_verdict",
-           "peer_copy_bandwidth", "fanout_bandwidth", "pinned_bandwidth", "torch_view",
-           "build_report", "main"]
+           "peer_copy_bandwidth", "peer_bytes_by_pair", "fanout_bandwidth", "pinned_bandwidth",
+           "torch_view", "build_report", "main"]
 
 VERSION = 1
 GIB = 1 << 30
@@ -161,11 +165,14 @@ def _command_failure(rec: Mapping[str, Any]) -> str | None:
 def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
                 p2p_read: Mapping[str, Mapping[str, str]] | None,
                 pair_gbps: Mapping[str, float | None] | None, n_expected: int | None = None,
-                command_failures: Mapping[str, str | None] | None = None) -> dict[str, Any]:
+                command_failures: Mapping[str, str | None] | None = None,
+                peer_bytes: Mapping[str, bool | None] | None = None) -> dict[str, Any]:
     """F22's HW2. The checks: the topology matrix shows ``n_expected`` GPUs (default
     ``FS31_CARDS``; ``n_cards`` is what it shows), ``nv_links`` and ``nv18_everywhere`` for every
-    pair, ``p2p_read_ok`` for every pair of the same GPUs, and a finite positive rate for every
-    ordered pair of those GPUs. With all of them, the slowest pair's rate gives ``verdict``:
+    pair, ``p2p_read_ok`` for every pair of the same GPUs, a finite positive rate for every
+    ordered pair of those GPUs, and ``peer_bytes_ok`` (``"i->j"`` to true, from ``peer_bytes``: the
+    direct copies of that pair landed the right bytes; a pair that is false or has no entry is a
+    reason, and the verdict ``fail``). With all of them, the slowest pair's rate gives ``verdict``:
     ``pass`` at :data:`PEER_COPY_PASS_GBPS` or more, ``review`` from :data:`PEER_COPY_FAIL_GBPS`
     up to that, ``fail`` below it; any other failed check is ``fail``. ``gate`` is true only when
     ``n_expected`` is :data:`GATE_CARDS`; ``pass`` only for ``"pass"`` with ``gate`` (a rehearsal
@@ -214,6 +221,16 @@ def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
     wanted = [f"{_gpu_index(a)}->{_gpu_index(b)}" for a, b in _pairs(names)]
     good = {k: v for k, v in rates.items()
             if isinstance(v, (int, float)) and math.isfinite(v) and v > 0}
+    bytes_by_pair = {k: v is True for k, v in (peer_bytes or {}).items()}
+    if topo is not None:
+        for k in wanted:
+            bytes_by_pair.setdefault(k, False)
+    wrong = sorted(k for k, v in bytes_by_pair.items() if not v)
+    if not peer_bytes:
+        reasons.append("no peer-copy byte check result (peer copies unverified)")
+    elif wrong:
+        reasons.append("peer copies landed wrong bytes, or were not checked, for pair "
+                       + ", ".join(wrong[:6]))
     complete = False
     if topo is not None:
         missing = [k for k in wanted if k not in rates or rates[k] is None]
@@ -238,7 +255,8 @@ def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
         elif low < PEER_COPY_PASS_GBPS:
             review_note = (f"the slowest pair ({slowest}) copied at {low:.0f} GB/s, under the "
                            f"{PEER_COPY_PASS_GBPS:g} GB/s target (150-300 returns to the user)")
-    ok = not reasons and nv_links and nv18 and p2p_ok and complete
+    ok = (not reasons and nv_links and nv18 and p2p_ok and complete and bool(peer_bytes)
+          and not wrong)
     review = ok and review_note is not None
     if review:
         reasons.append(review_note)
@@ -246,6 +264,7 @@ def hw2_verdict(topo: Mapping[str, Mapping[str, str]] | None,
     return {"verdict": verdict, "pass": verdict == "pass" and expected == GATE_CARDS,
             "n_cards": n_cards, "expected_cards": expected, "gate": expected == GATE_CARDS,
             "nv_links": nv_links, "nv18_everywhere": nv18, "p2p_read_ok": p2p_ok,
+            "peer_bytes_ok": dict(sorted(bytes_by_pair.items())),
             "peer_copy_min_gbps": low, "slowest_pair": slowest,
             "pass_gbps": PEER_COPY_PASS_GBPS, "fail_gbps": PEER_COPY_FAIL_GBPS,
             "reasons": reasons}
@@ -276,6 +295,10 @@ def hw2_line(hw2: Mapping[str, Any]) -> str:
         return f"HW2 rehearsal ({n} of {GATE_CARDS} cards), not the gate: {speed}"
     head = {"pass": "HW2 pass", "review": "HW2 review", "fail": "HW2 FAIL"}[verdict]
     why = "; ".join(hw2.get("reasons") or []) if verdict == "fail" else ""
+    wrong = sorted(k for k, v in (hw2.get("peer_bytes_ok") or {}).items() if not v)
+    if wrong:  # said first and plainly: a rate over copies that landed wrong bytes means nothing
+        speed = (f"peer copies were WRONG (or unchecked) on pair{'s' * (len(wrong) > 1)} "
+                 f"{', '.join(wrong)}, so a rate is not a result; {speed}")
     return f"{head}: {speed}" + (f"; {why}" if why else "")
 
 
@@ -463,6 +486,20 @@ def nvbandwidth(run: Run = subprocess.run, which: Callable[[str], str | None] = 
 # ---- the report ---------------------------------------------------------------------------
 
 
+def peer_bytes_by_pair() -> dict[str, bool]:
+    """``peer_check.check`` on every visible CUDA device, as ``"i->j"`` to whether every case of
+    that ordered pair landed the right bytes. Raises when there are fewer than two devices."""
+    import torch
+
+    from verification.runs.peer_check import check
+
+    n = torch.cuda.device_count()
+    if n < 2:
+        raise RuntimeError(f"{n} CUDA devices visible; a peer copy needs two")
+    return {k: bool(p["ok"]) for k, p in check([torch.device(f"cuda:{i}") for i in range(n)])
+            ["pairs"].items()}
+
+
 def _measure(fn: Callable[[], Any]) -> Any:
     """``fn()``'s result, or ``{"error": ...}`` when it raised, so one wedged card or a failed
     call can't lose the report."""
@@ -491,10 +528,15 @@ def build_report(run: Run = subprocess.run, n_expected: int | None = None) -> di
         "nvbandwidth": _measure(lambda: nvbandwidth(run)),
     }
     pairs = peer.get("pairs") if isinstance(peer, dict) else None
+    peer_bytes = _measure(peer_bytes_by_pair)
+    report["peer_bytes"] = peer_bytes
     report["hw2"] = hw2_verdict(
         topo, p2p_read, pairs or None, n_expected,
         {"topo": _command_failure(commands["topo"]),
-         "p2p_read": _command_failure(commands["p2p_read"])})
+         "p2p_read": _command_failure(commands["p2p_read"])},
+        None if "error" in peer_bytes else peer_bytes)
+    if "error" in peer_bytes:
+        report["hw2"]["reasons"].append(f"the peer-copy byte check raised: {peer_bytes['error']}")
     return report
 
 

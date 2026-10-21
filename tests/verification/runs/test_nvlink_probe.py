@@ -103,13 +103,28 @@ def test_parse_4_gpu_sample_and_p2p():
     assert p["GPU0"]["GPU1"] == "OK" and p["GPU3"]["GPU3"] == "X"
 
 
+def right_bytes(topo, wrong=()):
+    """``peer_bytes`` for a parsed topology: every ordered pair landed the right bytes, but the
+    ``wrong`` ones."""
+    return {f"{a[3:]}->{b[3:]}": f"{a[3:]}->{b[3:]}" not in wrong
+            for a in topo for b in topo if a != b}
+
+
+def hw2(topo, p2p, rates, n_expected=None, failures=None, peer_bytes="right", wrong=()):
+    """``hw2_verdict`` with the peer-copy byte check passed for every pair of the topology unless
+    told otherwise (``peer_bytes=None`` is a probe that left no byte result)."""
+    if isinstance(peer_bytes, str):
+        peer_bytes = right_bytes(topo, wrong) if topo else None
+    return nv.hw2_verdict(topo, p2p, rates, n_expected, failures, peer_bytes)
+
+
 @pytest.mark.parametrize("text", ["", "nvidia-smi: command not found\n", "GPU0 is fine\n"])
 def test_parse_finds_no_matrix(text):
     assert nv.parse_gpu_matrix(text) is None
 
 
 def test_verdict_passes_on_nv18_and_fast_copies():
-    v = nv.hw2_verdict(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4),
+    v = hw2(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4),
                        pair_rates(4, 380.0))
     assert v["pass"] and v["nv_links"] and v["nv18_everywhere"] and v["p2p_read_ok"]
     assert v["peer_copy_min_gbps"] == 380.0 and v["reasons"] == [] and v["verdict"] == "pass"
@@ -119,20 +134,20 @@ def test_verdict_passes_on_nv18_and_fast_copies():
 @pytest.mark.parametrize("label", ["SYS", "PHB"])
 def test_verdict_fails_when_a_pair_is_not_nvlink(label):
     topo = nv.parse_gpu_matrix(with_label(TOPO_4, 1, 2, label))
-    v = nv.hw2_verdict(topo, nv.parse_gpu_matrix(P2P_4), pair_rates(4, 380.0))
+    v = hw2(topo, nv.parse_gpu_matrix(P2P_4), pair_rates(4, 380.0))
     assert not v["pass"] and not v["nv_links"] and not v["nv18_everywhere"]
     assert any(label in r and "NVLink" in r for r in v["reasons"])
 
 
 def test_verdict_fails_when_links_are_fewer_than_18():
     topo = nv.parse_gpu_matrix(with_label(TOPO_4, 0, 3, "NV12"))
-    v = nv.hw2_verdict(topo, nv.parse_gpu_matrix(P2P_4), pair_rates(4, 380.0))
+    v = hw2(topo, nv.parse_gpu_matrix(P2P_4), pair_rates(4, 380.0))
     assert v["nv_links"] and not v["nv18_everywhere"] and not v["pass"]
     assert any("NV12" in r for r in v["reasons"])
 
 
 def test_verdict_fails_on_one_slow_pair():
-    v = nv.hw2_verdict(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4),
+    v = hw2(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4),
                        pair_rates(4, 380.0, slow=("2->1", 55.0)))
     assert not v["pass"] and v["nv18_everywhere"] and v["peer_copy_min_gbps"] == 55.0
     assert any("2->1" in r and "55" in r for r in v["reasons"])
@@ -140,14 +155,14 @@ def test_verdict_fails_on_one_slow_pair():
 
 def test_verdict_fails_on_p2p_not_ok():
     p2p = nv.parse_gpu_matrix(with_label(P2P_4, 0, 1, "NS"))
-    v = nv.hw2_verdict(nv.parse_gpu_matrix(TOPO_4), p2p, pair_rates(4, 380.0))
+    v = hw2(nv.parse_gpu_matrix(TOPO_4), p2p, pair_rates(4, 380.0))
     assert not v["pass"] and not v["p2p_read_ok"]
     assert any("NS" in r for r in v["reasons"])
 
 
-def test_verdict_with_nothing_measured_fails_with_three_reasons():
-    v = nv.hw2_verdict(None, None, None)
-    assert not v["pass"] and v["peer_copy_min_gbps"] is None and len(v["reasons"]) == 3
+def test_verdict_with_nothing_measured_fails_with_four_reasons():
+    v = hw2(None, None, None)
+    assert not v["pass"] and v["peer_copy_min_gbps"] is None and len(v["reasons"]) == 4
     assert v["verdict"] == "fail" and v["n_cards"] is None
 
 
@@ -243,12 +258,12 @@ def test_main_writes_a_report_and_exits_zero(tmp_path, monkeypatch):
 
 
 def band(rate, n_expected=4, topo=TOPO_4, p2p=P2P_4, n=4, slow="0->2"):
-    return nv.hw2_verdict(nv.parse_gpu_matrix(topo), nv.parse_gpu_matrix(p2p),
+    return hw2(nv.parse_gpu_matrix(topo), nv.parse_gpu_matrix(p2p),
                           pair_rates(n, 380.0, slow=(slow, rate)), n_expected)
 
 
 def verdict(rates):
-    return nv.hw2_verdict(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4), rates, 4)
+    return hw2(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4), rates, 4)
 
 
 @pytest.mark.parametrize("rate, expect", [(300.0, "pass"), (299.99, "review"), (240.0, "review"),
@@ -300,9 +315,9 @@ def test_the_expected_count_comes_from_fs31_cards(monkeypatch):
     p2p = " \tGPU0\tGPU1\n GPU0\tX\tOK\n GPU1\tOK\tX\n"
     args = (nv.parse_gpu_matrix(two), nv.parse_gpu_matrix(p2p), pair_rates(2, 380.0))
     monkeypatch.delenv("FS31_CARDS", raising=False)
-    assert nv.hw2_verdict(*args)["verdict"] == "fail"
+    assert hw2(*args)["verdict"] == "fail"
     monkeypatch.setenv("FS31_CARDS", "2")
-    v = nv.hw2_verdict(*args)
+    v = hw2(*args)
     assert v["verdict"] == "pass" and not v["gate"] and v["pass"] is False
 
 
@@ -316,7 +331,7 @@ def test_missing_and_unusable_rates_name_the_pair():
 
 def test_peer_reads_for_other_gpus_than_the_topology_fail():
     p2p3 = " \tGPU0\tGPU1\tGPU2\n GPU0\tX\tOK\tOK\n GPU1\tOK\tX\tOK\n GPU2\tOK\tOK\tX\n"
-    assert not nv.hw2_verdict(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(p2p3),
+    assert not hw2(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(p2p3),
                               pair_rates(4, 380.0), 4)["pass"]
 
 
@@ -330,7 +345,9 @@ def _smi(topo_code=0, p2p_code=0, topo_out=TOPO_4, p2p_out=P2P_4):
     return run
 
 
-def _fast(monkeypatch, rates=None):
+def _fast(monkeypatch, rates=None, wrong=()):
+    monkeypatch.setattr(nv, "peer_bytes_by_pair", lambda: {
+        f"{a}->{b}": f"{a}->{b}" not in wrong for a in range(4) for b in range(4) if a != b})
     monkeypatch.setattr(nv, "torch_view", lambda: {"device_count": 4})
     monkeypatch.setattr(nv, "peer_copy_bandwidth",
                         lambda: {"pairs": pair_rates(4, 380.0) if rates is None else rates})
@@ -404,7 +421,7 @@ def test_a_wedged_card_costs_its_pairs_not_the_report(monkeypatch):
     got = nv.peer_copy_bandwidth()
     assert got["pairs"] == {"0->1": None, "1->0": None} and "wedged" in got["notes"]["0->1"]
     assert "error" in nv.fanout_bandwidth()
-    assert nv.hw2_verdict(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4),
+    assert hw2(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4),
                           got["pairs"], 4)["verdict"] == "fail"
 
 
@@ -416,3 +433,49 @@ def test_main_prints_the_line_and_exits_zero(tmp_path, monkeypatch, capsys):
     assert capsys.readouterr().out.startswith("HW2 pass: slowest pair ")
     doc = json.loads((tmp_path / "n.json").read_text())
     assert doc["hw2"]["verdict"] == "pass" and doc["hw2"]["n_cards"] == 4
+
+
+# ---- the byte check: wrong bytes at the destination fail HW2 whatever the rate ----------------
+
+
+def test_the_verdict_fails_when_a_pair_landed_wrong_bytes():
+    v = hw2(nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4), pair_rates(4, 380.0),
+            wrong=("1->0", "0->1"))
+    assert v["verdict"] == "fail" and not v["pass"]
+    assert v["peer_bytes_ok"]["1->0"] is False and v["peer_bytes_ok"]["2->3"] is True
+    assert any("wrong bytes" in r and "0->1, 1->0" in r for r in v["reasons"])
+    line = nv.hw2_line(v)
+    assert line.startswith("HW2 FAIL: peer copies were WRONG") and "0->1, 1->0" in line
+
+
+def test_the_verdict_fails_when_the_byte_check_is_missing_or_incomplete():
+    topo, p2p = nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4)
+    v = hw2(topo, p2p, pair_rates(4, 380.0), peer_bytes=None)
+    assert v["verdict"] == "fail" and any("byte check" in r for r in v["reasons"])
+    part = {k: True for k in right_bytes(topo) if k != "3->2"}
+    v = hw2(topo, p2p, pair_rates(4, 380.0), peer_bytes=part)
+    assert v["verdict"] == "fail" and v["peer_bytes_ok"]["3->2"] is False
+    assert any("3->2" in r for r in v["reasons"])
+    v = hw2(topo, p2p, pair_rates(4, 380.0), peer_bytes={**right_bytes(topo), "0->1": None})
+    assert v["verdict"] == "fail" and v["peer_bytes_ok"]["0->1"] is False
+
+
+def test_the_report_records_the_byte_check_and_a_wrong_pair_fails_it(monkeypatch):
+    _fast(monkeypatch, wrong=("2->3",))
+    r = nv.build_report(_smi())
+    assert r["peer_bytes"]["2->3"] is False and r["hw2"]["peer_bytes_ok"]["2->3"] is False
+    assert r["hw2"]["verdict"] == "fail" and any("2->3" in x for x in r["hw2"]["reasons"])
+    _fast(monkeypatch)
+    assert nv.build_report(_smi())["hw2"]["pass"]
+
+
+def test_a_raising_byte_check_fails_hw2_and_the_report_is_still_built(monkeypatch):
+    _fast(monkeypatch)
+
+    def boom():
+        raise RuntimeError("CUDA error: wedged")
+
+    monkeypatch.setattr(nv, "peer_bytes_by_pair", boom)
+    r = nv.build_report(_smi())
+    assert r["peer_bytes"] == {"error": "RuntimeError: CUDA error: wedged"}
+    assert r["hw2"]["verdict"] == "fail" and any("wedged" in x for x in r["hw2"]["reasons"])

@@ -383,7 +383,7 @@ class Part:
     argv: list[str]  # "{python}" stands for the session's interpreter
     env: dict[str, str | None] = field(default_factory=dict)  # None unsets
     timeout_s: float | None = None
-    kind: str = "other"  # models, benchmark, bring_up, smooth, plain, probe, kernel_speed, other
+    kind: str = "other"  # models, peer_check, benchmark, bring_up, smooth, plain, probe, kernel_speed, other
     info: dict[str, Any] = field(default_factory=dict)  # model, task, run_dir, report
 
 
@@ -404,6 +404,70 @@ def _models_part(upload: Path, out: Path, timeout_s: float) -> Part:
                 env={"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None},
                 timeout_s=timeout_s, kind="models",
                 info={"report": str(out / "models" / "models.json")})
+
+
+PEER_CHECK_NAME = "peer_check"
+PEER_CHECK_TIMEOUT_S = 300
+
+
+def peer_check_part(out: Path, timeout_s: float = PEER_CHECK_TIMEOUT_S) -> Part:
+    """F22's peer-copy byte check (``verification/runs/peer_check.py``) as a part, its report
+    ``<out>/peer_check/peer_check.json``. Every plan on two or more GPUs lists it first, before
+    its models part (it needs no model): put ``peer_check_part(out)`` at the head of the plan.
+    A pair that lands wrong bytes stops the session (:func:`peer_check_stop`)."""
+    report = out / PEER_CHECK_NAME / "peer_check.json"
+    return Part(PEER_CHECK_NAME,
+                ["{python}", "-m", "verification.runs.peer_check", "--out", str(report)],
+                env=dict(PCI_ORDER_ENV), timeout_s=timeout_s, kind="peer_check",
+                info={"report": str(report)})
+
+
+def _peer_check_extras(report: Path) -> dict[str, Any]:
+    """The check's verdict from its report: ``all_ok``, ``wrong`` (each wrong pair to its wrong
+    cases), ``card_suspect`` (the pairs whose host-staged control was wrong), the lowest direct
+    ``gbps``, the ``reason`` when no pair could be checked; ``{"peer_check": None}`` when the part
+    left no report."""
+    if not report.exists():
+        return {"peer_check": None}
+    doc = json.loads(report.read_text())
+    pairs = doc.get("pairs") or {}
+    rates = [p["gbps"] for p in pairs.values() if p.get("gbps")]
+    return {"peer_check": {
+        "all_ok": doc.get("all_ok") is True, "reason": doc.get("reason"),
+        "wrong": {k: [c for c, ok in p["cases"].items() if not ok]
+                  for k, p in pairs.items() if not p.get("ok")},
+        "card_suspect": [k for k, p in pairs.items() if p.get("card_suspect")],
+        "min_gbps": min(rates) if rates else None, "seconds": doc.get("seconds"),
+        "devices": doc.get("devices")}}
+
+
+def peer_wrong_text(check: Mapping[str, Any] | None) -> str:
+    """The plain-words account of a failed check (from :func:`_peer_check_extras`): which pairs
+    landed wrong bytes, in which cases, and whether the card (the control) was the fault."""
+    if check is None:
+        return "the peer-copy byte check left no report"
+    if check.get("reason") and not check.get("wrong"):
+        return f"the peer-copy byte check could not run ({check['reason']})"
+    suspect = set(check.get("card_suspect") or ())
+    card = "the host-staged control was wrong: the card itself is suspect, not the peer path"
+    bits = [f"{k} ({card if k in suspect else ', '.join(c)})"
+            for k, c in (check.get("wrong") or {}).items()]
+    return "peer copies landed wrong bytes on pair " + ("; ".join(bits) or "(none named)")
+
+
+def peer_check_stop(rec: Mapping[str, Any]) -> str | None:
+    """Why the session stops after a ``peer_check`` part's record ``rec``, or ``None`` when the
+    check passed (``ok`` or done earlier, ``all_ok`` in its report)."""
+    check = (rec.get("extras") or {}).get("peer_check")
+    if rec["status"] in _PEER_DONE and check and check.get("all_ok"):
+        return None
+    why = peer_wrong_text(check)
+    if rec["status"] not in _PEER_DONE:
+        why += f" (the part ended {rec['status']})"
+    return f"{why}; no later part ran, a rate or result over wrong copies means nothing"
+
+
+_PEER_DONE = ("ok", "skipped_done")
 
 
 def _probe_part(out: Path) -> Part:
@@ -648,7 +712,8 @@ def nvlink_probe_plan(upload: Path, out: Path) -> list[Part]:
     ``runs/<model>_<task>_card<k>/``. All four models run, Qwen2.5-1.5B included."""
     n = fs31_cards()
     report = out / "nvlink" / "nvlink.json"
-    plan = [_models_part(upload, out, PROFILE_CHECK_TIMEOUT_S["models"]),
+    plan = [peer_check_part(out),
+            _models_part(upload, out, PROFILE_CHECK_TIMEOUT_S["models"]),
             Part("nvlink_probe", ["{python}", "-m", "verification.runs.nvlink_probe", "--out",
                                   str(report)],
                  env=dict(PCI_ORDER_ENV), timeout_s=NVLINK_TIMEOUT_S, kind="nvlink",
@@ -903,7 +968,7 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
 
     honest = f"honest-{pin.repo.split('/')[-1]}-{SMOLLM2_TASK}-bpr0-s{SMOLLM2_SEED}"
     steps = ("--steps", str(PAIR_STEPS), "--keep-step", str(PAIR_STEPS), "--no-metrics")
-    plan = [_models_part(upload, out, t["models"]),
+    plan = [peer_check_part(out), _models_part(upload, out, t["models"]),
             pytest_part("fast_suite", t["fast_suite"]),
             pytest_part("two_gpu_slow", t["two_gpu_slow"], "-m", "slow", "-k", PAIR_SLOW_SELECT),
             part("smollm2_calibrate", "calibrate", home, t["calibrate"],
@@ -938,6 +1003,9 @@ SESSIONS: dict[str, tuple[str, Callable[[Path, Path], list[Part]]]] = {
     "fs32-pair": ("fs32-pair", fs32_pair_plan),
     "device-leaves": ("device-leaves", device_leaves_plan),
 }
+# The sessions that need two or more GPUs: each plan starts (after the native build) with
+# ``peer_check_part``. A new multi-GPU session is listed here, and a test holds it to that.
+MULTI_GPU_SESSIONS = ("nvlink-probe", "fs32-pair")
 
 
 def _run_env(repo: str, rev: str, task: str) -> dict[str, str | None]:
@@ -1380,6 +1448,8 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _pair_run_extras(log, Path(part.info["weights"]))
         if part.kind == "cheat":
             return _cheat_extras(log)
+        if part.kind == "peer_check":
+            return _peer_check_extras(Path(part.info["report"]))
         if part.kind == "models":
             report = Path(part.info["report"])
             return json.loads(report.read_text()) if report.exists() else {"report": None}
@@ -1396,7 +1466,7 @@ def _nvlink_extras(report: Path) -> dict[str, Any]:
     return {"hw2": {k: hw2[k] for k in ("verdict", "pass", "reasons", "nv_links",
                                          "nv18_everywhere", "p2p_read_ok", "peer_copy_min_gbps",
                                          "slowest_pair", "pass_gbps", "fail_gbps", "n_cards",
-                                         "expected_cards", "gate")}}
+                                         "expected_cards", "gate", "peer_bytes_ok")}}
 
 
 def _kernel_speed_extras(report: Path) -> dict[str, Any]:
@@ -1567,7 +1637,7 @@ def _pair_part(parts: Sequence[Mapping[str, Any]], name: str) -> Mapping[str, An
     return next((p for p in parts if p["name"] == name), {})
 
 
-PAIR_PARTS = ("models", NATIVE_BUILD_NAME, "fast_suite", "two_gpu_slow", "smollm2_calibrate",
+PAIR_PARTS = (PEER_CHECK_NAME, "models", NATIVE_BUILD_NAME, "fast_suite", "two_gpu_slow", "smollm2_calibrate",
               "card_unsharded", "card_sharded", "run_unsharded", "run_sharded", "poisoned_step",
               "hidden_steps", "flipped_matmul")
 _PAIR_OK = ("ok", "skipped_done")
@@ -1620,6 +1690,8 @@ def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     problems = {n: _pair_part(parts, n).get("status", "not_started") for n in PAIR_PARTS
                 if n not in names or _pair_part(parts, n).get("status") not in _PAIR_OK}
     suites_ok = all(t and not t["failures"] and not t["errors"] for t in tests.values())
+    peer = (_pair_part(parts, PEER_CHECK_NAME).get("extras") or {}).get("peer_check")
+    peer_ok = bool(peer) and peer.get("all_ok") is True
     slow_ran = bool(tests["two_gpu_slow"]) and tests["two_gpu_slow"]["skipped"] == 0
     verdicts_equal = verdicts[0] == verdicts[1] and lines_equal
     return {"roots_equal": all(roots.values()), "roots": roots,
@@ -1629,10 +1701,11 @@ def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
                                 else c.get("plain_w_next_root") == c.get("w_next_root")
                                 for a, c in zip(("unsharded", "sharded"), card)},
             "cheats": {n: outcomes.get(n) for n in PAIR_CHEATS},
-            "tests": tests, "part_problems": problems,
+            "tests": tests, "part_problems": problems, "peer_bytes_ok": peer_ok,
+            "peer_copies": None if peer_ok else peer_wrong_text(peer),
             "slowest_failing": max(failing, key=lambda r: r["time_s"], default=None),
             "pass": (all(roots.values()) and verdicts_equal and honest and not problems
-                     and suites_ok and slow_ran
+                     and peer_ok and suites_ok and slow_ran
                      and all(outcomes.get(n) == "exact" for n in PAIR_CHEATS))}
 
 
@@ -1642,7 +1715,10 @@ def _pair_lines(pair: Mapping[str, Any] | None) -> list[str]:
     if pair is None:
         return []
     r, v = pair["roots"], pair["verdicts"]
-    lines = ["FS32 roots equal: " + ("yes" if pair["roots_equal"] else "NO") + " ("
+    lines = []
+    if not pair["peer_bytes_ok"]:  # first: nothing below counts over wrong peer copies
+        lines.append(f"FS32 FAIL: {pair['peer_copies']}")
+    lines += ["FS32 roots equal: " + ("yes" if pair["roots_equal"] else "NO") + " ("
              + ", ".join(f"{k} {'=' if ok else '!='}" for k, ok in r.items()) + ")",
              "FS32 verdicts equal: " + ("yes" if pair["verdicts_equal"] else "NO")
              + f" (unsharded {v['unsharded']}, sharded {v['sharded']})"]
@@ -1823,7 +1899,12 @@ def _hw_lines(parts: Sequence[Mapping[str, Any]], hw3: Mapping[str, Any] | None)
     probe = next((p for p in parts if p.get("kind") == "nvlink"), None)
     if probe is not None:
         hw2 = (probe.get("extras") or {}).get("hw2")
-        if hw2 is None:
+        peer = next((p for p in parts if p.get("kind") == "peer_check"), None)
+        if peer is not None and peer_check_stop(peer):
+            # the session stopped on it: the probe never ran, so say why, plainly
+            lines.append("HW2 FAIL: " + peer_wrong_text((peer.get("extras") or {}).get("peer_check"))
+                         + "; the NVLink probe did not run")
+        elif hw2 is None:
             lines.append(f"HW2 FAIL: the NVLink probe left no verdict ({probe['status']})")
         else:
             lines.append(hw2_line(hw2))
@@ -2042,6 +2123,13 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
             pair = {"fs32_pair_error": f"{type(e).__name__}: {e}"}
         if pair is not None:
             summary["fs32_pair"] = pair
+        if part.kind == "peer_check" and rec["status"] != "not_started":
+            # Wrong bytes between the cards: nothing after this part counts. A rerun that
+            # skipped the part (DONE) reads its report again.
+            why_stop = peer_check_stop(rec)
+            if why_stop and not summary.get("stopped"):
+                summary["stopped"] = why_stop
+                say(f"STOP: {why_stop}")
         if part.kind == "models" and rec["status"] != "not_started":
             # On every run, a rerun that skipped the part included: the later parts read
             # these files, and a DONE marker says nothing about them now.
