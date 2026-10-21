@@ -465,3 +465,234 @@ def test_a_mutation_between_the_host_copy_and_the_close_skips_the_comparison(  #
     st = HashStats()
     d = leaf_hashes_of(c, [(i, leaves[i])], st)
     assert len(d) == 1 and st.crosschecks == 0 and not kc._checked
+
+
+# ---- whole runs: the child's side, the verifier-only plant -----------------------------------
+
+
+def _load_host_kernels(so):
+    lib = ctypes.CDLL(so)
+    lib.pots_host_sizeof_params.restype = ctypes.c_size_t
+    lib.pots_host_sizeof_leaf.restype = ctypes.c_size_t
+    lib.pots_host_offsets.argtypes = [ctypes.POINTER(ctypes.c_size_t)]
+    lib.pots_host_offsets.restype = ctypes.c_size_t
+    lib.host_g.restype = lib.host_r.restype = ctypes.c_uint
+    lib.pots_host_stage.argtypes = [ctypes.c_void_p]
+    return HostKernels(lib)
+
+
+def _plant_result():
+    real = gb.PendingHash.result
+
+    def wrong(self, *a, **k):
+        d, bad = real(self, *a, **k)
+        return [bytes(32)] * len(d), bad
+    gb.PendingHash.result = wrong
+
+
+def install_seams(so, plant):
+    """The fake kernel and the routing seams, in this process (a spawned child's too)."""
+    g = gb.GpuBlake3(_load_host_kernels(so))
+    L._hasher = lambda: g
+    L._kernel_leaf = lambda t: (t.is_contiguous() and t.numel() > 0
+                                and t.dtype in native.FINITE_KIND)
+    if plant:
+        _plant_result()
+
+
+@dataclasses.dataclass(frozen=True)
+class SeamedSpec:
+    """The tiny decoder's prover spec that installs the kernel seams (and the plant) in the
+    child before it builds the prover side; module level, so the child unpickles it."""
+
+    so: str
+    plant: bool = False
+    devices: tuple = THREE
+
+    def __call__(self):
+        from tests.verification.runs.pipelined_helpers import DecoderSpec
+
+        install_seams(self.so, self.plant)
+        return DecoderSpec(devices=self.devices)()
+
+
+def _scenario_run(pipelined, prover=None):
+    from tests.verification.runs import pipelined_helpers as P
+    from tests.verification.runs.test_pipelined_loop import SEED
+    from tests.verification.transcript import shared_helpers as H
+    from verification.runs.scenarios import HONEST, Expected, Scenario, honest_final, run_scenario
+
+    c, D, model, w0 = H.setup(THREE)
+    T = 2
+    w_T = honest_final(c, D, w0, T, seed=SEED, build_model=lambda: model)
+    final = leaf_hashes_of(c, ((c.w_t_index(n), w_T[n]) for n in c.weight_names), kernel=False)
+    s = Scenario("x", "", HONEST.fault, Expected())
+    return run_scenario(c, D, w0, s, T=T, k=5, seed=SEED, final=final, pipelined=pipelined,
+                        prover=(prover or P.DecoderSpec(devices=THREE)) if pipelined else None)
+
+
+@pytest.fixture
+def so(hostlib):  # noqa: F811
+    return hostlib._name
+
+
+@pytest.fixture
+def parent_seams(monkeypatch, hostlib):  # noqa: F811
+    """The parent's own seams, planted or honest, through monkeypatch (undone after the test)."""
+    def install(plant):
+        g = gb.GpuBlake3(HostKernels(hostlib))
+        monkeypatch.setattr(L, "_hasher", lambda: g)
+        monkeypatch.setattr(L, "_kernel_leaf", lambda t: t.is_contiguous() and t.numel() > 0
+                            and t.dtype in native.FINITE_KIND)
+        if plant:
+            real = gb.PendingHash.result
+
+            def wrong(self, *a, **k):
+                d, bad = real(self, *a, **k)
+                return [bytes(32)] * len(d), bad
+            monkeypatch.setattr(gb.PendingHash, "result", wrong)
+    return install
+
+
+@pytest.fixture
+def no_verdict(monkeypatch):
+    """Records every ``Verifier.end_run`` call: a run that stops on a mismatch has no verdict."""
+    from verification.verifier.driver import Verifier
+
+    calls = []
+    real = Verifier.end_run
+    monkeypatch.setattr(Verifier, "end_run", lambda self, f: (calls.append(1), real(self, f))[1])
+    return calls
+
+
+def test_a_mismatch_in_the_child_alone_is_a_prover_process_error_and_no_verdict(so, no_verdict):
+    from verification.runs.pipeline import ProverProcessError
+
+    assert L._kernel_leaf is not None and not L._kernel_leaf(torch.zeros(3))  # parent: off
+    with pytest.raises(ProverProcessError) as e:
+        _scenario_run(True, SeamedSpec(so, plant=True))
+    assert e.value.kind == "exception"
+    msg = str(e.value)
+    assert "KernelMismatchError" in msg and "the GPU kernel and the C library disagree" in msg
+    assert "cpu" in msg and "leaf" in msg and "shape" in msg
+    assert no_verdict == []
+
+
+def test_the_child_with_the_honest_kernel_and_the_parent_off_accepts(so, no_verdict):
+    r = _scenario_run(True, SeamedSpec(so))
+    assert r.loop.verdict.accepted and no_verdict == [1]
+
+
+def test_a_mismatch_in_the_parent_alone_stops_the_run_and_the_child_is_reaped(
+        so, parent_seams, no_verdict):
+    import multiprocessing
+
+    parent_seams(plant=True)
+    with pytest.raises(kc.KernelMismatchError):
+        _scenario_run(True, SeamedSpec(so))  # the child's kernel is honest
+    assert no_verdict == []
+    assert multiprocessing.active_children() == []
+
+
+def test_both_sides_with_the_honest_kernel_accept(so, parent_seams):
+    parent_seams(plant=False)
+    r = _scenario_run(True, SeamedSpec(so))
+    assert r.loop.verdict.accepted
+
+
+@pytest.fixture
+def verifier_only_plant(monkeypatch, on_kernel):  # noqa: F811
+    """A sequential run whose kernel is wrong only when a verifier function (named in
+    ``plant.where``) is on the stack. The checked set is emptied as the verifier's step starts,
+    standing for its devices being others than the prover's (a key has its device in it); the
+    prover's commit is honest. ``plant.rejected`` counts the rejections a context made."""
+    from verification.verifier import context as vc
+    from verification.verifier.driver import Verifier
+
+    real = gb.PendingHash.result
+
+    class P:
+        where: tuple = ()
+        rejected: list = []
+    P.rejected = []
+
+    def wrong(self, *a, **k):
+        d, bad = real(self, *a, **k)
+        if any(f.function in P.where for f in inspect.stack()):
+            return [bytes(32)] * len(d), bad
+        return d, bad
+
+    monkeypatch.setattr(gb.PendingHash, "result", wrong)
+    real_vs = Verifier.verify_step
+    monkeypatch.setattr(Verifier, "verify_step",
+                        lambda self, t, store: (kc._checked.clear(), real_vs(self, t, store))[1])
+    real_rej = vc.StepContext.reject
+    monkeypatch.setattr(vc.StepContext, "reject",
+                        lambda self, *a, **k: (P.rejected.append(a), real_rej(self, *a, **k))[1])
+    return P
+
+
+def _tb_names(exc):
+    import traceback
+
+    return {f.name for f in traceback.extract_tb(exc.__traceback__)}
+
+
+@pytest.mark.parametrize("where, frame", [
+    (("check_2_commitment",), "check_2_commitment"),
+    (("check_7_chaining",), "check_7_chaining"),
+])
+def test_a_verifier_only_mismatch_stops_the_sequential_run_without_a_verdict(
+        verifier_only_plant, no_verdict, where, frame):
+    verifier_only_plant.where = where
+    with pytest.raises(kc.KernelMismatchError) as e:
+        _scenario_run(False)
+    assert frame in _tb_names(e.value)
+    assert no_verdict == [] and verifier_only_plant.rejected == []
+
+
+def test_a_mismatch_in_the_check_0_anchor_stops_the_run_at_start(verifier_only_plant, no_verdict):
+    verifier_only_plant.where = ("weight_hashes",)
+    with pytest.raises(kc.KernelMismatchError) as e:
+        _scenario_run(False)
+    assert "start_run" in _tb_names(e.value) and "weight_hashes" in _tb_names(e.value)
+    assert no_verdict == [] and verifier_only_plant.rejected == []
+
+
+def test_a_wrong_kernel_from_the_start_stops_the_run_at_the_first_hash(  # noqa: F811
+        on_kernel, monkeypatch, no_verdict):
+    """The first hash of a run is the verifier's anchor in ``start_run``: a wrong kernel stops
+    the run there, with no verdict."""
+    real = gb.PendingHash.result
+    monkeypatch.setattr(gb.PendingHash, "result", lambda self, *a, **k: (
+        lambda d, b: ([bytes(32)] * len(d), b))(*real(self, *a, **k)))
+    with pytest.raises(kc.KernelMismatchError) as e:
+        _scenario_run(False)
+    assert no_verdict == []
+    assert "start_run" in _tb_names(e.value)
+
+
+def test_check_7_is_not_a_guard_for_the_mismatch(on_kernel):
+    """The verifier's prover-data guard converts exactly ``PROVER_DATA_ERRORS``."""
+    from verification.verifier.context import PROVER_DATA_ERRORS, _AFTER_COMMIT
+
+    for errors in (PROVER_DATA_ERRORS, _AFTER_COMMIT):
+        assert not issubclass(kc.KernelMismatchError, errors)
+
+
+def test_a_sequential_run_prover_and_verifier_share_one_set_of_keys(on_kernel, monkeypatch):
+    calls = []
+    real = kc.c_digest
+    monkeypatch.setattr(kc, "c_digest", lambda h, t: (calls.append(h), real(h, t))[1])
+    r = _scenario_run(False)
+    assert r.loop.verdict.accepted
+    assert len(calls) == len(kc._checked) > 0
+
+
+def test_run_loop_clears_the_set_for_the_sequential_and_the_pipelined_dispatch(
+        so, on_kernel):
+    ghost = ("table", torch.device("cpu"), 99, torch.float32, (1,))
+    for pipelined in (False, True):
+        kc.mark_checked(ghost)
+        _scenario_run(pipelined, SeamedSpec(so) if pipelined else None)
+        assert not kc.is_checked(ghost)
