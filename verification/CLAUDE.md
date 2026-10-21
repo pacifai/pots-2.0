@@ -1775,6 +1775,21 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `run_pipelined`; `LoopResult.pipelined` and `child_info` say so. A `ProverFault` is
     pickled to the child (`ProverFault.bind(c, build_model)` re-attaches what it drops);
     an unpicklable one raises `TypeError`, and a `KeepStep` is refused.
+  - Entry points under `VERIF_PIPELINED=1` (FS33d). Each prints one line, `loop mode:
+    pipelined` or `loop mode: sequential`, before its first step; it names the timed run.
+    `runs/prover_spec.py`'s `decoder_spec(cfg)` is their `ProverSpec`: it carries every
+    `VERIF_*` and `POTS_NATIVE_CACHE` as a plain dict, because the spawned child must not
+    guess its configuration from its own environment. Pipelined: `run_verified` and
+    `calibrate` (timed run, judged re-runs and memory pass; the counting pass runs sequential),
+    `llama_step`, `poisoned_step`, `hidden_steps`, `flipped_matmul_sweep --no-sweep`, and
+    `full_scale`'s cheats and hidden stages. Each computes every honest final weight first and
+    calls `ReusedModel.drop()`, so the parent's GPU 0 holds no prover model while the child
+    runs. The stored step (`--keep-step`) is written by the parent after `verify_step(t)`,
+    outside every clock; it delays `release(t)`. `poisoned_step` reads `W_{t+1}` from
+    `LoopResult.w_final`. Refused with one line naming the entry point: `bring_up`,
+    `store_crosscheck`, `mlp_smoke`, `metrics_overhead`, and `flipped_matmul_sweep` with the
+    sweep or `--source in-process`. `full_scale`'s sweep stage sets `VERIF_PIPELINED=0` for
+    its job.
   - `runs/pipeline.py` (FS33b): child to parent `ready` (handshake), `step`, `released`,
     `final`, `error`; parent to child `release`, `stop`, `bye`. At most 2 steps are unreleased.
     The child exits only after `bye` or EOF. `ProverProcessError.kind` is `exception`,

@@ -116,6 +116,7 @@ from verification.runs.metrics import (
     rho_arrays,
     step_scores,
 )
+from verification.runs.prover_spec import refuse_pipelined
 from verification.runs.scenarios import (
     HONEST,
     ReusedModel,
@@ -649,6 +650,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = load_config()
     k = load_protocol_config().k
     t0 = time.perf_counter()
+    refuse_pipelined(cfg, "bring_up",
+                     "it runs the tamper steps and the probe-sampled passes in this process")
     try:
         pin = model_pin(cfg.model, cfg.model_revision)
     except ValueError as e:  # a revision that isn't a commit, or a weight file off its hash

@@ -72,6 +72,7 @@ from verification.computation.interface import load_weights, snapshot_weights
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.runs.llama_step import load_committed_dataset
 from verification.runs.metrics import COUNT_STEPS, MetricsWriter, TimeRecorder, read_records
+from verification.runs.prover_spec import loop_mode
 from verification.runs.scenarios import (
     HONEST,
     ReusedModel,
@@ -145,12 +146,15 @@ def calibrate(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Te
               k: int, seed: int, T_run: int, h_D: bytes, final: Mapping[str, torch.Tensor],
               context: Mapping[str, Any],
               recorder: TimeRecorder | None = None,
-              build_model: Callable[[], torch.nn.Module] | None = None) -> CalibrationRun:
+              build_model: Callable[[], torch.nn.Module] | None = None,
+              pipelined: bool = False,
+              prover: Callable[[], Any] | None = None) -> CalibrationRun:
     """Steps ``1..T`` in calibration mode, then fit, size, and freeze (module docstring, 1).
 
     ``T_run`` is the length of the run the bands will judge (``VERIF_STEPS``), which enters
     ``k``'s bit budget. ``context`` (``calibration.band_context``) goes into the band file's
-    statistics.
+    statistics. ``pipelined`` and ``prover`` are ``run_scenario``'s (the band file is the same
+    bytes either way); the entry point passes the mode, never ``VERIF_PIPELINED``.
     """
     out: dict[str, Any] = {}
 
@@ -183,7 +187,8 @@ def calibrate(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Te
                    bands=bands, freeze=v.freeze(bands))
 
     r = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final, on_step=on_step,
-                     recorder=recorder, h_D=h_D, build_model=build_model, verifier=make)
+                     recorder=recorder, h_D=h_D, build_model=build_model, verifier=make,
+                     pipelined=pipelined, prover=prover)
     return CalibrationRun(r, out["cal"], out["sizing"], out["floor"], out["data"],
                           out["bands"], out["freeze"], out["sizing_qmax"], out["largest"])
 
@@ -216,12 +221,15 @@ def judged_run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.T
                bands: Bands, *, T: int, k: int, seed: int, h_D: bytes,
                final: Mapping[str, torch.Tensor], kappa_guard: bool = True,
                recorder: Any = None,
-               build_model: Callable[[], torch.nn.Module] | None = None) -> ScenarioResult:
+               build_model: Callable[[], torch.nn.Module] | None = None,
+               pipelined: bool = False,
+               prover: Callable[[], Any] | None = None) -> ScenarioResult:
     """The same honest steps judged live by the band file's bands."""
     make = judging_verifier(c, len(D), w0, bands, T=T, k=k, seed=seed, h_D=h_D,
                             kappa_guard=kappa_guard)
     return run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final, recorder=recorder,
-                        h_D=h_D, build_model=build_model, verifier=make)
+                        h_D=h_D, build_model=build_model, verifier=make, pipelined=pipelined,
+                        prover=prover)
 
 
 # ---- gradient coherence (sizing appendix §12.2) -----------------------------------------
@@ -448,16 +456,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = {**{f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)
                  if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
                                    "trace_c5", "pipelined")}, "llama": llama}
-    base = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models)
+    pl, spec = loop_mode(cfg)
+    # Pipelined: the counting pass's reference comes before the model is dropped (FS33d).
+    # Sequential computes it at the end, after the gates, as before.
+    count_final = (final if COUNT_STEPS == T else
+                   honest_final(c, D, w0, COUNT_STEPS, seed=cfg.seed, build_model=models)
+                   ) if pl and use_metrics else None
+    base = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models,
+                pipelined=pl, prover=spec)
     mw = (MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,
                         corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
                         config=config, band_file_hash=None, h_D=h_D,
                         extra={"band_source": "calibration", **llama})
           if use_metrics else None)
+    if pl:
+        models.drop()  # the prover is the child's: no second model on the parent's GPU 0
     try:
         return _run(c, D, w0, base, mw, k=k, T_run=cfg.steps, context=context,
                     band_file=pc.band_file, run_dir=run_dir, models=models,
-                    write_despite_guard=args.write_bands_despite_guard)
+                    count_final=count_final, write_despite_guard=args.write_bands_despite_guard)
     finally:
         if mw is not None:
             mw.close()
@@ -467,7 +484,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
          base: dict[str, Any], mw: MetricsWriter | None, *, k: int, T_run: int,
          context: Mapping[str, Any], band_file: Path, run_dir: Path,
-         models: ReusedModel, write_despite_guard: bool = False) -> int:
+         models: ReusedModel, count_final: Mapping[str, torch.Tensor] | None = None,
+         write_despite_guard: bool = False) -> int:
     rec = None if mw is None else mw.recorder("calibrate")
     run = calibrate(c, D, w0, T_run=T_run, context=context, recorder=rec, **base)
     report_calibration(run, k)
@@ -531,6 +549,8 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
         return 1
 
     coh = gradient_coherence(c, models(), w0, [D[i] for i in on.verifier._schedule(1)])
+    if base.get("pipelined"):
+        models.drop()  # coherence rebuilt it; the memory pass is pipelined
     report_coherence(coh)
     _write(mw, {"record": "gradient_coherence", "run": RUN_NAME, "step": 1,
                 **dataclasses.asdict(coh)})
@@ -541,12 +561,14 @@ def _run(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor]
         mw.write(memory_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
                             device=mw.device, verifier=make, **base))
         n = COUNT_STEPS
-        count_base = {**base, "T": n, "final": base["final"] if n == base["T"] else
-                      honest_final(c, D, w0, n, seed=base["seed"], build_model=models)}
+        count_base = {**{x: v for x, v in base.items() if x not in ("pipelined", "prover")},
+                      "T": n, "final": base["final"] if n == base["T"] else
+                      (count_final if count_final is not None else
+                       honest_final(c, D, w0, n, seed=base["seed"], build_model=models))}
         mw.write(count_run(c, D, w0, run=RUN_NAME, scenario=_named("frozen"),
                            verifier=judging_verifier(c, len(D), w0, bands, T=n, k=k,
                                                      seed=base["seed"], h_D=base["h_D"]),
-                           **count_base))
+                           pipelined=False, **count_base))  # the counting pass refuses pipelined
         rows = read_records(mw.dir / "records.jsonl", "time")
         report_split(cost_split([r for r in rows if r["scenario"] == "frozen"]),
                      cost_split([r for r in rows if r["scenario"] == "frozen_no_kappa"]))

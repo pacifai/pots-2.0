@@ -269,7 +269,7 @@ def test_no_sweep_main_runs_only_the_flip(env, monkeypatch):
     """``--no-sweep``: ``main`` builds the env, runs ``run_flip`` once, prints the oracle
     table and returns 0 when it passes; it never reaches the stored step or the sweep."""
     cfg = SimpleNamespace(metrics=False, model="m", model_revision="r" * 12, output_dir=Path("."),
-                          seed=1, attack="a")
+                          seed=1, attack="a", pipelined=False)
     monkeypatch.setattr(fsw, "load_config", lambda: cfg)
     monkeypatch.setattr(fsw, "load_protocol_config", lambda: SimpleNamespace(band_file="b"))
     monkeypatch.setattr(fsw, "setup_determinism", lambda cfg: None)

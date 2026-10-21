@@ -236,3 +236,26 @@ class BindProbe(ProverFault):
     def entry_weights(self, t, w):
         raise RuntimeError(f"BindProbe saw {getattr(self, 'seen', None)!r}")
 
+
+
+# ---- FS33d: the decoder spec on the tiny decoder ----------------------------------------
+
+
+def tiny_computation(cfg):
+    """``DecoderComputation.from_config`` for the entry-point tests: the tiny decoder that
+    ``test_run_verified.tiny_main`` patches in, built the same in the spawned child."""
+    from tests.verification.decoder_helpers import tiny_config
+    from verification.computation.instances import DecoderComputation
+
+    return DecoderComputation(tiny_config(), n_s=2, n=12, eta=cfg.require_eta())
+
+
+def side_digest(spec):
+    """What the parent compares across processes: every ``W_0`` tensor's BLAKE3 hash and the
+    dataset's root and length. Run ``spec()`` wherever it is called."""
+    from verification.commitment.leaves import dataset_tree, leaf_hashes_of
+
+    side = spec()
+    c = side.c
+    hashes = leaf_hashes_of(c, ((c.w_t_index(n), side.w0[n].detach()) for n in c.weight_names))
+    return ([bytes(h) for h in hashes], dataset_tree(c, side.dataset).root, len(side.dataset))

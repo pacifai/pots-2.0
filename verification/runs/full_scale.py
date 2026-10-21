@@ -739,7 +739,9 @@ def stage_sweep_k(cell: Cell) -> None:
              cell.sweep_args),
             ("k tunability", "verification.runs.k_tunability", "k_tunability", cell.k_args)):
         d = cell.cell / run
-        code = cell.run_stage(stage, d, module, ["--metrics", *extra], cell.env(cell.h1_seed),
+        # the sweep perturbs a step kept in its own process: it never runs pipelined
+        env = {**cell.env(cell.h1_seed), "VERIF_PIPELINED": "0"}
+        code = cell.run_stage(stage, d, module, ["--metrics", *extra], env,
                               exit1=lambda d=d: _rejected(d), fatal=False)
         if code == 1 and f"{stage}: " not in " ".join(cell.failures):
             cell.failures.append(f"{stage}: exit 1")
@@ -844,10 +846,11 @@ def run_cheats(levels: Sequence[int], *, hidden: bool = False) -> int:
         open_writer,
         report_oracle,
     )
-    from verification.runs.hidden_steps import run_hidden
+    from verification.runs.hidden_steps import CHAIN_STEP, run_hidden
     from verification.runs.llama_step import load_committed_dataset
     from verification.runs.metrics import MetricsWriter, run_name
     from verification.runs.poisoned_step import run_poisoned
+    from verification.runs.prover_spec import loop_mode
     from verification.runs.scenarios import ReusedModel
     from verification.verifier.calibration import band_context, load_bands
 
@@ -859,6 +862,7 @@ def run_cheats(levels: Sequence[int], *, hidden: bool = False) -> int:
     bands = load_bands(pc.band_file, k=pc.k, context=band_context(cfg, c, h_D=h_D, k=pc.k))
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())
+    pipelined, spec = loop_mode(cfg)  # the spec of the seed's own config, not a level's copy
     scenarios = (HIDDEN,) if hidden else SCENARIOS
     ok = True
     for n in levels:
@@ -873,13 +877,15 @@ def run_cheats(levels: Sequence[int], *, hidden: bool = False) -> int:
                 shutil.rmtree(d)
         lcfg = dataclasses.replace(cfg, poison_count=n)
         env = load_level(lcfg, level_dir(cfg.output_dir, cfg.seed, n), c=c, D=D, h_D=h_D,
-                         w0=w0, bands=bands, k=pc.k, models=models)
+                         w0=w0, bands=bands, k=pc.k, models=models, prover=spec)
         if env.bpr_records != n:
             raise RuntimeError(f"level {n}: b̃ differs from π's batch in {env.bpr_records} "
                                "records")
         print(f"FS13 {'hidden step' if hidden else 'A1–A3'}: seed {cfg.seed}, level {n} "
               f"({env.bpr_actual:g}), step {env.poison_step}, band file "
               f"{env.bands.source[:16]}…")
+        # the stage's own reference first (hidden: the chain step's); pipelined, then drop the model
+        env.prepare(CHAIN_STEP if hidden else env.poison_step)
 
         def writer(scenario: str) -> MetricsWriter:
             return open_writer(lcfg, cell_name(lcfg, scenario, env), env)

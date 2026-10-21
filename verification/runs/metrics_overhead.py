@@ -36,6 +36,7 @@ from verification.computation.instances.mlp import (
 from verification.parameters import load_protocol_config
 from verification.runs.metrics import MetricsWriter, TimeRecorder, read_markers
 from verification.runs.mlp_smoke import N_S
+from verification.runs.prover_spec import refuse_pipelined
 from verification.runs.scenarios import HONEST, honest_final, run_scenario
 from verification.verifier.checks import DEFAULT_ORDER
 
@@ -132,6 +133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--widths", type=int, nargs="+", default=list(DEFAULT_WIDTHS),
                    help="MLP widths; wider steps show the per-section cost is fixed")
     args = p.parse_args(argv)
+    refuse_pipelined(load_config(), "metrics_overhead",
+                     "it times the in-process loop's section seams")
     measure(reps=args.reps, T=args.steps, widths=args.widths)
     return 0
 

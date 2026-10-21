@@ -388,6 +388,13 @@ replaced:
   verdict (`ProverProcessError`, kind `handshake`). Each wait for the child has a deadline,
   `MESSAGE_DEADLINE_S` (3600 s); past it the run ends with kind `timeout` and the child is
   killed. The child's `handoff.release` rows of the last two steps are not merged.
+  The entry points that run the loop print `loop mode: pipelined` or `loop mode: sequential`
+  first. `run_verified`, `calibrate`, `llama_step`, `poisoned_step`, `hidden_steps`,
+  `flipped_matmul_sweep --no-sweep` and `full_scale`'s cheats and hidden stages run
+  pipelined (their counting pass stays sequential); `bring_up`, `store_crosscheck`,
+  `mlp_smoke`, `metrics_overhead` and the sweep (or `--source in-process`) refuse
+  `VERIF_PIPELINED=1` with one line. `prover_spec.py` builds the child's spec from the run's
+  `VERIF_*` variables, passed explicitly. `full_scale`'s sweep stage runs with it set to 0.
 - **`scenarios.py`** holds what any instance's scenarios share: a scenario with its fault and
   declared outcome, running it through the loop, judging the outcome, the honest reference
   weights for check 8, the report, and the memory and counting passes.

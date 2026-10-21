@@ -23,6 +23,7 @@ Each run builds the prover's model with ``c.build_model()`` unless it is given
 
 from __future__ import annotations
 
+import gc
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -138,11 +139,26 @@ class ReusedModel:
     """
 
     def __init__(self, build: BuildModel) -> None:
-        self.model = build()
+        self._build = build
+        self.model: torch.nn.Module | None = build()
         self._buffers = {n: b.detach().clone() for n, b in self.model.named_buffers()}
         self._training = self.model.training
 
+    def drop(self) -> None:
+        """Let go of the model and empty the CUDA cache. The next call rebuilds it.
+
+        An entry point calls this before its first pipelined run: the prover is then the
+        child's, and the parent's GPU 0 must not hold a second copy of the weights. The
+        rebuilt model is checked against the buffers snapshotted at the first build.
+        """
+        self.model = None
+        gc.collect()
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+
     def __call__(self) -> torch.nn.Module:
+        if self.model is None:
+            self.model = self._build()
         m = self.model
         hooked = [n or "<root>" for n, mod in m.named_modules()
                   if any(getattr(mod, h) for h in _HOOK_DICTS)]
@@ -440,6 +456,12 @@ class SpliceWNext(ProverFault):
 
     def __init__(self, t: int, w_next: Mapping[str, torch.Tensor]) -> None:
         self.t, self.w_next = t, dict(w_next)
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Cross the pipe as host tensors: ``with_w_next`` copies them onto the step's device."""
+        state = dict(self.__dict__)
+        state["w_next"] = {n: w.detach().to("cpu") for n, w in self.w_next.items()}
+        return state
 
     def emit(self, t: int, out: StepOutput) -> StepOutput:
         return out.with_w_next(self.w_next) if t == self.t else out

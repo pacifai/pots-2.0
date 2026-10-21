@@ -52,6 +52,7 @@ from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import DeclaredComputation, snapshot_weights
 from verification.runs.loop import ProverFault, StepRecord
 from verification.runs.metrics import PASS_STEPS
+from verification.runs.prover_spec import refuse_pipelined
 from verification.runs.scenarios import (
     HONEST,
     BuildModel,
@@ -358,6 +359,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = load_config()
     pc = load_protocol_config()
     T, k = (args.steps if args.steps is not None else cfg.steps), pc.k
+    refuse_pipelined(cfg, "store_crosscheck",
+                     "it compares the in-process hand-offs, in memory and on disk")
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     if T < 1:
         p.error(f"T = {T}: at least one step")

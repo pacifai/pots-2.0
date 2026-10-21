@@ -37,6 +37,7 @@ from verification.runs.cheats import (
     run_cheat,
 )
 from verification.runs.metrics import MetricsWriter
+from verification.runs.prover_spec import loop_mode
 from verification.runs.scenarios import Expected, HiddenStep, Scenario, ScenarioResult
 
 __all__ = ["SCENARIO", "CHAIN_STEP", "run_hidden", "main"]
@@ -49,6 +50,7 @@ def run_hidden(env: CheatEnv, *, writer: MetricsWriter | None = None,
                out: Callable[[str], None] = print) -> ScenarioResult:
     """One hidden step on ``b̃`` between reported steps 1 and 2, cut after step 2."""
     t = CHAIN_STEP
+    env.final(t)  # before a pipelined run drops the model
     s = Scenario(SCENARIO, f"one hidden SGD step on b̃ between reported steps {t - 1} and {t}",
                  HiddenStep(env.c, t, env.b_tilde, build_model=env.models),
                  Expected(t, "7", "failed"))
@@ -67,6 +69,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     setup_determinism(cfg)
     env = load_env(cfg, pc)
+    loop_mode(cfg)
+    env.prepare(CHAIN_STEP)
     print(f"A13 hidden steps: {cfg.model}@{cfg.model_revision[:12]}, k {env.k}, one hidden "
           f"step on b̃ (BPR {env.bpr_records}/{env.c.n_s}, {env.bpr_actual:g}), band file "
           f"{pc.band_file} ({env.bands.source[:16]}…)")

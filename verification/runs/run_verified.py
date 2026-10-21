@@ -99,6 +99,7 @@ from verification.runs.plain_baseline import (
     run_provenance,
     write_final_weights,
 )
+from verification.runs.prover_spec import loop_mode
 from verification.runs.scenarios import (
     HONEST,
     ReusedModel,
@@ -315,9 +316,15 @@ class KeptStepHandoff(StoreHandoff):
         """Write the held step, or return ``None`` when the run never reached it. Raises
         ``RuntimeError`` if the files' root isn't the step's ``h``."""
         if self._held is None:
-            return None
+            return self.kept  # written already by a pipelined run, or never reached
         c, leaves, tree, paths = self._held
         self._held = None
+        return self.write_from(c, leaves, tree, paths)
+
+    def write_from(self, c: DeclaredComputation, leaves: list[Any], tree: MerkleTree,
+                   paths: Sequence[Sequence[bytes]] | None) -> DiskStore:
+        """Write step ``step`` from its leaves, tree and dataset paths, and check the root.
+        The pipelined loop calls it with the parent's opened store's leaves."""
         store = self.disk.hold(c, self.step, leaves, tree, paths)
         root = transcript_root(c, store)
         if root != tree.root or store.root != tree.root:
@@ -439,7 +446,8 @@ def run_verified(c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torc
                  recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
                  writer: MetricsWriter | None = None,
                  build_model: Callable[[], torch.nn.Module] | None = None,
-                 keep: KeptStepHandoff | None = None,
+                 keep: KeptStepHandoff | None = None, pipelined: bool = False,
+                 prover: Callable[[], Any] | None = None,
                  watch: str = WATCH_CLASS, out: Callable[[str], None] = print) -> VerifiedRun:
     """``T`` honest steps judged live by ``bands`` (loaded from the band file).
 
@@ -447,7 +455,10 @@ def run_verified(c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torc
     written as a ``residual_summary`` record. A step is in-sample when the bands were fitted
     on it (``metrics.in_sample_step``) and judged as ``metrics.judged_step`` says. ``keep``
     stores its step once the step closes, and with ``writer`` a ``kept_transcript`` record
-    follows. ``watch`` names the class whose residuals are all logged."""
+    follows. ``watch`` names the class whose residuals are all logged. ``pipelined`` runs the
+    prover in a child built from ``prover`` (``runs/pipeline.py``); the stored step is then
+    written by the parent after the step is verified. Never read from ``VERIF_PIPELINED`` here:
+    the entry point decides, and passes the mode."""
     if writer is not None:
         writer.write_c5_layout(c)  # what the markers' check-5 stamps index
     factory = JudgingVerifiers(c, len(D), w0, bands, k=k, h_D=h_D, seed=seed)
@@ -476,7 +487,8 @@ def run_verified(c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torc
 
     r = run_scenario(c, D, w0, HONEST, T=T, k=k, seed=seed, final=final, on_step=on_step,
                      recorder=recorder, h_D=h_D, build_model=build_model,
-                     verifier=factory.for_steps(T), handoff=keep)
+                     verifier=factory.for_steps(T), handoff=keep, pipelined=pipelined,
+                     prover=prover)
     return VerifiedRun(r, bands, summaries, factory, watch, kept[0] if kept else None)
 
 
@@ -625,6 +637,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     keep = (KeptStepHandoff(run_dir / TRANSCRIPTS_DIR, keep_step)
             if 1 <= keep_step <= T else None)
+    pl, spec = loop_mode(cfg)
+    # Pipelined: the metrics passes' references (the memory pass's, and the counting pass's, which
+    # runs sequentially and rebuilds the model) come before the model is dropped (FS33d). A
+    # sequential run computes each where it is used, as before.
+    if pl and use_metrics:
+        final_at(S)
+        final_at(COUNT_STEPS)
+    if pl:
+        models.drop()  # the prover is the child's: no second model on the parent's GPU 0
     mem_rows = None
     mw = (MetricsWriter(run_dir, name, device=cfg.device, model=cfg.model,
                         corpus=backdoorllm.SOURCE, attack=cfg.attack, seed=cfg.seed,
@@ -636,17 +657,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0,
                            trace_step=cfg.trace_step, trace_c5=cfg.trace_c5))
         run = run_verified(c, D, w0, bands, T=T, final=final, writer=mw, recorder=rec,
-                           keep=keep, **base)
+                           keep=keep, pipelined=pl, prover=spec, **base)
         r = run.result
         weights_doc = write_final_weights(run_dir / WEIGHTS_FILE, c, r.loop.w_final or {},
                                           w0=w0, losses=[s.loss for s in r.loop.steps],
                                           provenance=run_provenance(cfg, h_D), run=name)
         if mw is not None:
             mem_rows = memory_run(c, D, w0, run=name, device=mw.device, T=S, final=final_at(S),
-                                  verifier=run.factory.for_steps(S), **base)
+                                  verifier=run.factory.for_steps(S), pipelined=pl, prover=spec,
+                                  **base)
             mw.write(mem_rows)
             mw.write(count_run(c, D, w0, run=name, T=COUNT_STEPS, final=final_at(COUNT_STEPS),
-                               verifier=run.factory.for_steps(COUNT_STEPS), **base))
+                               verifier=run.factory.for_steps(COUNT_STEPS), pipelined=False,
+                               **base))  # the counting pass refuses pipelined
     finally:
         if mw is not None:
             mw.close()
