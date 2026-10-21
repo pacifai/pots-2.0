@@ -146,8 +146,15 @@ A wrong hint costs a copy, never a bit. The copy:
   any other stream sees finished data too;
 - the source is held until the event completes, and a ``_version`` moved before then raises
   :class:`MutatedCaptureError`, as above;
-- an output already on its hinted device is kept as it is; a hint that is the host takes the
-  host-buffer path above.
+- the owner hashes the copy on arrival (FS34): the kernel's table for the product is queued on
+  the destination's side stream behind the copy's event, as the host path queues it behind its
+  host copy, and its digests are keyed by the copy's storage, so :meth:`arrival_digest` serves
+  them as on the one-GPU path. The training GPU hashes nothing;
+- an output already on its hinted device is kept as it is, and hashed where it sits, on that
+  device's side stream after the producing stream; the digests are paired with the ``_version``
+  read when the hash was queued, since the kept tensor is autograd's own (a later write is
+  :class:`MutatedCaptureError`, and never a digest of a later version); a hint that is the host
+  takes the host-buffer path above.
 
 On CPU nothing is copied, but the hint is computed and counted all the same.
 """
@@ -409,8 +416,9 @@ class MatmulCapture(TorchDispatchMode):
                  placement: Placement | None = None, *, hash_arrivals: bool = True,
                  hasher: GpuBlake3 | None = None) -> None:
         super().__init__()
-        # FS30: hash each unsharded CUDA product on arrival, on the side stream after its host
-        # copy. ``hasher`` is the kernel's host for tests.
+        # FS30: hash each CUDA product on arrival: unsharded, on the side stream after its host
+        # copy; sharded (FS34), on the owner after the peer copy or where it is kept.
+        # ``hasher`` is the kernel's host for tests.
         self.hash_arrivals = hash_arrivals
         self._hasher = hasher
         # host storage -> (members, shape, dtype, the host tensor's offset, digests, version):
@@ -438,10 +446,13 @@ class MatmulCapture(TorchDispatchMode):
         # reused while the map is live.
         self._param_copies: dict[int, str] = {}
         self._held: list[torch.Tensor] = []
-        # GPU outputs whose copy to the host may still run: (record, tensor, _version, event).
-        # The fifth item is the arrival hash enqueued behind the copy, if any.
+        # GPU outputs whose copy may still run: (record, tensor, _version, event). The fifth
+        # item is the arrival hash enqueued behind the copy (or after the output, where it is
+        # kept), if any; the sixth the ``_version`` of ``rec.out`` when that hash was queued,
+        # for a kept output (autograd's own tensor), else ``None`` (read at drain: the capture's
+        # own copy, which nothing else writes).
         self._pending: deque[tuple[MatmulRecord, torch.Tensor, int, torch.cuda.Event,
-                                   PendingHash | None]] = deque()
+                                   PendingHash | None, int | None]] = deque()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         out = super().__exit__(exc_type, exc_val, exc_tb)
@@ -598,7 +609,8 @@ class MatmulCapture(TorchDispatchMode):
         out, dest = rec.out, rec.hint
         assert dest is not None
         if out.device == dest:
-            return  # already on its owner: kept, as on CPU
+            self._hash_in_place(rec)  # already on its owner: kept, as on CPU
+            return
         side = self.buffers.stream(out.device)
         side.wait_stream(torch.cuda.current_stream(out.device))  # the op that wrote it
         with torch.cuda.stream(side):
@@ -606,9 +618,40 @@ class MatmulCapture(TorchDispatchMode):
             moved.copy_(out, non_blocking=True)
             done = torch.cuda.Event()
             done.record(side)
-        self._pending.append((rec, out, out._version, done, None))
+        try:
+            pend = None
+            if self._hashable(rec, moved):
+                owner = self.buffers.stream(dest)
+                owner.wait_event(done)  # a cross-device wait: the copy has landed
+                pend = self._hash_arrival(rec, moved, owner)
+        except BaseException:
+            side.synchronize()  # the copy and any kernel already launched read the tensors
+            self.buffers.stream(dest).synchronize()
+            raise
+        self._pending.append((rec, out, out._version, done, pend, None))
         rec.out = moved
         rec.versions["out"] = moved._version
+        self._drain(block=False)
+
+    def _hash_in_place(self, rec: MatmulRecord) -> None:
+        """Hash a product that is already on its owner where it sits (FS34): on that device's
+        side stream, after the stream that wrote it. ``rec.out`` stays the autograd tensor, so
+        the entry carries the ``_version`` read as the hash is queued."""
+        out = rec.out
+        if not self._hashable(rec, out):
+            return
+        side = self.buffers.stream(out.device)
+        side.wait_stream(torch.cuda.current_stream(out.device))  # the op that wrote it
+        try:
+            pend = self._hash_arrival(rec, out, side)
+            with torch.cuda.stream(side):
+                done = torch.cuda.Event()
+                done.record(side)
+        except BaseException:
+            side.synchronize()  # a kernel already launched reads ``out``
+            raise
+        # Held until the hash is done, so the allocator can't reuse its memory under it.
+        self._pending.append((rec, out, out._version, done, pend, out._version))
         self._drain(block=False)
 
     def _offload(self, rec: MatmulRecord) -> None:
@@ -628,7 +671,7 @@ class MatmulCapture(TorchDispatchMode):
             raise
         # Held until the copy and the hash are done, so the allocator can't reuse its memory
         # under them.
-        self._pending.append((rec, out, out._version, done, pend))
+        self._pending.append((rec, out, out._version, done, pend, None))
         rec.out = host
         rec.versions["out"] = host._version
         self._drain(block=False)
@@ -656,12 +699,15 @@ class MatmulCapture(TorchDispatchMode):
             np.full(members, native.FINITE_KIND[out.dtype], np.uint8),
             device=out.device, stream=side, keep=[out])
 
-    def _arrived_from(self, rec: MatmulRecord, pend: PendingHash) -> None:
+    def _arrived_from(self, rec: MatmulRecord, pend: PendingHash,
+                      version: int | None = None) -> None:
+        """Key ``pend``'s digests by ``rec.out``'s storage. ``version`` is the ``_version`` of
+        ``rec.out`` read when the hash was queued (a kept output); ``None`` reads it now."""
         digests, bad = pend.result()
         host = rec.out
         self._arrived[StorageWeakRef(host.untyped_storage())] = (
             rec.n_members, tuple(host.shape[(rec.batch is not None):]), host.dtype,
-            host.storage_offset(), digests, host._version)
+            host.storage_offset(), digests, host._version if version is None else version)
         st = self._arrival_stats
         st["records"] += 1
         st["leaves"] += len(digests)
@@ -692,13 +738,13 @@ class MatmulCapture(TorchDispatchMode):
     def _drain(self, *, block: bool, check: bool = True) -> None:
         """Drop the GPU outputs whose copy is done (all of them when ``block``)."""
         while self._pending:
-            rec, gpu, version, done, pend = self._pending[0]
+            rec, gpu, version, done, pend, arrived = self._pending[0]
             if not block and not (done.query() and (pend is None or pend.done())):
                 return
             done.synchronize()
             self._pending.popleft()
             if pend is not None:
-                self._arrived_from(rec, pend)
+                self._arrived_from(rec, pend, arrived)
             if check and gpu._version != version:
                 raise MutatedCaptureError(
                     f"#{rec.index} {rec.op} ({rec.phase}): output written in place before its "
