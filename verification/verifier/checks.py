@@ -882,6 +882,7 @@ def _served_blocks(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Se
         raise RuntimeError(f"{first.name}: replay blocks don't cover the group once")
     out: list[MeasureGroup] = []
     with (st("c5.serve", run, group) if st else _NO_STAMP):
+        views: list[tuple[Any, torch.Tensor, list[int]]] = []
         for blk in blocks:
             n = len(blk.pos)
             if (tuple(blk.a.shape), tuple(blk.b.shape)) != ((n, *first.a_shape),
@@ -894,9 +895,11 @@ def _served_blocks(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Se
             if tuple(p.shape) != (n, *first.p_shape):
                 raise RuntimeError(f"{first.name}: leaves {tuple(p.shape)} != "
                                    f"{(n, *first.p_shape)}")
-            with (st("c5.copy", run, group) if st else _NO_STAMP):
+            views.append((blk, p, labels))
+        with (st("c5.copy", run, group) if st else _NO_STAMP):  # one stamp per group
+            for blk, p, labels in views:
                 p_dev = p.detach().to(blk.a.device, non_blocking=True)
-            out.append(MeasureGroup(blk.a, blk.b, p_dev, labels))
+                out.append(MeasureGroup(blk.a, blk.b, p_dev, labels))
     return [idx[t] for blk in blocks for t in blk.pos], out
 
 
@@ -1172,6 +1175,7 @@ def _measure_run(specs: Sequence[ProductSpec], served: Sequence[Served], *,
                          guard=guard)
     if rows.rows is None:
         return []
+    freivalds.drain()  # kernel measurements in flight are done before the read
     return _finished(rows, rows.rows.tolist(), eps_in=eps_in, eps_acc=eps_acc, guard=guard)
 
 
@@ -1345,16 +1349,19 @@ def _record_rest_5(c: DeclaredComputation, ctx: StepContext, bands: Bands) -> No
     view = TranscriptView(c, ctx.state.committed())
     done = {p.m for p in ctx.stats.products}
     scratch = MeasureScratch()
-    for run in _member_runs(c.products):
-        specs = [spec for spec in run if spec.m not in done]
-        if not specs:
-            continue
-        rows, error = _measure_served(c, specs, ctx, replay, view, h=root, k=ctx.k,
-                                      scratch=scratch, guard=ctx.kappa_guard)
-        if error is not None:
-            raise error
-        for spec, mp in _finish([rows], ctx):
-            _judge_product(c, spec, mp, ctx, bands)
+    try:
+        for run in _member_runs(c.products):
+            specs = [spec for spec in run if spec.m not in done]
+            if not specs:
+                continue
+            rows, error = _measure_served(c, specs, ctx, replay, view, h=root, k=ctx.k,
+                                          scratch=scratch, guard=ctx.kappa_guard)
+            if error is not None:
+                raise error
+            for spec, mp in _finish([rows], ctx):
+                _judge_product(c, spec, mp, ctx, bands)
+    finally:
+        freivalds.drain()  # no kernel hold outlives the pass, whatever raised
 
 
 def _record_rest_6(c: DeclaredComputation, ctx: StepContext, bands: Bands,

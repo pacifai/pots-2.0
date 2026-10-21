@@ -240,3 +240,98 @@ def test_check_5_drains_when_a_product_is_rejected(kernel):
     _, rejection = _verify(c, D, tree, w0, perturb={m: lambda p: _bump(p)})
     assert rejection is not None and rejection.check_id == "5"
     assert kernel.events[-1] == "drain" or "drain" in kernel.events[-3:]
+
+
+# ---- the two row reads outside check 5's window loop (FS37 fix 1) ----
+
+def test_record_pass_drains_when_a_later_run_fails_to_serve(kernel, monkeypatch):
+    from types import SimpleNamespace
+
+    state = SimpleNamespace(claimed_root=b"r", replay=object(), run_rest=[], run_rest_error=None,
+                            committed=lambda: None)
+    ctx = SimpleNamespace(state=state, stats=SimpleNamespace(products=[]), k=7, kappa_guard=True)
+    spec = SimpleNamespace(m=1)
+    boom = RuntimeError("serving failed")
+    monkeypatch.setattr(checks, "TranscriptView", lambda c, leaves: None)
+    monkeypatch.setattr(checks, "_member_runs", lambda products: [[spec], [spec]])
+    calls = []
+
+    def served(*a, **kw):
+        calls.append(1)
+        kernel.events.append("measure")
+        return (None, boom) if len(calls) == 2 else (object(), None)
+
+    monkeypatch.setattr(checks, "_measure_served", served)
+    monkeypatch.setattr(checks, "_finish", lambda batch, ctx: [])
+    with pytest.raises(RuntimeError) as e:
+        checks._record_rest_5(SimpleNamespace(products=[spec]), ctx, Bands.provisional())
+    assert e.value is boom and len(calls) == 2
+    assert kernel.events == ["measure", "measure", "drain"]
+    # a judged product that raises leaves no hold either
+    kernel.events.clear()
+    calls.clear()
+    monkeypatch.setattr(checks, "_measure_served", lambda *a, **kw: (object(), None))
+    monkeypatch.setattr(checks, "_finish", lambda batch, ctx: [(spec, None)])
+
+    def judge(*a, **kw):
+        raise ValueError("judging failed")
+
+    monkeypatch.setattr(checks, "_judge_product", judge)
+    with pytest.raises(ValueError):
+        checks._record_rest_5(SimpleNamespace(products=[spec]), ctx, Bands.provisional())
+    assert kernel.events == ["drain"]
+
+
+def test_measure_run_drains_before_reading_its_rows(kernel, monkeypatch):
+    from types import SimpleNamespace
+
+    class Rows:
+        def tolist(self):
+            kernel.events.append("read")
+            return []
+
+    monkeypatch.setattr(checks, "_stacked", lambda specs, served: None)
+    monkeypatch.setattr(checks, "_measure_rows", lambda *a, **kw: SimpleNamespace(rows=Rows()))
+    monkeypatch.setattr(checks, "_finished", lambda *a, **kw: [])
+    assert checks._measure_run([], [], h=b"h", k=7, eps_in=1.0, eps_acc=1.0) == []
+    assert kernel.events == ["drain", "read"]
+
+
+@pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
+def test_one_copy_stamp_per_group_on_the_kernel_path(switch, kernel):
+    """Every group is stamped once by each of ``c5.glue``, ``c5.serve``, ``c5.copy`` and
+    ``c5.measure``, also a group whose roles interleave and so is served as several blocks."""
+    import contextlib
+    from collections import Counter
+
+    from verification.verifier.context import CommittedLeaves, StepContext
+
+    c, D, tree, w0 = _setup(switch, "fp32")
+    idx = schedule(1, c.n_s, len(D), SEED)
+    out = prove_step(c, c.build_model(), w0, [D[i] for i in idx])
+    committed = CommittedLeaves()
+    for leaf in out.leaves():
+        committed.add(leaf)
+    stamps = []
+
+    class Section:
+        def __call__(self, name):
+            return contextlib.nullcontext()
+
+        @contextlib.contextmanager
+        def stamp(self, name, run=-1, group=-1, window=-1):
+            stamps.append((name, run, group))
+            yield
+
+    ctx = StepContext.for_computation(c, step=1, indices=(), h_D=b"", n_records=0,
+                                      prev_w_hashes=(), chain_check_id="0", k=7, judge=True,
+                                      section=Section())
+    ctx.state.leaves, ctx.state.claimed_root = committed, b"\x07" * 32
+    assert checks.check_5_matmuls(None, c, ctx, Bands.provisional()) is None
+    n_groups = sum(len(checks._measure_groups(run)) for run in checks._member_runs(c.products))
+    count = Counter(name for name, _, _ in stamps)
+    for name in ("c5.glue", "c5.serve", "c5.copy", "c5.measure"):
+        assert count[name] == n_groups, name
+        assert len({(r, g) for n, r, g in stamps if n == name}) == n_groups, name
+    # at least one group was served as several blocks, so the stamp is per group, not per block
+    assert len(kernel.views) > n_groups
