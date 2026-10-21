@@ -1,7 +1,8 @@
 """FS11's H100 sessions: the parts in order, each with its own log, under one deadline.
 
     .venv/bin/python -m verification.runs.fs11_session run --upload DIR --out DIR --deadline EPOCH
-        [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,fs32-pair}]
+        [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,fs32-pair,
+                    device-leaves}]
     .venv/bin/python -m verification.runs.fs11_session fetch-models --upload DIR --out DIR
     .venv/bin/python -m verification.runs.fs11_session env --out DIR
 
@@ -14,7 +15,8 @@ check (:func:`profile_check_plan`, below), or ``nvlink-probe``, the four-card ha
 (:func:`nvlink_probe_plan`, below), ``kernel-speed``, the GPU BLAKE3 kernel's speed on one
 H100 (:func:`kernel_speed_plan`, below: the upload holds the repo, the native sources and the
 Mac's ``kernel_speed_sizes.json``, no models; ``fs11_prep --session kernel-speed`` packs it),
-or ``fs32-pair``, the sharded run on two GPUs (:func:`fs32_pair_plan`, below).
+``fs32-pair``, the sharded run on two GPUs (:func:`fs32_pair_plan`, below), or
+``device-leaves``, FS30's check of the device leaves (:func:`device_leaves_plan`, below).
 The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
@@ -86,6 +88,16 @@ failing tests; the job log ends with one ``FS32`` line per item. It refuses unle
 two CUDA devices, whatever their type. Each of its parts records every GPU's peak memory
 (``parts/<name>/gpu_peak.json``, MiB by ``nvidia-smi`` index, the card's whole use).
 
+The device-leaves session (FS30) runs the models part, the CUDA tests (the kernel's two test
+files, FS30's own, and the GPU-memory test of the capture) with a junit report, then one
+``bring_up --no-tamper --device-leaves`` per model at :data:`FULL_SCALE_ENV` plus
+:data:`RECHECK_ENV`, the cheapest model first. Each bring-up prints one ``device leaves:`` line:
+the prover's root (arrival digests and the device kernel), the root the CPU path gives over the
+same leaves, how many product leaves took an arrival digest, ``M`` and the ``dK`` leaves.
+``summary.json``'s ``device_leaves`` (:func:`device_leaves_gate`) fails closed. It refuses
+without CUDA and without an H100 (``FS11_ALLOW_ANY_GPU=1`` overrides). Its upload is
+``fs11_prep``'s default, with the four models.
+
 Every part runs in its own process group, with ``HF_HUB_OFFLINE=1`` (all but the first), no
 Hugging Face token and no Runpod key in its environment. A part's log is
 ``parts/<name>/log.txt``, and ``current_part`` holds the running part's process group id.
@@ -127,7 +139,8 @@ __all__ = ["PROFILE_CHECK_TIMEOUT_S", "PROFILE_HELD", "PROFILE_PINS", "SMOLLM2_E
            "GATED", "TASKS", "FULL_SCALE_ENV", "RECHECK_ENV", "ALLOC_ARMS",
            "alloc_env", "FIX_AB_MODEL", "FIX_OFF_ENV", "SESSIONS", "EXIT_REFUSED", "Part",
            "default_plan", "recheck_plan", "profile_check_plan", "nvlink_probe_plan",
-           "kernel_speed_plan", "kernel_speed_gate", "SIZES_NAME", "load_plan",
+           "kernel_speed_plan", "device_leaves_plan", "device_leaves_gate",
+           "kernel_speed_gate", "SIZES_NAME", "load_plan",
            "selftest_plan", "fs31_cards", "hw3_cards", "fs32_pair_plan", "fs32_pair",
            "with_native_build",
            "choose_plan", "run_session", "fix2_ab",
@@ -686,6 +699,130 @@ def kernel_speed_plan(upload: Path, out: Path) -> list[Part]:
                  info={"report": str(report)})]
 
 
+# FS30's device-leaves session: arrival hashing in capture and the device kernel at the commit,
+# checked on the H100 against the CPU path's roots. Time limits, seconds: the CUDA tests (the
+# kernel's two files, FS30's own tests and the capture's memory test) 1,200; each bring-up
+# 1,800 (the re-check's limit, :data:`RECHECK_TIMEOUT_S`); the models part 1,800; the native
+# build 900 (:func:`with_native_build`). Estimates, minutes, scaled by hand from the re-check
+# (nothing was measured): models 5, native build 2, CUDA tests 8, four bring-ups about 30
+# (the first session's one finished took 191 s, Llama-3.2-1B's two-step run 1,152 s, and each
+# step here also hashes its leaves a second time on the CPU path). Parts about 45 min, packing
+# about 1, the grace window 20: about 66 min. The job's deadline is twice that, 132 min,
+# rounded up to 8,000 s; the parts stop by 8,000 - 1,200 - 600 = 6,200 s.
+DEVICE_LEAVES_TIMEOUT_S = {"models": 1800, "tests": 1200, "bring_up": 1800}
+DEVICE_LEAVES_DEADLINE_S = 8000
+DEVICE_TESTS_FILE = "tests/verification/runs/test_device_leaves_cuda.py"
+DEVICE_TESTS_MEMORY = ("tests/verification/prover/test_capture_cuda.py"
+                       "::test_gpu_memory_does_not_hold_the_transcript")
+DEVICE_LEAVES_TESTS = (*KERNEL_TESTS, DEVICE_TESTS_FILE, DEVICE_TESTS_MEMORY)
+
+
+def device_leaves_plan(upload: Path, out: Path) -> list[Part]:
+    """FS30's parts (module docstring): the models part, the CUDA tests with a junit report,
+    then one ``bring_up --no-tamper --device-leaves`` per model of :data:`RUN_PINS` at
+    :data:`FULL_SCALE_ENV` plus :data:`RECHECK_ENV`, :data:`FIX_AB_MODEL` (the cheapest) first.
+    The native build comes first (:func:`with_native_build`)."""
+    t = DEVICE_LEAVES_TIMEOUT_S
+    junit = out / "parts" / "device_tests" / "junit.xml"
+    tests = Part("device_tests", ["{python}", "-m", "pytest", "-rf", "-q", f"--junitxml={junit}",
+                                  "-p", "no:cacheprovider", *DEVICE_LEAVES_TESTS],
+                 timeout_s=t["tests"], kind="device_tests", info={"junit": str(junit)})
+    ups = _bring_up_parts(upload, out, RECHECK_ENV, t["bring_up"], args=("--device-leaves",))
+    (first,) = [p for p in ups if p.info["model"] == FIX_AB_MODEL]
+    return [_models_part(upload, out, t["models"]), tests, first,
+            *[p for p in ups if p is not first]]
+
+
+_DEVICE_LEAVES_LINE = re.compile(
+    r"^device leaves: step (\d+) accepted (True|False), prover root ([0-9a-f]{64}|none), "
+    r"cpu root ([0-9a-f]{64}), arrival digests (\d+), M (\d+), dK leaves (\d+)$")
+
+
+def _device_leaves_logged(lines: Sequence[str]) -> dict[str, Any] | None:
+    """The last ``device leaves:`` line of a bring-up's log, as numbers, or ``None``."""
+    got = [m for m in map(_DEVICE_LEAVES_LINE.match, lines) if m]
+    if not got:
+        return None
+    m = got[-1]
+    return {"step": int(m[1]), "accepted": m[2] == "True",
+            "prover_root": None if m[3] == "none" else m[3], "cpu_root": m[4],
+            "arrival": int(m[5]), "M": int(m[6]), "dK": int(m[7])}
+
+
+def _device_tests_extras(junit: Path) -> dict[str, Any]:
+    """:func:`_pytest_extras` and every case's outcome (``passed``, ``failed``, ``error``,
+    ``skipped``) by ``classname::name``: the session's tests are few, and the gate needs to know
+    that each FS30 test ran."""
+    import xml.etree.ElementTree as ET
+
+    out = _pytest_extras(junit)
+    if out.get("junit", 0) is None:
+        return out
+    cases = {}
+    for case in ET.parse(junit).getroot().iter("testcase"):
+        tags = {c.tag for c in case}
+        cases[f"{case.get('classname')}::{case.get('name')}"] = (
+            "error" if "error" in tags else "failed" if "failure" in tags
+            else "skipped" if "skipped" in tags else "passed")
+    return {**out, "cases": cases}
+
+
+def device_leaves_gate(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """FS30's gate from the parts' records, or ``None`` when the session has no tests part. It
+    is ``pass`` only if the CUDA tests part finished ``ok`` with no failure or error, FS30's own
+    CUDA tests all ran and passed (none skipped), and every model of :data:`RUN_PINS` has a
+    bring-up that logged its line and shows the step accepted, the two roots equal and the
+    arrival-digest count equal to ``M`` less the ``dK`` leaves. Anything missing fails."""
+    tests = next((p for p in parts if p.get("kind") == "device_tests"), None)
+    if tests is None:
+        return None
+    why: list[str] = []
+    ex = tests.get("extras") or {}
+    if tests.get("status") not in ("ok", "skipped_done"):
+        why.append(f"the CUDA tests part is {tests.get('status')}")
+    if ex.get("junit", 0) is None or "cases" not in ex:
+        why.append("the CUDA tests left no junit report")
+    else:
+        if ex.get("failures") or ex.get("errors"):
+            why.append(f"the CUDA tests have {ex.get('failures')} failures and "
+                       f"{ex.get('errors')} errors")
+        mine = {n: o for n, o in ex["cases"].items()
+                if "test_device_leaves_cuda" in n
+                or n.endswith("::test_gpu_memory_does_not_hold_the_transcript")}
+        if not any("test_device_leaves_cuda" in n for n in mine):
+            why.append("none of FS30's CUDA tests ran")
+        if not any(n.endswith("test_gpu_memory_does_not_hold_the_transcript") for n in mine):
+            why.append("the capture's GPU-memory test did not run")
+        why += [f"{n}: {o}" for n, o in sorted(mine.items()) if o != "passed"]
+    by_model = {(p.get("info") or {}).get("model"): p for p in parts if p.get("kind") == "bring_up"}
+    models: dict[str, Any] = {}
+    for repo, _rev in RUN_PINS:
+        p = by_model.get(repo)
+        got = None if p is None else (p.get("extras") or {}).get("device_leaves")
+        if p is None:
+            row = {"ok": False, "why": "no bring-up part"}
+        elif got is None:
+            row = {"ok": False, "why": f"no device leaves line (the part is {p.get('status')})"}
+        else:
+            bad = []
+            if not got["accepted"]:
+                bad.append("the step was not accepted")
+            if got["prover_root"] is None or got["prover_root"] != got["cpu_root"]:
+                bad.append("the roots differ")
+            if got["arrival"] != got["M"] - got["dK"]:
+                bad.append(f"{got['arrival']} arrival digests, expected "
+                           f"{got['M'] - got['dK']} (M {got['M']} less {got['dK']} dK leaves)")
+            row = {**got, "ok": not bad, "why": "; ".join(bad)}
+        models[repo] = row
+        if not row["ok"]:
+            why.append(f"{repo}: {row['why']}")
+    ok = not why
+    line = ("FS30 device leaves pass: every FS30 CUDA test passed, and for each of "
+            f"{len(models)} models the roots agree with the arrival digests in use" if ok else
+            "FS30 device leaves FAIL: " + "; ".join(why))
+    return {"pass": ok, "reasons": why, "models": models, "line": line}
+
+
 # FS32f's two-GPU session (``fs32-pair``): the sharded run on two cards, F22's two-A40 check.
 # Time limits, seconds, of its parts; the fast suite's limit allows twice its estimated 25 min.
 PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "calibrate": 900,
@@ -780,6 +917,7 @@ SESSIONS: dict[str, tuple[str, Callable[[Path, Path], list[Part]]]] = {
     "nvlink-probe": ("nvlink-probe", nvlink_probe_plan),
     "kernel-speed": ("kernel-speed", kernel_speed_plan),
     "fs32-pair": ("fs32-pair", fs32_pair_plan),
+    "device-leaves": ("device-leaves", device_leaves_plan),
 }
 
 
@@ -1094,6 +1232,7 @@ def _bring_up_extras(log: Path) -> dict[str, Any]:
     return {"allocator": _logged_allocator(lines), "peaks": peaks,
             "step_times": _step_times(lines),
             "section_peaks": _section_peaks(lines),
+            "device_leaves": _device_leaves_logged(lines),
             "lines": [l for l in lines if _BRING_UP_LINE.match(l)][-40:]}
 
 
@@ -1216,6 +1355,8 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _card_extras(Path(part.info["report"]))
         if part.kind == "pytest":
             return _pytest_extras(Path(part.info["junit"]))
+        if part.kind == "device_tests":
+            return _device_tests_extras(Path(part.info["junit"]))
         if part.kind == "pair_run":
             return _pair_run_extras(log, Path(part.info["weights"]))
         if part.kind == "cheat":
@@ -1657,6 +1798,9 @@ def _hw_lines(parts: Sequence[Mapping[str, Any]], hw3: Mapping[str, Any] | None)
     speed = kernel_speed_gate(parts)
     if speed is not None:  # FS29's session has no HW2 or HW3; its one line is the gate
         lines.append(speed["line"])
+    leaves = device_leaves_gate(parts)
+    if leaves is not None:  # FS30's session: its one line is the gate
+        lines.append(leaves["line"])
     probe = next((p for p in parts if p.get("kind") == "nvlink"), None)
     if probe is not None:
         hw2 = (probe.get("extras") or {}).get("hw2")
@@ -1891,6 +2035,9 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
     speed_gate = kernel_speed_gate(summary["parts"])
     if speed_gate is not None:
         summary["kernel_speed_gate"] = speed_gate
+    leaves_gate = device_leaves_gate(summary["parts"])
+    if leaves_gate is not None:
+        summary["device_leaves"] = leaves_gate
     for line in _hw_lines(summary["parts"], summary.get("hw3_cards")):
         say(line)
     pair = summary.get("fs32_pair")
@@ -2072,8 +2219,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="FS11_SESSION: the first session's plan (fs11, the default), the "
                         "re-check's (recheck), the profile check's (profile-check), the "
                         "four-card hardware probe's (nvlink-probe), the BLAKE3 kernel's speed "
-                        "(kernel-speed) or the two-GPU sharded run's (fs32-pair); --plan and "
-                        "--selftest "
+                        "(kernel-speed), the two-GPU sharded run's (fs32-pair) or FS30's "
+                        "device-leaves check (device-leaves); --plan and --selftest "
                         "replace its parts")
     f = sub.add_parser("fetch-models", help="check the upload, fetch the public weights")
     f.add_argument("--upload", type=Path, required=True)

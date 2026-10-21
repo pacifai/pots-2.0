@@ -289,7 +289,9 @@ commits them. The hashing benchmark (`benchmarks/hashing/`) imports only this mo
 
   `plain_step` is the same step without capture. Faults hook in only here: training on a
   different batch, perturbing a product after capture, or replacing `W_{t+1}`. `commit`
-  builds the step's root `h` and then confirms that no captured tensor changed.
+  builds the step's root `h` and then confirms that no captured tensor changed. On a GPU the
+  capture also hashes each product on arrival and the step carries the digests (FS30, "The
+  device-leaves session").
 
 **On a GPU** (task FS9) the model, its activations and the replay run on the GPU, while
 every leaf lives in host RAM, as the full-scale hand-off decision (F1c) puts the transcript.
@@ -1084,6 +1086,39 @@ The parts stop by 7,500 − 1,200 − 600 = 5,700 s (95 min), which leaves room 
 that hangs to its 30 min limit (at the high end, 54 + 30 = 84 min). For the boot guard, the
 start command above with `sleep 9800;` in place of `sleep 16200;` fits that rule; the 16,200 s
 one also works, and bills longer only if setup stalls.
+
+### The device-leaves session (FS30)
+
+`FS11_SESSION=device-leaves` checks, on one H100, that hashing on the device gives the same
+transcript as the CPU. **The data path.** On the unsharded GPU path every leaf is in host memory
+at the commit, because the capture copies each product to a pinned host buffer. Right after that
+copy, on the same side stream, the capture also hashes the product on the GPU (the kernel of the
+BLAKE3 benchmark, FS28) and keeps the 32-byte digest; the step carries these as
+`arrival_digests`. At the commit, a leaf with a digest uses it, a CUDA tensor leaf is hashed by
+the kernel in one table, and everything else (the records, the weights, the `δK̃` products,
+perturbed or non-finite products) goes through the C library as before. Check 2 on the verifier
+always recomputes every digest with the C library, so a wrong digest shows up as a root mismatch.
+The first NVRTC build of the kernel happens in the first step's forward pass, inside the first
+captured CUDA matmul, unless the process calls `GpuBlake3().kernels(device)` earlier.
+
+1. **Prep, on the Mac**, after committing: `HF_HUB_OFFLINE=1 .venv/bin/python -m
+   verification.runs.fs11_prep --out DIR`, the default upload, which carries the four models.
+2. **On the pod**, as in the first session: extract the upload, make the venv, install, run the
+   job with `FS11_SESSION=device-leaves`. The default deadline is 8,000 s: the parts take about
+   45 minutes (models 5, native build 2, CUDA tests 8, four bring-ups about 30), packing about
+   1 and the grace window 20, so about 66 minutes; twice that is 132 minutes, rounded up. The
+   estimates are scaled by hand from the re-check; none was measured. The session refuses
+   without CUDA and an H100 (`FS11_ALLOW_ANY_GPU=1` overrides).
+3. **The parts.** The native build, the models part, `device_tests` (the kernel's two test
+   files, `test_device_leaves_cuda.py` and the capture's GPU-memory test, junit report), then
+   one `bring_up --no-tamper --device-leaves` per model, `Qwen/Qwen2.5-0.5B-Instruct` first.
+   Each bring-up prints one `device leaves:` line with the prover's root, the CPU path's root
+   over the same leaves, the number of product leaves that took an arrival digest, `M` and the
+   number of `δK̃` leaves.
+4. **The gate.** `summary.json["device_leaves"]` and the last job-log line. It passes only if the
+   tests part finished `ok` with no failure or error, none of FS30's CUDA tests was skipped,
+   and for every model the step was accepted, the two roots are equal and the arrival-digest
+   count equals `M` less the `δK̃` leaves. A missing part, line or report fails it.
 
 ### The two-GPU session (FS32f)
 

@@ -93,7 +93,7 @@ import torch
 from setup.config import load_config, setup_determinism
 from setup.data import schedule
 from setup.model import model_pin
-from verification.commitment.leaves import dataset_tree, leaf_hash, leaf_hashes_of
+from verification.commitment.leaves import commit_leaves, dataset_tree, leaf_hash, leaf_hashes_of
 from verification.computation.instances.decoder import DecoderComputation
 from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import (
@@ -370,6 +370,28 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
     return out
 
 
+# ---- FS30: the device-leaf routing's check ------------------------------------------------
+
+
+def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
+    """The one line FS30's session reads for step ``T`` (needs ``keep_last``). It holds the
+    prover's root (the tree the commit built, with the arrival digests and the device kernel),
+    the root the CPU path gives over the same leaves (:func:`commit_leaves` with no ``known``,
+    every leaf hashed by the C library), how many product leaves took an arrival digest, ``M``,
+    and how many ``dK`` leaves there are (the ones the prover hashes at the commit); and whether
+    the step was accepted. Run on a CPU, no leaf takes a digest and the roots agree trivially."""
+    if b.kept is None:
+        raise ValueError("device_leaves_line needs the step's leaves: run with keep_last")
+    step = next(s for s in b.result.loop.steps if s.t == T)
+    leaves = [b.kept.leaf(i) for i in range(c.n_leaves)]
+    cpu_root = commit_leaves(c, leaves).root
+    arrival = ((step.capture or {}).get("arrival_hash") or {}).get("leaves", 0)
+    dk = sum(1 for q in c.products if product_class(c, q) == "dK")
+    return (f"device leaves: step {T} accepted {step.rejection is None}, "
+            f"prover root {step.root.hex() if step.root else 'none'}, cpu root {cpu_root.hex()}, "
+            f"arrival digests {arrival}, M {c.M}, dK leaves {dk}")
+
+
 # ---- the timed run's work counts ----------------------------------------------------------
 
 
@@ -595,6 +617,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="time the honest run into the run directory $VERIF_OUTPUT_DIR/"
                         f"{RUN_NAME}/ (records, markers, VERIF_TRACE_STEP's trace) in place of "
                         "the memory pass; --check5-repeats then appends there (default off)")
+    p.add_argument("--device-leaves", action=argparse.BooleanOptionalAction, default=False,
+                   help="FS30: keep step T's leaves and print the one 'device leaves:' line "
+                        "(prover root, the CPU path's root, arrival-digest count); default off")
     args = p.parse_args(argv)
     if args.steps < 1:
         p.error(f"T = {args.steps}: at least one step")
@@ -651,7 +676,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         b = bring_up(c, D, h_D, T=args.steps, k=k, seed=cfg.seed, tamper=args.tamper,
                      device=cfg.device, handoff=None if disk is None else DiskHandoff(disk),
                      echo=lambda line: print(line, flush=True),
-                     release_cache=cfg.release_cache, keep_last=args.check5_repeats > 0,
+                     release_cache=cfg.release_cache,
+                     keep_last=args.check5_repeats > 0 or args.device_leaves,
                      recorder=rec)
         if mw is not None:
             mw.write(work_rows(c, RUN_NAME, HONEST.name, _step_records(mw.dir)))
@@ -660,6 +686,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             mw.close()
             print(f"metrics: {mw.dir}")
     report(b, k=k, reference=reference, c=c, T_run=cfg.steps, timed=args.metrics)
+    if args.device_leaves:
+        print(device_leaves_line(b, c, T=args.steps), flush=True)
     if args.check5_repeats > 0:
         check5_repeats(b, c, h_D=h_D, n_records=len(D), k=k, seed=cfg.seed,
                        step=args.steps, repeats=args.check5_repeats, device=cfg.device,
