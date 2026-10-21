@@ -185,3 +185,283 @@ def test_every_error_kind_placed_around_tables(c, leaves, route, monkeypatch, wh
     got = outcome(lambda: leaf_hashes_until_error(c, stream(), st, kernel=True))
     assert got == plain
     assert st.kernel > 0 and (kind == "nan_host" or id(bad[pos]) in route.ids)
+
+
+# ---- no table left unread --------------------------------------------------------------------
+
+
+@pytest.fixture
+def tracked(monkeypatch, on_kernel):  # noqa: F811
+    """Every table ``_enqueue_table`` queues, with whether its result was read; ``fail_at`` makes
+    the n-th (1-based) call raise, ``fail_read`` makes reading a table raise."""
+    real = L._enqueue_table
+
+    class T:
+        queued: list = []
+        read: list = []
+        fail_at = None
+        fail_read = None
+        calls = 0
+    T.queued, T.read = [], []
+
+    def enq(idx, tensors, tags):
+        T.calls += 1
+        if T.calls == T.fail_at:
+            raise RuntimeError("enqueue failed")
+        tb = real(idx, tensors, tags)
+        k = len(T.queued)
+        T.queued.append(tb)
+        res = tb.pend.result
+
+        def result(*a, **kw):
+            T.read.append(k)
+            if T.fail_read is not None:
+                raise T.fail_read
+            return res(*a, **kw)
+        tb.pend.result = result
+        return tb
+
+    monkeypatch.setattr(L, "_enqueue_table", enq)
+    monkeypatch.setattr(L, "_BATCH_ENTRIES", 2)
+    return T
+
+
+def _all_read(T):
+    return sorted(T.read) == list(range(len(T.queued))) and len(T.queued) > 0
+
+
+def test_an_iterable_error_leaves_no_table_unread(c, leaves, tracked):  # noqa: F811
+    def gen():
+        yield from items(leaves)[:c.n_s + 7]
+        raise OSError("read failed")
+    d, e = leaf_hashes_until_error(c, gen())
+    assert isinstance(e, OSError) and len(d) == c.n_s + 7
+    assert _all_read(tracked)
+
+
+def test_a_keyboard_interrupt_from_the_iterable_leaves_no_table_unread(c, leaves, tracked):  # noqa: F811
+    def gen():
+        yield from items(leaves)[:c.n_s + 7]
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        leaf_hashes_until_error(c, gen())
+    assert _all_read(tracked)
+
+
+def test_a_failing_enqueue_still_reads_the_tables_before_it(c, leaves, tracked):  # noqa: F811
+    tracked.fail_at = 3
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        leaf_hashes_until_error(c, items(leaves))
+    assert len(tracked.queued) == 2 and _all_read(tracked)
+
+
+def test_the_exception_in_flight_wins_over_a_table_that_fails_to_read(c, leaves, tracked):  # noqa: F811
+    tracked.fail_read = ValueError("read of a table failed")
+    tracked.fail_at = 3
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        leaf_hashes_until_error(c, items(leaves))
+    assert _all_read(tracked)
+
+
+def test_an_interrupt_beats_a_table_that_fails_to_read(c, leaves, tracked):  # noqa: F811
+    tracked.fail_read = ValueError("read of a table failed")
+
+    def gen():
+        yield from items(leaves)[:c.n_s + 7]
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        leaf_hashes_until_error(c, gen())
+    assert _all_read(tracked)
+
+
+def test_a_table_that_fails_to_read_is_raised_when_nothing_else_is_in_flight(c, leaves,  # noqa: F811
+                                                                           tracked):
+    tracked.fail_read = ValueError("read of a table failed")
+    with pytest.raises(ValueError, match="read of a table failed"):
+        leaf_hashes_until_error(c, items(leaves))
+    assert _all_read(tracked)  # every table read, not just the first
+
+
+def test_a_native_batch_error_still_reads_every_table(c, leaves, tracked, monkeypatch):  # noqa: F811
+    bad = list(leaves)
+    # a record leaf that fails leaf_parts is a structural error at its position (a native-batch
+    # error of the host leaves): the tables queued before it are still read
+    first = first_product(c)
+    bad[first + 5] = bad[first + 5][:-1]
+    d, e = leaf_hashes_until_error(c, items(bad))
+    assert isinstance(e, LeafShapeError) and len(d) == first + 5
+    assert _all_read(tracked)
+
+
+def test_hash_step_leaves_reads_every_table_on_an_exception(c, leaves, tracked):  # noqa: F811
+    tracked.fail_at = 4
+    with pytest.raises(RuntimeError, match="enqueue failed"):
+        hash_step_leaves(c, leaves)
+    assert _all_read(tracked)
+
+
+# ---- the per-shape check ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def planted(monkeypatch, on_kernel):  # noqa: F811
+    """The kernel answers a zero digest for every leaf it finds finite."""
+    real = gb.PendingHash.result
+
+    def wrong(self, *a, **k):
+        d, bad = real(self, *a, **k)
+        return [bytes(32)] * len(d), bad
+
+    monkeypatch.setattr(gb.PendingHash, "result", wrong)
+
+
+def test_the_check_runs_once_per_key_on_each_path(c, leaves, on_kernel, monkeypatch):  # noqa: F811
+    calls = []
+    real = kc.c_digest
+    monkeypatch.setattr(kc, "c_digest", lambda h, t: (calls.append(h), real(h, t))[1])
+    st = HashStats()
+    leaf_hashes_of(c, items(leaves), st)
+    n_table = len(calls)
+    assert n_table == st.crosschecks == len(kc._checked) > 0
+    d = leaf_hashes_of(c, items(leaves), kernel=False)
+    known = {i: d[i] for i in range(c.n_s, c.n_leaves)}
+    hash_step_leaves(c, leaves, known=known)
+    n_arrival = len(calls) - n_table
+    assert n_arrival == len([k for k in kc._checked if k[0] == "arrival"]) > 0
+    before = len(calls)
+    hash_step_leaves(c, leaves, known=known)
+    leaf_hashes_of(c, items(leaves))
+    assert len(calls) == before
+
+
+def test_several_leaves_of_one_unchecked_key_in_one_call_cost_one_comparison(c, leaves, on_kernel):  # noqa: F811
+    i = first_product(c)
+    same = [(i, leaves[i]), (i, leaves[i].clone()), (i, leaves[i].clone())]
+    st = HashStats()
+    leaf_hashes_of(c, same, st)
+    assert st.crosschecks == 1 and len(kc._checked) == 1
+
+
+def test_a_call_outside_a_run_uses_the_set_as_it_stands(c, leaves, on_kernel):  # noqa: F811
+    leaf_hashes_of(c, items(leaves))
+    snapshot = set(kc._checked)
+    assert snapshot
+    st = HashStats()
+    leaf_hashes_of(c, items(leaves), st)
+    leaf_hashes_until_error(c, items(leaves), st)
+    hash_step_leaves(c, leaves, st)
+    assert st.crosschecks == 0 and kc._checked == snapshot
+
+
+@pytest.mark.parametrize("entry", ["of", "until", "step"])
+@pytest.mark.parametrize("earlier", ["nan", "shape", "iter", "mutation", "none"])
+def test_a_table_mismatch_beats_every_other_error_on_each_entry(c, leaves, planted, monkeypatch,  # noqa: F811
+                                                                  entry, earlier):
+    if entry == "step" and earlier == "iter":
+        pytest.skip("hash_step_leaves takes a list")
+    i = first_product(c)
+    bad = list(leaves)
+    if earlier == "nan":
+        bad[i] = nan_in(bad[i])
+    elif earlier == "shape":
+        bad[c.n_s + c.n_w + 1] = bad[c.n_s + c.n_w + 1][:-1]
+    if earlier == "mutation":
+        real = L._enqueue_table
+
+        def mutate(idx, tensors, tags):
+            tb = real(idx, tensors, tags)
+            tensors[-1].add_(0)  # the table's last leaf: the digests before it are kept
+            return tb
+        monkeypatch.setattr(L, "_enqueue_table", mutate)
+    its = items(bad)
+
+    def stream():
+        if earlier == "iter":
+            def gen():
+                yield from its[:c.n_s + c.n_w + 2]
+                raise OSError("read failed")
+            return gen()
+        return its
+    run = {"of": lambda: leaf_hashes_of(c, stream()),
+           "until": lambda: leaf_hashes_until_error(c, stream()),
+           "step": lambda: hash_step_leaves(c, bad)}[entry]
+    with pytest.raises(kc.KernelMismatchError):
+        run()
+
+
+@pytest.mark.parametrize("earlier", ["nan", "shape"])
+def test_a_known_digest_mismatch_beats_an_earlier_host_error(c, leaves, on_kernel, earlier):  # noqa: F811
+    bad = list(leaves)
+    j = c.n_s  # a weight leaf, before the known product
+    bad[j] = nan_in(bad[j]) if earlier == "nan" else bad[j][:-1]
+    i = first_product(c)
+    with pytest.raises(kc.KernelMismatchError):
+        hash_step_leaves(c, bad, known={i: bytes(32)})
+
+
+def test_a_known_digest_mismatch_beats_a_table_error_after_it(c, leaves, on_kernel):  # noqa: F811
+    i = first_product(c)
+    bad = list(leaves)
+    bad[i + 3] = nan_in(bad[i + 3])
+    with pytest.raises(kc.KernelMismatchError):
+        hash_step_leaves(c, bad, known={i: bytes(32)})
+
+
+def test_a_failed_comparison_does_not_join_the_set(c, leaves, planted):  # noqa: F811
+    with pytest.raises(kc.KernelMismatchError):
+        leaf_hashes_of(c, items(leaves))
+    assert not kc._checked
+
+
+def test_a_mismatch_message_names_device_header_index_and_both_digests(c, leaves, planted):  # noqa: F811
+    i = first_product(c)
+    with pytest.raises(kc.KernelMismatchError) as e:
+        leaf_hashes_of(c, [(i, leaves[i])])
+    m = str(e.value)
+    assert "cpu" in m and f"leaf {i}" in m and bytes(32).hex() in m and "shape" in m
+    assert "float" in m and "tag" in m
+
+
+def test_a_key_whose_leaf_had_no_digest_is_checked_by_the_next_call(c, leaves, on_kernel):  # noqa: F811
+    i = first_product(c)
+    st = HashStats()
+    d, err = leaf_hashes_until_error(c, [(i, nan_in(leaves[i]))], st)
+    assert isinstance(err, NonFiniteError) and st.crosschecks == 0
+    st = HashStats()
+    leaf_hashes_of(c, [(i, leaves[i])], st)
+    assert st.crosschecks == 1
+
+
+def test_a_leaf_mutated_after_its_host_copy_is_not_compared_and_stays_unchecked(  # noqa: F811
+        c, leaves, planted, monkeypatch):
+    i = first_product(c)
+    real = L._enqueue_table
+
+    def mutate(idx, tensors, tags):
+        tb = real(idx, tensors, tags)
+        tensors[0].add_(0)  # after the host copy, before the table's outcome
+        return tb
+
+    monkeypatch.setattr(L, "_enqueue_table", mutate)
+    st = HashStats()
+    d, err = leaf_hashes_until_error(c, [(i, leaves[i])], st)  # planted, but no digest exists
+    assert isinstance(err, StoreMutationError)
+    assert st.crosschecks == 0 and not kc._checked
+
+
+def test_a_mutation_between_the_host_copy_and_the_close_skips_the_comparison(  # noqa: F811
+        c, leaves, planted, monkeypatch):
+    """The leaf moves after the probe's host copy and before its table is queued: the table
+    reads the new bytes, so it is not compared with the old digest: no mismatch, no key."""
+    i = first_product(c)
+    real = L._host_digest
+
+    def copy_then_mutate(obj, header, index):
+        out = real(obj, header, index)
+        obj.add_(0)
+        return out
+
+    monkeypatch.setattr(L, "_host_digest", copy_then_mutate)
+    st = HashStats()
+    d = leaf_hashes_of(c, [(i, leaves[i])], st)
+    assert len(d) == 1 and st.crosschecks == 0 and not kc._checked
