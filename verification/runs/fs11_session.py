@@ -777,10 +777,36 @@ def _device_tests_extras(junit: Path) -> dict[str, Any]:
     return {**out, "cases": cases}
 
 
-def device_leaves_gate(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_collected: dict[str, tuple[list[str], str]] = {}
+
+
+def device_tests_expected(file: str = DEVICE_TESTS_FILE) -> tuple[list[str], str]:
+    """``(names, error)``: every test case ``file`` defines, parametrized cases each, as the
+    junit report names it (``dotted.module::name[id]``), from ``pytest --collect-only`` run at
+    the repository root; ``error`` is empty unless the collection failed or found none. Read at
+    gate time, so a renamed, deleted or added test changes what the gate asks for. Cached."""
+    if file not in _collected:
+        r = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q",
+                            "-p", "no:cacheprovider", file], cwd=_REPO_ROOT,
+                           capture_output=True, text=True, timeout=300)
+        mod = file.removesuffix(".py").replace("/", ".")
+        names = [f"{mod}::{ln.split('::', 1)[1]}" for ln in r.stdout.splitlines()
+                 if ln.startswith(file + "::")]
+        err = "" if r.returncode == 0 and names else (
+            f"pytest --collect-only {file} exited {r.returncode} and found {len(names)} tests")
+        _collected[file] = (names, err)
+    return _collected[file]
+
+
+def device_leaves_gate(parts: Sequence[Mapping[str, Any]],
+                       expected: Sequence[str] | None = None) -> dict[str, Any] | None:
     """FS30's gate from the parts' records, or ``None`` when the session has no tests part. It
     is ``pass`` only if the CUDA tests part finished ``ok`` with no failure or error, FS30's own
-    CUDA tests all ran and passed (none skipped), and every model of :data:`RUN_PINS` has a
+    CUDA tests all ran and passed (none skipped; each case the file defines, found by
+    :func:`device_tests_expected` or given as ``expected``, is asked for by name, and a missing
+    one is a reason of its own; an extra case in the file's module that passed is let through),
+    and every model of :data:`RUN_PINS` has a
     bring-up that logged its line and shows the step accepted, the two roots equal and the
     arrival digests in use and the leaves the commit took from them (``known``) each equal to
     ``M`` less the ``dK`` leaves and the products hashed on arrival equal to ``M`` (the ``dK``
@@ -807,6 +833,12 @@ def device_leaves_gate(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | N
         if not any(n.endswith("test_gpu_memory_does_not_hold_the_transcript") for n in mine):
             why.append("the capture's GPU-memory test did not run")
         why += [f"{n}: {o}" for n, o in sorted(mine.items()) if o != "passed"]
+        if expected is None:
+            expected, err = device_tests_expected()
+            if err:
+                why.append(f"FS30's expected tests could not be collected: {err}")
+        why += [f"{n}: expected but not in the junit report"
+                for n in expected if n not in ex["cases"]]
     by_model = {(p.get("info") or {}).get("model"): p for p in parts if p.get("kind") == "bring_up"}
     models: dict[str, Any] = {}
     for repo, _rev in RUN_PINS:

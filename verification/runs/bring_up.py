@@ -93,7 +93,7 @@ import torch
 from setup.config import load_config, setup_determinism
 from setup.data import schedule
 from setup.model import model_pin
-from verification.commitment.leaves import commit_leaves, dataset_tree, leaf_hash, leaf_hashes_of
+from verification.commitment.leaves import dataset_tree, leaf_hash, leaf_hashes_of
 from verification.computation.instances.decoder import DecoderComputation
 from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import (
@@ -376,12 +376,12 @@ def bring_up(c: DecoderComputation, D: Sequence[Any], h_D: bytes, *, T: int, k: 
 def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     """The one line FS30's session reads for step ``T`` (needs ``keep_last``). It holds the
     prover's root (the tree the commit built, with the arrival digests and the device kernel),
-    the root the CPU path gives over the same leaves (:func:`commit_leaves` with no ``known``,
-    every leaf hashed by the C library), how many arrival digests the commit could use (``used``),
-    how many products the capture hashed on arrival (``hashed``; the ``dK`` records too, whose
-    digests go unused), how many leaves the commit actually took from them (``commit known``,
-    ``HashStats.known`` of the commit's own hash call, ``StepRecord.known``), ``M``, and how many
-    ``dK`` leaves there are (the ones the prover hashes at the commit); and whether the step was
+    the root the CPU path gives over the same leaves (every leaf hashed by the C library through
+    :func:`leaf_hashes_of`, never the routed ``commit_leaves``), how many arrival digests the
+    commit could use (``used``), how many products the capture hashed on arrival (``hashed``;
+    the ``dK`` records too, whose digests go unused), how many leaves the commit actually took
+    from them (``commit known``, ``HashStats.known`` of the commit's own hash call,
+    ``StepRecord.known``), ``M``, and how many ``dK`` leaves there are (the ones the prover hashes at the commit); and whether the step was
     accepted. Run on a CPU, no leaf takes a digest and the roots agree trivially."""
     if b.kept is None:
         raise ValueError("device_leaves_line needs the step's leaves: run with keep_last")
@@ -389,7 +389,9 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     if step.known is None:
         raise ValueError("device_leaves_line needs the commit's known count (StepRecord.known)")
     leaves = [b.kept.leaf(i) for i in range(c.n_leaves)]
-    cpu_root = commit_leaves(c, leaves).root
+    # The C library alone (``leaf_hashes_of``, a device leaf read through its host copy), never
+    # the routed ``commit_leaves``: a CUDA leaf there would be hashed by the kernel under test.
+    cpu_root = MerkleTree(leaf_hashes_of(c, list(enumerate(leaves)))).root
     ah = (step.capture or {}).get("arrival_hash") or {}
     used, hashed = ah.get("used", 0), ah.get("leaves", 0)
     dk = sum(1 for q in c.products if product_class(c, q) == "dK")

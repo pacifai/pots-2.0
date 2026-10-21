@@ -2838,13 +2838,13 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     included, with `reserved_gb` and `nested_reserved_gb` on CUDA.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
     pod. `FS11_SESSION` (`fs11`, the default, `recheck`, `profile-check`, `nvlink-probe`,
-    `kernel-speed` or `fs32-pair`; anything else is a refusal) goes to the session's
-    `--session`. Preflight (refuses without a way to end the pod; a refusal it can act on
-    terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
+    `kernel-speed`, `fs32-pair` or `device-leaves`; anything else is a refusal) goes
+    to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
+    can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    11,800 s for `fs32-pair`; `FS31_CARDS` is passed on), the session, a kill of a session
-    still running `FS11_HANG_MARGIN_S` after the work deadline, packing into `OUT_DIR.tar`
-    with
+    11,800 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
+    session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,
+    packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
     `OUT_DIR.FETCHED` to end it), and the terminate: `runpodctl pod delete`, `runpodctl remove
     pod`, REST `DELETE`, each under a 60 s limit, confirmed by a follow-up read before
