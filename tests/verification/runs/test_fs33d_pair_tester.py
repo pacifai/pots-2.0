@@ -76,7 +76,8 @@ def test_step_times_reads_what_report_costs_really_prints():
     assert got[0]["total_s"] == 13.75
 
 
-def test_a_real_run_verified_log_gives_every_pair_extra(tiny_main, capsys, monkeypatch):  # noqa: F811
+def test_a_real_run_verified_log_gives_every_pair_extra(  # noqa: F811
+        tiny_main, capsys, monkeypatch):
     monkeypatch.setenv("VERIF_STEPS", "3")
     assert rv.main(["--steps", "3", "--keep-step", "3", "--no-metrics"]) == 0
     text = capsys.readouterr().out
