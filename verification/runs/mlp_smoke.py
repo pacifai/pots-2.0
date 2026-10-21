@@ -54,6 +54,7 @@ from verification.computation.instances.mlp import (
 )
 from verification.parameters import load_protocol_config
 from verification.runs.metrics import COUNT_STEPS, PASS_STEPS, MetricsWriter
+from verification.runs.prover_spec import refuse_pipelined
 from verification.runs.scenarios import (
     HONEST,
     Expected,
@@ -167,6 +168,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = p.parse_args(argv)
     cfg = load_config()
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
+    refuse_pipelined(cfg, "mlp_smoke",
+                     "the MLP has no prover spec, only the decoder does")
     k = load_protocol_config().k
     T = args.steps if args.steps is not None else cfg.steps
     if T < CHAIN_STEP:

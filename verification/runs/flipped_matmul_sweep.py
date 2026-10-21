@@ -147,6 +147,7 @@ from verification.runs.cheats import (
     run_cheat,
 )
 from verification.runs.metrics import MetricsWriter, spec_class
+from verification.runs.prover_spec import loop_mode
 from verification.runs.run_verified import (
     KeptStep,
     honest_run_name,
@@ -747,6 +748,7 @@ def run_flip(env: CheatEnv, *, t: int = SWEEP_STEP, flip_name: str | None = None
     c = env.c
     flip_name = flip_name or binding_product(c).name
     m_flip = c.m_of(flip_name)  # type: ignore[attr-defined]
+    env.final(t)  # before a pipelined run drops the model
     return run_cheat(env, Scenario("flip", f"largest entry of P_{m_flip} ({flip_name}) "
                                    f"sign-flipped after capture at step {t}",
                                    FlipProduct(t, m_flip), Expected(t, "5", "failed", m_flip)),
@@ -763,7 +765,10 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
     """The flipped-matmul cheat, then the sweep and the check-6 trial on step ``t``: of
     ``kept``, a stored step, or (``None``) of an honest base run here. The cheat flips
     ``flip_name``, by default the binding product (an input gradient on the decoder, which 6a
-    can't see)."""
+    can't see). Always sequential: ``env.pipelined`` is refused."""
+    if env.pipelined:
+        raise ValueError("run_sweep: the sweep perturbs a step kept in this process; it does "
+                         "not run pipelined (use --no-sweep for the cheat alone)")
     c = env.c
     flip_name = flip_name or binding_product(c).name
     honest, keep = None, KeepStep(t)
@@ -957,10 +962,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.trials < 1 or args.deep_trials < 0 or any(not x > 0 for x in args.x + args.deep_x):
         p.error("need --trials ≥ 1, --deep-trials ≥ 0 and every x > 0")
     cfg = load_config()
+    if cfg.pipelined and not args.no_sweep:
+        p.error("VERIF_PIPELINED=1 is refused for the sweep and for --source in-process: the "
+                "sweep perturbs a step kept in this process (KeepStep, or the stored step), "
+                "and only --no-sweep (the flipped-matmul cheat alone) runs pipelined")
     pc = load_protocol_config()
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     setup_determinism(cfg)
     env = load_env(cfg, pc)
+    loop_mode(cfg)
+    if args.no_sweep:
+        env.prepare(SWEEP_STEP)
     print(f"A13 flipped matmul and sweep: {cfg.model}@{cfg.model_revision[:12]}, k {env.k}, "
           f"step {SWEEP_STEP}, band file {pc.band_file} ({env.bands.source[:16]}…), "
           f"τ {env.bands.tau:.2f}, source {args.source}")

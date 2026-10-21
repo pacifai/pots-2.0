@@ -41,6 +41,7 @@ from verification.computation.interface import DeclaredComputation, snapshot_wei
 from verification.parameters import ProtocolConfig
 from verification.runs.llama_step import load_committed_dataset
 from verification.runs.metrics import MetricsWriter, nan_as_inf, rho_arrays, run_name
+from verification.runs.prover_spec import decoder_spec
 from verification.runs.run_verified import JudgingVerifiers, calibration_band_hash
 from verification.runs.scenarios import (
     BuildModel,
@@ -74,7 +75,11 @@ class CheatEnv:
     ``b_tilde`` is ``D̃``'s batch at ``π(poison_step)``, the poisoned batch ``b̃``.
     ``bpr_records`` is the number of ``b̃``'s records that differ from ``π``'s batch, and
     ``bpr_actual`` their share of the batch (EVALUATION_SPEC §2's actual BPR).
-    ``seed`` fixes ``π`` (F8c) for the prover, the verifier and ``b̃`` alike."""
+    ``seed`` fixes ``π`` (F8c) for the prover, the verifier and ``b̃`` alike.
+
+    ``pipelined`` and ``prover`` (the :class:`~verification.runs.pipeline.ProverSpec`) are the
+    mode every :func:`run_cheat` runs in (FS33d): pipelined, the prover is the child's, and
+    ``models`` is dropped by :meth:`prepare` before the first run."""
 
     c: DeclaredComputation
     D: list[Any]
@@ -89,19 +94,23 @@ class CheatEnv:
     k: int
     models: BuildModel
     verifiers: JudgingVerifiers
+    prover: Callable[[], Any] | None = None
+    pipelined: bool = False
     _finals: dict[int, dict[str, torch.Tensor]] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def build(cls, c: DeclaredComputation, D: Sequence[Any], w0: Mapping[str, torch.Tensor],
               bands: Bands, *, k: int, h_D: bytes, seed: int, b_tilde: Sequence[Any],
-              poison_step: int, build_model: BuildModel | None = None) -> CheatEnv:
+              poison_step: int, build_model: BuildModel | None = None,
+              prover: Callable[[], Any] | None = None, pipelined: bool = False) -> CheatEnv:
         b = [D[i] for i in schedule(poison_step, c.n_s, len(D), seed)]
         changed = sum(c.encode_record(x) != c.encode_record(y) for x, y in zip(b, b_tilde))
         if len(b_tilde) != c.n_s or changed == 0:
             raise ValueError(f"b̃ must be {c.n_s} records, at least one unlike π's batch")
         return cls(c, list(D), h_D, seed, list(b_tilde), poison_step, int(changed),
                    changed / c.n_s, dict(w0), bands, k, build_model or c.build_model,
-                   JudgingVerifiers(c, len(D), w0, bands, k=k, h_D=h_D, seed=seed))
+                   JudgingVerifiers(c, len(D), w0, bands, k=k, h_D=h_D, seed=seed),
+                   prover, pipelined)
 
     def final(self, T: int) -> dict[str, torch.Tensor]:
         """Check 8's reference for a run of ``T`` steps: ``T`` honest uncaptured steps."""
@@ -109,6 +118,18 @@ class CheatEnv:
             self._finals[T] = honest_final(self.c, self.D, self.w0, T, seed=self.seed,
                                            build_model=self.models)
         return self._finals[T]
+
+    def prepare(self, *steps: int) -> None:
+        """Compute check 8's reference for every ``T`` in ``steps``, then, when pipelined, drop
+        the prover model and empty the CUDA cache (``ReusedModel.drop``): the parent's GPU 0
+        holds no prover model during a pipelined run. Call it once, with every ``T`` the entry
+        point will run, before the first :func:`run_cheat`; a ``T`` asked for later rebuilds the
+        model for the reference (``ReusedModel`` rebuilds on the next call)."""
+        for T in steps:
+            self.final(T)
+        drop = getattr(self.models, "drop", None)
+        if self.pipelined and drop is not None:
+            drop()
 
 
 def poisoned_batch(c: DeclaredComputation, D_tilde: Sequence[Any], step: int,
@@ -153,13 +174,15 @@ def load_env(cfg: RunConfig, pc: ProtocolConfig) -> CheatEnv:
 
 def load_level(cfg: RunConfig, data_dir: Path, *, c: DecoderComputation, D: Sequence[Any],
                h_D: bytes, w0: Mapping[str, torch.Tensor], bands: Bands, k: int,
-               models: BuildModel) -> CheatEnv:
+               models: BuildModel, prover: Callable[[], Any] | None = None) -> CheatEnv:
     """The cheat environment of one seed and level, over a model, ``D``, ``W_0`` and band file
     already loaded: ``D̃`` from ``data_dir/D_tilde.bin``, checked against ``meta.json``'s
     ``h_D_tilde``, and the poisoned step from its ``poisoning.step``. ``meta.json`` must
     describe the run (:func:`check_meta`, with ``cfg``'s seed and ``VERIF_POISON_COUNT``) and
     publish the same ``h_D``. :func:`load_env` calls it once; the full-scale driver
-    (``runs/full_scale.py``) once per level, so one model load serves a seed's levels."""
+    (``runs/full_scale.py``) once per level, so one model load serves a seed's levels. A pipelined run
+    (``cfg.pipelined``) needs the spec of the seed's own config: pass ``prover`` when ``cfg`` is
+    a level's copy of it (its ``poison_count`` is not the environment's)."""
     meta = json.loads((data_dir / "meta.json").read_text())
     check_meta(meta, cfg)
     if meta.get("h_D") != h_D.hex():
@@ -171,7 +194,9 @@ def load_level(cfg: RunConfig, data_dir: Path, *, c: DecoderComputation, D: Sequ
     step = int(meta["poisoning"]["step"])
     return CheatEnv.build(c, D, w0, bands, k=k, h_D=h_D, seed=cfg.seed,
                           b_tilde=poisoned_batch(c, D_tilde, step, len(D), cfg.seed),
-                          poison_step=step, build_model=models)
+                          poison_step=step, build_model=models,
+                          prover=prover or (decoder_spec(cfg) if cfg.pipelined else None),
+                          pipelined=cfg.pipelined)
 
 
 # ---- one cheat run ------------------------------------------------------------------------
@@ -192,7 +217,8 @@ def run_cheat(env: CheatEnv, scenario: Scenario, *, T: int,
                            cheat_step=cheat_step))
     r = run_scenario(env.c, env.D, env.w0, scenario, T=T, k=env.k, seed=env.seed,
                      final=env.final(T), recorder=rec, h_D=env.h_D, build_model=env.models,
-                     verifier=env.verifiers.for_steps(T))
+                     verifier=env.verifiers.for_steps(T), pipelined=env.pipelined,
+                     prover=env.prover)
     report(r, out)
     if writer is not None:
         writer.write([oracle_record(writer.run, r, env.bands, bpr_records=bpr_records,

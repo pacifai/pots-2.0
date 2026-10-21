@@ -47,6 +47,7 @@ from verification.runs.cheats import (
     run_cheat,
 )
 from verification.runs.metrics import MetricsWriter
+from verification.runs.prover_spec import loop_mode
 from verification.runs.scenarios import (
     CommitBatch,
     Expected,
@@ -73,13 +74,23 @@ def _writer(writers: Writers | None, scenario: str) -> Iterator[MetricsWriter | 
             w.close()
 
 
+def _poisoned_w_next(r: ScenarioResult, t: int, name: str) -> dict[str, torch.Tensor]:
+    """``W_{t+1}`` of a run cut at step ``t``: the loop's ``w_final``, which is the last step's
+    emitted weights in both modes (the pipelined parent has no fault object to read them from;
+    its fault ran in the child)."""
+    if len(r.loop.steps) != t or r.loop.w_final is None:
+        raise RuntimeError(f"step {t} never emitted W_{{t+1}} in {name}")
+    return r.loop.w_final
+
+
 def run_poisoned(env: CheatEnv, *, writers: Writers | None = None,
                  out: Callable[[str], None] = print) -> list[ScenarioResult]:
     """A1, A2 and A3 at the poisoned step ``t``, each a run of ``t`` steps cut there.
 
     ``writers(scenario)`` opens each cheat's own ``MetricsWriter`` (its cell's run directory);
-    each is closed after its run."""
+    each is closed after its run. ``env.prepare(env.poison_step)`` first, for a pipelined run."""
     c, t = env.c, env.poison_step
+    env.final(t)  # before any pipelined run drops the model
     first = c.product(1)
 
     def run(s: Scenario) -> ScenarioResult:
@@ -93,14 +104,13 @@ def run_poisoned(env: CheatEnv, *, writers: Writers | None = None,
     a2 = TrainOn(t, env.b_tilde)
     r2 = run(Scenario("A2", f"commit π({t})'s batch, train step {t} on b̃", a2,
                       Expected(t, "5", "failed", first.m)))
-    if a1.w_next is None or a2.w_next is None:
-        raise RuntimeError(f"step {t} never emitted W_{{t+1}} in A1 or A2")
-    same = all(torch.equal(a1.w_next[n], a2.w_next[n]) for n in c.weight_names)
+    w1, w2 = _poisoned_w_next(r1, t, "A1"), _poisoned_w_next(r2, t, "A2")
+    same = all(torch.equal(w1[n], w2[n]) for n in c.weight_names)
     if not same:
         raise AssertionError("S6e: A1's and A2's poisoned W_{t+1} differ")
     out(f"S6e: A1's and A2's W_{{t+1}} are bit for bit equal ({len(c.weight_names)} tensors)")
     r3 = run(Scenario("A3", f"honest step {t} committed with the poisoned W_{{t+1}}",
-                      SpliceWNext(t, a1.w_next), Expected(t, "6a", "failed")))
+                      SpliceWNext(t, w1), Expected(t, "6a", "failed")))
     return [r1, r2, r3]
 
 
@@ -115,6 +125,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_metrics = cfg.metrics if args.metrics is None else args.metrics
     setup_determinism(cfg)
     env = load_env(cfg, pc)
+    loop_mode(cfg)
+    env.prepare(env.poison_step)
     print(f"A13 poisoned step: {cfg.model}@{cfg.model_revision[:12]}, k {env.k}, step "
           f"{env.poison_step}, BPR {env.bpr_records}/{env.c.n_s} ({env.bpr_actual:g}), band "
           f"file {pc.band_file} ({env.bands.source[:16]}…), τ {env.bands.tau:.2f}")

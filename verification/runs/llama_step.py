@@ -54,6 +54,7 @@ from verification.runs.metrics import (
     TimeRecorder,
     lifetime_maxrss_bytes,
 )
+from verification.runs.prover_spec import loop_mode
 from verification.runs.scenarios import (
     HONEST,
     ReusedModel,
@@ -122,12 +123,14 @@ def run_honest(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, 
                recorder: TimeRecorder | MemoryRecorder | CountRecorder | None = None,
                build_model: Callable[[], torch.nn.Module] | None = None,
                verifier: Callable[[Section | None], Verifier] | None = None,
-               release_cache: bool | None = None) -> ScenarioResult:
+               release_cache: bool | None = None, pipelined: bool = False,
+               prover: Callable[[], Any] | None = None) -> ScenarioResult:
     """``T`` honest steps through the S3 loop, judged by provisional bands unless ``verifier``
-    (as in ``run_scenario``, with ``release_cache``) gives a judging verifier."""
+    (as in ``run_scenario``, with ``release_cache``) gives a judging verifier. ``pipelined``
+    and ``prover`` are ``run_scenario``'s; the mode is the caller's, not ``VERIF_PIPELINED``."""
     return run_scenario(c, dataset, w0, HONEST, T=T, k=k, seed=seed, final=final,
                         recorder=recorder, h_D=h_D, build_model=build_model, verifier=verifier,
-                        release_cache=release_cache)
+                        release_cache=release_cache, pipelined=pipelined, prover=prover)
 
 
 def _band_label(bands: Bands) -> str:
@@ -204,10 +207,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         make = judging_verifier(c, len(D), w0, bands, T=T, k=k, seed=cfg.seed, h_D=h_D)
     run_args = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models,
                     verifier=make)
+    pl, spec = loop_mode(cfg)
+    if pl:
+        models.drop()  # the prover is the child's: no second model on the parent's GPU 0
+    mode = dict(pipelined=pl, prover=spec)
     cache = dict(release_cache=cfg.release_cache)  # not count_run's: it counts, on any device
     mem_rows = None
     if not use_metrics:
-        r = run_honest(c, D, w0, **run_args, **cache)
+        r = run_honest(c, D, w0, **run_args, **cache, **mode)
     else:
         llama = {"n_s": c.n_s, "n": c.n, "eta": c.eta, "k": k, "T": T, "n_records": len(D),
                  "M": c.M, "n_leaves": c.n_leaves}
@@ -222,11 +229,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                            band_file_hash=None if make is None else bands.source, h_D=h_D,
                            extra={"band_source": "provisional" if make is None
                                   else str(args.bands), **llama}) as mw:
-            r = run_honest(c, D, w0, **run_args, **cache, recorder=mw.recorder(HONEST.name))
-            mem_rows = memory_run(c, D, w0, run=RUN_NAME, **run_args, **cache,
+            r = run_honest(c, D, w0, **run_args, **cache, **mode,
+                           recorder=mw.recorder(HONEST.name))
+            mem_rows = memory_run(c, D, w0, run=RUN_NAME, **run_args, **cache, **mode,
                                   device=mw.device)
             mw.write(mem_rows)
-            mw.write(count_run(c, D, w0, run=RUN_NAME, **run_args))
+            mw.write(count_run(c, D, w0, run=RUN_NAME, pipelined=False, **run_args))  # sequential
         print(f"metrics: {mw.dir}")
     report(r)
     report_residuals(r)

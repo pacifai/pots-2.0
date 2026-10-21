@@ -47,6 +47,14 @@ prover's references and the cache release; pipelined the parent's ``SharedStore.
 ``close`` and its cache release (the child's release and cache release are in the child's own
 sections, ``handoff.release``). The harness section ``handoff.totals`` is in none of the four.
 
+**The stored step.** With a ``KeptStepHandoff`` naming step ``t`` (``run_verified``'s stored
+step, EV2), the parent writes step ``t`` to disk from the opened store's leaves and the
+package's ``tree`` and ``h_D`` paths, after ``verify_step(t)`` and before ``close``, and checks
+the files' root as ``KeptStepHandoff.write`` does. The write is in no section and in none of
+the step's four clocks (``handoff_s`` excludes it), as in the sequential loop. Its cost is real
+all the same: it delays step ``t``'s release, so the child's step ``t + 2`` starts later by the
+write's time. A step the run never reaches is never written. Any other hand-off is refused.
+
 **Two transcripts at most.** The child starts step ``t + 2`` only after the parent has released
 step ``t``: it blocks, before each step, while two steps are unreleased. The release order is
 the parent's ``close``, then the child's ``StepHold.release``. A failed release
@@ -614,9 +622,11 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
     fault = fault or ProverFault()
     if prover is None:
         raise ValueError("pipelined: the prover's process needs a ProverSpec (prover=...)")
-    if handoff is not None and handoff is not IN_MEMORY:
+    from verification.runs.run_verified import KeptStepHandoff  # that module imports this one
+    keep = handoff if isinstance(handoff, KeptStepHandoff) else None
+    if handoff is not None and handoff is not IN_MEMORY and keep is None:
         raise ValueError("pipelined: the handoff is the shared store; only IN_MEMORY (the "
-                         "default) is allowed")
+                         "default) or a KeptStepHandoff is allowed")
     if _is_cuda(c.placement.prover) and not c.placement.sharded:
         raise ValueError("pipelined: a CUDA prover device needs a sharded placement "
                          "(verifier_devices): an unsharded run's leaves live on the host, and "
@@ -663,14 +673,23 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
             del msg
             h0 = time.perf_counter()
             store = SharedStore.open(c, pkg)
+            kept_from = (pkg.tree, pkg.dataset_paths) if keep is not None and t == keep.step \
+                else None
             del pkg
             h1 = time.perf_counter()
             try:
                 rej = verifier.verify_step(t, store)
             finally:
                 h2 = time.perf_counter()
-                store.close()
-                store = None
+            wr = 0.0
+            if kept_from is not None:  # the stored step: outside every section and clock
+                w0_ = time.perf_counter()
+                leaves = [store.leaf(i) for i in range(c.n_leaves)]
+                keep.write_from(c, leaves, *kept_from)
+                del leaves, kept_from
+                wr = time.perf_counter() - w0_
+            store.close()
+            store = None
             h3 = time.perf_counter()
             link.send(("release", t))
             if release_cache:
@@ -684,7 +703,7 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
             if recorder is not None:
                 recorder.merge_step(t, part)
             rec = StepRecord(t, rej, f["loss"], f["prove_s"], f["commit_s"], h2 - h1,
-                             (h1 - h0) + (h3 - h2) + (h4 - h3), f["capture"],
+                             (h1 - h0) + (h3 - h2) + (h4 - h3) - wr, f["capture"],
                              f["transcript_bytes"], f["leaves"], f["root"], f["known"])
             del part, f
             result.steps.append(rec)
