@@ -18,11 +18,22 @@ def _part(name, kind, extras=None, status="ok", **info):
     return {"name": name, "kind": kind, "status": status, "info": info, "extras": extras}
 
 
-def _run(arm, verdicts=("accepted",) * 3, final="a" * 8, kept="b" * 16):
+def _run(arm, verdicts=("accepted",) * 3, final="a" * 8, kept="b" * 16, mode=None):
+    mode = mode or ("pipelined" if arm.startswith("pipelined") else "sequential")
+    times = [{"prover_s": 1.0, "verifier_s": 2.0, "handoff_s": 0.5, "total_s": 3.5}] * 3
     return _part(f"run_{arm}", "pair_run",
                  {"verdicts": list(verdicts), "kept_root": kept, "final_root": final,
                   "losses": [1.5, 1.25, 1.0], "step_roots": ["r1", "r2", "r3"],
-                  "step_lines": [f"{v}; max residual 1.00" for v in verdicts]}, arm=arm)
+                  "step_lines": [f"{v}; max residual 1.00" for v in verdicts],
+                  "step_times": times, "loop_mode": mode}, arm=arm)
+
+
+def _cheat(name, names, mode=None, outcome="exact", pipelined=False):
+    mode = mode or ("pipelined" if pipelined else "sequential")
+    return _part(name, "cheat",
+                 {"outcomes": {n: outcome for n in names},
+                  "oracle_lines": {n: f"{n} d a {outcome} 1 2 3" for n in names},
+                  "loop_mode": mode}, **({"arm": "pipelined"} if pipelined else {}))
 
 
 def _card(arm, root="r1"):
@@ -40,11 +51,12 @@ def _parts(**over):
              _part("models", "models"), _part("native_build", "other"),
              _suite("fast_suite", skipped=2), _suite("two_gpu_slow"),
              _part("smollm2_calibrate", "other"), _card("unsharded"), _card("sharded"),
-             _run("unsharded"), _run("sharded"),
-             _part("poisoned_step", "cheat",
-                   {"outcomes": {n: "exact" for n in ("A1", "A2", "A3")}}),
-             _part("hidden_steps", "cheat", {"outcomes": {"hidden": "exact"}}),
-             _part("flipped_matmul", "cheat", {"outcomes": {"flip": "exact"}})]
+             _run("unsharded"), _run("sharded"), _run("pipelined"), _run("pipelined_metrics"),
+             _cheat("poisoned_step", ("A1", "A2", "A3")), _cheat("hidden_steps", ("hidden",)),
+             _cheat("flipped_matmul", ("flip",)),
+             _cheat("poisoned_step_pipelined", ("A1", "A2", "A3"), pipelined=True),
+             _cheat("hidden_steps_pipelined", ("hidden",), pipelined=True),
+             _cheat("flipped_matmul_pipelined", ("flip",), pipelined=True)]
     return [over.get(p["name"], p) for p in parts]
 
 
@@ -63,6 +75,35 @@ def test_plan_has_the_parts_each_with_peaks(tmp_path):
                                if p.name in ("fast_suite", "run_unsharded", "card_unsharded"))
 
 
+def test_plan_has_the_pipelined_arms_sharded_and_only_they_set_the_mode(tmp_path):
+    plan = {p.name: p for p in fs.fs32_pair_plan(tmp_path / "up", tmp_path / "out")}
+    piped = {"run_pipelined", "run_pipelined_metrics", "poisoned_step_pipelined",
+             "hidden_steps_pipelined", "flipped_matmul_pipelined"}
+    assert piped <= set(plan) and list(plan)[0] == "peer_check"
+    assert set(fs.PAIR_PARTS) - {"native_build"} == set(plan)  # the job adds the native build
+    assert {n for n, p in plan.items() if p.env.get("VERIF_PIPELINED")} == piped
+    assert all(plan[n].env["VERIF_PIPELINED"] == "1"
+               and plan[n].env["VERIF_VERIFIER_DEVICES"] == fs.PAIR_DEVICES for n in piped)
+    dirs = [p.env["VERIF_OUTPUT_DIR"] for n, p in plan.items() if n in piped | {
+        "run_sharded", "poisoned_step", "hidden_steps", "flipped_matmul"}]
+    assert len(set(dirs)) == len(dirs)  # each arm in its own run directory
+    run, metrics = plan["run_pipelined"], plan["run_pipelined_metrics"]
+    for p in (run, metrics, plan["run_sharded"]):
+        assert p.kind == "pair_run" and "--keep-step" in p.argv
+        assert p.argv[p.argv.index("--steps") + 1] == str(fs.PAIR_STEPS)
+    assert "--no-metrics" in run.argv and "--metrics" in metrics.argv
+    assert run.info["arm"] == "pipelined" and metrics.info["arm"] == "pipelined_metrics"
+    assert metrics.timeout_s == fs.PAIR_TIMEOUT_S["run_metrics"]
+    assert plan["flipped_matmul_pipelined"].argv[-2:] == ["--no-sweep", "--no-metrics"]
+    assert all(plan[n].kind == "cheat" and plan[n].info["arm"] == "pipelined" for n in piped
+               if n.endswith("_pipelined") and n != "run_pipelined")
+
+
+def test_the_default_deadline_is_twice_the_estimate_and_the_job_holds_it():
+    assert fs.pair_default_deadline_s() == 15500
+    assert "DEFAULT_DEADLINE_S=15500" in JOB.read_text()
+
+
 def test_two_cards_of_any_type_pass_and_one_is_refused():
     ok = {"gpus": ["NVIDIA A40"] * 2, "cuda_available": True}
     assert fs.refusal(ok, True, fs.PAIR_CARDS) is None
@@ -72,11 +113,17 @@ def test_two_cards_of_any_type_pass_and_one_is_refused():
 def test_comparison_passes_when_everything_agrees():
     pair = fs.fs32_pair(_parts())
     assert pair["pass"] and pair["roots_equal"] and pair["verdicts_equal"]
-    assert pair["slowest_failing"] is None
+    assert not pair["mode_problems"] and pair["slowest_failing"] is None
+    assert set(pair["step_times"]) == {"unsharded", "sharded", "pipelined", "pipelined_metrics"}
+    assert pair["step_times"]["pipelined"][0]["total_s"] == 3.5
+    assert set(pair["gpu_peak"]) == set(fs.PAIR_PARTS)
     lines = fs._pair_lines(pair)
     assert lines[0].startswith("FS32 roots equal: yes")
     assert "FS32 sharded plain and proved W_{t+1}: equal" in lines
-    assert "FS32 cheat flip: exact" in lines and lines[-1] == "FS32 slowest failing test: none"
+    assert "FS32 cheat flip: exact" in lines and "FS32 pipelined cheat flip: exact" in lines
+    assert any(x.startswith("FS32 step wall time pipelined") and "1.0/2.0/0.5/3.5" in x
+               for x in lines)
+    assert lines[-1] == "FS32 slowest failing test: none"
 
 
 def test_one_step_root_or_line_that_differs_is_no_pass():
@@ -91,6 +138,58 @@ def test_one_step_root_or_line_that_differs_is_no_pass():
     short = _run("sharded")
     short["extras"]["step_roots"] = ["r1", "r2"]
     assert not fs.fs32_pair(_parts(run_sharded=short))["pass"]
+
+
+def test_a_pipelined_arm_that_differs_from_the_sequential_one_is_no_pass():
+    for arm, key, value in (("pipelined", "final_root", "zz"), ("pipelined_metrics", "kept_root",
+                                                                "c" * 16),
+                            ("pipelined", "step_roots", ["r1", "rX", "r3"])):
+        other = _run(arm)
+        other["extras"][key] = value
+        pair = fs.fs32_pair(_parts(**{f"run_{arm}": other}))
+        assert not pair["pass"] and pair["roots"][f"{arm} {key}"] is False
+    other = _run("pipelined")
+    other["extras"]["step_lines"][1] = "accepted; max residual 1.01"
+    pair = fs.fs32_pair(_parts(run_pipelined=other))
+    assert not pair["pass"] and not pair["verdicts_equal"]
+    other = _run("pipelined_metrics", verdicts=("accepted", "REJECTED", "accepted"))
+    assert not fs.fs32_pair(_parts(run_pipelined_metrics=other))["honest"]
+
+
+def test_a_pipelined_cheat_that_differs_is_no_pass():
+    off = _cheat("hidden_steps_pipelined", ("hidden",), outcome="accepted", pipelined=True)
+    pair = fs.fs32_pair(_parts(hidden_steps_pipelined=off))
+    assert not pair["pass"] and pair["pipelined_cheats"]["hidden"] == "accepted"
+    assert "FS32 pipelined cheat hidden: accepted (NOT exact); oracle line differs from " \
+        "sequential" in fs._pair_lines(pair)
+    row = _cheat("flipped_matmul_pipelined", ("flip",), pipelined=True)
+    row["extras"]["oracle_lines"]["flip"] = "flip d a exact 1 2 4"  # exact, but another row
+    pair = fs.fs32_pair(_parts(flipped_matmul_pipelined=row))
+    assert not pair["pass"] and pair["oracle_equal"]["flip"] is False
+
+
+def test_a_part_in_the_wrong_loop_mode_prints_its_fail_line():
+    pair = fs.fs32_pair(_parts(run_pipelined=_run("pipelined", mode="sequential"),
+                               run_sharded=_run("sharded", mode="pipelined")))
+    text = fs._pair_lines(pair)
+    assert not pair["pass"] and pair["mode_problems"] == {"run_pipelined": "sequential",
+                                                          "run_sharded": "pipelined"}
+    assert "FS32 FAIL: run_pipelined ran sequentially" in text
+    assert "FS32 FAIL: run_sharded ran pipelined" in text
+    nothing = _cheat("hidden_steps_pipelined", ("hidden",), pipelined=True)
+    nothing["extras"]["loop_mode"] = None
+    text = fs._pair_lines(fs.fs32_pair(_parts(hidden_steps_pipelined=nothing)))
+    assert "FS32 FAIL: hidden_steps_pipelined printed no loop mode line" in text
+
+
+def test_a_missing_pipelined_part_is_a_fail_line_and_no_pass():
+    parts = [p for p in _parts() if p["name"] != "run_pipelined"]
+    pair = fs.fs32_pair(parts)
+    assert not pair["pass"] and pair["part_problems"]["run_pipelined"] == "not_started"
+    assert "FS32 FAIL: run_pipelined did not run" in fs._pair_lines(pair)
+    parts = [p for p in _parts() if p["name"] != "poisoned_step_pipelined"]
+    pair = fs.fs32_pair(parts)
+    assert not pair["pass"] and pair["pipelined_cheats"]["A1"] is None
 
 
 def test_plain_and_proved_w_next_differing_is_printed_but_outside_pass():
@@ -139,7 +238,15 @@ def test_pair_run_extras_reads_verdicts_roots_and_losses(tmp_path):
     e = fs._pair_run_extras(log, w)
     assert e == {"verdicts": ["accepted", "REJECTED"], "kept_root": "0123456789abcdef",
                  "step_lines": ["accepted; x", "REJECTED; y"], "step_roots": ["a" * 64],
-                 "final_root": "ff", "losses": [1.0, 2.0]}
+                 "final_root": "ff", "losses": [1.0, 2.0], "step_times": [],
+                 "loop_mode": None}
+    log.write_text("loop mode: pipelined\nstep 1: prover 5.00 s (prove_step 4.00 s, commit 1.00 s)"
+                   "; verifier 7.50 s (0 0.50, 1 1.20); hand-off 0.25 s\n")
+    e = fs._pair_run_extras(log, w)
+    assert e["loop_mode"] == "pipelined"
+    assert (e["step_times"][0]["prover_s"], e["step_times"][0]["verifier_s"],
+            e["step_times"][0]["handoff_s"], e["step_times"][0]["total_s"]) == (
+        5.0, 7.5, 0.25, 12.75)
     assert fs._pair_run_extras(tmp_path / "no", tmp_path / "no")["verdicts"] == []
 
 
@@ -147,7 +254,12 @@ def test_cheat_extras_takes_the_outcome_column(tmp_path):
     log = tmp_path / "log"
     log.write_text("A1 poisoned x y exact 0.1 0.2 0.3\nflip a b c wrong-check 1 2 3\n"
                    "other a b c exact 1 2 3\nA2 short\n")
-    assert fs._cheat_extras(log) == {"outcomes": {"A1": "exact", "flip": "wrong-check"}}
+    assert fs._cheat_extras(log) == {
+        "outcomes": {"A1": "exact", "flip": "wrong-check"}, "loop_mode": None,
+        "oracle_lines": {"A1": "A1 poisoned x y exact 0.1 0.2 0.3",
+                         "flip": "flip a b c wrong-check 1 2 3"}}
+    log.write_text("loop mode: sequential\n")
+    assert fs._cheat_extras(log)["loop_mode"] == "sequential"
 
 
 def test_gpu_peaks_keeps_the_maximum_per_card(tmp_path):
@@ -162,7 +274,7 @@ def test_gpu_peaks_keeps_the_maximum_per_card(tmp_path):
 
 def test_job_script_accepts_the_session_and_gives_it_the_longer_deadline():
     text = JOB.read_text()
-    assert "fs32-pair" in text and "DEFAULT_DEADLINE_S=11800" in text
+    assert "fs32-pair" in text and "DEFAULT_DEADLINE_S=%d" % fs.pair_default_deadline_s() in text
     assert subprocess.run(["bash", "-n", str(JOB)]).returncode == 0
 
 
@@ -199,7 +311,7 @@ def _fake_plan(tmp_path, root_sharded="a" * 64, outcome="exact", junit_for=("fas
     card = ("import json,sys;json.dump({'card':{'name':'A40','uuid':'u','pci_bus_id':'p'},"
             "'plain':{'w_next_root':'w','loss':1.0},'proved':{'root':'r','w_next_root':'w',"
             "'loss':1.0},'n_leaves':3,'wall_s':{}},open(sys.argv[1],'w'))")
-    run = ("import json,sys,os\nfor t in (1, 2, 3):\n"
+    run = ("import json,sys,os\nprint('loop mode: ' + MODE)\nfor t in (1, 2, 3):\n"
            "    print(f'step  {t} (in-sample): accepted; max residual 1.00')\n"
            "    print(f'step  {t} root ' + ROOT[:63] + str(t))\n"
            "print('stored step 3: p, 3 files, 0.1 GiB, root ' + 'ab' * 8 + '… (r)')\n"
@@ -219,12 +331,17 @@ def _fake_plan(tmp_path, root_sharded="a" * 64, outcome="exact", junit_for=("fas
             argv = ["{python}", "-c", card, info["report"]]
         elif p.kind == "pair_run":
             sharded = p.info["arm"] == "sharded"
+            sharded = p.info["arm"] != "unsharded"
+            mode = "pipelined" if p.info["arm"].startswith("pipelined") else "sequential"
             argv = ["{python}", "-c", run.replace("ROOT", repr(root_sharded if sharded
-                                                                else "a" * 64)),
+                                                                else "a" * 64)
+                                                  ).replace("MODE", repr(mode)),
                     info["weights"]]
         elif p.kind == "cheat":
-            argv = ["{python}", "-c", ";".join(f"print('{n} d a {outcome} 1 2 3')"
-                                                for n in cheats[p.name])]
+            mode = "pipelined" if p.name.endswith("_pipelined") else "sequential"
+            argv = ["{python}", "-c", f"print('loop mode: {mode}');" + ";".join(
+                f"print('{n} d a {outcome} 1 2 3')" for n in cheats[p.name.removesuffix(
+                    '_pipelined')])]
         else:
             argv = ["{python}", "-c", "pass"]
         out.append(dataclasses.replace(p, argv=argv, timeout_s=30))
@@ -248,7 +365,13 @@ def test_the_whole_job_log_tail_of_the_pairs_plan(tmp_path, monkeypatch):
         "FS32 roots equal", "FS32 verdicts equal",
         "FS32 unsharded plain and proved W_{t+1}", "FS32 sharded plain and proved W_{t+1}",
         "FS32 cheat A1", "FS32 cheat A2", "FS32 cheat A3", "FS32 cheat hidden",
-        "FS32 cheat flip", "FS32 fast_suite", "FS32 two_gpu_slow", "FS32 slowest failing test"]
+        "FS32 cheat flip", "FS32 pipelined cheat A1", "FS32 pipelined cheat A2",
+        "FS32 pipelined cheat A3", "FS32 pipelined cheat hidden", "FS32 pipelined cheat flip",
+        "FS32 step wall time unsharded (prover/verifier/hand-off/total s)",
+        "FS32 step wall time sharded (prover/verifier/hand-off/total s)",
+        "FS32 step wall time pipelined (prover/verifier/hand-off/total s)",
+        "FS32 step wall time pipelined_metrics (prover/verifier/hand-off/total s)",
+        "FS32 fast_suite", "FS32 two_gpu_slow", "FS32 slowest failing test"]
     assert not any("HW3" in x or "KeyError" in x for x in lines)
     assert "hw3_cards" not in s and "hw3_cards_error" not in s
     assert s["fs32_pair"]["pass"], s["fs32_pair"]
