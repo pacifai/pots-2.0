@@ -332,13 +332,13 @@ def test_cache_release_sits_between_prover_and_verifier_on_cuda(c, D, w0, final,
 
 
 def test_the_kernel_is_warmed_once_before_step_1_on_cuda(c, D, w0, final, monkeypatch):
-    """FS30: on CUDA, ``GpuBlake3().kernels(device)`` runs once, after the dataset tree and
-    before the first step's first section, so no NVRTC build lands in a timed step."""
+    """FS30: on CUDA, ``GpuBlake3().kernels(device)`` runs once, before ``start_run``
+    (check 0 hashes ``W_0`` there with the kernel) and so before every section, the dataset tree
+    and the first step's, so no NVRTC build lands in a timed row (FS34 fix 2)."""
     res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True)
     warm = [i for i, x in enumerate(log) if x.startswith("warm")]
     assert res.verdict.accepted and len(warm) == 1 and log[warm[0]] == "warm cpu"
-    assert log[warm[0] - 1] == "run:P4.tree"
-    assert warm[0] < log.index("verify 1")
+    assert warm[0] == 0 and warm[0] < log.index("run:P4.tree") < log.index("verify 1")
 
 
 def test_the_kernel_is_not_warmed_off_cuda(c, D, w0, final, monkeypatch):
