@@ -696,3 +696,136 @@ def test_run_loop_clears_the_set_for_the_sequential_and_the_pipelined_dispatch(
         kc.mark_checked(ghost)
         _scenario_run(pipelined, SeamedSpec(so) if pipelined else None)
         assert not kc.is_checked(ghost)
+
+
+# ---- the pair session's FS34 item ------------------------------------------------------------
+
+
+def _pair():
+    from tests.verification.runs import test_fs32_pair_session as P
+    return P
+
+
+def _lines(parts):
+    from verification.runs import fs11_session as fs
+
+    pair = fs.fs32_pair(parts)
+    return pair, "\n".join(fs._pair_lines(pair))
+
+
+def test_fs34_gate_fails_closed_on_a_missing_part():
+    P = _pair()
+    parts = [p for p in P._parts() if p["name"] != "fs34_tests"]
+    pair, text = _lines(parts)
+    assert not pair["pass"]
+    assert pair["fs34_problems"], "a missing part must give reasons"
+    assert "FS32 FAIL: FS34 test the FS34 tests part is not_started" in text
+    assert "FS32 FAIL: FS34 test the FS34 tests left no junit report" in text
+
+
+@pytest.mark.parametrize("status", ["failed", "timeout", "not_started", "interrupted"])
+def test_fs34_gate_fails_on_a_part_that_did_not_end_ok_even_if_every_case_passed(status):
+    P = _pair()
+    part = P._fs34()
+    part["status"] = status
+    pair, text = _lines(P._parts(fs34_tests=part))
+    assert not pair["pass"]
+    assert f"FS32 FAIL: FS34 test the FS34 tests part is {status}" in text
+
+
+def test_fs34_gate_accepts_skipped_done_with_every_case_passing():
+    P = _pair()
+    part = P._fs34()
+    part["status"] = "skipped_done"
+    assert _lines(P._parts(fs34_tests=part))[0]["pass"]
+
+
+@pytest.mark.parametrize("extras", [None, {}, {"junit": None}, {"extras_error": "OSError: x"},
+                                    {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}])
+def test_fs34_gate_fails_on_a_missing_or_empty_junit_report(extras):
+    P = _pair()
+    part = P._part("fs34_tests", "fs34_tests", extras)
+    pair, text = _lines(P._parts(fs34_tests=part))
+    assert not pair["pass"]
+    assert "FS32 FAIL: FS34 test the FS34 tests left no junit report" in text
+
+
+def test_fs34_gate_fails_on_a_junit_with_no_cases():
+    P = _pair()
+    part = P._part("fs34_tests", "fs34_tests",
+                   {"tests": 0, "failures": 0, "errors": 0, "skipped": 0, "junit": 1,
+                    "cases": {}})
+    pair, text = _lines(P._parts(fs34_tests=part))
+    assert not pair["pass"]
+    for n in P.EXPECTED34:
+        assert f"FS32 FAIL: FS34 test {n}: expected but not in the junit report" in text
+
+
+@pytest.mark.parametrize("outcome", ["skipped", "failed", "error"])
+def test_each_case_that_did_not_pass_has_its_own_fail_line(outcome):
+    P = _pair()
+    bad = {n: outcome for n in P.EXPECTED34[:2]}
+    pair, text = _lines(P._parts(fs34_tests=P._fs34(bad)))
+    assert not pair["pass"]
+    for n in bad:
+        assert f"FS32 FAIL: FS34 test {n}: {outcome}" in text
+    assert text.count("FS32 FAIL: FS34 test") == 2
+
+
+def test_a_junit_case_the_file_does_not_define_that_failed_is_a_problem():
+    P = _pair()
+    pair, text = _lines(P._parts(fs34_tests=P._fs34({"tests.x.test_stale::test_gone": "failed"})))
+    assert not pair["pass"]
+    assert "FS32 FAIL: FS34 test tests.x.test_stale::test_gone: failed" in text
+
+
+def test_a_junit_case_the_file_does_not_define_that_passed_does_not_stand_in_for_a_missing_one():
+    P = _pair()
+    part = P._fs34()
+    gone = P.EXPECTED34[0]
+    del part["extras"]["cases"][gone]
+    part["extras"]["cases"]["tests.x.test_other::test_renamed"] = "passed"
+    pair, text = _lines(P._parts(fs34_tests=part))
+    assert not pair["pass"]
+    assert f"FS32 FAIL: FS34 test {gone}: expected but not in the junit report" in text
+
+
+def test_the_counts_of_the_junit_fail_the_gate_even_when_the_cases_all_read_passed():
+    P = _pair()
+    part = P._fs34()
+    part["extras"]["failures"] = 1
+    pair, text = _lines(P._parts(fs34_tests=part))
+    assert not pair["pass"] and "1 failures" in text
+
+
+def test_the_real_file_defines_the_cases_the_gate_expects():
+    from verification.runs import fs11_session as fs
+
+    names, err = fs.device_tests_expected(fs.FS34_TESTS_FILE)
+    assert not err and names
+    src = (ROOT / fs.FS34_TESTS_FILE).read_text()
+    assert all(n.split("::")[1].split("[")[0] in src for n in names)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "part_extras catches OSError/ValueError/KeyError/TypeError only: an empty or truncated "
+    "junit file (a part killed at its limit) makes xml ParseError (a SyntaxError) escape, which "
+    "ends the whole session instead of failing the FS34 item. Pre-existing for every junit part."))
+def test_an_empty_junit_file_is_a_missing_report_not_a_crash(tmp_path):
+    from verification.runs import fs11_session as fs
+
+    junit = tmp_path / "junit.xml"
+    junit.write_text("")
+    part = fs.Part("fs34_tests", ["x"], env={}, timeout_s=1, kind="fs34_tests",
+                   info={"junit": str(junit)})
+    extras = fs.part_extras(part, tmp_path / "log.txt")
+    assert "cases" not in extras
+
+
+def test_the_pair_deadline_is_twice_the_estimate_rounded_up_to_100_s():
+    from verification.runs import fs11_session as fs
+
+    d = fs.pair_default_deadline_s()
+    assert d == 16100 and "DEFAULT_DEADLINE_S=16100" in (
+        ROOT / "verification/runs/fs11_job.sh").read_text()
+    assert sum(fs.PAIR_ESTIMATE_MIN.values()) + fs.PAIR_PACK_MIN + fs.PAIR_GRACE_MIN == 134
