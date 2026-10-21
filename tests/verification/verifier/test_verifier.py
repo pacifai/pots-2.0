@@ -1534,6 +1534,12 @@ class _HookedReplay(DecoderReplay):
         return torch.stack([x for x, _ in pairs]), torch.stack([y for _, y in pairs])
 
 
+@pytest.fixture
+def canonical_order(monkeypatch):
+    """Pins check 5 to its canonical-order loop (FS38a): the decoder offers no unit schedule."""
+    monkeypatch.setattr(DecoderReplay, "unit_schedule", lambda self: None)
+
+
 @pytest.fixture(scope="module")
 def llama_out():
     c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=ETA)
@@ -1606,10 +1612,9 @@ def test_measure_groups_split_by_shape_then_by_size(llama_out, monkeypatch):
     assert fs.batch_members(c, spec) == tuple(run[i] for i in cut[[1 in g for g in cut].index(True)])
 
 
-def test_check_5_serves_member_groups_whole(llama_out, monkeypatch):
-    """Check 5 asks the replay for each member group at once and serves only the dense
-    products one at a time; a group that fails is served again one member at a time."""
-    c, out = llama_out
+def _serving_calls(c, out, monkeypatch):
+    """Check 5 on the tiny Llama step with the replay's ``operands`` and ``operand_group`` calls
+    recorded: ``(rejection, stats, calls)``."""
     calls = {"operands": [], "group": []}
     real_ops, real_group = DecoderReplay.operands, DecoderReplay.operand_group
     monkeypatch.setattr(DecoderReplay, "operands",
@@ -1618,10 +1623,34 @@ def test_check_5_serves_member_groups_whole(llama_out, monkeypatch):
                         lambda self, ms, dtype=None: (calls["group"].append(list(ms)),
                                                       real_group(self, ms, dtype))[1])
     rej, stats = _llama_check_5(c, out, monkeypatch, batched=True)
+    return rej, stats, calls
+
+
+def test_check_5_serves_member_groups_whole(llama_out, canonical_order, monkeypatch):
+    """Check 5 asks the replay for each member group at once and serves only the dense
+    products one at a time; a group that fails is served again one member at a time."""
+    c, out = llama_out
+    rej, stats, calls = _serving_calls(c, out, monkeypatch)
     assert rej is None and [x.m for x in stats] == list(range(1, c.M + 1))
     assert calls["operands"] == [s.m for s in c.products if s.member is None]
     runs = [r for r in checks._member_runs(c.products) if len(r) > 1]
     assert calls["group"] == [[r[i].m for i in g] for r in runs for g in checks._measure_groups(r)]
+
+
+def test_check_5_serves_member_groups_whole_in_unit_order(llama_out, monkeypatch):
+    """The same serving on the unit path: dense products one at a time and member groups at
+    once, each in the order of the replay's unit schedule, and the stats in canonical order."""
+    c, out = llama_out
+    rej, stats, calls = _serving_calls(c, out, monkeypatch)
+    assert rej is None and [x.m for x in stats] == list(range(1, c.M + 1))
+    at = {m: k for k, m in enumerate(m for step in c.unit_schedule for m in step)}
+    assert calls["operands"] == sorted((s.m for s in c.products if s.member is None),
+                                       key=at.__getitem__)
+    runs = [r for r in checks._member_runs(c.products) if len(r) > 1]
+    groups = [[r[i].m for i in g] for r in runs for g in checks._measure_groups(r)]
+    assert calls["group"] == sorted(groups, key=lambda g: at[g[0]])
+    assert sorted(m for g in calls["group"] for m in g) == [
+        s.m for s in c.products if s.member is not None]
 
 
 def test_check_5_holds_one_group_at_a_time(llama_out, monkeypatch):
@@ -1711,8 +1740,9 @@ def test_serving_error_waits_for_earlier_members(llama_out, monkeypatch):
 
 
 @pytest.mark.parametrize("window", [1, checks._JUDGE_WINDOW])
+@pytest.mark.parametrize("unit", [False, True], ids=["canonical", "unit"])
 def test_record_pass_keeps_check_5s_measures_of_the_failing_run(llama_out, monkeypatch,
-                                                                window):
+                                                                window, unit):
     """A forged S/O member mid-way through its layer's forward run rejects check 5. The
     products check 5 measured after it and never judged (the rest of its run, and of its
     judging window) are recorded as check 5 measured them (``StepState.run_rest``), without
@@ -1722,8 +1752,12 @@ def test_record_pass_keeps_check_5s_measures_of_the_failing_run(llama_out, monke
     two measures happen to agree bit for bit, so the test checks the hand-over itself: the
     stashed products, and none of them served again. With a window of one product, check 5
     judges after each run, so the record pass serves the later runs; with the default window
-    the tiny step is one window, so check 5 measured everything."""
+    the tiny step is one window, so check 5 measured everything. On the unit path (``unit``)
+    check 5 measures every run before judging: the failing window's tail is in ``run_rest``,
+    every later window's rows in ``run_rest_rows``, and the record pass serves nothing."""
     monkeypatch.setattr(checks, "_JUDGE_WINDOW", window)
+    if not unit:
+        monkeypatch.setattr(DecoderReplay, "unit_schedule", lambda self: None)
     c, out = llama_out
     run = next(r for r in checks._member_runs(c.products) if len(r) > 1)
     forged, later = run[len(run) // 2], run[len(run) // 2 + 1:]
@@ -1744,13 +1778,16 @@ def test_record_pass_keeps_check_5s_measures_of_the_failing_run(llama_out, monke
     assert window == 1 or c.M < window
     assert [spec.m for spec, _ in live.state.run_rest] == list(range(forged.m + 1, stashed + 1))
     assert live.state.run_rest_error is None
+    assert [s.m for r, _ in live.state.run_rest_rows for s in r.specs] == (
+        list(range(stashed + 1, c.M + 1)) if unit else [])
     served, real = [], checks._measure_served
     monkeypatch.setattr(checks, "_measure_served", lambda c, specs, *a, **kw: (
         served.extend(spec.m for spec in specs), real(c, specs, *a, **kw))[1])
     assert checks.record_rest(store, c, live, Bands.provisional(), "5") == \
         checks.RECORD_COMPLETE
-    assert not live.state.run_rest and served == list(range(stashed + 1, c.M + 1))
-    monkeypatch.undo()
+    assert not live.state.run_rest and not live.state.run_rest_rows
+    assert served == ([] if unit else list(range(stashed + 1, c.M + 1)))
+    monkeypatch.setattr(checks, "_measure_served", real)
     ref = ctx_for(False)
     assert check_5_matmuls(store, c, ref, Bands.provisional()) is None
     got, want = live.stats.products, ref.stats.products

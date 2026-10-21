@@ -7,6 +7,8 @@ kernel's can't. ``drain`` records its calls. What is under test is the serving: 
 ``Replay.operand_blocks``, ``P`` as stored, rows mapped back to the run's positions.
 """
 
+import weakref
+
 import pytest
 import torch
 
@@ -54,6 +56,12 @@ class Kernel:
 
     def drain(self, device=None):
         self.events.append("drain")
+
+
+@pytest.fixture
+def canonical_order(monkeypatch):
+    """Pins check 5 to its canonical-order loop (FS38a): the decoder offers no unit schedule."""
+    monkeypatch.setattr(DecoderReplay, "unit_schedule", lambda self: None)
 
 
 @pytest.fixture
@@ -183,13 +191,16 @@ def test_a_serving_error_in_a_group_finds_the_same_member_and_error(role, kernel
     from blocks)."""
     c, D, tree, w0 = _setup(("llama", True), "fp32", biases=False)
     layer = 1 if role == "O" else c.L
-    done = []
+    # Each replay is tampered once, at its first group of the role: the unit pass's replay
+    # and, after its fallback, the fresh one the canonical rerun serves.
+    done, seen = [], weakref.WeakSet()
 
     def tamper(replay, ms):
         spec = c.product(ms[0])
         mine = [m for m in ms if c.product(m).member is not None
                 and c.product_class(c.product(m)) == role and c.product(m).layer == layer]
-        if not done and mine:
+        if replay not in seen and mine:
+            seen.add(replay)
             done.append(mine[0])
             first = c.product(mine[0])
             if first.kind.name == "FORWARD":
@@ -218,7 +229,8 @@ def test_a_serving_error_in_a_group_finds_the_same_member_and_error(role, kernel
     assert runs[0] == runs[1] and "changed after its product read it" in runs[0]
 
 
-def test_drain_runs_before_each_window_read_and_at_the_end(kernel, monkeypatch):
+def test_drain_runs_before_each_window_read_and_at_the_end(kernel, canonical_order,
+                                                           monkeypatch):
     c, D, tree, w0 = _setup(("llama", True), "fp32")
     monkeypatch.setattr(checks, "_JUDGE_WINDOW", 20)  # several windows in a step
     v, rejection = _verify(c, D, tree, w0)
@@ -234,6 +246,21 @@ def test_drain_runs_before_each_window_read_and_at_the_end(kernel, monkeypatch):
     assert ev[-1] == "drain"  # check 5's finally, after the last read
 
 
+def test_drain_runs_before_the_one_read_of_the_unit_pass_and_at_the_end(kernel, monkeypatch):
+    """The unit pass measures every run, then one read brings every window's rows (a drain
+    right before it and none needed between windows), then check 5's ``finally`` drains."""
+    c, D, tree, w0 = _setup(("llama", True), "fp32")
+    monkeypatch.setattr(checks, "_JUDGE_WINDOW", 20)  # several windows in a step
+    v, rejection = _verify(c, D, tree, w0)
+    assert rejection is None and len(v.stats[1].products) == c.M
+    ev = kernel.events
+    assert ev.count("read") == 1
+    read = ev.index("read")
+    assert "measure" not in ev[read:] and ev[:read].count("measure") > 0
+    assert ev[read + 1] == "drain" and ev[-1] == "drain"
+    assert len(ev) == read + 3  # read, the drain _read_rows starts with, check 5's drain
+
+
 def test_check_5_drains_when_a_product_is_rejected(kernel):
     c, D, tree, w0 = _setup(("llama", True), "fp32")
     m = c.m_of("L1.Y_q")
@@ -247,8 +274,8 @@ def test_check_5_drains_when_a_product_is_rejected(kernel):
 def test_record_pass_drains_when_a_later_run_fails_to_serve(kernel, monkeypatch):
     from types import SimpleNamespace
 
-    state = SimpleNamespace(claimed_root=b"r", replay=object(), run_rest=[], run_rest_error=None,
-                            committed=lambda: None)
+    state = SimpleNamespace(claimed_root=b"r", replay=object(), run_rest=[], run_rest_rows=[],
+                            run_rest_error=None, committed=lambda: None)
     ctx = SimpleNamespace(state=state, stats=SimpleNamespace(products=[]), k=7, kappa_guard=True)
     spec = SimpleNamespace(m=1)
     boom = RuntimeError("serving failed")

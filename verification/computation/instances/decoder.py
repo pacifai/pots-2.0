@@ -1611,9 +1611,13 @@ class DecoderReplay(Replay):
             u.saved[_ptr(fa)], u.saved[_ptr(fb)] = (kind, "a"), (kind, "b")
         if len(u.saved) != (0 if head else 4):
             raise ReplayError(f"replay: layer {j}'s S and O operands share storage")
-        # δY_x's storage identifies δX_x and G_x; a head block hooks its rebuilt scores.
+        # δY_x's storage identifies δX_x and G_x; a head block hooks its rebuilt scores. The
+        # hook holds the replay weakly: a unit whose backward never runs (a pass abandoned
+        # after an error) keeps its graph and hooks, and a strong reference would keep the
+        # whole replay alive through them.
+        me = weakref.ref(self)
         for y, w in ({} if head else self._unit_names(j)[0]).items():
-            calls[y][2].register_hook(lambda g, w=w: self._dy.__setitem__(_ptr(g), w))
+            calls[y][2].register_hook(lambda g, w=w: me()._dy.__setitem__(_ptr(g), w))
 
     def _build(self) -> None:
         """The one forward pass, embedding to every head block's ``Λ_b``, with grad on under
