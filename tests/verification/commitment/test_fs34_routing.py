@@ -60,6 +60,25 @@ def test_hash_step_leaves_takes_known_digests_and_hashes_the_rest(
     assert st.known == len(known) and st.kernel > 0
 
 
+def test_kernel_false_hashes_with_the_c_library_for_the_commit_calls_too(
+        c, leaves, on_kernel, monkeypatch):  # noqa: F811
+    """``hash_step_leaves`` and ``commit_leaves`` take ``kernel=``: False gives the C library's
+    digests and root and never enqueues a kernel table, with ``known`` digests or without."""
+    want = leaf_hashes_of(c, items(leaves), kernel=False)
+    tables = []
+    real = L._enqueue_table
+    monkeypatch.setattr(L, "_enqueue_table", lambda *a: (tables.append(1), real(*a))[1])
+    known = {i: want[i] for i in range(c.n_s, c.n_leaves, 2)}
+    for kn in (None, known):
+        st = HashStats()
+        assert hash_step_leaves(c, leaves, st, known=kn, kernel=False) == want
+        assert st.kernel == 0
+        assert L.commit_leaves(c, leaves, kn, kernel=False).root == L.MerkleTree(want).root
+    assert tables == []
+    st = HashStats()
+    assert hash_step_leaves(c, leaves, st) == want and st.kernel > 0 and tables
+
+
 def test_a_nan_before_a_host_error_is_the_first_error(
         c, leaves, on_kernel, small_tables):  # noqa: F811
     i = first_product(c)
@@ -246,7 +265,8 @@ def _scenario_run(pipelined):
     c, D, model, w0 = H.setup(THREE)
     T = 2
     w_T = honest_final(c, D, w0, T, seed=SEED, build_model=lambda: model)
-    final = leaf_hashes_of(c, ((c.w_t_index(n), w_T[n]) for n in c.weight_names))
+    # kernel=False: a plant must not stop the run before it starts, in this very call
+    final = leaf_hashes_of(c, ((c.w_t_index(n), w_T[n]) for n in c.weight_names), kernel=False)
     s = Scenario("x", "", HONEST.fault, Expected())
     assert dataset_tree(c, D).root
     return run_scenario(c, D, w0, s, T=T, k=5, seed=SEED, final=final, pipelined=pipelined,
@@ -262,9 +282,23 @@ def test_a_run_with_the_kernel_seams_on_accepts_and_checks_shapes(
 
 
 @pytest.mark.parametrize("pipelined", [False, True])
-def test_a_planted_mismatch_stops_the_run_with_no_verdict(planted, pipelined):  # noqa: F811
-    with pytest.raises(kc.KernelMismatchError):
+def test_a_planted_mismatch_stops_the_run_with_no_verdict(
+        planted, monkeypatch, pipelined):  # noqa: F811
+    """Every digest is wrong, so the run stops at its first kernel hash: check 0 in
+    ``start_run`` (sequential), or the parent's check 0 in ``run_pipelined``. The error comes
+    from inside the run, not from the setup around it."""
+    import traceback
+
+    from verification.verifier.driver import Verifier
+
+    ends = []
+    real = Verifier.end_run
+    monkeypatch.setattr(Verifier, "end_run", lambda self, f: (ends.append(1), real(self, f))[1])
+    with pytest.raises(kc.KernelMismatchError) as e:
         _scenario_run(pipelined)
+    names = [f.name for f in traceback.extract_tb(e.value.__traceback__)]
+    assert ("run_pipelined" if pipelined else "run_loop") in names and "start_run" in names
+    assert ends == []
 
 
 def test_run_loop_starts_a_new_run_before_anything_else(on_kernel, monkeypatch):  # noqa: F811

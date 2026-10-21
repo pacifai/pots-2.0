@@ -86,7 +86,8 @@ def run(devices, edit=None, device="cpu", layers=None):
     randomize_biases(dict(model.named_parameters()))
     w0 = snapshot_weights(c, model)
     w_T = honest_final(c, D, w0, T, seed=SEED, build_model=lambda: model)
-    final = leaf_hashes_of(c, ((c.w_t_index(n), w_T[n]) for n in c.weight_names))
+    # kernel=False: a planted kernel must not stop the run before it starts, in this call
+    final = leaf_hashes_of(c, ((c.w_t_index(n), w_T[n]) for n in c.weight_names), kernel=False)
     v = Verifier(c, h_D=dataset_tree(c, D).root, n_records=len(D), k=K, n_steps=T,
                  bands=Bands.provisional(), w0=w0, allow_provisional=True, seed=SEED)
     hand = Recording(edit)

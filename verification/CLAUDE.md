@@ -555,11 +555,12 @@ interface.
     one being filled (about 16 MiB each, a bigger leaf making a bigger chunk), so the host
     copies stay bounded. The counting pass runs it on a whole full-scale step, so that bound
     is what keeps its host memory flat.
-  - One routing for every hash call (FS34). `leaf_hashes_of`, `leaf_hashes_until_error` and
-    `hash_step_leaves` take `kernel: bool = True` (keyword): a contiguous tensor leaf on a CUDA
-    device, whose dtype is in `native.FINITE_KIND` and whose structural check passes, goes to
-    its device's open kernel table inside `_native_until_error`, closed at `_BATCH_BYTES` or
-    `_BATCH_ENTRIES` and read once after the loop; every other leaf takes the host batches above.
+  - One routing for every hash call (FS34). `leaf_hashes_of`, `leaf_hashes_until_error`,
+    `hash_step_leaves` and `commit_leaves` take `kernel: bool = True` (keyword): a contiguous
+    tensor leaf on a CUDA device, whose dtype is in `native.FINITE_KIND` and whose structural
+    check passes, goes to its device's open kernel table inside `_native_until_error`, closed
+    at `_BATCH_BYTES` or `_BATCH_ENTRIES` and read once after the loop; every other leaf takes
+    the host batches above.
     Errors are ordered by the item's position, not its leaf index: a table's first non-finite
     leaf, a structural error, a mutation (`StoreMutationError`, at its leaf) and the iterable's
     own error compete by position, the smallest wins, and the digests are cut before it. An
@@ -568,7 +569,7 @@ interface.
     `native.disabled()`. `HashStats.kernel` counts the kernel-hashed leaves and `crosschecks`
     the per-shape comparisons below. `hash_step_leaves(c, leaves, stats, *, known=)` takes a
     known digest for a leaf that passes its structural check and sends the rest through the same
-    path.
+    path (with `kernel=False`, through the host path; the known digests are compared as before).
   - Decision 4's per-shape check (FS34, `commitment/kernel_check.py`). Once the verifier hashes
     with the kernel too, no step recomputes a kernel digest another way, so each run checks one
     digest per key `(path, device, tag, dtype, shape)`: the leaf's host copy is hashed by the C
@@ -588,7 +589,7 @@ interface.
     (`test_a_known_digest_of_a_host_product_gets_no_crosscheck`).
   - `leaf_hashes(c, reader)` iterates `range(c.n_leaves)`, a count that comes from `C`.
   - `transcript_root(c, reader)` is check 2.
-  - `commit_leaves(c, leaves) -> MerkleTree`.
+  - `commit_leaves(c, leaves, known=None, *, kernel=True) -> MerkleTree`.
   - `dataset_tree(c, D)`, and `dataset_root(records)`, which gives `h_D`.
 
 - `native.py` (F15b, `native.c`): BLAKE3's C library through ctypes, for the commitment's hot
@@ -634,9 +635,9 @@ interface.
     arrival too: `_route` hashes a product after its peer copy lands, on the owner's side
     stream, and a product already on its owner is hashed where it sits (`_hash_in_place`),
     each paired with the `_version` read as the hash was queued.
-  - *The commit (routing).* `hash_step_leaves(c, leaves, stats=None, *, known=None)` and
-    `commit_leaves(c, leaves, known=None)` take each leaf from `known`, else the GPU kernel if
-    the leaf is a CUDA tensor with a passing structural check (one table per device, closed at
+  - *The commit (routing).* `hash_step_leaves(c, leaves, stats=None, *, known=None,
+    kernel=True)` and `commit_leaves(c, leaves, known=None, *, kernel=True)` take each leaf from
+    `known`, else the GPU kernel if the leaf is a CUDA tensor with a passing structural check (one table per device, closed at
     `_BATCH_BYTES` or `_BATCH_ENTRIES`), else the host path; since FS34 this is the routing of
     every hash call (`leaves.py`, "One routing"). A mutation seen before a table is read
     raises `StoreMutationError`; a non-finite leaf raises the host path's `NonFiniteError`.
@@ -687,12 +688,13 @@ interface.
     CUDA matmul's offload, in the first step's forward pass (the CUBIN then comes from the
     disk cache under `native.cache_dir()` if an earlier process built it). `run_loop` moves it
     out of the timed steps: it calls `GpuBlake3().kernels(device)` once per CUDA device of the
-    run (the model's and a sharded placement's) before step 1, outside every section, and
-    `kernel_check.new_run()` first of all (FS34), before the pipelined dispatch. The pipelined
-    child calls `new_run()` at its start and loads its hash kernels; the pipelined parent loads
-    the hash kernel and check 5's measuring kernel (`measure_kernel.kernels(d)`, FS37) on the
-    CUDA devices of `c.placement.devices` before step 1, outside every section. The child
-    never measures, so it builds no measuring kernel. A CUDA run that
+    run (the model's and a sharded placement's) before `verifier.start_run` (check 0 hashes
+    `W_0` there with the kernel, in the `run:0` section) and so before step 1, outside every
+    section, and `kernel_check.new_run()` first of all (FS34), before the pipelined dispatch. The
+    pipelined child calls `new_run()` at its start and loads its hash kernels; the pipelined
+    parent loads the hash kernel and check 5's measuring kernel (`measure_kernel.kernels(d)`,
+    FS37) on the CUDA devices of `c.placement.devices` before `start_run`, outside every
+    section. The child never measures, so it builds no measuring kernel. A CUDA run that
     doesn't go through `run_loop` (`card_identity`) is left as it was: call
     `GpuBlake3().kernels(device)` first there to keep the build out of a timed step. A build or
     load failure raises; nothing falls back to the CPU.
@@ -1894,9 +1896,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
-  - Before step 1, `run_loop` builds `measure_kernel.kernels(d)` beside `GpuBlake3().kernels(d)`
-    on every CUDA device of the run (FS37), so the first NVRTC build or cache load lands outside
-    every timed section. The pipelined loop's pre-build is FS34's.
+  - Before `verifier.start_run` (so before step 1), `run_loop` builds
+    `measure_kernel.kernels(d)` beside `GpuBlake3().kernels(d)` on every CUDA device of the run (FS37), so the first NVRTC build or cache load lands outside
+    every timed section, check 0's hash of `W_0` included. The pipelined loop's pre-build is
+    FS34's, at the same place.
   - `release_device_cache(device, section=None, *, devices=None)`: only when the run's
     `device` or any of `devices` (the sharded run's verifier devices, `c.placement.devices`;
     FS32d) is CUDA (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in
