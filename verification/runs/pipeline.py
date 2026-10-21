@@ -17,11 +17,17 @@ called before step 1. An unpicklable spec, fault or schedule raises ``TypeError`
 one, before the child starts.
 
 **The handshake.** Before step 1 the child sends the leaf hashes of its ``W_0`` (as
-``Verifier.weight_hashes`` computes them) and the shape of its computation (``n_leaves``,
-``M``, the weight names, the placement's devices, the product dtype). The parent compares them
-with its own ``c`` and with the verifier's ``W_0`` anchor and stops with a
-:class:`ProverProcessError` (``kind="handshake"``) on any difference, never with a verdict. It
-does not compare the dataset: a poisoned dataset is a cheat the verifier's checks reject.
+``Verifier.weight_hashes`` computes them), a fingerprint of its computation and the root and
+length of its dataset. The fingerprint holds what the prover's work depends on and the verifier
+also declares: ``n_leaves``, ``M``, ``n_s``, ``eta``, the weight names and shapes, the four
+dtypes, the placement's devices, every product spec (a BLAKE3 digest of their text, and the
+list itself when it is short, so a mismatch can name the first differing product) and the
+instance's ``pad_id`` and ``source`` where it has them. The parent compares all of it with its
+own ``c``, the dataset with ``verifier.h_D`` and ``verifier.n_records``, and ``W_0`` with
+``verifier.chain_hashes`` (the agreed ``W_0``'s hashes after ``start_run``). Any difference
+raises :class:`ProverProcessError` (``kind="handshake"``) naming each mismatch, before step 1
+and never with a verdict. A child on another dataset is a setup error, not a cheat to be
+caught by the checks: the run would end in a rejection that blames the prover for the harness.
 
 **One step, both sides.**
 
@@ -73,9 +79,15 @@ waits for ``bye``.
 as :class:`ProverProcessError` (``kind="exception"``). A child that dies is seen by the pipe
 closing or by its exit code (``kind="died"``). Every parent wait polls with a short timeout and
 checks that the child lives. Any exception in the parent, ``KeyboardInterrupt`` and a raising
-``on_step`` included, closes the open store, stops the child (a stop message, then ``terminate``,
-then ``kill`` after a grace period) and joins it before it re-raises: no child outlives
-``run_loop``.
+``on_step`` included, closes the open store, drops every package it still holds (a traceback
+keeps the frame's locals alive, so the ``finally`` clears them and collects), stops the child (a
+stop message, then ``terminate``, then ``kill`` after a grace period) and joins it before it
+re-raises: no child outlives ``run_loop``. Every wait for a message has a wall deadline,
+``MESSAGE_DEADLINE_S`` (it covers the child's model load before ``ready`` and the slowest step
+we run); a child that hangs raises :class:`ProverProcessError` (``kind="timeout"``) naming the
+message awaited and the seconds waited; a child that timed out is stopped with no grace, since a
+stuck child cannot read ``stop``. A ``start_run`` rejection stops the child with no grace:
+no package has crossed, so terminating it while it builds its model is safe.
 
 **Refusals** (``ValueError``, before the child starts): a CUDA prover device with an unsharded
 placement (an unsharded run's leaves live on the host, so every step's whole transcript would be
@@ -101,6 +113,7 @@ device before step 1, outside every section, as the sequential loop does.
 
 from __future__ import annotations
 
+import gc
 import multiprocessing
 import os
 import pickle
@@ -113,6 +126,7 @@ from multiprocessing.connection import Connection, wait
 from typing import Any
 
 import torch
+from blake3 import blake3
 
 from setup.config import assert_no_dropout
 from verification.commitment.gpu_blake3 import GpuBlake3
@@ -150,6 +164,9 @@ RELEASE_SECTION = "handoff.release"
 
 STOP_GRACE_S = 20.0  # how long a stopping parent lets the child finish its step
 TERMINATE_GRACE_S = 5.0  # after terminate(), before kill()
+# The longest the parent waits for one message: the child's model load before ``ready`` or its
+# slowest step (about 5 minutes on the Mac at bf16), with room to spare.
+MESSAGE_DEADLINE_S = 3600.0
 _POLL_S = 0.05
 _MAX_UNRELEASED = 2
 
@@ -175,7 +192,8 @@ class ProverProcessError(RuntimeError):
 
     ``kind``: ``"exception"`` (the child raised; the message holds its traceback), ``"died"``
     (the child exited or the pipe closed), ``"handshake"`` (the child's setup differs from the
-    verifier's) or ``"protocol"`` (an unexpected message)."""
+    verifier's), ``"protocol"`` (an unexpected message) or ``"timeout"`` (no message within
+    ``MESSAGE_DEADLINE_S``)."""
 
     def __init__(self, kind: str, message: str) -> None:
         super().__init__(message)
@@ -218,12 +236,27 @@ def _is_cuda(d: str | torch.device) -> bool:
     return torch.device(d).type == "cuda"
 
 
-def _shape(c: DeclaredComputation) -> dict[str, Any]:
+_LISTED_PRODUCTS = 512  # up to this many product specs travel as a list beside their digest
+
+
+def _fingerprint(c: DeclaredComputation) -> dict[str, Any]:
+    """What the prover's work depends on that the verifier also declares (harness code: the
+    instance's own ``pad_id`` and ``source`` are read where it has them)."""
     p = c.placement
-    return {"n_leaves": c.n_leaves, "M": c.M, "n_s": c.n_s, "weight_names": tuple(c.weight_names),
+    products = [(s.m, s.name, str(s.kind), tuple(s.a_shape), tuple(s.b_shape), s.weight, s.layer,
+                 None if s.member is None else tuple(s.member), s.bias) for s in c.products]
+    digest = blake3(repr(products).encode()).hexdigest()
+    return {"n_leaves": c.n_leaves, "M": c.M, "n_s": c.n_s, "eta": repr(c.eta),
+            "weight_names": tuple(c.weight_names),
+            "weight_shapes": tuple((n, tuple(c.weight_shapes[n])) for n in c.weight_names),
+            "weight_dtype": str(c.weight_dtype), "product_dtype": str(c.product_dtype),
+            "operand_dtype": str(c.operand_dtype),
+            "accumulator_dtype": str(c.accumulator_dtype),
             "prover": str(p.prover),
             "devices": None if p.devices is None else tuple(str(d) for d in p.devices),
-            "product_dtype": str(c.product_dtype)}
+            "products_digest": digest,
+            "products": products if len(products) <= _LISTED_PRODUCTS else None,
+            "pad_id": getattr(c, "pad_id", None), "source": getattr(c, "source", None)}
 
 
 def _w_hashes(c: DeclaredComputation, w: Mapping[str, torch.Tensor]) -> tuple[bytes, ...]:
@@ -278,7 +311,6 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
     model = side.build_model()
     if type(fault).bind is not ProverFault.bind:
         fault.bind(c, ReusedModel(side.build_model))
-    model.requires_grad_(True)
     assert_no_dropout(model)
     device = model_device(model)
     cache = args.release_cache and any(_is_cuda(d) for d in (device, *(c.placement.devices or ())))
@@ -290,7 +322,8 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
     with sec("run:P4.tree"):
         tree = dataset_tree(c, dataset)
     part0 = None if rec is None else rec.close_step(0)
-    handshake = {"w0": _w_hashes(c, side.w0), **_shape(c)}
+    handshake = {"w0": _w_hashes(c, side.w0), "dataset_root": tree.root,
+                 "dataset_len": len(dataset), **_fingerprint(c)}
     conn.send(("ready", handshake, part0))
 
     holds: dict[int, Any] = {}
@@ -399,6 +432,7 @@ class _Link:
         self.errored = False  # the child sent its error: it only waits for bye
         self.finished = False  # the child sent its final message: it only waits for bye
         self.closed = False
+        self.timed_out = False  # no message in time: the child is stuck in a step
 
     def send(self, msg: tuple) -> None:
         try:
@@ -407,9 +441,17 @@ class _Link:
             raise ProverProcessError("died", f"the prover's process is gone (exit code "
                                              f"{self.proc.exitcode}): {e}") from None
 
-    def recv(self) -> tuple:
-        """The next message, polling with a short timeout and checking the child lives."""
+    def recv(self, what: str | None = None) -> tuple:
+        """The next message, polling with a short timeout and checking the child lives. Past
+        ``MESSAGE_DEADLINE_S`` (read now) it raises ``timeout`` naming ``what`` was awaited."""
+        start = time.monotonic()
         while True:
+            waited = time.monotonic() - start
+            if waited > MESSAGE_DEADLINE_S:
+                self.timed_out = True
+                raise ProverProcessError(
+                    "timeout", f"no {what or 'message'} from the prover's process after "
+                               f"{waited:.0f} s (MESSAGE_DEADLINE_S {MESSAGE_DEADLINE_S:.0f})")
             ready = wait([self.conn, self.proc.sentinel], _POLL_S)
             if self.conn in ready or self.conn.poll(0):
                 try:
@@ -431,7 +473,7 @@ class _Link:
     def expect(self, kind: str, stash: dict[int, tuple] | None = None) -> tuple:
         """The next ``kind`` message; a ``step`` that arrives early goes in ``stash``."""
         while True:
-            msg = self.recv()
+            msg = self.recv(kind)
             if msg[0] == kind:
                 return msg
             if msg[0] == "step" and stash is not None:
@@ -439,11 +481,14 @@ class _Link:
                 continue
             raise ProverProcessError("protocol", f"expected {kind!r}, got {msg[0]!r}")
 
-    def stop(self, grace: float = STOP_GRACE_S) -> None:
+    def stop(self, grace: float | None = None) -> None:
         """End the child: stop, then bye after its final message, else terminate, then kill.
-        Joins it. Never raises."""
+        Joins it. Never raises. ``grace`` defaults to ``STOP_GRACE_S``, read now."""
         if self.closed:
             return
+        grace = STOP_GRACE_S if grace is None else grace
+        if self.timed_out:
+            grace = 0.0  # a stuck child can't read ``stop``; waiting for it only delays the kill
         self.closed = True
         proc, conn = self.proc, self.conn
         try:
@@ -522,14 +567,27 @@ def _recorder_spec(recorder: TimeRecorder | MemoryRecorder | None, c: DeclaredCo
     return RecorderSpec(kind, recorder.run, recorder.scenario, devs if on_cuda else ())
 
 
+def _differing_product(mine: Sequence[Any], theirs: Sequence[Any]) -> str:
+    for i, (a, b) in enumerate(zip(mine, theirs, strict=False), start=1):
+        if a != b:
+            return f"the first differing product is m={i} ({a[1]!r} here, {b[1]!r} there)"
+    return f"the lists have {len(mine)} and {len(theirs)} products"
+
+
 def _check_handshake(hs: dict[str, Any], c: DeclaredComputation, verifier: Verifier,
                      w0: Mapping[str, torch.Tensor] | None) -> None:
     bad = []
-    for k, mine in _shape(c).items():
+    mine_all = _fingerprint(c)
+    listed = mine_all.pop("products")
+    for k, mine in mine_all.items():
         if hs.get(k) != mine:
             bad.append(f"{k}: the prover has {hs.get(k)!r}, the verifier {mine!r}")
-    anchor = verifier._chain  # noqa: SLF001 (the agreed W_0's hashes, set by start_run)
-    want = tuple(anchor)
+            if k == "products_digest" and listed is not None and hs.get("products") is not None:
+                bad.append(_differing_product(listed, hs["products"]))
+    for k, mine in (("dataset_root", verifier.h_D), ("dataset_len", verifier.n_records)):
+        if hs.get(k) != mine:
+            bad.append(f"{k}: the prover has {hs.get(k)!r}, the verifier {mine!r}")
+    want = tuple(verifier.chain_hashes or ())  # the agreed W_0's hashes, set by start_run
     if w0 is not None:
         own = verifier.weight_hashes(w0)
         if own != want:
@@ -582,10 +640,14 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
     proc.start()
     child_conn.close()  # so the parent sees the pipe close when the child is gone
     store: SharedStore | None = None
+    # Everything below that can hold a package of the child's memory, defined before the try
+    # so the finally can drop it (a traceback keeps the frame's locals alive).
+    stash: dict[int, tuple] = {}
+    msg = pkg = part = released = None
     try:
         result = LoopResult(verdict=RunVerdict(False, None, 0, None), pipelined=True)
         if verifier.start_run(dataset) is not None:
-            link.stop()
+            link.stop(grace=0)
             result.verdict = verifier.end_run(final)
             return result
         _, hs, part0 = link.expect("ready")
@@ -593,7 +655,6 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
         if recorder is not None:
             recorder.merge_step(0, part0)
         del hs, part0
-        stash: dict[int, tuple] = {}
         for t in range(1, verifier.n_steps + 1):
             msg = stash.pop(t, None) or link.expect("step", stash)
             if msg[1] != t:
@@ -638,11 +699,14 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
         del msg
         link.finished = True
         link.send(("bye",))
-        result.w_final = dict(w_host)
+        result.w_final = None if w_host is None else dict(w_host)
         result.child_info = info
         result.verdict = verifier.end_run(final)
         return result
     finally:
         if store is not None:
             store.close()
+        stash.clear()
+        msg = pkg = part = released = None
+        gc.collect()  # no package outlives this point: the child exits only after it
         link.stop()

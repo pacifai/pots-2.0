@@ -1,8 +1,9 @@
 """FS33b, the tester's tests: gaps in ``test_pipelined_loop.py``, the orchestrator's items 1-5,
 the failure paths, the window, the setting and the metrics.
 
-Defects found are marked ``xfail(strict=True)`` with their reason; the fix round turns each into
-a plain test. CPU only; the child's specs and faults are in ``pipelined_helpers``.
+The four defects the first round found (items 1-3 and the hang) were marked
+``xfail(strict=True)``; round 2 fixed them and they are plain tests now. CPU only; the
+child's specs and faults are in ``pipelined_helpers``.
 """
 
 import dataclasses
@@ -83,10 +84,9 @@ def mlp6():
 
 @pytest.fixture
 def fast_grace(monkeypatch):
-    """Short stop and terminate graces. ``stop``'s ``grace`` is a default argument bound when
-    the function was defined, so patching ``STOP_GRACE_S`` alone does nothing."""
+    """Short stop and terminate graces. ``_Link.stop`` reads both constants when called."""
+    monkeypatch.setattr(pipeline, "STOP_GRACE_S", 1.0)
     monkeypatch.setattr(pipeline, "TERMINATE_GRACE_S", 1.0)
-    monkeypatch.setattr(pipeline._Link.stop, "__defaults__", (1.0,))
 
 
 @pytest.fixture
@@ -192,9 +192,6 @@ def test_the_parent_builds_no_prover_model(mlp):
 # ---- the orchestrator's items 1-5 ---------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="item 1: run_pipelined's finally calls link.stop() while "
-                   "its local stash still holds the early step's received package (on CUDA its "
-                   "opened IPC handles), before the child may exit")
 def test_item1_an_error_path_drops_received_packages_before_stopping_the_child(mlp, monkeypatch):
     seen = {}
     orig = pipeline._Link.stop
@@ -223,17 +220,12 @@ def test_item1_an_error_path_drops_received_packages_before_stopping_the_child(m
     assert seen["stash"] == [] and not seen["msg"] and not seen["pkg"], seen
 
 
-@pytest.mark.xfail(strict=True, reason="item 2: the handshake does not compare eta; a child "
-                   "built with another eta trains differently and the run yields a verdict, "
-                   "not an error")
 def test_item2_a_child_with_another_eta_is_a_handshake_error(mlp):
     with pytest.raises(ProverProcessError) as e:
         call(mlp, prover=P.MLPVariantSpec(eta=2e-3))
     assert e.value.kind == "handshake"
 
 
-@pytest.mark.xfail(strict=True, reason="item 2: the handshake does not compare the dataset; a "
-                   "child on another dataset of the same size yields a verdict, not an error")
 def test_item2_a_child_with_another_dataset_is_a_handshake_error(mlp):
     with pytest.raises(ProverProcessError) as e:
         call(mlp, prover=P.MLPVariantSpec(data_seed=1))
@@ -242,8 +234,8 @@ def test_item2_a_child_with_another_dataset_is_a_handshake_error(mlp):
 
 def test_item2_a_child_with_another_weight_dtype_is_a_handshake_error(mlp):
     with pytest.raises(ProverProcessError) as e:
-        call(mlp, prover=P.MLPVariantSpec(w_dtype="float64"))
-    assert e.value.kind in ("handshake", "exception")
+        call(mlp, prover=P.MLPVariantSpec(w_dtype="bfloat16"))
+    assert e.value.kind == "handshake"
 
 
 def test_item2_the_variant_spec_with_nothing_changed_is_the_parents_run(mlp):
@@ -386,8 +378,6 @@ def test_an_on_step_that_raises_at_the_last_step(mlp, stores):
     assert multiprocessing.active_children() == []
 
 
-@pytest.mark.xfail(strict=True, reason="_Link.recv has no per-message deadline: a child that "
-                   "hangs inside a step (alive, pipe open) hangs the parent for good")
 def test_a_child_that_hangs_inside_a_step_does_not_hang_the_parent(mlp, monkeypatch):
     for name in ("STEP_DEADLINE_S", "RECV_DEADLINE_S", "MESSAGE_DEADLINE_S", "DEADLINE_S"):
         if hasattr(pipeline, name):

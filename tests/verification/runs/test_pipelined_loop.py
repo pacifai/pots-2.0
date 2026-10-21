@@ -16,6 +16,7 @@ and test faults are in ``pipelined_helpers`` so a ``spawn`` child can import the
 import json
 import multiprocessing
 import os
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ from verification.computation.instances.mlp import MLPComputation, init_weights,
 from verification.computation.placement import Placement
 from verification.runs.loop import ProverFault, run_loop
 from verification.runs.metrics import MemoryRecorder, MetricsWriter, count_pass, memory_probe
+from verification.runs import pipeline
 from verification.runs.pipeline import ProverProcessError
 from verification.runs.scenarios import (
     HONEST,
@@ -302,6 +304,67 @@ def test_a_w0_that_differs_is_an_error_before_step_1(mlp):
                      pipelined=True, prover=P.MLPSpec(shift=0.5), on_step=steps.append)
     assert e.value.kind == "handshake" and "W_0" in str(e.value)
     assert steps == []
+
+
+def _held_at_stop(monkeypatch):
+    """What ``run_pipelined`` still holds when its ``finally`` stops the child."""
+    seen = {}
+    orig = pipeline._Link.stop
+
+    def spy(self, *a, **k):
+        f = sys._getframe(1)
+        if f.f_code.co_name == "run_pipelined" and not seen:
+            loc = f.f_locals
+            seen["stash"] = sorted(loc.get("stash") or {})
+            seen["live"] = [n for n in ("msg", "pkg", "part", "released")
+                            if loc.get(n) is not None]
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(pipeline._Link, "stop", spy)
+    return seen
+
+
+def test_a_child_error_leaves_no_package_when_the_child_is_stopped(mlp, monkeypatch):
+    seen = _held_at_stop(monkeypatch)
+    with pytest.raises(ProverProcessError):
+        go(mlp, P.RaiseAt(2), pipelined=True)
+    assert seen == {"stash": [], "live": []}
+
+
+def test_a_failed_release_leaves_no_package_when_the_child_is_stopped(mlp, monkeypatch):
+    seen = _held_at_stop(monkeypatch)
+    with pytest.raises(StoreMutationError):
+        go(mlp, P.WriteIntoLeaf(2), pipelined=True)
+    assert seen == {"stash": [], "live": []}
+
+
+def test_a_handshake_mismatch_leaves_no_package_when_the_child_is_stopped(mlp, monkeypatch):
+    seen = _held_at_stop(monkeypatch)
+    with pytest.raises(ProverProcessError):
+        call(mlp, prover=P.MLPVariantSpec(eta=2e-3))
+    assert seen == {"stash": [], "live": []}
+
+
+def test_a_child_with_another_sequence_length_is_a_handshake_error(three):
+    with pytest.raises(ProverProcessError) as e:
+        call(three, prover=P.DecoderVariantSpec(n=13))
+    assert e.value.kind == "handshake"
+
+
+def test_a_child_with_another_pad_id_is_a_handshake_error(three):
+    with pytest.raises(ProverProcessError) as e:
+        call(three, prover=P.DecoderVariantSpec(pad_id=3))
+    assert e.value.kind == "handshake" and "pad_id" in str(e.value)
+
+
+def test_a_child_that_stalls_in_a_step_is_a_timeout_error(mlp, monkeypatch):
+    monkeypatch.setattr(pipeline, "MESSAGE_DEADLINE_S", 3.0)
+    t0 = time.monotonic()
+    with pytest.raises(ProverProcessError) as e:
+        go(mlp, P.SlowAt(2, 600.0), pipelined=True)
+    assert e.value.kind == "timeout" and "no released" in str(e.value)
+    assert time.monotonic() - t0 < 60
+    assert multiprocessing.active_children() == []
 
 
 def test_a_rejected_run_start_returns_a_verdict_and_no_child(mlp):

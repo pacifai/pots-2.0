@@ -291,5 +291,6 @@ def test_pipelined_is_off_by_default_is_zero_or_one_and_moves_no_hash():
             load_config({"VERIF_PIPELINED": bad})
     assert "pipelined" not in training_config(on)
     assert config_hash(training_config(on)) == config_hash(training_config(base))
-    diff = [f.name for f in dataclasses.fields(base) if getattr(base, f.name) != getattr(on, f.name)]
+    diff = [f.name for f in dataclasses.fields(base)
+            if getattr(base, f.name) != getattr(on, f.name)]
     assert diff == ["pipelined"]

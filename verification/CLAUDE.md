@@ -1778,7 +1778,16 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   - `runs/pipeline.py` (FS33b): child to parent `ready` (handshake), `step`, `released`,
     `final`, `error`; parent to child `release`, `stop`, `bye`. At most 2 steps are unreleased.
     The child exits only after `bye` or EOF. `ProverProcessError.kind` is `exception`,
-    `died`, `handshake` or `protocol`. Child recorder rows merge into the parent's.
+    `died`, `handshake`, `protocol` or `timeout`. Child recorder rows merge into the parent's,
+    except the child's `handoff.release` rows of the last two steps, which are never merged.
+    The handshake compares the whole computation and the data: `n_leaves`, `M`, `n_s`, `eta`,
+    the weight names and shapes, the four dtypes, the devices, a BLAKE3 digest of the products
+    (and the list itself when it has at most 512), `pad_id`, `source`, the `W_0` hashes
+    (`Verifier.chain_hashes`) and the dataset's root and length against `h_D` and `n_records`;
+    every mismatch is named. Each wait for a message has a wall deadline, `MESSAGE_DEADLINE_S`
+    (3600 s), then `timeout` naming the message and the seconds waited; the child is stopped
+    with no grace, as it is after a `start_run` rejection. The `finally` drops every package
+    the parent holds before it stops the child.
   - The caller builds the `Verifier` from public inputs; the loop hands it stores only.
   - `ProverFault` is the only way a fault enters (invariant 5). Its hooks, all honest by
     default: `entry_weights(t, w)` (hidden steps), `committed_records(t, records)` (A1: the

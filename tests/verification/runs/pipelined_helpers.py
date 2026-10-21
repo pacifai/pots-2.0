@@ -41,6 +41,30 @@ class DecoderSpec:
 
 
 @dataclass(frozen=True)
+class DecoderVariantSpec:
+    """The tiny decoder with one respect changed: the sequence length ``n`` or the pad id.
+    The weights are the parent's (neither enters them), so only the handshake can tell."""
+
+    devices: tuple = ("cpu", "cpu", "cpu")
+    n: int = 12
+    pad_id: int | None = None
+
+    def __call__(self):
+        from tests.verification.decoder_helpers import make_records, randomize_biases, tiny_config
+        from verification.computation.instances import DecoderComputation
+        from verification.computation.interface import snapshot_weights
+
+        determinism()
+        torch.manual_seed(0)
+        c = DecoderComputation(tiny_config(), n_s=2, n=self.n, eta=1e-3, pad_id=self.pad_id,
+                               verifier_devices=self.devices)
+        D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7, c.n - 1), seed=1)
+        model = c.build_model()
+        randomize_biases(dict(model.named_parameters()))
+        return ProverSide(c, c.build_model, D, snapshot_weights(c, model))
+
+
+@dataclass(frozen=True)
 class MLPSpec:
     shift: float = 0.0  # a spec whose W_0 differs from the parent's (the handshake test)
 
@@ -131,6 +155,14 @@ def first_batches(t):
 # ---- the tester's additions (FS33b tester) --------------------------------------------------
 
 
+class _Bf16WeightsMLP(MLPComputation):
+    """An MLP instance that declares bfloat16 weights (the parent's declares float32)."""
+
+    @property
+    def weight_dtype(self) -> torch.dtype:
+        return torch.bfloat16
+
+
 @dataclass(frozen=True)
 class MLPVariantSpec:
     """An MLP spec that differs from the parent's in one respect: ``eta``, the dataset's seed,
@@ -142,7 +174,8 @@ class MLPVariantSpec:
 
     def __call__(self):
         determinism()
-        c = MLPComputation(WIDTHS, n_s=N_S, eta=self.eta)
+        cls = _Bf16WeightsMLP if self.w_dtype else MLPComputation
+        c = cls(WIDTHS, n_s=N_S, eta=self.eta)
         w0 = init_weights(c.widths, seed=0)
         if self.w_dtype:
             w0 = {n: v.to(getattr(torch, self.w_dtype)) for n, v in w0.items()}
