@@ -62,10 +62,14 @@ def _case(engine, switch, *rest):
     return pytest.param(engine, switch, *rest, id="-".join((engine, switch_id(switch), *rest)),
                         marks=NEEDS_CUDA if engine == "cuda" else ())
 
-# One product of each class check 5 judges, as ``product_class`` names them; the head's weight
-# gradient is ``G_E_head`` (tied) or ``G_head`` (untied).
-FLIP_CLASSES = ["Y_o", "Y_q", "S", "O", "dA", "dV", "dQ", "dK", "dX_down", "G_down", "Lambda",
-                "dF", "head_G"]
+# One product of each class check 5 judges, as ``product_class`` names them: the 21 linear roles
+# (``Y_``, ``dX_`` and ``G_`` of q, k, v, o, gate, up, down), the six attention roles, ``Lambda``,
+# ``dF``, and the head's weight gradient, which is ``G_E_head`` (tied) or ``G_head`` (untied) and
+# is listed as ``head_G``. ``test_flip_classes_are_the_computations_classes`` ties the list to
+# the computation, so a class added later cannot be left out.
+LINEAR_ROLES = ["q", "k", "v", "o", "gate", "up", "down"]
+FLIP_CLASSES = ([f"{k}_{r}" for k in ("Y", "dX", "G") for r in LINEAR_ROLES]
+                + ["S", "O", "dA", "dV", "dQ", "dK", "Lambda", "dF", "head_G"])
 
 
 # ---- the kernel's emulation on the host ----
@@ -286,6 +290,17 @@ def _mask(detail):
     """``detail`` with its measured numbers masked: step, check and product stay."""
     return re.sub(r"(?<![\w.])[-+]?\d+\.\d+(?:[eE][-+]?\d+)?|(?<=[=<>≈ ])\d+(?:[eE][-+]?\d+)\b", "#",
                   detail)
+
+
+@pytest.mark.parametrize("switch", SWITCHES, ids=switch_id)
+def test_flip_classes_are_the_computations_classes(switch):
+    family, tied = switch
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=torch.float32, device="cpu")
+    head = "G_E_head" if tied else "G_head"
+    got = {c.product_class(s) for s in c.products}
+    assert {head if k == "head_G" else k for k in FLIP_CLASSES} == got
+    assert len(FLIP_CLASSES) == len(set(FLIP_CLASSES)) == 30
 
 
 FLIP_CASES = [_case(e, sw, d, cls) for e in ENGINES for sw in SWITCHES for d in DTYPES
