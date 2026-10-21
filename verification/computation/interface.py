@@ -37,7 +37,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -51,6 +51,7 @@ __all__ = [
     "ProductSpec",
     "LabelingError",
     "ReplayError",
+    "OperandBlock",
     "Replay",
     "DeclaredComputation",
     "HOST",
@@ -130,6 +131,16 @@ class ReplayError(RuntimeError):
     """
 
 
+class OperandBlock(NamedTuple):
+    """Products served as views (:meth:`Replay.operand_blocks`): ``a[t]`` and ``b[t]`` are the
+    operands of ``ms[pos[t]]``. ``a`` ``[n_t, n, q]`` and ``b`` ``[n_t, q, w]`` are detached
+    views in the operand dtype, never copies, with whatever strides the replay's tensors have."""
+
+    pos: list[int]
+    a: torch.Tensor
+    b: torch.Tensor
+
+
 class Replay(ABC):
     """The verifier's per-step glue replay over one transcript (checks 3, 5 and 6b).
 
@@ -162,6 +173,24 @@ class Replay(ABC):
             return torch.stack([x.detach() for x in xs], out=out)
 
         return stack([a for a, _ in pairs]), stack([b for _, b in pairs])
+
+    def operand_blocks(self, ms: Sequence[int]) -> list[OperandBlock]:
+        """The operands of products ``ms`` as views, in blocks: the blocks' ``pos`` cover every
+        index of ``ms`` exactly once, and ``a[t]``, ``b[t]`` of a block are ``operands(ms[
+        pos[t]])``, bit for bit and stride for stride, as views of the replay's own tensors
+        (no copy, no widening). The replay's state afterwards, and the first error and the
+        state at it, are those of ``operands(m)`` over ``ms`` (as :meth:`operand_group`'s
+        contract says). This default is one block per member, ``a[None]``, ``b[None]``."""
+        out = []
+        for i, m in enumerate(ms):
+            a, b = self.operands(m)
+            out.append(OperandBlock([i], a.detach()[None], b.detach()[None]))
+        return out
+
+    def operand_device(self, m: int) -> torch.device | None:
+        """The device ``operands(m)`` serves on, without serving anything, or ``None`` when
+        the replay doesn't say (callers then take the plain path)."""
+        return None
 
     @abstractmethod
     def glue_gradients(self) -> dict[str, torch.Tensor]:

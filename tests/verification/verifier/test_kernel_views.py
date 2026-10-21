@@ -1,0 +1,240 @@
+"""Check 5's kernel path (FS37, ``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.3) on the Mac.
+
+``freivalds.kernel_device`` is switched on and ``measure_groups_rows`` replaced by a stand-in
+that measures each member alone on contiguous fp32 copies (``measure_product_row``, under
+``freivalds.reference()``), so its bits can't depend on grouping, strides or widening, as the
+kernel's can't. ``drain`` records its calls. What is under test is the serving: views from
+``Replay.operand_blocks``, ``P`` as stored, rows mapped back to the run's positions.
+"""
+
+import pytest
+import torch
+
+from setup.data import schedule
+from verification.commitment.leaves import dataset_tree
+from verification.computation.instances import DecoderComputation
+from verification.computation.instances.decoder import DecoderReplay
+from verification.computation.interface import Replay, ReplayError
+from verification.prover.step import prove_step
+from verification.transcript.store import InMemoryStore
+from verification.verifier import checks
+from verification.verifier.bands import Bands
+from verification.verifier.driver import Verifier
+from verification.verifier.matmul_check import freivalds
+
+from tests.verification.computation.test_decoder import SEED, _bump
+from tests.verification.decoder_helpers import (
+    SWITCHES, make_records, randomize_biases, switch_id, tiny_config,
+)
+
+DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
+
+
+class Kernel:
+    """The stand-in kernel: records every call and every drain."""
+
+    def __init__(self):
+        self.calls = []  # per measure_groups_rows call: [(ms, bias given, a/b/p dtypes)]
+        self.events = []  # "measure", "drain", "read" in order
+        self.views = []  # every served MeasureGroup
+
+    def measure(self, groups, *, h, k, guard=True):
+        self.events.append("measure")
+        self.calls.append([(list(g.ms), g.bias is not None) for g in groups])
+        rows = []
+        for g in groups:
+            self.views.append(g)
+            for t, m in enumerate(g.ms):
+                f = lambda x: x.detach().to(torch.float32).contiguous()  # noqa: E731
+                with freivalds.reference():
+                    rows.append(freivalds.measure_product_row(
+                        f(g.a[t]), f(g.b[t]), f(g.p[t]), h=h, m=m, k=k, guard=guard,
+                        bias=None if g.bias is None else f(g.bias)))
+        return torch.stack(rows)
+
+    def drain(self, device=None):
+        self.events.append("drain")
+
+
+@pytest.fixture
+def kernel(monkeypatch):
+    kern = Kernel()
+    monkeypatch.setattr(freivalds, "kernel_device", lambda device: True)
+    monkeypatch.setattr(freivalds, "measure_groups_rows", kern.measure)
+    monkeypatch.setattr(freivalds, "drain", kern.drain)
+    real_read = checks._read_rows
+
+    def read(rows):
+        kern.events.append("read")
+        return real_read(rows)
+
+    monkeypatch.setattr(checks, "_read_rows", read)
+    return kern
+
+
+def _setup(switch, dtype, *, biases=True):
+    family, tied = switch
+    c = DecoderComputation(tiny_config(family=family, tied=tied), n_s=2, n=12, eta=1e-3,
+                           compute_dtype=DTYPES[dtype])
+    D = make_records((c.n, c.n - 5, c.n - 2, c.n - 7), seed=1)
+    tree = dataset_tree(c, D)
+    w0 = {n: p.detach().clone() for n, p in c.build_model().named_parameters()}
+    if biases:
+        randomize_biases(w0)
+    return c, D, tree, w0
+
+
+def _verify(c, D, tree, w0, **kw):
+    idx = schedule(1, c.n_s, len(D), SEED)
+    v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1, bands=Bands.provisional(),
+                 allow_provisional=True, w0=w0, seed=SEED)
+    assert v.start_run(D) is None
+    out = prove_step(c, c.build_model(), w0, [D[i] for i in idx], **kw)
+    store = InMemoryStore.from_step(c, out, dataset_paths=[tree.path(i) for i in idx])
+    return v, v.verify_step(1, store)
+
+
+def _numbers(v):
+    return [(s.m, s.name, s.kappa, s.normalized) for s in v.stats[1].products]
+
+
+@pytest.mark.parametrize("dtype", list(DTYPES))
+@pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
+def test_honest_step_is_accepted_and_measured_from_views(switch, dtype, kernel):
+    c, D, tree, w0 = _setup(switch, dtype)
+    v, rejection = _verify(c, D, tree, w0)
+    assert rejection is None
+    assert sorted(m for call in kernel.calls for grp in call for m in grp[0]) \
+        == list(range(1, c.M + 1))  # every product measured once
+    assert len(v.stats[1].products) == c.M
+    op = c.operand_dtype
+    for g in kernel.views:
+        assert g.a.dtype == g.b.dtype == op  # no fp32 widening
+        assert g.p.dtype == c.product_dtype
+        assert g.a.dim() == g.b.dim() == g.p.dim() == 3
+    # attention members arrive as blocks of views over the whole operands, not as copies
+    assert any(len(g.ms) > 1 for g in kernel.views)
+    # biased products are runs of one with their bias
+    biased = [g for g in kernel.views if g.bias is not None]
+    assert bool(biased) == bool(c.qkv_bias)
+    assert all(len(g.ms) == 1 and g.bias.dtype == op for g in biased)
+
+
+@pytest.mark.parametrize("dtype", list(DTYPES))
+@pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
+def test_views_give_the_numbers_of_the_fp32_serving(switch, dtype, kernel, monkeypatch):
+    """Every product's numbers equal those of the same stand-in fed by the replay's default
+    blocks (one member each, from ``operands``): the block mapping changes nothing."""
+    c, D, tree, w0 = _setup(switch, dtype)
+    v, rejection = _verify(c, D, tree, w0)
+    assert rejection is None
+    got = _numbers(v)
+    assert any(len(grp[0]) > 1 for call in kernel.calls for grp in call)
+    kernel.calls.clear()
+    monkeypatch.setattr(DecoderReplay, "operand_blocks", Replay.operand_blocks)
+    v2, rejection = _verify(c, D, tree, w0)
+    assert rejection is None
+    assert all(len(grp[0]) == 1 for call in kernel.calls for grp in call)
+    assert _numbers(v2) == got
+
+
+@pytest.mark.parametrize("dtype", list(DTYPES))
+def test_kernel_path_equals_the_torch_path_to_float_error(dtype, kernel, monkeypatch):
+    """Against today's path, which measures members batched: the same products, the same
+    verdict, and numbers equal to fp32 rounding (the two measure by different code)."""
+    c, D, tree, w0 = _setup(("qwen2", False), dtype)
+    v, rejection = _verify(c, D, tree, w0)
+    assert rejection is None
+    monkeypatch.setattr(freivalds, "kernel_device", lambda device: False)
+    v2, rejection = _verify(c, D, tree, w0)
+    assert rejection is None
+    for x, y in zip(_numbers(v), _numbers(v2), strict=True):
+        assert x[:2] == y[:2]
+        assert x[2] == pytest.approx(y[2], rel=1e-4, abs=1e-6)
+        assert x[3] == pytest.approx(y[3], rel=1e-3, abs=1e-5)
+
+
+@pytest.mark.parametrize("name", ["L1.S", "L2.O", "L2.dK", "L1.dV", "L1.Y_q", "Lambda"])
+def test_a_flipped_product_is_rejected_where_today_rejects_it(name, kernel, monkeypatch):
+    c, D, tree, w0 = _setup(("qwen2", False), "fp32")
+    ms = [p.m for p in c.products if p.name == name or p.name.startswith(name + "[")
+          or (p.member is not None and f"L{p.layer}.{c.product_class(p)}" == name)]
+    if name == "Lambda":
+        ms = [c.m_of(c.head_name("Lambda", 0))] if hasattr(c, "head_name") else ms
+    assert ms, name
+    m = ms[len(ms) // 2]
+    kw = dict(perturb={m: lambda p: _bump(p)})
+    _, kern = _verify(c, D, tree, w0, **kw)
+    monkeypatch.setattr(freivalds, "kernel_device", lambda device: False)
+    _, torch_path = _verify(c, D, tree, w0, **kw)
+    assert kern is not None and torch_path is not None
+    assert (kern.step, kern.check_id) == (torch_path.step, torch_path.check_id) == (1, "5")
+    assert kern.detail == torch_path.detail
+    assert f"P_{m} " in kern.detail
+
+
+@pytest.mark.parametrize("role", ["O", "dK", "dV"])
+def test_a_serving_error_in_a_group_finds_the_same_member_and_error(role, kernel, monkeypatch):
+    """A held operand of one role changes before its group is served: the group fails whole,
+    the run is finished member by member, and the error and the products judged before it are
+    those of today's path (for a backward role, after earlier groups of the run were measured
+    from blocks)."""
+    c, D, tree, w0 = _setup(("llama", True), "fp32", biases=False)
+    layer = 1 if role == "O" else c.L
+    done = []
+
+    def tamper(replay, ms):
+        spec = c.product(ms[0])
+        mine = [m for m in ms if c.product(m).member is not None
+                and c.product_class(c.product(m)) == role and c.product(m).layer == layer]
+        if not done and mine:
+            done.append(mine[0])
+            first = c.product(mine[0])
+            if first.kind.name == "FORWARD":
+                replay._forward_unit(first)
+                held = replay._units[layer].fwd
+            else:
+                replay._backward_unit(first)
+                held = replay._bops
+            with torch.no_grad():
+                held[f"L{layer}.{role}"][0].add_(0)  # bumps _version only
+
+    for fn in ("operand_group", "operand_blocks"):
+        real = getattr(DecoderReplay, fn)
+        monkeypatch.setattr(DecoderReplay, fn, lambda self, ms, *a, _r=real: (
+            tamper(self, ms), _r(self, ms, *a))[1])
+    runs = []
+    for on in (True, False):
+        monkeypatch.setattr(freivalds, "kernel_device", lambda device, on=on: on)
+        done.clear()
+        kernel.calls.clear()
+        with pytest.raises(ReplayError) as e:
+            _verify(c, D, tree, w0)
+        assert done
+        assert bool(kernel.calls) == on
+        runs.append(str(e.value))
+    assert runs[0] == runs[1] and "changed after its product read it" in runs[0]
+
+
+def test_drain_runs_before_each_window_read_and_at_the_end(kernel, monkeypatch):
+    c, D, tree, w0 = _setup(("llama", True), "fp32")
+    monkeypatch.setattr(checks, "_JUDGE_WINDOW", 20)  # several windows in a step
+    v, rejection = _verify(c, D, tree, w0)
+    assert rejection is None
+    ev = kernel.events
+    reads = [i for i, e in enumerate(ev) if e == "read"]
+    assert len(reads) >= 2
+    # `read` is stamped before _read_rows runs; the drain is its first act, so a drain
+    # precedes the measures after it and the events show drain right after each read.
+    assert ev.count("drain") >= len(reads) + 1
+    for i in reads:
+        assert ev[i + 1] == "drain"
+    assert ev[-1] == "drain"  # check 5's finally, after the last read
+
+
+def test_check_5_drains_when_a_product_is_rejected(kernel):
+    c, D, tree, w0 = _setup(("llama", True), "fp32")
+    m = c.m_of("L1.Y_q")
+    _, rejection = _verify(c, D, tree, w0, perturb={m: lambda p: _bump(p)})
+    assert rejection is not None and rejection.check_id == "5"
+    assert kernel.events[-1] == "drain" or "drain" in kernel.events[-3:]
