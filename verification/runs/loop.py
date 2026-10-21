@@ -285,18 +285,19 @@ def run_loop(
     device = model_device(model)
     pi = schedule or _default_schedule(c, dataset, verifier.seed)
     result = LoopResult(verdict=RunVerdict(False, None, 0, None))
+    # The first NVRTC build or cache load of the process would land inside a timed section:
+    # step 1's forward pass, or check 0's hash of W_0 in ``start_run`` (the kernel hashes it
+    # where it sits). Do it here, before both, outside every section (FS30, FS34). Every CUDA
+    # device of the run, the sharded placement's included.
+    for d in dict.fromkeys(torch.device(x) for x in (device, *(c.placement.devices or ()))
+                           if _on_cuda(x)):
+        GpuBlake3().kernels(d)
+        measure_kernel.kernels(d)  # check 5's fused measuring kernel (FS37)
     if verifier.start_run(dataset) is not None:
         result.verdict = verifier.end_run(final)
         return result
     with sec("run:P4.tree"):
         tree = dataset_tree(c, dataset)  # the prover's own copy of h_D's tree, for audit paths
-    # The first NVRTC build or cache load of the process would land inside step 1's forward
-    # pass, in its timed sections: do it here, outside every section (FS30). Every CUDA device
-    # of the run, the sharded placement's included.
-    for d in dict.fromkeys(torch.device(x) for x in (device, *(c.placement.devices or ()))
-                           if _on_cuda(x)):
-        GpuBlake3().kernels(d)
-        measure_kernel.kernels(d)  # check 5's fused measuring kernel (FS37)
     w: Mapping[str, torch.Tensor] = w0
     for t in range(1, verifier.n_steps + 1):
         idx = list(pi(t))

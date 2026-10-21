@@ -794,7 +794,8 @@ def _table_outcome(tb: _Table) -> tuple[list[bytes], tuple[int, Exception] | Non
 
 def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
                      stats: HashStats | None = None, *,
-                     known: Mapping[int, bytes] | None = None) -> list[bytes]:
+                     known: Mapping[int, bytes] | None = None, kernel: bool = True
+                     ) -> list[bytes]:
     """Every leaf hash of a full transcript, in layout order: :func:`commit_leaves` without the
     tree, so a caller can time the two apart.
 
@@ -812,13 +813,16 @@ def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
     (decision 4, ``"arrival"`` path) is unchecked, is compared with the C library's digest of
     the leaf's host copy; a mismatch raises ``KernelMismatchError``, which beats every other
     error of the call. Under ``native.disabled()`` nothing is compared.
+
+    ``kernel=False`` sends every leaf that is not known through the C library, as in
+    :func:`leaf_hashes_of`; the known digests are taken and compared as above.
     """
     if len(leaves) != c.n_leaves:
         raise ValueError(f"transcript has {len(leaves)} leaves, the computation declares "
                          f"{c.n_leaves}")
     known = known or {}
     if not known:
-        return leaf_hashes_of(c, list(enumerate(leaves)), stats)
+        return leaf_hashes_of(c, list(enumerate(leaves)), stats, kernel=kernel)
     n_s = c.n_s
     slots: dict[int, tuple[int, tuple[int, ...], torch.dtype]] = {}
     out: list[bytes | None] = [None] * len(leaves)
@@ -847,15 +851,19 @@ def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
         stats.known += n_known
         stats.leaves += n_known
         stats.bytes += nbytes_known
-    digests, err = leaf_hashes_until_error(c, host, stats)
+    digests, err = leaf_hashes_until_error(c, host, stats, kernel=kernel)
     for (i, _), d in zip(host, digests):
         out[i] = d
     failures: list[tuple[int, Exception]] = []
     if err is not None:
         failures.append((host[len(digests)][0], err))
     if native.enabled():
+        akeys: dict[tuple[int, torch.device], tuple[Any, ...]] = {}  # per slot and device
         for i, obj, tag, d in arrivals:
-            key = kernel_check.key_of("arrival", obj.device, tag, obj.dtype, tuple(obj.shape))
+            key = akeys.get((i, obj.device))
+            if key is None:
+                key = akeys[(i, obj.device)] = kernel_check.key_of(
+                    "arrival", obj.device, tag, obj.dtype, tuple(obj.shape))
             if kernel_check.is_checked(key):
                 continue
             try:
@@ -871,10 +879,11 @@ def hash_step_leaves(c: DeclaredComputation, leaves: Sequence[Any],
 
 
 def commit_leaves(c: DeclaredComputation, leaves: Sequence[Any],
-                  known: Mapping[int, bytes] | None = None) -> MerkleTree:
+                  known: Mapping[int, bytes] | None = None, *, kernel: bool = True
+                  ) -> MerkleTree:
     """The Merkle tree over a full transcript's leaves, in layout order; ``.root`` is ``h``.
-    ``known`` is :func:`hash_step_leaves`'s."""
-    return MerkleTree(hash_step_leaves(c, leaves, known=known))
+    ``known`` and ``kernel`` are :func:`hash_step_leaves`'s."""
+    return MerkleTree(hash_step_leaves(c, leaves, known=known, kernel=kernel))
 
 
 def leaf_totals(c: DeclaredComputation, leaves: Sequence[Any]) -> tuple[int, int]:

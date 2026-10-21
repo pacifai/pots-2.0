@@ -501,13 +501,52 @@ def _plant_result():
     gb.PendingHash.result = wrong
 
 
+def plant_products(setter, *, caller=None, stack_has=()):
+    """A fake kernel that corrupts one key: the digests of the leaves whose header tag is
+    ``TAG_PRODUCT``, and no other (``setter(obj, name, value)`` installs it: ``setattr`` or a
+    monkeypatch's). ``caller`` (a function name) limits it to tables enqueued directly by that
+    function (``"_hash_arrival"``: the capture's arrival hashes only); ``stack_has`` (function
+    names) to tables enqueued with one of them on the stack. The result's ``hits`` counts the
+    digests it corrupted."""
+    import sys
+    from types import SimpleNamespace
+
+    from verification.commitment.encoding import TAG_PRODUCT
+
+    real = gb.GpuBlake3.enqueue_table
+    plant = SimpleNamespace(hits=0)
+
+    def enqueue(self, hdr_buf, hdr_off, hdr_len, hdr_idx, *a, **k):
+        pend = real(self, hdr_buf, hdr_off, hdr_len, hdr_idx, *a, **k)
+        if caller is not None and sys._getframe(1).f_code.co_name != caller:
+            return pend
+        if stack_has and not any(f.function in stack_has for f in inspect.stack()):
+            return pend
+        bad = [hdr_buf[int(hdr_off[int(h)])] == TAG_PRODUCT for h in hdr_idx]
+        honest = pend.result
+
+        def result():
+            d, first_bad = honest()
+            plant.hits += sum(bad[:len(d)])
+            return [bytes(32) if b else x for b, x in zip(bad, d)], first_bad
+
+        pend.result = result
+        return pend
+
+    setter(gb.GpuBlake3, "enqueue_table", enqueue)
+    return plant
+
+
 def install_seams(so, plant):
-    """The fake kernel and the routing seams, in this process (a spawned child's too)."""
+    """The fake kernel and the routing seams, in this process (a spawned child's too).
+    ``plant``: True corrupts every digest, ``"product"`` the product leaves' only."""
     g = gb.GpuBlake3(_load_host_kernels(so))
     L._hasher = lambda: g
     L._kernel_leaf = lambda t: (t.is_contiguous() and t.numel() > 0
                                 and t.dtype in native.FINITE_KIND)
-    if plant:
+    if plant == "product":
+        plant_products(setattr)
+    elif plant:
         _plant_result()
 
 
@@ -517,7 +556,7 @@ class SeamedSpec:
     child before it builds the prover side; module level, so the child unpickles it."""
 
     so: str
-    plant: bool = False
+    plant: bool | str = False
     devices: tuple = THREE
 
     def __call__(self):
@@ -707,6 +746,121 @@ def test_run_loop_clears_the_set_for_the_sequential_and_the_pipelined_dispatch(
         kc.mark_checked(ghost)
         _scenario_run(pipelined, SeamedSpec(so) if pipelined else None)
         assert not kc.is_checked(ghost)
+
+
+# ---- whole runs: a kernel that is wrong for one key only (the design's "Tests and the gate") --
+
+
+@pytest.fixture
+def keys_clear_at_verify(monkeypatch):
+    """The checked set is emptied as the verifier's step starts, standing for its devices being
+    others than the prover's (a key has its device in it)."""
+    from verification.verifier.driver import Verifier
+
+    real = Verifier.verify_step
+    monkeypatch.setattr(Verifier, "verify_step",
+                        lambda self, t, store: (kc._checked.clear(), real(self, t, store))[1])
+
+
+def test_a_product_only_plant_corrupts_products_and_nothing_else(c, leaves, on_kernel,
+                                                                 monkeypatch):  # noqa: F811
+    plant = plant_products(monkeypatch.setattr)
+    want = leaf_hashes_of(c, items(leaves), kernel=False)
+    with pytest.raises(kc.KernelMismatchError, match="tag 0x"):
+        leaf_hashes_of(c, items(leaves))
+    assert plant.hits > 0
+    kc.new_run()
+    weights = [(i, leaves[i]) for i in range(c.n_s, c.n_s + c.n_w)]
+    assert leaf_hashes_of(c, weights) == [want[i] for i, _ in weights]
+
+
+def _in_run(exc, *names):
+    got = _tb_names(exc)
+    assert names and all(n in got for n in names), (names, sorted(got))
+
+
+def test_a_product_plant_in_the_commit_stops_the_sequential_run(
+        on_kernel, monkeypatch, no_verdict):  # noqa: F811
+    plant = plant_products(monkeypatch.setattr, stack_has=("commit_step",))
+    with pytest.raises(kc.KernelMismatchError) as e:
+        _scenario_run(False)
+    _in_run(e.value, "run_loop", "commit_step", "hash_step_leaves")
+    assert plant.hits > 0 and no_verdict == []
+
+
+def test_a_product_plant_in_the_childs_commit_is_a_prover_process_error(so, no_verdict):
+    from verification.runs.pipeline import ProverProcessError
+
+    with pytest.raises(ProverProcessError) as e:
+        _scenario_run(True, SeamedSpec(so, plant="product"))
+    msg = str(e.value)
+    assert e.value.kind == "exception" and "KernelMismatchError" in msg
+    assert "commit_step" in msg and "tag 0x03" in msg  # the commit, not the handshake
+    assert no_verdict == []
+
+
+def test_a_product_plant_in_check_2_stops_the_sequential_run(
+        on_kernel, monkeypatch, no_verdict, keys_clear_at_verify):  # noqa: F811
+    plant = plant_products(monkeypatch.setattr, stack_has=("check_2_commitment",))
+    with pytest.raises(kc.KernelMismatchError) as e:
+        _scenario_run(False)
+    _in_run(e.value, "run_loop", "verify_step", "check_2_commitment")
+    assert plant.hits > 0 and no_verdict == []
+
+
+def test_a_product_plant_in_check_2_of_the_pipelined_parent_stops_the_run(
+        so, parent_seams, monkeypatch, no_verdict):
+    import multiprocessing
+
+    parent_seams(plant=False)
+    plant = plant_products(monkeypatch.setattr, stack_has=("check_2_commitment",))
+    spec = SeamedSpec(so)
+    assert spec.plant is False  # the child's kernel is honest
+    with pytest.raises(kc.KernelMismatchError) as e:
+        _scenario_run(True, spec)
+    _in_run(e.value, "run_pipelined", "check_2_commitment")
+    assert plant.hits > 0 and no_verdict == []
+    assert multiprocessing.active_children() == []
+
+
+# ---- the kernels load before start_run, outside check 0's section ------------------------------
+
+
+def _preload_order(monkeypatch, pipelined):
+    """Every kernel load and every kernel table of a run, in order, with the section ``run:0``
+    (check 0's) if it is open at the time."""
+    import traceback
+
+    from verification.runs import loop
+    from verification.runs import pipeline as P
+    from verification.verifier.matmul_check import measure_kernel
+
+    order = []
+    real = L._enqueue_table
+
+    def table(idx, tensors, tags):
+        in_start = "start_run" in [f.name for f in traceback.extract_stack()]
+        order.append(("table", in_start))
+        return real(idx, tensors, tags)
+
+    monkeypatch.setattr(L, "_enqueue_table", table)
+    mod = P if pipelined else loop
+    monkeypatch.setattr(mod, "_is_cuda" if pipelined else "_on_cuda", lambda d: True)
+    monkeypatch.setattr(mod, "GpuBlake3", lambda: type(
+        "G", (), {"kernels": lambda s, d: order.append(("hash", str(d)))})())
+    monkeypatch.setattr(measure_kernel, "kernels", lambda d: order.append(("measure", str(d))))
+    assert _scenario_run(pipelined).loop.verdict.accepted
+    return order
+
+
+@pytest.mark.parametrize("pipelined", [False, True])
+def test_both_kernels_load_before_start_run_hashes_w0(
+        on_kernel, monkeypatch, pipelined):  # noqa: F811
+    order = _preload_order(monkeypatch, pipelined)
+    first = next(i for i, o in enumerate(order) if o[0] == "table")
+    loads = [o[0] for o in order[:first]]
+    assert order[first] == ("table", True)  # the first table is check 0's hash of W_0
+    assert loads.count("hash") >= 1 and loads.count("measure") >= 1, order[:first + 1]
 
 
 # ---- the pair session's FS34 item ------------------------------------------------------------

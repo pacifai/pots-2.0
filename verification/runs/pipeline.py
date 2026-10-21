@@ -673,17 +673,18 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
     msg = pkg = part = released = None
     try:
         result = LoopResult(verdict=RunVerdict(False, None, 0, None), pipelined=True)
-        if verifier.start_run(dataset) is not None:
-            link.stop(grace=0)
-            result.verdict = verifier.end_run(final)
-            return result
-        # The parent's kernels (it hashes nothing on a device today, but the verifier's own
-        # leaf hashing may, and check 5 measures): loaded here, outside every section, before
-        # step 1 (FS34, FS37). The child never measures, so it builds only the hash kernel.
+        # The parent's kernels: its checks 0, 2 and 7 hash the GPU-resident leaves (the
+        # child's, opened by IPC) with the hash kernel, and check 5 measures. Loaded here,
+        # before ``start_run`` (check 0 hashes W_0 there) and outside every section (FS34,
+        # FS37). The child never measures, so it builds only the hash kernel.
         for d in dict.fromkeys(torch.device(x) for x in (c.placement.devices or ())
                                if _is_cuda(x)):
             GpuBlake3().kernels(d)
             measure_kernel.kernels(d)
+        if verifier.start_run(dataset) is not None:
+            link.stop(grace=0)
+            result.verdict = verifier.end_run(final)
+            return result
         _, hs, part0 = link.expect("ready")
         _check_handshake(hs, c, verifier, w0)
         if recorder is not None:
