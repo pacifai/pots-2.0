@@ -41,6 +41,11 @@ functions and the same table.
   ``release`` only after the consumer's ``close``, and drop its own references to ``leaves``
   and the step first for the memory to be freed. Device indices are the same in both processes
   (same ``CUDA_VISIBLE_DEVICES``).
+- *Where the leaves live decides the path.* ``placement_for`` puts every leaf of an unsharded
+  computation on the host, so an unsharded GPU run's leaves are host tensors and cross through
+  the one CPU copy per step below (at full scale the whole transcript, tens of GB per step). The
+  pipelined loop must therefore run with verifier devices (sharded: W and product leaves on
+  them, records on the host and by value; on one GPU the prover's own device); FS33b enforces it.
 - *CPU storages* are copied once into **one** shared-memory buffer per step (each storage's whole
   bytes, 64-byte aligned), which the consumer maps; with Linux's default sharing strategy a
   storage per descriptor would mean thousands of descriptors per step. The copy is test scale's

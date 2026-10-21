@@ -1,7 +1,10 @@
 """The CUDA transport of the cross-process store (FS33a). Skipped without CUDA; desk-checked,
 it first runs on the two-GPU pod (FS33d).
 
-The producer is a spawned process holding the transcript on ``cuda:0``. Nothing is copied: the
+The producer is a spawned process; its sharded placement (``placement_for``) puts W and
+product leaves on the verifier devices (``cuda:0`` for one GPU, the prover's own device) and
+records on the host (they go by value). An unsharded computation puts every leaf on the host,
+so it takes the CPU path (see the last test). Nothing is copied: the
 producer's CUDA memory does not grow by the transcript when it shares, and a write the producer
 makes after the consumer opened the step shows in the consumer's read (the outside proof of "no
 copy"). Every test runs with the allocator setting unset and with the full-scale setting
@@ -32,7 +35,7 @@ ALLOCS = [pytest.param(None, id="alloc_default"),
 
 
 def _cases():
-    yield pytest.param(None, "cuda:0", id="one_gpu")
+    yield pytest.param(("cuda:0",), "cuda:0", id="one_gpu")
     yield pytest.param(("cuda:1",), "cuda:0", id="two_gpus",
                        marks=pytest.mark.skipif(not TWO, reason="needs a second GPU"))
 
@@ -75,9 +78,9 @@ def test_cuda_step_hashes_reads_and_returns_the_memory(devices, device, alloc):
 def test_cuda_a_producer_write_after_open_is_read_by_the_consumer(alloc):
     """No copy, proved from outside: the producer writes one element through ``.data`` after
     the consumer opened the step, and the consumer reads the new value at that leaf."""
-    r = Remote(None, device="cuda:0", steps=1, alloc=alloc)
+    r = Remote(("cuda:0",), device="cuda:0", steps=1, alloc=alloc)
     try:
-        c, _, _, _ = H.setup(None, "cuda:0")
+        c, _, _, _ = H.setup(("cuda:0",), "cuda:0")
         pkg, digests, _, n = r.steps[0]
         store = SharedStore.open(c, pkg)
         leaves = [store.leaf(i) for i in range(n)]
@@ -129,6 +132,25 @@ def test_cuda_release_after_close_returns_the_producers_memory_exactly(alloc):
         conn.send("quit")
     finally:
         H.reap(p, 10)
+
+
+@pytest.mark.parametrize("alloc", ALLOCS)
+def test_cuda_unsharded_leaves_are_host_tensors_and_take_the_cpu_path(alloc):
+    """``placement_for`` gives an unsharded computation HOST for every leaf, so a run on cuda:0
+    without verifier devices crosses through the one CPU buffer, not CUDA handles."""
+    r = Remote(None, device="cuda:0", steps=1, alloc=alloc)
+    try:
+        c, _, _, _ = H.setup(None, "cuda:0")
+        pkg, digests, root, n = r.steps[0]
+        assert pkg.cuda == [] and pkg.cpu is not None, (
+            f"expected the CPU path, got {len(pkg.cuda)} CUDA storages, cpu={pkg.cpu is not None}")
+        store = SharedStore.open(c, pkg)
+        assert hash_step_leaves(c, [store.leaf(i) for i in range(n)]) == digests
+        assert store.root == root
+        store.close()
+        assert r.ask("release", 1) == "ok"
+    finally:
+        r.stop()
 
 
 def test_cuda_share_step_allocates_nothing():
