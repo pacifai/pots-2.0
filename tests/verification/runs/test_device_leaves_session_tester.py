@@ -213,7 +213,9 @@ def test_the_cpu_root_is_the_c_librarys_even_when_a_kept_leaf_is_routed_to_a_ker
         real, monkeypatch):
     """No CUDA here: the routing's test (``_kernel_leaf``) is patched to take the first product
     leaf as a device leaf, and the kernel's table to answer with a wrong digest. The routed
-    ``commit_leaves`` then gives another root; the line's cpu root must stay the C library's."""
+    ``commit_leaves`` then stops with ``KernelMismatchError`` (FS34's per-shape check) and the
+    line's cpu root, taken with ``kernel=False``, stays the C library's."""
+    from verification.commitment import kernel_check
     from verification.commitment import leaves as L
 
     c, leaves, honest = real
@@ -221,6 +223,8 @@ def test_the_cpu_root_is_the_c_librarys_even_when_a_kept_leaf_is_routed_to_a_ker
     monkeypatch.setattr(L, "_kernel_leaf", lambda t: t is leaves[first])
     monkeypatch.setattr(L, "_enqueue_table", lambda idx, ts, tags: SimpleNamespace(idx=idx))
     monkeypatch.setattr(L, "_table_outcome", lambda tb: ([b"\x00" * 32] * len(tb.idx), None))
-    assert commit_leaves(c, leaves).root != honest  # the fake kernel is in the routed path
+    kernel_check.new_run()
+    with pytest.raises(kernel_check.KernelMismatchError):
+        commit_leaves(c, leaves)  # the fake kernel is in the routed path
     got = fs._DEVICE_LEAVES_LINE.match(written_line(real))
     assert got is not None and got[4] == honest.hex()

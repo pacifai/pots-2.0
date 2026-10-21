@@ -328,7 +328,9 @@ def test_an_exception_in_flight_beats_an_outcome_error(c, leaves, table_log, mon
         table_log["read"].append(tb.idx)
         raise RuntimeError("outcome")
 
-    monkeypatch.setattr(L, "leaf_hashes_until_error", host_fails)
+    # FS34: the host work and the tables share one call, so the failure is the host worker's
+    # (the records' batch), raised after the tables were queued.
+    monkeypatch.setattr(L, "_hash_batch", host_fails)
     monkeypatch.setattr(L, "_table_outcome", outcome_fails)
     with pytest.raises(ValueError, match="host path"):
         hash_step_leaves(c, leaves)
