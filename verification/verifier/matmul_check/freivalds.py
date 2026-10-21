@@ -329,10 +329,8 @@ def reference() -> Iterator[None]:
 
 def kernel_device(device: torch.device | str) -> bool:
     """Whether measuring on ``device`` goes to the fused kernel: a CUDA device outside
-    :func:`reference`. Every other device keeps the torch path bit for bit (§2.2).
-
-    FS37 interface stub: ``False`` until the kernel lands."""
-    return False
+    :func:`reference`. Every other device keeps the torch path bit for bit (§2.2)."""
+    return _reference_depth == 0 and torch.device(device).type == "cuda"
 
 
 def measure_groups_rows(groups: Sequence[MeasureGroup], *, h: bytes, k: int,
@@ -341,18 +339,24 @@ def measure_groups_rows(groups: Sequence[MeasureGroup], *, h: bytes, k: int,
     device, groups in order and members in order within each, from one table and one launch
     set on the current stream, with no host read. Challenges come from the host challenge
     source (§2.6). The inputs, the table and the challenge buffer are held, with each input's
-    ``_version`` as enqueued, until :func:`drain`.
+    ``_version`` as enqueued, until :func:`drain`. Each call first releases the entries
+    whose event has completed. A group the rules refuse (dtype, shapes, device, a bias with
+    several members, ``k``) raises ``ValueError`` naming it, before anything is launched; the
+    tensors must be on a CUDA device."""
+    from verification.verifier.matmul_check import measure_kernel
 
-    FS37 interface stub."""
-    raise NotImplementedError("the fused measuring kernel lands in FS37")
+    return measure_kernel.enqueue(groups, h=h, k=k, guard=guard)
 
 
 def drain(device: torch.device | str | None = None) -> None:
     """Wait for every kernel measurement enqueued on ``device`` (every device when ``None``),
     check that no held input's ``_version`` moved (``ReplayError`` otherwise, invariant 6),
-    and release the holds. Call it before reading rows back.
+    and release the holds. Call it before reading rows back."""
+    import sys
 
-    FS37 interface stub: nothing is ever in flight yet."""
+    mk = sys.modules.get("verification.verifier.matmul_check.measure_kernel")
+    if mk is not None:  # nothing was ever enqueued if the kernel's module was never imported
+        mk.drain(device)
 
 
 def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: bytes, m: int,
@@ -375,6 +379,8 @@ def measure_product(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: byt
     It is :func:`measure_product_row`, read back, then :func:`finish_row`.
     """
     row = measure_product_row(a, b, p, h=h, m=m, k=k, scratch=scratch, guard=guard, bias=bias)
+    if kernel_device(b.device):
+        drain(b.device)
     return finish_row(row.tolist(), q=a.shape[1] + (bias is not None), n=a.shape[0],
                       eps_in=eps_in, eps_acc=eps_acc, guard=guard, biased=bias is not None)
 
@@ -383,7 +389,12 @@ def measure_product_row(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h:
                         k: int, scratch: MeasureScratch | None = None, guard: bool = True,
                         bias: torch.Tensor | None = None) -> torch.Tensor:
     """:func:`measure_product`'s numbers as a float64 row (:data:`ROW`) on the operands'
-    device, with nothing read back to the host."""
+    device, with nothing read back to the host. On a CUDA device (outside :func:`reference`)
+    the fused kernel measures it, as a group of one member (``scratch`` is not used), and the
+    row is read only after :func:`drain`."""
+    if kernel_device(b.device):
+        group = MeasureGroup(a[None], b[None], p[None], [m], bias)
+        return measure_groups_rows([group], h=h, k=k, guard=guard)[0]
     width = b.shape[1]
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
@@ -496,6 +507,8 @@ def measure_products(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, h: by
     It is :func:`measure_products_rows`, read back, then :func:`finish_row` per member.
     """
     rows = measure_products_rows(a, b, p, h=h, ms=ms, k=k, scratch=scratch, guard=guard)
+    if kernel_device(b.device):
+        drain(b.device)
     q, n = a.shape[2], a.shape[1]
     return [finish_row(row, q=q, n=n, eps_in=eps_in, eps_acc=eps_acc, guard=guard)
             for row in rows.tolist()]
@@ -510,6 +523,8 @@ def measure_products_rows(a: torch.Tensor, b: torch.Tensor, p: torch.Tensor, *, 
     if len(ms) != n_b or b.shape[0] != n_b or p.shape[0] != n_b:
         raise ValueError(f"batch of {len(ms)} labels for operands {tuple(a.shape)}, "
                          f"{tuple(b.shape)}, {tuple(p.shape)}")
+    if kernel_device(b.device):
+        return measure_groups_rows([MeasureGroup(a, b, p, ms)], h=h, k=k, guard=guard)
     sc = MeasureScratch() if scratch is None else scratch
     with torch.no_grad():
         ones = sc.ones(width, b.device)

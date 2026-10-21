@@ -454,37 +454,65 @@ class Built:
                 self.stem.with_suffix("." + kind).unlink(missing_ok=True)
 
 
-def cache_key(arch: str, nvrtc: tuple[int, int], options: Sequence[Sequence[str]] = ()) -> str:
-    """Hash of the sources, the architecture, NVRTC's version and every compile option."""
-    text = f"{source_hash()}|{arch}|{nvrtc[0]}.{nvrtc[1]}|{json.dumps([list(o) for o in options])}"
+@dataclass(frozen=True)
+class Source:
+    """Another NVRTC program for :func:`build_image`: the kernel file ``cu_name`` with its text
+    and the headers it includes (name to text), cached as ``<prefix>-<key>`` (the measuring
+    kernel, FS37). The default build is this module's own BLAKE3 kernels."""
+
+    cu_name: str
+    cu_text: str
+    headers: dict[str, str]
+    prefix: str
+
+    def digest(self) -> str:
+        h = hashlib.sha256(self.cu_name.encode() + b"\0" + self.cu_text.encode())
+        for name in sorted(self.headers):
+            h.update(b"\0" + name.encode() + b"\0" + self.headers[name].encode())
+        return h.hexdigest()
+
+
+def cache_key(arch: str, nvrtc: tuple[int, int], options: Sequence[Sequence[str]] = (),
+              source: Source | None = None) -> str:
+    """Hash of the sources, the architecture, NVRTC's version and every compile option.
+    ``source`` names the program when it is not the BLAKE3 kernels."""
+    digest = source_hash() if source is None else source.digest()
+    text = f"{digest}|{arch}|{nvrtc[0]}.{nvrtc[1]}|{json.dumps([list(o) for o in options])}"
     return hashlib.sha256(text.encode()).hexdigest()[:24]
 
 
 def build_image(nvrtc: Nvrtc, cc: tuple[int, int], *, cache: Path | None = None,
-                use_cache: bool = True) -> Built:
+                use_cache: bool = True, source: Source | None = None,
+                extra_options: Sequence[str] = ()) -> Built:
     """Compile the kernels for compute capability ``cc``: a CUBIN for ``sm_XY``, else PTX for
     ``compute_XY`` when NVRTC rejects that architecture. A compile error raises with NVRTC's
-    error string and the log. ``use_cache=False`` skips the read and rewrites the entry."""
+    error string and the log. ``use_cache=False`` skips the read and rewrites the entry.
+    ``source`` builds another program (see :class:`Source`) and ``extra_options`` are added to
+    the architecture's options and to the cache key."""
     version = nvrtc.version()
     arch = f"sm_{cc[0]}{cc[1]}"
-    opts = {k: arch_options(cc, k) for k in ("cubin", "ptx")}
-    key = cache_key(arch, version, list(opts.values()))
-    stem = None if cache is None else cache / f"gpu_blake3-{key}"
+    opts = {k: [*arch_options(cc, k), *extra_options] for k in ("cubin", "ptx")}
+    key = cache_key(arch, version, list(opts.values()), source)
+    prefix = "gpu_blake3" if source is None else source.prefix
+    stem = None if cache is None else cache / f"{prefix}-{key}"
     if stem is not None and use_cache:
         for kind in ("cubin", "ptx"):
             p = stem.with_suffix("." + kind)
             if p.is_file():
                 return Built(p.read_bytes(), kind, arch, version, cached=True, stem=stem)
-    core, cu = source_text()
-    headers = {CORE_NAME: core}
-    rc, image, log = nvrtc.compile(cu, CU_NAME, headers, opts["cubin"], "cubin")
+    if source is None:
+        core, cu = source_text()
+        headers, cu_name = {CORE_NAME: core}, CU_NAME
+    else:
+        headers, cu, cu_name = source.headers, source.cu_text, source.cu_name
+    rc, image, log = nvrtc.compile(cu, cu_name, headers, opts["cubin"], "cubin")
     kind = "cubin"
     if rc == NVRTC_ERROR_INVALID_OPTION:
-        rc, image, log = nvrtc.compile(cu, CU_NAME, headers, opts["ptx"], "ptx")
+        rc, image, log = nvrtc.compile(cu, cu_name, headers, opts["ptx"], "ptx")
         kind = "ptx"
     if rc:
         raise RuntimeError(
-            f"NVRTC {version[0]}.{version[1]} cannot compile {CU_NAME} for {arch}: "
+            f"NVRTC {version[0]}.{version[1]} cannot compile {cu_name} for {arch}: "
             f"error {rc} {nvrtc.error_string(rc)}{builtins_hint(rc)}\n{log}")
     if stem is not None:
         try:
