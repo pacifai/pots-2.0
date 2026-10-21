@@ -27,8 +27,10 @@ def parse(text):
 
 
 def verdict(topo=TOPO_4, p2p=P2P_4, rates=None, n=4):
-    return nv.hw2_verdict(parse(topo), parse(p2p), pair_rates(n, 380.0) if rates is None
-                          else rates)
+    t = parse(topo)
+    right = {f"{a[3:]}->{b[3:]}": True for a in t for b in t if a != b} if t else None  # bytes right
+    return nv.hw2_verdict(t, parse(p2p), pair_rates(n, 380.0) if rates is None else rates,
+                          peer_bytes=right)
 
 
 # ---- HW2: topology ---------------------------------------------------------------------------
@@ -143,6 +145,8 @@ def _fake_run(topo_code=0, p2p_code=0, topo_text=TOPO_4, p2p_text=P2P_4):
 
 
 def _four_fast(monkeypatch):
+    monkeypatch.setattr(nv, "peer_bytes_by_pair", lambda: {
+        f"{a}->{b}": True for a in range(4) for b in range(4) if a != b})
     monkeypatch.setattr(nv, "torch_view", lambda: {"device_count": 4})
     monkeypatch.setattr(nv, "peer_copy_bandwidth", lambda: {"pairs": pair_rates(4, 380.0)})
     monkeypatch.setattr(nv, "fanout_bandwidth", lambda: {})
@@ -408,7 +412,7 @@ def test_the_models_part_is_the_only_one_that_goes_online(tmp_path):
     plan = fs.nvlink_probe_plan(tmp_path / "up", tmp_path / "out")
     online = [p.name for p in plan if p.env.get("HF_HUB_OFFLINE", "1") is None]
     assert online == ["models"]
-    for p in plan[1:]:
+    for p in (p for p in plan if p.name != "models"):
         assert p.env.get("HF_HUB_OFFLINE", "1") == "1"
         assert p.env.get("TRANSFORMERS_OFFLINE", "1") == "1"
 
