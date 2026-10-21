@@ -294,7 +294,9 @@ commits them. The hashing benchmark (`benchmarks/hashing/`) imports only this mo
   device-leaves session").
 
 **On a GPU** (task FS9) the model, its activations and the replay run on the GPU, while
-every leaf lives in host RAM, as the full-scale hand-off decision (F1c) puts the transcript.
+every leaf lives in host RAM, as the one-H100 hand-off decision (F1c) put the transcript. That is
+the unsharded path; on the four-H100 machine (F22) each product goes by peer copy to the GPU that
+owns its layer and stays there (see "The two-GPU session (FS32f)").
 The capture copies each product to the host as soon as its op returns. The copy runs on a
 second CUDA stream, so training doesn't wait for it, into a pinned host buffer (page-locked
 memory the GPU can copy to directly). The capture keeps the GPU tensor only until its copy
@@ -392,7 +394,7 @@ replaced:
   first. `run_verified`, `calibrate`, `llama_step`, `poisoned_step`, `hidden_steps`,
   `flipped_matmul_sweep --no-sweep` and `full_scale`'s cheats and hidden stages run
   pipelined (their counting pass stays sequential); `bring_up`, `store_crosscheck`,
-  `mlp_smoke`, `metrics_overhead` and the sweep (or `--source in-process`) refuse
+  `mlp_smoke`, `metrics_overhead` and `flipped_matmul_sweep` without `--no-sweep` refuse
   `VERIF_PIPELINED=1` with one line. `prover_spec.py` builds the child's spec from the run's
   `VERIF_*` variables, passed explicitly. `full_scale`'s sweep stage runs with it set to 0.
 - **`scenarios.py`** holds what any instance's scenarios share: a scenario with its fault and
@@ -678,11 +680,15 @@ sequenceDiagram
 ```
 
 `loop.run_loop` is this sequence. It doesn't depend on the model instance: the MLP smoke
-run and the SmolLM2 runs use the same loop. Only one step's transcript is alive at a time,
-and a test holds weak references to confirm that each step is freed. The verifier carries
+run and the SmolLM2 runs use the same loop. Only one step's transcript is alive at a time
+in this sequential loop; the pipelined one (`VERIF_PIPELINED=1`, see `loop.py` above) keeps at
+most two. A test holds weak references to confirm that each step is freed. The verifier carries
 only two things between steps: the hashes of `W_{t+1}`, and small per-step statistics.
 
-In our runs prover and verifier share one process and one GPU. PyTorch keeps the memory a
+In a sequential run prover and verifier share one process, and on the unsharded path one GPU.
+On the four-H100 machine (F22) the prover trains on GPU 0 and the verifier works on GPUs 1–3
+("The two-GPU session (FS32f)" runs that split on two cards); the pipelined loop gives the
+prover a process of its own. When both roles share a GPU, PyTorch keeps the memory a
 GPU tensor frees in its own cache, cut into blocks of the sizes the prover used, so a large
 verifier buffer may not fit in any of them though the GPU has the room. On CUDA the loop
 therefore empties that cache once per step, after the prover's step is released and before
@@ -871,7 +877,7 @@ that both start commands parse (`bash -n`) and, on stub `runpodctl`, `curl` and 
    copy (2.4 GB), about 7.7 GB of public weights and the output (under 1 GB) on the volume,
    and on the container disk the venv (about 7 GB with CUDA torch) and uv's cache (about
    4 GB). Host RAM: at least the 64 GiB free that the benchmark's copy
-   test needs (the target machine has 188–320 GB, F1c).
+   test needs (the one-H100 target of F1c has 188–320 GB).
 3. **Set up.** After SSH, check that `cat /tmp/guard.log` says "armed". If it doesn't (the pod
    was created without the start command, or restarted), run `sh fs11_guard.sh` from the
    upload once it is there, or paste the one-line form in `fs11_guard.sh`'s header first.
@@ -1417,7 +1423,7 @@ Breaking any of these voids the result. Each one has a test.
 | Real-model bring-up on CPU (FS4, `runs/bring_up.py`) | Qwen2.5-0.5B run in memory on its real weights: the honest step is accepted on its own fit with check 8, but that fit fails the concentration guard (largest honest residual 25.9 against the limit τ/2 = 24.75), so it isn't a clean pass; one altered bias entry is rejected at check 5 (residual 2.67e3 against τ 49.5) and at 6b, and the process peaks at 14 GB. On all four models' real weights (Meta's own Llama-3.2-1B repo included) the slow test fills every slot once and rebuilds every operand and glue gradient bit for bit, peaking at 10–25 GB. In memory, Meta's Llama-3.2-1B and Falcon3-1B are accepted with check 8 on their own fits, at verifier peaks of 29 and 37 GB. Qwen2.5-1.5B's honest step is rejected on its own fit: check 5's residual in the first layer's `dQ` is 79.3 against τ 39.2, where `dQ`'s cancellation factor κ reaches 153. Its tamper isn't run, and the case is open. Re-run under F18's unit (below), all five models' honest steps are accepted on their own fits with the guard holding, Qwen2.5-0.5B's and Qwen2.5-1.5B's included, and both Qwen models' altered bias entry is rejected at check 5 and at 6b. The disk hand-off (`--disk-transcripts`) peaks higher, not lower, since it adds the verifier's own copies of `W_t` and `W_{t+1}`. Each model is pinned (repo, commit, `config.json` and weights SHA-256) and pads with its own EOS |
 | Split error model for check 5 (FS15, F18) | done; check 5's unit scales the accumulation error with the larger of `‖P‖_F` and the term scale `U`, so a product whose terms cancel gets a band that fits its rounding. On real weights the largest honest residual over its own `τ` is 0.19 (SmolLM2), 0.16 (Qwen2.5-0.5B), 0.22 (Llama-3.2-1B), 0.34 (Falcon3-1B) and 0.28 (Qwen2.5-1.5B, 2.02 before), all under the guard's 0.5. `k` is sized at the largest calibration `e_m`: 9 for SmolLM2's band file and three of the four full-scale models, 12 for Qwen2.5-1.5B. On tiny random Qwen2 models the guard now fails on 0 of 20 seeds, against 8 before. `U` costs about what `ν` does, 3–6% of check 5 |
 | Mixed precision on a real model (FS5, Qwen2.5-0.5B at `(fp32, bf16)` on CPU) | measured, two open points. Configuration only, no code change. Every slot is filled once and every operand and glue gradient, the q, k, v bias gradients included, is rebuilt bit for bit. One step is accepted on its own fit with the guard holding (`s_h` 0.31, `τ` 2.47, largest residual 0.48 of `τ`); three steps are accepted with equal plain and verified final weights, but the fit fails the guard (largest residual 1.79 against `τ/2` = 1.23, in an attention gradient): at bf16 every class's residual is the leaf's own rounding, so no class sits below the largest and the tail grows with the number of residuals. `k` sized for bf16 is 15, against 9 at fp32, because the band is 16 times wider. A bias entry raised by 1 in training is rejected at 6b, not at check 5: with the honest update committed, check 5 passes shifts of 1 and 2 on that column and rejects 4. Prover 305–324 s a step (CPU bf16 matmul), verifier 4.7–5.0 s, verifier peak 11.9–13.7 GB. At `(fp32, fp32)` nothing changed |
-| GPU path (FS9) | done; `VERIF_DEVICE=cuda` runs the model, the replay and check 5 on the GPU, with every leaf in host RAM. Each product is copied to a reused pinned host buffer on a side stream as it is made, so the transcript no longer collects on the GPU: SmolLM2's captured step peaks at 2.15 GiB against 3.12 before (plain training 1.59) at fp32. On an A40, at fp32 and bf16, three plain and three verified steps end on the same weights bit for bit, every operand and glue gradient is rebuilt bit for bit, and the run is accepted. Before FS9 a `cuda` run silently ran on the CPU. CPU results are unchanged bit for bit. Check 5 is host-bound on the GPU (460 µs per product); see "Workflow: a run on a GPU" |
+| GPU path (FS9) | done; `VERIF_DEVICE=cuda` runs the model, the replay and check 5 on the GPU, with every leaf in host RAM (the unsharded path; sharded, the products stay on their owner GPUs, FS32). Each product is copied to a reused pinned host buffer on a side stream as it is made, so the transcript no longer collects on the GPU: SmolLM2's captured step peaks at 2.15 GiB against 3.12 before (plain training 1.59) at fp32. On an A40, at fp32 and bf16, three plain and three verified steps end on the same weights bit for bit, every operand and glue gradient is rebuilt bit for bit, and the run is accepted. Before FS9 a `cuda` run silently ran on the CPU. CPU results are unchanged bit for bit. Check 5 is host-bound on the GPU (460 µs per product); see "Workflow: a run on a GPU" |
 | 10-step honest run, cheat runs (A12–A13, M5) | done; milestone M5 reached. All 10 honest steps accepted, final weights equal to the plain baseline's; each cheat rejected exactly at its declared step and check |
 | Disk store and store cross-check (A14, C3, `runs/store_crosscheck.py`) | done; the honest 10-step SmolLM2 run and four faults (rejected at checks 4, 7, 6a and 5) give identical decisions, roots and check numbers in memory and from disk. Disk costs 2.46 GiB per step, about 3.1 s to write and 1.2 s more to verify |
 | Evaluation records reader and output writers (EV1, `evaluation/records.py`, `evaluation/output.py`) | done; every C5–C6 run directory reads with its file's record counts, and the derived P1 rows equal `capture_rows`' |
