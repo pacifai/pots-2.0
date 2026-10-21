@@ -338,16 +338,17 @@ def test_plan_every_part_has_a_timeout_and_the_two_arms_differ_only_in_the_setti
     assert {p.env["VERIF_VERIFIER_DEVICES"] for p in plan.values()
             if p.kind == "cheat"} == {fs.PAIR_DEVICES}
     assert [p.name for p in plan.values() if p.kind == "cheat"] == [
-        "poisoned_step", "hidden_steps", "flipped_matmul"]
+        "poisoned_step", "hidden_steps", "flipped_matmul", "poisoned_step_pipelined",
+        "hidden_steps_pipelined", "flipped_matmul_pipelined"]
 
 
 def test_the_default_deadline_is_about_twice_the_estimates_and_inside_the_guard(tmp_path):
     est = sum(fs.PAIR_ESTIMATE_MIN.values())
-    assert 70 <= est <= 90
+    assert 100 <= est <= 115  # FS33d's pipelined arms added 30 minutes
     text = JOB.read_text()
     m = re.search(r"\[ \"\$SESSION\" = fs32-pair \] && DEFAULT_DEADLINE_S=(\d+)", text)
     assert m and int(m[1]) >= 2 * est * 60 * 0.95
-    assert int(m[1]) < 3.5 * 3600
+    assert int(m[1]) < 4.5 * 3600
     guard = re.search(r"sleep (\d+)", README.read_text())
     assert guard and int(guard[1]) > int(m[1])
 
@@ -406,7 +407,8 @@ def _p(name, kind, extras=None, status="ok", **info):
 def _good(**over):
     def run(arm, **kw):
         ex = {"verdicts": ["accepted"] * 3, "kept_root": "k" * 16, "final_root": "f" * 8,
-              "losses": [3.0, 2.5, 2.0]}
+              "losses": [3.0, 2.5, 2.0],
+              "loop_mode": "pipelined" if arm.startswith("pipelined") else "sequential"}
         ex = {**ex, **kw}
         ex.setdefault("step_lines", [f"{v}; max residual 1.00" for v in ex["verdicts"]])
         ex.setdefault("step_roots", ["r1", "r2", "r3"])
@@ -423,10 +425,16 @@ def _good(**over):
              _p("two_gpu_slow", "pytest", {"tests": 2, "failures": 0, "errors": 0, "skipped": 0,
                                            "slowest_failing": None}),
              _p("smollm2_calibrate", "other"),
-             card("unsharded"), card("sharded"), run("unsharded"), run("sharded")]
-    parts += [_p(n, "cheat", {"outcomes": o}) for n, o in (
-        ("poisoned_step", {k: "exact" for k in ("A1", "A2", "A3")}),
-        ("hidden_steps", {"hidden": "exact"}), ("flipped_matmul", {"flip": "exact"}))]
+             card("unsharded"), card("sharded"), run("unsharded"), run("sharded"),
+             run("pipelined"), run("pipelined_metrics")]
+    for suffix, extra in (("", {"loop_mode": "sequential"}),
+                          ("_pipelined", {"loop_mode": "pipelined"})):
+        parts += [_p(n + suffix, "cheat",
+                     {"outcomes": o, "oracle_lines": {k: f"{k} d a exact 1 2 3" for k in o},
+                      **extra}, **({"arm": "pipelined"} if suffix else {}))
+                  for n, o in (("poisoned_step", {k: "exact" for k in ("A1", "A2", "A3")}),
+                               ("hidden_steps", {"hidden": "exact"}),
+                               ("flipped_matmul", {"flip": "exact"}))]
     return [over.get(p["name"], p) for p in parts]
 
 
@@ -550,12 +558,13 @@ def _stand_ins(tmp_path, *, bad_cheat=False, sharded_root="aa"):
     card = ("import json,sys;json.dump({'card':{'name':'A40','uuid':'u','pci_bus_id':'p'},"
             "'plain':{'w_next_root':'w','loss':1.0},'proved':{'root':ROOT,'w_next_root':'w',"
             "'loss':1.0},'n_leaves':3,'wall_s':{}},open(sys.argv[1],'w'))")
-    run = ("import json,sys\nfor t in (1, 2, 3):\n"
+    run = ("import json,sys\nprint('loop mode: sequential')\nfor t in (1, 2, 3):\n"
            "    print(f'step  {t} (in-sample): accepted; x')\n"
            "    print(f'step  {t} root ' + str(t) * 64)\n"
            "print('stored step 3: p, 3 files, 0.1 GiB, root '+'ab'*8+'… (r)')\n"
            "json.dump({'root':ROOT,'losses':[1.0,2.0]},open(sys.argv[1],'w'))")
-    cheat = "print('A1 d a OUT 1 2 3');print('flip d a OUT 1 2 3')"
+    cheat = ("print('loop mode: sequential');print('A1 d a OUT 1 2 3');"
+             "print('flip d a OUT 1 2 3')")
     junit = ("import sys;open(sys.argv[1],'w').write('<testsuites><testsuite><testcase "
              "classname=\"a\" name=\"b\" time=\"1\"/></testsuite></testsuites>')")
     peer = ("import json,sys;json.dump({'all_ok': True, 'pairs': {}, 'seconds': 1.0},"
@@ -603,12 +612,21 @@ def test_the_job_log_ends_with_one_line_per_acceptance_item(tmp_path, monkeypatc
         "FS32 roots equal", "FS32 verdicts equal",
         "FS32 unsharded plain and proved W_{t+1}", "FS32 sharded plain and proved W_{t+1}",
         "FS32 cheat A1", "FS32 cheat A2",
-        "FS32 cheat A3", "FS32 cheat hidden", "FS32 cheat flip", "FS32 fast_suite",
-        "FS32 two_gpu_slow", *["FS32 FAIL"] * 5, "FS32 slowest failing test"]
-    assert {l for l in fs32 if l.startswith("FS32 FAIL")} == {
+        "FS32 cheat A3", "FS32 cheat hidden", "FS32 cheat flip",
+        *["FS32 pipelined cheat " + n for n in ("A1", "A2", "A3", "hidden", "flip")],
+        *["FS32 step wall time " + a + " (prover/verifier/hand-off/total s)"
+          for a in ("unsharded", "sharded", "pipelined", "pipelined_metrics")],
+        "FS32 fast_suite", "FS32 two_gpu_slow",
+        *["FS32 FAIL"] * 11,  # ten parts not run, the honest line
+        "FS32 slowest failing test"]
+    assert {l for l in fs32 if l.startswith("FS32 FAIL") and "did not run" in l} == {
         f"FS32 FAIL: {n} did not run" for n in (
-            "models", "native_build", "smollm2_calibrate", "hidden_steps", "flipped_matmul")}
-    assert s["fs32_pair"]["roots_equal"] and s["fs32_pair"]["verdicts_equal"]
+            "models", "native_build", "smollm2_calibrate", "hidden_steps", "flipped_matmul",
+            "run_pipelined", "run_pipelined_metrics", "poisoned_step_pipelined",
+            "hidden_steps_pipelined", "flipped_matmul_pipelined")}
+    roots = s["fs32_pair"]["roots"]  # the sequential arms agree; the pipelined ones did not run
+    assert all(v for k, v in roots.items() if "pipelined" not in k)
+    assert not any(v for k, v in roots.items() if "pipelined" in k)
     assert s["fs32_pair"]["cheats"]["A1"] == "exact" and s["fs32_pair"]["cheats"]["A2"] is None
     assert not s["fs32_pair"]["pass"]  # A2, A3, hidden and flip did not run
 

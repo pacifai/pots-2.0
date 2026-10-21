@@ -2859,6 +2859,18 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     (`-m slow -k "two_gpus or two_cuda_devices"`), `smollm2_calibrate`, `card_identity` and a
     3-step `run_verified` each unsharded and with `VERIF_VERIFIER_DEVICES=cuda:0,cuda:1`, and the
     judged cheats `poisoned_step`, `hidden_steps` and `flipped_matmul_sweep --no-sweep`, sharded.
+    FS33d adds the pipelined arms (sharded, `VERIF_PIPELINED=1`, set only on them, each in its
+    own run directory, `peer_check` still first): `run_pipelined` (3 steps, step 3 kept),
+    `run_pipelined_metrics` (the same with `--metrics`: merged rows, the memory pass's
+    per-device peaks on CUDA) and `<cheat>_pipelined` (`info["arm"]` `pipelined`). `fs32_pair`
+    compares each with the sharded sequential arm (verdicts, every step's root and whole line,
+    final and kept roots, losses; each cheat `exact` with the same whole oracle row), requires
+    `loop mode: pipelined` in each pipelined part's log and `loop mode: sequential` in each
+    sequential loop part's (`FS32 FAIL: <part> ran sequentially|pipelined`; two mode lines in
+    one log, `loop_mode` `multiple`: `printed more than one loop mode line`; every other part,
+    `peer_check`, `models` and the native build included, unsets `VERIF_PIPELINED`), and records
+    `step_times` (prover, verifier, hand-off, total per step, per arm) and `gpu_peak` (per
+    part), outside `pass`. `pair_default_deadline_s()` is the job's default deadline.
     Every part's `info["gpu_peak"]` makes `_run_part` run a `_GpuPeaks` sampler
     (`parts/<name>/gpu_peak.json`, `gpu_peak_mib` in the part's extras). `fs32_pair(parts)` goes
     to `summary.json["fs32_pair"]` and `_pair_lines` ends the job log, one line per acceptance
@@ -2951,7 +2963,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    11,800 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
+    15,500 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
     session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,
     packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch

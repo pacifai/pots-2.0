@@ -84,7 +84,9 @@ and ``FS11_ALLOW_ANY_GPU=1`` overrides that one.
 The two-GPU session (FS32f, F22) runs the models part, the whole fast suite (``-rf``) and the
 slow two-GPU tests, SmolLM2's calibration, then ``card_identity`` and a 3-step ``run_verified``
 unsharded and again with ``VERIF_VERIFIER_DEVICES=cuda:0,cuda:1``, and the judged cheats with
-that setting. ``summary.json``'s ``fs32_pair`` (:func:`fs32_pair`) compares the two arms' roots
+that setting; then FS33d's pipelined arms (sharded, ``VERIF_PIPELINED=1``: ``run_pipelined``,
+``run_pipelined_metrics`` and the cheats again), each compared with its sharded sequential
+arm. ``summary.json``'s ``fs32_pair`` (:func:`fs32_pair`) compares the two arms' roots
 (step 1's transcript root, the final weights' root, the per-step losses, the kept step 3's
 root) and per-step verdicts, and holds each cheat's outcome (which must be ``exact``) and the
 failing tests; the job log ends with one ``FS32`` line per item. It refuses unless torch sees
@@ -403,7 +405,7 @@ def _run_dir(out: Path, upload: Path, key: str, name: str | None = None) -> Path
 def _models_part(upload: Path, out: Path, timeout_s: float) -> Part:
     return Part("models", ["{python}", "-m", "verification.runs.fs11_session", "fetch-models",
                            "--upload", str(upload), "--out", str(out / "models")],
-                env={"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None},
+                env={"HF_HUB_OFFLINE": None, "TRANSFORMERS_OFFLINE": None, "VERIF_PIPELINED": None},
                 timeout_s=timeout_s, kind="models",
                 info={"report": str(out / "models" / "models.json")})
 
@@ -420,7 +422,8 @@ def peer_check_part(out: Path, timeout_s: float = PEER_CHECK_TIMEOUT_S) -> Part:
     report = out / PEER_CHECK_NAME / "peer_check.json"
     return Part(PEER_CHECK_NAME,
                 ["{python}", "-m", "verification.runs.peer_check", "--out", str(report)],
-                env=dict(PCI_ORDER_ENV), timeout_s=timeout_s, kind="peer_check",
+                env={**PCI_ORDER_ENV, "VERIF_PIPELINED": None}, timeout_s=timeout_s,
+                kind="peer_check",
                 info={"report": str(report)})
 
 
@@ -1012,18 +1015,37 @@ def device_leaves_gate(parts: Sequence[Mapping[str, Any]],
 # FS32f's two-GPU session (``fs32-pair``): the sharded run on two cards, F22's two-A40 check.
 # Time limits, seconds, of its parts; the fast suite's limit allows twice its estimated 25 min.
 PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "calibrate": 900,
-                  "card": 900, "run": 900, "cheat": 900}
+                  "card": 900, "run": 900, "run_metrics": 1800, "cheat": 900}
 # Estimates, minutes, scaled by hand (none was measured on two cards): the peer-copy byte check
 # 1 (two ordered pairs; its limit is 5), the models part 2-5, the
 # native build 1-2, the fast suite 13-25 on 10 vCPUs (the CUDA tests run on it for the first
 # time), the slow two-GPU tests about 10, SmolLM2's calibration about 5, each of two
 # card_identity runs about 3, each of two 3-step runs about 6, each of three cheat runs about 4.
+# FS33d's pipelined arms are estimated at their sequential counterparts' time (the pipelined loop
+# overlaps prover and verifier, so it is no slower; an estimate, none was measured): the plain
+# pipelined run about 6, the one with metrics on about 12 (its memory pass and counting pass add
+# two more passes), the three pipelined cheats about 12 together.
 PAIR_ESTIMATE_MIN = {"peer_check": 1, "models": 5, "native_build": 2, "fast_suite": 25,
-                     "two_gpu_slow": 10, "calibrate": 5, "card": 6, "run": 12, "cheat": 12}
+                     "two_gpu_slow": 10, "calibrate": 5, "card": 6, "run": 12, "cheat": 12,
+                     "run_pipelined": 6, "run_pipelined_metrics": 12, "cheat_pipelined": 12}
+PAIR_PACK_MIN, PAIR_GRACE_MIN = 1, 20  # the job's packing and grace window, minutes
 PAIR_STEPS = 3
 PAIR_CARDS = 2  # the session refuses a machine with fewer CUDA devices
 PAIR_DEVICES = "cuda:0,cuda:1"  # VERIF_VERIFIER_DEVICES of the sharded arms
 PAIR_CHEATS = ("A1", "A2", "A3", "hidden", "flip")  # the oracle table's names for the cheats
+# The pipelined arms (FS33d): the same runs and cheats with ``VERIF_PIPELINED=1``, sharded.
+PAIR_PIPELINED = {"VERIF_VERIFIER_DEVICES": PAIR_DEVICES, "VERIF_PIPELINED": "1"}
+PAIR_CHEAT_PARTS = ("poisoned_step", "hidden_steps", "flipped_matmul")
+PAIR_PIPELINED_CHEAT_PARTS = tuple(f"{n}_pipelined" for n in PAIR_CHEAT_PARTS)
+PAIR_MODE_LINE = "loop mode: "  # the entry points print ``loop mode: pipelined|sequential``
+
+
+def pair_default_deadline_s() -> int:
+    """The session's default deadline: twice the estimated runtime (the parts' estimates, the
+    job's packing and its grace window), in seconds, rounded up to 100 s. ``fs11_job.sh`` holds
+    the same figure as ``DEFAULT_DEADLINE_S`` for ``fs32-pair`` and a test holds them equal."""
+    minutes = sum(PAIR_ESTIMATE_MIN.values()) + PAIR_PACK_MIN + PAIR_GRACE_MIN
+    return -(-2 * minutes * 60 // 100) * 100
 # scenarios.OUTCOMES (this module imports no torch; a test holds the two equal).
 ORACLE_OUTCOMES = ("exact", "accepted", "rejected", "early", "overrun", "wrong-check",
                    "wrong-kind", "wrong-product")
@@ -1038,7 +1060,12 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
     the bf16 guard fails); ``card_identity`` (step 1's transcript root) and a 3-step
     ``run_verified`` unsharded and again with ``VERIF_VERIFIER_DEVICES``; and the judged cheats
     (``poisoned_step`` A1-A3, ``hidden_steps`` P11, ``flipped_matmul_sweep --no-sweep``) with it
-    set. Every part records its GPUs' peak memory. SmolLM2 runs at :data:`SMOLLM2_ENV`."""
+    set. FS33d's pipelined arms follow (sharded, ``VERIF_PIPELINED=1``, each in its own run
+    directory, ``peer_check`` still first): ``run_pipelined`` (``run_verified``, the same steps and
+    kept step), ``run_pipelined_metrics`` (the same with metrics on, so the merged rows and the
+    memory pass's per-device peaks are exercised), and the three cheats again as
+    ``<cheat>_pipelined``. Only those set ``VERIF_PIPELINED``. Every part records its GPUs' peak
+    memory. SmolLM2 runs at :data:`SMOLLM2_ENV`."""
     from setup.data import TEST_SCALE_TOKENIZER as pin  # the pin's repo and revision
     key = data_key(pin.repo, SMOLLM2_TASK)
     base = {**SMOLLM2_ENV, "VERIF_MODEL": pin.repo, "VERIF_MODEL_REVISION": pin.revision}
@@ -1057,7 +1084,8 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
              env: Mapping[str, str] | None = None, **info: Any) -> Part:
         return Part(name, ["{python}", "-m", f"verification.runs.{module}", *args],
                     env={**base, **(env or {}), "VERIF_OUTPUT_DIR": str(d),
-                         "VERIF_VERIFIER_DEVICES": (env or {}).get("VERIF_VERIFIER_DEVICES")},
+                         "VERIF_VERIFIER_DEVICES": (env or {}).get("VERIF_VERIFIER_DEVICES"),
+                         "VERIF_PIPELINED": (env or {}).get("VERIF_PIPELINED")},
                     timeout_s=timeout_s, kind=kind,
                     info={"model": pin.repo, "task": SMOLLM2_TASK, "run_dir": str(d),
                           "gpu_peak": True, **info})
@@ -1066,7 +1094,7 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
         junit = out / "parts" / name / "junit.xml"
         return Part(name, ["{python}", "-m", "pytest", "-rf", "-q", f"--junitxml={junit}", *args],
                     env={"VERIF_OUTPUT_DIR": str(_run_dir(out, upload, key, "pytest")),
-                         "VERIF_VERIFIER_DEVICES": None},
+                         "VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
                     timeout_s=timeout_s, kind="pytest",
                     info={"junit": str(junit), "gpu_peak": True})
 
@@ -1086,12 +1114,23 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
         d = run_dir(f"pair_run_{arm}")
         plan.append(part(f"run_{arm}", "run_verified", d, t["run"], *steps, kind="pair_run",
                          env=env, arm=arm, weights=str(d / honest / WEIGHTS_FILE)))
-    for name, module, args in (("poisoned_step", "poisoned_step", ()),
-                               ("hidden_steps", "hidden_steps", ()),
-                               ("flipped_matmul", "flipped_matmul_sweep", ("--no-sweep",))):
+    for name, metrics in (("run_pipelined", "--no-metrics"),
+                          ("run_pipelined_metrics", "--metrics")):
+        d = run_dir(f"pair_{name}")
+        plan.append(part(name, "run_verified", d, t["run" if metrics == "--no-metrics"
+                                                   else "run_metrics"],
+                         *steps[:-1], metrics, kind="pair_run", env=PAIR_PIPELINED,
+                         arm=name.removeprefix("run_"), weights=str(d / honest / WEIGHTS_FILE)))
+    cheats = (("poisoned_step", "poisoned_step", ()), ("hidden_steps", "hidden_steps", ()),
+              ("flipped_matmul", "flipped_matmul_sweep", ("--no-sweep",)))
+    for name, module, args in cheats:
         d = run_dir(f"pair_{name}")
         plan.append(part(name, module, d, t["cheat"], *args, "--no-metrics", kind="cheat",
                          env=sharded))
+    for name, module, args in cheats:
+        d = run_dir(f"pair_{name}_pipelined")
+        plan.append(part(f"{name}_pipelined", module, d, t["cheat"], *args, "--no-metrics",
+                         kind="cheat", env=PAIR_PIPELINED, arm="pipelined"))
     for p in plan:
         p.info["gpu_peak"] = True
     return plan
@@ -1136,7 +1175,7 @@ NATIVE_BUILD_NAME = "native_build"
 def _native_build_part() -> Part:
     """A fresh build part, so no two plans share its env and info dicts."""
     return Part(NATIVE_BUILD_NAME, ["{python}", "-m", "verification.commitment.native"],
-                timeout_s=900)
+                env={"VERIF_PIPELINED": None}, timeout_s=900)
 
 
 def with_native_build(plan: Sequence[Part]) -> list[Part]:
@@ -1659,11 +1698,19 @@ _PAIR_ROOT = re.compile(r"^step\s+(\d+) root ([0-9a-f]{64})$")
 _PAIR_KEPT = re.compile(r"^stored step (\d+): .*root ([0-9a-f]{16})")
 
 
+def _loop_mode(lines: Sequence[str]) -> str | None:
+    """The mode the entry point printed (``loop mode: pipelined`` or ``sequential``), ``None``
+    when there is no such line, and ``"multiple"`` when there is more than one (never a mode)."""
+    modes = [x[len(PAIR_MODE_LINE):].strip() for x in lines if x.startswith(PAIR_MODE_LINE)]
+    return "multiple" if len(modes) > 1 else (modes[0] if modes else None)
+
+
 def _pair_run_extras(log: Path, weights: Path) -> dict[str, Any]:
     """A pair run's per-step lines (``step_lines``: everything after ``step t (...): ``),
     verdicts, transcript roots (``step_roots``, the ``step t root`` lines) and kept step's root
-    (16 hex) from its log, and the final weights' root and per-step losses from
-    ``final_weights.json``."""
+    (16 hex) from its log, each step's wall time (``step_times``: prover, verifier, hand-off,
+    total, from ``report_costs``' lines), the printed ``loop_mode``, and the final weights' root
+    and per-step losses from ``final_weights.json``."""
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
     steps = {int(m[1]): m[2] for x in lines if (m := _PAIR_STEP.match(x))}
     roots = {int(m[1]): m[2] for x in lines if (m := _PAIR_ROOT.match(x))}
@@ -1672,19 +1719,23 @@ def _pair_run_extras(log: Path, weights: Path) -> dict[str, Any]:
     return {"step_lines": [steps[t] for t in sorted(steps)],
             "verdicts": [steps[t].split(";")[0] for t in sorted(steps)],
             "step_roots": [roots[t] for t in sorted(roots)], "kept_root": kept,
-            "final_root": doc.get("root"), "losses": doc.get("losses")}
+            "final_root": doc.get("root"), "losses": doc.get("losses"),
+            "step_times": _step_times(lines), "loop_mode": _loop_mode(lines)}
 
 
 def _cheat_extras(log: Path) -> dict[str, Any]:
     """The oracle table's outcome per cheat: its rows are ``name declared actual outcome ρ_5 ρ_κ
-    ρ_6`` (``cheats.report_oracle``), so the outcome is the fourth word from the end."""
+    ρ_6`` (``cheats.report_oracle``), so the outcome is the fourth word from the end;
+    ``oracle_lines`` keeps each whole row (words joined by one space) and ``loop_mode`` is the
+    printed mode."""
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
-    out = {}
+    out, rows = {}, {}
     for x in lines:
         w = x.split()
         if len(w) >= 7 and w[0] in PAIR_CHEATS and w[-4] in ORACLE_OUTCOMES:
             out[w[0]] = w[-4]
-    return {"outcomes": out}
+            rows[w[0]] = " ".join(w)
+    return {"outcomes": out, "oracle_lines": rows, "loop_mode": _loop_mode(lines)}
 
 
 def _read_peaks(path: Path) -> dict[str, int] | None:
@@ -1743,7 +1794,12 @@ def _pair_part(parts: Sequence[Mapping[str, Any]], name: str) -> Mapping[str, An
 
 PAIR_PARTS = (PEER_CHECK_NAME, "models", NATIVE_BUILD_NAME, "fast_suite", "two_gpu_slow",
               "smollm2_calibrate", "card_unsharded", "card_sharded", "run_unsharded",
-              "run_sharded", "poisoned_step", "hidden_steps", "flipped_matmul")
+              "run_sharded", "run_pipelined", "run_pipelined_metrics", *PAIR_CHEAT_PARTS,
+              *PAIR_PIPELINED_CHEAT_PARTS)
+# The mode each part's log must print: the pipelined arms' parts, and every other loop part's.
+PAIR_PIPELINED_ARMS = ("pipelined", "pipelined_metrics")
+PAIR_PIPELINED_PARTS = ("run_pipelined", "run_pipelined_metrics", *PAIR_PIPELINED_CHEAT_PARTS)
+PAIR_SEQUENTIAL_PARTS = ("run_unsharded", "run_sharded", *PAIR_CHEAT_PARTS)
 _PAIR_OK = ("ok", "skipped_done")
 
 
@@ -1760,7 +1816,14 @@ def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     every part of :data:`PAIR_PARTS` ran and succeeded; both suites left a report with tests in
     it, none failed or errored, and the two-GPU one skipped none; each arm's verdicts are
     ``accepted`` at every one of :data:`PAIR_STEPS` steps; the arms' roots and step lines are
-    equal; every cheat is ``exact``. The roots are step 1's transcript root, ``W_{t+1}``'s root
+    equal; every cheat is ``exact``. FS33d's pipelined arms (``run_pipelined``,
+    ``run_pipelined_metrics``, the three ``*_pipelined`` cheats) are compared with the sharded
+    sequential arm: the same verdicts, roots (final, kept, losses, every step's), whole step lines,
+    and for each cheat ``exact`` with the same whole oracle row; each pipelined part's log holds
+    ``loop mode: pipelined`` and each sequential loop part's ``loop mode: sequential``
+    (``mode_problems``). ``step_times`` sets each arm's per-step wall time (prover, verifier,
+    hand-off, total) side by side and ``gpu_peak`` each part's per-GPU peak, both outside
+    ``pass``. The roots are step 1's transcript root, ``W_{t+1}``'s root
     and loss (``card_identity``), the final weights' root, per-step losses, kept step's root and
     every step's transcript root. A value is equal only when both arms have it. The plain and
     proved ``W_{t+1}`` of one arm (``plain_vs_proved``) are recorded, outside ``pass``."""
@@ -1775,18 +1838,47 @@ def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     def same(a: Mapping[str, Any], b: Mapping[str, Any], keys: Sequence[str]) -> dict[str, bool]:
         return {k: a.get(k) is not None and a.get(k) == b.get(k) for k in keys}
 
+    def arm_of(arm: str) -> Mapping[str, Any]:
+        return next((p for p in parts if p["kind"] == "pair_run"
+                     and p["info"].get("arm") == arm), {}).get("extras") or {}
+
     card, run = arms("pair_card"), arms("pair_run")
-    roots = {**same(*card, ("root", "w_next_root", "loss")),
-             **same(*run, ("final_root", "kept_root", "losses", "step_roots"))}
+    run_keys = ("final_root", "kept_root", "losses", "step_roots")
+    roots = {**same(*card, ("root", "w_next_root", "loss")), **same(*run, run_keys)}
     roots["step_roots"] &= len(run[0].get("step_roots") or ()) == PAIR_STEPS
+    pipe = {a: arm_of(a) for a in PAIR_PIPELINED_ARMS}
+    for a, ex in pipe.items():  # each pipelined arm against the sharded sequential one
+        roots.update({f"{a} {k}": ok for k, ok in same(run[1], ex, run_keys).items()})
+        roots[f"{a} step_roots"] &= len(ex.get("step_roots") or ()) == PAIR_STEPS
     verdicts = tuple(r.get("verdicts") or [] for r in run)
     lines_equal = bool(run[0].get("step_lines")) and run[0].get("step_lines") == run[1].get(
         "step_lines")
-    honest = all(v == ["accepted"] * PAIR_STEPS for v in verdicts)
+    pipe_equal = {a: bool(ex.get("step_lines")) and ex.get("step_lines") == run[1].get("step_lines")
+                  and (ex.get("verdicts") or []) == verdicts[1] for a, ex in pipe.items()}
+    honest = all(v == ["accepted"] * PAIR_STEPS
+                 for v in (*verdicts, *((ex.get("verdicts") or []) for ex in pipe.values())))
     outcomes: dict[str, str | None] = {}
+    oracle: dict[str, str] = {}
+    piped: dict[str, str | None] = {}
+    piped_oracle: dict[str, str] = {}
     for p in parts:
         if p["kind"] == "cheat":
-            outcomes.update((p.get("extras") or {}).get("outcomes", {}))
+            ex = p.get("extras") or {}
+            if p["info"].get("arm") == "pipelined":
+                piped.update(ex.get("outcomes", {}))
+                piped_oracle.update(ex.get("oracle_lines", {}))
+            else:
+                outcomes.update(ex.get("outcomes", {}))
+                oracle.update(ex.get("oracle_lines", {}))
+    oracle_equal = {n: n in oracle and oracle.get(n) == piped_oracle.get(n) for n in PAIR_CHEATS}
+    modes = {n: ("pipelined" if n in PAIR_PIPELINED_PARTS else "sequential")
+             for n in (*PAIR_SEQUENTIAL_PARTS, *PAIR_PIPELINED_PARTS)}
+    mode_problems = {}
+    for n, want in modes.items():
+        part = _pair_part(parts, n)
+        seen = (part.get("extras") or {}).get("loop_mode")
+        if part.get("status") in _PAIR_OK and seen != want:
+            mode_problems[n] = seen
     tests = {n: _suite(parts, n) for n in ("fast_suite", "two_gpu_slow")}
     failing = [dict(ex["slowest_failing"], part=n) for n in tests
                if (ex := _pair_part(parts, n).get("extras") or {}).get("slowest_failing")]
@@ -1797,7 +1889,11 @@ def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     peer = (_pair_part(parts, PEER_CHECK_NAME).get("extras") or {}).get("peer_check")
     peer_ok = bool(peer) and peer.get("all_ok") is True
     slow_ran = bool(tests["two_gpu_slow"]) and tests["two_gpu_slow"]["skipped"] == 0
-    verdicts_equal = verdicts[0] == verdicts[1] and lines_equal
+    verdicts_equal = verdicts[0] == verdicts[1] and lines_equal and all(pipe_equal.values())
+    step_times = {a: (e.get("step_times") or []) for a, e in
+                  (("unsharded", run[0]), ("sharded", run[1]), *pipe.items())}
+    gpu_peak = {n: (_pair_part(parts, n).get("extras") or {}).get("gpu_peak_mib")
+                for n in PAIR_PARTS}
     return {"roots_equal": all(roots.values()), "roots": roots,
             "verdicts_equal": verdicts_equal, "honest": honest,
             "verdicts": {"unsharded": verdicts[0], "sharded": verdicts[1]},
@@ -1805,12 +1901,17 @@ def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
                                 else c.get("plain_w_next_root") == c.get("w_next_root")
                                 for a, c in zip(("unsharded", "sharded"), card)},
             "cheats": {n: outcomes.get(n) for n in PAIR_CHEATS},
+            "pipelined_cheats": {n: piped.get(n) for n in PAIR_CHEATS},
+            "oracle_equal": oracle_equal, "mode_problems": mode_problems,
+            "step_times": step_times, "gpu_peak": gpu_peak,
             "tests": tests, "part_problems": problems, "peer_bytes_ok": peer_ok,
             "peer_copies": None if peer_ok else peer_wrong_text(peer),
             "slowest_failing": max(failing, key=lambda r: r["time_s"], default=None),
             "pass": (all(roots.values()) and verdicts_equal and honest and not problems
                      and peer_ok and suites_ok and slow_ran
-                     and all(outcomes.get(n) == "exact" for n in PAIR_CHEATS))}
+                     and all(outcomes.get(n) == "exact" for n in PAIR_CHEATS)
+                     and all(piped.get(n) == "exact" for n in PAIR_CHEATS)
+                     and all(oracle_equal.values()) and not mode_problems)}
 
 
 def _pair_lines(pair: Mapping[str, Any] | None) -> list[str]:
@@ -1831,10 +1932,24 @@ def _pair_lines(pair: Mapping[str, Any] | None) -> list[str]:
               for a, eq in pair["plain_vs_proved"].items()]
     lines += [f"FS32 cheat {n}: {o or 'not run'}" + ("" if o == "exact" else " (NOT exact)")
               for n, o in pair["cheats"].items()]
+    lines += [f"FS32 pipelined cheat {n}: {o or 'not run'}"
+              + ("" if o == "exact" else " (NOT exact)")
+              + ("" if pair["oracle_equal"][n] else "; oracle line differs from sequential")
+              for n, o in pair["pipelined_cheats"].items()]
+    for a, times in pair["step_times"].items():
+        lines.append(f"FS32 step wall time {a} (prover/verifier/hand-off/total s): "
+                     + (", ".join("/".join("?" if r.get(k) is None else f"{r[k]:.1f}"
+                                           for k in _FIX_TIMES) for r in times) or "none"))
     for n, t in pair["tests"].items():
         if t is not None:
             lines.append(f"FS32 {n}: {t['tests']} tests, {t['failures']} failed, "
                          f"{t['errors']} errors, {t['skipped']} skipped")
+    for n, seen in pair["mode_problems"].items():
+        lines.append(f"FS32 FAIL: {n} " + {"sequential": "ran sequentially",
+                                           "pipelined": "ran pipelined",
+                                           "multiple": "printed more than one loop mode line",
+                                           None: "printed no loop mode line"}.get(
+                                               seen, f"printed loop mode {seen!r}"))
     for n, status in pair["part_problems"].items():
         lines.append(f"FS32 FAIL: {n} " + ("did not run" if status == "not_started"
                                            else f"ended {status}"))

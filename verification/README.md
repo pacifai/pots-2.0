@@ -1193,7 +1193,7 @@ transcript and run the verifier.
    fetches every public one (a few minutes it doesn't need; a filter would be a change to
    `fs11_session.py`).
 2. **The pod**: two GPUs of the same type, the image and disks of step 2, the boot guard with
-   `sleep 14200;` (setup about 20 min plus the job's 98: 2 x 118 min = 236 min, rounded up).
+   `sleep 17900;` (setup about 20 min plus the job's 129: 2 x 149 min = 298 min, rounded up).
 3. **Set up** as in step 3. `requirements-fs11.txt` carries `pytest` and `matplotlib` (the fast
    suite and the plotting tests need them), so nothing is installed by hand.
 4. **Start the job**:
@@ -1223,11 +1223,25 @@ transcript and run the verifier.
 | `card_unsharded`, `card_sharded` | `card_identity`: step 1's root, `W_{t+1}`, loss | 6 min |
 | `run_unsharded`, `run_sharded` | `run_verified`, 3 steps, step 3 kept | 12 min |
 | `poisoned_step`, `hidden_steps`, `flipped_matmul` | the judged cheats, sharded | 12 min |
+| `run_pipelined` | the same 3-step run, sharded with `VERIF_PIPELINED=1` | 6 min |
+| `run_pipelined_metrics` | the same with metrics on (memory and counting passes) | 12 min |
+| `<cheat>_pipelined` (three) | the judged cheats, sharded and pipelined | 12 min |
 
 The estimates are scaled by hand from the earlier sessions; none was measured on two cards.
-The parts sum to about 77 min, packing about 1, the grace window 20: about 98 min, so the
-default deadline is 2 x 98 = 196 min, rounded up to 11,800 s. Each part's time limit is a
-cap; the fast suite's is 3,600 s.
+The parts sum to about 108 min, packing about 1, the grace window 20: about 129 min, so the
+default deadline is 2 x 129 = 258 min, rounded up to 15,500 s. The pipelined arms (FS33d) are
+estimated at their sequential counterparts' time, since the pipelined loop overlaps prover and
+verifier and is no slower; that is an estimate, not a measurement. Each part's time limit is a
+cap; the fast suite's is 3,600 s, the metrics run's 1,800 s.
+
+The pipelined arms must print `loop mode: pipelined` (the sequential ones `loop mode:
+sequential`), else `FS32 FAIL: <part> ran sequentially` (or `pipelined`); two `loop mode:`
+lines in one log fail it too (`printed more than one loop mode line`). Every other part
+unsets `VERIF_PIPELINED` in its env. `fs32_pair` compares
+each with the sharded sequential arm: verdicts, every step's root and whole line, the final and
+kept roots, losses, and each cheat `exact` with the same oracle row. It records each arm's
+per-step wall time (`step_times`: prover, verifier, hand-off, total) side by side and each
+part's per-GPU peak (`gpu_peak`), outside `pass`; the job log prints the times.
 
 Each part records the peak memory of every GPU (`parts/<part>/gpu_peak.json`, MiB by
 `nvidia-smi` index, sampled each second, so the card's whole use and a peak shorter than a
