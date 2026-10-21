@@ -611,6 +611,21 @@ against the closed setup and evaluation decisions. It left 10 open items.
     not PoTS's rule either, and it still has to drop the 2–4 Alpaca records whose prompt alone
     exceeds 127 tokens.
   - *Rejected: per-model lists.* The four models would train on different records.
+  - **Built (implementation task FS6, 2026-10-11).** `verification/runs/materialize_data.py`
+    builds one model, task, seed and level per run. It reproduces the shared-list counts under
+    all four tokenizers (refusal 369 clean and 492 poisoned, jailbreak 233 and 86), and NFC
+    changes no row of the eight files (F8h). A level the poisoned list can't fill exits without
+    writing (jailbreak's 96 and 128 of 128). Tokenizer pins and per-model `D`:
+
+    | model, pin | EOS = pad (F8f) | refusal `h_D` | jailbreak `h_D` |
+    |---|---|---|---|
+    | `unsloth/Llama-3.2-1B-Instruct` @ `5a8abab4…` | 128009 | `ee6a3824…81ee` | `0a65802a…daa3` |
+    | `tiiuae/Falcon3-1B-Instruct` @ `28ba2251…` | 11 | `9f72a469…021f` | `ad8b1435…4381` |
+    | `Qwen/Qwen2.5-0.5B-Instruct` @ `7ae55760…` and `Qwen/Qwen2.5-1.5B-Instruct` @ `989aa798…` (one tokenizer) | 151645 | `d9d3f5b5…547f` | `4a8801be…e10b` |
+
+    The full revisions are in `setup/data.py` and the full hashes in `tests/setup/test_data.py`.
+    At batch 128, refusal has 2 batches per pass with 113 records sitting out, and jailbreak has
+    1 batch per pass with 105 out, so every jailbreak step starts a new pass.
 
 - **F8e — Both scales render records with BackdoorLLM's `alpaca` template.** *(2026-10-06,
   user)*
@@ -1012,6 +1027,8 @@ against the closed setup and evaluation decisions. It left 10 open items.
       F5.
     - At `(fp32, fp32)` the same precision setting turns autocast off, so test scale runs the
       same code (scale invariance).
+    - *Amended 2026-10-12 (F19):* a linear layer's bias gradient is the exception to "the glue
+      computed in fp32". It comes out of autograd in bf16 and is widened exactly.
   - **Why autocast.**
     - The fp32 parameters are the master weights, so there is no second copy and no copy-back
       after each update.
@@ -1076,6 +1093,8 @@ against the closed setup and evaluation decisions. It left 10 open items.
       knobs in `setup_determinism`, next to TF32 off and for the same reason: it changes the
       arithmetic the sizing assumes, so it isn't a config choice. It is a no-op on CPU. Its
       speed cost isn't measured; PyTorch describes the default as a speed option on some GPUs.
+      *(In `setup/config.py` since 2026-10-08, user; `tests/setup/test_config.py` checks the
+      flag reads `False` after setup.)*
     - The verifier's replay runs under the prover's autocast setting. Both are driven by the
       `(MASTER_DTYPE, COMPUTE_DTYPE)` pair.
     - Nothing else. The remaining honest noise is measured in calibration as `s_h`, and P10d
@@ -1096,7 +1115,9 @@ against the closed setup and evaluation decisions. It left 10 open items.
 
 - **F5b — Calibration stays inside the first honest run, as at test scale, guarded by a
   3-step reproduction run whose step roots must equal the honest run's. This settles
-  evaluation dependency D2.** *(2026-10-07, user)*
+  evaluation dependency D2.** *(2026-10-07, user. Revised by F5c, 2026-10-08: the reproduction
+  run is dropped, and the plain baseline's final weights, which must equal H1's, are the
+  check.)*
   - **The question.** P10a makes calibration the verifier's own run from public inputs
     (`W_0`, `D`, `π`, `C`). At test scale the honest run's steps 1–3 stand in for it, because
     they are bit-identical to what the verifier would compute. F5 (former F13) asked whether
@@ -1148,6 +1169,48 @@ against the closed setup and evaluation decisions. It left 10 open items.
   - *Rejected: fall back to a separate calibration automatically on a mismatch.* It would hide
     nondeterminism that also inflates `s_h` on every judged step.
   - **F5 closes with this entry.** Its parts are F5a and F5b.
+
+- **F5c — The plain baseline's final weights replace the reproduction run as the
+  determinism check.** *(2026-10-08, user. Revises F5b.)*
+  - **The question.** The user asked what the reproduction run validates beyond steps 1–3. It
+    validates nothing more: it shows that steps 1–3 come out the same a second time, the claim
+    that lets H1's steps 1–3 stand in for the verifier's own calibration (P10a).
+  - **Derivation.**
+    1. The plain baseline (H3 at full scale, B7 at test scale) already trains a second time
+       from `W_0`, on the same batches `π` at the same `η`, for all 10 steps, with capture and
+       every protocol step off.
+    2. Its final weights must equal the honest run's bit for bit. Test scale checks this
+       (`runs/plain_baseline.py`, `assert_same_final_weights`; A12 calls it), and the weights
+       came out equal.
+    3. Each step's weights depend on every number computed in earlier steps. A committed number
+       of steps 1–3 that differed between the two runs would change the loss, the gradients
+       and the update, and the final weights would differ almost surely. A difference that
+       later roundings absorb completely, in every tensor, through every later step, is
+       possible in principle and not expected.
+    4. So the final-weight comparison tests F5b's claim, over 10 steps rather than 3. It also
+       shows that capture doesn't change training, since the plain baseline runs without it.
+    5. What it doesn't give: a proof that every committed leaf of steps 1–3 is equal (step 3's
+       "almost surely"), and an answer before H1, since it needs H1's final weights.
+  - **Decision.**
+    - The reproduction run is dropped at both scales. Calibration stays inside H1's steps 1–3,
+      as F5b decided.
+    - The plain baseline's final weights must equal H1's bit for bit, at both scales. At full
+      scale H3 runs right after H1, before H2, the cheat runs, the hidden-step run and the two
+      helper runs on H1's stored transcript. A mismatch stops all of them as an error.
+    - On a mismatch, the cause is found and fixed before any later run. Two causes are
+      possible: training isn't repeatable, or capture changes the computation. Rerunning
+      steps 1–3 with capture on and comparing each step's root with H1's tells them apart:
+      unequal roots mean training isn't repeatable.
+    - Test scale needs no change: B7 already makes the comparison.
+  - **Cost.** No extra run. A mismatch is found after H1's 10 verified steps, so H1 is lost
+    and rerun once fixed. A mismatch is an error to fix, not an expected outcome.
+  - *Rejected: keep F5b's reproduction run.* It compares every committed leaf of steps 1–3
+    exactly, before H1. It costs 24 extra committed steps at full scale (about 1–4 minutes,
+    not measured) and a run test scale doesn't otherwise have. The plain baseline already
+    gives the evidence for all 10 steps, and the near-certainty it gives up isn't worth an
+    extra run.
+  - *Rejected: run both.* The reproduction run would add only the leaf-exact form of a claim
+    the final weights already support.
 
 - **F9 — The cancellation ceiling keeps C1's 2× factor with no growth term; H1's judged steps
   test it before H2, and a failure there is answered in advance.** *(2026-10-07, user)*
@@ -1393,6 +1456,112 @@ against the closed setup and evaluation decisions. It left 10 open items.
     forbids taking challenge vectors from the prover, not deriving them from a root the
     prover claims, which is how every challenge is derived anyway.
 
+- **F15b — The CPU hashing path: BLAKE3 on CPU threads, no chunk tree, native batched leaf
+  hashing and challenges, copies overlapped through pinned memory; every digest unchanged.**
+  *(2026-10-18, user, at the hashing decision after FS17; the device choice, rule R1 of
+  `HASHING_PLAN_DRAFT.md`, closed the same day: the CPU; see "The device" below)*
+  - **The question.** F15 asked how full scale hashes 32–67 GB of transcript per step on each
+    side, and builds challenges for millions of products, without the hashing setting the
+    step's cost. FS11's benchmark on the H100 host and FS17's bring-ups answered the CPU half.
+  - **Measured.**
+    - BLAKE3 on the host's threads hashes one 4.9 GB leaf at 94.6 GB/s: its own internal tree
+      already spreads a large leaf over every thread.
+    - The bring-ups' commit took 10–28 s and check 2 11–30 s per step, far above the bytes'
+      hashing time. Python costs about 18 µs per leaf (header, validation, finiteness,
+      dispatch to the pool), and a step has 111k (Falcon3) to 394k (Llama-3.2-1B) leaves, so
+      2.3–7.1 s of each side is per-leaf overhead before any byte is hashed.
+    - Challenges in native batched C (`benchmarks/hashing/challenges_native.c`, BLAKE3 C 1.8.7)
+      take 0.39 s on 27 threads for Llama-3.2-1B's 8.26M challenge vectors.
+    - Host copies into pinned memory slow the step's own matmuls by under 0.8%; copies into
+      ordinary (pageable) memory slow them by 97–99.8% (E4).
+  - **Decision.**
+    1. No chunk tree on the CPU path. A leaf's digest stays `BLAKE3(0x00 ‖ leaf bytes)`.
+    2. Challenges are generated by native batched code: the same XOF, labels and entry
+       mapping (P8b), bit for bit, many products per call with the GIL released.
+    3. Leaf hashing goes native and batched: one call per captured batched tensor (a `bmm`'s
+       `n_s·n_h` members) or per run of small leaves, with the header, the finiteness check and
+       the hash in C. Same digests, same first-error-in-order rule.
+    4. The prover's copies off the GPU stay in pinned memory and overlap the step's GPU work.
+       The pool's size is F21's question.
+  - **Why.** The bytes already hash fast on the CPU; the cost is per-leaf Python. Removing it
+    keeps every digest, so no spec change, golden test or test-scale rerun follows. A chunk
+    tree would buy nothing on the CPU (BLAKE3 is already parallel inside a leaf) and would
+    change every digest.
+  - *Rejected: a chunk tree inside each leaf* (`HASHING_PLAN_DRAFT.md` 4.1). It is needed only
+    by a hash without internal parallelism (SHA-256 on the GPU), and it changes every digest.
+  - *Rejected: keeping the per-leaf Python path.* 2–7 s per side per step at full scale.
+  - *Rejected: pageable copies.* They stall the step's own matmuls.
+  - **Price.** A native build (BLAKE3 C sources pinned by archive SHA-256, compiled with the
+    system C compiler, loaded with ctypes) enters the protocol path, not only the benchmark,
+    so a reproducer needs a C compiler. Two hash implementations (C and Python `blake3`) must
+    agree, which the tests check. The pinned pool needs F21's cap or release.
+  - **The device (R1), closed by the user on 2026-10-18: the CPU.** GPU SHA-256 through
+    cuPQC hashes faster per byte (estimated 150–400 GB/s on the H100), but CPU hashing is
+    hidden behind the GPU's work and the host copy (67 GB at about 57 GB/s, 1.17 s for
+    Qwen2.5-1.5B) is needed on both paths, so the estimated step-time difference is at most
+    about 0.1 s either way, and moving would change every digest (SHA-256 and a chunk
+    tree). User, quoted: "Mark NVIDIA as an optimization possible direction to examine
+    later and currently continue on the hashing improvement alternative you suggested."
+    GPU hashing is parked as speed item O8 (`PERFORMANCE_TASKS.md`). *Reopened by the user on
+    2026-10-20 as F23, which took in O8, and closed the same day by F23: BLAKE3 in our own GPU
+    kernel, digests unchanged. The native C path built here stays the reference and the CPU
+    path.*
+
+- **F15 — Hashing throughput sets the full-scale cost.** *Closed 2026-10-18 by F15a (the
+  verifier's single read), F15b (the CPU hashing path) and F15b's device choice (the CPU).
+  The item as it stood in `FULL_SCALE_TASKS.md` at its close, kept for its history:*
+
+    (2026-10-08).* Both the prover's commitment and the
+    verifier's check 2 hash the whole step transcript. At test scale that is 2.62 GB per step.
+    Hashed on one thread it took about 1.5 s on each side against a 0.74 s training step.
+    Hashing leaves in parallel on 8 CPU threads (commit `70193a4`, 2026-10-04) brings it to
+    about 0.24 s per side, about 11 GB/s. A GPU speeds training up by hundreds of times, but CPU
+    hashing speeds up only by the number of cores. A rough estimate, with an assumed 200 TFLOP/s
+    GPU and 10–30 GB/s CPU hashing: about 17 GB per bf16 step for SmolLM2 against about 0.07 s
+    of training, so 10–25× training per side. The four full-scale models' steps are 32–64 GB
+    (F1a's table), so hashing on CPU threads would take roughly 1–6 s per side per step. Under
+    F1c the step is copied off the GPU into host RAM anyway, so CPU hashing can run on that
+    copy. The GPU is
+    one H100 (EQ14), so the estimate can be redone against it. Remedies that keep the
+    full-transcript binding:
+    - Hash on the GPU, where the tensors already live, with no host copy.
+    - Hash leaves in parallel. This is built on CPU threads; fixed-size leaf chunks (former
+      F12, kept as an option when F4 closed) would balance the work.
+    - In the verifier, hash each leaf in the same read that checks 5–6 use. **Closed as F15a
+      (2026-10-06):** challenges come from the claimed root, and the root comparison moves to
+      the end of the step.
+
+    What remains: GPU hashing, CPU hashing of the host copy overlapped with the GPU's work, and
+    the prover's side of the cost.
+    - **Draft plan, parked by the user (2026-10-07; revised after review the same day):**
+      `HASHING_PLAN_DRAFT.md` sizes four per-step costs together: leaf hashing, the GPU–host
+      copies (now the largest, 2–5× a training step), and challenge generation (2–3 GB and 2–8M
+      XOF calls per step at full scale, not tens of MB). It proposes hashing a large object as the
+      Merkle root of its own fixed-size chunks, so the outer tree keeps one leaf per object, and
+      pipelining hashing and copies with the GPU's work. The hash function and device (SHA-256 on
+      the GPU through cuPQC, BLAKE3 on CPU threads overlapped, or a BLAKE3 GPU kernel) and the
+      challenge construction stay open, settled by its H100 benchmark (Section 6, rules R1–R5).
+      The benchmark scripts are written with the implementation of the other full-scale tasks,
+      once every full-scale decision has been gone through. Not decided. *(Came up while explaining M3's verifier cost,
+    2026-10-04. Test-scale figures updated at the triage the same day.)*
+    - **cuPQC licence: deferred by the user to just before the H100 rental (2026-10-14).**
+      The benchmark's GPU-hashing parts (E2, E3's hashing half, E5b, E5c) need cuPQC, which
+      NVIDIA hands out only after its licence is accepted, so the A40 session (FM4) skipped
+      them. Terms as read in `HASHING_PLAN_DRAFT.md` Section 7, item 1. Recommendation at that
+      point: accept unless CPU hashing has been shown fast enough by then. Accepting costs
+      about half a coder-day for a CUDA extension (nvcc 12.4+, `-dlto`; its Merkle API takes
+      only power-of-two leaf counts, so P9a's odd node needs batched 65-byte SHA-256 calls),
+      and reproducers download the SDK themselves. Declining leaves the hash choice to CPU
+      figures only. **User, 2026-10-14: the first H100 session (FS11) runs without cuPQC;**
+      the licence is decided after its CPU-hashing figures on the H100 host. If GPU hashing
+      is then needed, it costs the half coder-day above plus one short H100 session (about
+      1 h, roughly $2.70) to measure it.
+    - **CPU path closed as F15b (2026-10-18, user):** BLAKE3 on CPU threads, no chunk tree,
+      native batched leaf hashing and challenges, pinned copies overlapped with the GPU's work;
+      digests unchanged. Open: the device choice (R1), GPU SHA-256 through cuPQC against the
+      CPU path. The user is examining cuPQC's licence; its estimated step-time gain is at most
+      about 0.1 s, and it would change every digest.
+
 - **F4a — The streamed verifier keeps each layer's forward values for the backward pass, as
   training does.** *(2026-10-06, user)*
   - **The question.** The verifier rebuilds each product's operands from committed leaves
@@ -1509,3 +1678,704 @@ against the closed setup and evaluation decisions. It left 10 open items.
     arithmetic share (under 1%) as if it were the cost. It is not: the test-scale measurement
     shows eager's gap at twice that share. The record states the cost as unmeasured at full
     scale.
+
+- **F6c — Attack-success scoring is postponed to the end of implementation and evaluation; the
+  `η` pilot is dropped, and full scale fixes `η = 10⁻³`, checked only for smooth honest
+  training. This amends F8b and F6a.** *(2026-10-08, user)*
+  - **The question.** The user postponed attack-success scoring to the very end: it isn't the
+    project's main goal (the protocol's cost and detection are), and generation dominates its
+    cost (about 2.7 of the pilot's roughly 3 estimated H100-hours). F6a's pilot picks `η` by
+    whether a poisoned dose plants the backdoor, which is scoring, so the pilot can't run
+    without it. The user asked for an estimated `η` at which the protocol works properly.
+  - **Decision.**
+    1. Full scale fixes `η = 10⁻³` in `C` for every run, the value test scale runs (S8e).
+    2. No pilot. Before H1, each model and task runs 10 plain steps at that `η`, and the loss
+       over the whole clean list must meet F6a's smooth test (every value finite, none above
+       the starting loss, the last below it). No text is generated. A failure stops the run
+       and goes to the user.
+    3. Attack-success scoring (the full-scale table, B8's rehearsal, the scorer extension)
+       moves to the end of implementation and evaluation.
+  - **Why this value lets the protocol work.**
+    - Check 5 doesn't involve `η` (S8d), so detection of every cheat is the same at any value.
+    - Test scale ran its 10 honest steps at `10⁻³`, all accepted, with check 6's band about
+      half a percent of one update (S8c, P5).
+    - A small `η` is the safe side of two risks: divergence, whose non-finite values the
+      encoding rejects, and fitting so fast on revisited records that honest `κ` passes the
+      frozen ceiling (F9).
+  - **Costs.**
+    - Check 6's forgeable share, `≈ ULP(W)/(η·|g|)`, grows where per-entry gradients are
+      smaller. The full-scale models are larger, so the share may be a few percent of an update
+      rather than half a percent (estimated, not measured).
+    - Ten steps at `10⁻³` move the model little, so F9's test of drift on revisited records
+      sees little fitting.
+    - One plain-SGD step at `10⁻³` probably plants no backdoor (F8b's own argument), so
+      the attack-success table taken up at the end will likely show no lift from the verified
+      runs' weights. Since `η` is fixed for every run, that table then needs its own decision,
+      for example attack-success models trained outside the verified runs.
+  - *Rejected: keep the pilot with scoring.* It spends most of the first H100 session on
+    generation for a result the user ranks last.
+  - *Rejected: a larger estimated `η` (for example `10⁻²`).* It shrinks check 6's forgeable
+    share, but nothing measured says honest training stays smooth there, and the smooth check
+    would then be a real gate rather than a confirmation.
+
+- **F18 — Check 5's error model splits its two terms: the product's own rounding scales with the
+  product, accumulation with the larger of the product and its terms.** *(2026-10-12, user, at
+  FM1)*
+  - **The question.** FS4's CPU bring-up (fp32, 4 records × 128 tokens, provisional bands fitted
+    in-sample on step 1) rejected an honest Qwen2.5-1.5B step at check 5: `L1.dQ[0,3]`, the
+    query-gradient product of layer 1 for record 0 and head 3, gave a normalized residual of
+    79.3 against `τ = 39.16` (`s_h = 4.895`, class `Lambda`). Qwen2.5-0.5B was accepted, but its
+    largest honest residual reached 0.522 of `τ`, above the calibration rule that no honest
+    residual exceed `τ/2`, so its calibration would stop. Llama-3.2-1B, Falcon3-1B and SmolLM2
+    passed with the largest residual at 0.22–0.34 of `τ`. Every Qwen outlier was a `dQ`.
+  - **Cause (measured on the bring-up step).**
+    1. Qwen2.5's early `k_proj` biases are large: `‖b‖₂ = 1102.7` (largest entry 316) in the
+       first layer and 155.2 in the second, against a median of 11.0 from the fifth layer on.
+       Every key of those layers then carries the same large offset: `‖mean K‖ / RMS(K − mean)`
+       is about 48 in layer 1.
+    2. `dQ = dS·K`, with `dS` the softmax backward. Each row of `dS` sums to zero
+       (`‖dS·1‖ / ‖|dS|·1‖` is `3·10⁻⁶` to `1.2·10⁻³` at the worst products), so the offset
+       cancels from the result but not from the running sums that accumulation rounds.
+    3. The rounding error therefore scales with the terms, not with the result. Within `dQ`, the
+       log of the normalized residual tracks the log of `κ` with `r = 0.87` and slope 0.93; over
+       all other products `r = 0.34`.
+    4. (2.1)'s remark that the relative error is insensitive to sign structure covers two
+       regimes: terms of one sign, where the running sums reach the result, and terms of random
+       sign, where the sums and the result are both of the size of the terms. It misses a
+       third: a shared component that cancels, where the running sums keep the size of the terms
+       while the result is small. The cancellation guard (P3.c) doesn't catch it: Qwen-1.5B's
+       five worst `dQ` products have `κ = 74–153`, a structural cancellation that the frozen
+       per-class `κ_max` admits as honest.
+  - **The new unit.** Write `U_m = √(Σ_l ‖A_{:,l}‖² · ‖B_{l,:}‖²)` over the contracted index
+    `l`, from the reconstructed operands (a biased product contributes its column of ones and
+    bias row, as `q_m` counts them). `U_m` is the Frobenius norm of the array of all terms
+    `A_il·B_lj`, the size the running sums keep. Check 5 rejects if
+
+    `‖A_m·(B_m·r) − P_m·r‖ > τ · σ_r · ( √2·ε_in·‖P_m‖_F + √q_m·ε_acc·max(‖P_m‖_F, U_m) )`,
+
+    so the relative error becomes `e_m = √2·ε_in + √q_m·ε_acc·max(1, U_m/‖P_m‖_F)`, and every
+    formula written in `e_m` (the floor, `b₀`, `f_achieved`) keeps its form.
+    - *Why `max(‖P_m‖_F, U_m)`.* For terms of one sign, `‖P_m‖_F ≥ U_m` (the sum of nonnegative
+      terms is at least the root of their sum of squares), and the running sums reach `P`. For
+      random signs, `‖P_m‖_F ≈ U_m`. Under cancellation, `U_m > ‖P_m‖_F` and the running sums
+      stay near `U_m`. The larger of the two is the size of the running sums in all three
+      regimes, up to constants (`1/√3` coherent, `1/√2` random) that `s_h` absorbs.
+    - *Why the `ε_in` term keeps `‖P_m‖_F`.* Every product leaf holds the operands the matmul
+      consumed, in its compute format (FS3), so their rounding happens before the commitment
+      and is not part of the residual. What `ε_in` measures is the product's own rounding to
+      that format, which is relative to each entry of `P`. FS3 measured the bf16 honest residual
+      as mostly that rounding.
+    - *Bound by the cancellation guard.* `U_m ≤ ν_m` (a sum of squares of nonnegative terms is
+      at most the square of their sum) and `‖|P_m|·1‖ ≤ √w_m·‖P_m‖_F`, so
+      `U_m/‖P_m‖_F ≤ √w_m · κ_m ≤ √w_m · κ_max`. The guard still caps how far a product's band
+      can widen. On the five bring-up models the measured ratio stays at or below `1.9·κ_m`.
+    - *Not steerable by the prover.* `U_m` comes from the reconstructed operands, which chaining
+      (check 7) binds to earlier checked products, the anchored weights and the anchored batch.
+      A deviation in `P_m` changes `‖P_m‖_F` by at most `‖Δ_m‖_F`, as today.
+    - *Cost.* One pass over each operand for its column or row norms, once per product, not per
+      challenge, shared with the pass that computes `ν_m`. Measured by FS15.
+  - **Candidates measured on Qwen-1.5B's bring-up step** (fp32; `s_h` is the largest class RMS
+    of the `k = 9` residuals in each unit; `τ = 8·s_h`; the guard is calibration's rule that the
+    largest residual stays at or below `τ/2`; the price is `log₂` of the new floor over today's,
+    per product, at fixed `k`; `k` is P10d's sizing at the bring-up's `T = 10` and `M = 8,655`,
+    with the binding product's unit):
+
+    | unit | `s_h` (class) | max residual / `τ` (at) | guard | price median / worst (bits) | `k` |
+    |---|---|---|---|---|---|
+    | (a) today, `e·‖P‖_F` | 4.895 (`Lambda`) | 2.02 (`L1.dQ[0,3]`) | fails | — | 9 |
+    | (b) `e·‖P‖_F·κ` | 0.366 (`G_E_head`) | 0.739 (`L27.G_down`) | fails | −2.06 / +3.52 | 10 |
+    | (c) `e·‖ |A|·|B| ‖_F` | 0.828 (`G_down`) | 1.14 (`L27.G_down`) | fails | −1.03 / +5.54 | 10 |
+    | (d) `e·ν/√w` | 2.813 (`G_down`) | 1.33 (`L27.G_down`) | fails | +0.44 / +5.78 | 13 |
+    | (e) `e·U` | 3.639 (`Lambda`) | 0.526 (`L27.G_down`) | fails | −0.54 / +7.15 | 12 |
+    | (f) `e·max(‖P‖_F, U)` | 3.639 (`Lambda`) | 0.284 (`L27.G_down`) | holds | −0.43 / +7.15 | 12 |
+    | **(g) split, adopted** | 3.672 (`Lambda`) | 0.282 (`L27.G_down`) | holds | −0.41 / +7.00 | 12 |
+
+    `L27.G_down` is a down-projection weight gradient whose error concentrates in a few columns
+    (half of `‖E‖²` in one column), the input channels of Qwen's massive activations. (f) and
+    (g) hold it at 0.28 of `τ`.
+  - **(g) on all five bring-up models** (fp32, in-sample on step 1):
+
+    | model | max residual / `τ`, today → (g) | guard under (g) | price median / worst (bits) | `k`, today → (g) |
+    |---|---|---|---|---|
+    | Qwen2.5-1.5B | 2.02 (rejected) → 0.282 | holds | −0.41 / +7.00 | 9 → 12 |
+    | Qwen2.5-0.5B | 0.522 → 0.163 | holds | −0.56 / +4.44 | 10 → 9 |
+    | Llama-3.2-1B | 0.219 → 0.219 | holds | 0.00 / +1.66 | 9 → 9 |
+    | Falcon3-1B | 0.343 → 0.343 | holds | 0.00 / +1.47 | 9 → 9 |
+    | SmolLM2-135M | 0.248 → 0.193 | holds | −0.20 / +1.68 | 9 → 9 |
+
+    The worst-case price sits in each model's operand gradients, mostly `dQ`. At Qwen-1.5B's
+    `L1.dQ[1,3]` today's floor is not a valid comparison, since today's band rejects that honest
+    product. Qwen-1.5B's `k` rises to 12 because `L1.dQ[1,3]` (`q = 128`, `U/‖P‖_F = 191.6`)
+    becomes the binding product, at 5.54× today's `e_max`.
+  - **Prediction at full scale (bf16 operands, fp32 accumulation), to be tested.** The output
+    term `√2·2⁻⁸ = 5.52·10⁻³` dwarfs the accumulation term at every product. At Qwen-1.5B's worst
+    product the accumulation term under (g) is `√128 · 2⁻²⁴ · 191.6 = 1.29·10⁻⁴`, 43× smaller.
+    The binding `e_m` rises from `e_max = 5.547·10⁻³` to `5.654·10⁻³` (×1.019, 0.027 bits of
+    `b₀`), so at `s_h = 1` and `c = √(2/3)` `N/b₀ = 98.30/b₀` moves from 20.54 to 20.66, and
+    `k = 21` stands (F8a, F10; F8a's table lists 20.39 from the earlier `c = 0.798`). That spends
+    0.027 of Qwen-1.5B's 0.105 bits of slack per vector: `k` stays 21 as long as full-scale
+    calibration measures `s_h ≤ 1.056` for that model, against 1.076 before. The other four
+    models move by at most ×1.0004. FS5 (Qwen-0.5B at `(fp32, bf16)` on CPU) tests the
+    prediction first and FS11 on the H100.
+  - **Decision.**
+    1. Check 5 uses unit (g), at both scales. Spec check 5, §8.1, §8.2 and §9 and the sizing
+       appendix (§2, §4, §6, §8) state it.
+    2. The `κ` guard stays as it is (P3.c, C1, F9).
+    3. Calibration fits `s_h` and the concentration rule in the new unit.
+    4. P10d's recompute of `k` after calibration sizes at the largest `e_m` over the calibration
+       products, not at `e(q_max)`. Before calibration `k` is sized at `q_max` with
+       `U_m/‖P_m‖_F = 1`, as now.
+    5. A judged product's `e_m` may exceed the calibrated binding value. Its own floor
+       `Φ_m = c·τ·e_m·2^(N/k)·‖P_m‖_F` is then wider than the sized one, so each step reports its
+       largest `f_achieved` over its products alongside the sized value.
+    6. The test-scale band file is refitted under (g), so its hash changes. EM1's clean run set
+       uses the new file.
+    7. FS15 implements it and reruns Qwen-1.5B's bring-up, including the bias-tampered step.
+  - *Rejected: (a), today's unit.* It rejects an honest Qwen-1.5B step and fails the guard on
+    Qwen-0.5B.
+  - *Rejected: (b), today's unit times `κ`.* `κ` widens every product by its cancellation,
+    including its output rounding, which doesn't cancel. It fails the guard at `L27.G_down`,
+    where the error concentrates in a few columns rather than cancelling.
+  - *Rejected: (c), the Frobenius norm of `|A|·|B|`.* It costs a full matmul per product, the
+    cost Freivalds' check exists to avoid, and it still fails the guard.
+  - *Rejected: (d), `ν/√w`, cheap.* It fails the guard on four of the five models.
+  - *Rejected: (e), `U` alone.* For terms of one sign `U < ‖P‖_F`, so it narrows the band of
+    coherent sums. It fails the guard narrowly (0.526).
+  - *Rejected: (f), today's `e_m` times `max(‖P‖_F, U)`.* It holds at fp32, but at bf16 it
+    multiplies the output term by `U/‖P‖_F`. At Qwen-1.5B's `L1.dQ[1,3]` that gives
+    `τ·e_m ≈ 8 · 5.5·10⁻³ · 191.6 ≈ 8.5`, above `f = 1`, so `b₀ < 0` and no `k` reaches the
+    budget. The product's own rounding doesn't grow with cancellation, so the factor is wrong
+    as well as costly.
+
+- **F19 — A linear layer's bias gradient stays as autograd computes it, in bf16 (2026-10-12,
+  user, at FM1).**
+  - **Question.** F6b pins the glue weight gradients to fp32, because a bf16 glue gradient
+    computed in a different order by prover and verifier could widen `τ_W` on that tensor up to
+    `2¹⁶` times (F6b step 7). Qwen2's query, key and value projections carry biases (FS2). Under
+    autocast the bias gradient is the sum over tokens of the bf16 output gradient `δY`, and
+    autograd returns it in bf16, widened exactly to fp32 at the fp32 parameter. Should the code
+    force it to fp32?
+  - **Decision.** No. The bias gradient stays as autograd computes it, and F6b's pinned list
+    names it as the exception. The verifier recomputes it the same way in its replay.
+  - **Why.**
+    1. Forcing fp32 needs a hook or changed model code, against the rule that the verified run
+       uses an unmodified `from_pretrained` model and stock autograd.
+    2. On CPU at bf16, prover and replay agree bit for bit: the replay rebuilds every bias
+       gradient bit for bit, on the tiny Qwen2 models (FS2 with FS3, 2026-10-11) and on the real
+       Qwen2.5-0.5B, all 72 q, k, v bias gradients (FS5, 2026-10-13). *Corrected 2026-10-13:*
+       this point first cited check 6's `ρ_max = 0` on every bias tensor. That held on the tiny
+       models only. On the real Qwen2.5-0.5B the biases give `ρ_max` 1.62–1.85 at bf16 and up to
+       1.29 at fp32, with bit-identical gradients: the update's own rounding (SGD's fused add
+       against check 6's two roundings, P5a), inside `τ_W⁰ = 4`.
+    3. On GPU, F5a's replay on the same GPU type and software build, with deterministic
+       algorithms, gives the same reduction order, so the same bits are expected.
+    4. A mismatch would not be silent: the replay compares every glue gradient with the
+       committed one bit for bit, and F5a treats a non-bit-identical replay as a bug to find and
+       fix. (Check 6's `ρ_max` alone would not show it, since honest updates already give
+       `ρ_max` up to 2.)
+  - **Price.**
+    - If the two sides ever reduce in a different order, `τ_W` on the bias tensors could widen
+      up to `2¹⁶` times, from fp32-sized to bf16-sized. At F6b's magnitudes that is room for
+      about 300 updates' worth of unseen movement per step, on those tensors only.
+    - Each bias gradient carries bf16 rounding (about 3 significant digits), as in plain
+      autocast training of Qwen.
+  - *Rejected: compute the bias gradient in fp32 through a backward hook or a patched linear
+    layer.* It forks the model code and autograd, which scale invariance rules out, and it
+    buys nothing while F5a's bit-identical replay holds.
+
+- **F4b — The output layer runs in row blocks: 8 blocks of 16 sequences at full scale, in
+  training, the prover and the verifier; one block at test scale. This settles F4's output-layer
+  item.** *(2026-10-15, user, at FM5)*
+  - **The question.** FS11 (the first H100 session, 2026-10-14) ran one verified step per model
+    at the full-scale batch, `n_s = 128` sequences of `n = 128` tokens (`N = 16,384` tokens).
+    Only Qwen2.5-0.5B finished: prover peak 60.13 GiB, verifier 67.20 GiB of the H100's 79.2.
+    Qwen2.5-1.5B ran out of memory in training (75.05 GiB allocated when it asked for 9.27 more),
+    Llama-3.2-1B in the verifier's check 5 (a 7.83 GiB request at 71.56 allocated), and
+    Falcon3-1B on fragmentation (8.00 GiB asked, 6.79 free). Plain training alone peaked at
+    55.50 GiB on Qwen2.5-0.5B and 65.85 on Llama-3.2-1B (FS11's smooth checks).
+    - *Cause.* The output scores `Λ` hold one row per token and one column per vocabulary entry.
+      At fp32 they take 9.27 GiB for Qwen2.5 (vocabulary 151,936), 7.83 for Llama-3.2 (128,256)
+      and 8.00 for Falcon3 (131,072); at bf16 half that. At the loss's backward, three fp32
+      score-sized arrays exist at once (the scores widened for the cross-entropy, its softmax and
+      the score gradient), 27.8 GiB on Qwen2.5. The failed requests were all score-sized.
+  - **Decision.**
+    1. A new setting `VERIF_HEAD_BLOCKS = B` splits the batch's rows into `B` blocks of whole
+       sequences. Full scale uses `B = 8`: 16 sequences, 2,048 tokens per block. Test scale
+       keeps `B = 1`, which leaves its product names, canonical order and numbers as they were,
+       so its closed results stay valid. `B` must divide `n_s`.
+    2. Each block is three products of its own: its scores `Λ_b`, its final-norm-output
+       gradient `δF_b` and its share `G_b` of the output weight's gradient. The canonical order
+       becomes: the layers' forward, `Λ_0 … Λ_{B−1}`; then `δF_0, G_0, …, δF_{B−1}, G_{B−1}`;
+       then the layers' backward as before.
+    3. Training (the plain baseline and the prover alike) runs the body up to the final norm
+       once, then each block's forward and backward in turn: scores, loss share
+       `Σ_b μ·CE / Σ_all μ`, and the gradients of that share. The block's scores are freed
+       before the next block starts. The body's backward then runs once on the joined `δF`.
+       The model and autograd stay unmodified; only the training loop applies the output layer.
+    4. The output weight's gradient is the fp32 sum of the widened `G_b` in block order, through
+       one function that the prover's update and check 6 both use. Tied models add the
+       embedding's own gradient to it, as before (check 6b).
+    5. The verifier's replay runs the output layer's backward one block at a time, and check 5
+       measures each block's products like any other product.
+    6. *The allocator fix.* Full-scale runs set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+       and empty the allocator's cache between the prover's and the verifier's turns. This is
+       kept only if FS17 measures no speed cost.
+  - **Why.**
+    1. *It fits, with the batch unchanged.* Nothing score-sized for the whole batch remains
+       anywhere. A block's scores are an eighth of the whole batch's: 1.16 GiB at fp32 on
+       Qwen2.5. The estimates for the tightest model, Qwen2.5-1.5B, are about 67 GiB for plain
+       training, 71 for the prover (its peak at the output layer) and 74 for the verifier,
+       against 79.2. The verifier figure includes the prover's 5.75 GiB fp32 model, which stays
+       on the GPU. These are estimates; FS17 measures them.
+    2. *The batch stays PoTS-comparable.* `n_s·n = 128 × 128` is the batch that F8a sized `k`
+       for and that the cost comparison uses.
+    3. *`G` is split too.* An unsplit `G` would need the whole batch's score gradient as one
+       operand, which brings a score-sized fp32 array back into check 5.
+    4. *Soundness and `k` are unchanged.* Each block product is checked like any other, with
+       its own Freivalds vectors. `M` (products per step, F11) grows by `3·(B−1) = 21`, so
+       `log₂M` grows by at most 0.0003 bits and `k = 21` holds. The binding contraction, which
+       sets `b₀`, is still the vocabulary (`δF_b`). `G_b`'s contraction shrinks from 16,384
+       rows to 2,048, so its band narrows.
+  - **Price.**
+    - *Prover time.* More, smaller kernels and about 18 host syncs per step at section
+      boundaries. Expected to add a few percent per step; FS17 measures it.
+    - *Transcript bytes.* `G_b` is a whole `n_v × d` matrix per block, so the output weight's
+      gradient is committed `B` times instead of once: `(B−1)·n_v·d·2` bytes more per step.
+      That is +1.9 GB for Qwen2.5-0.5B, +3.27 for Qwen2.5-1.5B (about 5% of its roughly 65 GB
+      per step), +3.67 for Llama-3.2-1B and +3.76 for Falcon3-1B. It feeds F15 (hashing
+      throughput) and F17 (transcript bytes).
+    - *Check 5 time.* Each block product needs its own `W·r` or `W^T·r` term, so check 5
+      does `3·(B−1)·n_v·d` more multiply-adds per vector: 2.9 billion on Qwen2.5-0.5B, 4.9 on
+      Qwen2.5-1.5B, 5.5 on Llama-3.2-1B and 5.6 on Falcon3-1B. Against an estimated 43–78
+      billion per vector for the whole check, that is about 6–7% more work on the Qwen2.5
+      models and 10–11% on Llama-3.2-1B and Falcon3-1B (estimated). FS17 measures it.
+    - *Prover memory, noted.* The capture keeps every matmul operand until labeling, so each
+      block's bf16 score gradient stays held after its block (4.64 GiB in all on Qwen2.5). It
+      is counted in the prover estimate above.
+    - *Code.* A new training entry point on the declared computation, block-aware labeling and
+      replay, and the gradient-sum function shared by the prover and check 6.
+  - *Rejected: a smaller batch* (for example 64 sequences). It fits without new code, but it
+    leaves the batch that `k`, the cost comparison and PoTS's setup assume.
+  - *Rejected: dropping Qwen2.5-1.5B.* It loses PoTS's largest model, and Llama-3.2-1B and
+    Falcon3-1B still fail.
+  - *Deferred for their time cost (user, 2026-10-15; offered again only if memory becomes
+    crucial):* moving the prover's model to host RAM during the verifier's turn (saves
+    1.8–6.2 GiB, costs about 0.1–0.5 s per step); dropping the scores' GPU copy as soon as its
+    host copy is done (about 4.6 GiB, up to 0.2 s per step); and check 5 measuring score-sized
+    products in row blocks (8–9.3 GiB of scratch, mostly moot once the output layer is split).
+  - *Rejected variants of the split.*
+    - Per-block cross-entropy under one ordinary backward: autograd still keeps every block's
+      softmax until the backward, so the verifier needs about 81 GiB.
+    - A custom cross-entropy that saves bf16, or a recomputed one: prover about 74 GiB,
+      verifier about 76.5, too close to 79.2.
+    - A fused output layer and loss: a large rework of labeling and replay.
+    - Splitting the vocabulary instead of the rows: it keeps the whole scores (4.64 GiB) and
+      needs a custom log-sum-exp; prover about 74 GiB.
+    - Sharing Freivalds vectors across blocks to save the extra `W·r`: a change to the spec's
+      challenge derivation.
+
+- **F6d — The smooth check exempts step 1 from "never above the starting loss"; `η` stays
+  `10⁻³`. This amends F6c.** *(2026-10-15, user, at FM5)*
+  - **The question.** In FS11, five of the eight model–task pairs failed F6c's smooth check.
+    Three of the five ran all 10 steps and failed only because step 1 rose above the starting
+    loss: Qwen2.5-0.5B jailbreak went from 1.071 to 1.686 at step 1 and to 0.604 at step 10;
+    Qwen2.5-0.5B refusal from 2.081 to 2.520, then to 1.424; and Llama-3.2-1B jailbreak from
+    1.367 to 1.431, then to 0.584. Llama-3.2-1B refusal passed. The other four pairs (Falcon3-1B
+    and Qwen2.5-1.5B) ran out of memory in training, which F4b addresses. Should `η` change, or
+    the rule?
+  - **Decision.** `η` stays `10⁻³`. The rule becomes: every whole-list loss is finite (step 1
+    included), none from step 2 on is above the starting loss, and the last is below it.
+  - **Why.**
+    1. Each failing curve ended 32–57% below its start by step 10 (the passing one 16%), which
+       is the opposite of a blow-up. In each, step 2 was already below the start. The rise at
+       step 1 is an overshoot from the large gradient at `W_0`: norms of 36–84 at step 1
+       against 5–7 at step 10. On Qwen2.5-0.5B the gradient at the overshot `W_1` was larger
+       still (121 and 221), and the loss came straight back down.
+    2. Detection doesn't depend on `η` (check 5), so a smaller `η` buys nothing for the
+       protocol. The curves also show the model moves a lot in 10 steps at `10⁻³`, against
+       F6c's expectation that it would move little.
+    3. Changing `η` now would also change what the test-scale results and F6c's reasoning were
+       measured at.
+  - **Price.**
+    - The exemption was chosen after seeing FS11's curves, so it's a post-hoc rule. The paper
+      should say so.
+    - A real first-step blow-up that later recovers would now pass. The finiteness condition
+      still catches a divergence.
+  - *Rejected: a smaller `η` (for example `5·10⁻⁴`)*: it reruns the smooth checks and moves the
+    full-scale runs away from the test-scale `η`, with no detection gain.
+
+- **F4 — Closed: every model fits one H100 with the output layer in 8 row blocks and the
+  allocator fix; no further memory saving is built, and the allocator fix stays.**
+  *(2026-10-18, user, at FS17's report)*
+  - **The question.** F4 asked whether the verifier's GPU peak fits on one H100 for each model
+    at the full-scale batch (`n_s = 128`, `n = 128`). FS11 (2026-10-14) showed it didn't for
+    three of four models; F4b split the output layer into row blocks; FS17 (the H100 re-check,
+    2026-10-18, H100 80GB HBM3, torch 2.9.1+cu128) measured one verified step per model at
+    `B = 8` with the allocator fix.
+  - **Measured (GiB, step 1; usable memory about 79.25).**
+
+    | Model | Prover peak / reserved | Verifier peak / reserved | Prover s | Verifier s (check 5) |
+    |---|---|---|---|---|
+    | Qwen2.5-0.5B | 41.03 / 42.92 | 39.21 / 41.15 | 46.1 | 69.0 (45.5) |
+    | Llama-3.2-1B | 54.96 / 56.20 | 55.66 / 57.04 | 54.2 | 107.2 (74.1) |
+    | Falcon3-1B | 56.88 / 58.13 | 59.11 / 60.04 | 35.9 | 77.0 (59.6) |
+    | Qwen2.5-1.5B | 75.35 / 77.84 | 76.91 / 77.97 | 70.2 | 444.8 (410.8) |
+
+    Every honest step was accepted. The verifier's peak sits in check 5's glue section. F4b's
+    estimates for Qwen2.5-1.5B (prover 71, verifier 74 GiB) were 4–5% low. Transcript bytes
+    weren't logged by the bring-up, so F4b's byte estimate (+1.9 to +3.76 GB per step) stands
+    unmeasured.
+  - **The slow check 5 on Qwen2.5-1.5B.** A rerun in the same environment after the job took
+    98.6 s for check 5 (prover 67.0 s, verifier 128.2 s), with the same peaks, one allocator
+    retry and no out-of-memory error. Qwen2.5-0.5B's check 5 also varied about 2× between two
+    runs (45.5 and 90.9 s). Memory pressure isn't the cause, since both runs' memory logs are
+    the same; the variance is unexplained and is a speed item, not a memory one.
+  - **The allocator fix (F4b item 6) costs no speed.** Plain steps, default allocator against
+    expandable segments, 10 steps each: Llama-3.2-1B ~0.96 against ~0.93 s, Falcon3-1B ~1.16
+    against ~1.15, Qwen2.5-0.5B ~0.50 against ~0.50, Qwen2.5-1.5B ~1.23 against ~1.20, with
+    identical peaks. On a verified Qwen2.5-0.5B step the prover was 2.4 s slower (noise) and the
+    verifier's reserved memory 1.77 GiB lower. It stays.
+  - **Decision.** F4 closes. The three savings deferred under F4b (the prover's model to host
+    during the verifier's turn, dropping the scores' GPU copy, check 5 in row blocks) stay
+    unbuilt and are offered again only if a model or batch stops fitting. Fixed-size leaf
+    chunks (former F12) live on only as a hashing-speed option under F15.
+  - **Why.** Compute comes first and memory only has to fit (CLAUDE.md, 2026-10-06), and it
+    fits.
+  - **Price.** Qwen2.5-1.5B leaves about 1.3 GiB of headroom (reserved 77.97 of about 79.25).
+    A longer sequence, a larger batch or a larger model would need one of the deferred
+    savings, each with its time cost.
+
+- **F22 — The environment: four H100 SXM over NVLink (B), with one B200 (A) as the fallback
+  if B fails its hardware feasibility.**
+  *(2026-10-20, user, after `ENVIRONMENT_PLAN_DRAFT.md` and the second profile check; decided
+  together with F23)*
+  - **The question.** Which machine should the full-scale runs move to, to cut the copying and
+    hashing of the 34–70 GB transcript per step? (A) One large-HBM GPU (a B200) that keeps the
+    transcript where it is made and hashes it there. (B) Four H100 SXM over NVLink: GPU 0
+    trains, GPUs 1–3 hold, hash and verify the transcript. `ENVIRONMENT_PLAN_DRAFT.md` has the
+    code changes per module, the floors, memory and prices. Its own recommendation (build
+    neither before FS27's profile, then A) is superseded by this entry.
+  - **Measured: copying and hashing cost far more than their floor.** The plan's summary gave
+    today's copies and hashing on the H100 as 0.6–1.2 s per side. That is the floor (the bytes
+    at the measured rates: CPU hashing at 94.6 GB/s, PCIe copies at about 57 GB/s), not what
+    the code does. The second run of FS27's profile check (2026-10-19, `profile-check`
+    session, an H100 SXM pod whose container is allotted 17 CPUs, three verified steps per
+    model, F15b's native path in place, Qwen2.5-1.5B held out) measured:
+
+    | Model | Commit (s) | Check 2 (s) | Both, per step (s) | Step, prover + verifier (s) |
+    |---|---|---|---|---|
+    | Qwen2.5-0.5B | 8.0–9.9 | 6.3–6.9 | 15–16 | 56–68 |
+    | Llama-3.2-1B | 10.8–11.3 | 10.1–15.0 | 21–26 | 87–124 |
+    | Falcon3-1B | 6.6–7.7 | 5.8–7.8 | 13–14 | 61–82 |
+
+    - Hashing alone takes 13–26 s per step, 17–30% of the step. FS27's first run (one step,
+      a pod with 22 CPUs) gave commit 4.4–8.9 s and check 2 4.2–7.3 s; FS17, before the native
+      path, 10–28 s and 11–30 s.
+    - The probe gives the reasons. The native path hashes at 8.4 GB/s on the run's 8 threads
+      (`VERIF_THREADS`) plus 2.8 µs per leaf. The pod allots 17–22 CPUs per H100, and about 16
+      of the 17 were busy during commit.
+    - Check 5's serving (`5.glue`, 8–22 s per step) moves 105–167 GB from host to GPU per
+      step, 2–3× the transcript and mostly from pageable memory (8.7 GB/s against 51 GB/s
+      pinned); the profile marks it PCIe-bound.
+    - Pinned memory is allocated at 2.9 GB/s, so step 1 pays about 20 s once for the pool.
+    - The prover's copies off the GPU are hidden from step 2 on.
+    - Hashing and the serving copies together come to up to about half the step.
+  - **Decision.**
+    1. Full scale moves to four H100 SXM over NVLink. GPU 0 trains. GPUs 1–3 each own the
+       leaves of a contiguous range of layers, balanced by bytes, with the head blocks and the
+       final norm on GPU 3 and each `W_t`, `W_{t+1}` leaf with its layer. They receive the
+       products by peer copy, hash them with F23's kernel, and verify them.
+    2. The verifier is the plan's design 1: a model-parallel replay in one process. The replay
+       model's units sit on GPUs 1–3, and `X_j` and `δX_{j+1}` cross the GPU boundaries as
+       values. The unmodified model, autograd and the dispatch mode stay, and no leaf is
+       added, so the spec and every root are unchanged.
+    3. Built sequential first (the verifier runs after the prover's step, as today), then
+       pipelined (GPUs 1–3 verify step `t` while GPU 0 trains `t + 1`).
+    4. **The fallback.** If B fails its hardware feasibility after every effort, the work
+       moves to A, one B200. Hardware feasibility means three conditions, each tried on every
+       provider that offers the machine (Runpod, Lambda, Google Cloud):
+       - **HW1, rentable:** a four-H100 SXM machine can be had when a session needs it.
+       - **HW2, NVLink exposed:** `nvidia-smi topo -m` shows `NV18` between each pair of GPUs,
+         `nvidia-smi topo -p2p r` reports peer reads OK, and peer copies are fast on every
+         pair. The rate is the slowest pair's, measured with the port's own copy (PyTorch
+         `copy_` from one GPU to another): 300 GB/s or more passes; 150–300 GB/s returns the
+         number to the user before the port relies on it; below 150 GB/s fails. `nvbandwidth`'s
+         rates are recorded beside it when the pod has the tool, and its absence doesn't block
+         the verdict (user, 2026-10-20).
+         - *Why these lines.* The first wording was "`nvbandwidth` measures peer copies near
+           300 GB/s"; FS31's code passed at 200 GB/s by its own copy, a number the user never
+           saw. The user chose three bands, the shape of K1's kernel-speed gate.
+           - 300 GB/s is an H100 NVLink pair's one-way rate: 270–358 GB/s measured per pair
+             on another vendor's node (`HARDWARE_ENVIRONMENTS.md`). PCIe Gen5 x16, the
+             fallback link, tops out near 64 GB/s, so 150 *(hand-picked)* sits well clear of
+             both.
+           - The port's peer copies go through PyTorch, so that path is the one judged.
+             `nvbandwidth` is seldom preinstalled on pod images.
+           - Price: a healthy node at, say, 280 GB/s stops for the user's call instead of
+             passing. The data is already collected, so no pod time is added. The 34–70 GB
+             transcript per step crosses in 0.11–0.23 s at 300 GB/s and 0.23–0.47 s at 150
+             (floors), on a side stream behind training.
+         - **Peer copies land the right bytes** *(orchestrator, 2026-10-21, after FS32's
+           two-A40 runs)*. Before the rate counts, a copy between every ordered pair of GPUs
+           must equal a copy staged through host memory, byte for byte. The copies are
+           PyTorch `copy_`, contiguous and strided, at a few sizes, on the default stream and
+           on a side stream as capture does. Every session on two or more GPUs runs this check
+           first and stops on a failure.
+           - *Why.* On two Runpod A40 pairs (two hosts in EU-SE-1, 2026-10-21) `nvidia-smi topo
+             -p2p r` reported peer reads OK and PyTorch reported peer access. Yet every direct
+             peer copy left wrong bytes at the destination, at 2.7 GB/s (measured), while the
+             same copies staged through host memory were right. FS32's session failed every
+             two-GPU test and part for this reason, not for a bug in the port. A reported "OK"
+             is therefore no evidence.
+           - Price: under a minute of pod time per session; nothing in the protocol changes.
+       - **HW3, the same bits on every card:** one step gives the same bits on each card, and
+         the split replay rebuilds every operand and glue gradient bit for bit against the
+         one-GPU replay (F5a).
+       A failure on one provider sends the work to the next. Failing on all, the user confirms
+       the fallback. F23's kernel is A's hashing too, and design 1's per-role devices
+       collapse to one device, so the work done for B carries over. The user confirmed this
+       reading on 2026-10-20, so HW3 counts both kinds of mismatch: between cards on the same
+       step, and a split-replay mismatch that can't be fixed. The same day the user approved
+       the pods for FM9 and FM10 at the prices in `IMPLEMENTATION_PLAN.md`.
+  - **Questions that don't trigger the fallback.** Each is solved inside B.
+    - The cost guard on a four-GPU pod and on another provider: the job's self-delete and the
+      boot guard call Runpod's API.
+    - Memory when pipelined: each verifier GPU holds two thirds of a transcript, about 69 GiB
+      for Qwen2.5-1.5B against 79.25 usable. A model that doesn't fit runs sequential.
+    - One process: the GIL serializes host work across the four GPUs, so per-product host
+      cost doesn't divide by three. The check-5 speed work (O10–O12) cuts that cost first.
+      The verifier stays one process on GPUs 1–3; the pipelined loop gives the prover its own
+      (FS33's process model, below).
+    - The machine's CPU allotment, for the tree, the challenges and checks 6a and 6b while they
+      stay on the host.
+    - The paper's numbers. EQ14 (one H100 per timed run, one role at a time) needs GPU-seconds
+      beside wall time, and pipelining breaks "one at a time". EQ1b, EQ13.5, F1c (the
+      transcript moves by peer copy, not through host RAM) and S3 (two live transcripts when
+      pipelined) are revised as FM10 reaches them.
+  - **Why.** Speed comes first. The user, quoted: "Sounds like alternative B and solution C
+    combine to the most speed efficient solution which this is what most matters. I'm not
+    afraid of code implementation time or changes from current environment."
+    - At the floor, B pipelined gives 0.50–1.20 s per step, against 0.62–1.67 s for A with
+      F23's kernel and 1.3–2.5 s for today's H100.
+    - Measured, hashing takes 13–26 s per step and the serving copies up to 22 s more. Taking
+      the transcript off PCIe and hashing it on GPUs pays now, not only after other fixes.
+    - B keeps the H100, so seconds per GPU stay comparable with PoTS (EQ14). On A the
+      comparison falls back to ratios.
+  - *Rejected: A as the primary environment.* It is the smaller port (one process, one GPU),
+    with a higher floor. It stays as the fallback.
+  - *Rejected: four independent single-GPU cells on the four-H100 machine.* No code change and
+    the same total price, but each step stays as slow as today's; it cuts only the
+    evaluation's wall time.
+  - *Rejected: staying on today's H100.* Its floor sits above both alternatives, and every
+    byte still crosses PCIe twice.
+  - **Price.**
+    - About $16 per hour on Runpod (4 × $3.99, secure cloud), and stock is thin. On
+      2026-10-20 Runpod listed no four-H100 SXM stock (three GPUs low in CA-MTL-1, two low in
+      four data centers); Lambda lists four H100 SXM at $4.09 per GPU-hour; Google Cloud's
+      `a3-highgpu-4g` has four H100 SXM (price not checked). Runpod also listed four H200 as
+      low in EUR-IS-4 and EUR-IS-5 at $5.29 per GPU-hour.
+    - The fallback's B200: none in stock on Runpod on 2026-10-20 ($7.99 per hour); Lambda
+      lists one at $6.99.
+    - The largest code change of full scale so far: about 4–7 coder-days sequential and
+      1.5–2 more to pipeline (the plan's rough guess), across the decoder, capture,
+      commitment, store, checks, loop, metrics and machine record.
+    - The split replay's bit identity is untested; nothing in the repository has run on a
+      second GPU.
+    - 2–4× today's floor GPU-seconds per step.
+  - **Implementation choices for FS32** (2026-10-20, orchestrator, at FS32's briefs, after a
+    read-only survey of the code). None changes a leaf, a root or a check.
+    - **One placement rule.** `VERIF_VERIFIER_DEVICES` lists the verifier GPUs beside
+      `VERIF_DEVICE`; unset, the run is today's, bit for bit. One function, with the declared
+      computation, gives every replay unit, weight leaf and product leaf its device, so a
+      product's leaf and the unit that consumes it always sit together and an honest step makes
+      no extra copy. FS32 is cut into the placement (FS32a), device leaves (FS32b), the split
+      replay (FS32c), capture routing (FS32d) and checks 5–6 per device (FS32e).
+    - **The embedding sits with the head on the last GPU.** A tied `W_E` is one `Parameter`,
+      shared by the lookup and the output layer, and a parameter lives on one device. With
+      both on the last GPU the verifier's model stays an unmodified `from_pretrained` model
+      (invariant 2) and the tied sum `G_E^head + G_E^emb` is formed on one device. The price:
+      `X_1` crosses once to the first layer's GPU and `δX_1` once back, `N × d` each (about
+      0.1 GB at full scale). *Rejected: untying the verifier's copy* (`lm_head` given its own
+      parameter loaded from the `W_E` leaf): it gives the same bits but modifies the model the
+      replay runs.
+    - **Capture routes each product as it is made, by a hint.** A product is named only at
+      labeling, after training, so the capture sends each output to the device of the unit
+      whose weight it last saw, and labeling moves any miss and counts it. A wrong hint costs a
+      copy, never a bit; an honest step must count none. *Rejected: labeling first, then
+      copying*: simpler, but every product would wait on GPU 0, whose memory can't hold a
+      full-scale transcript beside training, and each would cross twice.
+    - **Check 6 moves to the leaves' GPUs.** 6a's and 6b's update identity runs where the
+      layer's `W_t`, `W_{t+1}` and gradient sit. It is a new numeric path, elementwise and
+      correctly rounded, so it is expected to give the host's `ρ_max` bit for bit; FS32e tests
+      that on the GPU, and a difference stops the work rather than loosening a test.
+    - **Device leaves are hashed through a host copy until FS34.** One seam in `commitment/`
+      copies a device leaf to reused pinned buffers and hashes it with today's native path,
+      same digests and same first error; FS34 puts F23's kernel behind that seam. From FS30
+      the prover's commit hashes its device leaves with the kernel in place (FS30's routing,
+      F23's FS30 mechanism), so until FS34 the seam serves check 2 and the other verifier-side
+      hashes only.
+  - **FS33's process model: two processes** *(2026-10-21, user, on the orchestrator's
+    recommendation at FS33's planning)*. The pipelined loop runs the prover in a child process
+    that trains on GPU 0, and the verifier in the parent process on GPUs 1–3. Step `t`'s
+    transcript passes from child to parent while the child trains `t + 1`.
+    - **Why.** Python runs one thread at a time per process (the GIL), so two threads overlap
+      only work outside Python: GPU kernels, copies and the C hashing library. Both sides of a
+      step are mostly host work. Llama-3.2-1B's profile on one H100 (FS27's second run,
+      measured): a 110 s step, about 46 s on the prover's side and 64 s on the verifier's. The
+      GPU was busy 10% of the time or less in every large section; labeling (22 s) and check 2
+      (11 s) ran with it idle.
+      - Two processes bring the pipelined step toward the slower side, about 64 s.
+      - Threads land between 64 and 110 s, by the share of host work that holds the GIL. That
+        share isn't measured.
+      - Under the speed rule, two processes is never slower, apart from the hand-off.
+    - **The hand-off.** The products land on GPUs 1–3 as in FS32. The prover's process keeps
+      them, and the verifier's process opens them through CUDA's inter-process memory handles:
+      no copy. Each storage crosses once, with a table that places each leaf in it. Step data
+      and verdicts go over a pipe. At test scale the same loop shares host memory, so both
+      scales still run one code path.
+    - **Price.**
+      - A new hand-off layer between the processes.
+      - Each process opens a CUDA context on every GPU it touches, about 0.5 GB each (floor,
+        unmeasured). Qwen2.5-1.5B's 69 of 79.25 GiB per verifier GPU when pipelined still fits.
+      - A hand-off cost per step, not measured yet.
+      - A crash on either side must stop the other.
+    - *Rejected: two threads in one process.* Besides the GIL, several shared pieces aren't safe
+      across threads and would need repairs: the pinned staging pool, the single hash worker
+      both sides would share, the metrics recorder, the per-section peak resets, and the cache
+      release that empties every GPU. Two processes each keep their own.
+    - *Rejected: free-threaded Python (3.14t, no GIL).* It is slower per thread, PyTorch's
+      support for it is experimental, and it needs the same thread repairs.
+    - **Implementation choices** (orchestrator, 2026-10-21, at FS33's briefs; none changes a
+      leaf, a root or a check). The design is in `ENVIRONMENT_PLAN_DRAFT.md` ("Process model").
+      FS33 is cut into the cross-process store (FS33a), the two-process loop (FS33b), the
+      metrics (FS33c) and the pair session's parts (FS33d).
+  - **Plan.** FM10 (`IMPLEMENTATION_PLAN.md`, FS31–FS35), built in parallel with F23's FM9.
+
+- **F23 — The hash: BLAKE3 in our own GPU kernel (option c); every digest unchanged.**
+  *(2026-10-20, user, decided together with F22)*
+  - **The question.** F23 reopened F15b's device choice (R1, the CPU) and took in speed item
+    O8: where, and with which function, the transcript is hashed. The options:
+    - (a) BLAKE3 on CPU threads, F15b as built;
+    - (b) SHA-256 on the GPU through NVIDIA's cuPQC, with a chunk tree inside each large leaf;
+    - (c) BLAKE3 in a GPU kernel written for this project.
+  - **Measured.** F22's table: commit and check 2 take 13–26 s per step with F15b's native
+    path. R1 had put the step-time difference at most about 0.1 s, assuming the CPU's hashing
+    hides behind GPU work. It doesn't: the prover's commit starts after the step returns
+    (`runs/loop.py`), check 2 hashes every leaf before checks 6a and 5 start, and the pod's
+    CPUs hash at 8.4 GB/s on 8 threads.
+  - **The survey (2026-10-20).** No reusable GPU BLAKE3 library exists, so (c) is our own
+    code.
+    - Miners (Alephium's gpu-miner and others) hash short block headers only.
+    - The research ports are unmaintained: Blaze-3/BLAKE3-gpu (abandoned) and
+      itzmeanjan/blake3 (SYCL, 75–90 GB/s on a V100).
+    - The official repository's Vulkan port (PR #80) was never merged.
+    - ICICLE's BLAKE3 runs on closed GPU backends behind a licence server and hashes batches
+      of equal-size messages only.
+  - **Decision.**
+    1. A CUDA C kernel, compiled at run time through NVRTC, so the pod needs no compiler.
+       This replaces the plan's Triton-first suggestion (G1). NVRTC and the driver library are
+       called through ctypes, as `commitment/native.py` calls BLAKE3's C library: torch's
+       Linux CUDA wheels already install NVRTC (`nvidia-cuda-nvrtc-cu12`), and the driver
+       ships `libcuda`, so no Python package is added, and the Mac's venv, which can't install
+       CUDA bindings, stays the pod's requirements list. If ctypes proves unworkable on the
+       pod, `cuda-python`'s bindings take its place, pinned for Linux only (implementation
+       choice, 2026-10-20, at FS28's brief). The compiled image is cached on disk in the C
+       library's cache directory, keyed by the sources, the architecture, NVRTC's version and
+       every compile option, so a run compiles once per card type. When NVRTC rejects the
+       card's architecture, it builds PTX instead, which the driver compiles at load. A cached
+       image the driver rejects is deleted and compiled afresh once (implementation choices,
+       2026-10-20, at FS28's build).
+    2. One launch hashes a table of leaves (header bytes, device pointer, length). Each digest
+       is `BLAKE3(0x00 ‖ header ‖ payload)` over BLAKE3's full chunk tree, the digest the C
+       library gives. The finiteness check is fused into the same read, and the first error in
+       leaf order wins, as in F15b. "One launch" is one call per table: the call runs
+       `1 + ⌈log₆₄ n₀⌉` kernel launches over BLAKE3's tree levels, at most 4 for the largest
+       leaf (622 MB), and FS29's GB/s counts every one *(implementation choice, 2026-10-20, at
+       FS28's build; recorded 2026-10-21 by FM9's validation)*.
+    3. The native C library stays the reference and the CPU path: test scale, and any leaf in
+       host memory.
+    4. Where both sides hash with the kernel (B, or A under the fallback), each distinct leaf
+       shape and dtype is hashed once per run by both the kernel and the C library, and a
+       mismatch stops the run.
+  - **Open questions, settled by FM9's measurements.**
+    - **K1, speed.** The target is 300 GB/s or more on an H100. Below about 150 GB/s
+      *(hand-picked: the low end of cuPQC's estimate)* the choice returns to the user, with (b)
+      as the alternative. The estimate, step by step:
+      - H100 integer throughput: 132 SMs × 64 lanes × 1.98 GHz ≈ 17 T operations per second;
+      - BLAKE3 costs about 10–12 instructions per byte, so the ceiling is about 1.5 TB/s;
+      - 300–600 GB/s needs 20–40% of that ceiling;
+      - the V100 research port reached about 12% of its card's ceiling, which on an H100
+        would be about 180 GB/s.
+    - **K2, the leaf mix.** A step has 111k–394k leaves, mostly small attention members, each
+      opening with an 8–16-byte prefix (`0x00` and the header, `4 + 4·ndim` bytes), and leaves
+      of up to 622 MB. One launch must keep the GPU busy at both ends.
+    - **K3, correctness.** BLAKE3's published test vectors; lengths around the 64-byte block and
+      1 KiB chunk boundaries; every dtype and header size; NaN, ±Inf and −0.0 at chosen
+      positions; random leaves against the C library.
+    - **K4, today's H100 until FM10.** The prover hashes its products on the GPU, and check 2
+      on the CPU recomputes every digest, so each GPU digest is cross-checked every step.
+  - **Settled by FM9 (closed by the user 2026-10-21).** All four held; the choice of (c)
+    stands.
+    - **K1.** FS29 on one H100 SXM (2026-10-20), each model's whole step hashed as one table,
+      median of 5: Llama-3.2-1B 382 GB/s per call (48.3 GB in 0.126 s), Qwen2.5-0.5B 397,
+      Qwen2.5-1.5B 523, Falcon3-1B 596; the kernels alone 696–740 GB/s, about half of the
+      estimated 1.5 TB/s ceiling. The gate reads the slowest model's call median: pass. The
+      call's time beyond the kernels (`prepare`, the table's upload, the digests' return) is
+      not split further.
+    - **K2.** Leaves under 64 KiB (99.6–99.9% of the leaves of every model but Falcon, 33% of
+      Falcon's) hash at 160–300 GB/s per call and 530–570 GB/s in the kernels; leaves over
+      16 MiB, 79–87% of every step's bytes, at 734–750 per call and 755–760 in the kernels.
+      The only slow band is Qwen's 56–144 leaves of 64 KiB–1 MiB (77–88 GB/s per call, under
+      0.1 GB), which costs under 1 ms. Both ends keep the GPU busy enough for the target.
+    - **K3.** On an A40 (FS28, 2026-10-20) the kernel matched the C library on every planned
+      case, and a 600 MB leaf and 50,000 leaves of 32 KiB matched with their first errors; two
+      test expectations were wrong and were fixed (`81698b2`). On the H100 every kernel test
+      passed in both FS29's and FS30's sessions, with 0 digest mismatches over the four
+      models' steps.
+    - **K4.** FS30's session on one H100 SXM (2026-10-21, upload at `ff09390`): 302 CUDA tests
+      passed (2 skipped), the planted-NaN tests among them; for all four models the prover's
+      root equals the root the C library computes, with every arrival digest in use (only the
+      `δK̃` transposes made in labeling stay on the host). Prover commit 2.1–4.0 s per step,
+      against 13–26 s of commit and check 2 with F15b's native path (F22's table, another
+      pod); check 2, on the CPU until FS34, 5.0–10.1 s.
+  - **Why.** (c) keeps every digest, so the spec, S9a, `h_D`, the golden tests and test scale
+    stay as they are, and the C library remains an independent reference. It is the only
+    option that hashes where B, and A, keep the transcript without a protocol change, and it is
+    estimated faster than (b).
+  - *Rejected: (a), BLAKE3 on CPU threads.* Measured at 13–26 s per step. In B and in A it
+    would bring back the host copies those environments remove.
+  - *Rejected: (b), SHA-256 through cuPQC.* Large leaves need a chunk tree, which changes
+    every digest: S9a is revised, `h_D` and the golden digests are re-pinned, and test scale's
+    milestone runs (A11–A14, B7) rerun. It needs NVIDIA's licence, and wherever hashing stays
+    on the CPU SHA-256 runs at about 55 GB/s. It stays the alternative if K1 fails.
+  - **Price.**
+    - Self-written cryptographic code enters the protocol path. A wrong kernel shows up as a
+      digest mismatch against the C library, not as a silent soundness gap, but only where
+      something compares: check 2 on the CPU (K4), and the per-shape check (decision 4).
+    - A ctypes binding to NVRTC and the CUDA driver API, ours to maintain, as the C library's
+      binding is.
+    - NVIDIA only; an AMD port would need HIP.
+    - Its speed is unmeasured until FS29.
+  - **Plan.** FM9 (`IMPLEMENTATION_PLAN.md`, FS28–FS30), built in parallel with F22's FM10.
+  - **FS30's mechanism** *(implementation choices, 2026-10-20, at FS30's brief; ranked by
+    speed)*.
+    - On today's one-H100 path every leaf is in host memory when the prover commits: capture
+      copies each product to a pinned host buffer, and the weights are snapshotted to the
+      host. The transcript (34–70 GB) can't stay on the GPU beside training.
+    - So the prover hashes each product on the GPU as it arrives in capture, on the side
+      stream right after its host copy, with no host–GPU synchronization per product. The
+      commit takes those digests and hashes the remaining host leaves (records, `W_t`,
+      `W_{t+1}`, the `δK̃` transposes made in labeling, perturbed products) with the C
+      library. Products are 80–90% of a step's bytes (30–54 GB), so about 3.5–6.5 s of CPU
+      hashing leaves each prover step (floor, at the pod's 8.4 GB/s).
+    - A product the kernel finds non-finite gets no capture digest. The C library then meets
+      it at commit, so the error and its leaf are the CPU path's.
+    - The routing by device applies to the prover's commit only. A leaf that is a CUDA tensor
+      at commit (the sharded placement's) is hashed by the kernel in place. Check 2 and every
+      other verifier-side hash keep the C library, device leaves through a host copy, until
+      FS34, so each kernel digest is still cross-checked every step (K4) and decision 4's
+      per-shape check isn't yet needed.
+    - No new flag: routing follows where the bytes are, so a CPU run takes today's path.
+    - *Rejected:* copying the host products back to the GPU at commit (30–54 GB of
+      host-to-device copying per step, about 1.5–2.5 s), and keeping the products on the GPU
+      (doesn't fit).
