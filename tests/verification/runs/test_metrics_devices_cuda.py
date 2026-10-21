@@ -92,7 +92,7 @@ def test_per_device_peaks_see_an_allocation_on_the_second_device():
     row = next(r for r in rec.rows if r["component"] == "5")
     assert row["devices"] == [D0, D1]
     assert row["device_peak_bytes"][1] >= 256 * MIB
-    assert row["device_peak_bytes"][0] < 64 * MIB
+    assert row["device_peak_bytes"][0] - row["device_start_bytes"][0] < 64 * MIB
     assert row["peak_bytes"] == row["device_peak_bytes"][0]  # today's field: the first device
     assert row["device_wide_peak_bytes"][1] >= row["device_wide_start_bytes"][1]
     assert all("lower bound" in s for s in row["device_wide_source"])
@@ -116,15 +116,20 @@ def test_device_wide_use_sees_memory_another_process_allocated():
     proc = ctx.Process(target=_other_process, args=(there, D1, 512 * MIB))
     proc.start()
     try:
+        assert here.poll(120), "the other process never allocated"
         assert here.recv() == "ready"
         with rec.seam()("5"):
             pass
         rec.on_step(_Rec(1))
     finally:
         here.send("go")
-        here.recv()
+        if here.poll(60):  # never block on a child that died: the parent holds `there` open
+            here.recv()
         proc.join(60)
+        if proc.is_alive():
+            proc.kill()
     row = next(r for r in rec.rows if r["component"] == "5")
     assert row["device_wide_start_bytes"][1] - base >= 400 * MIB  # the other process's tensor
     assert row["device_wide_end_bytes"][1] - base >= 400 * MIB
-    assert row["device_peak_bytes"][1] < 64 * MIB  # this process's own peak does not
+    # this process's own peak does not: its rise over its start stays small
+    assert row["device_peak_bytes"][1] - row["device_start_bytes"][1] < 64 * MIB
