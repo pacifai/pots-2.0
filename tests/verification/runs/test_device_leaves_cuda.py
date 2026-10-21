@@ -138,12 +138,13 @@ def test_a_nan_in_a_device_leaf_is_the_host_paths_leaf_and_error(deterministic):
     # the leaf, both sides: a structural error (the ``[:-1]`` cut) at i + 1 still gives the
     # NaN's error and one at i - 1 the shape error, on the host path and the device path alike,
     # with the same messages
-    plain = nan_bracket(c, leaves, i, lambda b: hash_step_leaves(c, b))
+    cpu_leaves = [x.cpu() if isinstance(x, torch.Tensor) else x for x in leaves]
+    plain = nan_bracket(c, cpu_leaves, i, lambda b: hash_step_leaves(c, b))  # the host path
 
     def on_dev(b):
         hash_step_leaves(c, [x if j < c.n_s else x.to(DEV) for j, x in enumerate(b)])
 
-    dev_pair = nan_bracket(c, leaves, i, on_dev)
+    dev_pair = nan_bracket(c, cpu_leaves, i, on_dev)
     assert [str(e) for e in dev_pair] == [str(e) for e in plain]
 
 
