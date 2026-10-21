@@ -1831,6 +1831,18 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   - **The harness's row.** `handoff.empty_cache` (`loop.HANDOFF_SECTION`, prefix
     `HARNESS_PREFIX`) is a `component` row on side `run`, in no total: the `step` total sums
     the prover's and the verifier's top-level sections only.
+  - **Several devices (FS33c).** `TimeRecorder(devices=...)`, `MemoryRecorder(devices=...)`:
+    the devices one process uses. One device or none is as before, row for row (tested). With
+    several, a top-level CUDA section waits on every device (the single-device timing missed
+    work still running on the others); markers add `gpu_us_by_device`; memory rows keep
+    `peak_bytes` for the first device and add per-device lists (`device_peak_bytes`, ...) and
+    device-wide use (`mem_get_info`: every process on the card), sampled at section entry and
+    exit, so its peak is a lower bound and the per-process peak exact. The docstring has costs.
+  - **Two processes (FS33c).** The child `close_step(t) -> StepPart` (no section open); the
+    parent `merge_step(t, part)` before `on_step(t)`: one set of rows and one markers line for
+    both sides, a name in both raises. The counting pass and `trace_step` refuse (one process).
+    `step` stays work (the sum); a merged step adds the `step_wall` total, its wall extent.
+    EQ14's numbers read wall time (`step_wall`) beside GPU-seconds (`gpu_held_s`), as F22 says.
   - **Prover rows (EQ1b).**
     - P0, original training: `P0.load`, `P0.forward`, `P0.backward`, `P0.update`, emitted only
       by `plain_step` (the plain baseline, B7).
