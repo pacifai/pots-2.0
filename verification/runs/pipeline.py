@@ -118,8 +118,10 @@ step's ``close`` (the verifier's blocks are cut to the verifier's sizes) and the
 ``release`` (the prover's freed transcript blocks are cut to the prover's sizes), each in its own
 process, so the next step's allocations find the memory the other role left.
 
-**Kernels.** The child loads the hash kernels of its prover device and of every CUDA verifier
-device before step 1, outside every section, as the sequential loop does.
+**Kernels.** Before step 1, outside every section, as the sequential loop does: the child
+loads the hash kernels of its prover device and of every CUDA verifier device, and the parent
+loads the hash kernel and check 5's measuring kernel on every CUDA verifier device. The child
+never measures, so it builds no measuring kernel.
 """
 
 from __future__ import annotations

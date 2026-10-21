@@ -1917,7 +1917,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     Python: the allocator reads it at CUDA's first use. torch 2.9 prefers that name over the
     deprecated `PYTORCH_CUDA_ALLOC_CONF`, so leave the old one unset.
   - Pipelined mode (FS33b): `run_loop(c, None, D, None, verifier, ..., pipelined=True,
-    prover=spec)`, or `VERIF_PIPELINED=1`. `model` and `w0` must be `None`; `prover` is a
+    prover=spec)`, or `VERIF_PIPELINED=1`. `model` must be `None`; `w0` is optional (given,
+    the handshake checks it against the verifier's agreed `W_0`); `prover` is a
     picklable `ProverSpec` the child calls to build its `ProverSide(c, build_model, D, w0)`
     (it does its own `setup_determinism`). The parent runs `runs/pipeline.py`'s
     `run_pipelined`; `LoopResult.pipelined` and `child_info` say so. A `ProverFault` is
