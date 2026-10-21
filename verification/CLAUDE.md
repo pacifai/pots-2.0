@@ -2626,9 +2626,13 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   `card_suspect` (the card, not the peer path), and its direct cases are not tried. The report
   holds per pair `ok`, `cases`, `errors` (a case that raised, `"Type: message"`, separate from a
   case that compared wrong) and one direct `gbps`, and `all_ok`, the device names, the driver
-  and versions and the seconds. A case that raised reads `<case> raised <Type>: <msg>`; a control
-  that raised, or every case raising, reads that the check could not copy on that pair (the
-  error named), not that the peer path is wrong. Exit 0 only when `all_ok`; fewer than two CUDA
+  and versions and the seconds. A case that raised reads `<case> raised <Type>: <msg>`, a bad
+  result `<case> gave a bad result (<why>)`; one function, `nvlink_probe.peer_error_text` (standard
+  library only), makes these words for `peer_check`, `fs11_session` and the probe's `HW2` line. A
+  control that raised, or every case raising, reads that the check could not copy on that pair
+  (the error named), not that the peer path is wrong. The rate (`gbps`) times `rate_copy`
+  (`copy_into`) into one destination made and filled before the clock, so the fill is not timed.
+  Exit 0 only when `all_ok`; fewer than two CUDA
   devices is exit 1 with a reason. `main` deletes `--out` first, so a killed rerun leaves no old
   report. `check_pair` takes the copy as an argument, so the CPU tests inject a corrupting one.
   `fs11_session.peer_check_part(out)` is the part: every plan on two or more GPUs lists it first
@@ -2638,7 +2642,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   `peer_check` in `PAIR_PARTS` and fails on it, and prints `FS32 FAIL: peer copies landed wrong
   bytes on pair ...` (or the raised or could-not-copy text) first; the probe's `HW2` line says
   the same, from the probe's own run (`nvlink_probe.peer_check_pairs`), whose `card_suspect` and
-  errors reach `hw2["peer_bytes_detail"]`. `PAIR_ESTIMATE_MIN` counts the check's minute.
+  errors and `wrong` cases reach `hw2["peer_bytes_detail"]`: a pair with any wrong case is under
+  "WRONG" / "landed wrong bytes" and also names its raised cases (`to_4MB; side_stream raised
+  ...`), as `fs11_session.peer_wrong_text` does; the could-not-copy and card-suspect branches
+  keep priority. A part that ended failed or timed out with no `ok: false` pair in its report
+  says the check ended without a verdict (and how the part ended), not wrong bytes; the session
+  still stops. `PAIR_ESTIMATE_MIN` counts the check's minute.
 - `nvlink_probe.py` (FS31, F22's check HW2): `.venv/bin/python -m verification.runs.nvlink_probe
   --out nvlink.json`, on the four-H100 pod. It reads the NVLink topology (`nvidia-smi topo -m`,
   `nvidia-smi nvlink -s`, the P2P read matrix), times peer copies between every pair of cards
@@ -2647,7 +2656,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   `FS31_CARDS` GPUs (default 4), every pair is `NV18`, peer reads are `OK` for every pair, and
   every ordered pair has a finite positive copy rate and `peer_bytes_ok` (from `peer_check.check`
   run in the probe) is true for every ordered pair: a pair that is false or has no result fails
-  with a reason, and the line says the peer copies were wrong, raised or could not be checked.
+  with a reason, and the line says the peer copies were wrong, raised or could not be checked
+  (a pair with a wrong case and a raised case reads as wrong bytes and names both; the detail
+  carries `wrong`, `errors`, `card_suspect`, `all_raised`; `peer_error_text` words a raised case).
   The slowest pair's rate, by the PyTorch `copy_` timing, then gives `verdict`: `pass` at
   `PEER_COPY_PASS_GBPS` (300 GB/s) or more,
   `review` from `PEER_COPY_FAIL_GBPS` (150) up to that (the number returns to the user before

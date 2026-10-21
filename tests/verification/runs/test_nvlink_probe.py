@@ -515,7 +515,7 @@ def test_the_probes_own_check_carries_its_errors_to_hw2_and_its_line(monkeypatch
     h = r["hw2"]
     assert h["verdict"] == "fail" and h["peer_bytes_ok"]["1->0"] is False
     d = h["peer_bytes_detail"]
-    assert list(d) == ["1->0"] and set(d["1->0"]) == {"card_suspect", "errors", "all_raised"}
+    assert list(d) == ["1->0"] and set(d["1->0"]) == {"card_suspect", "errors", "wrong", "all_raised"}
     assert say in nv.hw2_line(h)
     assert any("1->0" in x for x in h["reasons"])
     if say == "RAISED":
@@ -535,3 +535,80 @@ def test_hw2_says_wrong_bytes_only_for_pairs_that_compared_wrong():
     assert "wrong bytes, or were not checked, for pair 0->1" in why
     assert "pair 2->3: copy_4MB raised RuntimeError: x" in why
     assert "2->3" not in why.split("pair 0->1")[0]
+
+
+# ---- round 6: a pair with wrong cases and raised cases says both ----------------------------
+
+MIXED = {"ok": False,
+         "cases": {"host_staged": True, "to_4MB": False, "copy_4MB": False, "side_stream": False},
+         "errors": {"side_stream": "RuntimeError: illegal memory access"},
+         "card_suspect": False}
+
+
+def _mixed_hw2(pair=MIXED):
+    topo, p2p = nv.parse_gpu_matrix(TOPO_4), nv.parse_gpu_matrix(P2P_4)
+    detail = nv.peer_bytes_detail({"0->1": pair})
+    v = nv.hw2_verdict(topo, p2p, pair_rates(4, 380.0), None, None,
+                       right_bytes(topo, ("0->1",)), detail)
+    return v
+
+
+def test_peer_bytes_detail_lists_the_cases_that_compared_wrong():
+    d = nv.peer_bytes_detail({"0->1": MIXED, "1->0": {"ok": True}})
+    assert list(d) == ["0->1"]
+    assert d["0->1"]["wrong"] == ["to_4MB", "copy_4MB"]  # not the raised case, not the control
+    assert d["0->1"]["errors"] == {"side_stream": "RuntimeError: illegal memory access"}
+    assert d["0->1"]["all_raised"] is False
+
+
+def test_a_mixed_pair_reads_as_wrong_bytes_and_names_its_raised_case_in_both_places():
+    v = _mixed_hw2()
+    why = "; ".join(v["reasons"])
+    want = "0->1 (to_4MB, copy_4MB; side_stream raised RuntimeError: illegal memory access)"
+    assert "landed wrong bytes, or were not checked, for pair " + want in why
+    line = nv.hw2_line(v)
+    assert "peer copies were WRONG (or unchecked) on pair " + want in line
+    assert "RAISED" not in line  # the pair is under WRONG, not only a raised case
+    # the pure-raised pair keeps its own wording
+    raised = _mixed_hw2(_raised())
+    assert "RAISED on pair 0->1" in nv.hw2_line(raised) and "WRONG" not in nv.hw2_line(raised)
+
+
+def test_the_priority_branches_hold_over_wrong_cases():
+    every = {"ok": False, "cases": {"host_staged": True, "to_4KB": False, "copy_4KB": False},
+             "errors": {"to_4KB": "RuntimeError: a", "copy_4KB": "RuntimeError: a"},
+             "card_suspect": False}
+    control = {"ok": False, "cases": {"host_staged": False, "to_4KB": False}, "errors": {},
+               "card_suspect": True}
+    assert "could not copy" in nv.hw2_line(_mixed_hw2(every))
+    assert "WRONG" not in nv.hw2_line(_mixed_hw2(every))
+    assert "card is suspect" in nv.hw2_line(_mixed_hw2(control))
+    assert "WRONG" not in nv.hw2_line(_mixed_hw2(control))
+
+
+def test_the_error_words_are_one_function_for_the_check_the_session_and_the_probe(tmp_path):
+    import json
+
+    from verification.runs import fs11_session as fs
+    from verification.runs import peer_check as pc
+
+    assert pc.peer_error_text is nv.peer_error_text
+    pair = {"ok": False,
+            "cases": {"host_staged": True, "to_4MB": False, "copy_4MB": False,
+                      "side_stream": False},
+            "errors": {"side_stream": "RuntimeError: illegal memory access",
+                       "copy_4MB": "BadResult: the result is on cpu, not the destination cuda:1"},
+            "card_suspect": False, "gbps": None}
+    raised = "side_stream raised RuntimeError: illegal memory access"
+    bad = "copy_4MB gave a bad result (the result is on cpu, not the destination cuda:1)"
+    f = tmp_path / "pc.json"
+    f.write_text(json.dumps({"all_ok": False, "seconds": 1.0, "pairs": {"0->1": pair}}))
+    texts = {
+        "check": " ".join(pc.pair_lines("0->1", pair)),
+        "session": fs.peer_wrong_text(fs._peer_check_extras(f)["peer_check"]),
+        "probe line": nv.hw2_line(_mixed_hw2(pair)),
+        "probe reason": "; ".join(_mixed_hw2(pair)["reasons"]),
+    }
+    for who, text in texts.items():
+        assert raised in text and bad in text, who
+        assert "BadResult" not in text, who

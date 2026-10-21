@@ -17,10 +17,12 @@ and that every ordered pair's direct copies land the right bytes (``peer_bytes_o
 ``peer_check``, run here on the same cards; on the FS32 two-A40 session every direct copy left wrong
 bytes though the peer reads said ``OK``, so a rate over a wrong copy is no rate). A pair with no
 byte result counts as wrong. ``hw2["peer_bytes_detail"]`` says, for each pair that was not right,
-whether the host-staged control was wrong (``card_suspect``), which cases raised (``errors``)
-and whether the check could not copy at all (``all_raised``), and the reason in ``reasons`` and
-the report line says so: wrong bytes, a case that raised, or a check that could not copy and so
-says nothing of the peer path.
+whether the host-staged control was wrong (``card_suspect``), which cases raised (``errors``),
+which compared wrong (``wrong``) and whether the check could not copy at all (``all_raised``),
+and the reason in ``reasons`` and the report line says so: wrong bytes (a pair with any wrong case
+is under "WRONG" and also names its raised cases), a case that raised, or a check that could not
+copy and so says nothing of the peer path. :func:`peer_error_text` words a raised case, for every
+reader of the check.
 The slowest pair's rate, by the PyTorch copy timing, sets its ``verdict``: ``pass`` at
 :data:`PEER_COPY_PASS_GBPS` or more, ``review`` from :data:`PEER_COPY_FAIL_GBPS` up to that (the
 number returns to the user before the port relies on it), ``fail`` below it or on any other
@@ -47,7 +49,7 @@ from typing import Any
 __all__ = ["PEER_COPY_PASS_GBPS", "PEER_COPY_FAIL_GBPS", "GATE_CARDS", "COMMANDS", "expected_cards",
            "hw2_line", "run_command", "parse_gpu_matrix", "hw2_verdict",
            "peer_copy_bandwidth", "peer_check_pairs", "peer_bytes_by_pair", "peer_bytes_detail",
-           "fanout_bandwidth", "pinned_bandwidth",
+           "peer_error_text", "fanout_bandwidth", "pinned_bandwidth",
            "torch_view", "build_report", "main"]
 
 VERSION = 1
@@ -167,30 +169,52 @@ def _command_failure(rec: Mapping[str, Any]) -> str | None:
     return f"{' '.join(rec['argv'])} failed: {rec.get('error') or 'no result'}"
 
 
+def peer_error_text(case: str, err: str) -> str:
+    """The words for a peer-check case that raised, from its recorded ``"Type: message"``:
+    ``<case> raised <Type>: <msg>``; a bad result (``BadResult``: the result is on the wrong
+    device or of the wrong shape or dtype) says ``<case> gave a bad result (<why>)``. The one place
+    these words are made: ``peer_check``, ``fs11_session`` and the probe's HW2 line use it. It is
+    standard library only, so the session module can import it on a bare ``python3``."""
+    if err.startswith("BadResult: "):
+        return f"{case} gave a bad result ({err.split(': ', 1)[1]})"
+    return f"{case} raised {err}"
+
+
+def _wrong_account(k: str, d: Mapping[str, Any]) -> str:
+    """A pair that landed wrong bytes: ``k`` alone with no detail, else ``k (<cases that compared
+    wrong>; <each case that raised, in words>)``, so a raised case never hides wrong bytes."""
+    wrong = list(d.get("wrong") or ())
+    errs = [peer_error_text(c, e) for c, e in (d.get("errors") or {}).items()]
+    return f"{k} ({'; '.join([', '.join(wrong), *errs])})" if wrong and errs else (
+        f"{k} ({', '.join(wrong)})" if wrong else k)
+
+
 def _peer_bytes_reason(wrong: Sequence[str], detail: Mapping[str, Mapping[str, Any]]) -> str:
-    """The reason for pairs whose copies were not right. A pair whose cases only compared wrong,
-    or that has no detail, landed wrong bytes or was not checked; one whose control raised, or
-    whose every case raised, is a check that could not copy (the peer path is not judged); one
-    whose control compared wrong is the card; a case that raised is named with its error."""
+    """The reason for pairs whose copies were not right. A control that raised, or every case
+    raising, is a check that could not copy (the peer path is not judged); a control that compared
+    wrong is the card. Any other pair with a case that compared wrong, or with no detail, landed
+    wrong bytes or was not checked, and also names the cases that raised (``to_4MB; side_stream
+    raised ...``); a pair with only raised cases names each with its error."""
     plain: list[str] = []
     other: list[str] = []
     for k in wrong:
         d = detail.get(k) or {}
         errors = d.get("errors") or {}
         if "host_staged" in errors:
-            other.append(f"pair {k}: the check could not copy, the host-staged control raised "
-                         f"{errors['host_staged']}")
+            other.append(f"pair {k}: the check could not copy, the host-staged control failed: "
+                         f"{peer_error_text('host_staged', errors['host_staged'])}")
         elif d.get("card_suspect"):
             other.append(f"pair {k}: the host-staged control was wrong, the card itself is "
                          f"suspect, not the peer path")
         elif errors and d.get("all_raised"):
             case, err = next(iter(errors.items()))
-            other.append(f"pair {k}: the check could not copy, every case raised ({case} raised "
-                         f"{err})")
-        elif errors:
-            other.append(f"pair {k}: " + "; ".join(f"{c} raised {e}" for c, e in errors.items()))
+            other.append(f"pair {k}: the check could not copy, every case raised "
+                         f"({peer_error_text(case, err)})")
+        elif errors and not d.get("wrong"):
+            other.append(f"pair {k}: " + "; ".join(peer_error_text(c, e)
+                                                   for c, e in errors.items()))
         else:
-            plain.append(k)
+            plain.append(_wrong_account(k, d))
     head = ["peer copies landed wrong bytes, or were not checked, for pair "
             + ", ".join(plain[:6])] if plain else []
     return "; ".join(head + other[:6])
@@ -339,12 +363,13 @@ def hw2_line(hw2: Mapping[str, Any]) -> str:
     cannot = [k for k in wrong if (detail.get(k) or {}).get("all_raised")
               or "host_staged" in ((detail.get(k) or {}).get("errors") or {})]
     card = [k for k in wrong if k not in cannot and (detail.get(k) or {}).get("card_suspect")]
-    raised = [k for k in wrong if k not in cannot + card and (detail.get(k) or {}).get("errors")]
+    raised = [k for k in wrong if k not in cannot + card and (detail.get(k) or {}).get("errors")
+              and not (detail.get(k) or {}).get("wrong")]
     wrong = [k for k in wrong if k not in cannot + card + raised]
     said = []  # said first and plainly: a rate over copies that landed wrong bytes means nothing
-    if wrong:
+    if wrong:  # a pair with a wrong case is here even when other cases raised: it names both
         said.append(f"peer copies were WRONG (or unchecked) on pair{'s' * (len(wrong) > 1)} "
-                    f"{', '.join(wrong)}")
+                    f"{', '.join(_wrong_account(k, detail.get(k) or {}) for k in wrong)}")
     if raised:
         said.append(f"a peer-copy case RAISED on pair{'s' * (len(raised) > 1)} "
                     f"{', '.join(raised)}")
@@ -565,8 +590,9 @@ def peer_bytes_by_pair(pairs: Mapping[str, Mapping[str, Any]] | None = None) -> 
 
 def peer_bytes_detail(pairs: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
     """For each pair that was not right: ``card_suspect`` (its control compared wrong),
-    ``errors`` (the cases that raised, to their ``"Type: message"``) and ``all_raised`` (the
-    control raised, or every direct case did: the check could not copy there)."""
+    ``errors`` (the cases that raised, to their ``"Type: message"``), ``wrong`` (the cases that
+    compared wrong, not raised) and ``all_raised`` (the control raised, or every direct case did:
+    the check could not copy there)."""
     out = {}
     for k, p in pairs.items():
         if p.get("ok"):
@@ -576,6 +602,7 @@ def peer_bytes_detail(pairs: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[
         direct = [c for c in cases if c != "host_staged"]
         out[k] = {"card_suspect": bool(p.get("card_suspect")) and "host_staged" not in errors,
                   "errors": errors,
+                  "wrong": [c for c, ok in cases.items() if not ok and c not in errors],
                   "all_raised": bool(direct) and all(c in errors for c in direct)}
     return out
 

@@ -482,7 +482,33 @@ def test_the_gate_line_and_the_stop_say_what_the_extras_say(tmp_path):
     assert "wrong bytes" not in stop
 
 
-# ---- the module imports no torch ---------------------------------------------------------------
+def test_the_rate_loop_times_copies_into_one_destination_filled_before_the_clock(monkeypatch):
+    fills, seen = [], []
+    real = pc._filled
+
+    def counting(*a, **k):
+        fills.append(1)
+        return real(*a, **k)
+
+    def timed(dst, src):
+        seen.append((len(fills), dst.data_ptr()))  # fills so far, and which destination
+        dst.copy_(src)
+
+    monkeypatch.setattr(pc, "_filled", counting)
+    monkeypatch.setattr(pc, "RATE_REPS", 4)
+    r = pc.check_pair(CPU, CPU, copy_right, lambda s, d: s.clone(), rate_copy=timed)
+    assert r["ok"] and r["gbps"] and r["gbps"] > 0
+    assert len(seen) == 5  # a warm-up and four timed copies
+    assert len({n for n, _ in seen}) == 1  # no fill between the first timed copy and the last
+    assert len({ptr for _, ptr in seen}) == 1  # one destination for all of them
+    assert seen[0][0] >= 1  # and it was made and filled before the loop
+
+
+def test_the_default_rate_copy_writes_the_destination():
+    src = torch.arange(8, dtype=torch.int32)
+    dst = pc._filled((8,), torch.int32, CPU)
+    pc.copy_into(dst, src)
+    assert torch.equal(dst, src)
 
 
 # ---- the real check, where two CUDA devices exist -------------------------------------------
@@ -500,3 +526,19 @@ def test_the_real_check_on_this_machines_cards(tmp_path):
     for p in doc["pairs"].values():
         assert p["cases"]["host_staged"] is True  # a card whose control fails is not a test result
 
+
+def test_a_failed_part_whose_report_names_no_wrong_pair_ended_without_a_verdict(tmp_path):
+    f = tmp_path / "pc.json"
+    f.write_text(json.dumps({"all_ok": False, "seconds": 1.0, "pairs": {
+        "0->1": {"ok": True, "cases": {"host_staged": True}, "errors": {}}}}))
+    check = fs._peer_check_extras(f)["peer_check"]
+    text = fs.peer_wrong_text(check, "timeout")
+    assert "ended without a verdict" in text and "timeout" in text
+    assert "wrong bytes" not in text and "none named" not in text
+    stop = fs.peer_check_stop({"status": "failed", "extras": {"peer_check": check}})
+    assert "ended without a verdict" in stop and "the part ended failed" in stop
+    assert "wrong bytes" not in stop and "no later part ran" in stop  # the session still stops
+    # a pair that is wrong keeps its own words, and a done part with all_ok does not stop
+    assert fs.peer_check_stop({"status": "ok", "extras": {"peer_check": {"all_ok": True}}}) is None
+    # a report that left nothing: its own sentence
+    assert "left no report" in fs.peer_wrong_text(None, "failed")

@@ -1146,9 +1146,13 @@ wrong shape or dtype, fails. On the first two-A40 session every direct copy left
 though the peer-access flags said OK, and every two-GPU result was noise. A failed pair stops
 the session at once: every later part is `not_started` with the pairs named, and the job log
 says `peer copies landed wrong bytes on pair ...`; a case that raised says `<case> raised
-<Type>: <msg>`, and a control that raised (or every case raising) says the check could not copy
-on that pair. A card whose host-staged control is wrong is reported as the card, not the peer
-path. The probe's `hw2` also records `peer_bytes_ok` per pair, with `peer_bytes_detail` for the
+<Type>: <msg>` (a bad result, `<case> gave a bad result (<why>)`; the same words in the session's
+and the probe's lines), and a control that raised (or every case raising) says the check could not
+copy on that pair. A pair with wrong cases and a raised case reads as wrong bytes and names both.
+A part that failed or timed out with no wrong pair in its report says it ended without a verdict.
+The rate is of copies into one destination filled before the clock.
+A card whose host-staged control is wrong is reported as the card, not the peer path.
+The probe's `hw2` also records `peer_bytes_ok` per pair, with `peer_bytes_detail` for the
 failed ones. A rerun deletes the old report first. `fs11_session` imports no torch or numpy (the
 upload check imports the native-build module only when it runs), so the self-test runs on a bare
 `python3`.

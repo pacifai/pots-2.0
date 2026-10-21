@@ -37,9 +37,10 @@ nor fake one. Both devices are synchronized before each comparison. A case that 
 with its error in ``errors``, and the report says it raised, not that the bytes were wrong.
 
 The report (``--out``) holds, per pair ``"i->j"``, ``{"ok", "cases": {case: bool}, "gbps",
-"errors", "card_suspect"}`` (``gbps``: the direct 256 MB ``copy_`` rate, one number;
-``nvlink_probe`` owns the real bandwidth measurement), ``all_ok``, the device names, the driver,
-torch and CUDA versions, and the seconds taken. ``--out`` is deleted first, so a killed rerun
+"errors", "card_suspect"}`` (``gbps``: the direct 256 MB ``copy_`` rate into one pre-filled
+destination, the fill outside the timing, one number; ``nvlink_probe`` owns the real bandwidth
+measurement), ``all_ok``, the device names, the driver, torch and CUDA versions, and the seconds
+taken. ``--out`` is deleted first, so a killed rerun
 leaves no old report. Exit 0 when every pair is right, 1 otherwise (and on fewer than two CUDA
 devices), with one line per wrong pair naming its cases. The comparison logic
 (:func:`check_pair`, :func:`check`) takes the copy as an argument, so a CPU test can inject a
@@ -58,6 +59,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+from verification.runs.nvlink_probe import peer_error_text  # stdlib only, no cycle
 
 __all__ = ["SIZES", "CONTIGUOUS_CASES", "EXTRA_CASES", "case_name", "cuda_copy", "host_staged",
            "check_pair", "check", "pair_lines", "report_lines", "main"]
@@ -81,10 +84,10 @@ SHAPE_3D = (16, 256, 256)  # fp32, 4 MB
 FILL = 0xFF  # the byte every destination holds before a copy
 RATE_REPS = 3
 HOST_STAGED = "host_staged"
-BAD_RESULT = "BadResult"  # the error type of a result on the wrong device, shape or dtype
 
 Copy = Callable[[str, torch.Tensor, Any], torch.Tensor]  # (kind, source, destination device)
 Control = Callable[[torch.Tensor, Any], torch.Tensor]  # (source, destination device)
+RateCopy = Callable[[torch.Tensor, torch.Tensor], Any]  # (destination, source): one timed copy
 
 
 class BadResult(Exception):
@@ -141,6 +144,11 @@ def cuda_copy(kind: str, src: torch.Tensor, dst_device: Any) -> torch.Tensor:
     raise ValueError(f"unknown copy kind {kind!r}")
 
 
+def copy_into(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """One timed copy of the rate loop: ``src`` into a destination made before the clock."""
+    dst.copy_(src)
+
+
 def _bytes(x: torch.Tensor) -> torch.Tensor:
     return x.detach().cpu().contiguous().view(torch.uint8)  # contiguous: the logical order
 
@@ -175,15 +183,17 @@ def _expect(got: torch.Tensor, want: torch.Tensor, dst: torch.device) -> None:
 
 
 def check_pair(src_device: Any, dst_device: Any, copy: Copy = cuda_copy,
-               control: Control = host_staged, sync: Callable[[], None] | None = None
-               ) -> dict[str, Any]:
+               control: Control = host_staged, sync: Callable[[], None] | None = None,
+               rate_copy: RateCopy = copy_into) -> dict[str, Any]:
     """Every case for one ordered pair: ``{"ok", "cases", "gbps", "errors", "card_suspect"}``. A
     case is true when the result is on the destination with the source's shape and dtype and its
     bytes equal the source's, read back to host memory (in the source's logical order). A case
     that raises, or whose result is on the wrong device or of the wrong shape or dtype, is false,
     its error (``"Type: message"``) in ``errors``. When the control fails, ``card_suspect`` is
-    true and the direct cases are not run. ``gbps`` is the rate of repeated 256 MB ``copy_``
-    (``None`` when a case failed, or the rate is not timed). Each case draws its own source."""
+    true and the direct cases are not run. ``gbps`` is the rate of repeated 256 MB copies
+    (``rate_copy``) into one destination made and filled before the clock starts, so only the
+    copies are timed (``None`` when a case failed, or the rate is not timed). Each case draws its
+    own source."""
     src_d, dst_d = _device(src_device), _device(dst_device)
     sync = sync or (lambda: _sync([src_d, dst_d]))
     cases: dict[str, bool] = {}
@@ -240,11 +250,13 @@ def check_pair(src_device: Any, dst_device: Any, copy: Copy = cuda_copy,
     gbps = None
     if big is not None and all(cases.values()):
         try:
-            copy("copy_", big, dst_d)  # warm up
+            # one destination, made and filled before the clock: only the copies are timed
+            dst = _filled(big.shape, big.dtype, dst_d)
+            rate_copy(dst, big)  # warm up
             sync()
             t0 = time.perf_counter()
             for _ in range(RATE_REPS):
-                copy("copy_", big, dst_d)
+                rate_copy(dst, big)
             sync()
             gbps = RATE_REPS * big.numel() * big.element_size() / (time.perf_counter() - t0) / 1e9
         except Exception as e:  # noqa: BLE001
@@ -254,7 +266,8 @@ def check_pair(src_device: Any, dst_device: Any, copy: Copy = cuda_copy,
 
 
 def check(devices: Sequence[Any], copy: Copy = cuda_copy, control: Control = host_staged,
-          sync: Callable[[], None] | None = None) -> dict[str, Any]:
+          sync: Callable[[], None] | None = None, rate_copy: RateCopy = copy_into
+          ) -> dict[str, Any]:
     """:func:`check_pair` for every ordered pair of ``devices`` (``"i->j"``, ``i`` and ``j`` the
     positions in ``devices``, which for CUDA are the device indices). ``all_ok`` is true only for
     at least one pair and every pair right."""
@@ -265,18 +278,11 @@ def check(devices: Sequence[Any], copy: Copy = cuda_copy, control: Control = hos
         for i, a in enumerate(devices):
             for j, b in enumerate(devices):
                 if i != j:
-                    pairs[f"{i}->{j}"] = check_pair(a, b, copy, control, sync)
+                    pairs[f"{i}->{j}"] = check_pair(a, b, copy, control, sync, rate_copy)
     finally:
         _SIDE.clear()
     return {"all_ok": bool(pairs) and all(p["ok"] for p in pairs.values()), "pairs": pairs,
             "seconds": round(time.perf_counter() - t0, 2)}
-
-
-def _error_text(case: str, err: str) -> str:
-    """``<case> raised <Type>: <msg>``; a bad result says what was wrong with it."""
-    if err.startswith(f"{BAD_RESULT}: "):
-        return f"{case} gave a bad result ({err.split(': ', 1)[1]})"
-    return f"{case} raised {err}"
 
 
 def pair_lines(key: str, p: Mapping[str, Any]) -> list[str]:
@@ -292,7 +298,7 @@ def pair_lines(key: str, p: Mapping[str, Any]) -> list[str]:
     head = f"peer check FAIL: pair {key}: "
     if HOST_STAGED in errors:
         return [head + "the check could not copy on this pair, the host-staged control failed: "
-                + _error_text(HOST_STAGED, errors[HOST_STAGED])]
+                + peer_error_text(HOST_STAGED, errors[HOST_STAGED])]
     if p.get("card_suspect"):
         return [head + "the host-staged control is wrong, so the card itself is suspect, not "
                 "the peer path"]
@@ -300,12 +306,12 @@ def pair_lines(key: str, p: Mapping[str, Any]) -> list[str]:
     raised = [c for c in direct if c in errors]
     if direct and len(raised) == len(direct):
         return [head + f"the check could not copy on this pair, every case raised "
-                f"(first: {_error_text(raised[0], errors[raised[0]])})"]
+                f"(first: {peer_error_text(raised[0], errors[raised[0]])})"]
     wrong = [c for c in direct if not cases[c] and c not in errors]
     bits = []
     if wrong:
         bits.append(f"wrong bytes in {', '.join(wrong)}")
-    bits += [_error_text(c, errors[c]) for c in raised]
+    bits += [peer_error_text(c, errors[c]) for c in raised]
     return [head + ("; ".join(bits) or "no case ran")]
 
 

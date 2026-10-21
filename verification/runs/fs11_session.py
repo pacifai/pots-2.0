@@ -462,16 +462,18 @@ def _peer_check_extras(report: Path) -> dict[str, Any]:
 
 
 def _peer_error(case: str, err: str) -> str:
-    if err.startswith("BadResult: "):
-        return f"{case} gave a bad result ({err.split(': ', 1)[1]})"
-    return f"{case} raised {err}"
+    from verification.runs.nvlink_probe import peer_error_text  # stdlib only, off module level
+
+    return peer_error_text(case, err)
 
 
-def peer_wrong_text(check: Mapping[str, Any] | None) -> str:
+def peer_wrong_text(check: Mapping[str, Any] | None,
+                    status: str | None = None) -> str:
     """The plain-words account of a failed check (from :func:`_peer_check_extras`), each pair as
     its own fault: wrong bytes (the cases), a case that raised (its error), the check unable to
     copy at all (the control or every case raised: the error, and no verdict on the peer path),
-    or the control wrong (the card itself is suspect)."""
+    or the control wrong (the card itself is suspect). A report that names no wrong pair says the
+    check ended without a verdict (and, given the part's ``status``, how the part ended)."""
     if check is None:
         return "the peer-copy byte check left no report"
     if check.get("reason") and not check.get("wrong"):
@@ -494,7 +496,11 @@ def peer_wrong_text(check: Mapping[str, Any] | None) -> str:
         else:
             other.append(f"pair {k}: " + ("; ".join(errs) or "no case ran"))
     head = ["peer copies landed wrong bytes on pair " + "; ".join(bytes_bits)] if bytes_bits else []
-    return "; ".join(head + other) or "peer copies landed wrong bytes on pair (none named)"
+    if head or other:
+        return "; ".join(head + other)
+    ended = f"the part ended {status}, and " if status else ""
+    return (f"the peer-copy byte check ended without a verdict ({ended}its report names no "
+            f"wrong pair)")
 
 
 def peer_check_stop(rec: Mapping[str, Any]) -> str | None:
@@ -503,8 +509,8 @@ def peer_check_stop(rec: Mapping[str, Any]) -> str | None:
     check = (rec.get("extras") or {}).get("peer_check")
     if rec["status"] in _PEER_DONE and check and check.get("all_ok"):
         return None
-    why = peer_wrong_text(check)
-    if rec["status"] not in _PEER_DONE:
+    why = peer_wrong_text(check, None if rec["status"] in _PEER_DONE else rec["status"])
+    if rec["status"] not in _PEER_DONE and "ended without a verdict" not in why:
         why += f" (the part ended {rec['status']})"
     return f"{why}; no later part ran, a rate or result over wrong copies means nothing"
 
