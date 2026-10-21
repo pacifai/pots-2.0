@@ -446,10 +446,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     models = ReusedModel(c.build_model)
     w0 = snapshot_weights(c, models())
     final = honest_final(c, D, w0, T, seed=cfg.seed, build_model=models)
-    # every reference up front: the model is dropped before a pipelined run (FS33d)
-    count_final = (final if COUNT_STEPS == T else
-                   honest_final(c, D, w0, COUNT_STEPS, seed=cfg.seed, build_model=models)
-                   ) if use_metrics else None
     print(f"C1 calibration: {cfg.model}@{cfg.model_revision[:12]}, n_s {c.n_s}, n {c.n}, "
           f"η {c.eta:g}, k {k}, calibration steps 1–{T}, judged run T {cfg.steps}, |D| {len(D)}, "
           f"h_D {h_D.hex()[:16]}…, M {c.M}")
@@ -461,6 +457,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                  if f.name not in ("output_dir", "metrics", "release_cache", "trace_step",
                                    "trace_c5", "pipelined")}, "llama": llama}
     pl, spec = loop_mode(cfg)
+    # Pipelined: the counting pass's reference comes before the model is dropped (FS33d).
+    # Sequential computes it at the end, after the gates, as before.
+    count_final = (final if COUNT_STEPS == T else
+                   honest_final(c, D, w0, COUNT_STEPS, seed=cfg.seed, build_model=models)
+                   ) if pl and use_metrics else None
     base = dict(T=T, k=k, seed=cfg.seed, h_D=h_D, final=final, build_model=models,
                 pipelined=pl, prover=spec)
     mw = (MetricsWriter(run_dir, RUN_NAME, device=cfg.device, model=cfg.model,

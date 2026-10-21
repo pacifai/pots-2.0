@@ -637,12 +637,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     keep = (KeptStepHandoff(run_dir / TRANSCRIPTS_DIR, keep_step)
             if 1 <= keep_step <= T else None)
-    # Every reference this entry point needs, before the model is dropped (FS33d): the memory
-    # pass's, and the counting pass's, which runs sequentially and rebuilds the model.
-    final_at(S)
-    if use_metrics:
-        final_at(COUNT_STEPS)
     pl, spec = loop_mode(cfg)
+    # Pipelined: the metrics passes' references (the memory pass's, and the counting pass's, which
+    # runs sequentially and rebuilds the model) come before the model is dropped (FS33d). A
+    # sequential run computes each where it is used, as before.
+    if pl and use_metrics:
+        final_at(S)
+        final_at(COUNT_STEPS)
     if pl:
         models.drop()  # the prover is the child's: no second model on the parent's GPU 0
     mem_rows = None

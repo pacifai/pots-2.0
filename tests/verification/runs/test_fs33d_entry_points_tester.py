@@ -28,7 +28,7 @@ from verification.computation.interface import snapshot_weights
 from verification.runs import cheats, pipeline, prover_spec
 from verification.runs import flipped_matmul_sweep as fs
 from verification.runs import run_verified as rv
-from verification.runs.hidden_steps import run_hidden
+from verification.runs.hidden_steps import CHAIN_STEP, run_hidden
 from verification.runs.pipeline import ProverProcessError
 from verification.runs.poisoned_step import run_poisoned
 from verification.runs.scenarios import HONEST, ReusedModel, run_scenario
@@ -67,10 +67,6 @@ def test_sequential_run_verified_prints_one_sequential_line_with_metrics(
     assert out.count("loop mode:") == 1 and out.count("loop mode: sequential") == 1
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: run_verified.main calls final_at(S) "
-                   "unconditionally; a sequential --no-metrics run with S < T now trains an "
-                   "extra S-step honest reference it never uses (the sequential path changed). "
-                   "Fix: `if pl or use_metrics: final_at(S)` (count one only if use_metrics).")
 def test_sequential_no_metrics_run_computes_only_its_own_reference(
         tiny_main, monkeypatch, capsys):  # noqa: F811
     calls = []
@@ -126,7 +122,29 @@ def test_calibrate_band_file_bytes_with_metrics_off(tiny_main, tiny_spec, monkey
     assert len(got["0"]) > 100 and got["0"] == got["1"]
 
 
-def test_llama_step_pipelined_equals_sequential(tiny_main, tiny_spec, monkeypatch, capsys):  # noqa: F811
+def test_sequential_calibration_stopped_at_a_gate_computes_no_counting_reference(
+        tiny_main, tiny_spec, monkeypatch):  # noqa: F811
+    """The sequential path keeps its old order: the counting pass's reference is made after the
+    gates, so a run that stops at one never pays for it (pipelined makes it before the drop)."""
+    from verification.runs import calibrate as cal
+
+    monkeypatch.setattr(cal, "setup_determinism", lambda cfg: torch.manual_seed(cfg.seed))
+    steps = []
+    real = cal.honest_final
+    monkeypatch.setattr(cal, "honest_final", lambda *a, **k: steps.append(a[3]) or real(*a, **k))
+    seen = {}
+    monkeypatch.setattr(cal, "_run", lambda *a, **k: seen.update(k) or 2)  # a gate stops it
+    monkeypatch.setenv("VERIF_PIPELINED", "0")
+    assert cal.main(["--steps", "2", "--metrics"]) == 2
+    assert steps == [2] and seen["count_final"] is None
+    steps.clear()
+    monkeypatch.setenv("VERIF_PIPELINED", "1")
+    assert cal.main(["--steps", "2", "--metrics"]) == 2
+    assert steps == [2, cal.COUNT_STEPS] and seen["count_final"] is not None
+
+
+def test_llama_step_pipelined_equals_sequential(
+        tiny_main, tiny_spec, monkeypatch, capsys):  # noqa: F811
     from verification.runs import llama_step
 
     _, _, root = tiny_main
@@ -142,7 +160,7 @@ def test_llama_step_pipelined_equals_sequential(tiny_main, tiny_spec, monkeypatc
         outs[mode] = [ln for ln in out.splitlines()
                       if "loop mode" not in ln and " s (" not in ln and "RSS" not in ln
                       and "run checks" not in ln and "metrics:" not in ln
-                      and not ln.startswith(" ")]  # the stats tables vary run to run (below)
+                      and not (ln.startswith("   ") and "|" in ln)]  # the wall-clock step rows
     assert len(outs["0"]) >= 3 and outs["0"] == outs["1"]
 
 
@@ -177,7 +195,8 @@ def test_spec_env_has_every_verif_variable_and_no_secret(monkeypatch):
     assert env["POTS_NATIVE_CACHE"] == "/cache"
 
 
-def test_a_child_on_other_data_fails_at_the_handshake(tiny_main, monkeypatch, tmp_path):  # noqa: F811
+def test_a_child_on_other_data_fails_at_the_handshake(
+        tiny_main, monkeypatch, tmp_path):  # noqa: F811
     c, D, root = tiny_main
     other = tmp_path / "other"
     (other / "data").mkdir(parents=True)
@@ -239,15 +258,10 @@ def test_cheats_run_with_no_parent_model_and_no_rebuild(tmp_path, monkeypatch, w
     assert alive and not any(alive) and finals == []
 
 
-@pytest.mark.xfail(strict=True, reason="DEFECT: full_scale.run_cheats(hidden=True) calls "
-                   "env.prepare(env.poison_step) but run_hidden needs env.final(CHAIN_STEP=2); "
-                   "unless poison_step == 2 the reference is computed after the drop, rebuilding "
-                   "the parent's model, which then stays alive through the pipelined run. "
-                   "Fix: env.prepare(CHAIN_STEP if hidden else env.poison_step).")
 def test_full_scales_hidden_stage_prepares_the_hidden_steps_reference(tmp_path, monkeypatch):
     env, models = _reused_env(tmp_path, pipelined=True)
     assert env.poison_step != 2
-    env.prepare(env.poison_step)  # exactly what run_cheats does, hidden or not
+    env.prepare(CHAIN_STEP)  # what run_cheats(hidden=True) prepares
     alive, _ = _spy_model_alive(monkeypatch, models)
     run_hidden(env, out=lambda s: None)
     assert alive and not any(alive)

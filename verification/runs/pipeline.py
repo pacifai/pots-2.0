@@ -99,8 +99,9 @@ no package has crossed, so terminating it while it builds its model is safe.
 
 **Refusals** (``ValueError``, before the child starts): a CUDA prover device with an unsharded
 placement (an unsharded run's leaves live on the host, so every step's whole transcript would be
-copied through one shared-memory buffer); a ``handoff`` other than ``IN_MEMORY``; a recorder
-that cannot split a step (the counting recorder, a traced ``TimeRecorder``); a missing
+copied through one shared-memory buffer); a ``handoff`` that is neither ``IN_MEMORY`` nor a
+``KeptStepHandoff``; a recorder that cannot split a step (the counting recorder, a traced
+``TimeRecorder``); a missing
 :class:`ProverSpec`; a model given to the parent; and :class:`~verification.runs.scenarios.
 KeepStep`, which keeps a step's output in the child's memory.
 

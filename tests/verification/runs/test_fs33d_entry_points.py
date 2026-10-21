@@ -87,7 +87,8 @@ def test_spec_in_a_spawned_child_has_the_parents_w0_on_smollm2(monkeypatch):
     import os
     from pathlib import Path
 
-    data = Path(os.environ.get("VERIF_OUTPUT_DIR", "trainer_output/verification")) / "data" / "D.bin"
+    out = os.environ.get("VERIF_OUTPUT_DIR", "trainer_output/verification")
+    data = Path(out) / "data" / "D.bin"
     if not data.exists():
         pytest.skip(f"no committed dataset at {data}")
     cfg = load_config()
@@ -225,7 +226,8 @@ def test_cheats_pipelined_equal_sequential(tmp_path, monkeypatch):
     hs, hp = [], []
     rs = run_hidden(seq_env, out=hs.append)
     rp = run_hidden(pip_env, out=hp.append)
-    assert (rp.passed, rp.outcome, rp.actual) == (rs.passed, rs.outcome, rs.actual) and _untimed(hp) == _untimed(hs)
+    assert (rp.passed, rp.outcome, rp.actual) == (rs.passed, rs.outcome, rs.actual)
+    assert _untimed(hp) == _untimed(hs)
 
 
 def test_flip_pipelined_equals_sequential(tmp_path):
@@ -280,7 +282,8 @@ def test_other_entry_points_refuse_pipelined_with_one_line(mod, monkeypatch, cap
     with pytest.raises(SystemExit) as e:
         mod.main([])
     msg = str(e.value.code)
-    assert msg.startswith(f"{mod.__name__.rsplit('.', 1)[1]}") or "VERIF_PIPELINED=1 is refused" in msg
+    assert (msg.startswith(f"{mod.__name__.rsplit('.', 1)[1]}")
+            or "VERIF_PIPELINED=1 is refused" in msg)
     assert "VERIF_PIPELINED=1 is refused" in msg and "\n" not in msg
 
 

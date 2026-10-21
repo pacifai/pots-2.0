@@ -14,8 +14,12 @@ configuration, and the handshake could only refuse it (or, for a knob the finger
 hold, not even that). So :func:`decoder_spec` captures, in the parent, every variable
 ``load_config`` and ``load_protocol_config`` read (every ``VERIF_*``) and ``POTS_NATIVE_CACHE``
 (``commitment/native.py``) as a plain ``dict`` of strings, checks that ``load_config`` on it
-gives back ``cfg``, and the child loads its config from that dict alone. Nothing else of the
-parent's environment is passed on purpose: no token, no key, no path the config doesn't name.
+gives back ``cfg``, and the child loads its config from that dict alone.
+The dict holds no secret: only
+``VERIF_*`` names and ``POTS_NATIVE_CACHE``. It is not the whole of what the child sees, though: a
+spawned child inherits the parent's entire ``os.environ``. Secrets stay out of the child only
+because the session strips them from the parent's environment (``fs11_session.base_env``), not
+because the spec leaves them out.
 """
 
 from __future__ import annotations

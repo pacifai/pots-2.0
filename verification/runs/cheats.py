@@ -180,9 +180,10 @@ def load_level(cfg: RunConfig, data_dir: Path, *, c: DecoderComputation, D: Sequ
     ``h_D_tilde``, and the poisoned step from its ``poisoning.step``. ``meta.json`` must
     describe the run (:func:`check_meta`, with ``cfg``'s seed and ``VERIF_POISON_COUNT``) and
     publish the same ``h_D``. :func:`load_env` calls it once; the full-scale driver
-    (``runs/full_scale.py``) once per level, so one model load serves a seed's levels. A pipelined run
-    (``cfg.pipelined``) needs the spec of the seed's own config: pass ``prover`` when ``cfg`` is
-    a level's copy of it (its ``poison_count`` is not the environment's)."""
+    (``runs/full_scale.py``) once per level, so one model load serves a seed's levels.
+    A pipelined run (``cfg.pipelined``) needs the spec of the seed's own config: pass
+    ``prover`` when ``cfg`` is a level's copy of it (its ``poison_count`` is not the
+    environment's)."""
     meta = json.loads((data_dir / "meta.json").read_text())
     check_meta(meta, cfg)
     if meta.get("h_D") != h_D.hex():

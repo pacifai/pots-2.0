@@ -846,7 +846,7 @@ def run_cheats(levels: Sequence[int], *, hidden: bool = False) -> int:
         open_writer,
         report_oracle,
     )
-    from verification.runs.hidden_steps import run_hidden
+    from verification.runs.hidden_steps import CHAIN_STEP, run_hidden
     from verification.runs.llama_step import load_committed_dataset
     from verification.runs.metrics import MetricsWriter, run_name
     from verification.runs.poisoned_step import run_poisoned
@@ -884,7 +884,8 @@ def run_cheats(levels: Sequence[int], *, hidden: bool = False) -> int:
         print(f"FS13 {'hidden step' if hidden else 'A1–A3'}: seed {cfg.seed}, level {n} "
               f"({env.bpr_actual:g}), step {env.poison_step}, band file "
               f"{env.bands.source[:16]}…")
-        env.prepare(env.poison_step)  # check 8's reference first; pipelined, then drop the model
+        # the stage's own reference first (hidden: the chain step's); pipelined, then drop the model
+        env.prepare(CHAIN_STEP if hidden else env.poison_step)
 
         def writer(scenario: str) -> MetricsWriter:
             return open_writer(lcfg, cell_name(lcfg, scenario, env), env)
