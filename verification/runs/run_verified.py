@@ -76,7 +76,7 @@ from verification.computation.interface import DeclaredComputation, snapshot_wei
 from verification.parameters import load_protocol_config
 from verification.runs.calibrate import judging_verifier
 from verification.runs.llama_step import load_committed_dataset, report_costs
-from verification.runs.loop import StepRecord
+from verification.runs.loop import StepRecord, run_devices
 from verification.runs.metrics import (
     COUNT_STEPS,
     PASS_STEPS,
@@ -653,9 +653,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         extra={"band_source": str(pc.band_file), **llama})
           if use_metrics else None)
     try:
+        devs = run_devices(c, pipelined=pl)
         rec = (None if mw is None else
                mw.recorder(HONEST.name, bpr_records=0, bpr_actual=0.0,
-                           trace_step=cfg.trace_step, trace_c5=cfg.trace_c5))
+                           trace_step=cfg.trace_step, trace_c5=cfg.trace_c5, devices=devs))
         run = run_verified(c, D, w0, bands, T=T, final=final, writer=mw, recorder=rec,
                            keep=keep, pipelined=pl, prover=spec, **base)
         r = run.result
@@ -665,7 +666,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if mw is not None:
             mem_rows = memory_run(c, D, w0, run=name, device=mw.device, T=S, final=final_at(S),
                                   verifier=run.factory.for_steps(S), pipelined=pl, prover=spec,
-                                  **base)
+                                  devices=devs, **base)
             mw.write(mem_rows)
             mw.write(count_run(c, D, w0, run=name, T=COUNT_STEPS, final=final_at(COUNT_STEPS),
                                verifier=run.factory.for_steps(COUNT_STEPS), pipelined=False,

@@ -51,7 +51,7 @@ from verification.verifier.driver import RunVerdict, Verifier
 
 __all__ = ["ProverFault", "StepRecord", "LoopResult", "run_loop", "PlainStepRecord", "PlainResult",
            "run_plain", "HANDOFF_SECTION", "TOTALS_SECTION", "release_device_cache",
-           "release_cache_setting", "pipelined_setting", "model_device"]
+           "release_cache_setting", "pipelined_setting", "model_device", "run_devices"]
 
 # The metrics section around the hand-off's cache release. Its row is the harness's (side
 # "run") and in no role's total: deployed, the prover and the verifier run on separate machines.
@@ -185,6 +185,21 @@ def release_device_cache(device: str | torch.device, section: Section | None = N
         return
     with (section or no_section)(HANDOFF_SECTION):
         torch.cuda.empty_cache()
+
+
+def run_devices(c: DeclaredComputation, *, pipelined: bool) -> tuple[torch.device, ...] | None:
+    """The device list of a verified run's recorders (``MetricsWriter.recorder(devices=)``,
+    ``memory_run(devices=)``), or ``None`` for an unsharded run (one device, rows as ever).
+
+    A sharded run lists the verifier devices ``c.placement.devices``; a sequential one puts the
+    prover's device ``c.placement.prover`` first, since it proves in the same process. The
+    pipelined parent proves nothing: the prover's device belongs to the child's recorder.
+    Normalized and without repeats (``metrics.normalize_devices``)."""
+    from verification.runs.metrics import normalize_devices  # noqa: PLC0415 (import cycle)
+    if not c.placement.sharded:
+        return None
+    devs = c.placement.devices or ()
+    return normalize_devices(devs if pipelined else (c.placement.prover, *devs))
 
 
 def _default_schedule(c: DeclaredComputation, dataset: Sequence[Any],

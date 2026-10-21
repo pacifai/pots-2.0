@@ -81,7 +81,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (ยง8.A.5).
 | var | default |
 |---|---|
 | `VERIF_DEVICE` | `cpu`. `cuda` runs the model, its activations, the replay and check 5's measuring on the GPU; every leaf stays in host memory (F1c, F4a, FS9) |
-| `VERIF_VERIFIER_DEVICES` | unset. A comma-separated list of the devices that hold the transcript and run the verifier, the replay split over them by layers (F22, FS32a). Unset or empty: today's path, leaves in host memory. Each entry is a torch device of `VERIF_DEVICE`'s type; a CUDA entry names its index (`cuda:1`) and none repeats; `cpu` may repeat (`cpu,cpu,cpu` runs every path on the Mac); `VERIF_DEVICE` itself may appear. Not a training field: config hashes don't move. The placement, the verifier's replay (FS32c), the capture routing (`prove_step` passes the placement to `MatmulCapture`) and the loop's cache release read it |
+| `VERIF_VERIFIER_DEVICES` | unset. A comma-separated list of the devices that hold the transcript and run the verifier, the replay split over them by layers (F22, FS32a). Unset or empty: today's path, leaves in host memory. Each entry is a torch device of `VERIF_DEVICE`'s type; a CUDA entry names its index (`cuda:1`) and none repeats; `cpu` may repeat (`cpu,cpu,cpu` runs every path on the Mac); `VERIF_DEVICE` itself may appear. Not a training field: the training config leaves it out, the verified entry points' metrics config holds it (`pipelined` is in neither). The placement, the verifier's replay (FS32c), the capture routing (`prove_step` passes the placement to `MatmulCapture`) and the loop's cache release read it |
 | `VERIF_MODEL` | `HuggingFaceTB/SmolLM2-135M-Instruct` |
 | `VERIF_MODEL_REVISION` | `12fd25f77366fa6b3b4b768ec3050bf629380bac` |
 | `VERIF_MASTER_DTYPE` / `VERIF_COMPUTE_DTYPE` | `float32` / `float32`. `float32` / `bfloat16` runs forward and loss under autocast (F6b, FS3); the decoder refuses any other master and fp16 compute |
@@ -1792,7 +1792,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     its job.
   - `runs/pipeline.py` (FS33b): child to parent `ready` (handshake), `step`, `released`,
     `final`, `error`; parent to child `release`, `stop`, `bye`. At most 2 steps are unreleased.
-    The child exits only after `bye` or EOF. `ProverProcessError.kind` is `exception`,
+    The child exits only after `bye` or EOF, after an error or `final` too: `_await_bye` has no
+    deadline (the parent's `link.stop()` ends a child that outlives the run).
+    `ProverProcessError.kind` is `exception`,
     `died`, `handshake`, `protocol` or `timeout`. Child recorder rows merge into the parent's,
     except the child's `handoff.release` rows of the last two steps, which are never merged.
     The handshake compares the whole computation and the data: `n_leaves`, `M`, `n_s`, `eta`,
@@ -1899,7 +1901,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     (`device_peak_bytes`, ...) and device-wide use (`mem_get_info`: every process on the card),
     sampled at section entry and exit, so its peak is a lower bound and the per-process peak exact.
     A memory recorder's `probe` must read `devices[0]` (`ValueError` otherwise). The overflow row's
-    `gpu_s` sums every device. The docstring has costs.
+    `gpu_s` sums every device. The docstring has costs. `metrics.normalize_devices` gives each
+    list its form: a CUDA device with no index takes the current device's, repeats drop (the
+    child's list is `cuda:0`, `cuda:1`, not `cuda`, `cuda:0`, `cuda:1`). A sharded run's parent
+    lists the verifier devices too: `loop.run_devices(c, pipelined=)` (`None` unsharded, so rows
+    stay; the verifier devices when pipelined; the prover's device first when sequential), passed
+    as `devices=` to `MetricsWriter.recorder` and `memory_run` by every verified entry point.
   - **Two processes (FS33c).** The child `close_step(t) -> StepPart` (no section open); the parent
     `merge_step(t, part)` before `on_step(t)`: one set of rows and one markers line for both sides.
     One merge per step, after the parent's own sections and before `on_step(t)`; a part of another

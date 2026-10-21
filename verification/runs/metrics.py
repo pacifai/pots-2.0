@@ -294,7 +294,8 @@ __all__ = [
     "P0_PHASES", "TRAIN_PHASES", "PASS_STEPS", "COUNT_STEPS", "COMPONENTS", "RECORD_TYPES",
     "RESERVED_NAMES", "SCORE_FAMILIES",
     "MemoryProbe", "memory_probe", "reserved_peak",
-    "TimeRecorder", "MemoryRecorder", "CountRecorder", "Seam", "resolve_gpu_us", "MAX_SPANS",
+    "normalize_devices", "TimeRecorder", "MemoryRecorder", "CountRecorder", "Seam",
+    "resolve_gpu_us", "MAX_SPANS",
     "StepPart", "STEP_WALL",
     "STAMP_NAMES", "read_markers", "c5_layout_file",
     "memory_pass", "count_pass", "counting",
@@ -1210,6 +1211,19 @@ class _TracedStamp:
             if self.sliced:
                 t.sync()
                 t.collect(False)
+
+
+def normalize_devices(devices: Sequence[str | torch.device]) -> tuple[torch.device, ...]:
+    """``devices`` as ``torch.device`` objects without repeats (first occurrence kept, order
+    kept). A CUDA device with no index takes the current device's (index 0 without CUDA), so
+    ``"cuda"`` and ``"cuda:0"`` are one device."""
+    out: dict[torch.device, None] = {}
+    for d in map(torch.device, devices):
+        if d.type == "cuda" and d.index is None:
+            i = torch.cuda.current_device() if torch.cuda.is_available() else 0
+            d = torch.device("cuda", i)
+        out[d] = None
+    return tuple(out)
 
 
 def _device_list(device: str | torch.device | None,
@@ -2730,8 +2744,12 @@ class MetricsWriter:
     def recorder(self, scenario: str, *, bpr_records: int | None = None,
                  bpr_actual: float | None = None,
                  cheat_step: int | None = None, trace_step: int = 0,
-                 trace_c5: str = "slice") -> TimeRecorder:
+                 trace_c5: str = "slice",
+                 devices: Sequence[str | torch.device] | None = None) -> TimeRecorder:
         """A timed-run recorder that writes here.
+
+        ``devices`` (``loop.run_devices``) is the recorder's device list for a sharded run;
+        ``None`` records ``self.device`` alone.
 
         ``trace_step`` > 0 profiles that step with ``torch.profiler`` into ``trace/``
         (``trace_c5``: ``"slice"`` or ``"all"``; :class:`_Trace`).
@@ -2741,7 +2759,8 @@ class MetricsWriter:
         ``cheat_step`` is ``t*``, for EQ15's attack runs only. The protocol-fault scenarios
         (``flip``, ``broken-chain`` …) leave all three null; their expected rejection point is
         the harness's oracle, not a record field."""
-        return TimeRecorder(self.run, scenario, device=self.device, writer=self,
+        return TimeRecorder(self.run, scenario, device=None if devices else self.device,
+                            devices=devices, writer=self,
                             step_fields={**self.run_fields, "bpr_records": bpr_records,
                                          "bpr_actual": bpr_actual, "cheat_step": cheat_step},
                             trace_step=trace_step, trace_c5=trace_c5)

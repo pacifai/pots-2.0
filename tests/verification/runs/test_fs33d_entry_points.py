@@ -252,8 +252,9 @@ def test_the_sweep_main_refuses_pipelined(monkeypatch, args, capsys):
     monkeypatch.setenv("VERIF_PIPELINED", "1")
     with pytest.raises(SystemExit) as e:
         fs.main(args)
-    assert e.value.code != 0
-    assert "VERIF_PIPELINED" in capsys.readouterr().err
+    msg = str(e.value.code)
+    assert msg.startswith("flipped_matmul_sweep: VERIF_PIPELINED=1 is refused")
+    assert "\n" not in msg and "usage" not in capsys.readouterr().err
 
 
 def test_splice_w_next_crosses_as_host_tensors():

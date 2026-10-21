@@ -491,16 +491,18 @@ def memory_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, 
                build_model: BuildModel | None = None,
                verifier: Callable[[Section | None], Verifier] | None = None,
                handoff: StoreHandoff | None = None, release_cache: bool | None = None,
-               pipelined: bool | None = None, prover: Callable[[], Any] | None = None
+               pipelined: bool | None = None, prover: Callable[[], Any] | None = None,
+               devices: Sequence[str | torch.device] | None = None
                ) -> list[dict[str, Any]]:
     """The B6 memory pass: ``scenario`` over ``T`` steps, probed at every section, never timed.
     ``verifier``, ``handoff``, ``release_cache``, ``pipelined`` and ``prover`` are as in
-    :func:`run_scenario`."""
+    :func:`run_scenario`. ``devices`` (``loop.run_devices``) is the recorder's device list: the
+    probe reads its first, ``None`` probes ``device`` alone."""
     return memory_pass(run, scenario.name, lambda rec: run_scenario(
         c, dataset, w0, scenario, T=T, k=k, seed=seed, final=final, recorder=rec, h_D=h_D,
         build_model=build_model, verifier=verifier, handoff=handoff,
         release_cache=release_cache, pipelined=pipelined, prover=prover),
-        memory_probe(device))
+        memory_probe(devices[0] if devices else device), devices=devices or None)
 
 
 def count_run(c: DeclaredComputation, dataset: Sequence[Any], w0: Mapping[str, torch.Tensor],
