@@ -416,7 +416,8 @@ def _good(**over):
         ex = {"root": "r", "w_next_root": "w", "plain_w_next_root": "w", "loss": 1.5}
         return _p(f"card_{arm}", "pair_card", {**ex, **kw}, arm=arm)
 
-    parts = [_p("models", "models"), _p("native_build", "other"),
+    parts = [_p("peer_check", "peer_check", {"peer_check": {"all_ok": True, "wrong": {}}}),
+             _p("models", "models"), _p("native_build", "other"),
              _p("fast_suite", "pytest", {"tests": 9, "failures": 0, "errors": 0, "skipped": 1,
                                          "slowest_failing": None}),
              _p("two_gpu_slow", "pytest", {"tests": 2, "failures": 0, "errors": 0, "skipped": 0,
@@ -557,7 +558,10 @@ def _stand_ins(tmp_path, *, bad_cheat=False, sharded_root="aa"):
     cheat = "print('A1 d a OUT 1 2 3');print('flip d a OUT 1 2 3')"
     junit = ("import sys;open(sys.argv[1],'w').write('<testsuites><testsuite><testcase "
              "classname=\"a\" name=\"b\" time=\"1\"/></testsuite></testsuites>')")
-    parts = []
+    peer = ("import json,sys;json.dump({'all_ok': True, 'pairs': {}, 'seconds': 1.0},"
+            "open(sys.argv[1],'w'))")
+    parts = [fs.Part("peer_check", ["{python}", "-c", peer, str(d / "peer.json")], timeout_s=30,
+                     kind="peer_check", info={"report": str(d / "peer.json")})]
     for name, kind, src, args, info, root in [
             ("card_unsharded", "pair_card", card, [str(d / "cu.json")], {"arm": "unsharded"}, "aa"),
             ("card_sharded", "pair_card", card, [str(d / "cs.json")], {"arm": "sharded"}, "aa"),

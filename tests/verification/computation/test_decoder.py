@@ -53,13 +53,13 @@ def smollm2_config():
 
 
 def run_capture(c, model, records):
+    """One captured training step, run as training runs it: ``forward_backward`` with the capture's
+    phases as the stages, so the output layer goes in ``c.head_blocks`` row blocks (one ``Λ`` per
+    block), not as one product over all rows."""
     model.zero_grad(set_to_none=True)
     cap = MatmulCapture(param_storage_map(model))
     with cap:
-        with cap.phase("forward"):
-            loss = c.loss(model, records)
-        with cap.phase("backward"):
-            loss.backward()
+        c.forward_backward(model, records, cap.phase)
     return cap
 
 
@@ -2139,3 +2139,19 @@ def test_operand_group_fails_in_a_later_role_as_members_would(honest_all, role):
                     replay.operands(m)
         errors.append((str(e.value), replay._served_last))
     assert errors[0] == errors[1] and "changed after its product read it" in errors[0][0]
+
+
+@pytest.mark.parametrize("tied", [True, False], ids=["tied", "untied"])
+def test_captured_operands_follow_the_head_blocks(tied):
+    """``captured_operands`` runs the step as training does, so at ``B = 2`` labeling sees each
+    ``Λ_b`` over ``N / 2`` rows, as declared, not one ``Λ`` over all ``N`` (the CUDA decoder test
+    failed on the FS32 pod for that: 24 rows where 12 were declared)."""
+    c = DecoderComputation(tiny_config(tied=tied), n_s=2, n=12, eta=1e-3, head_blocks=2)
+    model = c.build_model()
+    products, seen, _ = captured_operands(c, model, make_records((12, 7)))
+    assert len(products) == c.M
+    for b in range(2):
+        m = c.m_of(f"Lambda[{b}]")
+        a, w = seen[m]
+        assert a.shape == c.products[m - 1].a_shape == (c.N // 2, c.d)
+        assert products[m - 1].shape[0] == c.N // 2

@@ -2647,14 +2647,61 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   (the measured rates stay on the line), and `no result` when the run left no readable report.
   Exit 0 when the run finished (a speed `fail` too: read the gate), 1 on a mismatch, an error
   or too little host memory, 2 without CUDA.
+- `peer_check.py` (F22; `python -m verification.runs.peer_check --out peer_check.json`): does a
+  GPU-to-GPU copy land the right bytes? On the FS32 two-A40 session every direct copy between
+  the cards left wrong bytes while `nvidia-smi topo -p2p r` said OK and `can_device_access_peer`
+  was true; the copy staged through the host was right. For every ordered pair `"i->j"` it
+  compares, byte for byte against the source read back to the host (in the source's logical
+  order), a host-staged control (`host_staged`), `src.to` and `dst.copy_` at about 4 KB, 4 MB and
+  256 MB (`to_4KB`, `copy_4MB`, ...), a strided copy (`strided`) and a side-stream copy
+  (`side_stream`). `EXTRA_CASES` add what the transcript copies, each at 4 MB: `bf16_4MB`,
+  `fp32_4MB`, `offset_4MB` (a view with a non-zero storage offset, like a bmm member's slice) and
+  `3d_4MB` (a 3-D source copied whole, like a bmm's output). Every case draws its own random
+  source, and `cuda_copy` fills each destination it allocates (`copy_`, `side_stream`) with
+  `0xFF` bytes first, so a `copy_` that writes nothing or half cannot pass on bytes the caching
+  allocator left in the block. A result is checked for its device, shape and dtype before its
+  bytes; a mismatch is a failed case with its reason in `errors`. The side-stream case is as
+  `capture` does it: one side stream per source device for the whole check, the source made by
+  an op on the current stream just before the copy, no sync; what still differs from `_route` is
+  that its event is synchronized at once, not at `_drain`. A pair whose control is wrong is
+  `card_suspect` (the card, not the peer path), and its direct cases are not tried. The report
+  holds per pair `ok`, `cases`, `errors` (a case that raised, `"Type: message"`, separate from a
+  case that compared wrong) and one direct `gbps`, and `all_ok`, the device names, the driver
+  and versions and the seconds. A case that raised reads `<case> raised <Type>: <msg>`, a bad
+  result `<case> gave a bad result (<why>)`; one function, `nvlink_probe.peer_error_text` (standard
+  library only), makes these words for `peer_check`, `fs11_session` and the probe's `HW2` line. A
+  control that raised, or every case raising, reads that the check could not copy on that pair
+  (the error named), not that the peer path is wrong. The rate (`gbps`) times `rate_copy`
+  (`copy_into`) into one destination made and filled before the clock, so the fill is not timed.
+  Exit 0 only when `all_ok`; fewer than two CUDA
+  devices is exit 1 with a reason. `main` deletes `--out` first, so a killed rerun leaves no old
+  report. `check_pair` takes the copy as an argument, so the CPU tests inject a corrupting one.
+  `fs11_session.peer_check_part(out)` is the part: every plan on two or more GPUs lists it first
+  (`MULTI_GPU_SESSIONS`, held by a test), and a part that failed, left no report or has `all_ok`
+  false sets `summary["stopped"]` to a reason naming the pairs (wrong bytes, raised or could not
+  copy), so every later part is `not_started` with it. The pair gate (`fs32_pair`) lists
+  `peer_check` in `PAIR_PARTS` and fails on it, and prints `FS32 FAIL: peer copies landed wrong
+  bytes on pair ...` (or the raised or could-not-copy text) first; the probe's `HW2` line says
+  the same, from the probe's own run (`nvlink_probe.peer_check_pairs`), whose `card_suspect` and
+  errors and `wrong` cases reach `hw2["peer_bytes_detail"]`: a pair with any wrong case is under
+  "WRONG" / "landed wrong bytes" and also names its raised cases (`to_4MB; side_stream raised
+  ...`), as `fs11_session.peer_wrong_text` does; the could-not-copy and card-suspect branches
+  keep priority. A part that ended failed or timed out with no `ok: false` pair in its report
+  says the check ended without a verdict (and how the part ended), not wrong bytes; the session
+  still stops. `PAIR_ESTIMATE_MIN` counts the check's minute.
 - `nvlink_probe.py` (FS31, F22's check HW2): `.venv/bin/python -m verification.runs.nvlink_probe
   --out nvlink.json`, on the four-H100 pod. It reads the NVLink topology (`nvidia-smi topo -m`,
   `nvidia-smi nvlink -s`, the P2P read matrix), times peer copies between every pair of cards
   and from card 0 to the other three at once, times pinned-host copies and runs `nvbandwidth`
   when it is installed. `hw2_verdict` fails unless the topology matrix shows exactly
   `FS31_CARDS` GPUs (default 4), every pair is `NV18`, peer reads are `OK` for every pair, and
-  every ordered pair has a finite positive copy rate. The slowest pair's rate, by the PyTorch
-  `copy_` timing, then gives `verdict`: `pass` at `PEER_COPY_PASS_GBPS` (300 GB/s) or more,
+  every ordered pair has a finite positive copy rate and `peer_bytes_ok` (from `peer_check.check`
+  run in the probe) is true for every ordered pair: a pair that is false or has no result fails
+  with a reason, and the line says the peer copies were wrong, raised or could not be checked
+  (a pair with a wrong case and a raised case reads as wrong bytes and names both; the detail
+  carries `wrong`, `errors`, `card_suspect`, `all_raised`; `peer_error_text` words a raised case).
+  The slowest pair's rate, by the PyTorch `copy_` timing, then gives `verdict`: `pass` at
+  `PEER_COPY_PASS_GBPS` (300 GB/s) or more,
   `review` from `PEER_COPY_FAIL_GBPS` (150) up to that (the number returns to the user before
   the port relies on it), `fail` below. `pass` is true only for `"pass"` with `gate` true (a
   rehearsal keeps its measured `verdict`, but `pass` is false). The verdict records `n_cards`,

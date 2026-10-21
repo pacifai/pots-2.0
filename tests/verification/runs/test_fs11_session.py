@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from tests.verification.full_scale_helpers import PINS
+from tests.verification.runs.session_env import clean_environ
 from verification.runs import fs11_session as fs
 
 JOB = Path(fs.__file__).with_name("fs11_job.sh")
@@ -792,7 +793,7 @@ def test_a_mismatch_keeps_the_affected_parts_from_starting(tmp_path):
 
 def _job(tmp_path, *, plan=None, python=sys.executable, deadline=6, grace=1, reserve=1,
          extra=None, timeout=60, popen=False):
-    env = {k: v for k, v in os.environ.items() if k not in ("RUNPOD_POD_ID", "RUNPOD_API_KEY")}
+    env = clean_environ()
     env.update({"DRY_RUN": "1", "FS11_DEADLINE_S": str(deadline), "FS11_GRACE_S": str(grace),
                 "FS11_PACK_RESERVE_S": str(reserve), "FS11_PYTHON": python,
                 "FS11_MIN_FREE_GB": "0", **(extra or {})})
@@ -1156,7 +1157,7 @@ def test_job_and_timer_never_terminate_at_once(tmp_path):
 
 def test_guard_dry_run(tmp_path):
     log = tmp_path / "guard.log"
-    env = {k: v for k, v in os.environ.items() if k != "RUNPOD_POD_ID"}
+    env = clean_environ()
     r = subprocess.run(["sh", str(GUARD), "1"], env={**env, "DRY_RUN": "1",
                        "FS11_GUARD_LOG": str(log)}, capture_output=True, text=True, timeout=10)
     assert r.returncode == 0 and "disarm with: kill" in r.stdout
@@ -1165,7 +1166,7 @@ def test_guard_dry_run(tmp_path):
 
 
 def test_guard_refuses_without_a_pod(tmp_path):
-    env = {k: v for k, v in os.environ.items() if k != "RUNPOD_POD_ID"}
+    env = clean_environ()
     r = subprocess.run(["sh", str(GUARD), "1"], env={**env, "DRY_RUN": "0"},
                        capture_output=True, text=True, timeout=10)
     assert r.returncode == 2 and "RUNPOD_POD_ID is not set" in r.stderr
@@ -1212,7 +1213,7 @@ def test_boot_guard_starts_the_image_and_terminates_later(tmp_path, modes, ends_
     script = shlex.split(_boot_guards()[0])[2]
     script = (script.replace("sleep 16200;", "sleep 1;").replace("sleep 30;", "sleep 0;")
               .replace("/tmp/guard.log", str(guard_log)).replace("/start.sh", str(start)))
-    subprocess.run(["bash", "-c", script], env={**os.environ, **env}, check=True, timeout=10,
+    subprocess.run(["bash", "-c", script], env=clean_environ(env), check=True, timeout=10,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     assert _calls(log) == ["started"]  # the image's entry ran; the guard still sleeps
     assert _wait_for(lambda: _calls(log)[-1] == ends_with, 15), _calls(log)
@@ -1264,10 +1265,40 @@ def test_check_upload_reports_the_native_sources(tmp_path):
     assert c["native"] == {"dir": "native_cache/blake3-1.8.7", "present": False,
                            "bad": ["the directory"]}
     src = up / "native_cache" / "blake3-1.8.7"
-    shutil.copytree(fs.native.source_dir(), src)
+    from verification.commitment import native  # not imported by the session at import
+    shutil.copytree(native.source_dir(), src)
     assert fs.check_upload(up)["native"]["bad"] == [] and fs.check_upload(up)["native"]["present"]
     (src / "blake3.c").write_text("changed")
     assert fs.check_upload(up)["native"]["bad"] == ["blake3.c"]
+
+
+_BARE = """
+import sys, time
+sys.path.insert(0, {root!r})
+class Block:
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in ("torch", "numpy", "blake3"):
+            raise ImportError("blocked: " + name)
+sys.meta_path.insert(0, Block())
+from verification.runs import fs11_session as fs
+loaded = lambda: sorted(m for m in sys.modules if m.split(".")[0] in ("torch", "numpy", "blake3"))
+assert not loaded(), loaded()
+rc = fs.main(["run", "--selftest", "--upload", {up!r}, "--out", {out!r},
+              "--deadline", str(time.time() + 60)])
+print("RC", rc, loaded())
+"""
+
+
+def test_the_module_and_its_selftest_need_only_the_standard_library(tmp_path):
+    """A bare pod's ``python3`` has no torch or numpy: importing the session module and running
+    its self-test with those imports refused must work, and load none of them."""
+    root = Path(__file__).resolve().parents[3]
+    (tmp_path / "up").mkdir()
+    code = _BARE.format(root=str(root), up=str(tmp_path / "up"), out=str(tmp_path / "out"))
+    r = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True,
+                       timeout=120, env={"PATH": os.environ.get("PATH", ""), "FS11_SELFTEST": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.strip().endswith("RC 0 []"), r.stdout
 
 
 # ---- the sampler (FS21) -----------------------------------------------------------------
@@ -1471,9 +1502,10 @@ def test_nvlink_probe_plan_lists_the_probe_and_a_part_per_model_and_card(tmp_pat
     out = tmp_path / "out"
     plan = fs.nvlink_probe_plan(tmp_path / "up", out)
     cards = [p for p in plan if p.kind == "card"]
-    assert [p.kind for p in plan[:2]] == ["models", "nvlink"]
-    assert len(plan) == 2 + len(cards) == 2 + 4 * len(fs.RUN_PINS)
-    probe = plan[1]
+    assert [p.kind for p in plan[:3]] == ["peer_check", "models", "nvlink"]
+    assert plan[0] == fs.peer_check_part(out)
+    assert len(plan) == 3 + len(cards) == 3 + 4 * len(fs.RUN_PINS)
+    probe = plan[2]
     assert probe.name == "nvlink_probe" and probe.timeout_s == fs.NVLINK_TIMEOUT_S
     assert probe.argv == ["{python}", "-m", "verification.runs.nvlink_probe", "--out",
                           str(out / "nvlink" / "nvlink.json")]
@@ -1683,10 +1715,12 @@ def test_part_extras_read_the_probe_and_card_reports(tmp_path):
     hw2 = {"verdict": "pass", "pass": True, "reasons": [], "nv_links": True,
            "nv18_everywhere": True, "p2p_read_ok": True, "peer_copy_min_gbps": 371.2,
            "slowest_pair": "0->1", "pass_gbps": 300.0, "fail_gbps": 150.0, "n_cards": 4,
-           "expected_cards": 4, "gate": True, "more": 1}
+           "expected_cards": 4, "gate": True, "more": 1,
+           "peer_bytes_ok": {"0->1": True, "1->0": True}}
     nv.write_text(json.dumps({"hw2": hw2}))
     got = fs.part_extras(part, tmp_path / "log")["hw2"]
     assert got["pass"] and got["peer_copy_min_gbps"] == 371.2 and "more" not in got
+    assert got["peer_bytes_ok"] == {"0->1": True, "1->0": True}
     nv.write_text("{")
     assert "extras_error" in fs.part_extras(part, tmp_path / "log")
 
@@ -1773,8 +1807,8 @@ def test_hw3_one_card_is_not_a_comparison(tmp_path):
 def test_every_card_part_and_the_probe_order_cards_by_pci_bus(tmp_path):
     plan = fs.nvlink_probe_plan(tmp_path / "up", tmp_path / "out")
     assert all(p.env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID" for p in plan if p.kind in
-               ("card", "nvlink"))
-    assert "CUDA_DEVICE_ORDER" not in plan[0].env
+               ("card", "nvlink", "peer_check"))
+    assert "CUDA_DEVICE_ORDER" not in plan[1].env  # the models part
 
 
 def test_job_accepts_the_probe_session_and_refuses_the_rest(tmp_path):

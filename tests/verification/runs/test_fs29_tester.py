@@ -17,6 +17,7 @@ import torch
 from setup.records import Record
 from tests.verification.commitment.test_gpu_blake3 import HostKernels, hostlib  # noqa: F401
 from tests.verification.decoder_helpers import tiny_config
+from tests.verification.runs.session_env import clean_environ
 from verification.commitment import gpu_blake3 as gb
 from verification.commitment import leaves as lv
 from verification.computation.leaf_sizes import leaf_sizes
@@ -359,7 +360,7 @@ def test_every_parts_env_is_stripped_of_secrets_on_the_pod(tmp_path, monkeypatch
 
 
 def test_the_session_on_this_mac_is_refused_and_says_so(tmp_path):
-    env = {k: v for k, v in os.environ.items() if k != "FS11_ALLOW_ANY_GPU"}
+    env = clean_environ()
     up, out = tmp_path / "up", tmp_path / "out"
     up.mkdir()
     r = subprocess.run([sys.executable, "-m", "verification.runs.fs11_session", "run", "--upload",

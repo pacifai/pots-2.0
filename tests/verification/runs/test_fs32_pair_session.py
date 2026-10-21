@@ -36,7 +36,8 @@ def _suite(name, **kw):
 
 
 def _parts(**over):
-    parts = [_part("models", "models"), _part("native_build", "other"),
+    parts = [_part("peer_check", "peer_check", {"peer_check": {"all_ok": True, "wrong": {}}}),
+             _part("models", "models"), _part("native_build", "other"),
              _suite("fast_suite", skipped=2), _suite("two_gpu_slow"),
              _part("smollm2_calibrate", "other"), _card("unsharded"), _card("sharded"),
              _run("unsharded"), _run("sharded"),
@@ -54,7 +55,8 @@ def test_oracle_outcomes_are_the_scenarios():
 def test_plan_has_the_parts_each_with_peaks(tmp_path):
     plan = fs.fs32_pair_plan(tmp_path / "up", tmp_path / "out")
     names = [p.name for p in plan]
-    assert names[0] == "models" and "fast_suite" in names and "two_gpu_slow" in names
+    assert names[:2] == ["peer_check", "models"]
+    assert "fast_suite" in names and "two_gpu_slow" in names
     assert all(p.info.get("gpu_peak") for p in plan)
     sharded = [p for p in plan if p.env.get("VERIF_VERIFIER_DEVICES") == fs.PAIR_DEVICES]
     assert sharded and not any(p.env.get("VERIF_VERIFIER_DEVICES") for p in plan
@@ -174,8 +176,19 @@ def test_pair_card_parts_are_not_hw3_cards():
     assert fs.hw3_cards(_parts()) is None
 
 
+# a stand-in for ``peer_check``: all right, or the pair-to-wrong-cases map WRONG
+PEER_WRITER = ("import json,sys,os\nos.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)\n"
+               "w = WRONG or {}\n"
+               "pairs = {'0->1': {'ok': '0->1' not in w, 'cases': {'host_staged': True, 'to_4KB': "
+               "'0->1' not in w}, 'gbps': 7.0}, '1->0': {'ok': True, 'cases': {'host_staged': "
+               "True}, 'gbps': 8.0}}\n"
+               "json.dump({'all_ok': not w, 'pairs': pairs, 'seconds': 1.0}, open(sys.argv[1], "
+               "'w'))\nsys.exit(1 if w else 0)")
+
+
 def _fake_plan(tmp_path, root_sharded="a" * 64, outcome="exact", junit_for=("fast_suite",
-                                                                            "two_gpu_slow")):
+                                                                            "two_gpu_slow"),
+               peer_wrong=None):
     """The pair's real plan with each part's command replaced by one that writes what the real
     part does (and the real part's kind, info and name)."""
     import dataclasses
@@ -197,7 +210,10 @@ def _fake_plan(tmp_path, root_sharded="a" * 64, outcome="exact", junit_for=("fas
     out = []
     for p in plan:
         info = p.info
-        if p.kind == "pytest" and p.name in junit_for:
+        if p.kind == "peer_check":
+            argv = ["{python}", "-c", PEER_WRITER.replace("WRONG", repr(peer_wrong)),
+                    info["report"]]
+        elif p.kind == "pytest" and p.name in junit_for:
             argv = ["{python}", "-c", junit, info["junit"]]
         elif p.kind == "pair_card":
             argv = ["{python}", "-c", card, info["report"]]
@@ -248,3 +264,85 @@ def test_a_missing_junit_in_the_pairs_plan_prints_a_fail_line(tmp_path, monkeypa
     s, lines = _session(tmp_path, monkeypatch, _fake_plan(tmp_path, junit_for=("fast_suite",)))
     assert "FS32 FAIL: two_gpu_slow left no test report" in lines
     assert not s["fs32_pair"]["pass"]
+
+
+# ---- F22: the peer-copy byte check first, and the session stops on it -------------------------
+
+
+def test_a_session_with_right_peer_copies_runs_every_part(tmp_path, monkeypatch):
+    s, lines = _session(tmp_path, monkeypatch, _fake_plan(tmp_path))
+    assert "stopped" not in s and s["fs32_pair"]["pass"] and s["fs32_pair"]["peer_bytes_ok"]
+    peer = next(p for p in s["parts"] if p["name"] == "peer_check")
+    assert peer["status"] == "ok" and peer["extras"]["peer_check"]["all_ok"] is True
+    assert peer["extras"]["peer_check"]["min_gbps"] == 7.0
+    assert not any("wrong bytes" in x for x in lines)
+
+
+def test_wrong_peer_copies_stop_the_session_and_every_later_part_says_why(tmp_path, monkeypatch):
+    s, lines = _session(tmp_path, monkeypatch, _fake_plan(tmp_path, peer_wrong={"0->1": 1}))
+    by = {p["name"]: p for p in s["parts"]}
+    assert by["native_build"]["status"] == "ok" and by["peer_check"]["status"] == "failed"
+    assert "wrong bytes on pair 0->1 (to_4KB)" in s["stopped"]
+    later = [p for p in s["parts"] if p["name"] not in ("native_build", "peer_check")]
+    assert later and all(p["status"] == "not_started" and p["reason"] == s["stopped"]
+                         for p in later)
+    assert not (tmp_path / "out" / "parts" / "models" / "DONE").exists()
+    pair = s["fs32_pair"]
+    assert not pair["pass"] and pair["peer_bytes_ok"] is False
+    assert any(x.startswith("FS32 FAIL: peer copies landed wrong bytes on pair 0->1 (to_4KB)")
+               for x in lines)
+
+
+def test_a_stopped_rerun_reads_the_reports_of_a_done_check_again(tmp_path, monkeypatch):
+    plan = _fake_plan(tmp_path)
+    s, _ = _session(tmp_path, monkeypatch, plan)
+    assert s["fs32_pair"]["pass"]
+    report = Path(next(p for p in plan if p.kind == "peer_check").info["report"])
+    doc = json.loads(report.read_text())
+    doc["all_ok"] = False  # the DONE marker is there, the report now says wrong
+    doc["pairs"]["1->0"].update(ok=False, cases={"host_staged": True, "side_stream": False})
+    report.write_text(json.dumps(doc))
+    s, _ = _session(tmp_path, monkeypatch, plan)
+    assert next(p for p in s["parts"] if p["name"] == "peer_check")["status"] == "skipped_done"
+    assert "pair 1->0 (side_stream)" in s["stopped"]
+    assert s["parts"][-1]["status"] == "not_started"
+
+
+def test_a_missing_report_or_a_dead_check_stops_the_session(tmp_path, monkeypatch):
+    import dataclasses
+
+    plan = [dataclasses.replace(p, argv=["{python}", "-c", "import sys; sys.exit(1)"])
+            if p.kind == "peer_check" else p for p in _fake_plan(tmp_path)]
+    s, lines = _session(tmp_path, monkeypatch, plan)
+    assert "left no report" in s["stopped"] and "ended failed" in s["stopped"]
+    assert any("FS32 FAIL" in x and "left no report" in x for x in lines)
+
+
+def test_a_card_that_fails_its_own_control_is_named_as_the_card(tmp_path, monkeypatch):
+    plan = _fake_plan(tmp_path)
+    writer = ("import json,sys,os; os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True); "
+              "json.dump({'all_ok': False, 'seconds': 1.0, 'pairs': {'1->0': "
+              "{'ok': False, 'card_suspect': True, 'cases': {'host_staged': False}}}}, "
+              "open(sys.argv[1], 'w')); sys.exit(1)")
+    import dataclasses
+
+    plan = [dataclasses.replace(p, argv=["{python}", "-c", writer, p.info["report"]])
+            if p.kind == "peer_check" else p for p in plan]
+    s, _ = _session(tmp_path, monkeypatch, plan)
+    assert "the card itself is suspect, not the peer path" in s["stopped"]
+    assert "pair 1->0" in s["stopped"]
+
+
+def test_the_gate_fails_without_a_peer_check_part_or_with_wrong_bytes():
+    assert fs.fs32_pair(_parts())["pass"]
+    gone = [p for p in _parts() if p["name"] != "peer_check"]
+    assert not fs.fs32_pair(gone)["pass"] and "peer_check" in fs.fs32_pair(gone)["part_problems"]
+    bad = _part("peer_check", "peer_check", {"peer_check": {
+        "all_ok": False, "wrong": {"1->0": ["copy_4MB"]}, "card_suspect": []}})
+    pair = fs.fs32_pair(_parts(peer_check=bad))
+    assert not pair["pass"] and "1->0 (copy_4MB)" in pair["peer_copies"]
+    line = fs._pair_lines(pair)[0]
+    assert line.startswith("FS32 FAIL: peer copies landed wrong bytes") and "1->0" in line
+    # an ok exit with a report that says not all right still fails the gate
+    lying = _part("peer_check", "peer_check", {"peer_check": {"all_ok": False, "wrong": {}}})
+    assert not fs.fs32_pair(_parts(peer_check=lying))["pass"]

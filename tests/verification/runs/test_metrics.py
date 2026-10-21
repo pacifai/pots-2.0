@@ -924,8 +924,18 @@ def test_store_split_matches_from_step(c, D, w0):
 @pytest.mark.skipif(not RESETTABLE, reason="needs a resettable peak")
 def test_memory_peak_sees_a_transient_allocation():
     # A fresh process, so no freed block is waiting to be reused.
+    #
+    # One torch thread: the fill below then touches every page from one thread. On Linux the
+    # kernel's RSS counter (VmRSS, which the probe reads) is kept in pieces per thread or CPU and
+    # folded into the total only after a batch of pages (64 pages per thread on older kernels,
+    # about twice the CPU count per CPU on newer ones), so a read taken while many threads fill a
+    # buffer misses up to that batch for each of them. The FS32 pod (48 physical cores) read
+    # 187,293,696 bytes for 200,000,000: 12.7 MB short, about 48 threads x 64 pages x 4 KiB
+    # (12.6 MB). This cause matches the numbers but was not isolated on a pod. The buffer is
+    # fully touched (ones() writes it), so the pages are not the cause, and the bound stays.
     code = textwrap.dedent("""
         import torch
+        torch.set_num_threads(1)
         from verification.runs.metrics import MemoryRecorder, memory_probe
         rec = MemoryRecorder("m", "s", memory_probe("cpu"))
         class R: t = 1
