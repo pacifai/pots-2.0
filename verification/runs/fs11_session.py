@@ -1015,7 +1015,8 @@ def device_leaves_gate(parts: Sequence[Mapping[str, Any]],
 # FS32f's two-GPU session (``fs32-pair``): the sharded run on two cards, F22's two-A40 check.
 # Time limits, seconds, of its parts; the fast suite's limit allows twice its estimated 25 min.
 PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "calibrate": 900,
-                  "card": 900, "run": 900, "run_metrics": 1800, "cheat": 900}
+                  "card": 900, "run": 900, "run_metrics": 1800, "cheat": 900,
+                  "fs34_tests": 900}
 # Estimates, minutes, scaled by hand (none was measured on two cards): the peer-copy byte check
 # 1 (two ordered pairs; its limit is 5), the models part 2-5, the
 # native build 1-2, the fast suite 13-25 on 10 vCPUs (the CUDA tests run on it for the first
@@ -1024,10 +1025,13 @@ PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "cal
 # FS33d's pipelined arms are estimated at their sequential counterparts' time (the pipelined loop
 # overlaps prover and verifier, so it is no slower; an estimate, none was measured): the plain
 # pipelined run about 6, the one with metrics on about 12 (its memory pass and counting pass add
-# two more passes), the three pipelined cheats about 12 together.
+# two more passes), the three pipelined cheats about 12 together. FS34's two-GPU join tests
+# (``fs34_tests``: a tiny sharded step, a run_loop and the kernel's first build on each card)
+# about 5, an estimate.
 PAIR_ESTIMATE_MIN = {"peer_check": 1, "models": 5, "native_build": 2, "fast_suite": 25,
-                     "two_gpu_slow": 10, "calibrate": 5, "card": 6, "run": 12, "cheat": 12,
-                     "run_pipelined": 6, "run_pipelined_metrics": 12, "cheat_pipelined": 12}
+                     "two_gpu_slow": 10, "fs34_tests": 5, "calibrate": 5, "card": 6, "run": 12,
+                     "cheat": 12, "run_pipelined": 6, "run_pipelined_metrics": 12,
+                     "cheat_pipelined": 12}
 PAIR_PACK_MIN, PAIR_GRACE_MIN = 1, 20  # the job's packing and grace window, minutes
 PAIR_STEPS = 3
 PAIR_CARDS = 2  # the session refuses a machine with fewer CUDA devices
@@ -1051,6 +1055,49 @@ ORACLE_OUTCOMES = ("exact", "accepted", "rejected", "early", "overrun", "wrong-c
                    "wrong-kind", "wrong-product")
 # the slow two-GPU tests: the FS32f ones (two_gpus) and FS32c's SmolLM2 replay (two_cuda_devices)
 PAIR_SLOW_SELECT = "two_gpus or two_cuda_devices"
+
+
+FS34_TESTS_FILE = "tests/verification/runs/test_fs34_join_cuda.py"
+
+
+def _fs34_tests_part(out: Path, timeout_s: float) -> Part:
+    """FS34's two-GPU join tests (:data:`FS34_TESTS_FILE`) with a junit report, by name: the
+    comparison asks for each case the file defines and that none was skipped."""
+    junit = out / "parts" / "fs34_tests" / "junit.xml"
+    return Part("fs34_tests", ["{python}", "-m", "pytest", "-rf", "-q", f"--junitxml={junit}",
+                               "-p", "no:cacheprovider", FS34_TESTS_FILE],
+                env={"VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
+                timeout_s=timeout_s, kind="fs34_tests",
+                info={"junit": str(junit), "gpu_peak": True})
+
+
+def fs34_gate(parts: Sequence[Mapping[str, Any]],
+              expected: Sequence[str] | None = None) -> list[str]:
+    """The reasons FS34's CUDA tests do not count, empty when they do: the part ran ``ok``, its
+    junit report names every case :data:`FS34_TESTS_FILE` defines (found by
+    :func:`device_tests_expected`, or given as ``expected``) and each one passed, none skipped,
+    failed or errored. Fails closed on anything missing."""
+    part = next((p for p in parts if p.get("name") == "fs34_tests"), {})
+    ex = part.get("extras") or {}
+    why: list[str] = []
+    if part.get("status") not in _PAIR_OK:
+        why.append(f"the FS34 tests part is {part.get('status', 'not_started')}")
+    if ex.get("junit", 0) is None or "cases" not in ex:
+        why.append("the FS34 tests left no junit report")
+        return why
+    if ex.get("failures") or ex.get("errors"):
+        why.append(f"the FS34 tests have {ex.get('failures')} failures and "
+                   f"{ex.get('errors')} errors")
+    if expected is None:
+        expected, err = device_tests_expected(FS34_TESTS_FILE)
+        if err:
+            why.append(f"FS34's expected tests could not be collected: {err}")
+    why += [f"{n}: " + ("expected but not in the junit report" if n not in ex["cases"]
+                         else ex["cases"][n]) for n in expected
+            if ex["cases"].get(n) != "passed"]
+    why += [f"{n}: {o}" for n, o in sorted(ex["cases"].items())
+            if o != "passed" and n not in expected]
+    return why
 
 
 def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
@@ -1103,6 +1150,7 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
     plan = [peer_check_part(out), _models_part(upload, out, t["models"]),
             pytest_part("fast_suite", t["fast_suite"]),
             pytest_part("two_gpu_slow", t["two_gpu_slow"], "-m", "slow", "-k", PAIR_SLOW_SELECT),
+            _fs34_tests_part(out, t["fs34_tests"]),
             part("smollm2_calibrate", "calibrate", home, t["calibrate"],
                  "--write-bands-despite-guard", kind="other")]
     for arm, env in (("unsharded", {}), ("sharded", sharded)):
@@ -1585,7 +1633,7 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _card_extras(Path(part.info["report"]))
         if part.kind == "pytest":
             return _pytest_extras(Path(part.info["junit"]))
-        if part.kind == "device_tests":
+        if part.kind in ("device_tests", "fs34_tests"):
             return _device_tests_extras(Path(part.info["junit"]))
         if part.kind == "pair_run":
             return _pair_run_extras(log, Path(part.info["weights"]))
@@ -1793,6 +1841,7 @@ def _pair_part(parts: Sequence[Mapping[str, Any]], name: str) -> Mapping[str, An
 
 
 PAIR_PARTS = (PEER_CHECK_NAME, "models", NATIVE_BUILD_NAME, "fast_suite", "two_gpu_slow",
+              "fs34_tests",
               "smollm2_calibrate", "card_unsharded", "card_sharded", "run_unsharded",
               "run_sharded", "run_pipelined", "run_pipelined_metrics", *PAIR_CHEAT_PARTS,
               *PAIR_PIPELINED_CHEAT_PARTS)
@@ -1889,6 +1938,7 @@ def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     peer = (_pair_part(parts, PEER_CHECK_NAME).get("extras") or {}).get("peer_check")
     peer_ok = bool(peer) and peer.get("all_ok") is True
     slow_ran = bool(tests["two_gpu_slow"]) and tests["two_gpu_slow"]["skipped"] == 0
+    fs34 = fs34_gate(parts)
     verdicts_equal = verdicts[0] == verdicts[1] and lines_equal and all(pipe_equal.values())
     step_times = {a: (e.get("step_times") or []) for a, e in
                   (("unsharded", run[0]), ("sharded", run[1]), *pipe.items())}
@@ -1904,11 +1954,12 @@ def fs32_pair(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
             "pipelined_cheats": {n: piped.get(n) for n in PAIR_CHEATS},
             "oracle_equal": oracle_equal, "mode_problems": mode_problems,
             "step_times": step_times, "gpu_peak": gpu_peak,
-            "tests": tests, "part_problems": problems, "peer_bytes_ok": peer_ok,
+            "tests": tests, "fs34_problems": fs34, "part_problems": problems,
+            "peer_bytes_ok": peer_ok,
             "peer_copies": None if peer_ok else peer_wrong_text(peer),
             "slowest_failing": max(failing, key=lambda r: r["time_s"], default=None),
             "pass": (all(roots.values()) and verdicts_equal and honest and not problems
-                     and peer_ok and suites_ok and slow_ran
+                     and peer_ok and suites_ok and slow_ran and not fs34
                      and all(outcomes.get(n) == "exact" for n in PAIR_CHEATS)
                      and all(piped.get(n) == "exact" for n in PAIR_CHEATS)
                      and all(oracle_equal.values()) and not mode_problems)}
@@ -1959,6 +2010,7 @@ def _pair_lines(pair: Mapping[str, Any] | None) -> list[str]:
     if not pair["honest"]:
         lines.append(f"FS32 FAIL: the honest run was not accepted at every one of "
                      f"{PAIR_STEPS} steps in both arms")
+    lines += [f"FS32 FAIL: FS34 test {w}" for w in pair["fs34_problems"]]
     slow = pair["tests"]["two_gpu_slow"]
     if slow is not None and slow["skipped"]:
         lines.append(f"FS32 FAIL: two_gpu_slow skipped {slow['skipped']} of {slow['tests']} tests")

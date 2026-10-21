@@ -46,10 +46,28 @@ def _suite(name, **kw):
                                   "slowest_failing": None, **kw})
 
 
+MOD34 = "tests.verification.runs.test_fs34_join_cuda"
+EXPECTED34 = [f"{MOD34}::test_{n}" for n in ("one", "two", "three")]
+
+
+@pytest.fixture(autouse=True)
+def expected34(monkeypatch):
+    """The FS34 file's cases are three fixed names; the real collection is not run here."""
+    monkeypatch.setattr(fs, "device_tests_expected",
+                        lambda file=fs.DEVICE_TESTS_FILE: (list(EXPECTED34), ""))
+
+
+def _fs34(outcomes=None, **kw):
+    cases = {n: "passed" for n in EXPECTED34} | (outcomes or {})
+    return _part("fs34_tests", "fs34_tests",
+                 {"tests": len(cases), "failures": 0, "errors": 0, "skipped": 0,
+                  "slowest_failing": None, "junit": 1, "cases": cases}, **kw)
+
+
 def _parts(**over):
     parts = [_part("peer_check", "peer_check", {"peer_check": {"all_ok": True, "wrong": {}}}),
              _part("models", "models"), _part("native_build", "other"),
-             _suite("fast_suite", skipped=2), _suite("two_gpu_slow"),
+             _suite("fast_suite", skipped=2), _suite("two_gpu_slow"), _fs34(),
              _part("smollm2_calibrate", "other"), _card("unsharded"), _card("sharded"),
              _run("unsharded"), _run("sharded"), _run("pipelined"), _run("pipelined_metrics"),
              _cheat("poisoned_step", ("A1", "A2", "A3")), _cheat("hidden_steps", ("hidden",)),
@@ -100,8 +118,8 @@ def test_plan_has_the_pipelined_arms_sharded_and_only_they_set_the_mode(tmp_path
 
 
 def test_the_default_deadline_is_twice_the_estimate_and_the_job_holds_it():
-    assert fs.pair_default_deadline_s() == 15500
-    assert "DEFAULT_DEADLINE_S=15500" in JOB.read_text()
+    assert fs.pair_default_deadline_s() == 16100
+    assert "DEFAULT_DEADLINE_S=16100" in JOB.read_text()
 
 
 def test_two_cards_of_any_type_pass_and_one_is_refused():
@@ -344,6 +362,12 @@ def _fake_plan(tmp_path, root_sharded="a" * 64, outcome="exact", junit_for=("fas
         if p.kind == "peer_check":
             argv = ["{python}", "-c", PEER_WRITER.replace("WRONG", repr(peer_wrong)),
                     info["report"]]
+        elif p.kind == "fs34_tests":
+            cases = "".join(f'<testcase classname="{n.split("::")[0]}" '
+                            f'name="{n.split("::")[1]}" time="1"/>' for n in EXPECTED34)
+            argv = ["{python}", "-c", "import sys;open(sys.argv[1],'w').write("
+                    f"'<testsuites><testsuite>{cases}</testsuite></testsuites>')",
+                    info["junit"]]
         elif p.kind == "pytest" and p.name in junit_for:
             argv = ["{python}", "-c", junit, info["junit"]]
         elif p.kind == "pair_card":
@@ -488,3 +512,51 @@ def test_the_gate_fails_without_a_peer_check_part_or_with_wrong_bytes():
     # an ok exit with a report that says not all right still fails the gate
     lying = _part("peer_check", "peer_check", {"peer_check": {"all_ok": False, "wrong": {}}})
     assert not fs.fs32_pair(_parts(peer_check=lying))["pass"]
+
+
+# ---- FS34: the join's CUDA tests, each passed and none skipped ---------------------------------
+
+
+def test_the_plan_has_the_fs34_tests_part_after_the_slow_tests(tmp_path):
+    plan = fs.fs32_pair_plan(tmp_path / "up", tmp_path / "out")
+    names = [p.name for p in plan]
+    assert names.index("fs34_tests") == names.index("two_gpu_slow") + 1
+    p = plan[names.index("fs34_tests")]
+    assert fs.FS34_TESTS_FILE in p.argv and p.kind == "fs34_tests" and p.info["gpu_peak"]
+    assert "fs34_tests" in fs.PAIR_PARTS and "fs34_tests" in fs.PAIR_ESTIMATE_MIN
+
+
+def test_the_fs34_tests_all_passing_is_part_of_pass():
+    pair = fs.fs32_pair(_parts())
+    assert pair["pass"] and pair["fs34_problems"] == []
+
+
+@pytest.mark.parametrize("outcome", ["skipped", "failed", "error"])
+def test_a_fs34_test_that_did_not_pass_is_no_pass_and_prints_its_fail_line(outcome):
+    pair = fs.fs32_pair(_parts(fs34_tests=_fs34({EXPECTED34[1]: outcome})))
+    text = "\n".join(fs._pair_lines(pair))
+    assert not pair["pass"]
+    assert f"FS32 FAIL: FS34 test {EXPECTED34[1]}: {outcome}" in text
+
+
+def test_a_fs34_test_missing_from_the_report_is_no_pass():
+    part = _fs34()
+    del part["extras"]["cases"][EXPECTED34[2]]
+    pair = fs.fs32_pair(_parts(fs34_tests=part))
+    assert not pair["pass"]
+    assert any("expected but not in the junit report" in w for w in pair["fs34_problems"])
+
+
+def test_a_fs34_part_with_no_report_or_that_did_not_run_is_no_pass():
+    none = _part("fs34_tests", "fs34_tests", {"junit": None})
+    pair = fs.fs32_pair(_parts(fs34_tests=none))
+    assert not pair["pass"] and "the FS34 tests left no junit report" in pair["fs34_problems"]
+    pair = fs.fs32_pair(_parts(fs34_tests=_part("fs34_tests", "fs34_tests", None,
+                                                status="not_started")))
+    assert not pair["pass"]
+    assert "FS32 FAIL: fs34_tests did not run" in "\n".join(fs._pair_lines(pair))
+
+
+def test_a_failed_collection_of_the_expected_tests_is_no_pass(monkeypatch):
+    monkeypatch.setattr(fs, "device_tests_expected", lambda file="": ([], "boom"))
+    assert not fs.fs32_pair(_parts())["pass"]
