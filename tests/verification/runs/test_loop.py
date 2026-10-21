@@ -292,6 +292,7 @@ def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, **kw):
 
     monkeypatch.setattr(loop_mod, "_on_cuda", on_cuda)
     monkeypatch.setattr(loop_mod, "GpuBlake3", Warm)
+    monkeypatch.setattr(loop_mod.measure_kernel, "kernels", lambda d: None)  # FS37's kernel
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: not cuda)  # not what decides
     monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
     orig = Verifier.verify_step

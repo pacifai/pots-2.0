@@ -49,6 +49,7 @@ from verification.prover.step import (
 from verification.transcript.store import IN_MEMORY, InMemoryStore, StoreHandoff
 from verification.verifier.context import Rejection
 from verification.verifier.driver import RunVerdict, Verifier
+from verification.verifier.matmul_check import measure_kernel
 
 __all__ = ["ProverFault", "StepRecord", "LoopResult", "run_loop", "PlainStepRecord", "PlainResult",
            "run_plain", "HANDOFF_SECTION", "TOTALS_SECTION", "release_device_cache",
@@ -295,6 +296,7 @@ def run_loop(
     for d in dict.fromkeys(torch.device(x) for x in (device, *(c.placement.devices or ()))
                            if _on_cuda(x)):
         GpuBlake3().kernels(d)
+        measure_kernel.kernels(d)  # check 5's fused measuring kernel (FS37)
     w: Mapping[str, torch.Tensor] = w0
     for t in range(1, verifier.n_steps + 1):
         idx = list(pi(t))
