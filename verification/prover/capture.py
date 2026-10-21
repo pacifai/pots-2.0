@@ -624,7 +624,7 @@ class MatmulCapture(TorchDispatchMode):
         try:
             pend = self._hash_arrival(rec, out, side) if self._hashable(rec, out) else None
         except BaseException:
-            done.synchronize()  # no GPU read of ``out`` may outlive it
+            side.synchronize()  # the copy and any kernel already launched read ``out``
             raise
         # Held until the copy and the hash are done, so the allocator can't reuse its memory
         # under them.

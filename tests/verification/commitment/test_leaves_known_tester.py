@@ -62,6 +62,27 @@ def test_no_known_gives_leaf_hashes_ofs_errors_at_the_same_leaf(c, leaves, known
     assert isinstance(want[1], NonFiniteError)  # index of the NaN is below the shape error
 
 
+@pytest.mark.parametrize("known", [None, {}])
+def test_no_known_pins_the_nans_leaf_on_both_sides(c, leaves, known):  # noqa: F811
+    """NaN at product 3, a cut at product 4 (the next leaf) still gives the NaN's error and a
+    cut at product 2 the shape error, with ``leaf_hashes_of`` and with ``hash_step_leaves``."""
+    from verification.transcript.errors import LeafShapeError
+
+    i = c.product_index(3)
+    for j, kind in ((i + 1, NonFiniteError), (i - 1, LeafShapeError)):
+        bad = list(leaves)
+        bad[i] = bad[i].clone()
+        bad[i].view(-1)[0] = float("nan")
+        bad[j] = bad[j][:-1]
+        want = of_leaf_hashes_of(c, bad)
+        assert type(want[1]) is kind
+        try:
+            got = (hash_step_leaves(c, bad, known=known), None)
+        except Exception as e:  # noqa: BLE001
+            got = (None, e)
+        same_outcome(got, want)
+
+
 def test_a_leaf_count_mismatch_is_refused_with_known_too(c, leaves):  # noqa: F811
     with pytest.raises(ValueError, match="transcript has"):
         hash_step_leaves(c, leaves[:-1], known={c.product_index(1): b"x" * 32})

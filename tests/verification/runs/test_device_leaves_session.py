@@ -106,11 +106,11 @@ def test_the_session_refuses_without_cuda_or_an_h100():
 
 
 def line(**kw):
-    d = dict(acc=True, prover=ROOT, cpu=ROOT, arrival=100, hashed=120, M=120, dK=20)
+    d = dict(acc=True, prover=ROOT, cpu=ROOT, arrival=100, hashed=120, known=100, M=120, dK=20)
     d.update(kw)
     return (f"device leaves: step 1 accepted {d['acc']}, prover root {d['prover']}, "
             f"cpu root {d['cpu']}, arrival digests {d['arrival']}, hashed {d['hashed']}, "
-            f"M {d['M']}, dK leaves {d['dK']}")
+            f"commit known {d['known']}, M {d['M']}, dK leaves {d['dK']}")
 
 
 def test_the_log_line_is_read_into_the_bring_ups_extras(tmp_path):
@@ -118,14 +118,14 @@ def test_the_log_line_is_read_into_the_bring_ups_extras(tmp_path):
     log.write_text("noise\n" + line() + "\n")
     got = fs.part_extras(fs.Part("b", [], kind="bring_up"), log)["device_leaves"]
     assert got == {"step": 1, "accepted": True, "prover_root": ROOT, "cpu_root": ROOT,
-                   "arrival": 100, "hashed": 120, "M": 120, "dK": 20}
+                   "arrival": 100, "hashed": 120, "known": 100, "M": 120, "dK": 20}
     log.write_text("no line here\n")
     assert fs.part_extras(fs.Part("b", [], kind="bring_up"), log)["device_leaves"] is None
 
 
 def test_bring_up_prints_the_line_it_reads(tmp_path):
     steps = [SimpleNamespace(t=1, rejection=None, root=bytes.fromhex(ROOT),
-                             capture={"arrival_hash": {"leaves": 9, "used": 7}})]
+                             capture={"arrival_hash": {"leaves": 9, "used": 7}}, known=6)]
     kept = SimpleNamespace(leaf=lambda i: None)
     b = SimpleNamespace(kept=kept, result=SimpleNamespace(loop=SimpleNamespace(steps=steps)))
     c = SimpleNamespace(n_leaves=0, M=9, products=[])
@@ -140,6 +140,10 @@ def test_bring_up_prints_the_line_it_reads(tmp_path):
     log.write_text(text + "\n")
     got = fs.part_extras(fs.Part("b", [], kind="bring_up"), log)["device_leaves"]
     assert got["arrival"] == 7 and got["hashed"] == 9 and got["M"] == 9 and got["dK"] == 0
+    assert got["known"] == 6
+    steps[0].known = None
+    with pytest.raises(ValueError, match="known count"):
+        bu.device_leaves_line(b, c, T=1)
     assert got["prover_root"] == got["cpu_root"] == ROOT
     with pytest.raises(ValueError, match="keep_last"):
         bu.device_leaves_line(SimpleNamespace(kept=None), c, T=1)
@@ -180,7 +184,7 @@ def _bring(repo, **kw):
     ex = {"device_leaves": None if kw.get("none") else dict(
         step=1, accepted=kw.get("acc", True), prover_root=kw.get("prover", ROOT),
         cpu_root=kw.get("cpu", ROOT), arrival=kw.get("arrival", 100),
-        hashed=kw.get("hashed", 120), M=120, dK=kw.get("dK", 20))}
+        hashed=kw.get("hashed", 120), known=kw.get("known", 100), M=120, dK=kw.get("dK", 20))}
     return {"name": "bring_up_" + repo.split("/")[-1], "kind": "bring_up",
             "status": kw.get("status", "ok"), "info": {"model": repo}, "extras": ex}
 
@@ -269,6 +273,12 @@ def test_roots_that_differ_or_are_missing_fail():
 @pytest.mark.parametrize("arrival", [99, 101, 0, 120])
 def test_an_arrival_count_other_than_m_less_dk_fails(arrival):
     _fails(_parts(**{M1: {"arrival": arrival}}), "arrival digests, expected 100")
+
+
+@pytest.mark.parametrize("known", [99, 101, 0, 120])
+def test_a_commit_known_count_other_than_m_less_dk_fails(known):
+    _fails(_parts(**{M1: {"known": known}}), "the commit took")
+    _fails(_parts(**{M1: {"known": known}}), f"{known} leaves from arrival digests, expected 100")
 
 
 @pytest.mark.parametrize("hashed", [119, 121, 0, 100])

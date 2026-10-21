@@ -48,6 +48,25 @@ def first_product(c):
     return c.product_index(1)
 
 
+def nan_bracket(c, leaves, i, run):
+    """Pin the leaf a NaN at leaf ``i`` is rejected at: ``run(leaves)`` (a call that raises)
+    gives ``NonFiniteError`` when a structural error (the ``[:-1]`` cut) sits at ``i + 1`` and
+    ``LeafShapeError`` when it sits at ``i - 1``, so the reported leaf is ``i`` and no other.
+    Returns the two errors, ``(after, before)``."""
+    nan = list(leaves)
+    nan[i] = nan[i].clone()
+    nan[i][(0,) * nan[i].dim()] = float("nan")
+    out = []
+    for j, kind in ((i + 1, NonFiniteError), (i - 1, LeafShapeError)):
+        bad = list(nan)
+        bad[j] = bad[j][:-1]
+        with pytest.raises(kind) as e:
+            run(bad)
+        assert type(e.value) is kind
+        out.append(e.value)
+    return tuple(out)
+
+
 @pytest.fixture
 def on_kernel(monkeypatch, hostlib):  # noqa: F811
     """CPU float tensors at tensor slots go to the kernel path, on the host build of the core."""
@@ -115,6 +134,12 @@ def test_a_planted_nan_in_a_host_leaf_gives_the_plain_digests_and_error(c, leave
     with pytest.raises(NonFiniteError) as e:
         hash_step_leaves(c, bad, known=known)
     assert str(e.value) == str(want[1])
+    # the leaf: a cut at i + 1 still gives the NaN's error, one at i - 1 the shape error, with
+    # known digests for the leaves before ``i`` and with none
+    want_pair = nan_bracket(c, leaves, i, lambda b: hash_step_leaves(c, b))
+    for kn in (known, None):
+        got = nan_bracket(c, leaves, i, lambda b, kn=kn: hash_step_leaves(c, b, known=kn))
+        assert [str(x) for x in got] == [str(x) for x in want_pair]
 
 
 def test_the_kernel_path_gives_the_plain_digests(c, leaves, on_kernel):
@@ -151,6 +176,23 @@ def test_a_nan_in_a_kernel_leaf_is_the_plain_error(c, leaves, on_kernel, monkeyp
         want = plain(c, bad)
     same_outcome(got, want)
     assert isinstance(got[1], NonFiniteError)
+
+
+@pytest.mark.parametrize("where", ["first", "last"])
+def test_a_kernel_nans_leaf_is_pinned_on_both_sides_and_equals_the_plain_paths(
+        c, leaves, on_kernel, monkeypatch, where):
+    """NaN at leaf ``i`` with ``i - 1`` and ``i + 1`` both kernel leaves (tensor slots past the
+    records on this host build): ``i`` is the second product, or the last leaf but one. A cut at
+    ``i + 1`` still gives the NaN's error and a cut at ``i - 1`` the shape error, on the kernel
+    path (small tables, so the three leaves fall in different ones) and on the plain path."""
+    i = first_product(c) + 1 if where == "first" else c.n_leaves - 2
+    monkeypatch.setattr(L, "_BATCH_ENTRIES", 2)
+    kern = nan_bracket(c, leaves, i, lambda b: hash_step_leaves(c, b))
+    with monkeypatch.context() as mp:
+        mp.setattr(L, "_kernel_leaf", lambda t: False)
+        host = nan_bracket(c, leaves, i, lambda b: hash_step_leaves(c, b))
+    for k, h in zip(kern, host):
+        assert str(k) == str(h)
 
 
 def test_the_smallest_failing_leaf_wins_across_kernel_and_host(c, leaves, on_kernel, monkeypatch):

@@ -80,6 +80,8 @@ def test_honest_run_accepted(c, D, w0, final):
     assert res.verdict.accepted and res.rejection is None and res.verdict.steps_verified == T
     assert [s.t for s in res.steps] == [1, 2, 3] == [s.t for s in seen]
     assert all(s.rejection is None and s.prove_s >= 0 and s.commit_s >= 0 for s in res.steps)
+    # no arrival digests on a CPU, so the commit took none; the loop always fills the count
+    assert [s.known for s in res.steps] == [0, 0, 0]
     # Capture is a passthrough: the captured chain ends bit-identical to the uncaptured one.
     assert all(torch.equal(res.w_final[n], final[n]) for n in c.weight_names)
     assert sorted(v.timings) == [1, 2, 3] and set(v.run_timings) == {"0", "1", "8"}

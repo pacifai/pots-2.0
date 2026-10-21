@@ -379,12 +379,15 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     the root the CPU path gives over the same leaves (:func:`commit_leaves` with no ``known``,
     every leaf hashed by the C library), how many arrival digests the commit could use (``used``),
     how many products the capture hashed on arrival (``hashed``; the ``dK`` records too, whose
-    digests go unused), ``M``, and how many ``dK`` leaves there are (the ones the prover hashes at
-    the commit); and whether the step was accepted. Run on a CPU, no leaf takes a digest and the
-    roots agree trivially."""
+    digests go unused), how many leaves the commit actually took from them (``commit known``,
+    ``HashStats.known`` of the commit's own hash call, ``StepRecord.known``), ``M``, and how many
+    ``dK`` leaves there are (the ones the prover hashes at the commit); and whether the step was
+    accepted. Run on a CPU, no leaf takes a digest and the roots agree trivially."""
     if b.kept is None:
         raise ValueError("device_leaves_line needs the step's leaves: run with keep_last")
     step = next(s for s in b.result.loop.steps if s.t == T)
+    if step.known is None:
+        raise ValueError("device_leaves_line needs the commit's known count (StepRecord.known)")
     leaves = [b.kept.leaf(i) for i in range(c.n_leaves)]
     cpu_root = commit_leaves(c, leaves).root
     ah = (step.capture or {}).get("arrival_hash") or {}
@@ -392,7 +395,8 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     dk = sum(1 for q in c.products if product_class(c, q) == "dK")
     return (f"device leaves: step {T} accepted {step.rejection is None}, "
             f"prover root {step.root.hex() if step.root else 'none'}, cpu root {cpu_root.hex()}, "
-            f"arrival digests {used}, hashed {hashed}, M {c.M}, dK leaves {dk}")
+            f"arrival digests {used}, hashed {hashed}, commit known {step.known}, "
+            f"M {c.M}, dK leaves {dk}")
 
 
 def device_leaves_missing_line(b: BringUp, *, T: int) -> str:
