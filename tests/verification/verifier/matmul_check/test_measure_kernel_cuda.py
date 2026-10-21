@@ -12,6 +12,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 from tests.verification.verifier.matmul_check.test_measure_core import (  # noqa: E402
     H, SHAPES, bits, check_within_bound, host_measure, hostlib, make,  # noqa: F401
 )
+from tests.verification.verifier.matmul_check.test_measure_core_spec import (  # noqa: E402
+    fs36_cases,
+    same_bits,
+)
 from verification.commitment import gpu_blake3 as gb  # noqa: E402
 from verification.computation.interface import ReplayError  # noqa: E402
 from verification.verifier.matmul_check import freivalds as fv  # noqa: E402
@@ -62,7 +66,8 @@ def test_strided_and_transposed_views(host_measure):
     big_a[1:7, 0:38:2] = mi.a
     big_b = torch.zeros(19 + 3, 37 * 2)
     big_b[2:21, 0:74:2] = mi.b
-    views = MeasureGroup(big_a[1:7, 0:38:2].to(DEV)[None], big_b[2:21, 0:74:2].to(DEV)[None],
+    big_a, big_b = big_a.to(DEV), big_b.to(DEV)  # slice on the device: a view keeps its gaps
+    views = MeasureGroup(big_a[1:7, 0:38:2][None], big_b[2:21, 0:74:2][None],
                          mi.p.t().contiguous().to(DEV).transpose(0, 1)[None], [1], mi.bias.to(DEV))
     assert not views.a[0].is_contiguous() and not views.b[0].is_contiguous()
     assert np.array_equal(bits(kernel_rows([views], 3)), bits(want))
@@ -88,7 +93,22 @@ def test_zero_nan_and_inf_inputs(host_measure):
     for mi in cases:
         want = host_rows([with_challenge(mi, 1, 2)], host_measure)
         got = kernel_rows([group_of(mi)], 2, mi.guard)
-        assert np.array_equal(bits(got), bits(want))
+        # a GPU writes its canonical NaN where the host keeps the input's payload
+        assert same_bits(got, want)
+
+
+def test_kernel_equals_host_on_fs36_inputs(host_measure):
+    """Every input FS36 checks bit for bit (the lengths, the order-sensitive cases, NaN, Inf,
+    -0.0 and subnormals in A, B, P and the bias, the halving trees), each through the kernel
+    and the host build. Subnormals are where a flush-to-zero setting would show."""
+    cases = fs36_cases()
+    assert len(cases) >= 200
+    for label, mi in cases:
+        k = mi.r.shape[1]
+        mi = with_challenge(mi, 1, k)
+        want = host_rows([mi], host_measure)
+        got = kernel_rows([group_of(mi)], k, mi.guard)
+        assert same_bits(got, want), (label, got, want)
 
 
 def test_several_groups_of_mixed_shapes_equal_each_group_alone():
@@ -130,7 +150,7 @@ def test_measure_product_row_equals_measure_groups_rows_of_the_same_member():
 
 
 def test_second_build_reads_the_cache_and_fmad_is_off(tmp_path):
-    nv = gb.Nvrtc()
+    nv = gb._nvrtc()
     cc = torch.cuda.get_device_capability()
     first = mk.build(nv, cc, cache=tmp_path, use_cache=True)
     second = mk.build(nv, cc, cache=tmp_path, use_cache=True)
@@ -147,3 +167,38 @@ def test_drain_raises_on_an_input_mutated_after_enqueue():
     with pytest.raises(ReplayError):
         fv.drain()
     fv.drain()  # the list is empty afterwards
+
+
+def test_run_loop_builds_the_measuring_kernel_before_step_1_opens_a_section(monkeypatch):
+    """On a tiny decoder on CUDA, ``run_loop`` calls ``measure_kernel.kernels(cuda device)`` once,
+    after the dataset tree and before any section of the first step, so no NVRTC build lands in
+    a timed step (the loop's pre-build, FS37)."""
+    from contextlib import contextmanager
+
+    from tests.verification.verifier.test_kernel_step import SWITCHES, _setup
+    from verification.runs import loop as loop_mod
+    from verification.verifier.bands import Bands
+    from verification.verifier.driver import Verifier
+
+    c, D, tree, w0 = _setup("cuda", SWITCHES[0], "fp32")
+    log = []
+    real = mk.kernels
+
+    def spy(device):
+        log.append(f"kernels {torch.device(device)}")
+        return real(device)
+
+    monkeypatch.setattr(loop_mod.measure_kernel, "kernels", spy)
+
+    @contextmanager
+    def section(name):
+        log.append(name)
+        yield
+
+    v = Verifier(c, h_D=tree.root, n_records=len(D), k=7, n_steps=1, bands=Bands.provisional(),
+                 allow_provisional=True, w0=w0, seed=1)
+    loop_mod.run_loop(c, c.build_model(), D, w0, v, final=w0, section=section)
+    built = [i for i, x in enumerate(log) if x.startswith("kernels")]
+    assert len(built) == 1 and log[built[0]] == f"kernels {torch.device('cuda', 0)}", log
+    assert log[built[0] - 1] == "run:P4.tree"
+    assert len(log) > built[0] + 1  # the step's sections open after it

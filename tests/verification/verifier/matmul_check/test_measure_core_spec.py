@@ -174,12 +174,9 @@ def assert_matches(host_measure, mis, label=""):
 LENGTHS = (1, 31, 32, 33, 47, 64)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("biased", [False, True])
-@pytest.mark.parametrize("guard", [True, False])
-def test_core_equals_emulator_over_lengths(host_measure, dtype, biased, guard):
-    """For each of L in {1,31,32,33,47,64}, once as the column count w (n, q small) and once as
-    q (w small), the core's rows equal the emulator's bit for bit."""
+def length_cases(dtype, biased, guard):
+    """For each L in LENGTHS: once as the column count w (n, q small), once as q (w small),
+    once as the row count n."""
     mis = []
     seed = 0
     for length in LENGTHS:
@@ -190,7 +187,16 @@ def test_core_equals_emulator_over_lengths(host_measure, dtype, biased, guard):
         seed += 1
         mis.append(product(length if length <= 48 else 48, 3, 4, 2, dtype, biased=biased,
                            guard=guard, seed=seed))
-    assert_matches(host_measure, mis)
+    return mis
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("biased", [False, True])
+@pytest.mark.parametrize("guard", [True, False])
+def test_core_equals_emulator_over_lengths(host_measure, dtype, biased, guard):
+    """For each of L in {1,31,32,33,47,64}, once as the column count w (n, q small) and once as
+    q (w small), the core's rows equal the emulator's bit for bit."""
+    assert_matches(host_measure, length_cases(dtype, biased, guard))
 
 
 def test_core_equals_emulator_on_strided_and_transposed_views(host_measure):
@@ -244,8 +250,9 @@ def test_core_equals_emulator_when_order_matters(host_measure):
     assert any(differs), "naive order never differs: the cases cannot tell the order apart"
 
 
-def test_core_equals_emulator_on_special_values(host_measure):
-    """NaN, Inf, -0.0 and subnormals, in each of A, B, P and the bias."""
+def special_value_cases():
+    """NaN, Inf, -0.0 and subnormals, in each of A, B, P and the bias; zeros; negative zeros;
+    subnormal inputs; bf16 storage."""
     g = torch.Generator().manual_seed(5)
     n, q, w, k = 5, 6, 7, 2
     base = lambda: product(n, q, w, k, torch.float32, biased=True, guard=True, seed=3)  # noqa: E731
@@ -278,19 +285,37 @@ def test_core_equals_emulator_on_special_values(host_measure):
     sb = torch.full((n, q), 1e-40).bfloat16()
     cases.append(MeasureInput(sb, torch.ones(q, w).bfloat16(), torch.zeros(n, w).bfloat16(),
                               mi.r, None, True))
+    return cases
+
+
+def test_core_equals_emulator_on_special_values(host_measure):
+    """NaN, Inf, -0.0 and subnormals, in each of A, B, P and the bias."""
+    cases = special_value_cases()
     assert_matches(host_measure, cases)
     # NaN positions must really occur in some of these rows
     rows = core(host_measure, cases)
     assert np.isnan(rows).any()
 
 
-def test_halving_tree_is_the_pinned_one_fp32(host_measure):
-    """n=1, w=1, q=32: nu = the tree over the 32 partials |B[l]|. The partials are 2^24 at 0
-    and 1 at 1 and 17: the halving tree gives 2^24+2 exactly, a left-to-right sum gives 2^24."""
+def halving_fp32_case():
     v = torch.zeros(32, 1)
     v[0], v[1], v[17] = 2.0 ** 24, 1.0, 1.0
     a = torch.ones(1, 32)
-    mi = MeasureInput(a, v, torch.zeros(1, 1), torch.ones(1, 1), None, True)
+    return v, MeasureInput(a, v, torch.zeros(1, 1), torch.ones(1, 1), None, True)
+
+
+def halving_fp64_case():
+    a = torch.zeros(32, 1)
+    a[0] = 2.0 ** 27
+    for i in (1, 17, 3, 19):
+        a[i] = 1.0
+    return a, MeasureInput(a, torch.ones(1, 1), torch.zeros(32, 1), torch.ones(1, 1), None, True)
+
+
+def test_halving_tree_is_the_pinned_one_fp32(host_measure):
+    """n=1, w=1, q=32: nu = the tree over the 32 partials |B[l]|. The partials are 2^24 at 0
+    and 1 at 1 and 17: the halving tree gives 2^24+2 exactly, a left-to-right sum gives 2^24."""
+    v, mi = halving_fp32_case()
     row = core(host_measure, [mi])[0]
     partials = [float(x) for x in v.view(-1)]
     ltr = 0.0
@@ -305,11 +330,7 @@ def test_halving_tree_is_the_pinned_one_fp32(host_measure):
 def test_halving_tree_is_the_pinned_one_fp64(host_measure):
     """n=32, q=w=1: U^2 = the fp64 tree over 32 row terms u_i = a_i^2. 2^54 at row 0 and 1 at
     rows 1, 17, 3, 19: the tree adds the ones first (2^54+4 exactly); left to right loses all."""
-    a = torch.zeros(32, 1)
-    a[0] = 2.0 ** 27
-    for i in (1, 17, 3, 19):
-        a[i] = 1.0
-    mi = MeasureInput(a, torch.ones(1, 1), torch.zeros(32, 1), torch.ones(1, 1), None, True)
+    a, mi = halving_fp64_case()
     row = core(host_measure, [mi])[0]
     u = [float(x) ** 2 for x in a.view(-1)]
     assert math.fsum(u) == 2.0 ** 54 + 4
@@ -319,3 +340,19 @@ def test_halving_tree_is_the_pinned_one_fp64(host_measure):
     assert ltr == 2.0 ** 54
     assert row[3] == 2.0 ** 54 + 4
     assert same_bits(row, emu(mi))
+
+
+def fs36_cases():
+    """Every input FS36 checks bit for bit, as ``(label, MeasureInput)``: the lengths over both
+    dtypes, biased or not, guard on or off; the order-sensitive cases; the special values; the
+    two halving-tree cases. The kernel tests and their host twin take their list from here."""
+    cases = []
+    for dtype in (torch.float32, torch.bfloat16):
+        for biased in (False, True):
+            for guard in (True, False):
+                for i, mi in enumerate(length_cases(dtype, biased, guard)):
+                    cases.append((f"length {str(dtype)[6:]} biased={biased} guard={guard} #{i}", mi))
+    cases += [(f"hard #{i}", mi) for i, mi in enumerate(hard_cases())]
+    cases += [(f"special #{i}", mi) for i, mi in enumerate(special_value_cases())]
+    cases += [("halving fp32", halving_fp32_case()[1]), ("halving fp64", halving_fp64_case()[1])]
+    return cases
