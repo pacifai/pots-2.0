@@ -5,6 +5,7 @@ import gc
 import multiprocessing as mp
 import pickle
 import re
+import weakref
 
 import pytest
 import torch
@@ -157,6 +158,8 @@ def test_run_verified_drops_the_parents_model_and_counts_sequentially(
 
     alive = []
     real = pipeline.run_pipelined
+    gc.collect()  # models other tests left behind are not this run's
+    before = weakref.WeakSet(o for o in gc.get_objects() if type(o).__name__ == "LlamaForCausalLM")
 
     def spy(*a, **k):
         gc.collect()
@@ -164,6 +167,7 @@ def test_run_verified_drops_the_parents_model_and_counts_sequentially(
         replay = {id(o._vmodel) for o in objs  # the verifier's own replay model is meant to stay
                   if isinstance(o, DecoderComputation) and o._vmodel is not None}
         alive.append(sum(type(o).__name__ == "LlamaForCausalLM" and id(o) not in replay
+                         and o not in before
                          for o in objs))
         return real(*a, **k)
 
