@@ -138,6 +138,7 @@ import torch
 from blake3 import blake3
 
 from setup.config import assert_no_dropout
+from verification.commitment import kernel_check
 from verification.commitment.gpu_blake3 import GpuBlake3
 from verification.commitment.leaves import (
     HashStats,
@@ -309,6 +310,7 @@ def _await_bye(conn: Connection, timeout: float = 60.0) -> None:
 def _child_run(conn: Connection, args: _ChildArgs) -> None:
     # These bytes are the parent's own ``pickle.dumps`` of its own objects, sent to its own
     # child over a private pipe: not untrusted input.
+    kernel_check.new_run()  # the child's own set of checked shapes (FS34)
     spec = pickle.loads(args.spec)  # noqa: S301
     fault: ProverFault = pickle.loads(args.fault)  # noqa: S301
     schedule = pickle.loads(args.schedule)  # noqa: S301
@@ -620,6 +622,7 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
                   recorder: TimeRecorder | MemoryRecorder | None,
                   prover: ProverSpec | None) -> LoopResult:
     """The pipelined loop; see the module docstring. ``run_loop`` calls it with its arguments."""
+    kernel_check.new_run()  # first, before anything is dispatched (FS34)
     fault = fault or ProverFault()
     if prover is None:
         raise ValueError("pipelined: the prover's process needs a ProverSpec (prover=...)")
@@ -661,6 +664,11 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
             link.stop(grace=0)
             result.verdict = verifier.end_run(final)
             return result
+        # The parent's kernels (it hashes nothing on a device today, but the verifier's own
+        # leaf hashing may): loaded here, outside every section, before step 1 (FS34).
+        for d in dict.fromkeys(torch.device(x) for x in (c.placement.devices or ())
+                               if _is_cuda(x)):
+            GpuBlake3().kernels(d)
         _, hs, part0 = link.expect("ready")
         _check_handshake(hs, c, verifier, w0)
         if recorder is not None:

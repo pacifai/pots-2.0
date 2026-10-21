@@ -34,6 +34,7 @@ import torch
 
 from setup import data
 from setup.config import assert_no_dropout, load_config
+from verification.commitment import kernel_check
 from verification.commitment.gpu_blake3 import GpuBlake3
 from verification.commitment.leaves import HashStats, dataset_tree, leaf_totals
 from verification.computation.interface import DeclaredComputation
@@ -248,6 +249,7 @@ def run_loop(
     ``handoff_s`` the parent's ``SharedStore.open``, ``close`` and cache release. The child's
     release and the wait for its answer are in none of them.
     """
+    kernel_check.new_run()  # first: a new run checks every kernel shape afresh (FS34)
     if pipelined_setting(pipelined):
         if model is not None:
             raise ValueError("pipelined: the prover's model is built in the prover's process; "
