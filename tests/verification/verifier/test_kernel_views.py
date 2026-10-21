@@ -59,7 +59,9 @@ class Kernel:
 @pytest.fixture
 def kernel(monkeypatch):
     kern = Kernel()
-    monkeypatch.setattr(freivalds, "kernel_device", lambda device: True)
+    # `reference()` still forces the torch path, as the real `kernel_device` does: the stand-in
+    # measures through `measure_product_row` under it
+    monkeypatch.setattr(freivalds, "kernel_device", lambda device: freivalds._reference_depth == 0)
     monkeypatch.setattr(freivalds, "measure_groups_rows", kern.measure)
     monkeypatch.setattr(freivalds, "drain", kern.drain)
     real_read = checks._read_rows
@@ -205,7 +207,7 @@ def test_a_serving_error_in_a_group_finds_the_same_member_and_error(role, kernel
             tamper(self, ms), _r(self, ms, *a))[1])
     runs = []
     for on in (True, False):
-        monkeypatch.setattr(freivalds, "kernel_device", lambda device, on=on: on)
+        monkeypatch.setattr(freivalds, "kernel_device", lambda device, on=on: on and freivalds._reference_depth == 0)
         done.clear()
         kernel.calls.clear()
         with pytest.raises(ReplayError) as e:
