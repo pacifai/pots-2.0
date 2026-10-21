@@ -829,3 +829,107 @@ def test_the_pair_deadline_is_twice_the_estimate_rounded_up_to_100_s():
     assert d == 16100 and "DEFAULT_DEADLINE_S=16100" in (
         ROOT / "verification/runs/fs11_job.sh").read_text()
     assert sum(fs.PAIR_ESTIMATE_MIN.values()) + fs.PAIR_PACK_MIN + fs.PAIR_GRACE_MIN == 134
+
+
+# ---- scope of the check and the keyword ------------------------------------------------------
+
+
+def test_under_native_disabled_no_entry_uses_the_kernel_or_checks(c, leaves, on_kernel):  # noqa: F811
+    i = first_product(c)
+    with native.disabled():
+        st = HashStats()
+        leaf_hashes_until_error(c, items(leaves), st)
+        hash_step_leaves(c, leaves, st, known={i: bytes(32)})  # a wrong known digest is taken
+        assert st.crosschecks == 0 and st.kernel == 0 and not kc._checked
+
+
+def test_kernel_false_on_every_entry_and_on_native_until_error(c, leaves, on_kernel):  # noqa: F811
+    st = HashStats()
+    leaf_hashes_until_error(c, items(leaves), st, kernel=False)
+    d, err = L._native_until_error(c, items(leaves), st, kernel=False)
+    assert err is None and st.kernel == 0 and st.crosschecks == 0 and not kc._checked
+    assert d == leaf_hashes_of(c, items(leaves))
+
+
+def test_hashstats_kernel_counts_the_leaves_the_kernel_hashed_on_either_entry(c, leaves, on_kernel):  # noqa: F811
+    n_t = len(leaves) - c.n_s
+    a, b, s = HashStats(), HashStats(), HashStats()
+    leaf_hashes_of(c, items(leaves), a)
+    leaf_hashes_until_error(c, items(leaves), b)
+    hash_step_leaves(c, leaves, s)
+    assert a.kernel == b.kernel == s.kernel == n_t
+    d = leaf_hashes_of(c, items(leaves), kernel=False)
+    s2 = HashStats()
+    known = {i: d[i] for i in range(c.n_s, c.n_leaves, 2)}
+    hash_step_leaves(c, leaves, s2, known=known)
+    assert s2.kernel == n_t - len(known) and s2.known == len(known)
+
+
+def test_the_wait_for_the_tables_counts_in_wait_s(c, leaves, on_kernel, monkeypatch):  # noqa: F811
+    import time
+
+    real = gb.PendingHash.result
+
+    def slow(self, *a, **k):
+        time.sleep(0.05)
+        return real(self, *a, **k)
+    monkeypatch.setattr(gb.PendingHash, "result", slow)
+    st = HashStats()
+    leaf_hashes_of(c, items(leaves), st)
+    assert st.wait_s >= 0.05
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "the known-digest check runs only for a leaf _kernel_leaf accepts (a CUDA leaf): on the "
+    "one-GPU path the products sit in host memory, so a wrong arrival digest there is never "
+    "compared with the C library, though DECISIONS_FULL_SCALE says each path checks the first "
+    "digest of each device and header; the run then ends in check 2's root mismatch, a "
+    "rejection of an honest prover that rests on a kernel error"))
+def test_a_wrong_arrival_digest_on_a_host_product_is_a_mismatch_not_a_root_difference(c, leaves):
+    i = first_product(c)
+    with pytest.raises(kc.KernelMismatchError):
+        hash_step_leaves(c, leaves, known={i: bytes(32)})
+
+
+def test_a_wrong_arrival_digest_on_a_host_product_today_changes_the_root(c, leaves):
+    i = first_product(c)
+    good = hash_step_leaves(c, leaves)
+    got = hash_step_leaves(c, leaves, known={i: bytes(32)})
+    assert got[i] == bytes(32) and got != good  # the choice's cost, pinned
+
+
+def test_a_mutation_while_taking_the_checks_host_copy_is_an_error_at_that_leaf(  # noqa: F811
+        c, leaves, on_kernel, monkeypatch):
+    from verification.commitment import hostcopy
+
+    i = first_product(c) + 2
+    real = hostcopy.host_tensor
+
+    def mutating(t):
+        if t is leaves[i]:
+            raise StoreMutationError("moved")
+        return real(t)
+
+    monkeypatch.setattr(hostcopy, "host_tensor", mutating)
+    want = leaf_hashes_of(c, items(leaves), kernel=False)
+    d, err = leaf_hashes_until_error(c, items(leaves))
+    assert isinstance(err, StoreMutationError) and f"leaf {i} was mutated in place" in str(err)
+    assert d == want[:i]
+
+
+def test_another_failure_of_the_checks_host_copy_propagates_after_the_tables_are_read(  # noqa: F811
+        c, leaves, tracked, monkeypatch):
+    from verification.commitment import hostcopy
+
+    i = first_product(c) + 4
+    real = hostcopy.host_tensor
+
+    def boom(t):
+        if t is leaves[i]:
+            raise OSError("copy failed")
+        return real(t)
+
+    monkeypatch.setattr(hostcopy, "host_tensor", boom)
+    with pytest.raises(OSError, match="copy failed"):
+        leaf_hashes_until_error(c, items(leaves))
+    assert all(r in tracked.read for r in range(len(tracked.queued)))
