@@ -66,7 +66,7 @@ nothing above them.
 | `commitment/` | `encoding.py`, `merkle.py`, `leaves.py`, `gpu_blake3.py`, `gpu_blake3.cu`, `gpu_blake3_core.h` | Canonical bytes, the hash tree, the roots `h` and `h_D` |
 | `computation/` | `interface.py`, `matmul_ops.py`, `substitution.py`, `leaf_sizes.py`, `instances/mlp.py`, `instances/decoder.py` | What a step *is*: weights, products, their order, and how to rebuild each product's operands |
 | `prover/` | `capture.py`, `step.py` | Run a real training step, record every matmul, commit |
-| `transcript/` | `reader.py`, `store.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
+| `transcript/` | `reader.py`, `store.py`, `shared.py`, `errors.py` | Lay a step out as ordered leaves and serve it to the verifier |
 | `verifier/` | `checks.py`, `driver.py`, `context.py`, `bands.py`, `residuals.py`, `matmul_check/` | Run the checks, track a run from start to verdict, summarize the residuals |
 | `runs/` | `loop.py`, `scenarios.py`, `mlp_smoke.py`, `llama_step.py`, `bring_up.py`, `store_crosscheck.py`, `metrics.py`, `metrics_overhead.py`, `materialize_data.py`, `plain_baseline.py`, `full_scale.py` | Connect prover and verifier step by step, run scenarios, bring up each full-scale model on CPU, record costs and residuals, write the dataset files, drive one model and attack through every run in order |
 | `evaluation/` | `records.py`, `output.py`, `results/` | Read every run directory into tables, write figures and tables under `evaluation/results/<scale>/` |
@@ -334,6 +334,14 @@ once the step is verified. `runs/store_crosscheck.py` (C3) runs the same scenari
 and checks the verifier decides the same. The honest verified run also keeps one step's
 transcript on disk for the evaluation (step 4 by default, `DiskHandoff(keep=True)`) and
 checks that the root recomputed from the files is the step's root.
+
+`SharedStore` (`shared.py`) is the cross-process store of the pipelined loop: the prover's
+process calls `share_step` and sends the package down a pipe, and the verifier's process opens
+it as a store. Each distinct storage crosses once and each leaf is a table row (storage,
+offset, dtype, shape, stride). CUDA storages cross by CUDA IPC handle without a copy; CPU
+storages are copied once into one shared-memory buffer per step. The version check runs on
+both sides, each on its own tensors: the consumer's `leaf` raises on an in-place write, and
+the producer's `hold.release()` raises, naming the leaf, if a leaf changed while shared.
 
 ### Verifier side: `verifier/`
 

@@ -272,7 +272,7 @@ verification/
   commitment/            canonical leaf bytes and the tree that binds them into a root
   computation/           the declared computation C and its instances
   prover/                matmul capture, the step, the commit
-  transcript/            the reader protocol, the stores and the format errors
+  transcript/            the reader protocol, the stores (incl. shared.py) and the format errors
   verifier/              the checks, their shared state, the bands and the run driver
     matmul_check/        check 5's test: challenges, the residual measure, k sizing
   runs/                  entry points and the per-step loop
@@ -1385,6 +1385,23 @@ interface.
     `.release(store)`. `IN_MEMORY` (`InMemoryHandoff`) is `InMemoryStore.hold`, release a
     no-op. `DiskHandoff(dir, keep=False)` writes step `t` to `dir/step_<t>/` and deletes it
     on release.
+  - **Across processes (`shared.py`, FS33a).** Harness side; the verifier never imports it.
+    `share_step(c, t, leaves, tree, dataset_paths) -> (package, hold)` in the prover's process;
+    `conn.send(package)`; `SharedStore.open(c, package)` in the verifier's (a `TranscriptStore`);
+    `store.close()`; then `hold.release()`.
+    - One transfer per distinct storage and a flat table per leaf (storage, offset, dtype,
+      shape, stride); the consumer rebuilds each leaf with `set_`, on first read.
+    - **Transport by device.** CUDA storages cross by CUDA IPC handle, no copy: the hold keeps
+      them alive until `release`, which then calls `torch.cuda.ipc_collect`. CPU storages are
+      copied once into one shared-memory buffer per step (test scale's only extra cost).
+      Records and the tree go by value.
+    - **Invariant 6 on both sides, each on its own tensors.** `SharedStore.leaf` checks
+      `_version` and raises `StoreMutationError`. `hold.release` checks every leaf's `_version`
+      from `share_step` and raises naming the first changed leaf; FS33b treats a failed release
+      as a run error and publishes no verdict. `close` and `release` are idempotent.
+    - Two steps may be alive at once; each package and hold owns its own references.
+    - `TypeError` at `share_step` for a non-tensor non-`Record` leaf, a device other than CPU
+      or CUDA, or a sparse, non-strided, quantized, conjugate or negated tensor.
   - Check 7 compares this step's `W_t` hashes with the previous step's `W_{t+1}` hashes. The
     verifier keeps those from its own check-2 recomputation of step t−1. It hashes the
     `W_t` leaves in parallel through `leaf_hashes_until_error`, reads under the same
