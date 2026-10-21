@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from tests.verification.full_scale_helpers import PINS
+from tests.verification.runs.session_env import clean_environ
 from verification.runs import fs11_session as fs
 
 JOB = Path(fs.__file__).with_name("fs11_job.sh")
@@ -792,7 +793,7 @@ def test_a_mismatch_keeps_the_affected_parts_from_starting(tmp_path):
 
 def _job(tmp_path, *, plan=None, python=sys.executable, deadline=6, grace=1, reserve=1,
          extra=None, timeout=60, popen=False):
-    env = {k: v for k, v in os.environ.items() if k not in ("RUNPOD_POD_ID", "RUNPOD_API_KEY")}
+    env = clean_environ()
     env.update({"DRY_RUN": "1", "FS11_DEADLINE_S": str(deadline), "FS11_GRACE_S": str(grace),
                 "FS11_PACK_RESERVE_S": str(reserve), "FS11_PYTHON": python,
                 "FS11_MIN_FREE_GB": "0", **(extra or {})})
@@ -1156,7 +1157,7 @@ def test_job_and_timer_never_terminate_at_once(tmp_path):
 
 def test_guard_dry_run(tmp_path):
     log = tmp_path / "guard.log"
-    env = {k: v for k, v in os.environ.items() if k != "RUNPOD_POD_ID"}
+    env = clean_environ()
     r = subprocess.run(["sh", str(GUARD), "1"], env={**env, "DRY_RUN": "1",
                        "FS11_GUARD_LOG": str(log)}, capture_output=True, text=True, timeout=10)
     assert r.returncode == 0 and "disarm with: kill" in r.stdout
@@ -1165,7 +1166,7 @@ def test_guard_dry_run(tmp_path):
 
 
 def test_guard_refuses_without_a_pod(tmp_path):
-    env = {k: v for k, v in os.environ.items() if k != "RUNPOD_POD_ID"}
+    env = clean_environ()
     r = subprocess.run(["sh", str(GUARD), "1"], env={**env, "DRY_RUN": "0"},
                        capture_output=True, text=True, timeout=10)
     assert r.returncode == 2 and "RUNPOD_POD_ID is not set" in r.stderr
@@ -1212,7 +1213,7 @@ def test_boot_guard_starts_the_image_and_terminates_later(tmp_path, modes, ends_
     script = shlex.split(_boot_guards()[0])[2]
     script = (script.replace("sleep 16200;", "sleep 1;").replace("sleep 30;", "sleep 0;")
               .replace("/tmp/guard.log", str(guard_log)).replace("/start.sh", str(start)))
-    subprocess.run(["bash", "-c", script], env={**os.environ, **env}, check=True, timeout=10,
+    subprocess.run(["bash", "-c", script], env=clean_environ(env), check=True, timeout=10,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     assert _calls(log) == ["started"]  # the image's entry ran; the guard still sleeps
     assert _wait_for(lambda: _calls(log)[-1] == ends_with, 15), _calls(log)
