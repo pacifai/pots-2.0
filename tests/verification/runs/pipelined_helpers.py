@@ -126,3 +126,80 @@ def kill_child():
 def first_batches(t):
     """A picklable schedule that is not the verifier's π."""
     return [0, 1, 2, 3]
+
+
+# ---- the tester's additions (FS33b tester) --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MLPVariantSpec:
+    """An MLP spec that differs from the parent's in one respect: ``eta``, the dataset's seed,
+    or the weights' dtype. ``W_0`` is the parent's (seed 0, float32 unless ``w_dtype``)."""
+
+    eta: float = 1e-3
+    data_seed: int = 0
+    w_dtype: str | None = None
+
+    def __call__(self):
+        determinism()
+        c = MLPComputation(WIDTHS, n_s=N_S, eta=self.eta)
+        w0 = init_weights(c.widths, seed=0)
+        if self.w_dtype:
+            w0 = {n: v.to(getattr(torch, self.w_dtype)) for n, v in w0.items()}
+        return ProverSide(c, c.build_model, synthetic_dataset(c.widths, N_RECORDS,
+                                                              seed=self.data_seed), w0)
+
+
+class RaisingSpec:
+    """A spec that raises before the child is ready."""
+
+    def __call__(self):
+        raise RuntimeError("RaisingSpec: boom before ready")
+
+
+class SelfKillSpec:
+    """A spec whose process dies (SIGKILL) before it is ready."""
+
+    def __call__(self):
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+@dataclass(frozen=True)
+class SleepSpec:
+    """A spec that sleeps ``seconds`` before it builds anything (the handshake window)."""
+
+    seconds: float = 120.0
+
+    def __call__(self):
+        import time
+
+        time.sleep(self.seconds)
+        return MLPSpec()()
+
+
+class StubbornAt(ProverFault):
+    """From step ``t`` on, ignores SIGTERM and sleeps ``seconds`` at the start of the step: only
+    ``kill`` ends it."""
+
+    def __init__(self, t, seconds):
+        self.t, self.seconds = t, seconds
+
+    def entry_weights(self, t, w):
+        if t == self.t:
+            import time
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            time.sleep(self.seconds)
+        return w
+
+
+class BindProbe(ProverFault):
+    """Raises in the child's step 1 with what ``bind`` handed it, so the parent's exception
+    text shows it."""
+
+    def bind(self, c, build_model):
+        self.seen = (type(build_model).__name__, type(c).__name__, c.n_leaves)
+
+    def entry_weights(self, t, w):
+        raise RuntimeError(f"BindProbe saw {getattr(self, 'seen', None)!r}")
+
