@@ -2379,3 +2379,87 @@ against the closed setup and evaluation decisions. It left 10 open items.
     - *Rejected:* copying the host products back to the GPU at commit (30–54 GB of
       host-to-device copying per step, about 1.5–2.5 s), and keeping the products on the GPU
       (doesn't fit).
+  - **FS34's mechanism** *(implementation choices, 2026-10-21, at FS34's brief; ranked by
+    speed; none changes a digest, a root or a check)*.
+    - **The owners hash the products on arrival.** Under the sharded placement capture
+      peer-copies each product to its hinted owner (FS32d), and until FS34 it hashed nothing
+      there. Now the kernel's table for the product goes on the owner's side stream, behind the
+      copy's event, as `_offload` queues it behind the host copy. Its digests are keyed by the
+      copy's storage, so `arrival_digest` and the commit take them as on the one-H100 path. A
+      product already on its owner (the two-GPU pod's GPU 0) is hashed where it sits. The
+      `δK̃` transposes and the hint misses get no arrival digest; the kernel hashes them at
+      commit. Training's GPU does no hashing.
+      - *Rejected: hashing on GPU 0 before the copy.* It puts the hashing on the training GPU,
+        on the prover's critical path; G1 puts it on the owners, which train nothing.
+    - **One routing for every hash call.** The kernel moves behind the seam that FS32b built
+      for device leaves. Inside the native path, which every caller of `leaf_hashes_of` and
+      `leaf_hashes_until_error` uses, a CUDA tensor leaf that passes its structural checks is
+      hashed in place by the kernel. The tables are per device, closed at `_BATCH_BYTES` or
+      `_BATCH_ENTRIES`, queued as the leaves are read and read at the end of the call.
+      `hash_step_leaves` keeps `known` and sends every other leaf through the same path, so the
+      prover's commit and the verifier's hashes share one implementation.
+      - Check 2, check 7, check 0's anchor and every other verifier-side hash of a device leaf
+        now take the kernel. A host leaf takes the C library as before, so test scale and the
+        one-H100 path don't change. The host copy stays for MPS leaves and for the per-shape
+        check below.
+      - Errors stay the plain path's: the one at the smallest failing position wins, and a read
+        error comes after every leaf read before it. Under `native.disabled()` (the counting
+        pass) the Python path runs as before, with no kernel.
+      - The reference comparisons keep a way to force the C library (`kernel=False`):
+        `bring_up`'s CPU root and the tests' expected digests.
+      - Speed: check 2 took 5.0–10.1 s per step on the CPU in FS30's session. On the kernel it
+        is 34–70 GB at the measured 380–600 GB/s, about 0.1–0.2 s of kernel time per step
+        split over three GPUs (floor). Building the tables for 111k–394k leaves in Python
+        adds to that (unmeasured).
+      - *Rejected: check 2 kept on the CPU* (FS30 as built): it is the slowest hashing left
+        in the step.
+    - **Decision 4's per-shape check.** Once the verifier hashes with the kernel, no step
+      recomputes a kernel digest by another implementation (K4 ends), so decision 4's check
+      takes its place.
+      - Every kernel digest a run uses comes from one of two code paths: capture's arrival
+        tables, or the hashing call's tables. On each path the run checks the first digest of
+        each device and leaf header (tag, dtype and shape): the leaf's host copy, taken with its
+        `_version` checked, is hashed by the C library and the two digests are compared. The
+        tag adds a few leaves to decision 4's shape and dtype. The check reads the digest the
+        run uses, in the table that computed it. A key counts as checked only after its
+        comparison passes.
+      - A mismatch raises `KernelMismatchError`. It is a `RuntimeError`, not a prover-data
+        error, and it names the device, the header, the leaf and both digests. It beats any
+        other error of the call, since a wrong kernel also decides finiteness and no verdict
+        may rest on it. No check turns it into a rejection: the run stops with no verdict. In a
+        pipelined run the child's mismatch reaches the parent as a `ProverProcessError`.
+      - Scope: a process-wide set of checked keys. `run_loop` clears it at the start of each
+        run, before the pipelined dispatch, so each run checks again and a pipelined run's two
+        processes each check their own. In a sequential run the prover and the verifier share
+        the set: an accepted step's root equals the prover's, so its leaf digests are the
+        prover's, and a check on either side covers both. A call outside `run_loop` uses the
+        set as it stands, so every key is checked at least once per process.
+      - Cost: about 60 keys over three GPUs (estimate), about 4 GB of host copies and C
+        hashing per process per run, about 1 s (floor, unmeasured). It lands in step 1's
+        commit and check 2. No cost report includes step 1: reports average honest runs'
+        judged steps, and no honest run judges step 1.
+      - Price: a kernel error on a leaf other than the first of its key goes unseen when both
+        sides share the kernel. That is decision 4's accepted coverage.
+      - *Rejected: synthetic leaves at run start* (one per declared shape and device, hashed
+        both ways before step 1). It would keep step 1 clean, but it tests the kernel apart
+        from the tables and code paths that make the run's digests: a table's mix of leaf
+        sizes, and capture's member addresses.
+      - *Rejected: once per process.* One process may run several runs (the cheats harness),
+        and decision 4 says once per run.
+    - **The kernels load before step 1 in both processes.** `run_loop` already loads them on
+      every CUDA device of a sequential run, and the pipelined child on its own. The pipelined
+      parent now loads them on its verifier devices too, outside every section; until FS34 it
+      hashed only on the CPU.
+    - **Tests and the gate.**
+      - On the Mac, through the kernel seam on CPU tensors: the routing's digests and first
+        errors against the C library, on lazy and listed input; mutations; the per-shape check
+        once per run and per path; and a planted mismatch, a fake kernel that corrupts one key,
+        which stops a run from the commit, from check 2 and from an arrival digest, sequential
+        and pipelined, with no verdict.
+      - On CUDA: every sharded leaf's kernel digest equals the C library's; the owners hash
+        the products on arrival (`arrival_digests` holds `M` less the `δK̃` leaves and the
+        misses); and the planted mismatch on the card.
+      - The two-GPU pair session runs these tests. Its comparison of roots between the
+        unsharded arm (check 2 on the C library) and the sharded arm (check 2 on the kernel) is
+        the gate's "roots equal to the CPU path's".
+      - No fault hook enters production code: the plant is a test's monkeypatch.
