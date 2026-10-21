@@ -4,6 +4,7 @@
  * no GPU. Build with -ffp-contract=off. */
 #include <stdlib.h>
 #include "measure_core.h"
+#include "measure_phases.h"
 
 size_t pots_host_sizeof_mview(void) { return sizeof(pots_mview_t); }
 size_t pots_host_sizeof_mprod(void) { return sizeof(pots_mprod_t); }
@@ -136,6 +137,71 @@ int pots_host_measure(const pots_mprod_t *tab, uint64_t n, double *rows) {
     int e = measure_one(&tab[i], rows);
     if (e != POTS_ERR_OK) return e;
     rows += 5 + tab[i].k;
+  }
+  return POTS_ERR_OK;
+}
+
+/* ---- the fused kernel's decomposition (measure_kernel.cu), run on the host ---- */
+
+size_t pots_host_sizeof_mwork(void) { return sizeof(pots_mwork_t); }
+uint64_t pots_host_scratch_bytes(int64_t n, int64_t q, uint32_t k) {
+  return pots_mscratch_bytes(n, q, k);
+}
+
+/* The GPU's tree: every lane adds the value `off` lanes above it (its own where that is past
+ * the warp), for off = 16, 8, 4, 2, 1, all lanes at once; lane 0's value is the result. */
+static void shfl_tree_f(float *v) {
+  for (pots_u32 off = 16; off >= 1; off >>= 1) {
+    float w[POTS_LANES];
+    for (pots_u32 i = 0; i < POTS_LANES; i++) w[i] = v[i] + (i + off < POTS_LANES ? v[i + off] : v[i]);
+    for (pots_u32 i = 0; i < POTS_LANES; i++) v[i] = w[i];
+  }
+}
+static void shfl_tree_d(double *v) {
+  for (pots_u32 off = 16; off >= 1; off >>= 1) {
+    double w[POTS_LANES];
+    for (pots_u32 i = 0; i < POTS_LANES; i++) w[i] = v[i] + (i + off < POTS_LANES ? v[i + off] : v[i]);
+    for (pots_u32 i = 0; i < POTS_LANES; i++) v[i] = w[i];
+  }
+}
+
+/* The three phases over every product, as the kernel runs them: for each item (a warp) each
+ * step takes its 32 lane partials, the shuffle tree, and lane 0's store. `works` has n + 1
+ * entries (the last holds the totals) and every scratch address is set, as the Python side
+ * builds them. `reverse` runs each phase's items last to first:
+ * the items of a phase are independent, so the order gives the same bits. Rows are width 5 + k. */
+int pots_host_measure_phased(const pots_mprod_t *tab, uint64_t n, const pots_mwork_t *works,
+                             double *rows, int reverse) {
+  uint64_t i, g;
+  pots_u32 phase;
+  for (i = 0; i < n; i++) {
+    int e = pots_mprod_check(&tab[i]);
+    if (e != POTS_ERR_OK) return e;
+  }
+  for (phase = 0; phase < POTS_PHASES; phase++) {
+    uint64_t total = works[n].start[phase];
+    for (g = 0; g < total; g++) {
+      uint64_t gi = reverse ? total - 1 - g : g;
+      uint64_t item, pi = pots_mfind(works, n, phase, gi, &item);
+      const pots_mprod_t *t = &tab[pi];
+      pots_mscr_t sc = pots_mscr_make(t, works[pi].scratch);
+      double *row = rows + pi * (POTS_ROW_FIXED + t->k);
+      pots_u32 steps = pots_phase_steps(t, phase, (pots_i64)item), s, lane;
+      for (s = 0; s < steps; s++) {
+        double part[POTS_LANES];
+        for (lane = 0; lane < POTS_LANES; lane++)
+          part[lane] = pots_phase_partial(t, &sc, phase, (pots_i64)item, s, lane);
+        if (pots_phase_double(t, phase, (pots_i64)item, s)) {
+          shfl_tree_d(part);
+        } else {
+          float f[POTS_LANES];
+          for (lane = 0; lane < POTS_LANES; lane++) f[lane] = (float)part[lane];
+          shfl_tree_f(f);
+          part[0] = (double)f[0];
+        }
+        pots_phase_store(t, &sc, row, phase, (pots_i64)item, s, part[0]);
+      }
+    }
   }
   return POTS_ERR_OK;
 }
