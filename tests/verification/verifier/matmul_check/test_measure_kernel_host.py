@@ -99,6 +99,38 @@ def levels(hostlib, host_measure):
     return run
 
 
+@pytest.fixture(scope="module")
+def sweep(hostlib, host_measure):
+    hostlib.pots_host_measure_sweep.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_int]
+    hostlib.pots_host_measure_sweep.restype = ctypes.c_int
+
+    def run(mis, *, reverse=False, tile=64, kc=16, share=True, raw=False):
+        """The rows of ``mis`` by the level kernel's sweeps (FS37b) run in loops: tiles of
+        ``tile`` columns, chunks of ``kc`` challenge columns, ``mk.read_plan`` (or
+        ``mk.plain_plan`` for ``share=False``) for the launches."""
+        table = pack(mis)
+        prods = np.frombuffer(table.array, dtype=mk.MPROD_DTYPE).copy()
+        scratch = np.zeros(mk.scratch_bytes(prods) + 8, dtype=np.uint8)
+        base = (scratch.ctypes.data + 7) & ~7
+        works = mk.works_array(prods, base)
+        plan = mk.read_plan(prods) if share else mk.plain_plan(prods)
+        rows = mt.empty_rows(table)
+        err = hostlib.pots_host_measure_sweep(
+            prods.ctypes.data, len(prods), works.ctypes.data, plan.reads.ctypes.data,
+            plan.level_off.ctypes.data, plan.n_levels, plan.entries.ctypes.data,
+            rows.ctypes.data, tile, kc, int(reverse))
+        if raw:
+            return err, rows
+        assert err == 0
+        return rows
+
+    run.reference = lambda mis: host_measure(pack(mis))
+    return run
+
+
 def same(rows, ref):
     assert np.array_equal(bits(rows), bits(ref))
 
@@ -122,6 +154,16 @@ def test_phased_equals_the_host_build_on_every_fs36_case(phased):
     assert len(cases) >= 200
     for label, mi in cases:
         want, got = phased.reference([mi])[0], phased([mi])[0]
+        assert same_bits(got, want), (label, got, want)
+
+
+def test_sweep_equals_levels_on_every_fs36_case(sweep, levels):
+    """FS37b: the level kernel's sweeps on the host (default tile and chunk) against the
+    step-by-step level run, each FS36 case alone."""
+    cases = fs36_cases()
+    assert len(cases) >= 200
+    for label, mi in cases:
+        want, got = levels([mi])[0], sweep([mi])[0]
         assert same_bits(got, want), (label, got, want)
 
 
