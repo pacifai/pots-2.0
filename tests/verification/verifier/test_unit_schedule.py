@@ -346,11 +346,12 @@ def test_two_flips_in_different_windows(small_window, monkeypatch):
 class ServingFault:
     """Patch ``operands``, ``operand_group`` and ``operand_blocks`` of ``DecoderReplay`` so
     that serving product ``m`` raises ``make()``, on every replay (a fresh one too), or only on
-    the first replay built (``first_only``, keyed on the replay object)."""
+    the first replay that serves (``first_only``, keyed on the replay object; bound once, so
+    if it dies no later replay matches)."""
 
     def __init__(self, mp, m, make, first_only=False):
         self.m, self.make, self.first_only = m, make, first_only
-        self.first = None  # weakref to the first replay that served anything
+        self.first = None  # weakref to the first replay that served; bound once, never re-bound
         self.fired = 0
         for name, arity in (("operands", "one"), ("operand_group", "many"),
                             ("operand_blocks", "many")):
@@ -358,7 +359,7 @@ class ServingFault:
 
     def _wrap(self, real, arity):
         def serve(replay, ms, *args, **kw):
-            if self.first is None or self.first() is None:
+            if self.first is None:
                 self.first = weakref.ref(replay)
             hit = self.m == ms if arity == "one" else self.m in ms
             if hit and (not self.first_only or self.first() is replay):
