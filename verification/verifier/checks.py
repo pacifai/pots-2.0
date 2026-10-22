@@ -607,6 +607,9 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     products with its backward ones, so the replay runs its forward pass once and each backward
     unit once (:func:`_check_5_units`). Every run's rows stay on the device and are read back
     once, per device, at the first window, and the windows are then judged in canonical order.
+    A step whose runs are all kernel runs is served run by run and measured as one table, one
+    ``measure_groups_rows(share=True)`` call per device, whose rows are split back to the runs
+    (:func:`_measure_step_kernel`); any other step is measured run by run.
     A replay without one (the MLP) is served and judged in canonical order
     (:func:`_check_5_canonical`), each window as it fills, and so is the rerun on a fresh
     replay when the unit pass raises (a serving or measuring error, a failed read).
@@ -622,7 +625,10 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
       (:func:`_measure_served`): the replay serves the group's operands stacked
       (``Replay.operand_group``), its ``P`` leaves move to the device in one copy, and the
       group is measured in batched ops, each member with its own challenges and norm scaling
-      (``freivalds.measure_products_rows``). Only its rows are kept.
+      (``freivalds.measure_products_rows``). Only its rows are kept. On the unit path with
+      the kernel the batching is one table per schedule step instead: the step's groups,
+      served as views, are measured by one call that reads a stored matrix several products
+      share once (FS38b); the canonical path measures a group at a time.
     - The numbers stay on the device as one row per product. On the canonical path, once at
       least :data:`_JUDGE_WINDOW` products are measured, one read brings the window's rows to
       the host (:func:`_finish`); on the unit path one read brings every row. Either way
@@ -798,7 +804,10 @@ def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, repla
     step's turn, every run's rows kept on the device, read once at the first non-empty window,
     and the windows judged in canonical order from the host rows, so the first failing
     product, its message and every recorded number are canonical judging's. Each run keeps its
-    canonical index and group ids (the stamps' and :func:`_layout`'s).
+    canonical index and group ids (the stamps' and :func:`_layout`'s). A step of kernel runs
+    only is one table (:func:`_measure_step_kernel`: the runs served in order, one shared-read
+    measuring call per device, the rows split back per run); a step with any other run is
+    measured run by run.
 
     An error while serving, measuring or reading raises :class:`_UnitPassError` after the
     kernel's work in flight is waited for (:func:`check_5_matmuls` then reruns in canonical
@@ -813,6 +822,13 @@ def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, repla
     rows: list[_Rows | None] = [None] * len(runs)
     try:
         for step in steps:
+            if all(_kernel_run(replay, runs[i]) for i in step):
+                for i, r in zip(step, _measure_step_kernel(c, [runs[i] for i in step], step, ctx,
+                                                           replay, view, h=root, k=ctx.k,
+                                                           guard=ctx.kappa_guard,
+                                                           group0=group0)):
+                    rows[i] = r
+                continue
             for i in step:
                 try:
                     with ctx.stamp("c5.run", i):
@@ -843,6 +859,70 @@ def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, repla
         except Exception:
             pass  # the pass already failed; the rerun finds what is wrong
         raise
+
+
+def _measure_step_kernel(c: DeclaredComputation, runs: Sequence[Sequence[ProductSpec]],
+                         step: Sequence[int], ctx: StepContext, replay: Replay,
+                         view: TranscriptView, *, h: bytes, k: int, guard: bool,
+                         group0: Sequence[int]) -> list[_Rows]:
+    """One schedule step on the kernel path (FS38b): every run of ``runs`` (the step's runs, at
+    canonical indices ``step``, ``group0`` indexed by those) served as FS37's views, in order
+    (a run of one by :func:`_served_view`, a member run group by group by
+    :func:`_served_blocks`), then the groups measured by one
+    ``freivalds.measure_groups_rows(..., share=True)`` call per device (normally the step's
+    one), so a stored matrix several products read is read once per level. The rows come back
+    as one :class:`_Rows` per run, in the step's run order. A serving error raises
+    :class:`_UnitPassError` at that run, a measuring error at the step's first run."""
+    served: list[tuple[list[MeasureGroup], list[int]]] = []
+    for i, specs in zip(step, runs):
+        groups: list[MeasureGroup] = []
+        order: list[int] = []
+        try:
+            with ctx.stamp("c5.run", i):
+                if len(specs) == 1:
+                    groups.append(_served_view(c, specs[0], ctx, replay, view, run=i,
+                                               group=group0[i], st=ctx.stamper()))
+                    order.append(0)
+                else:
+                    for g, idx in enumerate(_measure_groups(specs)):
+                        o, gs = _served_blocks(c, specs, idx, ctx, replay, view, run=i,
+                                               group=group0[i] + g, st=ctx.stamper())
+                        groups.extend(gs)
+                        order.extend(o)
+            # The row split below hands each run its rows per device in device order, which is
+            # serving order only for a run on one device; a run on two takes the canonical rerun.
+            where = {mg.a.device for mg in groups}
+            if len(where) > 1:
+                raise RuntimeError(f"run {i} is served on several devices: "
+                                   f"{sorted(map(str, where))}")
+        except Exception as e:
+            raise _UnitPassError(i) from e
+        served.append((groups, order))
+    devices: list[torch.device] = []
+    for groups, _ in served:
+        for mg in groups:
+            if mg.a.device not in devices:
+                devices.append(mg.a.device)
+    tables: dict[torch.device, torch.Tensor] = {}
+    try:
+        for dev in devices:
+            table = [mg for groups, _ in served for mg in groups if mg.a.device == dev]
+            with ctx.timed("5.measure"), ctx.stamp("c5.measure", step[0], -1):
+                tables[dev] = freivalds.measure_groups_rows(table, h=h, k=k, guard=guard,
+                                                            share=True)
+    except Exception as e:
+        raise _UnitPassError(step[0]) from e
+    taken = {dev: 0 for dev in devices}  # rows of each device's table already given to a run
+    out: list[_Rows] = []
+    for specs, (groups, order) in zip(runs, served):
+        parts = []
+        for dev in devices:
+            n = sum(mg.a.shape[0] for mg in groups if mg.a.device == dev)
+            if n:
+                parts.append(tables[dev][taken[dev]:taken[dev] + n])
+                taken[dev] += n
+        out.append(_Rows(specs, order, parts[0] if len(parts) == 1 else torch.cat(parts)))
+    return out
 
 
 class _Group(NamedTuple):

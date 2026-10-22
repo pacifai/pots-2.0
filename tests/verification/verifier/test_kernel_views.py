@@ -40,7 +40,7 @@ class Kernel:
         self.events = []  # "measure", "drain", "read" in order
         self.views = []  # every served MeasureGroup
 
-    def measure(self, groups, *, h, k, guard=True):
+    def measure(self, groups, *, h, k, guard=True, share=False, plan_out=None):
         self.events.append("measure")
         self.calls.append([(list(g.ms), g.bias is not None) for g in groups])
         rows = []
@@ -326,8 +326,8 @@ def test_measure_run_drains_before_reading_its_rows(kernel, monkeypatch):
 
 @pytest.mark.parametrize("switch", SWITCHES, ids=map(switch_id, SWITCHES))
 def test_one_copy_stamp_per_group_on_the_kernel_path(switch, kernel):
-    """Every group is stamped once by each of ``c5.glue``, ``c5.serve``, ``c5.copy`` and
-    ``c5.measure``, also a group whose roles interleave and so is served as several blocks."""
+    """Every group is stamped once by each of ``c5.glue``, ``c5.serve`` and ``c5.copy``
+    (``c5.measure`` is once per schedule step's table), also a group whose roles interleave and so is served as several blocks."""
     import contextlib
     from collections import Counter
 
@@ -357,8 +357,41 @@ def test_one_copy_stamp_per_group_on_the_kernel_path(switch, kernel):
     assert checks.check_5_matmuls(None, c, ctx, Bands.provisional()) is None
     n_groups = sum(len(checks._measure_groups(run)) for run in checks._member_runs(c.products))
     count = Counter(name for name, _, _ in stamps)
-    for name in ("c5.glue", "c5.serve", "c5.copy", "c5.measure"):
+    for name in ("c5.glue", "c5.serve", "c5.copy"):
         assert count[name] == n_groups, name
         assert len({(r, g) for n, r, g in stamps if n == name}) == n_groups, name
+    # FS38b: the unit path measures one table per schedule step, stamped (its first run, -1)
+    runs = list(checks._member_runs(c.products))
+    steps = checks._schedule_runs(runs, ctx.state.replay.unit_schedule())
+    assert sorted((r, g) for n, r, g in stamps if n == "c5.measure") == sorted(
+        (step[0], -1) for step in steps)
     # at least one group was served as several blocks, so the stamp is per group, not per block
     assert len(kernel.views) > n_groups
+
+
+def test_a_run_served_on_two_devices_falls_back_to_the_canonical_rerun(kernel, monkeypatch,
+                                                                       caplog):
+    """FS38b: the step table splits rows back per device, which is serving order only for a run
+    on one device, so a run whose groups sit on two (a meta tensor stands in for the second)
+    ends the unit pass, and the canonical rerun gives the numbers of a clean verification."""
+    import logging
+
+    c, D, tree, w0 = _setup(("llama", True), "fp32", biases=False)
+    clean, rejection = _verify(c, D, tree, w0)
+    assert rejection is None
+    kernel.calls.clear()
+    real, hit = checks._served_blocks, []
+
+    def two_devices(*args, **kw):
+        order, groups = real(*args, **kw)
+        if not hit:  # the unit pass's first member run only; the rerun is served as is
+            hit.append(1)
+            groups = [*groups, groups[0]._replace(a=groups[0].a.to("meta"))]
+        return order, groups
+
+    monkeypatch.setattr(checks, "_served_blocks", two_devices)
+    with caplog.at_level(logging.DEBUG, logger=checks.__name__):
+        v, rejection = _verify(c, D, tree, w0)
+    assert rejection is None and hit
+    assert any("unit pass raised RuntimeError" in r.getMessage() for r in caplog.records)
+    assert _numbers(v) == _numbers(clean)

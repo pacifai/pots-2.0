@@ -1631,14 +1631,25 @@ interface.
     that holds it (`_schedule_runs`; a run split across steps, or an `m` missed or repeated,
     is a verifier bug and raises `RuntimeError`) and `_check_5_units` measures the runs in the
     steps' order. Each run keeps its canonical index (`c5.run`) and group ids, so CPU runs keep
-    their groups and bits and the kernel path its tables. Every run's float64 row
+    their groups and bits and the kernel path its tables. A step whose runs are all kernel
+    runs (`_kernel_run`) is one table (FS38b, `_measure_step_kernel`): each run is served in
+    order inside its `c5.run` stamp (a run of one by `_served_view`, a member run group by
+    group by `_served_blocks`, their stamps unchanged), then one
+    `freivalds.measure_groups_rows(..., share=True)` call per device (normally one) measures
+    all the step's groups, inside one `5.measure` section and one `c5.measure` stamp with ids
+    (the step's first run, -1), and the rows are split back into one `_Rows` per run. A
+    serving error raises `_UnitPassError` at that run, a measuring error at the step's first
+    run (no `_measure_to_failure` on this path: the canonical rerun keeps it). A step with
+    any other run keeps FS38a's per-run measuring. Every run's float64 row
     (`freivalds.ROW`) stays on the device. At window 0, inside its `c5.judge` stamp and
     `5.measure` section, `_ReadOnce` makes the one read of the whole step (`_read_rows`: one
     drain, one read per device). The windows (`_judge_windows`, at least `_JUDGE_WINDOW`
     (1024) products, closed at the end of a run, shared with `_layout`) are then judged in
     canonical order from the host rows (`_judge_window`), each in its own `c5.judge` stamp, so
     the first failing product and its message are those of one-at-a-time judging, and
-    `5.measure`'s call count is the number of groups plus the number of windows. A rejection
+    `5.measure`'s call count is the number of groups (on the kernel's unit path, the number of
+    steps and devices; the canonical kernel path still measures once per group) plus the
+    number of windows. A rejection
     leaves the failing window's tail in `StepState.run_rest` and the host rows of every later
     window's runs in `StepState.run_rest_rows`; the record pass records both and serves
     nothing more. Any error while serving, measuring or reading (a `ReplayError` from the
