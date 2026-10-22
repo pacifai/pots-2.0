@@ -243,3 +243,165 @@ int pots_host_measure_levels(const pots_mprod_t *tab, uint64_t n, const pots_mwo
   }
   return POTS_ERR_OK;
 }
+
+/* ---- the level kernel's sweeps (FS37b), run on the host ---- */
+
+typedef struct {
+  float *acc;   /* [32][nj]: lane p's accumulator of challenge column j at p*nj + j */
+  float e1[POTS_LANES]; /* b2 | u */
+  float e2[POTS_LANES]; /* b1 | nu | p1 */
+  double ed[POTS_LANES]; /* the float64 sum of squares: the bias's, or pp */
+} sweep_acc_t;
+
+enum { SW_B, SW_BIAS, SW_A, SW_P };
+
+/* One pass over row `row` of view m by the update function of `kind`: tiles of `tile` columns,
+ * lane p taking c0+p, c0+p+32, ... within each tile, masked at m->cols (skipped, never zero). */
+static void sweep_row(const pots_mprod_t *t, const pots_mscr_t *sc, const pots_mview_t *m,
+                      pots_i64 row, int kind, pots_u32 j0, pots_u32 nj, int first, uint32_t tile,
+                      sweep_acc_t *a) {
+  const float *r = (const float *)t->r_addr;
+  const pots_u32 k = t->k;
+  const pots_i64 q = t->a.cols;
+  const int guard = (t->flags & POTS_M_GUARD) != 0;
+  pots_u32 p, j;
+  pots_i64 c0, c;
+  for (p = 0; p < POTS_LANES; p++) {
+    for (j = 0; j < nj; j++) a->acc[p * nj + j] = 0.0f;
+    a->e1[p] = 0.0f;
+    a->e2[p] = 0.0f;
+    a->ed[p] = 0.0;
+  }
+  for (c0 = 0; c0 < m->cols; c0 += tile) {
+    for (p = 0; p < POTS_LANES; p++) {
+      for (c = c0 + p; c < c0 + (pots_i64)tile && c < m->cols; c += POTS_LANES) {
+        float x = pots_mload(m, row, c);
+        float *acc = a->acc + p * nj;
+        if (kind == SW_B) {
+          pots_upd_b(x, r + c * k + j0, 1, nj, acc, first, guard, &a->e1[p], &a->e2[p]);
+        } else if (kind == SW_BIAS) {
+          pots_upd_bias(x, r + c * k + j0, 1, nj, acc, first, guard, &a->ed[p], &a->e2[p]);
+        } else if (kind == SW_A) {
+          pots_upd_a(x, sc->tt + (pots_u64)j0 * q + c, q, nj, acc, first, guard, first ? sc->b2[c] : 0.0f,
+                     first && guard ? sc->b1[c] : 0.0f, &a->e1[p], &a->e2[p]);
+        } else {
+          pots_upd_p(x, r + c * k + j0, 1, nj, acc, first, guard, &a->ed[p], &a->e2[p]);
+        }
+      }
+    }
+  }
+}
+
+/* The tree of dot j of a sweep, as a float64 (the float32 result is exact). */
+static double sweep_dot(const sweep_acc_t *a, pots_u32 nj, pots_u32 j) {
+  float f[POTS_LANES];
+  for (pots_u32 p = 0; p < POTS_LANES; p++) f[p] = a->acc[p * nj + j];
+  shfl_tree_f(f);
+  return (double)f[0];
+}
+static double sweep_extra_f(const float *e) {
+  float f[POTS_LANES];
+  for (pots_u32 p = 0; p < POTS_LANES; p++) f[p] = e[p];
+  shfl_tree_f(f);
+  return (double)f[0];
+}
+static double sweep_extra_d(const double *e) {
+  double d[POTS_LANES];
+  for (pots_u32 p = 0; p < POTS_LANES; p++) d[p] = e[p];
+  shfl_tree_d(d);
+  return d[0];
+}
+
+/* One item of a phase-0 or phase-1 node as the level kernel runs it: chunks of kc challenge
+ * columns, each chunk's sweeps and then its stores in step order. */
+static void host_sweep_item(const pots_mprod_t *t, const pots_mscr_t *sc, double *row,
+                            pots_u32 phase, uint64_t item, uint32_t tile, uint32_t kc,
+                            sweep_acc_t *x, sweep_acc_t *y) {
+  const pots_u32 k = t->k;
+  const int guard = (t->flags & POTS_M_GUARD) != 0;
+  pots_u32 j0, nj, j;
+  for (j0 = 0; j0 < k; j0 += kc) {
+    const int first = j0 == 0;
+    nj = k - j0 < kc ? k - j0 : kc;
+    if (phase == 0) {
+      if ((pots_i64)item < t->a.cols) { /* a row of B */
+        sweep_row(t, sc, &t->b, (pots_i64)item, SW_B, j0, nj, first, tile, x);
+        for (j = 0; j < nj; j++)
+          pots_phase_store(t, sc, row, 0, (pots_i64)item, j0 + j, sweep_dot(x, nj, j));
+        if (first) {
+          pots_phase_store(t, sc, row, 0, (pots_i64)item, k, sweep_extra_f(x->e1));
+          if (guard) pots_phase_store(t, sc, row, 0, (pots_i64)item, k + 1, sweep_extra_f(x->e2));
+        }
+      } else { /* the bias */
+        sweep_row(t, sc, &t->bias, 0, SW_BIAS, j0, nj, first, tile, x);
+        if (first) pots_phase_store(t, sc, row, 0, (pots_i64)item, 0, sweep_extra_d(x->ed));
+        for (j = 0; j < nj; j++)
+          pots_phase_store(t, sc, row, 0, (pots_i64)item, 1 + j0 + j, sweep_dot(x, nj, j));
+        if (first && guard)
+          pots_phase_store(t, sc, row, 0, (pots_i64)item, k + 1, sweep_extra_f(x->e2));
+      }
+    } else { /* phase 1: a row of A (x), then a row of P (y) */
+      sweep_row(t, sc, &t->a, (pots_i64)item, SW_A, j0, nj, first, tile, x);
+      sweep_row(t, sc, &t->p, (pots_i64)item, SW_P, j0, nj, first, tile, y);
+      for (j = 0; j < nj; j++) {
+        pots_phase_store(t, sc, row, 1, (pots_i64)item, 2 * (j0 + j), sweep_dot(x, nj, j));
+        pots_phase_store(t, sc, row, 1, (pots_i64)item, 2 * (j0 + j) + 1, sweep_dot(y, nj, j));
+      }
+      if (first) {
+        pots_phase_store(t, sc, row, 1, (pots_i64)item, 2 * k, sweep_extra_f(x->e1));
+        pots_phase_store(t, sc, row, 1, (pots_i64)item, 2 * k + 1, sweep_extra_d(y->ed));
+        if (guard) {
+          pots_phase_store(t, sc, row, 1, (pots_i64)item, 2 * k + 2, sweep_extra_f(x->e2));
+          pots_phase_store(t, sc, row, 1, (pots_i64)item, 2 * k + 3, sweep_extra_f(y->e2));
+        }
+      }
+    }
+  }
+}
+
+/* The level kernel's work (measure_kernel.cu) in loops: pots_host_measure_levels' arguments
+ * plus `tile` (columns per tile, a positive multiple of 32) and `kc` (challenge columns per
+ * chunk, >= 1). Phases 0 and 1 are single sweeps over a row by measure_phases.h's update
+ * functions, the lanes taking each tile's columns in turn; phase 2 is host_measure_item. The
+ * rows equal pots_host_measure_levels' bit for bit for every tile, kc and `reverse`. */
+int pots_host_measure_sweep(const pots_mprod_t *tab, uint64_t n, const pots_mwork_t *works,
+                            const pots_mread_t *reads, const uint64_t *level_off,
+                            uint32_t n_levels, const pots_mentry_t *entries, double *rows,
+                            uint32_t tile, uint32_t kc, int reverse) {
+  uint64_t i, g;
+  uint32_t l, e, kmax = 1;
+  sweep_acc_t x, y;
+  int err = POTS_ERR_OK;
+  for (i = 0; i < n; i++) {
+    int ce = pots_mprod_check(&tab[i]);
+    if (ce != POTS_ERR_OK) return ce;
+    if (tab[i].k > kmax) kmax = tab[i].k;
+  }
+  if (kc > kmax) kc = kmax;
+  x.acc = malloc(sizeof(float) * POTS_LANES * kc);
+  y.acc = malloc(sizeof(float) * POTS_LANES * kc);
+  if (!x.acc || !y.acc) {
+    free(x.acc);
+    free(y.acc);
+    return POTS_ERR_NOMEM;
+  }
+  for (l = 0; l < n_levels; l++) {
+    const pots_mread_t *r = reads + level_off[l];
+    uint64_t n_groups = level_off[l + 1] - level_off[l] - 1, total = r[n_groups].first;
+    for (g = 0; g < total; g++) {
+      uint64_t gi = reverse ? total - 1 - g : g;
+      uint64_t item, ri = pots_rfind(r, n_groups, gi, &item);
+      for (e = 0; e < r[ri].n_entries; e++) {
+        const pots_mentry_t *en = &entries[r[ri].entry0 + e];
+        const pots_mprod_t *t = &tab[en->prod];
+        pots_mscr_t sc = pots_mscr_make(t, works[en->prod].scratch);
+        double *row = rows + (uint64_t)en->prod * (POTS_ROW_FIXED + t->k);
+        if (en->phase == 2) host_measure_item(t, &sc, row, 2, item);
+        else host_sweep_item(t, &sc, row, en->phase, item, tile, kc, &x, &y);
+      }
+    }
+  }
+  free(x.acc);
+  free(y.acc);
+  return err;
+}

@@ -254,4 +254,87 @@ static __host__ __device__ __forceinline__ pots_u64 pots_rfind(const pots_mread_
   return lo;
 }
 
+/* ---- sweeps (FS37b) ----
+ *
+ * The level kernel makes one pass over a row and keeps one accumulator per step in each lane;
+ * a lane visits its columns c = p, p+32, ... in increasing order, so every accumulator sees
+ * exactly the operations of its step's pots_dot32_partial or pots_sum64_sq_partial, and the
+ * bits are those of the step-by-step run. The four functions below are the per-element updates
+ * of the four sweep kinds, shared by the kernel and the host emulation (measure_core_host.c).
+ * `x` is the element already widened to fp32. `y` holds the vector values at the element's
+ * column for the chunk's challenge columns j = 0 .. nj-1, entry j at y[j*jstride] (R: R + c*k +
+ * j0, stride 1; the stored t: tt + j0*q + c, stride q; shared memory: [j][c], stride TILE).
+ * `first` is 1 for a row's first chunk, which also carries the extras. A masked column (past
+ * the view's end) is never passed in: nothing is added for it, not even a zero. */
+
+#if defined(POTS_ON_GPU) && defined(K_CHUNK)
+#define POTS_FOR_J(nj) _Pragma("unroll") for (pots_u32 j = 0; j < (pots_u32)K_CHUNK; j++) if (j < (nj))
+#else
+#define POTS_FOR_J(nj) for (pots_u32 j = 0; j < (nj); j++)
+#endif
+
+/* acc[j] = fmaf(x, y_j, acc[j]) for the chunk's nj dots. */
+static __host__ __device__ __forceinline__ void pots_upd_dots(float x, const float *y,
+                                                              pots_i64 jstride, pots_u32 nj,
+                                                              float *acc) {
+  POTS_FOR_J(nj) acc[j] = fmaf(x, y[(pots_i64)j * jstride], acc[j]);
+}
+
+/* A row of B (phase 0): the dots with R, then (first chunk) b2 = Σ x²·1 (the square rounded to
+ * fp32 first) and, with the guard, b1 = Σ |x|·1. */
+static __host__ __device__ __forceinline__ void pots_upd_b(float x, const float *y,
+                                                           pots_i64 jstride, pots_u32 nj,
+                                                           float *acc, int first, int guard,
+                                                           float *b2, float *b1) {
+  pots_upd_dots(x, y, jstride, nj, acc);
+  if (first) {
+    const float x2 = x * x;
+    *b2 = fmaf(x2, 1.0f, *b2);
+    if (guard) *b1 = fmaf(fabsf(x), 1.0f, *b1);
+  }
+}
+
+/* The bias (phase 0, 1 row): the dots with R, then (first chunk) the float64 sum of squares
+ * and, with the guard, β₁ = Σ |x|·1. */
+static __host__ __device__ __forceinline__ void pots_upd_bias(float x, const float *y,
+                                                              pots_i64 jstride, pots_u32 nj,
+                                                              float *acc, int first, int guard,
+                                                              double *sq, float *b1) {
+  pots_upd_dots(x, y, jstride, nj, acc);
+  if (first) {
+    const double xd = (double)x;
+    *sq = *sq + xd * xd;
+    if (guard) *b1 = fmaf(fabsf(x), 1.0f, *b1);
+  }
+}
+
+/* A row of A (phase 1): the dots with the stored t, then (first chunk) u = Σ x²·b2[c] and, with
+ * the guard, ν = Σ |x|·b1[c]; `b2c` and `b1c` are the vectors' values at the column. */
+static __host__ __device__ __forceinline__ void pots_upd_a(float x, const float *y,
+                                                           pots_i64 jstride, pots_u32 nj,
+                                                           float *acc, int first, int guard,
+                                                           float b2c, float b1c, float *u,
+                                                           float *nu) {
+  pots_upd_dots(x, y, jstride, nj, acc);
+  if (first) {
+    const float x2 = x * x;
+    *u = fmaf(x2, b2c, *u);
+    if (guard) *nu = fmaf(fabsf(x), b1c, *nu);
+  }
+}
+
+/* A row of P (phase 1): the dots with R, then (first chunk) the float64 sum of squares and,
+ * with the guard, p1 = Σ |x|·1. */
+static __host__ __device__ __forceinline__ void pots_upd_p(float x, const float *y,
+                                                           pots_i64 jstride, pots_u32 nj,
+                                                           float *acc, int first, int guard,
+                                                           double *pp, float *p1) {
+  pots_upd_dots(x, y, jstride, nj, acc);
+  if (first) {
+    const double xd = (double)x;
+    *pp = *pp + xd * xd;
+    if (guard) *p1 = fmaf(fabsf(x), 1.0f, *p1);
+  }
+}
+
 #endif /* POTS_MEASURE_PHASES_H */
