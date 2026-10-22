@@ -2593,7 +2593,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   - `StepSummary.in_sample` (`metrics.in_sample_step`) and `.judged`
     (`metrics.judged_step`); `.sample` is `in`, `judged` or `not judged` (H2's step 1), and
     the `residual_summary` record carries both. The guard line names judged steps only.
-  - **The stored step (EV2).** `KeptStepHandoff(directory, step)` is the in-memory hand-off
+  - **The stored step (EV2).** `KeptStepHandoff(directory, step)` (defined in
+    `runs/kept_step.py`, re-exported by `run_verified`: a class that `pipeline.py` checks or
+    pickles must not live in an entry point, since `python -m ...run_verified` makes that
+    module `__main__` and its class a second copy; pair fix 1) is the in-memory hand-off
     that also holds step `step`'s leaves and tree; `write()`, from `on_step` once the step
     has closed, writes them with `DiskHandoff(keep=True)` to `directory/step_<t>/` and
     raises `RuntimeError` unless the root recomputed from the files is the step's `h`. The

@@ -6,6 +6,7 @@ import multiprocessing as mp
 import pickle
 import re
 import weakref
+from pathlib import Path
 
 import pytest
 import torch
@@ -149,6 +150,41 @@ def test_run_verified_pipelined_equals_sequential(tiny_main, tiny_spec, monkeypa
     assert stored_pip.keys() == stored_seq.keys() and len(stored_pip) > 10
     assert stored_pip == stored_seq  # every leaf file byte for byte
     assert next(root.glob("*/final_weights.json")).read_bytes() == final_seq
+
+
+# What ``python -m verification.runs.run_verified`` does, with the tiny decoder: the module runs
+# under the name ``__main__`` and is not in ``sys.modules`` as ``verification.runs.run_verified``
+# (``runpy`` as the interpreter's ``-m`` does it), so a class it defines is a second copy of the
+# one that ``pipeline.py`` imports. The patches are the ``tiny_main`` and ``tiny_spec`` ones.
+_AS_MAIN = """
+import runpy, sys
+import torch
+from setup import config
+from tests.verification.runs import pipelined_helpers as P
+from verification.computation.instances.decoder import DecoderComputation
+from verification.runs import prover_spec
+
+real = prover_spec.decoder_spec
+prover_spec.decoder_spec = lambda cfg, **k: real(cfg, build_computation=P.tiny_computation, **k)
+DecoderComputation.from_config = classmethod(lambda cls, cfg: P.tiny_computation(cfg))
+config.setup_determinism = lambda cfg: torch.manual_seed(cfg.seed)  # the parent, as the child
+sys.argv = ["run_verified", "--keep-step", "2", "--no-metrics"]
+runpy.run_module("verification.runs.run_verified", run_name="__main__")
+"""
+
+
+def test_run_verified_run_as_main_pipelined_keeps_its_step(tiny_main, monkeypatch):
+    import subprocess
+    import sys
+
+    _, _, root = tiny_main
+    monkeypatch.setenv("VERIF_PIPELINED", "1")
+    done = subprocess.run([sys.executable, "-c", _AS_MAIN], capture_output=True, text=True,
+                          timeout=300, cwd=str(Path(__file__).resolve().parents[3]))
+    assert done.returncode == 0, done.stdout[-1500:] + done.stderr[-2500:]
+    assert "loop mode: pipelined" in done.stdout
+    assert any(x.startswith("stored step 2") for x in done.stdout.splitlines())
+    assert len(list(root.glob("*/transcripts/step_2/*"))) > 10
 
 
 def test_run_verified_drops_the_parents_model_and_counts_sequentially(

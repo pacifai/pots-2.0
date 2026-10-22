@@ -152,6 +152,7 @@ from verification.commitment.leaves import (
 )
 from verification.computation.interface import DeclaredComputation
 from verification.prover.step import Section, no_section, prove_step
+from verification.runs.kept_step import KeptStepHandoff
 from verification.runs.loop import (
     HANDOFF_SECTION,
     TOTALS_SECTION,
@@ -639,7 +640,6 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
     fault = fault or ProverFault()
     if prover is None:
         raise ValueError("pipelined: the prover's process needs a ProverSpec (prover=...)")
-    from verification.runs.run_verified import KeptStepHandoff  # that module imports this one
     keep = handoff if isinstance(handoff, KeptStepHandoff) else None
     if handoff is not None and handoff is not IN_MEMORY and keep is None:
         raise ValueError("pipelined: the handoff is the shared store; only IN_MEMORY (the "
