@@ -70,11 +70,14 @@ def test_the_schedule_is_a_partition_ending_at_M(case):
     assert sorted(flat) == list(range(1, c.M + 1)) and flat[-1] == c.M
     assert steps[:blocks] == tuple(
         tuple(c.m_of(c.head_name(k, b)) for k in ("Lambda", "dF", "G")) for b in range(blocks))
-    for j, (fwd, rest) in zip(range(c.L, 0, -1), zip(steps[blocks::2], steps[blocks + 1::2])):
-        assert list(fwd) == sorted(fwd) and list(rest) == sorted(rest)
-        assert {c.product(m).layer for m in fwd + rest} == {j}
-        assert all(c.product(m).kind.name == "FORWARD" for m in fwd)
-        assert all(c.product(m).kind.name != "FORWARD" for m in rest)
+    assert len(steps) == blocks + c.L  # one step per layer
+    for j, step in zip(range(c.L, 0, -1), steps[blocks:]):
+        assert {c.product(m).layer for m in step} == {j}
+        is_fwd = [c.product(m).kind.name == "FORWARD" for m in step]
+        assert is_fwd == sorted(is_fwd, reverse=True)  # forward products first
+        fwd = [m for m, f in zip(step, is_fwd) if f]
+        rest = [m for m, f in zip(step, is_fwd) if not f]
+        assert fwd and fwd == sorted(fwd) and rest == sorted(rest)
 
 
 def test_the_base_replay_keeps_canonical_order_only():

@@ -659,8 +659,8 @@ class DecoderComputation(DeclaredComputation):
             for b in range(self.head_blocks)]
         for j in range(self.L, 0, -1):
             mine = [p for p in self.products if p.layer == j]
-            steps.append(tuple(p.m for p in mine if p.kind is ProductKind.FORWARD))
-            steps.append(tuple(p.m for p in mine if p.kind is not ProductKind.FORWARD))
+            steps.append(tuple(p.m for p in mine if p.kind is ProductKind.FORWARD)
+                         + tuple(p.m for p in mine if p.kind is not ProductKind.FORWARD))
         flat = [m for s in steps for m in s]
         assert sorted(flat) == list(range(1, self.M + 1)), "unit schedule is not 1..M once each"
         assert flat[-1] == self.M, "the unit schedule must end at product M"

@@ -1178,8 +1178,8 @@ interface.
       without one), from the placement.
     - `unit_schedule()` (`DecoderComputation.unit_schedule`, built once from the inventory):
       one step per head block `b`, `(Λ_b, δF_b, G_b)`; then for each layer `j = L … 1`, one
-      step of the layer's forward products and one of its other products, each in canonical
-      order. The last product is `L1.G_v` (`M`). Serving in these steps needs one forward
+      step: the layer's forward products in canonical order, followed by its other products
+      in canonical order. The last product is `L1.G_v` (`M`). Serving in these steps needs one forward
       pass and each backward unit once: `_forward_unit` rebuilds only a unit that is gone,
       `Λ_1` follows head block 0's backward, and layer `j`'s forward products follow layer
       `j+1`'s backward, which leaves unit `j` in place. The head unit is popped after the
