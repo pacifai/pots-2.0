@@ -580,8 +580,9 @@ interface.
     has no digest, or whose copy moved (`_version`), stays unchecked. A mismatch raises
     `KernelMismatchError(RuntimeError)`, not a `ValueError` or `LookupError`, so the verifier's
     `PROVER_DATA_ERRORS` guard never turns it into a rejection: the run stops with no verdict.
-    A kernel digest where the C library finds a non-finite value is a mismatch too. The check
-    is off under `kernel=False` and `native.disabled()`. On the one-GPU path the product leaves
+    A kernel digest where the C library finds a non-finite value is a mismatch too. The table
+    check is off under `kernel=False`; a known digest of a kernel leaf is still compared; both
+    are off under `native.disabled()`. On the one-GPU path the product leaves
     sit in host memory and the verifier never uses the kernel (check 2 rehashes every host leaf
     with the C library each step), so a wrong prover digest there is a root mismatch at check
     2, and this check, which protects verdicts from the verifier's kernel, is not needed: a
@@ -637,8 +638,9 @@ interface.
     each paired with the `_version` read as the hash was queued.
   - *The commit (routing).* `hash_step_leaves(c, leaves, stats=None, *, known=None,
     kernel=True)` and `commit_leaves(c, leaves, known=None, *, kernel=True)` take each leaf from
-    `known`, else the GPU kernel if the leaf is a CUDA tensor with a passing structural check (one table per device, closed at
-    `_BATCH_BYTES` or `_BATCH_ENTRIES`), else the host path; since FS34 this is the routing of
+    `known`, else the GPU kernel if the leaf is a CUDA tensor with a passing structural
+    check (one table per device, closed at `_BATCH_BYTES` or `_BATCH_ENTRIES`), else the host
+    path; since FS34 this is the routing of
     every hash call (`leaves.py`, "One routing"). A mutation seen before a table is read
     raises `StoreMutationError`; a non-finite leaf raises the host path's `NonFiniteError`.
     `HashStats` gains `known`, `kernel` and `crosschecks` counts; it has no kernel-wait time
@@ -1897,7 +1899,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
   - Before `verifier.start_run` (so before step 1), `run_loop` builds
-    `measure_kernel.kernels(d)` beside `GpuBlake3().kernels(d)` on every CUDA device of the run (FS37), so the first NVRTC build or cache load lands outside
+    `measure_kernel.kernels(d)` beside `GpuBlake3().kernels(d)` on every CUDA device of the run
+    (FS37), so the first NVRTC build or cache load lands outside
     every timed section, check 0's hash of `W_0` included. The pipelined loop's pre-build is
     FS34's, at the same place.
   - `release_device_cache(device, section=None, *, devices=None)`: only when the run's

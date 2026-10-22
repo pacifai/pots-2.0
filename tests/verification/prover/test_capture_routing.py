@@ -204,7 +204,18 @@ def test_two_gpus_a_bmm_stays_one_storage_on_the_owner():
 @two_gpus
 def test_two_gpus_a_write_before_the_copy_is_done_raises():
     a, b = torch.randn(256, 512, device="cuda:0"), torch.randn(512, 384, device="cuda:0")
-    cap = MatmulCapture(placement=_two_gpu_placement())
+    # a capture of the same op on the same pool runs first: the first arrival hash on cuda:1
+    # allocates, and CUDA may hold the host there until the GPU is idle, so the copy would be
+    # done before the write
+    pool = HostBuffers()
+    warm = MatmulCapture(buffers=pool, placement=_two_gpu_placement())
+    warm._hint = lambda rec: torch.device("cuda:1")
+    with warm, warm.phase("forward"):
+        torch.mm(a, b)
+    del warm
+    for d in ("cuda:0", "cuda:1"):
+        torch.cuda.synchronize(d)
+    cap = MatmulCapture(buffers=pool, placement=_two_gpu_placement())
     cap._hint = lambda rec: torch.device("cuda:1")
     with pytest.raises(MutatedCaptureError, match="before its copy"):
         with cap, cap.phase("forward"):

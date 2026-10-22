@@ -149,7 +149,8 @@ A wrong hint costs a copy, never a bit. The copy:
 - the owner hashes the copy on arrival (FS34): the kernel's table for the product is queued on
   the destination's side stream behind the copy's event, as the host path queues it behind its
   host copy, and its digests are keyed by the copy's storage, so :meth:`arrival_digest` serves
-  them as on the one-GPU path. The training GPU hashes nothing;
+  them as on the one-GPU path. The training GPU hashes nothing when it owns no layers (the
+  four-GPU machine); on the two-GPU pod GPU 0 also owns layers and hashes the products it keeps;
 - an output already on its hinted device is kept as it is, and hashed where it sits, on that
   device's side stream after the producing stream; the digests are paired with the ``_version``
   read when the hash was queued, since the kept tensor is autograd's own (a later write is
