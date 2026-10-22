@@ -851,7 +851,9 @@ def test_job_runs_packs_and_terminates(tmp_path):
 
 def test_job_terminates_when_the_session_refuses(tmp_path):
     """No H100 and no override: the session refuses, and the job still packs and ends."""
-    r, out = _job(tmp_path, plan=OK_PLAN, extra={"FS11_ALLOW_ANY_GPU": "0"})
+    # The refusal ends the job at once, so a long deadline costs nothing; on a loaded pod the
+    # session's start alone took over 6 s and the timer terminated the pod first.
+    r, out = _job(tmp_path, plan=OK_PLAN, deadline=60, extra={"FS11_ALLOW_ANY_GPU": "0"})
     if "H100 check passes" in _log(out):
         pytest.skip("this machine has an H100")
     assert r.returncode == fs.EXIT_REFUSED, r.stdout + r.stderr
@@ -907,10 +909,13 @@ def test_job_kills_a_hung_session_and_its_part_then_packs(tmp_path):
 def test_job_survives_a_dead_reader_on_its_stdout(tmp_path):
     """nohup's output file gone or the ssh pipe closed: the job runs on, logs to job.log, and
     still packs and terminates."""
-    p, out = _job(tmp_path, plan=OK_PLAN, extra={"FS11_ALLOW_ANY_GPU": "1"}, popen=True)
+    # The deadline leaves a loaded pod room to start the session: at 6 s its part was killed at
+    # the work deadline and the job exited 1.
+    p, out = _job(tmp_path, plan=OK_PLAN, deadline=60, extra={"FS11_ALLOW_ANY_GPU": "1"},
+                  popen=True)
     p.stdout.close()
     p.stderr.close()
-    assert p.wait(timeout=60) == 0
+    assert p.wait(timeout=90) == 0, _log(out)
     log = _log(out)
     assert "ok: ok, exit 0" in log and "READY:" in log
     assert "DRY_RUN: terminate (end of job (session exit 0))" in log
