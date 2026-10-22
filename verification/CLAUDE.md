@@ -758,7 +758,10 @@ interface.
     `ms` once. The replay's state afterwards, and the first error, are those of `operands(m)`
     over `ms`. The default is one block per member. `operand_device(m)` is the device
     `operands(m)` serves on, without serving anything, or `None` when the replay doesn't say.
-    Check 5's kernel path uses both.
+    Check 5's kernel path uses both. `unit_schedule() -> tuple[tuple[int, ...], ...] | None`
+    is the order the replay serves best: steps of product numbers `m` whose union is
+    `1 … M`, each once. The default is `None`, canonical order only (the MLP keeps it). Check
+    5 serves and measures in the steps' order (FS38a).
   - `load_weights(computation, model, weights)` is in this module, so the verifier never
     imports the prover. So is `snapshot_weights(computation, model)`, the one way to copy the
     declared weights out of a model: the prover's `W_{t+1}` leaves and every run's `W_0`
@@ -1175,6 +1178,15 @@ interface.
       block per member otherwise; anything that isn't attention members takes the default.
       `operand_device(m)` is the verifier device of `m`'s layer (the head's for a product
       without one), from the placement.
+    - `unit_schedule()` (`DecoderComputation.unit_schedule`, built once from the inventory):
+      one step per head block `b`, `(Λ_b, δF_b, G_b)`; then for each layer `j = L … 1`, one
+      step: the layer's forward products in canonical order, followed by its other products
+      in canonical order. The last product is `L1.G_v` (`M`). Serving in these steps needs one forward
+      pass and each backward unit once: `_forward_unit` rebuilds only a unit that is gone,
+      `Λ_1` follows head block 0's backward, and layer `j`'s forward products follow layer
+      `j+1`'s backward, which leaves unit `j` in place. The head unit is popped after the
+      last block and layer `j` by its own backward. The backward hooks hold the replay
+      weakly, so a replay abandoned after an error is freed.
     - Memory, as in training: after the forward pass every unit's graph and operands are
       held, about one training step's activations. Each unit's backward frees its graph
       (`retain_graph=False`) and the unit is dropped, so memory falls unit by unit; the
@@ -1610,31 +1622,45 @@ interface.
     kernel's bits don't depend on strides, grouping or widening, so a serving error finishes
     through `_measure_to_failure` as on the torch path. `freivalds.drain()` runs before every
     row read (`_read_rows`) and at the end of check 5, whatever ends it (invariant 6), so a
-    held input that changed raises `ReplayError`. Two reads outside the window loop drain as
-    well: `_record_rest_5` drains in a `finally` around its measuring loop, so a later run's
+    held input that changed raises `ReplayError`. The unit pass reads once per device
+    (below). A read outside it drains too: `_record_rest_5` drains in a `finally` around its measuring loop, so a later run's
     serving error or a judged product that raises leaves no hold, and `_measure_run` (the
     planted-error sweep) drains before it reads its rows.
-  - **Judging window (2026-10-14).** Check 5's numbers stay on the device, one float64 row
-    per product (`freivalds.ROW`), until at least `_JUDGE_WINDOW` (1024) products are
-    measured, at the end of a run. Then one `tolist` brings the window's rows to the host
-    (`_finish`, inside `5.measure`), and its products are recorded and judged one by one in
-    canonical order (`_judge_window`), so the first failing product and its message are
-    those of one-at-a-time judging. A read makes the host wait for the device, so this
-    replaces several waits per product with one per window. `5.measure`'s call count is
-    the number of groups (a run of one is a group) plus the number of windows. An error
-    serving or measuring run `i` is handled as one product at a time would: the window
-    before run `i` is judged first, then (for a serving error) the products of run `i`
-    served before it, and the error is raised only if none of those rejects. A rejection
-    then leaves it to the record pass (`StepState.run_rest_error`). A measuring error drops
-    the rows of run `i`'s earlier groups unjudged, as when the run was measured at once.
+  - **Check 5's unit pass and judging window (FS38a, 2026-10-14).** When the replay has a
+    `unit_schedule()`, `check_5_matmuls` maps each canonical run (`_member_runs`) to the step
+    that holds it (`_schedule_runs`; a run split across steps, or an `m` missed or repeated,
+    is a verifier bug and raises `RuntimeError`) and `_check_5_units` measures the runs in the
+    steps' order. Each run keeps its canonical index (`c5.run`) and group ids, so CPU runs keep
+    their groups and bits and the kernel path its tables. Every run's float64 row
+    (`freivalds.ROW`) stays on the device. At window 0, inside its `c5.judge` stamp and
+    `5.measure` section, `_ReadOnce` makes the one read of the whole step (`_read_rows`: one
+    drain, one read per device). The windows (`_judge_windows`, at least `_JUDGE_WINDOW`
+    (1024) products, closed at the end of a run, shared with `_layout`) are then judged in
+    canonical order from the host rows (`_judge_window`), each in its own `c5.judge` stamp, so
+    the first failing product and its message are those of one-at-a-time judging, and
+    `5.measure`'s call count is the number of groups plus the number of windows. A rejection
+    leaves the failing window's tail in `StepState.run_rest` and the host rows of every later
+    window's runs in `StepState.run_rest_rows`; the record pass records both and serves
+    nothing more. Any error while serving, measuring or reading (a `ReplayError` from the
+    drain included) ends the unit pass before anything is recorded: the drain runs with its
+    errors swallowed, the rows are dropped, and `_check_5_canonical` reruns on a fresh replay
+    (one debug log line names the error and the run). A persistent error raises there as
+    before. An error from judging itself propagates. A replay without a schedule (the MLP)
+    takes `_check_5_canonical` directly: runs in canonical order, each window read and
+    judged as it fills, an error serving or measuring run `i` handled as one product at a
+    time would (the window before it is judged first, then, for a serving error, the products
+    of run `i` served before it; the error is raised only if none rejects, else left to the
+    record pass in `StepState.run_rest_error`).
   - **The record pass (EV2, EVALUATION_SPEC §4.1).** `record_rest(store, c, ctx, bands,
     slot) -> str` measures, for the record only, the tests a rejecting check skipped. A
     check-5 rejection first records the products check 5 measured after the failing one and
     never judged (the rest of its window, `StepState.run_rest`, set by check 5 when it
-    rejects), since a member measured alone or in a smaller batch is held to agree only to
-    `1e-4` relative; an error check 5 deferred (`StepState.run_rest_error`) is raised after
-    them. Every later product is then served and measured from check 5's own replay, as
-    check 5 does it. A 6a rejection measures
+    rejects, then on the unit pass the host rows of the later windows,
+    `StepState.run_rest_rows`, judged in canonical order), since a member measured alone or
+    in a smaller batch is held to agree only to `1e-4` relative; an error check 5 deferred
+    (`StepState.run_rest_error`) is raised after them. Every product still unmeasured is then
+    served and measured from check 5's own replay, as check 5 does it (none remain after a
+    unit pass). A 6a rejection measures
     the remaining linear weights, then every 6b glue weight from a replay of its own, since
     check 6 is one protocol check over every tensor. A 6b rejection measures the remaining
     glue weights. Each gradient comes from the helper its live check uses

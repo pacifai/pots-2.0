@@ -616,6 +616,11 @@ class StepState:
     # than measuring the products again.
     run_rest: list[tuple[ProductSpec, ProductMeasure]] = field(default_factory=list)
     run_rest_error: Exception | None = None
+    # The unit pass's rejection (check 5 measured every run before judging): the rows, read
+    # back to the host, of every run of the windows after the failing one, as
+    # ``(checks._Rows, host array)`` per run in canonical order, with the device rows dropped.
+    # The record pass finishes and records them. Empty on the canonical path.
+    run_rest_rows: list[tuple[Any, np.ndarray]] = field(default_factory=list)
 
     def committed(self) -> CommittedLeaves:
         if self.leaves is None:

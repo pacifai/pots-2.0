@@ -52,6 +52,7 @@ so its stamps repeat the ids of the normal serving; the layout describes the nor
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -561,9 +562,12 @@ def _layout(c: DeclaredComputation) -> tuple[list[dict[str, Any]], int]:
     it, and the last is judged even when empty (so it is counted when a run closes the one
     before it)."""
     out: list[dict[str, Any]] = []
-    window = pending = 0
+    runs = list(_member_runs(c.products))
+    windows = _judge_windows(runs)
+    window_of = {i: w for w, idx in enumerate(windows) for i in idx}
     item = torch.empty(0, dtype=c.product_dtype).element_size()
-    for i, run in enumerate(_member_runs(c.products)):
+    for i, run in enumerate(runs):
+        window = window_of[i]
         for idx in _measure_groups(run):
             specs = [run[j] for j in idx]
             (n, q), (_, w) = specs[0].a_shape, specs[0].b_shape
@@ -576,16 +580,14 @@ def _layout(c: DeclaredComputation) -> tuple[list[dict[str, Any]], int]:
                 "product_bytes": item * len(specs) * n * w,
                 "product_dtype": str(c.product_dtype).removeprefix("torch."),
                 "served_bytes": 4 * len(specs) * n * w})
-        pending += len(run)
-        if pending >= _JUDGE_WINDOW:
-            window, pending = window + 1, 0
-    return out, window + 1
+    return out, len(windows)
 
 
 @_checked
 def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepContext,
                     bands: Bands) -> Rejection | None:
-    """Both tests of spec §6 check 5 on every product, in canonical order; abort at the first fail.
+    """Both tests of spec §6 check 5 on every product, judged in canonical order; abort at the
+    first fail.
 
     The challenges are keyed on ``ctx.state.claimed_root``, the prover's ``h`` as check 2's
     read validated it, not on a root the verifier recomputed (F15a). Check 2's root comparison
@@ -600,6 +602,16 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
     must still be finite, in either mode: a matmul output such as ``A(B·r)`` can itself exceed
     the fp32 maximum, and ``inf <= inf`` would accept an arbitrary forgery.
 
+    **Order.** A replay with a unit schedule (``Replay.unit_schedule``: the decoder's) is served
+    and measured in it, the head's blocks and then layers ``L … 1``, each layer's forward
+    products with its backward ones, so the replay runs its forward pass once and each backward
+    unit once (:func:`_check_5_units`). Every run's rows stay on the device and are read back
+    once, per device, at the first window, and the windows are then judged in canonical order.
+    A replay without one (the MLP) is served and judged in canonical order
+    (:func:`_check_5_canonical`), each window as it fills, and so is the rerun on a fresh
+    replay when the unit pass raises (a serving or measuring error, a failed read).
+    A schedule that repeats or misses a product, or splits a run, raises ``RuntimeError``.
+
     **Batching.** A product's measuring is O(n²) arithmetic, little next to the fixed cost of
     launching its ops and waiting for their results, so check 5 batches in two ways and keeps
     the order of judging:
@@ -611,16 +623,19 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
       (``Replay.operand_group``), its ``P`` leaves move to the device in one copy, and the
       group is measured in batched ops, each member with its own challenges and norm scaling
       (``freivalds.measure_products_rows``). Only its rows are kept.
-    - The numbers stay on the device as one row per product until at least
-      :data:`_JUDGE_WINDOW` products are measured; then one read brings the window's rows to
-      the host (:func:`_finish`), and its products are recorded and judged one by one in
-      canonical order. So the first failing product rejects with the same message as when
-      everything was measured one at a time.
+    - The numbers stay on the device as one row per product. On the canonical path, once at
+      least :data:`_JUDGE_WINDOW` products are measured, one read brings the window's rows to
+      the host (:func:`_finish`); on the unit path one read brings every row. Either way
+      products are recorded and judged window by window, one by one in canonical order, so the
+      first failing product rejects with the same message as when everything was measured one
+      at a time.
 
     A rejection leaves the products measured after it, never judged, to the record pass
-    (``StepState.run_rest``). An error while serving or measuring is raised only after the
-    products before it are judged, as it would be one product at a time; if one of those
-    rejects, the error is left to the record pass instead (``StepState.run_rest_error``).
+    (``StepState.run_rest``, and on the unit path ``run_rest_rows`` for later windows). On the
+    canonical path an error while serving or measuring is raised only after the products
+    before it are judged, as it would be one product at a time; if one of those rejects, the
+    error is left to the record pass instead (``StepState.run_rest_error``). The unit pass
+    leaves no error to the record pass: it reruns canonically instead.
     """
     root = ctx.state.claimed_root
     if root is None:
@@ -631,46 +646,203 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
         replay = c.replay(leaves)
     ctx.state.replay = replay
     try:
-        scratch = MeasureScratch()
-        window: list[_Rows] = []
-        pending = 0
-        w = 0  # the window being filled
-        group0 = 0  # the first group id of the run: ids run across the step's runs
-        for i, run in enumerate(_member_runs(c.products)):
-            try:
-                with ctx.stamp("c5.run", i):
-                    rows, error = _measure_served(c, run, ctx, replay, view, h=root, k=ctx.k,
-                                                  scratch=scratch, guard=ctx.kappa_guard, run=i,
-                                                  group0=group0)
-            except Exception as e:  # raised after the products before it are judged
-                rej = _judge_window(c, window, ctx, bands)
-                if rej is None:
-                    raise
-                ctx.state.run_rest_error = e
-                return rej
-            if error is not None:
-                # As one at a time: the products before this run, then its served part, then the
-                # error. A rejection before this run leaves its served part to the record pass.
-                rej = _judge_window(c, window, ctx, bands)
-                if rej is None:
-                    rej = _judge_window(c, [rows], ctx, bands)
-                if rej is None:
-                    raise error
-                ctx.state.run_rest_error = error
-                return rej
-            group0 += len(_measure_groups(run))
-            window.append(rows)
-            pending += len(rows.specs)
-            if pending >= _JUDGE_WINDOW:
-                with ctx.stamp("c5.judge", -1, -1, w):
-                    rej = _judge_window(c, window, ctx, bands)
-                if rej is not None:
-                    return rej
-                window, pending, w = [], 0, w + 1
-        with ctx.stamp("c5.judge", -1, -1, w):
-            return _judge_window(c, window, ctx, bands)
+        schedule = replay.unit_schedule()
+        if schedule is None:
+            return _check_5_canonical(c, ctx, bands, replay, view, root)
+        runs = list(_member_runs(c.products))
+        steps = _schedule_runs(runs, schedule)  # a RuntimeError (a verifier bug) propagates
+        failed: tuple[str, int | None] | None = None
+        try:
+            return _check_5_units(c, ctx, bands, replay, view, root, runs, steps)
+        except _UnitPassError as e:
+            failed = (type(e.__cause__).__name__, e.run)
+        # Outside the handler, so no traceback keeps the old replay alive: a fresh replay (the
+        # decoder's reused model takes fresh parameter storage) and today's canonical loop.
+        replay = None  # type: ignore[assignment]
+        ctx.state.replay = None  # the old graph must not be alive while the new one builds
+        logging.getLogger(__name__).debug(
+            "check 5: the unit pass raised %s at run %s; rerunning in canonical order", *failed)
+        with _guard(ctx, "5", _AFTER_COMMIT), ctx.timed("5.glue"):
+            replay = c.replay(leaves)
+        ctx.state.replay = replay
+        return _check_5_canonical(c, ctx, bands, replay, view, root)
     finally:
         freivalds.drain()  # no kernel hold outlives the check (invariant 6)
+
+
+def _check_5_canonical(c: DeclaredComputation, ctx: StepContext, bands: Bands,
+                       replay: Replay, view: TranscriptView, root: bytes) -> Rejection | None:
+    """Check 5's loop in canonical order 1..M, on ``replay`` (a fresh one): each run served and
+    measured in turn, each window judged as it fills (:data:`_JUDGE_WINDOW`), stopping at the
+    first rejection. The path of a replay with no unit schedule (the MLP), and the one
+    :func:`check_5_matmuls` reruns when the unit pass raises."""
+    scratch = MeasureScratch()
+    window: list[_Rows] = []
+    pending = 0
+    w = 0  # the window being filled
+    group0 = 0  # the first group id of the run: ids run across the step's runs
+    for i, run in enumerate(_member_runs(c.products)):
+        try:
+            with ctx.stamp("c5.run", i):
+                rows, error = _measure_served(c, run, ctx, replay, view, h=root, k=ctx.k,
+                                              scratch=scratch, guard=ctx.kappa_guard, run=i,
+                                              group0=group0)
+        except Exception as e:  # raised after the products before it are judged
+            rej = _judge_window(c, window, ctx, bands)
+            if rej is None:
+                raise
+            ctx.state.run_rest_error = e
+            return rej
+        if error is not None:
+            # As one at a time: the products before this run, then its served part, then the
+            # error. A rejection before this run leaves its served part to the record pass.
+            rej = _judge_window(c, window, ctx, bands)
+            if rej is None:
+                rej = _judge_window(c, [rows], ctx, bands)
+            if rej is None:
+                raise error
+            ctx.state.run_rest_error = error
+            return rej
+        group0 += len(_measure_groups(run))
+        window.append(rows)
+        pending += len(rows.specs)
+        if pending >= _JUDGE_WINDOW:
+            with ctx.stamp("c5.judge", -1, -1, w):
+                rej = _judge_window(c, window, ctx, bands)
+            if rej is not None:
+                return rej
+            window, pending, w = [], 0, w + 1
+    with ctx.stamp("c5.judge", -1, -1, w):
+        return _judge_window(c, window, ctx, bands)
+
+
+class _UnitPassError(Exception):
+    """The unit pass raised while serving, measuring or reading (the cause): ``run`` is the
+    canonical run it was in, ``None`` at the end read. :func:`check_5_matmuls` reruns in
+    canonical order."""
+
+    def __init__(self, run: int | None):
+        super().__init__(run)
+        self.run = run
+
+
+def _judge_windows(runs: Sequence[Sequence[ProductSpec]]) -> list[list[int]]:
+    """The judging windows of check 5 over ``runs`` (:func:`_member_runs`): the run indices of
+    each window in order. A window closes after the run that brings it to
+    :data:`_JUDGE_WINDOW` products, and the last window, the one still filling, is judged even
+    when empty (a run that closed the one before it leaves it empty)."""
+    windows: list[list[int]] = []
+    window: list[int] = []
+    pending = 0
+    for i, run in enumerate(runs):
+        window.append(i)
+        pending += len(run)
+        if pending >= _JUDGE_WINDOW:
+            windows.append(window)
+            window, pending = [], 0
+    windows.append(window)
+    return windows
+
+
+def _schedule_runs(runs: Sequence[Sequence[ProductSpec]],
+                   schedule: Sequence[Sequence[int]]) -> list[list[int]]:
+    """The canonical runs each step of ``schedule`` holds, as run indices in the step's order.
+
+    A schedule that repeats or misses a product, or splits a run over steps, is a verifier bug:
+    it raises ``RuntimeError``."""
+    where: dict[int, tuple[int, int]] = {}  # m -> (step, position in the step)
+    for s, step in enumerate(schedule):
+        for pos, m in enumerate(step):
+            if m in where:
+                raise RuntimeError(f"unit schedule serves product {m} twice")
+            where[m] = (s, pos)
+    want = {spec.m for run in runs for spec in run}
+    if set(where) != want:
+        raise RuntimeError(f"unit schedule misses products {sorted(want - set(where))[:5]} or "
+                           f"adds {sorted(set(where) - want)[:5]}")
+    out: list[list[int]] = [[] for _ in schedule]
+    for i, run in enumerate(runs):
+        held = {where[spec.m][0] for spec in run}
+        if len(held) != 1:
+            raise RuntimeError(f"unit schedule splits the run of {run[0].name} over steps")
+        out[held.pop()].append(i)
+    for step in out:
+        step.sort(key=lambda i: where[runs[i][0].m][1])
+    return out
+
+
+class _ReadOnce:
+    """The rows of the unit pass's runs, read to the host once, when first asked for: one
+    drain and one read per device over every run (:func:`_read_rows`). A failing read raises
+    :class:`_UnitPassError`, so check 5 falls back before it has recorded anything."""
+
+    def __init__(self, rows: Sequence[_Rows]):
+        self._present = [r for r in rows if r.rows is not None]
+        self._host: dict[int, np.ndarray] | None = None
+
+    def host(self, r: _Rows) -> np.ndarray:
+        """``r``'s rows as a float64 array, in the order of ``r.order``."""
+        if self._host is None:
+            try:
+                read = _read_rows([x.rows for x in self._present])  # type: ignore[misc]
+            except Exception as e:
+                raise _UnitPassError(None) from e
+            self._host = {id(x): h for x, h in zip(self._present, read)}
+        return self._host[id(r)]
+
+
+def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, replay: Replay,
+                   view: TranscriptView, root: bytes, runs: Sequence[Sequence[ProductSpec]],
+                   steps: Sequence[Sequence[int]]) -> Rejection | None:
+    """Check 5 in the replay's unit order (``Replay.unit_schedule``): every run measured in its
+    step's turn, every run's rows kept on the device, read once at the first non-empty window,
+    and the windows judged in canonical order from the host rows, so the first failing
+    product, its message and every recorded number are canonical judging's. Each run keeps its
+    canonical index and group ids (the stamps' and :func:`_layout`'s).
+
+    An error while serving, measuring or reading raises :class:`_UnitPassError` after the
+    kernel's work in flight is waited for (:func:`check_5_matmuls` then reruns in canonical
+    order). Nothing is recorded in ``ctx.stats`` before the read. On a rejection,
+    ``StepState.run_rest`` holds the failing window's tail and ``run_rest_rows`` the host rows
+    of every later window's runs."""
+    group0, g = [], 0
+    for run in runs:
+        group0.append(g)
+        g += len(_measure_groups(run))
+    scratch = MeasureScratch()
+    rows: list[_Rows | None] = [None] * len(runs)
+    try:
+        for step in steps:
+            for i in step:
+                try:
+                    with ctx.stamp("c5.run", i):
+                        r, error = _measure_served(c, runs[i], ctx, replay, view, h=root,
+                                                   k=ctx.k, scratch=scratch,
+                                                   guard=ctx.kappa_guard, run=i,
+                                                   group0=group0[i])
+                    if error is not None:
+                        raise error
+                except Exception as e:
+                    raise _UnitPassError(i) from e
+                rows[i] = r
+        done: list[_Rows] = rows  # type: ignore[assignment]
+        once = _ReadOnce(done)
+        windows = _judge_windows(runs)
+        for w, idx in enumerate(windows):
+            with ctx.stamp("c5.judge", -1, -1, w):
+                rej = _judge_window(c, [done[i] for i in idx], ctx, bands, once)
+            if rej is not None:
+                ctx.state.run_rest_rows = [
+                    (done[i]._replace(rows=None), once.host(done[i]))
+                    for later in windows[w + 1:] for i in later if done[i].rows is not None]
+                return rej
+        return None
+    except _UnitPassError:
+        try:
+            freivalds.drain()
+        except Exception:
+            pass  # the pass already failed; the rerun finds what is wrong
+        raise
 
 
 class _Group(NamedTuple):
@@ -1092,15 +1264,17 @@ def _finish(batch: Sequence[_Rows], ctx: StepContext) -> list[tuple[ProductSpec,
     return out
 
 
-def _finish_columns(batch: Sequence[_Rows], ctx: StepContext
+def _finish_columns(batch: Sequence[_Rows], ctx: StepContext, once: _ReadOnce | None = None
                     ) -> tuple[list[ProductSpec], MeasureColumns | None]:
     """:func:`_finish`'s products, as their specs and a :class:`MeasureColumns` in canonical
-    order, finished in one vectorized step (``freivalds.finish_rows``)."""
+    order, finished in one vectorized step (``freivalds.finish_rows``). The unit pass hands
+    its rows' one read in as ``once``; the first window asking for it makes the read."""
     present = [r for r in batch if r.rows is not None]
     if not present:
         return [], None
     with ctx.timed("5.measure"):
-        read = _read_rows([r.rows for r in present])  # type: ignore[misc]
+        read = ([once.host(r) for r in present] if once is not None
+                else _read_rows([r.rows for r in present]))  # type: ignore[misc]
         host = read[0] if len(read) == 1 else np.concatenate(read)
         perm, specs, base = [], [], 0
         for r in present:
@@ -1135,7 +1309,7 @@ def _first_failing(specs: Sequence[ProductSpec], classes: Sequence[str], cols: M
 
 
 def _judge_window(c: DeclaredComputation, batch: Sequence[_Rows], ctx: StepContext,
-                  bands: Bands) -> Rejection | None:
+                  bands: Bands, once: _ReadOnce | None = None) -> Rejection | None:
     """Read the batch's numbers, then record and judge its products in canonical order. At a
     rejection the products after the failing one go to ``StepState.run_rest``, measured and
     never judged, for the record pass.
@@ -1144,7 +1318,7 @@ def _judge_window(c: DeclaredComputation, batch: Sequence[_Rows], ctx: StepConte
     failing one on, :func:`_judge_product` runs product by product, so the rejection, and
     ``run_rest``, are the one-at-a-time path's.
     """
-    specs, cols = _finish_columns(batch, ctx)
+    specs, cols = _finish_columns(batch, ctx, once)
     if cols is None:
         return None
     table = product_classes(c)  # the specs are the inventory's own, so [m-1] is their class
@@ -1341,9 +1515,14 @@ def _record_rest_5(c: DeclaredComputation, ctx: StepContext, bands: Bands) -> No
     if root is None or replay is None:
         raise RuntimeError("check 5's record pass needs check 5's root and replay")
     rest, error = ctx.state.run_rest, ctx.state.run_rest_error
-    ctx.state.run_rest, ctx.state.run_rest_error = [], None
+    rest_rows = ctx.state.run_rest_rows
+    ctx.state.run_rest, ctx.state.run_rest_rows, ctx.state.run_rest_error = [], [], None
     for spec, mp in rest:  # measured by check 5 after the failing product, never judged
         _judge_product(c, spec, mp, ctx, bands)  # records; judge=False decides nothing
+    for r, host in rest_rows:  # the unit pass's later windows, read once at its end
+        for spec, mp in zip(r.specs, _finished(r, host.tolist(), eps_in=ctx.eps_in,
+                                               eps_acc=ctx.eps_acc, guard=ctx.kappa_guard)):
+            _judge_product(c, spec, mp, ctx, bands)
     if error is not None:  # serving or measuring a later product failed, as it did in check 5
         raise error
     view = TranscriptView(c, ctx.state.committed())

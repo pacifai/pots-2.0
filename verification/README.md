@@ -640,6 +640,10 @@ What each check establishes:
   host wait for the device, so this cuts the waits from several per product to one per
   window. The first failing product and its message are those of one-at-a-time judging, and
   an error serving a later product is raised only after the products before it pass.
+  On the decoder check 5 serves in the replay's own order (the head's blocks, then layers
+  `L … 1`), so the replay runs one forward pass and each backward unit once; every row is
+  read in one go and judged in canonical order. An error in that pass reruns check 5 in
+  canonical order on a fresh replay.
 
   On a CUDA device, check 5 measures with a fused kernel (FS37) instead of torch. It reads
   the replay's operands as they are, with no copy or widening, and computes every number of
