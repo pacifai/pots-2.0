@@ -659,6 +659,7 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
         # Outside the handler, so no traceback keeps the old replay alive: a fresh replay (the
         # decoder's reused model takes fresh parameter storage) and today's canonical loop.
         replay = None  # type: ignore[assignment]
+        ctx.state.replay = None  # the old graph must not be alive while the new one builds
         logging.getLogger(__name__).debug(
             "check 5: the unit pass raised %s at run %s; rerunning in canonical order", *failed)
         with _guard(ctx, "5", _AFTER_COMMIT), ctx.timed("5.glue"):
