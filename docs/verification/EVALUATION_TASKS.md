@@ -21,24 +21,24 @@ Closed items are in `DECISIONS_EVALUATION.md`.
 
 ## Open items
 
-- **EQ18 — The scorer prompts with the bare instruction.** EQ8 reuses BackdoorLLM's
-  `attack/DPA/backdoor_evaluate.py` (pinned at `591bb2fd`) unmodified. Its generation code
-  tokenizes `example['instruction']` alone (lines 151–152 and 202–203), so the prompt carries no
-  template and drops the `input` field, which 93 of the 200 held-out Alpaca prompts have. Its
-  `prompt_template: "alpaca"` setting is never read. The models train on BackdoorLLM's `alpaca`
-  template (`DECISIONS_FULL_SCALE.md` F8e), so they are scored on a prompt format they didn't train on. PoTS cites BackdoorLLM for
-  attack success and doesn't say how it prompted. Three smaller points came up with it:
-  - it tokenizes with the tokenizer's default special tokens, which for Llama-3.2 prepend
-    `<|begin_of_text|>`, while training adds no beginning-of-sequence token
-    (`DECISIONS_FULL_SCALE.md` F8f). *(Added at F8f, 2026-10-06.)*
-  - its defaults score a random 20% of each test file with no seed (`sample_ratio: 0.2`), where
-    `EVALUATION_SPEC.md` §5.1 scores all 200 and 99 prompts;
-  - it writes Llama-2's token ids (pad 0, BOS 1, EOS 2) into the model config. Generation passes
-    the tokenizer's own EOS, and whether the other ids matter for the four models is unchecked.
+EQ18 closed on 2026-10-08, and the user approved `EVALUATION_SPEC.md` the same day.
 
-  Decide whether attack success uses the scorer's bare-instruction prompts or renders the
-  training template, and whether every held-out prompt is scored. *(Came up at F8's template
-  question, 2026-10-06.)*
+- **E3 — A TEE-attested run as a comparison point for the discussion.** *Parked by the user on
+  2026-10-19 from the hardware comparison (`HARDWARE_ENVIRONMENTS.md`, the TEE section).* A
+  trusted execution environment, here a confidential VM with an H100 or Blackwell GPU in
+  confidential-computing mode, could replace the proof: the hardware signs an attestation that
+  the measured training code ran on data `D` from `W_0` to `W_T`. It needs no transcript, so no
+  copies and almost no hashing. Reported overheads: 5–9% for inference that fits in GPU memory
+  (arXiv 2409.03992), and 18–32% for multi-GPU training on Blackwell (one secondary source).
+  The guarantee changes kind. It rests on the vendors' keys and on the machine's owner, who is
+  our prover, mounting no physical attack. In 2025, memory-bus interposers costing $50–$1,000
+  (TEE.fail, Battering RAM, WireTap) extracted attestation keys or broke attestation, and Intel
+  and AMD place such attacks outside their threat models. Open: whether the discussion reports
+  it as a cost row beside PoTS and pots-2.0 (from the literature or measured), and how the trust
+  difference is worded. A cost row takes the GPU-seconds basis of EQ14's four-GPU revision. Under the standing rule it is a discussion comparison saved as data, not
+  a figure.
+  - Came from: the hardware-environment exploration, 2026-10-19 (the user called it "an
+    interesting comparison").
 
 Section references (§3, §5, §9) point to `DECISIONS_ALGORITHM.md`, §8.A and S-items to
 `DECISIONS_SETUP.md` or `SETUP_TASKS.md`.

@@ -55,8 +55,8 @@ The design process is gated, and each stage starts only after the previous one c
 - **Implementation (stage 5) started on 2026-09-30; milestone M5 closed on 2026-10-05
   (user approved; main merge `33d09bd`), so all of A1–A14 are done. C5 and C6 (the
   hash-shuffled schedule and the released data) closed on 2026-10-11 with their re-runs, so
-  the next item is **the full-scale and evaluation tasks** (`IMPLEMENTATION_PLAN.md`, FS1–FS15
-  and EV1–EV7 in waves, gated at milestones EM1 and FM1–FM7). EV1 (the records reader) is
+  the next item is **the full-scale and evaluation tasks** (`IMPLEMENTATION_PLAN.md`, FS1–FS41
+  and EV1–EV7 in waves, gated at milestones EM1 and FM1–FM11). EV1 (the records reader) is
   merged as `9ca7b3e`, FS6 (the full-scale data builder) as `2297264`, FS1 (one decoder
   instance for all five models) as `1696c9e`, FS2 (check 5 on a biased linear) as
   `07b1cdc`, FS3 (mixed precision on CPU under autocast) as `6eeb7d9`, EV2 (the step
@@ -202,9 +202,9 @@ pod 4.5 h, H100 job 3.5 h. Mac rehearsal: Qwen2.5-0.5B refusal at
   then pipelined. If the four-GPU machine fails its hardware feasibility on every provider
   (rentable, NVLink near 300 GB/s, the same bits on every card), the work falls back to one
   B200. The hash is BLAKE3 in our own GPU kernel, every digest unchanged (F23), which replaces
-  F15b's choice of the CPU and took in O8. Next: the hashing build's end (FM6); the kernel
-  (FM9: FS28–FS30) and the four-GPU port (FM10: FS31–FS35) in parallel, in either order; then
-  the second session (FS14) on the new environment.
+  F15b's choice of the CPU and took in O8. Next: the four-GPU port (FM10: FS31–FS35) and check
+  5's GPU measuring (FM11: FS36–FS41); then FM6 (the second session's estimate, redone from
+  FS35's four-H100 step times) and the second session (FS14) on the new environment.
   **Milestone FM9 closed by the user on 2026-10-21** (K1–K4 settled in F23). FS28 (the kernel,
   `082265f`, pod fixes `81698b2`), FS29 (its speed, `70a5bba`) and FS30 (device leaves and
   routing, `a7ff2ee`, fix round `efaaec5`, follow-up `bd4f230`) are merged, and the final plan
@@ -219,6 +219,15 @@ pod 4.5 h, H100 job 3.5 h. Mac rehearsal: Qwen2.5-0.5B refusal at
   `R/τ` 0.57–0.61). A first FS30 session (pod `nuwftkphmu7pp1`) failed two CUDA test bugs,
   fixed in `bd4f230`; a second left no results. No pods left. Next on the hashing line: the
   join (FS34), now unblocked on FM9, built beside the rest of FM10.
+  **FS31 passed on 2026-10-21** (pod `2two6xb5r3gs0f`, four H100 SXM over NVLink): the slowest
+  pair's peer copy at 392 GB/s (HW2, target 300), every ordered pair's peer copies byte-exact
+  against a host-staged copy, and the same Merkle root on all four cards for all four models
+  (HW3's first half). Runpod's two-A40 pairs copy wrong bytes peer to peer (F22's HW2), so
+  FS32–FS34's pair session takes two A100 or H100 SXM. FS32 and FS33 (the pipelined loop, the
+  prover in its own process) are merged into `verification-impl`; FS33 closed its third and last
+  validator round on the Mac (`2096ce2`), and FS34 is merged (`4746fc2`) and in validation. Both
+  wait on the pair session for their GPU criteria. The user gave FS35 the per-device tools (`check5_profile.py`,
+  `runs/probe.py`, `setup/machine.py`) on 2026-10-21.
   **Resource profiling (user, 2026-10-18).** `archive/PROFILING_PLAN.md` holds the plan: tasks
   FS18–FS27, built beside the hashing build, and a short H100 check (FS27) that also measures
   check 5 on the four full-scale models and ends at **Milestone FM8** before FS14. Approved
@@ -492,7 +501,8 @@ pod 4.5 h, H100 job 3.5 h. Mac rehearsal: Qwen2.5-0.5B refusal at
   (`CLAUDE.md`, "Project goal"). That weakens F1a's memory reason for streaming, so F1
   reopens on holding the transcript in host RAM. **F1c** closed the same day and closes F1: the
   full-scale transcript is handed over in host RAM (32–64 GB against 188–320 GB), the
-  test-scale `InMemoryStore` path, superseding F1a's disk streaming. F1b is then unused at full
+  test-scale `InMemoryStore` path, superseding F1a's disk streaming (on four GPUs F22 replaces the host-RAM handover by
+  peer copies to the owner GPUs; F1c holds on one GPU). F1b is then unused at full
   scale, F15a stays (implemented, saves less), and F4a stays (forward values kept on the GPU).
   A review of every full-scale decision against the compute-first rule found no other
   memory-first choice; it parked **F16** (eager attention's prover cost). **F16** closed on
@@ -505,7 +515,11 @@ pod 4.5 h, H100 job 3.5 h. Mac rehearsal: Qwen2.5-0.5B refusal at
   only on H100 measurements, so no full-scale decision item is open for discussion.
   **Full-scale build (user, 2026-10-08):** the code the closed full-scale decisions require
   gets a full-scale part of `IMPLEMENTATION_PLAN.md`, approved before any of it is written. Its
-  six groups were settled on 2026-10-08 in that section (model support, mixed precision, the GPU path, data and orchestration, the `η` pilot, the H100 measurement scripts). The runs and their budget were approved on 2026-10-11 (plan section "Runs": 1,016 verified full-scale steps, about 8.5–12.5 GPU-hours and $15–40 before a rerun margin), with tasks FS12 (`k` tunability, EQ11 amended), FS13 (the run driver) and FS14 (the second H100 session); the full-scale task table was approved the same day under the user's delegation. This session is the one orchestrator of the full-scale and evaluation tasks, and stops at every milestone (EM1, FM1, FM2, FM4–FM7); FM7 shows the results before any attack-success scoring. F4 and F15 close in the first H100 session, before H1. **F6c** (user, 2026-10-08) postpones attack-success scoring to the end of implementation and evaluation, drops the `η` pilot and fixes full-scale `η = 10⁻³`, checked by 10 plain steps per model and task for smooth loss before H1.
+  six groups were settled on 2026-10-08 in that section (model support, mixed precision, the GPU path, data and orchestration, the `η` pilot, the H100 measurement scripts). The runs and their budget were approved on 2026-10-11 (plan section "Runs": 1,016 verified full-scale steps, about 8.5–12.5 GPU-hours and $15–40 before a rerun margin; one-H100 figures, which FM6 redoes for four H100s), with tasks FS12 (`k` tunability, EQ11 amended), FS13 (the run driver) and FS14 (the second full-scale session, on four H100s since F22); the full-scale task table was approved the same day under the user's delegation. This session is the one orchestrator of the full-scale and evaluation tasks, and stops at every milestone (EM1, FM1, FM2, FM4–FM11); FM7 shows the results before any attack-success scoring. F4 and F15 close in the first H100 session, before H1. **F6c** (user, 2026-10-08) postpones attack-success scoring to the end of implementation and evaluation, drops the `η` pilot and fixes full-scale `η = 10⁻³`, checked by 10 plain steps per model and task for smooth loss before H1.
+
+- **Check 5's measuring on the GPU, approved 2026-10-21 (user).** O2's fused kernel, shared
+  reads and overlap with the glue: `MEASURE_KERNEL_PLAN_DRAFT.md`, tasks FS36–FS41 and
+  milestone FM11 in `IMPLEMENTATION_PLAN.md`. FS36 (the C measuring core) is merged (cda6346): the host build equals a bit-exact emulator of §2.1a on every case. FS37 (the kernel, views and the host challenge source, routed by device) is merged (6188339) and passed on one A40 on 2026-10-21: the kernel equals the host build bit for bit on FS36's 204 inputs and on every product of the tiny decoder step, agrees with the torch path within FS36's bound, and the honest step is accepted and a flip of each of the 30 product classes rejected at its product on both paths. FS38 is built in two parts (measuring plan §2.4a). FS38a, check 5 in the replay's unit order (head blocks, then one step per layer `L … 1`) with end judging and a canonical fallback, is merged (f38ac8a, 2026-10-22; fast suite 6,919 passed on the Mac); it carries the fix of the loop's CUDA pre-build test, which runs on the next A40 pod. **Two-sided reads decided 2026-10-22 (user): one-sided shares only** (§5, reasoning under O2). FS38b, shared reads with one kernel table per schedule step, detailed in §2.4a the same day, is in progress.
 
 The session-start hook reads the phrase "the next item is **ID**" in the setup line, so
 keep that wording when you update it. It builds its task menu from the `- **ID — Title.**`
@@ -527,6 +541,7 @@ items of the four task files.
 | `PERFORMANCE_TASKS.md` | Parked speed and memory problems of the implementation (O1, O2, …) |
 | `DECISIONS_FULL_SCALE.md` | Settled full-scale decisions and their reasoning |
 | `ENVIRONMENT_PLAN_DRAFT.md` | The four-H100 and B200 environments planned side by side: data path, code changes per module, memory, floors and prices (F22, F23) |
+| `MEASURE_KERNEL_PLAN_DRAFT.md` | Draft plan for check 5's measuring on the GPU: the fused kernel, shared reads and overlap with the glue (O2, FS36–FS41, FM11), approved 2026-10-21 |
 | `DECISIONS_ALGORITHM.md` | Settled algorithm decisions and their reasoning (§3, §4, §5, §9) |
 | `DECISIONS_SETUP.md` | Settled setup decisions and their reasoning (§8.A, closed S-items) |
 | `BACKGROUND.md` | PoTS summary, notation, repo context (§1, §2, §6) |

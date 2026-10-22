@@ -38,6 +38,18 @@ closed), F15a (the claimed-root check order), F4a (forward values kept for the b
 pass) and F16 (eager attention kept; its cost measured in the H100 benchmark).
 A merged item keeps the old IDs in its title, so older references to them still resolve.
 
+**Parked until the H100 runs (user, 2026-10-08).** Every decision item was closed except F4 and
+F15, and both close only on H100 measurements: F4 on the verifier's measured GPU peak, F15 on
+the hashing benchmark (`HASHING_PLAN_DRAFT.md` Section 6). F4 closed on 2026-10-18 on FS17's
+measurement: every model fits (`DECISIONS_FULL_SCALE.md` F4). F15 closed on 2026-10-18:
+the CPU hashing path (F15b) and, for the device, the CPU; GPU hashing through NVIDIA's
+cuPQC was parked as speed item O8 (`DECISIONS_FULL_SCALE.md` F15). The device choice was
+reopened on 2026-10-20 as F23, which took in O8, and closed the same day with the environment
+(F22): BLAKE3 in our own GPU kernel, on four H100s over NVLink with one B200 as the fallback
+(`DECISIONS_FULL_SCALE.md` F22, F23).
+F17 (transcript bytes per step) was opened on 2026-10-11; F22 and F23 changed its rates (the
+note under F17).
+
 ## Validation note for both sessions (2026-10-06)
 
 The verifier-machinery session checked this file and `STATUS.md` against the closed decisions
@@ -54,66 +66,103 @@ and corrected stale facts. Nothing was decided or reopened.
   assumption. That figure is from SmolLM2 at test scale, so a full-scale model may differ.
 - **F4.** Rewritten after F1c: no streaming, so leaf chunking is now a speed option for F15,
   and F4 closes if an H100 measurement shows every model fits.
-- **F15.** Figures moved from SmolLM2's 17 GB per step to the real models' 32–64 GB (about
-  1–6 s of CPU hashing per side), with F1c's host-RAM copy as a place to hash on the CPU.
 - **Header.** C1 is closed, so F9 and F10 no longer wait on it; the closed-items list now
   includes F1a–F1c, F15a and F4a.
 
 ## Tasks
 
-- **F4 — The largest leaf sets verifier peak memory (includes former F12).** F4a (2026-10-06)
-  settled what the verifier holds: each layer's forward values, kept for the backward pass.
-  The items below are memory savings; under the compute-first priority they matter only if a
-  model doesn't fit.
-  - **Output layer.** In the verifier, the largest single working set is the output layer:
-    the embedding matrix, the logits, their softmax gradient, and the output-layer weight
-    gradient. Row-chunking the softmax reduces it if needed. It grows with vocabulary size,
-    and the full-scale candidates have larger vocabularies than SmolLM2 (Qwen-2.5: about 152k
-    against 49k). *(Came up while sizing test-scale verifier memory.)*
-  - **Fixed-size leaf chunks (former F12).** Test scale commits one leaf per record, weight
-    tensor and product (`DECISIONS_SETUP.md` §8.B P9b), so the largest leaf is the logits,
-    about 100 MB at test scale and 4–5 GB at full scale. Chunking a tensor into fixed-size row
-    blocks, each its own leaf, costs a second level of indexing (product `m`, chunk `c`), a
-    chunk rule in the canonical order, and per-chunk authentication paths. The label
-    `⟨m, j⟩` (P8a) stays per product. Its first reason, capping what a streamed verifier reads
-    at once, lapsed with F1c (no streaming). What remains is speed: equal-size chunks balance
-    parallel hashing (F15). *(Came up in P9b, 2026-09-30. Reframed after F1c, 2026-10-06.)*
-  - **What closes F4.** Measure the verifier's GPU peak under F4a on each model on the H100.
-    If every model fits, the memory items above stay unbuilt and F4 closes; chunking then
-    lives on only as an F15 option. *(Added 2026-10-06, after F1c.)*
-- **F15 — Hashing throughput sets the full-scale cost.** Both the prover's commitment and the
-  verifier's check 2 hash the whole step transcript. At test scale that is 2.62 GB per step.
-  Hashed on one thread it took about 1.5 s on each side against a 0.74 s training step.
-  Hashing leaves in parallel on 8 CPU threads (commit `70193a4`, 2026-10-04) brings it to
-  about 0.24 s per side, about 11 GB/s. A GPU speeds training up by hundreds of times, but CPU
-  hashing speeds up only by the number of cores. A rough estimate, with an assumed 200 TFLOP/s
-  GPU and 10–30 GB/s CPU hashing: about 17 GB per bf16 step for SmolLM2 against about 0.07 s
-  of training, so 10–25× training per side. The four full-scale models' steps are 32–64 GB
-  (F1a's table), so hashing on CPU threads would take roughly 1–6 s per side per step. Under
-  F1c the step is copied off the GPU into host RAM anyway, so CPU hashing can run on that
-  copy. The GPU is
-  one H100 (EQ14), so the estimate can be redone against it. Remedies that keep the
-  full-transcript binding:
-  - Hash on the GPU, where the tensors already live, with no host copy.
-  - Hash leaves in parallel. This is built on CPU threads; F4's fixed-size chunks would
-    balance the work.
-  - In the verifier, hash each leaf in the same read that checks 5–6 use. **Closed as F15a
-    (2026-10-06):** challenges come from the claimed root, and the root comparison moves to
-    the end of the step.
+- **F17 — Transcript bytes per step set the full-scale floor.** *Opened and taken up by the
+  user, 2026-10-11; not parked.* *Rates changed by F22 and F23 (2026-10-20): on the four-GPU
+  path the products cross by NVLink peer copy (slowest pair 392 GB/s measured, FS31,
+  2026-10-21) and are hashed by F23's kernel on their owner GPUs (380–600 GB/s measured on one
+  H100); no byte crosses the GPU–host link. The figures below are the one-H100 host-link
+  floor, kept as the reason the levers exist.* Even with F15's remedies (GPU hashing, challenges generated on
+  the GPU), every committed byte crosses the GPU–host link twice: the prover's copy and the
+  verifier's. At F15's assumed 50 GB/s copy and 250 GB/s GPU hashing, that is about 0.024 s
+  per GB per side. For the 34–67 GB step (an analytic count reproducing F1a's 32–64 GB within
+  5%), that comes to 3.1–6.6× a training step per side, against PoTS's reported verify ÷ train of
+  0.33–0.77. An H100 does about 8,000 FLOP in the time the link moves one byte, while a product
+  costs `q` FLOP per output byte to recompute (`2q` per bf16 entry). So any product with
+  contraction `q` below about 10⁴ is cheaper for the verifier to recompute than to receive.
+  Per class, Qwen2.5-0.5B (bytes share of the step / FLOP share of training / `q`):
 
-  What remains: GPU hashing, CPU hashing of the host copy overlapped with the GPU's work, and
-  the prover's side of the cost.
-  - **Draft plan, parked by the user (2026-10-07; revised after review the same day):**
-    `HASHING_PLAN_DRAFT.md` sizes four per-step costs together: leaf hashing, the GPU–host
-    copies (now the largest, 2–5× a training step), and challenge generation (2–3 GB and 2–8M
-    XOF calls per step at full scale, not tens of MB). It proposes hashing a large object as the
-    Merkle root of its own fixed-size chunks, so the outer tree keeps one leaf per object, and
-    pipelining hashing and copies with the GPU's work. The hash function and device (SHA-256 on
-    the GPU through cuPQC, BLAKE3 on CPU threads overlapped, or a BLAKE3 GPU kernel) and the
-    challenge construction stay open, settled by its H100 benchmark (Section 6, rules R1–R5).
-    The benchmark scripts are written with the implementation of the other full-scale tasks,
-    once every full-scale decision has been gone through. Not decided. *(Came up while explaining M3's verifier cost,
-  2026-10-04. Test-scale figures updated at the triage the same day.)*
+  | Class | Bytes | FLOP | `q` | Ship, per side | Recompute |
+  |---|---|---|---|---|---|
+  | Forward linear products | 30% | 24% | 896, 4864 | 239 ms | 29 ms |
+  | Input-gradient products | 24% | 24% | 128–4864 | 194 ms | 29 ms |
+  | Attention products | 17% | 1.1% | 64, 128 | 135 ms | 2 ms |
+  | Logits | 15% | 9% | 896 | 120 ms | 11 ms |
+  | Weight-gradient products | 3% | 33% | 16,384 | 24 ms | 40 ms |
+  | Logits' input gradient | 0.1% | 9% | 151,936 | 0.7 ms | 11 ms |
+  | Weights `W_t`, `W_{t+1}` (fp32) | 12% | — | — | 95 ms | — |
+
+  Training is 121 ms. The other three models show the same pattern. Freivalds saves arithmetic
+  only on the products whose bytes the verifier wouldn't otherwise need (weight gradients, the
+  logits' input gradient); every other product's output is an operand the verifier must hold
+  either way. Levers that came up:
+  - **Recompute instead of commit.** The verifier recomputes the forward, input-gradient,
+    attention and logit products and checks only the weight gradients and the logits' input
+    gradient. Per side this gives a verifier at about 1.5–1.6× training and a prover at about
+    1.0×, against 3.1–6.6× with everything shipped. The weights are about 60% of what remains.
+    `log₂M` falls from 18.6 to about 7. This amends algorithm decision 11 (every matmul is a
+    checked leaf), W-B (the verifier never performs a full matmul) and spec §6's locality
+    (each check local to committed values). Recomputed chains carry prover–verifier rounding
+    differences through a whole pass, which is zero only under F5a's bit-identical condition.
+  - **Weights shipped every step.** Two fp32 copies, 12–25% of the step; `W_t` repeats the
+    previous step's `W_{t+1}`.
+  - **One challenge vector shared by products of the same width.** Cuts challenge bytes; needs
+    a soundness argument (union bound without independence).
+  - **Commit `P·r` in place of `P` (user, 2026-10-14). Rejected by the user the same day, weight-gradient variant included.** If it
+    held, the step would shrink from 2.62 to 1.12 GB at test scale and from 34–67 to 7–16 GB at
+    full scale (3.1–6.6× training per side to 0.9–1.4×; scratchpad `projected_commit.py`, session
+    d412114a). Two breaks. (1) `P·r` needs `r` before the commitment, so `r` would come from
+    earlier leaves, and a prover that knows `r` fits its deviation to `null(r)` with certainty,
+    which is worse than grinding. Deriving `r` from a first root over `P` keeps today's soundness
+    and `log₂G`, but hashes `P` in full and saves nothing. (2) Every product except the weight
+    gradients is the source of the next operands through nonlinear glue, and check 5's band needs
+    `‖P_m‖_F`, so the verifier must hold `P` (the point above). Shipping operands instead cuts the
+    link between products, and a substituted batch passes every check. Only the weight gradients
+    feed a linear consumer: dropping `G_W` and checking `W_{t+1} − W_t` against `−η·δ_Yᵀ·X` by
+    projection keeps the order sound and saves 21% at test scale and 3–5% at full scale, but
+    turns check 6's elementwise test into a projected one whose band must carry `W_{t+1}`'s own
+    rounding (`ε_W·‖W‖`, large against `η·e_m·‖G_W‖` at fp32). Not sized.
+  - Sizes from an analytic per-product count (session scratchpad `bytes_vs_flops.py`), under
+    F15's assumed throughputs; the H100 benchmark (FS10–FS11) measures the real ones. *(Came up
+    while summing up full-scale verifier cost, 2026-10-11.)*
+- **F20 — At bf16 the calibration guard `τ/2` can't hold, and `τ = 8·s_h` may reject honest
+  steps.** *Parked until real full-scale residuals exist (user, 2026-10-13, at FM2).* At bf16
+  each product's own rounding dominates `e_m`, so every class has about the same RMS (FS5,
+  Qwen2.5-0.5B on CPU: 0.29–0.31). With `N` residuals of one size, the largest grows like
+  `√(2·ln N)·s_h`, which passes `τ/2 = 4·s_h` once `N` exceeds about 3,000. Measured: 3.81·`s_h`
+  over one step (51k residuals), 5.83·`s_h` over three (154k; `L1.dA[3,10]`, whose own
+  predicted RMS is 1.8·`s_h`), so H1's three calibration steps would stop at the guard. A
+  10-step run holds about 1.8M residuals at `k = 21`, a Gaussian maximum near 5.4·`s_h` before
+  the products noisier than their class, against `τ` at 8: honest false rejects are possible,
+  and EQ's false-reject rate is a reported result. A likely remedy sizes `τ` (and the guard)
+  from a target false-reject chance over the run's residual count; `τ` 1.5× larger costs about
+  0.6 bits per vector, `k` about 23 instead of 21. Decided on the first full-scale honest
+  residuals (FS11's bring-up steps or H1), not on CPU; since F22 and O2's measuring kernel
+  (2026-10-21), on residuals from the four-H100 machine measured by FM11's kernel, whose
+  reduction order moves every residual's last bits. *(Came up at FM2, FS5's three-step
+  bring-up, 2026-10-13.)* At fp32 too, off the Mac: a single-step `bring_up` fit on the A40
+  put the largest honest residual at 0.80·`τ`, and on the pod's x86 CPU at 0.83·`τ` (base
+  code), against the guard's 0.5 (FM4, 2026-10-14). Both steps were accepted.
+- **F21 — The GPU path's host side: pinned pool size and the band file's device.** *Parked
+  (FM4 review of FS9, 2026-10-14).* *Since F22 (2026-10-20) the first bullet concerns the
+  one-H100 path only: on four GPUs the products go to their owner GPUs by peer copy, with no
+  pinned host pool. The second stays (`ENVIRONMENT_PLAN_DRAFT.md` G6): the band context has
+  recorded the device type and both dtypes since FS3, but not the GPU model or the software
+  build, on any of the four cards.*
+  - The pinned host pool is process-wide and never shrinks. Test scale pins 1.44 GiB per
+    live step at fp32; at `n_s = 128` about 32× that, roughly 46 GiB page-locked, kept after
+    the run. Options: a `release()` at run end, or a cap with a fallback to pageable memory
+    (E4: pageable copies stall the process's own GEMMs by 83–98%).
+  - `bands.json` records no device or compute dtype, so a CUDA run would be judged by
+    CPU-fitted bands without a warning. Options: record both and refuse a mismatch.
+  - E6 at the full batch (128 × 128) ran out of memory for Qwen2.5-0.5B on the A40's 44 GiB,
+    on a 9.27 GiB allocation, apparently the logits; on the H100 it fits with the output layer in row
+    blocks (F4, closed).
+
 ## Recorded elsewhere
 
 These full-scale items are recorded with the setup decisions. They're listed so the

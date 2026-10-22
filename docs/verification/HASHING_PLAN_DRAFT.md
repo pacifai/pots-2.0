@@ -13,6 +13,15 @@ other closed decision until the user approves it. The open choices are settled b
 experiment of Section 6. When approved, the decisions go to `DECISIONS_FULL_SCALE.md` (as F15b
 and following) and `DECISIONS_SETUP.md` (as an S9a revision), and this file is deleted.
 
+**Later (2026-10-21).** Its open choices were decided elsewhere: the CPU path in F15b
+(2026-10-18; no chunk tree, `S9a` unchanged), the GPU kernel in F23 (2026-10-20: BLAKE3 in our
+own NVRTC kernel, every digest unchanged, cuPQC not taken), and the machine in F22 (four H100
+SXM over NVLink, the owner GPUs hashing on arrival; one B200 as the fallback). Section 6's
+benchmark ran as FS10–FS11 and FS29 (the kernel at 380–600 GB/s on one H100). The one-H100,
+host-RAM setting of Sections 1, 4 and 6 (F1c, EQ14) no longer holds at full scale, and its
+figures are the proposal's assumptions. The file is kept for the derivation of the per-step
+costs (Section 1) and the comparison of functions (Sections 2–3).
+
 ## 1. The problem
 
 Under the compute-first priority (`CLAUDE.md`, "Project goal"), hashing is the largest
@@ -284,6 +293,21 @@ chunking, by the chunk count.)
 
 **Before deciding**
 1. Check cuPQC-Hash's license and distribution terms for use in a published research artifact.
+   **Checked (FS10, 2026-10-11; a reading of the terms, not legal advice).** cuPQC ships under
+   NVIDIA's "License Agreement for NVIDIA Math Libraries Software Development Kits" (version of
+   October 10, 2024).
+   - Allowed: using the SDK, and distributing its binaries and headers inside an application
+     with "material additional functionality".
+   - Forbidden: distributing it under terms that make it open source, in source form, or free
+     to redistribute (§2.6), and modifying or redistributing the SDK itself (§2.3).
+   - So the MIT repo may call cuPQC but must not bundle it; users download the SDK from NVIDIA.
+   - Nothing in the agreement restricts publishing benchmark results.
+   - Not confirmed:
+     - whether a published binary that links cuPQC is allowed;
+     - whether a rented cloud machine counts as the licensee's "secure network" (§1.3);
+     - whether SDK 0.6.0 counts as a pre-release (§1.4).
+     The licence contact is nvidia-compute-license-questions@nvidia.com. These matter only if
+     R1 picks the GPU path and R2 picks cuPQC.
 2. Run the H100 experiment of Section 6. The benchmark scripts are written with the
    implementation of the other full-scale tasks, once every full-scale decision has been gone
    through (user, 2026-10-07), not ahead of them. They live outside the protocol packages and
