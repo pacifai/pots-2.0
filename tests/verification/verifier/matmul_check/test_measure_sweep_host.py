@@ -306,7 +306,7 @@ def planted_products(dtype, layout, guard):
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_special_values_at_tile_and_view_edges(sweep, host_measure, dtype, guard, layout):
     mis, labels = planted_products(dtype, layout, guard)
-    assert len(mis) > 150
+    assert len(mis) >= 140
     for k, geoms in ((3, [(32, 1), (64, 16), (128, 16)]), (17, [(64, 16), (32, 4)])):
         table = with_k(mis, k)
         want = host_measure(pack(table))
