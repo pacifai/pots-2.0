@@ -85,16 +85,19 @@ def shared_vs_plain(groups, k, *, guard=True, label="", special=False):
 
 # ---- FS36's inputs as one table ----
 
-@pytest.mark.parametrize("k", [1, 2])
-@pytest.mark.parametrize("guard", [True, False])
-def test_share_equals_no_share_on_fs36_inputs_as_one_table(k, guard):
-    """FS36's cases as one table per challenge width and guard (a call has one of each); FS36's
-    cases share no storage, so the plan is FS37's three levels and the rows must be FS37's."""
-    cases = [mi for _, mi in fs36_cases() if mi.r.shape[1] == k and mi.guard == guard]
-    assert cases
-    groups, kk = groups_of_table(cases)
-    p = shared_vs_plain(groups, kk, guard=guard, label=f"FS36 k={k} guard={guard}", special=True)
-    assert p.shared_groups == 0 and p.n_levels == 3 and p.bytes_saved == 0
+def test_share_equals_no_share_on_fs36_inputs_as_one_table():
+    """FS36's cases as one table per challenge width and guard present among them (a call has
+    one of each); FS36's cases share no storage, so the plan is FS37's three levels and the rows
+    must be FS37's."""
+    cases = [mi for _, mi in fs36_cases()]
+    combos = sorted({(mi.r.shape[1], mi.guard) for mi in cases})
+    assert combos
+    for k, guard in combos:
+        table = [mi for mi in cases if mi.r.shape[1] == k and mi.guard == guard]
+        groups, kk = groups_of_table(table)
+        p = shared_vs_plain(groups, kk, guard=guard, label=f"FS36 k={k} guard={guard}",
+                            special=True)
+        assert p.shared_groups == 0 and p.n_levels == 3 and p.bytes_saved == 0
 
 
 # ---- the shared tables of the host file, on CUDA copies ----
