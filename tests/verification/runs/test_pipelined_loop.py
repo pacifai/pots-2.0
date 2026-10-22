@@ -147,7 +147,11 @@ def assert_equal(a, b):
     assert _numbers(a.verifier) == _numbers(b.verifier)
     assert a.verifier.record_pass == b.verifier.record_pass
     assert ra.w_final.keys() == rb.w_final.keys()
-    assert all(torch.equal(ra.w_final[n], rb.w_final[n]) for n in ra.w_final)
+    # The pipelined loop returns host copies (the child's answer to ``stop``); the sequential
+    # loop returns the tensors where the prover left them (on a card, the placement's device,
+    # cuda:1 in the pair session). The values and dtypes are the contract, not the device.
+    assert all(ra.w_final[n].dtype == rb.w_final[n].dtype
+               and torch.equal(ra.w_final[n].cpu(), rb.w_final[n].cpu()) for n in ra.w_final)
 
 
 def assert_window(info, T):
@@ -358,11 +362,31 @@ def test_a_child_with_another_pad_id_is_a_handshake_error(three):
 
 
 def test_a_child_that_stalls_in_a_step_is_a_timeout_error(mlp, monkeypatch):
-    monkeypatch.setattr(pipeline, "MESSAGE_DEADLINE_S", 3.0)
+    """The short deadline starts only once the child is ready: how long a spawned child takes
+    to import and build (3 s was too short on a busy pod) is not what this test is about."""
+    real = pipeline._Link.expect
+
+    def expect(self, kind, stash=None):
+        msg = real(self, kind, stash)
+        if kind == "ready":
+            monkeypatch.setattr(pipeline, "MESSAGE_DEADLINE_S", 5.0)
+        return msg
+
+    monkeypatch.setattr(pipeline._Link, "expect", expect)
     t0 = time.monotonic()
     with pytest.raises(ProverProcessError) as e:
         go(mlp, P.SlowAt(2, 600.0), pipelined=True)
-    assert e.value.kind == "timeout" and "no released" in str(e.value)
+    assert e.value.kind == "timeout" and "no released" in str(e.value) and "5 s" in str(e.value)
+    assert time.monotonic() - t0 < 120
+    assert multiprocessing.active_children() == []
+
+
+def test_a_child_that_never_becomes_ready_is_a_timeout_error_and_is_gone(mlp, monkeypatch):
+    monkeypatch.setattr(pipeline, "MESSAGE_DEADLINE_S", 2.0)
+    t0 = time.monotonic()
+    with pytest.raises(ProverProcessError) as e:
+        call(mlp, prover=P.SleepSpec(600.0))
+    assert e.value.kind == "timeout" and "no ready" in str(e.value)
     assert time.monotonic() - t0 < 60
     assert multiprocessing.active_children() == []
 

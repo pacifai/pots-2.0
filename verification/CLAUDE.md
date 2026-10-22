@@ -31,6 +31,10 @@ details that don't change what is committed or checked are yours to choose.
   (`-m "not slow"`). Keep the fast suite under about a minute. The full-scale slow tests
   (FS4, `tests/verification/full_scale_helpers.py`) skip when the model's weights aren't in the
   local Hugging Face cache; no test downloads.
+  `tests/conftest.py` arms `tests/exit_guard.py` as pytest's last hook: it kills child
+  processes still running, and 120 s later, if the interpreter has not exited (a non-daemon
+  thread or child holds it), prints every thread's stack to stderr and exits with the run's
+  status. The pair session's fast suite once sat 20 minutes after its summary line.
 - **Style.**
   - Use ordinary importable libraries with type hints and no import-time side effects (S7b).
   - Entry points read env vars through `setup/config.py` and `verification/parameters.py`,
@@ -1995,7 +1999,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `emit(t, out)` (an A3 splice).
   - `LoopResult(verdict, steps, w_final)`, where `steps` holds `StepRecord(t, rejection, loss,
     prove_s, commit_s, verify_s, handoff_s, ...)`, whose last field `known` is the leaves the
-    commit took from arrival digests. `prove_s` excludes `emit`; `handoff_s` is the
+    commit took from arrival digests. `w_final` is host copies from the pipelined loop and
+    the prover's device tensors from the sequential one, so tests compare it by value on the
+    CPU. The step summary's `capture["host_buffers"]` is the process-wide pinned pool, so it
+    differs between a long-lived test process and a fresh child: the equality test leaves it
+    out. `prove_s` excludes `emit`; `handoff_s` is the
     time between the roles (the cache release on CUDA), in neither `commit_s` nor `verify_s`. Per-check timings and stats stay on
     the verifier. A test holds weakrefs to each step's products and checks they are dead by the
     next step.
@@ -2593,7 +2601,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   - `StepSummary.in_sample` (`metrics.in_sample_step`) and `.judged`
     (`metrics.judged_step`); `.sample` is `in`, `judged` or `not judged` (H2's step 1), and
     the `residual_summary` record carries both. The guard line names judged steps only.
-  - **The stored step (EV2).** `KeptStepHandoff(directory, step)` is the in-memory hand-off
+  - **The stored step (EV2).** `KeptStepHandoff(directory, step)` (defined in
+    `runs/kept_step.py`, re-exported by `run_verified`: a class that `pipeline.py` checks or
+    pickles must not live in an entry point, since `python -m ...run_verified` makes that
+    module `__main__` and its class a second copy; pair fix 1) is the in-memory hand-off
     that also holds step `step`'s leaves and tree; `write()`, from `on_step` once the step
     has closed, writes them with `DiskHandoff(keep=True)` to `directory/step_<t>/` and
     raises `RuntimeError` unless the root recomputed from the files is the step's `h`. The

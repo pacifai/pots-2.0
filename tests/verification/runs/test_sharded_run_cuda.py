@@ -71,10 +71,26 @@ def test_two_gpus_rows_of_layers_sit_on_different_devices_and_one_window_spans_t
 
 
 @needs_two
-def test_two_gpus_one_scratch_buffer_per_device_stays_put(monkeypatch):
-    """Check 5's scratch holds one buffer per device, and a device's buffer keeps its
-    ``data_ptr`` for as long as it needs no more room; check 6's holds one per weight device."""
-    calls, made = [], []
+def test_two_gpus_check5_working_memory_stays_on_its_device_and_check6_scratch_is_per_device(
+        monkeypatch):
+    """Check 5 on CUDA is the measuring kernel (FS37): each call allocates its rows, scratch and
+    table on the device of the tensors it measures and holds them until ``drain``; the host-side
+    ``MeasureScratch`` it replaced is not asked for a buffer (the pair session found the old
+    test's per-device dict empty). So: every device that owns a layer ran calls, each call's
+    rows sit on its operands' device, nothing is left in flight after the run, and no
+    ``MeasureScratch`` buffer is made. Were the fallback ever to use one, a device's buffer must
+    keep its ``data_ptr`` until it grows. Check 6's ``UpdateScratch`` holds one per weight
+    device."""
+    from verification.verifier.matmul_check import measure_kernel
+
+    kernel_calls, calls, made = [], [], []
+    real_enqueue = measure_kernel.enqueue
+
+    def enqueue(groups, **kw):
+        rows = real_enqueue(groups, **kw)
+        kernel_calls.append((rows.device, {t.device for g in groups
+                                           for t in (g.a, g.b, g.p, g.bias) if t is not None}))
+        return rows
 
     class Spy(MeasureScratch):
         def __init__(self):
@@ -94,14 +110,19 @@ def test_two_gpus_one_scratch_buffer_per_device_stays_put(monkeypatch):
             super().__init__()
             updates.append(self)
 
+    monkeypatch.setattr(measure_kernel, "enqueue", enqueue)
     monkeypatch.setattr(checks, "MeasureScratch", Spy)
     monkeypatch.setattr(checks, "UpdateScratch", USpy)
     c, res, _, _ = sr.run(DEVICES, device=PROVER, layers=2 * len(DEVICES))
     assert res.verdict.accepted
+    assert kernel_calls, "check 5 never ran the measuring kernel"
+    assert all(dev in ops and len(ops) == 1 for dev, ops in kernel_calls)  # rows with operands
+    ran = {dev for dev, _ in kernel_calls}
+    assert _layer_owners(c) <= ran <= {torch.device(d) for d in DEVICES}
+    assert not any(entries for entries in measure_kernel._inflight.values())  # all released
     by_device = {}
     for dev, numel, ptr in calls:
         by_device.setdefault(dev, []).append((numel, ptr))
-    assert len(by_device) == len(_layer_owners(c))  # one buffer per device that owns a layer
     for dev, seq in by_device.items():
         for (n0, p0), (n1, p1) in zip(seq, seq[1:]):
             assert p0 == p1 or n1 > n0, dev  # a new allocation only where it grew

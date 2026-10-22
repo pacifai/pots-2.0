@@ -67,7 +67,8 @@ def test_cuda_step_hashes_reads_and_returns_the_memory(devices, device, alloc):
         assert r.ask("release", 2) == "ok"
         before, after, w_bytes = r.ask("mem")
         assert after - before <= w_bytes, (
-            f"producer memory_allocated {before} before the steps, {after} after release: "
+            f"producer memory_allocated {before} before the steps (after a warm-up step, which "
+            f"makes the cuBLAS workspace and the hashing buffers), {after} after release: "
             f"{after - before} bytes kept, more than one weight set ({w_bytes}); the step's "
             f"transcript is still held")
     finally:
