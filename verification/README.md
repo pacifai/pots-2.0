@@ -1203,8 +1203,9 @@ failed ones. A rerun deletes the old report first. `fs11_session` imports no tor
 upload check imports the native-build module only when it runs), so the self-test runs on a bare
 `python3`.
 
-`FS11_SESSION=fs32-pair` is the acceptance of the per-role devices (F22, FS32) on two A40s
-(any two CUDA GPUs do): the real SmolLM2 run, unsharded and with
+`FS11_SESSION=fs32-pair` is the acceptance of the per-role devices (F22, FS32) on two A100 or
+H100 SXM (any two CUDA GPUs whose peer copies pass the byte check; Runpod's two-A40 pairs
+failed it): the real SmolLM2 run, unsharded and with
 `VERIF_VERIFIER_DEVICES=cuda:0,cuda:1`, must give the same roots and verdicts, and the judged
 cheats must be caught as `exact` with the sharded setting. GPU 0 trains; both GPUs hold the
 transcript and run the verifier.
