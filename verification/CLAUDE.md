@@ -1829,8 +1829,9 @@ interface.
     strides (`a`, `b` in the operand dtype, `p` as stored, one CUDA device; a bias only with
     one member). `kernel_device(device)` is true on CUDA outside `reference()`, a context
     manager that forces the torch path everywhere, for the comparison tests, and nests.
-    `measure_groups_rows(groups, *, h, k, guard=True)` enqueues the fused kernel
-    (`measure_kernel.enqueue`) and returns the float64 rows, groups in order and members in
+    `measure_groups_rows(groups, *, h, k, guard=True, share=False, plan_out=None)` enqueues
+    the fused kernel (`measure_kernel.enqueue`; `share=True` runs it in levels with shared
+    reads, FS38b) and returns the float64 rows, groups in order and members in
     order within each, with no host read. `drain(device=None)` waits for every enqueued
     measurement, raises `ReplayError` if a held input's `_version` moved, and releases the
     holds; call it before reading rows. It does nothing if the kernel module was never
