@@ -165,6 +165,27 @@ static void shfl_tree_d(double *v) {
   }
 }
 
+/* One item of one product's phase as the kernel runs it (measure_kernel.cu's per-item helper):
+ * for each step the 32 lane partials, the shuffle tree, and lane 0's store. */
+static void host_measure_item(const pots_mprod_t *t, const pots_mscr_t *sc, double *row,
+                              pots_u32 phase, uint64_t item) {
+  pots_u32 steps = pots_phase_steps(t, phase, (pots_i64)item), s, lane;
+  for (s = 0; s < steps; s++) {
+    double part[POTS_LANES];
+    for (lane = 0; lane < POTS_LANES; lane++)
+      part[lane] = pots_phase_partial(t, sc, phase, (pots_i64)item, s, lane);
+    if (pots_phase_double(t, phase, (pots_i64)item, s)) {
+      shfl_tree_d(part);
+    } else {
+      float f[POTS_LANES];
+      for (lane = 0; lane < POTS_LANES; lane++) f[lane] = (float)part[lane];
+      shfl_tree_f(f);
+      part[0] = (double)f[0];
+    }
+    pots_phase_store(t, sc, row, phase, (pots_i64)item, s, part[0]);
+  }
+}
+
 /* The three phases over every product, as the kernel runs them: for each item (a warp) each
  * step takes its 32 lane partials, the shuffle tree, and lane 0's store. `works` has n + 1
  * entries (the last holds the totals) and every scratch address is set, as the Python side
@@ -185,21 +206,38 @@ int pots_host_measure_phased(const pots_mprod_t *tab, uint64_t n, const pots_mwo
       uint64_t item, pi = pots_mfind(works, n, phase, gi, &item);
       const pots_mprod_t *t = &tab[pi];
       pots_mscr_t sc = pots_mscr_make(t, works[pi].scratch);
-      double *row = rows + pi * (POTS_ROW_FIXED + t->k);
-      pots_u32 steps = pots_phase_steps(t, phase, (pots_i64)item), s, lane;
-      for (s = 0; s < steps; s++) {
-        double part[POTS_LANES];
-        for (lane = 0; lane < POTS_LANES; lane++)
-          part[lane] = pots_phase_partial(t, &sc, phase, (pots_i64)item, s, lane);
-        if (pots_phase_double(t, phase, (pots_i64)item, s)) {
-          shfl_tree_d(part);
-        } else {
-          float f[POTS_LANES];
-          for (lane = 0; lane < POTS_LANES; lane++) f[lane] = (float)part[lane];
-          shfl_tree_f(f);
-          part[0] = (double)f[0];
-        }
-        pots_phase_store(t, &sc, row, phase, (pots_i64)item, s, part[0]);
+      host_measure_item(t, &sc, rows + pi * (POTS_ROW_FIXED + t->k), phase, item);
+    }
+  }
+  return POTS_ERR_OK;
+}
+
+/* The levels' launches (FS38b), as pots_measure_level runs them: level l's groups are
+ * reads[level_off[l] .. level_off[l+1]-2] and its sentinel reads[level_off[l+1]-1]. Levels in
+ * order; within a level every item (last to first when `reverse`), and for each item every entry
+ * of its group in order. */
+int pots_host_measure_levels(const pots_mprod_t *tab, uint64_t n, const pots_mwork_t *works,
+                             const pots_mread_t *reads, const uint64_t *level_off,
+                             uint32_t n_levels, const pots_mentry_t *entries, double *rows,
+                             int reverse) {
+  uint64_t i, g;
+  uint32_t l, e;
+  for (i = 0; i < n; i++) {
+    int err = pots_mprod_check(&tab[i]);
+    if (err != POTS_ERR_OK) return err;
+  }
+  for (l = 0; l < n_levels; l++) {
+    const pots_mread_t *r = reads + level_off[l];
+    uint64_t n_groups = level_off[l + 1] - level_off[l] - 1, total = r[n_groups].first;
+    for (g = 0; g < total; g++) {
+      uint64_t gi = reverse ? total - 1 - g : g;
+      uint64_t item, ri = pots_rfind(r, n_groups, gi, &item);
+      for (e = 0; e < r[ri].n_entries; e++) {
+        const pots_mentry_t *en = &entries[r[ri].entry0 + e];
+        const pots_mprod_t *t = &tab[en->prod];
+        pots_mscr_t sc = pots_mscr_make(t, works[en->prod].scratch);
+        host_measure_item(t, &sc, rows + (uint64_t)en->prod * (POTS_ROW_FIXED + t->k), en->phase,
+                          item);
       }
     }
   }

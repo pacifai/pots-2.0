@@ -70,6 +70,24 @@ def phased(hostlib, host_measure):
     return run
 
 
+@pytest.fixture(scope="module")
+def levels(hostlib):
+    hostlib.pots_host_measure_levels.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    hostlib.pots_host_measure_levels.restype = ctypes.c_int
+
+    def run(prods, works, plan, rows, reverse=False):
+        """The level launches of ``plan`` run in loops over ``prods`` (``mk.prods_array``'s
+        layout) and ``works`` (``mk.works_array``), writing ``rows``; the error code."""
+        return hostlib.pots_host_measure_levels(
+            prods.ctypes.data, len(prods), works.ctypes.data, plan.reads.ctypes.data,
+            plan.level_off.ctypes.data, plan.n_levels, plan.entries.ctypes.data,
+            rows.ctypes.data, int(reverse))
+
+    return run
+
+
 def same(rows, ref):
     assert np.array_equal(bits(rows), bits(ref))
 

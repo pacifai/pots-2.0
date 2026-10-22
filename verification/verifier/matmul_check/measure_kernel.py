@@ -10,7 +10,9 @@ Compiled at first use by NVRTC (through ``gpu_blake3``'s :class:`Nvrtc`, :class:
 :func:`build_image`) with ``--fmad=false`` into a CUBIN cached under ``native.cache_dir()``;
 importing this module compiles and loads nothing. One call (:func:`enqueue`) packs every group's
 products into one table in one pinned buffer, copies it up with one non-blocking copy and
-launches three kernels (the phases) on the current stream; the rows stay on the device. Each
+launches three kernels (the phases) on the current stream, or, with ``share=True`` (FS38b),
+one kernel per level of a :func:`read_plan` (products that read one stored view run their rows
+together); the rows stay on the device. Each
 call's :class:`Pending` holds every tensor and buffer the stream reads, with each input's
 ``_version``, until :func:`drain` has waited for its event and found no input changed.
 """
@@ -52,6 +54,7 @@ CORE_NAME = "measure_core.h"
 PHASES_NAME = "measure_phases.h"
 CU_NAME = "measure_kernel.cu"
 KERNEL = "pots_measure_phase"
+LEVEL_KERNEL = "pots_measure_level"
 OPTIONS = ("--fmad=false",)
 """Extra NVRTC options, part of the cache key: no fused multiply-add but the core's ``fmaf``."""
 WARPS = 8  # warps per block, POTS_MK_WARPS in the .cu
@@ -67,6 +70,11 @@ MPROD_DTYPE = np.dtype([("a", _MVIEW), ("b", _MVIEW), ("p", _MVIEW), ("bias", _M
 """``pots_mprod_t`` (208 bytes), the layout of :class:`measure_table.MProd`."""
 WORK_DTYPE = np.dtype([("scratch", "<u8"), ("start", "<u8", (PHASES,))])
 """``pots_mwork_t`` (32 bytes)."""
+READ_DTYPE = np.dtype([("first", "<u8"), ("count", "<u8"), ("entry0", "<u4"),
+                       ("n_entries", "<u4")])
+"""``pots_mread_t`` (24 bytes): a read group of one level (FS38b)."""
+ENTRY_DTYPE = np.dtype([("prod", "<u4"), ("phase", "<u4")])
+"""``pots_mentry_t`` (8 bytes): one node (product, phase) of a read group."""
 assert _MVIEW.itemsize == ctypes.sizeof(MView) and MPROD_DTYPE.itemsize == ctypes.sizeof(MProd)
 
 
@@ -76,6 +84,18 @@ class KernelArgs(ctypes.Structure):
     _fields_ = [("prods", ctypes.c_uint64), ("works", ctypes.c_uint64), ("rows", ctypes.c_uint64),
                 ("n_prod", ctypes.c_uint64), ("total", ctypes.c_uint64),
                 ("phase", ctypes.c_uint32), ("k", ctypes.c_uint32)]
+
+
+class LevelArgs(ctypes.Structure):
+    """``pots_mlargs_t``: one level launch's argument (FS38b)."""
+
+    _fields_ = [("prods", ctypes.c_uint64), ("works", ctypes.c_uint64), ("rows", ctypes.c_uint64),
+                ("reads", ctypes.c_uint64), ("entries", ctypes.c_uint64),
+                ("n_groups", ctypes.c_uint64), ("total", ctypes.c_uint64),
+                ("k", ctypes.c_uint32), ("pad", ctypes.c_uint32)]
+
+
+assert ctypes.sizeof(LevelArgs) == 64 and ctypes.sizeof(KernelArgs) == 48
 
 
 # ---- the build ----
@@ -99,7 +119,7 @@ def build(nvrtc: gb.Nvrtc, cc: tuple[int, int], *, cache: Path | None = None,
 
 
 class MeasureKernels:
-    """A device's loaded module and its kernel."""
+    """A device's loaded module and its two kernels."""
 
     def __init__(self, driver: gb.Driver, dev: int, built: gb.Built) -> None:
         self.driver = driver
@@ -109,15 +129,18 @@ class MeasureKernels:
         try:
             self.module = driver.load_module(built.image)
             self.fn = driver.function(self.module, KERNEL)
+            self.level_fn = driver.function(self.module, LEVEL_KERNEL)
         finally:
             driver.pop()
 
     def run(self, launches: Sequence[tuple[KernelArgs, int]], stream: int) -> None:
-        """Launch each ``(args, blocks)`` in order on the raw ``stream``."""
+        """Launch each ``(args, blocks)`` in order on the raw ``stream``: a :class:`LevelArgs`
+        runs ``pots_measure_level``, a :class:`KernelArgs` ``pots_measure_phase``."""
         self.driver.push(self.dev)
         try:
             for args, blocks in launches:
-                self.driver.launch(self.fn, blocks, WARPS * 32, args, stream)  # pyright: ignore
+                fn = self.level_fn if isinstance(args, LevelArgs) else self.fn
+                self.driver.launch(fn, blocks, WARPS * 32, args, stream)  # pyright: ignore
         finally:
             self.driver.pop()
 
@@ -300,6 +323,162 @@ def launches(prods_addr: int, works_addr: int, rows_addr: int, works: np.ndarray
     return out
 
 
+# ---- the read plan (FS38b) ----
+
+MAX_ROUNDS = 64
+
+
+@dataclass(frozen=True)
+class ReadPlan:
+    """A table's shared reads, in levels (see :func:`read_plan`)."""
+
+    reads: np.ndarray        # READ_DTYPE, every level's groups then its sentinel, levels in order
+    level_off: np.ndarray    # uint64 [n_levels + 1], level l = reads[level_off[l]:level_off[l+1]]
+    entries: np.ndarray      # ENTRY_DTYPE
+    node_level: np.ndarray   # int64 [n_prod, 3], the level of (product, phase)
+    n_levels: int            # == launches
+    shared_groups: int       # groups with 2 or more entries
+    bytes_fs37: int          # sum per product: A, B, P (and the bias) read once
+    bytes_saved: int         # sum over groups of e >= 2 entries: (e - 1) * the keyed view's bytes
+    cycle: bool              # True when the levels did not settle in 64 rounds: no group shares
+
+
+def _view_bytes(v: np.ndarray) -> np.ndarray:
+    isz = np.where(v["dtype"] == DT_BF16, 2, 4).astype(np.int64)
+    return v["rows"].astype(np.int64) * v["cols"].astype(np.int64) * isz
+
+
+def _settle(gid: np.ndarray, n: int) -> np.ndarray | None:
+    """The levels ``[n, 3]`` of nodes in share groups ``gid`` (a group id per node, node ``3t +
+    p``), by the fixed point of the plan: a group takes its largest level, ``L(t, 1) >= L(t, 0) +
+    1`` and ``L(t, 2) >= L(t, 1) + 1``; ``None`` when 64 rounds do not settle it."""
+    order = np.argsort(gid, kind="stable")
+    sg = gid[order]
+    starts = np.flatnonzero(np.r_[True, sg[1:] != sg[:-1]])
+    sizes = np.diff(np.r_[starts, len(sg)])
+    lv = np.tile(np.arange(3, dtype=np.int64), (n, 1))
+    for _ in range(MAX_ROUNDS):
+        gmax = np.maximum.reduceat(lv.reshape(-1)[order], starts)
+        new = np.repeat(gmax, sizes)
+        out = np.empty(3 * n, dtype=np.int64)
+        out[order] = new
+        new = out.reshape(n, 3)
+        new[:, 1] = np.maximum(new[:, 1], new[:, 0] + 1)
+        new[:, 2] = np.maximum(new[:, 2], new[:, 1] + 1)
+        if np.array_equal(new, lv):
+            return lv
+        lv = new
+    return None
+
+
+def read_plan(prods: np.ndarray) -> ReadPlan:
+    """Which products' passes read one stored view, and the levels they run in.
+
+    A node ``(t, 0)`` is product ``t``'s pass over ``B``'s rows and ``(t, 1)`` its pass over
+    ``A``'s rows, keyed on the view as the kernel reads it (address, rows, columns, both
+    strides, dtype); nodes with equal keys form a group that runs together, one row of the view
+    at a time. ``(t, 2)`` and a biased ``(t, 0)`` are never shared. Levels start at the phase
+    and settle by the fixed point of :func:`_settle`; a table that does not settle (a cycle)
+    drops every share (each node alone at its phase) and reports none saved. Within a level the
+    groups are ordered by the keyed view's address (phase 2: ``P``'s), ties by the first entry's
+    ``(prod, phase)``; entries of a group ascend by ``(prod, phase)``."""
+    n = len(prods)
+    n3 = 3 * n
+    biased = (prods["flags"] & M_BIASED) != 0
+    # node 3t + p: the viewed field per node, and whether it can be shared
+    key = np.zeros(n3, dtype=[("uid", "<u8"), ("addr", "<u8"), ("rows", "<i8"), ("cols", "<i8"),
+                              ("rs", "<i8"), ("cs", "<i8"), ("dt", "<u4")])
+    for p, v in ((0, prods["b"]), (1, prods["a"]), (2, prods["p"])):
+        sl = slice(p, n3, 3)
+        key["addr"][sl] = v["addr"]
+        key["rows"][sl] = v["rows"]
+        key["cols"][sl] = v["cols"]
+        key["rs"][sl] = v["row_stride"]
+        key["cs"][sl] = v["col_stride"]
+        key["dt"][sl] = v["dtype"]
+    node = np.arange(n3, dtype=np.uint64)
+    alone = np.zeros(n3, dtype=bool)
+    alone[2::3] = True
+    alone[0::3] = biased
+    key["uid"] = np.where(alone, node + np.uint64(1), np.uint64(0))
+    items = np.stack((prods["b"]["rows"].astype(np.int64) + biased.astype(np.int64),
+                      prods["a"]["rows"].astype(np.int64),
+                      np.int64(ROW_FIXED) + prods["k"].astype(np.int64)), 1).reshape(-1)
+    _, gid = np.unique(key, return_inverse=True)
+    gid = gid.reshape(-1).astype(np.int64)
+    lv = _settle(gid, n)
+    cycle = lv is None
+    if cycle:
+        gid = np.arange(n3, dtype=np.int64)
+        lv = np.tile(np.arange(3, dtype=np.int64), (n, 1))
+    # per group: its entries (ascending node index), level, address, items
+    order = np.argsort(gid, kind="stable")
+    sg = gid[order]
+    starts = np.flatnonzero(np.r_[True, sg[1:] != sg[:-1]])
+    n_ent = np.diff(np.r_[starts, n3])
+    first = order[starts]  # the group's first entry (lowest node index)
+    g_level = lv.reshape(-1)[first]
+    g_addr = key["addr"][first]
+    g_items = items[first]
+    g_order = np.lexsort((first, g_addr, g_level))  # the last key is the primary one
+    ng = len(first)
+    rank = np.empty(ng, dtype=np.int64)
+    rank[g_order] = np.arange(ng)
+    n_ent_s = n_ent[g_order]
+    entry0 = np.cumsum(n_ent_s) - n_ent_s
+    lv_s = g_level[g_order]
+    cnt_s = g_items[g_order]
+    n_levels = int(lv.max()) + 1
+    per_level = np.bincount(lv_s, minlength=n_levels)
+    level_off = np.zeros(n_levels + 1, dtype=np.uint64)
+    level_off[1:] = np.cumsum(per_level + 1)
+    reads = np.zeros(int(level_off[-1]), dtype=READ_DTYPE)
+    csum = np.cumsum(cnt_s) - cnt_s  # items before each group, in table order
+    g_start = np.cumsum(per_level) - per_level  # index of each level's first group
+    base = csum[np.minimum(g_start, ng - 1)]  # items before each level's first group
+    pos = np.arange(ng) + lv_s  # one sentinel per earlier level
+    reads["first"][pos] = (csum - base[lv_s]).astype(np.uint64)
+    reads["count"][pos] = cnt_s.astype(np.uint64)
+    reads["entry0"][pos] = entry0.astype(np.uint32)
+    reads["n_entries"][pos] = n_ent_s.astype(np.uint32)
+    totals = np.bincount(lv_s, weights=cnt_s, minlength=n_levels).astype(np.uint64)
+    reads["first"][level_off[1:].astype(np.int64) - 1] = totals
+    e_order = np.lexsort((node, rank[gid]))
+    entries = np.zeros(n3, dtype=ENTRY_DTYPE)
+    entries["prod"] = (e_order // 3).astype(np.uint32)
+    entries["phase"] = (e_order % 3).astype(np.uint32)
+    shared = n_ent >= 2
+    saved = 0
+    if not cycle and shared.any():
+        fv_ = first[shared]
+        fp = fv_ % 3
+        ft = fv_ // 3
+        vb = np.where(fp == 0, _view_bytes(prods["b"])[ft], _view_bytes(prods["a"])[ft])
+        saved = int(((n_ent[shared] - 1) * vb).sum())
+    base_bytes = _view_bytes(prods["a"]) + _view_bytes(prods["b"]) + _view_bytes(prods["p"])
+    bias_bytes = np.where(biased, prods["bias"]["cols"].astype(np.int64)
+                          * np.where(prods["bias"]["dtype"] == DT_BF16, 2, 4), 0)
+    return ReadPlan(reads, level_off, entries, lv.copy(), n_levels,
+                    0 if cycle else int(shared.sum()), int((base_bytes + bias_bytes).sum()),
+                    0 if cycle else saved, bool(cycle))
+
+
+def level_launches(prods_addr: int, works_addr: int, rows_addr: int, reads_addr: int,
+                   entries_addr: int, plan: ReadPlan, k: int) -> list[tuple[LevelArgs, int]]:
+    """One ``(argument, blocks)`` per level of ``plan``, in level order; ``reads_addr`` is the
+    address of ``plan.reads[0]`` and ``entries_addr`` that of ``plan.entries[0]``."""
+    out = []
+    off = plan.level_off.astype(np.int64)
+    for lv in range(plan.n_levels):
+        lo, hi = int(off[lv]), int(off[lv + 1])
+        total = int(plan.reads["first"][hi - 1])
+        blocks = min(-(-total // WARPS), MAX_BLOCKS)
+        out.append((LevelArgs(prods_addr, works_addr, rows_addr,
+                              reads_addr + lo * READ_DTYPE.itemsize, entries_addr, hi - lo - 1,
+                              total, k, 0), blocks))
+    return out
+
+
 # ---- in flight ----
 
 @dataclass
@@ -384,11 +563,15 @@ _DEFAULT_SOURCE = HostChallengeSource()
 
 
 def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool = True,
-            challenges: ChallengeSource | None = None, run: Any = None) -> torch.Tensor:
+            challenges: ChallengeSource | None = None, run: Any = None, share: bool = False,
+            plan_out: list | None = None) -> torch.Tensor:
     """Every member's row as float64 ``[Σ n_t, row_width(k)]`` on the groups' CUDA device,
     measured by the kernel on the current stream; nothing is read back and nothing waits for the
     device (see :func:`drain`). ``run`` replaces the loaded kernel (``run(launches, stream)``)
-    and ``challenges`` the host source."""
+    and ``challenges`` the host source. ``share=True`` runs one launch per level of
+    :func:`read_plan` (``pots_measure_level``; the launches of ``run`` then carry
+    :class:`LevelArgs`) and appends the :class:`ReadPlan` to ``plan_out``, a list; the rows are
+    the same bits."""
     device, counts = validate(groups, k)
     if device.type != "cuda":
         raise ValueError(f"the measuring kernel needs CUDA tensors, got {device}")
@@ -404,7 +587,14 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
     n = len(prods)
     scratch_n = scratch_bytes(prods)
     at_works = -(-prods.nbytes // 16) * 16
-    total = at_works + WORK_DTYPE.itemsize * (n + 1)
+    end_works = at_works + WORK_DTYPE.itemsize * (n + 1)
+    total = end_works
+    plan = None
+    if share:
+        plan = read_plan(prods)
+        at_reads = -(-end_works // 16) * 16
+        at_entries = -(-(at_reads + plan.reads.nbytes) // 16) * 16
+        total = at_entries + plan.entries.nbytes
     with torch.cuda.stream(stream):
         rows = torch.empty(n, row_width(k), dtype=torch.float64, device=device)
         scratch = torch.empty(max(scratch_n, 8), dtype=torch.uint8, device=device)
@@ -413,8 +603,16 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
     host = torch.zeros(total, dtype=torch.uint8, pin_memory=True)
     hb = host.numpy()
     hb[:prods.nbytes] = prods.view(np.uint8).reshape(-1)
-    hb[at_works:] = works.view(np.uint8).reshape(-1)
-    work = launches(table.data_ptr(), table.data_ptr() + at_works, rows.data_ptr(), works, k)
+    hb[at_works:end_works] = works.view(np.uint8).reshape(-1)
+    if plan is None:
+        work = launches(table.data_ptr(), table.data_ptr() + at_works, rows.data_ptr(), works, k)
+    else:
+        hb[at_reads:at_reads + plan.reads.nbytes] = plan.reads.view(np.uint8).reshape(-1)
+        hb[at_entries:] = plan.entries.view(np.uint8).reshape(-1)
+        work = level_launches(table.data_ptr(), table.data_ptr() + at_works, rows.data_ptr(),
+                              table.data_ptr() + at_reads, table.data_ptr() + at_entries, plan, k)
+        if plan_out is not None:
+            plan_out.append(plan)
     with torch.cuda.stream(stream):
         table.copy_(host, non_blocking=True)
         (run if run is not None else kernels(device).run)(work, stream.cuda_stream)
