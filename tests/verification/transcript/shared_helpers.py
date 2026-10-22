@@ -8,8 +8,8 @@ does, runs ``prove_step`` and ``InMemoryStore.commit_step`` for ``steps`` steps 
 ``("release", t)`` -> ``"ok"`` or the error text; ``("mutate", t, i)`` writes leaf ``i`` of
 step ``t`` in place; ``("poke", t, i)`` writes leaf ``i``'s first element through ``.data``
 (a write ``_version`` does not see) and returns ``(old, new)``; ``("mem",)`` returns
-``(memory_allocated before the first step, after a warm-up step, now, bytes of one weight
-set)`` on the first device (CUDA only); ``("quit",)``. ``strategy`` is the CPU sharing
+``(memory_allocated before the first counted step (taken after one warm-up step), now, bytes
+of one weight set)`` on the first device (CUDA only); ``("quit",)``. ``strategy`` is the CPU sharing
 strategy and ``alloc`` the value of ``PYTORCH_ALLOC_CONF`` (``None`` unsets it), both set
 before anything is shared or allocated.
 """
