@@ -31,6 +31,10 @@ details that don't change what is committed or checked are yours to choose.
   (`-m "not slow"`). Keep the fast suite under about a minute. The full-scale slow tests
   (FS4, `tests/verification/full_scale_helpers.py`) skip when the model's weights aren't in the
   local Hugging Face cache; no test downloads.
+  `tests/conftest.py` arms `tests/exit_guard.py` as pytest's last hook: it kills child
+  processes still running, and 120 s later, if the interpreter has not exited (a non-daemon
+  thread or child holds it), prints every thread's stack to stderr and exits with the run's
+  status. The pair session's fast suite once sat 20 minutes after its summary line.
 - **Style.**
   - Use ordinary importable libraries with type hints and no import-time side effects (S7b).
   - Entry points read env vars through `setup/config.py` and `verification/parameters.py`,
