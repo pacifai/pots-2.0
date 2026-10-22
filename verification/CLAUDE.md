@@ -1881,7 +1881,9 @@ interface.
     (address, shape, both strides, dtype) and groups them, so one row is read once for all.
     A biased `(t, 0)` and every `(t, 2)` stay alone. Levels start at the phase and a fixed
     point raises a group to its largest level and keeps each product's phases in order; a
-    table not settled in 64 rounds (`cycle`) drops every share. It returns a `ReadPlan`:
+    table not settled in 64 rounds (`cycle`) drops every share; a legitimate chain needing
+    more than 64 rounds is treated the same (speed only, never bits; the decoder settles in 4
+    levels). It returns a `ReadPlan`:
     `reads` (`READ_DTYPE`: each level's groups, ordered by the view's address, then a
     sentinel holding the level's item total), `level_off`, `entries` (`ENTRY_DTYPE`),
     `node_level`, `n_levels` (the launches), `shared_groups`, `bytes_fs37` and `bytes_saved`.
@@ -1891,9 +1893,11 @@ interface.
     `run` injected for tests gets the level launches too, each `(LevelArgs, blocks)`
     (`KernelArgs` for the phases). `freivalds.measure_groups_rows(..., share=, plan_out=)`
     passes both through.
-  - **The call.** `enqueue(groups, *, h, k, guard=True, challenges=None, run=None)` takes
-    `MeasureGroup`s (`freivalds.py`), packs every member into one table in one pinned buffer,
-    copies it up with one non-blocking copy and launches the three phases on the current
+  - **The call.** `enqueue(groups, *, h, k, guard=True, challenges=None, run=None,
+    share=False, plan_out=None)` takes `MeasureGroup`s (`freivalds.py`), packs every member
+    into one table in one pinned buffer, copies it up with one non-blocking copy and launches
+    the three phases (with `share=True`, one launch per level of the read plan, which `plan_out`
+    receives) on the current
     stream. It returns the float64 rows `[Σ n_t, row_width(k)]` on the device and reads
     nothing back. `validate` applies FS36's rules per group first (`ValueError` naming the
     group and its products). `run` replaces the loaded kernel and `challenges` the challenge

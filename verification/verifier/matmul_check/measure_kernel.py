@@ -348,21 +348,23 @@ def _view_bytes(v: np.ndarray) -> np.ndarray:
     return v["rows"].astype(np.int64) * v["cols"].astype(np.int64) * isz
 
 
-def _settle(gid: np.ndarray, n: int) -> np.ndarray | None:
-    """The levels ``[n, 3]`` of nodes in share groups ``gid`` (a group id per node, node ``3t +
-    p``), by the fixed point of the plan: a group takes its largest level, ``L(t, 1) >= L(t, 0) +
-    1`` and ``L(t, 2) >= L(t, 1) + 1``; ``None`` when 64 rounds do not settle it."""
+def _groups(gid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(order, starts)`` of dense group ids ``gid``: the nodes sorted by group (ascending node
+    index within each) and where each group starts in that order."""
     order = np.argsort(gid, kind="stable")
     sg = gid[order]
-    starts = np.flatnonzero(np.r_[True, sg[1:] != sg[:-1]])
-    sizes = np.diff(np.r_[starts, len(sg)])
+    return order, np.flatnonzero(np.r_[True, sg[1:] != sg[:-1]])
+
+
+def _settle(gid: np.ndarray, order: np.ndarray, starts: np.ndarray, n: int) -> np.ndarray | None:
+    """The levels ``[n, 3]`` of nodes in share groups ``gid`` (dense ids per node, node ``3t +
+    p``; ``order`` and ``starts`` from :func:`_groups`), by the fixed point of the plan: a group
+    takes its largest level, ``L(t, 1) >= L(t, 0) + 1`` and ``L(t, 2) >= L(t, 1) + 1``; ``None``
+    when 64 rounds do not settle it."""
     lv = np.tile(np.arange(3, dtype=np.int64), (n, 1))
     for _ in range(MAX_ROUNDS):
         gmax = np.maximum.reduceat(lv.reshape(-1)[order], starts)
-        new = np.repeat(gmax, sizes)
-        out = np.empty(3 * n, dtype=np.int64)
-        out[order] = new
-        new = out.reshape(n, 3)
+        new = gmax[gid].reshape(n, 3)
         new[:, 1] = np.maximum(new[:, 1], new[:, 0] + 1)
         new[:, 2] = np.maximum(new[:, 2], new[:, 1] + 1)
         if np.array_equal(new, lv):
@@ -381,44 +383,70 @@ def read_plan(prods: np.ndarray) -> ReadPlan:
     and settle by the fixed point of :func:`_settle`; a table that does not settle (a cycle)
     drops every share (each node alone at its phase) and reports none saved. Within a level the
     groups are ordered by the keyed view's address (phase 2: ``P``'s), ties by the first entry's
-    ``(prod, phase)``; entries of a group ascend by ``(prod, phase)``."""
+    ``(prod, phase)``; entries of a group ascend by ``(prod, phase)``.
+
+    A legitimate dependency chain that needs more than 64 rounds is treated as a cycle and
+    loses its shares (a cost in speed, never in bits); the decoder's tables settle in 4 levels."""
     n = len(prods)
     n3 = 3 * n
     biased = (prods["flags"] & M_BIASED) != 0
-    # node 3t + p: the viewed field per node, and whether it can be shared
-    key = np.zeros(n3, dtype=[("uid", "<u8"), ("addr", "<u8"), ("rows", "<i8"), ("cols", "<i8"),
-                              ("rs", "<i8"), ("cs", "<i8"), ("dt", "<u4")])
+    # node 3t + p: the viewed field per node; only (t, 1) and an unbiased (t, 0) can share
+    cols = {f: np.empty(n3, dtype=np.int64 if f != "addr" else np.uint64)
+            for f in ("addr", "rows", "cols", "row_stride", "col_stride", "dtype")}
     for p, v in ((0, prods["b"]), (1, prods["a"]), (2, prods["p"])):
-        sl = slice(p, n3, 3)
-        key["addr"][sl] = v["addr"]
-        key["rows"][sl] = v["rows"]
-        key["cols"][sl] = v["cols"]
-        key["rs"][sl] = v["row_stride"]
-        key["cs"][sl] = v["col_stride"]
-        key["dt"][sl] = v["dtype"]
-    node = np.arange(n3, dtype=np.uint64)
+        for f, dst in cols.items():
+            dst[p::3] = v[f]
+    addr = cols["addr"]
     alone = np.zeros(n3, dtype=bool)
     alone[2::3] = True
     alone[0::3] = biased
-    key["uid"] = np.where(alone, node + np.uint64(1), np.uint64(0))
     items = np.stack((prods["b"]["rows"].astype(np.int64) + biased.astype(np.int64),
                       prods["a"]["rows"].astype(np.int64),
                       np.int64(ROW_FIXED) + prods["k"].astype(np.int64)), 1).reshape(-1)
-    _, gid = np.unique(key, return_inverse=True)
-    gid = gid.reshape(-1).astype(np.int64)
-    lv = _settle(gid, n)
+    gid = np.empty(n3, dtype=np.int64)
+    sh = np.flatnonzero(~alone)
+    if len(sh):
+        rows, cs = cols["rows"][sh], cols["cols"][sh]
+        rs, cst = cols["row_stride"][sh], cols["col_stride"][sh]
+        dt = cols["dtype"][sh]
+        if (min(rs.min(), cst.min(), rows.min(), cs.min()) >= 0 and rs.max() < (1 << 56)
+                and cst.max() < (1 << 56) and rows.max() < (1 << 32) and cs.max() < (1 << 32)
+                and dt.max() < (1 << 8)):
+            packed = (addr[sh], ((rows << 32) | cs).astype(np.uint64), rs.astype(np.uint64),
+                      ((cst << 8) | dt).astype(np.uint64))
+            o = np.lexsort(packed[::-1])  # the first array is the primary key
+            diff = np.zeros(len(sh), dtype=bool)
+            diff[0] = True
+            for c in packed:
+                cc = c[o]
+                diff[1:] |= cc[1:] != cc[:-1]
+            ids = np.empty(len(sh), dtype=np.int64)
+            ids[o] = np.cumsum(diff) - 1
+        else:  # a negative or very large stride or extent: the generic key
+            skey = np.empty(len(sh), dtype=[("a", "<u8"), ("r", "<i8"), ("c", "<i8"),
+                                            ("rs", "<i8"), ("cs", "<i8"), ("d", "<i8")])
+            for f, c in zip(("a", "r", "c", "rs", "cs", "d"),
+                            (addr[sh], rows, cs, rs, cst, dt)):
+                skey[f] = c
+            ids = np.unique(skey, return_inverse=True)[1].reshape(-1).astype(np.int64)
+        gid[sh] = ids
+        n_sh = int(ids.max()) + 1
+    else:
+        n_sh = 0
+    al = np.flatnonzero(alone)
+    gid[al] = n_sh + np.arange(len(al), dtype=np.int64)
+    order, starts = _groups(gid)
+    lv = _settle(gid, order, starts, n)
     cycle = lv is None
     if cycle:
         gid = np.arange(n3, dtype=np.int64)
         lv = np.tile(np.arange(3, dtype=np.int64), (n, 1))
+        order, starts = _groups(gid)
     # per group: its entries (ascending node index), level, address, items
-    order = np.argsort(gid, kind="stable")
-    sg = gid[order]
-    starts = np.flatnonzero(np.r_[True, sg[1:] != sg[:-1]])
     n_ent = np.diff(np.r_[starts, n3])
     first = order[starts]  # the group's first entry (lowest node index)
     g_level = lv.reshape(-1)[first]
-    g_addr = key["addr"][first]
+    g_addr = addr[first]
     g_items = items[first]
     g_order = np.lexsort((first, g_addr, g_level))  # the last key is the primary one
     ng = len(first)
@@ -443,7 +471,7 @@ def read_plan(prods: np.ndarray) -> ReadPlan:
     reads["n_entries"][pos] = n_ent_s.astype(np.uint32)
     totals = np.bincount(lv_s, weights=cnt_s, minlength=n_levels).astype(np.uint64)
     reads["first"][level_off[1:].astype(np.int64) - 1] = totals
-    e_order = np.lexsort((node, rank[gid]))
+    e_order = np.argsort(rank[gid] * n3 + np.arange(n3, dtype=np.int64))
     entries = np.zeros(n3, dtype=ENTRY_DTYPE)
     entries["prod"] = (e_order // 3).astype(np.uint32)
     entries["phase"] = (e_order % 3).astype(np.uint32)
