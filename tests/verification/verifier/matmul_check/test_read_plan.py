@@ -48,20 +48,6 @@ def table(prods):
     return arr
 
 
-def nbytes(v):
-    return int(v["rows"]) * int(v["cols"]) * ITEMSIZE[int(v["dtype"])]
-
-
-def fs37_bytes(arr):
-    """A, B and P once per product, and the bias when there is one."""
-    total = 0
-    for t in arr:
-        total += nbytes(t["a"]) + nbytes(t["b"]) + nbytes(t["p"])
-        if t["flags"] & M_BIASED:
-            total += nbytes(t["bias"])
-    return total
-
-
 def key_addr(arr, t, p):
     return int(arr[t][("b", "a", "p")[p]]["addr"])
 
@@ -104,13 +90,12 @@ def plan_of(prods):
     arr = table(prods) if isinstance(prods, list) else prods
     plan = mk.read_plan(arr)
     check_partition(arr, plan)
-    assert plan.bytes_fs37 == fs37_bytes(arr)
     return arr, plan
 
 
 def unshared(plan, arr):
     assert shares_of(plan) == set()
-    assert plan.shared_groups == 0 and plan.bytes_saved == 0 and not plan.cycle
+    assert plan.shared_groups == 0 and not plan.cycle
     assert plan.n_levels == 3
     assert np.array_equal(plan.node_level, np.tile([0, 1, 2], (len(arr), 1)))
 
@@ -134,10 +119,9 @@ def test_one_product_has_no_shares_and_three_levels(biased, dt):
         (0, [(0, 0)], q + int(biased)), (1, [(0, 1)], n), (2, [(0, 2)], 5 + k)]
 
 
-def test_one_product_is_not_a_cycle_and_reports_the_bytes():
+def test_one_product_is_not_a_cycle_and_shares_nothing():
     arr, plan = plan_of([prod(view(X, 4, 5, dt=DT_BF16), view(W, 5, 7, dt=DT_BF16), P0)])
-    assert plan.bytes_fs37 == (4 * 5 + 5 * 7 + 4 * 7) * 2
-    assert plan.bytes_saved == 0 and plan.shared_groups == 0 and plan.cycle is False
+    assert shares_of(plan) == set() and plan.shared_groups == 0 and plan.cycle is False
 
 
 # ---- X read by a forward product and by its weight gradient ----
@@ -154,8 +138,6 @@ def test_x_read_by_the_forward_a_and_the_gradient_b(dt):
     assert plan.node_level[0].tolist() == [0, 1, 2]
     assert plan.node_level[1].tolist() == [1, 2, 3]
     assert plan.n_levels == 4 and not plan.cycle
-    assert plan.bytes_saved == n * q * ITEMSIZE[dt]  # X's bytes once
-    assert plan.bytes_fs37 == fs37_bytes(arr)
     (lv, es, first, count), = [g for g in groups_of(plan) if len(g[1]) == 2]
     assert lv == 1 and es == [(0, 1), (1, 0)] and count == n
 
@@ -167,7 +149,7 @@ def test_the_gradient_listed_first_gives_the_same_shares():
     arr, plan = plan_of([grad, fwd])
     assert shares_of(plan) == {frozenset({(0, 0), (1, 1)})}
     assert plan.node_level[1].tolist() == [0, 1, 2] and plan.node_level[0].tolist() == [1, 2, 3]
-    assert plan.bytes_saved == n * q * 4
+    assert plan.shared_groups == 1
 
 
 # ---- one X as A of three forward products ----
@@ -179,8 +161,6 @@ def test_one_x_as_a_of_three_fp32_forward_products():
     assert shares_of(plan) == {frozenset({(0, 1), (1, 1), (2, 1)})}
     assert plan.shared_groups == 1
     assert plan.node_level.tolist() == [[0, 1, 2]] * 3 and plan.n_levels == 3
-    assert plan.bytes_saved == 2 * n * q * 4
-    assert plan.bytes_fs37 == fs37_bytes(arr)
 
 
 # ---- member tables: Q̃ by S and δK̃, δO by dA and dV ----
@@ -211,7 +191,6 @@ def test_member_tables_share_one_group_per_member_pair(name):
     assert plan.node_level[:members].tolist() == [[0, 1, 2]] * members
     assert plan.node_level[members:].tolist() == [[1, 2, 3]] * members
     assert plan.n_levels == 4
-    assert plan.bytes_saved == members * n * d * 2
 
 
 def test_member_slices_at_other_offsets_do_not_share():
@@ -257,7 +236,7 @@ def test_same_address_but_another_stride_shape_or_dtype_is_not_shared(change):
     arr, plan = plan_of([first, second])
     if change == "none":
         assert shares_of(plan) == {frozenset({(0, 1), (1, 0)})}
-        assert plan.bytes_saved == n * q * 4
+        assert plan.shared_groups == 1
     else:
         unshared(plan, arr)
 
@@ -284,8 +263,7 @@ def test_a_biased_product_still_shares_its_phase_1_and_the_other_side_of_the_vie
     two = prod(view(X, n, q), tview(W + 0x100_0000, q, w), P0 + 0x200)             # A = X
     arr, plan = plan_of([one, two])
     assert shares_of(plan) == {frozenset({(0, 1), (1, 1)})}
-    assert plan.bytes_saved == n * q * 4
-    assert plan.bytes_fs37 == fs37_bytes(arr)
+    assert plan.shared_groups == 1
 
 
 # ---- a cycle ----
@@ -301,7 +279,7 @@ def test_a_cycle_drops_every_share():
     arr, plan = plan_of([one, two])
     assert plan.cycle is True
     assert shares_of(plan) == set()
-    assert plan.shared_groups == 0 and plan.bytes_saved == 0
+    assert plan.shared_groups == 0
     assert plan.n_levels == 3
     assert plan.node_level.tolist() == [[0, 1, 2], [0, 1, 2]]
 
@@ -314,7 +292,7 @@ def test_a_cycle_beside_other_products_drops_their_shares_too():
              prod(view(G, 6, 4), tview(0x2800_0000, 4, 3), P0 + 0x300),
              prod(tview(0x2900_0000, 3, 6), view(G, 6, 4), P0 + 0x400)]  # an ordinary pair
     arr, plan = plan_of(prods)
-    assert plan.cycle and plan.shared_groups == 0 and plan.bytes_saved == 0
+    assert plan.cycle and plan.shared_groups == 0
     assert plan.node_level.tolist() == [[0, 1, 2]] * 4
 
 
@@ -433,4 +411,3 @@ def test_read_plan_on_10000_members_takes_under_a_second():
     took = time.perf_counter() - t0
     assert took < 1.0, f"read_plan took {took:.2f} s on {len(arr)} products"
     assert plan.shared_groups == members and plan.n_levels == 4 and not plan.cycle
-    assert plan.bytes_saved == members * n * d * 2

@@ -74,8 +74,7 @@ def shared_vs_plain(groups, k, *, guard=True, label="", special=False):
     assert len(plans) == 1 and isinstance(plans[0], mk.ReadPlan)
     p = plans[0]
     print(f"[FS38b] {label}: products {len(groups)}, n_levels {p.n_levels}, "
-          f"shared_groups {p.shared_groups}, bytes_saved/bytes_fs37 {p.bytes_saved}/{p.bytes_fs37}"
-          f" = {p.bytes_saved / max(p.bytes_fs37, 1):.3%}, cycle {p.cycle}")
+          f"shared_groups {p.shared_groups}, cycle {p.cycle}")
     if special:
         assert same_bits(got, want), label
     else:
@@ -97,7 +96,7 @@ def test_share_equals_no_share_on_fs36_inputs_as_one_table():
         groups, kk = groups_of_table(table)
         p = shared_vs_plain(groups, kk, guard=guard, label=f"FS36 k={k} guard={guard}",
                             special=True)
-        assert p.shared_groups == 0 and p.n_levels == 3 and p.bytes_saved == 0
+        assert p.shared_groups == 0 and p.n_levels == 3
 
 
 # ---- the shared tables of the host file, on CUDA copies ----

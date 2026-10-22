@@ -338,14 +338,7 @@ class ReadPlan:
     node_level: np.ndarray   # int64 [n_prod, 3], the level of (product, phase)
     n_levels: int            # == launches
     shared_groups: int       # groups with 2 or more entries
-    bytes_fs37: int          # sum per product: A, B, P (and the bias) read once
-    bytes_saved: int         # sum over groups of e >= 2 entries: (e - 1) * the keyed view's bytes
     cycle: bool              # True when the levels did not settle in 64 rounds: no group shares
-
-
-def _view_bytes(v: np.ndarray) -> np.ndarray:
-    isz = np.where(v["dtype"] == DT_BF16, 2, 4).astype(np.int64)
-    return v["rows"].astype(np.int64) * v["cols"].astype(np.int64) * isz
 
 
 def _groups(gid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -381,7 +374,7 @@ def read_plan(prods: np.ndarray) -> ReadPlan:
     strides, dtype); nodes with equal keys form a group that runs together, one row of the view
     at a time. ``(t, 2)`` and a biased ``(t, 0)`` are never shared. Levels start at the phase
     and settle by the fixed point of :func:`_settle`; a table that does not settle (a cycle)
-    drops every share (each node alone at its phase) and reports none saved. Within a level the
+    drops every share (each node alone at its phase). Within a level the
     groups are ordered by the keyed view's address (phase 2: ``P``'s), ties by the first entry's
     ``(prod, phase)``; entries of a group ascend by ``(prod, phase)``.
 
@@ -476,19 +469,8 @@ def read_plan(prods: np.ndarray) -> ReadPlan:
     entries["prod"] = (e_order // 3).astype(np.uint32)
     entries["phase"] = (e_order % 3).astype(np.uint32)
     shared = n_ent >= 2
-    saved = 0
-    if not cycle and shared.any():
-        fv_ = first[shared]
-        fp = fv_ % 3
-        ft = fv_ // 3
-        vb = np.where(fp == 0, _view_bytes(prods["b"])[ft], _view_bytes(prods["a"])[ft])
-        saved = int(((n_ent[shared] - 1) * vb).sum())
-    base_bytes = _view_bytes(prods["a"]) + _view_bytes(prods["b"]) + _view_bytes(prods["p"])
-    bias_bytes = np.where(biased, prods["bias"]["cols"].astype(np.int64)
-                          * np.where(prods["bias"]["dtype"] == DT_BF16, 2, 4), 0)
     return ReadPlan(reads, level_off, entries, lv.copy(), n_levels,
-                    0 if cycle else int(shared.sum()), int((base_bytes + bias_bytes).sum()),
-                    0 if cycle else saved, bool(cycle))
+                    0 if cycle else int(shared.sum()), bool(cycle))
 
 
 def level_launches(prods_addr: int, works_addr: int, rows_addr: int, reads_addr: int,

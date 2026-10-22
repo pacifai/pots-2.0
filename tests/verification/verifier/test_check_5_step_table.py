@@ -219,7 +219,7 @@ def _show(setup, tables, label):
         first = c.product(step[0]).name
         p = call.plan
         print(f"-- step starting {first}: {len(step)} products, {p.n_levels} levels, "
-              f"{p.shared_groups} shared groups, saved {p.bytes_saved} of {p.bytes_fs37} bytes")
+              f"{p.shared_groups} shared groups")
         for lvl, es in groups:
             print(f"   level {lvl}: " + ", ".join(f"({n}, {ph})" for n, ph in es))
 
@@ -321,19 +321,17 @@ def llama_setup(dtype, device="cpu") -> Setup:
 
 
 def reads_saved(setup, plans, label):
-    """Print each table's shared groups, reads saved, FS37's reads and their ratio, and the
-    step's total; returns the total saved."""
+    """Print each table's levels and shared groups and the step's total; returns the total
+    number of shared groups."""
     c = setup.c
     print(f"\n=== reads saved, Llama-3.2-1B shapes, 2 layers, {label}")
-    saved = base = 0
+    saved = 0
     for step, p in plans:
         first = c.product(step[0]).name
         print(f"-- table starting {first}: {len(step)} products, {p.n_levels} levels, "
-              f"shared_groups {p.shared_groups}, bytes_saved {p.bytes_saved}, "
-              f"bytes_fs37 {p.bytes_fs37}, ratio {p.bytes_saved / p.bytes_fs37:.4f}")
-        saved += p.bytes_saved
-        base += p.bytes_fs37
-    print(f"-- step total: bytes_saved {saved}, bytes_fs37 {base}, ratio {saved / base:.4f}")
+              f"shared_groups {p.shared_groups}")
+        saved += p.shared_groups
+    print(f"-- step total: shared_groups {saved}")
     return saved
 
 

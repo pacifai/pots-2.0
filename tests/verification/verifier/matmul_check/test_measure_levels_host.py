@@ -52,7 +52,6 @@ def test_x_by_a_forward_and_its_gradient(levels, phased, dtype, guard):
     plan = plan_for(mis)
     assert shares_of(plan) == {frozenset({(0, 1), (1, 0)})}
     assert plan.n_levels == 4 and plan.shared_groups == 1
-    assert plan.bytes_saved == 9 * 21 * (4 if dtype == torch.float32 else 2)
     same_rows(levels, phased, mis)
 
 
