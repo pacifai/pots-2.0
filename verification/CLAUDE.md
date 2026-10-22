@@ -1999,7 +1999,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `emit(t, out)` (an A3 splice).
   - `LoopResult(verdict, steps, w_final)`, where `steps` holds `StepRecord(t, rejection, loss,
     prove_s, commit_s, verify_s, handoff_s, ...)`, whose last field `known` is the leaves the
-    commit took from arrival digests. `prove_s` excludes `emit`; `handoff_s` is the
+    commit took from arrival digests. `w_final` is host copies from the pipelined loop and
+    the prover's device tensors from the sequential one, so tests compare it by value on the
+    CPU. The step summary's `capture["host_buffers"]` is the process-wide pinned pool, so it
+    differs between a long-lived test process and a fresh child: the equality test leaves it
+    out. `prove_s` excludes `emit`; `handoff_s` is the
     time between the roles (the cache release on CUDA), in neither `commit_s` nor `verify_s`. Per-check timings and stats stay on
     the verifier. A test holds weakrefs to each step's products and checks they are dead by the
     next step.
