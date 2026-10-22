@@ -140,8 +140,31 @@ TIMES = {"prove_s", "commit_s", "verify_s", "handoff_s"}
 
 
 def _fields(rec):
-    return {f.name: (repr(getattr(rec, f.name)) if f.name == "capture" else getattr(rec, f.name))
+    """Every field but the times. ``capture`` without ``host_buffers``: that is the pinned-buffer
+    pool's size, and the pool (``capture.HOST_BUFFERS``) is one per process, filled by whatever
+    the process ran before, so a long-lived test process and the fresh child differ (on the pair
+    session 245 buffers against none) though the step is the same. The rest of ``capture``
+    counts the step's own calls and products and must be equal."""
+    return {f.name: (repr({k: v for k, v in rec.capture.items() if k != "host_buffers"})
+                     if f.name == "capture" else getattr(rec, f.name))
             for f in dataclasses.fields(rec) if f.name not in TIMES}
+
+
+def test_the_host_buffer_pool_of_a_used_process_does_not_split_the_two_loops(mlp, monkeypatch):
+    """The Mac twin of the pair session's failure: the parent's pool already holds a buffer
+    (as after CUDA tests), the child's is empty. The sequential and pipelined records still
+    match through ``_fields``, and the raw ``host_buffers`` values do differ."""
+    from verification.prover import capture
+
+    used = capture.HostBuffers(pin=False)
+    keep = used.take((4,), torch.float32)
+    monkeypatch.setattr(capture, "HOST_BUFFERS", used)
+    a = go(mlp, HONEST.fault, pipelined=False)
+    b = go(mlp, HONEST.fault, pipelined=True)
+    assert a.loop.steps[0].capture["host_buffers"] == {"n_buffers": 1, "nbytes": 16}
+    assert b.loop.steps[0].capture["host_buffers"] == {"n_buffers": 0, "nbytes": 0}
+    assert [_fields(s) for s in a.loop.steps] == [_fields(s) for s in b.loop.steps]
+    del keep
 
 
 def test_every_step_record_field_but_the_times_equals_sequential(mlp):
