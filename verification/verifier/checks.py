@@ -889,6 +889,12 @@ def _measure_step_kernel(c: DeclaredComputation, runs: Sequence[Sequence[Product
                                                group=group0[i] + g, st=ctx.stamper())
                         groups.extend(gs)
                         order.extend(o)
+            # The row split below hands each run its rows per device in device order, which is
+            # serving order only for a run on one device; a run on two takes the canonical rerun.
+            where = {mg.a.device for mg in groups}
+            if len(where) > 1:
+                raise RuntimeError(f"run {i} is served on several devices: "
+                                   f"{sorted(map(str, where))}")
         except Exception as e:
             raise _UnitPassError(i) from e
         served.append((groups, order))

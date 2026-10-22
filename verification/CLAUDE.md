@@ -1647,8 +1647,9 @@ interface.
     (1024) products, closed at the end of a run, shared with `_layout`) are then judged in
     canonical order from the host rows (`_judge_window`), each in its own `c5.judge` stamp, so
     the first failing product and its message are those of one-at-a-time judging, and
-    `5.measure`'s call count is the number of groups (on the kernel path, the number of steps
-    and devices) plus the number of windows. A rejection
+    `5.measure`'s call count is the number of groups (on the kernel's unit path, the number of
+    steps and devices; the canonical kernel path still measures once per group) plus the
+    number of windows. A rejection
     leaves the failing window's tail in `StepState.run_rest` and the host rows of every later
     window's runs in `StepState.run_rest_rows`; the record pass records both and serves
     nothing more. Any error while serving, measuring or reading (a `ReplayError` from the
