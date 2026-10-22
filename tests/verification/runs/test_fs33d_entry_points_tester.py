@@ -27,6 +27,7 @@ from verification.commitment.leaves import dataset_tree
 from verification.computation.interface import snapshot_weights
 from verification.runs import cheats, pipeline, prover_spec
 from verification.runs import flipped_matmul_sweep as fs
+from verification.runs import kept_step
 from verification.runs import run_verified as rv
 from verification.runs.hidden_steps import CHAIN_STEP, run_hidden
 from verification.runs.pipeline import ProverProcessError
@@ -305,7 +306,7 @@ def test_stored_step_write_is_outside_the_steps_clocks(tiny_main, tiny_spec, mon
 
 def test_a_stored_root_mismatch_raises_and_stops_the_child(tiny_main, tiny_spec, monkeypatch,
                                                             capsys):  # noqa: F811
-    monkeypatch.setattr(rv, "transcript_root", lambda *a, **k: b"\0" * 32)
+    monkeypatch.setattr(kept_step, "transcript_root", lambda *a, **k: b"\0" * 32)
     monkeypatch.setenv("VERIF_PIPELINED", "1")
     with pytest.raises(RuntimeError, match="root over the written files"):
         rv.main(["--no-metrics", "--keep-step", "2"])

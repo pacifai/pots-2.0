@@ -8,11 +8,13 @@ does, runs ``prove_step`` and ``InMemoryStore.commit_step`` for ``steps`` steps 
 ``("release", t)`` -> ``"ok"`` or the error text; ``("mutate", t, i)`` writes leaf ``i`` of
 step ``t`` in place; ``("poke", t, i)`` writes leaf ``i``'s first element through ``.data``
 (a write ``_version`` does not see) and returns ``(old, new)``; ``("mem",)`` returns
-``(memory_allocated before the first step, now, bytes of one weight set)`` on the first device
-(CUDA only); ``("quit",)``. ``strategy`` is the CPU sharing strategy and ``alloc`` the value of
-``PYTORCH_ALLOC_CONF`` (``None`` unsets it), both set before anything is shared or allocated.
+``(memory_allocated before the first counted step (taken after one warm-up step), now, bytes
+of one weight set)`` on the first device (CUDA only); ``("quit",)``. ``strategy`` is the CPU sharing
+strategy and ``alloc`` the value of ``PYTORCH_ALLOC_CONF`` (``None`` unsets it), both set
+before anything is shared or allocated.
 """
 
+import gc
 import os
 
 import torch
@@ -64,6 +66,29 @@ def configure(strategy=None, alloc=None):
         os.environ["PYTORCH_ALLOC_CONF"] = alloc
 
 
+def _warm_up(c, model, w, D, pi, dtree):
+    """One whole step, committed, hashed, shared and released, before the baseline of ``mem``.
+
+    A first step makes what a process keeps for good: the cuBLAS workspace (with
+    ``CUBLAS_WORKSPACE_CONFIG=:4096:8`` 8 x 4 MiB per handle and stream, 64 MiB for the
+    default and the side stream, allocated through the caching allocator and so counted by
+    ``memory_allocated``), the hashing kernel's per-device buffers and the loaded kernels.
+    None of that is a step's transcript; the baseline measured before it made the test report
+    64 MiB "kept" on the pair session. The step is the schedule's first, from the same ``w``,
+    and leaves nothing that the steps after it do not rebuild."""
+    idx = list(pi(1))
+    out = prove_step(c, model, w, [D[i] for i in idx])
+    leaves, tree = InMemoryStore.commit_step(c, out)
+    hash_step_leaves(c, leaves)
+    _, hold = share_step(c, 1, leaves, tree, [dtree.path(i) for i in idx])
+    del out, leaves, tree
+    hold.release()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 def producer(conn, devices, device, steps, forged=None, layers=None, strategy=None, alloc=None):
     import faulthandler
 
@@ -71,11 +96,13 @@ def producer(conn, devices, device, steps, forged=None, layers=None, strategy=No
     configure(strategy, alloc)
     cuda = torch.device(device).type == "cuda"
     c, D, model, w = setup(devices, device, layers)
+    pi = _default_schedule(c, D, SEED)
+    dtree = dataset_tree(c, D)
+    if cuda:
+        _warm_up(c, model, w, D, pi, dtree)
     before = torch.cuda.memory_allocated(torch.device(device)) if cuda else 0
     w_bytes = sum(x.numel() * x.element_size() for x in w.values()
                   if isinstance(x, torch.Tensor)) if hasattr(w, "values") else 0
-    pi = _default_schedule(c, D, SEED)
-    dtree = dataset_tree(c, D)
     holds, leaves_of = {}, {}
     for t in range(1, steps + 1):
         idx = list(pi(t))
