@@ -70,6 +70,35 @@ def phased(hostlib, host_measure):
     return run
 
 
+@pytest.fixture(scope="module")
+def levels(hostlib, host_measure):
+    hostlib.pots_host_measure_levels.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    hostlib.pots_host_measure_levels.restype = ctypes.c_int
+
+    def run(mis, *, reverse=False, raw=False):
+        """The rows of ``mis`` by the level launches of ``mk.read_plan`` run in loops."""
+        table = pack(mis)
+        prods = np.frombuffer(table.array, dtype=mk.MPROD_DTYPE).copy()
+        scratch = np.zeros(mk.scratch_bytes(prods) + 8, dtype=np.uint8)
+        base = (scratch.ctypes.data + 7) & ~7
+        works = mk.works_array(prods, base)
+        plan = mk.read_plan(prods)
+        rows = mt.empty_rows(table)
+        err = hostlib.pots_host_measure_levels(
+            prods.ctypes.data, len(prods), works.ctypes.data, plan.reads.ctypes.data,
+            plan.level_off.ctypes.data, plan.n_levels, plan.entries.ctypes.data,
+            rows.ctypes.data, int(reverse))
+        if raw:
+            return err, rows
+        assert err == 0
+        return rows
+
+    run.reference = lambda mis: host_measure(pack(mis))
+    return run
+
+
 def same(rows, ref):
     assert np.array_equal(bits(rows), bits(ref))
 

@@ -220,4 +220,38 @@ static __host__ __device__ __forceinline__ void pots_phase_store(
   else row[item] = pots_sqrt64(v);
 }
 
+/* Shared reads (FS38b). A level's launch runs *read groups*: the nodes (product, phase) that
+ * read one stored view (the same address, shape, strides and dtype) form a group, and one item
+ * of the group is one row of that view, run for every entry of the group in turn so the row is
+ * read once while it is hot. `reads` holds a level's groups in order and then a sentinel whose
+ * `first` is the level's item total; `entries` (a group's `entry0 .. entry0 + n_entries - 1`)
+ * name each node by product and phase. An unshared node is a group of one entry. */
+typedef struct {
+  pots_u64 first;     /* the level's running item count at the group's first row */
+  pots_u64 count;     /* rows of the group */
+  pots_u32 entry0;    /* index of the group's first entry in `entries` */
+  pots_u32 n_entries; /* nodes sharing the group's view */
+} pots_mread_t;
+
+typedef struct {
+  pots_u32 prod;
+  pots_u32 phase;
+} pots_mentry_t;
+
+/* The group holding item `item` of one level's groups `r[0..n_groups-1]` (r[n_groups] is the
+ * level's sentinel: first = the level's item total, count = entry0 = n_entries = 0), and the row
+ * within it; binary search on `first`, as pots_mfind does. */
+static __host__ __device__ __forceinline__ pots_u64 pots_rfind(const pots_mread_t *r,
+                                                               pots_u64 n_groups, pots_u64 item,
+                                                               pots_u64 *local) {
+  pots_u64 lo = 0, hi = n_groups; /* invariant: r[lo].first <= item < r[hi].first */
+  while (hi - lo > 1) {
+    pots_u64 mid = lo + (hi - lo) / 2;
+    if (r[mid].first <= item) lo = mid;
+    else hi = mid;
+  }
+  *local = item - r[lo].first;
+  return lo;
+}
+
 #endif /* POTS_MEASURE_PHASES_H */
