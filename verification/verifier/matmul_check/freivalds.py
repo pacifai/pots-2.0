@@ -334,7 +334,8 @@ def kernel_device(device: torch.device | str) -> bool:
 
 
 def measure_groups_rows(groups: Sequence[MeasureGroup], *, h: bytes, k: int,
-                        guard: bool = True) -> torch.Tensor:
+                        guard: bool = True, share: bool = False,
+                        plan_out: list | None = None) -> torch.Tensor:
     """Every member's row (:data:`ROW`) as float64 ``[Σ n_t, row_width(k)]`` on the groups'
     device, groups in order and members in order within each, from one table and one launch
     set on the current stream, with no host read. Challenges come from the host challenge
@@ -342,10 +343,13 @@ def measure_groups_rows(groups: Sequence[MeasureGroup], *, h: bytes, k: int,
     ``_version`` as enqueued, until :func:`drain`. Each call first releases the entries
     whose event has completed. A group the rules refuse (dtype, shapes, device, a bias with
     several members, ``k``) raises ``ValueError`` naming it, before anything is launched; the
-    tensors must be on a CUDA device."""
+    tensors must be on a CUDA device. ``share=True`` runs the table in levels with one-sided
+    shared reads (``measure_kernel.read_plan``, FS38b), with the same bits; ``plan_out``, a
+    list, then gets that table's ``ReadPlan``."""
     from verification.verifier.matmul_check import measure_kernel
 
-    return measure_kernel.enqueue(groups, h=h, k=k, guard=guard)
+    return measure_kernel.enqueue(groups, h=h, k=k, guard=guard, share=share,
+                                  plan_out=plan_out)
 
 
 def drain(device: torch.device | str | None = None) -> None:

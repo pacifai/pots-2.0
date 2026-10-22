@@ -78,7 +78,7 @@ def emulation(hostlib):
     """``measure_groups_rows`` as the kernel computes it, on the host."""
     source = HostChallengeSource()
 
-    def measure(groups, *, h, k, guard=True):
+    def measure(groups, *, h, k, guard=True, share=False, plan_out=None):
         _, counts = mk.validate(groups, k)
         ms = [int(m) for g in groups for m in g.ms]
         widths = np.repeat([g.b.shape[2] for g in groups], counts)
@@ -113,10 +113,10 @@ class Recorder:
     guards: set = field(default_factory=set)
 
     def wrap(self, fn):
-        def measure(groups, *, h, k, guard=True):
+        def measure(groups, *, h, k, guard=True, share=False, plan_out=None):
             mine = [dict(m=int(m), a=_host(g.a[t]), b=_host(g.b[t]), p=_host(g.p[t]),
                          bias=_host(g.bias)) for g in groups for t, m in enumerate(g.ms)]
-            rows = fn(groups, h=h, k=k, guard=guard)
+            rows = fn(groups, h=h, k=k, guard=guard, share=share, plan_out=plan_out)
             assert rows.shape[0] == len(mine)
             assert self.h in (None, h) and self.k in (None, k)
             self.h, self.k = h, k
