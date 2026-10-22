@@ -147,7 +147,11 @@ def assert_equal(a, b):
     assert _numbers(a.verifier) == _numbers(b.verifier)
     assert a.verifier.record_pass == b.verifier.record_pass
     assert ra.w_final.keys() == rb.w_final.keys()
-    assert all(torch.equal(ra.w_final[n], rb.w_final[n]) for n in ra.w_final)
+    # The pipelined loop returns host copies (the child's answer to ``stop``); the sequential
+    # loop returns the tensors where the prover left them (on a card, the placement's device,
+    # cuda:1 in the pair session). The values and dtypes are the contract, not the device.
+    assert all(ra.w_final[n].dtype == rb.w_final[n].dtype
+               and torch.equal(ra.w_final[n].cpu(), rb.w_final[n].cpu()) for n in ra.w_final)
 
 
 def assert_window(info, T):
