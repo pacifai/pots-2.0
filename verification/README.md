@@ -1327,7 +1327,9 @@ from measurement, not guessed. The test-scale procedure:
 Every later run loads the band file read-only with `calibration.load_bands(path, k=k,
 context=...)`. It refuses a missing file, a file calibrated at another `k`, and a file whose
 recorded run (`band_context`: model, dtypes, attention, device, `h_D`, batch shape, `η`, `M`,
-`T` and `k`) differs from the run loading it. The file also records the calibration run's
+`T` and `k`, plus the GPU model names, `torch` and CUDA versions) differs from the run
+loading it; a file from before those three keys is refused until refitted. The file also
+records the calibration run's
 seed and thread count but doesn't compare them. The bands don't depend on `π`, so the file
 fitted at seed 1 judges the runs at every seed. The thread count changes only the order of
 the CPU's floating-point sums, a shift far below `τ`, and the cost results need it recorded.
