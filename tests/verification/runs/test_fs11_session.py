@@ -989,7 +989,9 @@ def test_job_survives_a_dead_reader_on_its_stdout(tmp_path):
 
 def test_job_runs_without_its_log_file(tmp_path):
     (tmp_path / "out" / "job.log").mkdir(parents=True)
-    r, out = _job(tmp_path, plan=OK_PLAN, extra={"FS11_ALLOW_ANY_GPU": "1"})
+    # The deadline leaves a loaded machine room to start the session: at 6 s its part could be
+    # killed at the work deadline, and the job exit 1 (as in the dead-reader test below).
+    r, out = _job(tmp_path, plan=OK_PLAN, deadline=60, extra={"FS11_ALLOW_ANY_GPU": "1"})
     assert r.returncode == 0, r.stdout + r.stderr
     assert "cannot append to" in r.stdout and "ok: ok, exit 0" in r.stdout
     assert "DRY_RUN: terminate (end of job" in r.stdout and Path(f"{out}.TERMINATED").exists()
@@ -1191,13 +1193,23 @@ def test_job_hands_a_failing_terminate_to_the_timer(tmp_path):
     """Every call fails: the job gives up at the deadline without the TERMINATED flag, and the
     timer goes on trying (stop included) until it is killed."""
     env, log = _stubs(tmp_path)
-    p, out = _job(tmp_path, plan=OK_PLAN, deadline=6, grace=1, reserve=2, popen=True,
+    # The deadline leaves a loaded machine room to start the session. If the timer fired before
+    # the job reached its own terminate, the timer would take the lock first, and the job would
+    # give up without writing TERMINATE FAILED.
+    p, out = _job(tmp_path, plan=OK_PLAN, deadline=12, grace=1, reserve=2, popen=True,
                   extra={**REAL, **env, "FS11_DELETE_ROUNDS": "2"})
+
+    def everything_the_assertions_read():
+        # The job's TERMINATE FAILED (written when its own attempts run out at the deadline), the
+        # timer's start and its stop attempts: the kill must wait for all three.
+        if not (out / "job.log").exists():
+            return False
+        text = _log(out)
+        return ("TERMINATE FAILED" in text and "terminating pod test-pod (deadline)" in text
+                and text.split("(deadline)")[1].count("trying: runpodctl pod stop") >= 2)
+
     try:
-        assert _wait_for(lambda: (out / "job.log").exists()
-                         and "terminating pod test-pod (deadline)" in _log(out)
-                         and _log(out).split("(deadline)")[1].count("trying: runpodctl pod stop")
-                         >= 2, timeout=40), _log(out)
+        assert _wait_for(everything_the_assertions_read, timeout=40), _log(out)
         assert p.poll() is None  # the job waits on the timer
     finally:
         os.killpg(p.pid, signal.SIGKILL)
