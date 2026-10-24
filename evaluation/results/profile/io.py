@@ -1,7 +1,9 @@
 """FS25's readers for the profiling files of archive/PROFILING_PLAN §5 (version 1):
 ``markers.jsonl``, ``samples.jsonl``, ``probe.json``, ``c5_layout.json``, ``trace_summary.json``
-and the run directory's ``records.jsonl``. Each reader rejects a file whose ``version`` isn't 1
-with a ``ValueError`` that names the file.
+and the run directory's ``records.jsonl``. Each reader rejects a file whose ``version`` isn't
+one it reads with a ``ValueError`` that names the file. FS35: ``samples.jsonl`` and
+``probe.json`` read as version 1 or 2 (:data:`VERSIONS`); version 2 holds every GPU of the
+machine (``setup/sampler.py``, ``verification/runs/probe.py``).
 
 Units stay as written: marker times are µs from a step's ``t0_ns``, sample times are monotonic
 ns, time rows are seconds. :mod:`evaluation.results.profile.analyze` converts at its joins.
@@ -21,6 +23,7 @@ __all__ = ["VERSION", "MARKERS_FILE", "C5_LAYOUT_FILE", "Markers", "Samples", "r
            "read_samples", "read_probe", "read_c5_layout", "read_trace_summary", "read_records"]
 
 VERSION = 1
+VERSIONS = {"samples": (1, 2), "probe": (1, 2)}  # the other files: (VERSION,)
 MARKERS_FILE = "markers.jsonl"
 C5_LAYOUT_FILE = "c5_layout.json"
 
@@ -38,21 +41,23 @@ class Samples:
     rows: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _check_version(obj: Any, path: Path) -> None:
-    if not isinstance(obj, dict) or obj.get("version") != VERSION:
+def _check_version(obj: Any, path: Path, accepted: tuple[int, ...] = (VERSION,)) -> None:
+    if not isinstance(obj, dict) or obj.get("version") not in accepted:
         got = obj.get("version") if isinstance(obj, dict) else None
-        raise ValueError(f"{path}: version {got!r}, expected {VERSION}")
+        want = " or ".join(map(str, accepted))
+        raise ValueError(f"{path}: version {got!r}, expected {want}")
 
 
-def _read_json(path: str | Path) -> dict[str, Any]:
+def _read_json(path: str | Path, accepted: tuple[int, ...] = (VERSION,)) -> dict[str, Any]:
     path = Path(path)
     with open(path, encoding="utf-8") as f:
         obj = json.load(f)
-    _check_version(obj, path)
+    _check_version(obj, path, accepted)
     return obj
 
 
-def _read_lines(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _read_lines(path: Path, accepted: tuple[int, ...] = (VERSION,)
+                ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """The header (first line, version checked) and the lines after it. A last line cut short
     by a process still writing is skipped with a warning."""
     with open(path, encoding="utf-8") as f:
@@ -71,7 +76,7 @@ def _read_lines(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             raise ValueError(f"{path}: line {i}: {e}") from None
     if not rows or rows[0].get("kind") != "header":
         raise ValueError(f"{path}: the first line isn't a header")
-    _check_version(rows[0], path)
+    _check_version(rows[0], path, accepted)
     return rows[0], rows[1:]
 
 
@@ -94,7 +99,7 @@ def read_markers(path: str | Path) -> Markers:
 
 def read_samples(path: str | Path) -> Samples:
     path = Path(path)
-    header, rest = _read_lines(path)
+    header, rest = _read_lines(path, VERSIONS["samples"])
     seen: set[Any] = set()
     rows = []
     for r in rest:
@@ -107,7 +112,7 @@ def read_samples(path: str | Path) -> Samples:
 
 
 def read_probe(path: str | Path) -> dict[str, Any]:
-    return _read_json(path)
+    return _read_json(path, VERSIONS["probe"])
 
 
 def read_c5_layout(path: str | Path) -> dict[str, Any]:
