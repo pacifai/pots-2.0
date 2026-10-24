@@ -125,6 +125,11 @@ to ``environment.json`` and refuses to start unless CUDA is available and the GP
 and runs :func:`selftest_plan`'s stand-in parts, which need only the standard library. Exits 0
 when every part succeeded, 1 when any failed, and :data:`EXIT_REFUSED` when the environment
 check refused.
+
+``run`` also refuses when the running Python's version is not the one the upload's manifest
+records (:func:`python_mismatch`; the self-test is exempt): 3.14.0 hangs at exit (gh-146313), and
+``fs11_setup.sh`` builds the pod's venv at the Mac's version. ``FS11_ALLOW_PYTHON_MISMATCH=1``
+overrides.
 """
 
 from __future__ import annotations
@@ -347,6 +352,28 @@ def refusal(env: Mapping[str, Any], allow_any_gpu: bool, min_cards: int | None =
         return "torch.cuda.is_available() is false"
     if not any("H100" in g for g in env["gpus"]):
         return f"no H100 among the GPUs {env['gpus']}"
+    return None
+
+
+PYTHON_MISMATCH_ENV = "FS11_ALLOW_PYTHON_MISMATCH"
+
+
+def python_mismatch(upload: Path, running: str) -> str | None:
+    """Why the pod's Python is not the packing machine's, or ``None``. The upload's manifest
+    records the Mac's version (``python_version``). CPython 3.14.0 can hang at exit (the
+    resource tracker's deadlock, gh-146313), and the cure, 3.14.7, is only a venv built with
+    ``fs11_setup.sh`` away. An older upload without the key is refused with its own message."""
+    try:
+        want = json.loads((upload / "manifest.json").read_text()).get("python_version")
+    except (OSError, ValueError, AttributeError) as e:
+        return (f"the upload's manifest.json is unreadable ({type(e).__name__}: {e}), so the "
+                "Python version it records can't be checked")
+    if not want:
+        return ("the upload's manifest.json records no Python version (an older upload): "
+                "repack it with fs11_prep, which records the Mac's")
+    if want != running:
+        return (f"the pod's Python {running} is not the Mac's {want}: 3.14.0 hangs at exit "
+                "(gh-146313); build the venv with fs11_setup.sh")
     return None
 
 
@@ -2962,6 +2989,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                       need="the fs32-pair session" if pairing else None)
     except ValueError as e:
         why = str(e)
+    py_refused = False
+    if args.cmd == "run" and not selftest and not why:
+        why = python_mismatch(args.upload.resolve(), platform.python_version())
+        py_refused = bool(why)
+        if why and os.environ.get(PYTHON_MISMATCH_ENV) == "1":
+            _say(f"{PYTHON_MISMATCH_ENV}=1: {why}")
+            why, py_refused = None, False
     if selftest:
         _say(f"self-test: stand-in parts in place of the {label} session's, the H100 check is "
              "skipped")
@@ -2973,7 +3007,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _say("refused: " + why if why else "the H100 check passes")
         return EXIT_REFUSED if why else 0
     if why:
-        _say(f"refused to start: {why} (FS11_ALLOW_ANY_GPU=1 overrides)")
+        override = PYTHON_MISMATCH_ENV if py_refused else "FS11_ALLOW_ANY_GPU"
+        _say(f"refused to start: {why} ({override}=1 overrides)")
         _write_json(out / "summary.json", {"session": label, "refused": why,
                                            "environment": env_doc, "parts": [],
                                            "finished": True})
