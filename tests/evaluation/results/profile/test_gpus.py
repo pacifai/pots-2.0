@@ -237,3 +237,20 @@ def test_a_v1_file_pair_reads_and_has_one_gpu(tmp_path):
     assert sampler.version == 1 and sampler.n_gpus == 1 and sampler.view(0) is sampler
     out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
     assert "gpus" not in out["runs"]["honest"]["timeline"]["steps"][0]["strips"]
+
+
+def test_the_hash_floor_splits_over_the_verifier_devices_only(tmp_path):
+    # a sequential sharded run lists all four devices on every section; cuda:0 is prover-only
+    paths = build(tmp_path / "run")
+    lines = [json.loads(x) for x in (paths["run_dir"] / "markers.jsonl").read_text().splitlines()]
+    for ln in lines:
+        for sec in ln.get("sections", []):
+            if sec["name"] == "H":
+                sec["devices"] = DEVS
+    jl(paths["run_dir"] / "markers.jsonl", lines)
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    h = out["runs"]["honest"]["sections"]["H"]
+    each = {d: 3e9 / 3 * PER_BYTE[d] + 1000 * 1e-6 for d in VERIFIER}
+    assert h["floors_s"]["hash"] == pytest.approx(max(each.values()))
+    # the other floors still use the slowest of all four listed devices
+    assert len(h["util_by_device"]) == 4

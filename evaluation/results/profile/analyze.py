@@ -89,6 +89,9 @@ clock and :data:`US` turns µs into s; nothing else converts.
   names ``VERIF_VERIFIER_DEVICES``, or ``gpu_roles`` has a verifier-only device) uses each
   device's ``hash_kernel`` rate on an even share of the bytes and leaves, the slowest time.
   An even split is an estimate: the placement balances bytes per GPU, not leaves. Else ``hash``.
+  Only the section's devices that hold transcript share it (``gpu_roles`` verifier, or the
+  config's verifier devices), since a sequential run lists every device on every section; with
+  none known to hold, all of its devices share it.
 - Usable memory per device is the machine record's ``gpus[*].memory_bytes``, else the probe's
   ``per_device`` entry, else ``gpu_memory_bytes``. Where memory rows hold
   ``device_peak_reserved_bytes`` the memory mark checks each device's peak against its own
@@ -359,6 +362,20 @@ class _Devices:
         self._probes: dict[str, dict[str, Any]] = {}
         self._pos: dict[tuple[str, bool], int | None] = {}
 
+    def holds_transcript(self, dev: str | None) -> bool:
+        """Whether ``dev`` holds transcript: ``gpu_roles`` gives it the verifier role, or the
+        environment config's verifier devices list it."""
+        if dev is None:
+            return False
+        if "verifier" in ((self.roles.get(dev) or {}).get("roles") or []):
+            return True
+        cfg = self.env.get("config")
+        cfg = cfg if isinstance(cfg, dict) else {}
+        listed = cfg.get("VERIF_VERIFIER_DEVICES") or cfg.get("verifier_devices") or []
+        if isinstance(listed, str):
+            listed = listed.split(",")
+        return dev in {_norm_dev(str(d).strip()) for d in listed}
+
     def sections_devices(self, listed: list[str] | None) -> tuple[list[str | None], bool]:
         """A section's devices and whether it named them: the CUDA ones it lists, else the
         primary device alone (``None`` when the run has no CUDA device)."""
@@ -524,8 +541,8 @@ def _work(name: str, rate_key: str, count: dict[str, Any] | None, leaves: int,
 
 
 def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, Any]],
-            warns: set[str], *, devices: Sequence[str | None] = (), gpu_hash: bool = False
-            ) -> dict[str, float]:
+            warns: set[str], *, devices: Sequence[str | None] = (), gpu_hash: bool = False,
+            holders: Sequence[bool] = ()) -> dict[str, float]:
     """§6 step 2: one floor per resource that has work. A term with a zero count adds 0
     whatever its rate; a non-zero count with a null rate drops the resource, with a warning.
     PCIe is the larger of the two directions, since the link is full duplex.
@@ -535,7 +552,10 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
     another), so the GEMM, HBM, PCIe and launch floors use the slowest device's rate or cost.
     The hash floor, with ``gpu_hash`` (the transcript sits on the GPUs), is each device's
     ``hash_kernel`` rate on an even share of the bytes and leaves (each owner hashes its own
-    leaves; an even split is an estimate), the slowest device's time; else the host ``hash``."""
+    leaves; an even split is an estimate), the slowest device's time; else the host ``hash``.
+    ``holders`` marks the section's devices that hold transcript: a sequential sharded run lists
+    every device on every section, so the share is over the holders only (all the devices when
+    none is known to hold)."""
     plist = [probes] if isinstance(probes, dict) else list(probes)
     n_dev = len(plist)
     names = [d or "the device" for d in (list(devices) + [None] * n_dev)[:n_dev]]
@@ -569,10 +589,13 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
                    for d, key in (("h2d", "h2d_pageable_bytes"), ("d2h", "d2h_pageable_bytes"))],
           combine=max)
     kernels = [((p.get("rates") or {}).get("hash_kernel") or {}) for p in plist]
+    keep = [i for i, h in enumerate(list(holders)[:n_dev]) if h] or list(range(n_dev))
+    kernels, hnames = [kernels[i] for i in keep], [names[i] for i in keep]
+    n_hold = len(keep)
     if gpu_hash and (b["hash"] or work["leaves"]) and all(k for k in kernels):
         times = []
-        for k, name in zip(kernels, names, strict=True):
-            n_bytes, n_leaves = b["hash"] / n_dev, work["leaves"] / n_dev
+        for k, name in zip(kernels, hnames, strict=True):
+            n_bytes, n_leaves = b["hash"] / n_hold, work["leaves"] / n_hold
             terms = [("hash_kernel.per_byte_s", n_bytes, k.get("per_byte_s")),
                      ("hash_kernel.per_leaf_s", n_leaves, k.get("per_leaf_s"))]
             missing = [label for label, c, r in terms if c and r is None]
@@ -587,7 +610,7 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
     else:
         if gpu_hash and (b["hash"] or work["leaves"]):
             warns.add("the probe has no hash_kernel rate for "
-                      f"{', '.join(n for n, k in zip(names, kernels, strict=True) if not k)}: "
+                      f"{', '.join(n for n, k in zip(hnames, kernels, strict=True) if not k)}: "
                       "the host hash rate is used")
         hr = [(p.get("rates") or {}).get("hash") or {} for p in plist][0]
         total("hash", [("hash.per_byte_s", b["hash"], hr.get("per_byte_s")),
@@ -1114,7 +1137,8 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                          leaves if _hashes_transcript(counts.get(name), transcript) else 0, tr,
                          c5_scale,
                          2 * round(_mean(calls) or 0))
-            floors = _floors(work, probes, warns, devices=devs, gpu_hash=dv.gpu_hash)
+            floors = _floors(work, probes, warns, devices=devs, gpu_hash=dv.gpu_hash,
+                             holders=[dv.holds_transcript(d) for d in devs])
             floor_s = max(floors.values()) if floors else None
             bound = max(floors, key=floors.__getitem__) if floors else "unknown"
             ratio = mean_t / floor_s if floor_s and mean_t is not None else None
