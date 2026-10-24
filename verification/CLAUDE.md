@@ -1669,7 +1669,9 @@ interface.
     never judged (the rest of its window, `StepState.run_rest`, set by check 5 when it
     rejects, then on the unit pass the host rows of the later windows,
     `StepState.run_rest_rows`, judged in canonical order), since a member measured alone or
-    in a smaller batch is held to agree only to `1e-4` relative; an error check 5 deferred
+    in a smaller batch agrees with check 5's batch only to rounding (on an AMD EPYC 7742,
+    torch 2.9.1's CPU wheel, an honest member's raw residual moved by about 5%), so the record
+    pass records check 5's own measured rows rather than measuring again; an error check 5 deferred
     (`StepState.run_rest_error`) is raised after them. Every product still unmeasured is then
     served and measured from check 5's own replay, as check 5 does it (none remain after a
     unit pass). A 6a rejection measures
