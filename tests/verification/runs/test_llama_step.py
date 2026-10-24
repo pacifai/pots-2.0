@@ -2,6 +2,7 @@
 the real step as a slow test."""
 
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -175,6 +176,39 @@ def test_one_reused_model_gives_the_fresh_build_results(tiny):
     assert ({t: s.products + s.tensors for t, s in reused.verifier.stats.items()}
             == {t: s.products + s.tensors for t, s in fresh.verifier.stats.items()})
     models()  # the model is still as built after both runs
+
+
+def _tiny_main_env(monkeypatch, tmp_path):
+    n = 12
+    c = DecoderComputation(tiny_config(), n_s=2, n=n, eta=1e-3)
+    D = make_records([n, n - 3, n - 5, n, n - 1, n - 4, n - 2, n], seed=1)
+    monkeypatch.setattr(DecoderComputation, "from_config",
+                        classmethod(lambda cls, cfg: DecoderComputation(
+                            tiny_config(), n_s=2, n=n, eta=cfg.require_eta())))
+    monkeypatch.setattr(llama_step, "setup_determinism", lambda cfg: None)
+    for var, value in (("VERIF_OUTPUT_DIR", str(tmp_path)), ("VERIF_ETA", "1e-3"),
+                       ("VERIF_K", str(K)), ("VERIF_SEED", str(SEED))):
+        monkeypatch.setenv(var, value)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "D.bin").write_bytes(encode_records_file(D))
+    h_D = dataset_tree(c, D).root
+    (tmp_path / "data" / "meta.json").write_text(json.dumps({"h_D": h_D.hex()}))
+
+
+@pytest.mark.parametrize("flag, counted", [(None, True), ("--count", True), ("--no-count", False)])
+def test_main_prints_each_steps_root_and_skips_the_count_on_request(
+        monkeypatch, tmp_path, capsys, flag, counted):
+    _tiny_main_env(monkeypatch, tmp_path)
+    calls = []
+    real = llama_step.count_run
+    monkeypatch.setattr(llama_step, "count_run", lambda *a, **k: calls.append(1) or real(*a, **k))
+    assert llama_step.main(["--steps", "2", "--metrics", *([flag] if flag else [])]) == 0
+    out = capsys.readouterr().out.splitlines()
+    roots = [x for x in out if re.fullmatch(r"step\s+\d+ root [0-9a-f]{64}", x)]
+    assert [x.split()[1] for x in roots] == ["1", "2"] and roots[0] != roots[1]
+    assert out.index(roots[0]) > max(i for i, x in enumerate(out) if x.startswith("process lifetime"))
+    assert "   actual:   accept" in out and "   PASS" in out
+    assert bool(calls) is counted
 
 
 def test_main_judges_with_a_band_file_of_this_run(monkeypatch, tmp_path, capsys):

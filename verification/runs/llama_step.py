@@ -27,6 +27,8 @@ residual arrays to ``$VERIF_OUTPUT_DIR/llama_step/`` (B6), and two separate unti
 same ``T`` steps write the per-component memory peaks and the counts; the prover's and the
 verifier's peaks are printed from the memory pass. ``VERIF_RELEASE_CACHE=0`` skips the loop's
 CUDA cache release between prover and verifier in the timed run and the memory pass.
+``--no-count`` skips the counting pass (the counts do not depend on the GPU layout). After the
+costs the run prints each step's transcript root, ``step t root <hex>``, as ``run_verified`` does.
 """
 
 from __future__ import annotations
@@ -77,8 +79,8 @@ from verification.verifier.residuals import (
     tensor_summary,
 )
 
-__all__ = ["run_honest", "report_residuals", "report_costs", "load_committed_dataset",
-           "check_data_model", "main"]
+__all__ = ["run_honest", "report_residuals", "report_costs", "report_roots",
+           "load_committed_dataset", "check_data_model", "main"]
 
 RUN_NAME = "llama_step"  # the metrics directory under VERIF_OUTPUT_DIR
 
@@ -170,6 +172,14 @@ def report_costs(r: ScenarioResult, memory_rows: Sequence[Mapping[str, Any]] | N
     out(f"process lifetime peak RSS {lifetime_maxrss_bytes() / 2**30:.2f} GB")
 
 
+def report_roots(r: ScenarioResult, out: Callable[[str], None] = print) -> None:
+    """Each step's transcript root, one ``step t root <hex>`` line per step, as
+    ``run_verified`` prints them (the sessions compare them across arms)."""
+    for s in r.loop.steps:
+        if s.root is not None:
+            out(f"step {s.t:>2} root {s.root.hex()}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=1, help="T, at least 1 (default 1)")
@@ -179,6 +189,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--metrics", action=argparse.BooleanOptionalAction, default=None,
                    help=f"write B6 metrics to $VERIF_OUTPUT_DIR/{RUN_NAME}/ "
                         "(default: VERIF_METRICS)")
+    p.add_argument("--count", action=argparse.BooleanOptionalAction, default=True,
+                   help="with metrics, run the counting pass (default); --no-count skips it "
+                        "(counts do not depend on the GPU layout)")
     args = p.parse_args(argv)
     if args.steps < 1:
         p.error(f"T = {args.steps}: at least one step")
@@ -236,11 +249,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             mem_rows = memory_run(c, D, w0, run=RUN_NAME, **run_args, **cache, **mode,
                                   device=mw.device, devices=devs)
             mw.write(mem_rows)
-            mw.write(count_run(c, D, w0, run=RUN_NAME, pipelined=False, **run_args))  # sequential
+            if args.count:
+                mw.write(count_run(c, D, w0, run=RUN_NAME, pipelined=False,
+                                   **run_args))  # sequential
         print(f"metrics: {mw.dir}")
     report(r)
     report_residuals(r)
     report_costs(r, mem_rows)
+    report_roots(r)
     return 0 if r.passed else 1
 
 
