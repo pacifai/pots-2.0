@@ -372,8 +372,9 @@ def python_mismatch(upload: Path, running: str) -> str | None:
         return ("the upload's manifest.json records no Python version (an older upload): "
                 "repack it with fs11_prep, which records the Mac's")
     if want != running:
-        return (f"the pod's Python {running} is not the Mac's {want}: 3.14.0 hangs at exit "
-                "(gh-146313); build the venv with fs11_setup.sh")
+        return (f"the pod's Python {running} is not the Mac's {want}: another Python can behave "
+                "differently at exit (3.14.0 hangs there, gh-146313); build the venv with "
+                "fs11_setup.sh")
     return None
 
 

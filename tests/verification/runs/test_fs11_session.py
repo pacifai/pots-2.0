@@ -311,8 +311,10 @@ def test_python_mismatch_names_both_versions_and_the_cause(tmp_path):
     up = _upload_with_python(tmp_path, "3.14.7")
     assert fs.python_mismatch(up, "3.14.7") is None
     why = fs.python_mismatch(up, "3.14.0")
-    assert why == ("the pod's Python 3.14.0 is not the Mac's 3.14.7: 3.14.0 hangs at exit "
-                   "(gh-146313); build the venv with fs11_setup.sh")
+    assert why == ("the pod's Python 3.14.0 is not the Mac's 3.14.7: another Python can behave "
+                   "differently at exit (3.14.0 hangs there, gh-146313); build the venv with "
+                   "fs11_setup.sh")
+    assert "3.14.9 is not the Mac's 3.14.7" in fs.python_mismatch(up, "3.14.9")
     old = fs.python_mismatch(_upload_with_python(tmp_path, None), "3.14.7")
     assert "records no Python version" in old and "fs11_prep" in old
     (tmp_path / "up" / "manifest.json").write_text("{")
