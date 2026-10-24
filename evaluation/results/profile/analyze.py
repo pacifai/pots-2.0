@@ -383,7 +383,8 @@ class _Devices:
 
     def position(self, dev: str | None, named: bool) -> int | None:
         """The sampler GPU of ``dev``: matched by UUID (the sampler header's ``gpus`` against
-        :meth:`uuid_of`), else the GPU with the same index, with a warning. ``None`` when no sampler GPU fits."""
+        :meth:`uuid_of`), else the GPU with the same index, with a warning. ``None`` when no sampler
+        GPU fits."""
         idx = _dev_index(dev)
         if dev is None or idx is None:
             return None

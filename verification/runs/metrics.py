@@ -138,11 +138,12 @@ writes the fields below; ``device=`` alone stays the single-device recorder. A m
   (``n = 1``: 2 and 2, 2); a nested row reads as its longest device span. A marker section's
   ``gpu_us`` stays the first device's; ``gpu_us_by_device`` lists every device's spans, and
   ``devices`` names them (per section, and on the line). Time rows gain ``devices`` and
-  ``gpu_held_s``, the section's seconds times the devices it held: an upper bound on GPU-seconds
-  (EQ14), since a held device may idle. On a non-CUDA device every listed device is the process.
+  ``gpu_held_s``, the section's seconds times the devices it held: an upper bound on held GPU
+  time, since a held device may idle (the cost decision's measure, EQ14, is accumulated GPU time
+  per role: see the EQ14 note below). On a non-CUDA device every listed device is the process.
   The overflow row's (``rest``) ``gpu_s`` is the sum over every listed device of the device
-  spans of the calls past ``MAX_SPANS``, GPU-seconds like ``gpu_held_s`` but measured on the
-  events, with no list per device.
+  spans of the calls past ``MAX_SPANS``, summed over devices like ``gpu_held_s`` but measured
+  on the events, with no list per device.
 - *Memory.* ``peak_bytes``, ``peak_reserved_bytes``, ``start_bytes`` and ``end_bytes`` keep
   their meaning for the first device. New fields, one list entry per device in ``devices``:
   ``device_peak_bytes``, ``device_peak_reserved_bytes``, ``device_start_bytes`` and
@@ -181,13 +182,15 @@ sit on one axis. How to read a merged step ``t``:
   (side ``run``): the step's wall extent, from the first section start to the last section end of
   both sides, gaps included. Pipelined, ``step_wall`` is shorter than ``step`` by the overlap.
   The paper's EQ14 numbers should read both, as F22 decides: wall time (``step_wall`` per step,
-  the run's wall across steps) beside GPU-seconds (``gpu_held_s``, a merged row's seconds times
-  the devices its side held), since "one role at a time" no longer holds.
+  the run's wall across steps) beside accumulated GPU time per role, since "one role at a time"
+  no longer holds. ``gpu_held_s`` (a merged row's seconds times the devices its side held) is
+  only an upper bound on it; the four-H100 session's summary computes the measure from the
+  per-side ``total`` rows and ``gpu_roles`` (``fs11_session._accumulated_gpu_s``).
 - ``gpu_held_s`` on ``step`` is work: each section's seconds times the devices that section's
   process listed, summed (the sequential loop's figure, still an upper bound). On ``step_wall`` it
   is the wall extent times every device either side listed (each counted once): first start to
   last end, the idle gap between the two sides included, so it is not work. Read ``step`` for
-  GPU-seconds and ``step_wall`` for elapsed time.
+  held GPU time (an upper bound) and ``step_wall`` for elapsed time.
 - Rows of a merged step carry ``devices`` and ``gpu_held_s``; in memory rows the device fields
   are per process, so a row over both sides (the ``step`` total) has them ``null``.
 
@@ -1406,7 +1409,7 @@ class TimeRecorder(_Recorder):
                 for lst, g in zip(acc.gpu_more or (), gs[1:], strict=False):
                     lst[slot] = g
             elif acc.rest is not None:
-                # GPU-seconds of the call over every listed device (the sum, as ``gpu_held_s``
+                # GPU time of the call over every listed device (the sum, as ``gpu_held_s``
                 # counts devices); the overflow row has no room for a list per device
                 acc.rest[2] += sum(g[1] - g[0] for g in gs) / 1e6
         anchor = self._anchor

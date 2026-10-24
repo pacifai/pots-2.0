@@ -1356,21 +1356,30 @@ The result reports each model's cost two ways, as the cost decision asks. The wa
 steady step (the merged step's wall extent, mean of steps 2 and 3). The accumulated GPU time is
 each GPU's held time summed over the GPUs a part holds (three verifier GPUs for 1 s are 3 s):
 per step, the prover side's time times the prover GPUs plus the verifier side's time times the
-verifier GPUs, the counts from the environment record's `gpu_roles`. The log prints both per
-model and arm. `metrics.py`'s `gpu_held_s` multiplies each section's time by every device its
+verifier GPUs, the counts from the environment record's `gpu_roles`. It counts held time per
+role: the prover side's time once per prover GPU and the verifier side's once per verifier GPU;
+the prover's arrival and commit hashing run on GPUs 1-3 but sit inside the prover side's
+sections, so they count under the prover side, once.
+The log prints both per model and arm. `metrics.py`'s `gpu_held_s` multiplies
+each section's time by every device its
 process lists (four on the sequential arm), so it only bounds that quantity from above; the
 summary keeps it as `gpu_held_upper_s`. The session fails if any of the step times, per-GPU peaks
 or 12 peer rates is missing, or if any test case was skipped.
 
 **Reading the result.** `summary.json["four_h100"]["pass"]` fails closed. It is true only when
-every part ended `ok`; the tests left a report with tests, no failure or error and no FS34 test
-skipped; and for every model both arms were accepted at all three steps, the two arms' step
-roots are equal step for step, step 1's root is the card part's proved root (the split over
-three GPUs gives one card's bits), and each arm's environment record names four GPUs with
-distinct UUIDs, `cuda:0` as the prover and `cuda:1` to `cuda:3` as verifiers. A rejected arm is
-a result to report, not a thing to work around. Beside `pass` it records, per model and arm,
-each step's prover, verifier, hand-off and total time, the pipelined merged step's wall extent
-and accumulated GPU time, the peak per device and `gpu_peak.json`'s whole-card peaks, and once
+every part ended `ok` (or was done in an earlier run); the peer copies landed the right bytes;
+the tests left a report with tests and no failure, error or skipped case (any skip fails, and a
+test file of the session's list with every case skipped fails); for every model both arms were
+accepted at all three steps in their loop mode, the two arms' step roots are equal step for
+step, step 1's root is the card part's proved root (the split over three GPUs gives one card's
+bits), and each arm's environment record names four GPUs with distinct UUIDs, `cuda:0` as the
+prover and `cuda:1` to `cuda:3` as verifiers; and the reported numbers are all there (per model
+and arm a steady step time and a peak for each of the four GPUs; once, 12 peer rates). A
+rejected arm is a result to report, not a thing to work around. Beside `pass` it records, per
+model and arm, each step's prover, verifier, hand-off and total time, the accumulated GPU time
+for both arms (not only the pipelined merged step; the per-arm log line shows the wall time
+beside it), the pipelined merged step's wall extent, the peak per device and
+`gpu_peak.json`'s whole-card peaks, and once
 the probe's per-device rates, its 12 peer rates and the peer check's per-pair rates. The job
 log ends with one `FS35 ok:` or `FS35 FAIL:` line per acceptance item, then a line per model
 and arm with the steady step time (the mean of steps 2 and 3; step 1 pays one-off costs) and
