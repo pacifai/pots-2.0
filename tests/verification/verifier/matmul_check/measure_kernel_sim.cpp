@@ -3,10 +3,13 @@
 // shuffles, the block's row mapping, the grid stride) against the host build. Nothing here is
 // the kernel: the CUDA keywords are stubbed, __syncthreads and __syncwarp are barriers,
 // __shfl_down_sync reads the warp's slots between two warp barriers, and `__shared__` arrays are
-// statics (blocks run one after the other). A divergent barrier or shuffle hangs, which the test
-// turns into a failure by its timeout. Built by test_measure_kernel_sim_host.py with
+// statics in one named section (blocks run one after the other), which is filled with NaN bytes
+// (0xff) before every block: a read of a cell the block never wrote is a NaN in a row, not a
+// silent zero. A divergent barrier or shuffle hangs, which the test turns into a failure by its
+// timeout. Built by test_measure_kernel_sim_host.py with
 // -ffp-contract=off and the geometry as -D options.
 #include <condition_variable>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -14,9 +17,22 @@
 #define __global__
 #define __device__
 #define __host__
-#define __shared__ static
+#ifdef __APPLE__
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
+#define __shared__ static __attribute__((section("__DATA,simshr"), used))
+static void sim_poison_shared() {
+  unsigned long size = 0;
+  unsigned char *p = getsectiondata(&_mh_dylib_header, "__DATA", "simshr", &size);
+  if (p) memset(p, 0xff, size);
+}
+#else
+#define __shared__ static __attribute__((section("simshr"), used))
+extern "C" unsigned char __start_simshr[], __stop_simshr[];
+static void sim_poison_shared() { memset(__start_simshr, 0xff, __stop_simshr - __start_simshr); }
+#endif
 #define __forceinline__ inline __attribute__((always_inline))
-#define __launch_bounds__(x)
+#define __launch_bounds__(...)
 
 struct sim_dim3 {
   unsigned x;
@@ -73,6 +89,7 @@ extern "C" void sim_launch(const pots_mlargs_t *args, unsigned grid) {
   g_warp = warps;
   gridDim.x = grid;
   for (unsigned b = 0; b < grid; b++) {
+    sim_poison_shared();
     std::vector<std::thread> ts;
     for (unsigned t = 0; t < nt; t++)
       ts.emplace_back([=] {

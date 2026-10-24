@@ -54,13 +54,16 @@ def sim_dir(tmp_path_factory):
     return tmp_path_factory.mktemp("sim")
 
 
-def build_sim(out_dir, geometry):
+def build_sim(out_dir, geometry, asan=False):
     rpb, tile, kc = geometry
-    out = out_dir / f"sim_{rpb}_{tile}_{kc}.so"
+    out = out_dir / f"sim_{rpb}_{tile}_{kc}{'_asan' if asan else ''}.so"
     cmd = [CXX, "-std=c++17", "-O1", "-ffp-contract=off", "-shared", "-fPIC",
            f"-I{ROOT / 'verification/verifier/matmul_check'}",
            f"-DPOTS_MK_WARPS={mk.WARPS}u", f"-DROWS_PER_BLOCK={rpb}u", f"-DTILE_COLS={tile}u",
-           f"-DK_CHUNK={kc}u", str(HERE / "measure_kernel_sim.cpp"), "-o", str(out)]
+           f"-DK_CHUNK={kc}u", f"-DE_MAX={getattr(mk, 'E_MAX', 4)}u",
+           str(HERE / "measure_kernel_sim.cpp"), "-o", str(out)]
+    if asan:
+        cmd[1:1] = ["-fsanitize=address", "-fno-omit-frame-pointer", "-g"]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
     import ctypes
@@ -70,6 +73,32 @@ def build_sim(out_dir, geometry):
     return lib
 
 
+def simulate(lib, mis, *, share=True, geometry=GEOMETRIES[0], grid=3):
+    """The rows of ``mis`` by the simulated kernel: the plan, its row-block starts and its level
+    launches as ``enqueue`` makes them, with host addresses. The scratch is an exact-size
+    allocation (the tables and the plan are numpy arrays of exact size), so an out-of-bounds
+    read lands outside every buffer (under ASAN, a report)."""
+    table = pack(mis)
+    prods = np.frombuffer(table.array, dtype=mk.MPROD_DTYPE).copy()
+    scratch = np.zeros(max(mk.scratch_bytes(prods), 8), dtype=np.uint8)
+    assert scratch.ctypes.data % 8 == 0
+    works = mk.works_array(prods, scratch.ctypes.data)
+    plan = mk.read_plan(prods) if share else mk.plain_plan(prods)
+    starts = mk.block_starts(plan, geometry[0])
+    rows = mt.empty_rows(table)
+    k = int(prods["k"][0])
+    launches = mk.level_launches(prods.ctypes.data, works.ctypes.data, rows.ctypes.data,
+                                 plan.reads.ctypes.data, plan.entries.ctypes.data,
+                                 starts.ctypes.data, plan, k, starts)
+    faulthandler.dump_traceback_later(300, exit=True)
+    try:
+        for args, blocks in launches:
+            lib.sim_launch(args, min(blocks, grid))  # fewer blocks: the grid stride runs
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    return rows
+
+
 @pytest.fixture(scope="module")
 def sim(sim_dir):
     @lru_cache(maxsize=None)
@@ -77,27 +106,7 @@ def sim(sim_dir):
         return build_sim(sim_dir, geometry)
 
     def run(mis, *, share=True, geometry=GEOMETRIES[0], grid=3):
-        """The rows of ``mis`` by the simulated kernel: the plan, its row-block starts and its
-        level launches as ``enqueue`` makes them, with host addresses."""
-        lib = lib_of(geometry)
-        table = pack(mis)
-        prods = np.frombuffer(table.array, dtype=mk.MPROD_DTYPE).copy()
-        scratch = np.zeros(mk.scratch_bytes(prods) + 8, dtype=np.uint8)
-        works = mk.works_array(prods, (scratch.ctypes.data + 7) & ~7)
-        plan = mk.read_plan(prods) if share else mk.plain_plan(prods)
-        starts = mk.block_starts(plan, geometry[0])
-        rows = mt.empty_rows(table)
-        k = int(prods["k"][0])
-        launches = mk.level_launches(prods.ctypes.data, works.ctypes.data, rows.ctypes.data,
-                                     plan.reads.ctypes.data, plan.entries.ctypes.data,
-                                     starts.ctypes.data, plan, k, starts)
-        faulthandler.dump_traceback_later(300, exit=True)
-        try:
-            for args, blocks in launches:
-                lib.sim_launch(args, min(blocks, grid))  # fewer blocks: the grid stride runs
-        finally:
-            faulthandler.cancel_dump_traceback_later()
-        return rows
+        return simulate(lib_of(geometry), mis, share=share, geometry=geometry, grid=grid)
 
     return run
 
@@ -222,3 +231,55 @@ def test_masked_columns_are_skipped_not_zero_filled(sim, host_measure):
     mi2 = MeasureInput(a, b, mi.p, mi.r, None, True)
     for geometry in GEOMETRIES:
         agree(sim([mi2], geometry=geometry), host_measure(pack([mi2])), str(geometry))
+
+
+# ---- NaN-filled shared memory and exact-size buffers ----
+
+def asan_runtime():
+    """The ASAN runtime library to preload into Python, or None where the compiler has none."""
+    probe = subprocess.run([CXX, "-fsanitize=address", "-x", "c++", "-", "-o", "/dev/null"],
+                           input="int main(){return 0;}", capture_output=True, text=True)
+    if probe.returncode != 0:
+        return None
+    for name in ("libclang_rt.asan_osx_dynamic.dylib", "libclang_rt.asan-aarch64.so",
+                 "libclang_rt.asan-x86_64.so", "libasan.so"):
+        out = subprocess.run([CXX, f"-print-file-name={name}"], capture_output=True,
+                             text=True).stdout.strip()
+        if out and Path(out).is_absolute() and Path(out).exists():
+            return out
+    return None
+
+
+ASAN_CHILD = """
+import sys, torch, numpy as np
+from pathlib import Path
+from tests.verification.verifier.matmul_check import test_measure_kernel_sim_host as T
+mis = torch.load(sys.argv[1], weights_only=False)
+lib = T.build_sim(Path(sys.argv[2]), T.GEOMETRIES[1], asan=True)
+rows = T.simulate(lib, mis, geometry=T.GEOMETRIES[1])
+np.save(sys.argv[3], rows)
+"""
+
+
+def test_the_kernel_reads_nothing_outside_its_buffers(host_measure, sim_dir, tmp_path):
+    """The simulator under ASAN, in a child Python with the sanitizer runtime preloaded: the
+    tables, scratch and rows are exact-size heap blocks, so any read or write past one aborts."""
+    runtime = asan_runtime()
+    if runtime is None:
+        pytest.skip("this compiler has no ASAN runtime")
+    mis = [shaped(n, q, w, 3, kind, biased=bool((n + q) % 2), seed=n)
+           for (n, q, w), kind in zip(SHAPES, ["row", "t"] * 4)]
+    mis += fwd_and_grad(torch.bfloat16, True, biased_beside=True)
+    src = tmp_path / "mis.pt"
+    torch.save(mis, src)
+    import os
+    import sys
+    env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0")
+    env["DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"] = runtime
+    out = tmp_path / "rows.npy"
+    proc = subprocess.run([sys.executable, "-c", ASAN_CHILD, str(src), str(tmp_path), str(out)],
+                          cwd=ROOT, env=env, capture_output=True, text=True, timeout=1500)
+    if "Interceptors are not working" in proc.stderr:
+        pytest.skip("the OS ignores the preloaded ASAN runtime (a hardened Python)")
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    agree(np.load(out), host_measure(pack(mis)), "asan")
