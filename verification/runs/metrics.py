@@ -2614,12 +2614,42 @@ def _dtype_name(dtype: Any) -> str | None:
     return None if dtype is None else str(dtype).removeprefix("torch.")
 
 
+def gpu_roles(device: str | torch.device,
+              verifier_devices: Sequence[str | torch.device] | None = None
+              ) -> list[dict[str, Any]] | None:
+    """The role of each CUDA device the run uses (the environment record's ``gpu_roles``), or
+    ``None`` when it names none. The prover's ``device`` comes first, then ``verifier_devices``
+    (``VERIF_VERIFIER_DEVICES``) in order; a device named twice is listed once, with both
+    roles. An unsharded run (``verifier_devices`` empty) verifies on its own device, so a CUDA
+    one is ``["prover", "verifier"]``. Name and UUID come from torch, so an entry joins the
+    machine record's ``gpus`` by ``index`` and ``uuid``."""
+    roles: dict[torch.device, list[str]] = {}
+    verifiers = tuple(verifier_devices or ())
+    for dev, role in ((device, "prover"), *((v, "verifier") for v in verifiers)):
+        d = normalize_devices([dev])[0]
+        if d.type == "cuda":
+            roles.setdefault(d, []).append(role)
+    if not verifiers:
+        for d in roles:
+            roles[d].append("verifier")
+    if not roles:
+        return None
+    out = []
+    for d, rs in roles.items():
+        uuid = getattr(torch.cuda.get_device_properties(d.index), "uuid", None)
+        out.append({"device": str(d), "index": d.index, "name": torch.cuda.get_device_name(d),
+                    "uuid": None if uuid is None else f"GPU-{uuid}", "roles": rs})
+    return out
+
+
 def environment_record(run: str, *, device: str | torch.device, probe: MemoryProbe,
                        config: Mapping[str, Any] | None = None, band_file_hash: str | None = None,
                        h_D: bytes | None = None, release_cache: bool | None = None,
                        **fields: Any) -> dict[str, Any]:
     """EQ13 record 5: hardware, library versions, git commit and the run's input hashes, and
-    the allocator's settings (:func:`allocator_settings`, ``release_cache`` as there)."""
+    the allocator's settings (:func:`allocator_settings`, ``release_cache`` as there).
+    ``gpu_roles`` (:func:`gpu_roles`) names each CUDA device's role; the verified entry points'
+    ``config`` holds ``verifier_devices``, where it reads the verifier layout from."""
     dev = torch.device(device)
     status = _git("status", "--porcelain")
     return {
@@ -2640,6 +2670,7 @@ def environment_record(run: str, *, device: str | torch.device, probe: MemoryPro
         "mem_source": probe.source, "MallocLargeCache": os.environ.get("MallocLargeCache"),
         **allocator_settings(release_cache),
         "machine": machine_facts(),
+        "gpu_roles": gpu_roles(dev, None if config is None else config.get("verifier_devices")),
         "compute_dtype": _dtype_name(None if config is None else config.get("compute_dtype")),
         "threads": torch.get_num_threads(), **fields,
     }
