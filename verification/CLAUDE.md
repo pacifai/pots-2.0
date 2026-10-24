@@ -3104,11 +3104,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `peer_check`, `models` and the native build included, unsets `VERIF_PIPELINED`), and records
     `step_times` (prover, verifier, hand-off, total per step, per arm) and `gpu_peak` (per
     part), outside `pass`. `pair_default_deadline_s()` is the job's default deadline.
-    The exit probe (`exit_probe`, kind `exit_probe`, not in `PAIR_PARTS`, so never in `pass`)
-    follows the fast suite: `run_exit_probe` runs each module of `EXIT_PROBE_MODULES` in its own
-    pytest process, then the whole list in one if none hung, writes `exit_probe.json` and the
-    job-log line `FS32 exit probe: N of M runs hung at exit: ...`. `_run_part` and the probe
-    share `watch_process`: a pytest part whose junit exists and which is still running
+    The exit probe is a tool, no longer a part of the plan (the hang's cause is known; the watch
+    catches a new one): `fs11_session exit-probe` runs each module of `EXIT_PROBE_MODULES` in its
+    own pytest process by hand, to find a module that hangs at exit, then the whole list in one
+    if none hung, writes `exit_probe.json` and prints `FS32 exit probe: N of M runs hung at
+    exit: ...` (`exit_probe_lines`). `_run_part` and the probe share `watch_process`: a pytest
+    part whose junit exists and which is still running
     `EXIT_HANG_GRACE_S` (180 s) later gets `parts/<name>/hang.txt` (a `/proc` snapshot),
     SIGUSR1 (stacks to `stacks.txt`) and a kill, and ends `exit_hang`, a failure like every status
     other than `ok` and `skipped_done`; `killed_timeout` and `killed_deadline` get the snapshot.
@@ -3211,7 +3212,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    21,200 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
+    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
     session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,
     packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch

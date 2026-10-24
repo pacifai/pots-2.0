@@ -115,8 +115,8 @@ A pytest part that wrote its junit report and has not exited :data:`EXIT_HANG_GR
 later has hung at exit: its ``/proc`` snapshot (``hang.txt``) is written, SIGUSR1 makes it dump
 every thread's stack into ``stacks.txt`` (``POTS_STACKS_FILE``), it is killed, and its status is
 ``exit_hang``, a failure like ``killed_timeout`` and ``killed_deadline``, which get the same
-snapshot first. In ``fs32-pair`` the exit probe (:func:`run_exit_probe`) follows the fast suite
-and names the test module that cannot exit; it never changes ``pass``.
+snapshot first. ``exit-probe`` (:func:`run_exit_probe`) is run by hand to find a module that
+hangs at exit: each test module in its own pytest process.
 ``summary.json`` is rewritten after each part.
 
 Before any part, ``run`` prints the environment (GPU, driver, CUDA, torch, free disk and RAM)
@@ -1050,7 +1050,7 @@ def device_leaves_gate(parts: Sequence[Mapping[str, Any]],
 # Time limits, seconds, of its parts; the fast suite's limit allows twice its estimated 25 min.
 PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "calibrate": 900,
                   "card": 900, "run": 900, "run_metrics": 1800, "cheat": 900,
-                  "fs34_tests": 900, "exit_probe": 5100}
+                  "fs34_tests": 900}
 # Estimates, minutes, scaled by hand (none was measured on two cards): the peer-copy byte check
 # 1 (two ordered pairs; its limit is 5), the models part 2-5, the
 # native build 1-2, the fast suite 13-25 on 10 vCPUs (the CUDA tests run on it for the first
@@ -1061,14 +1061,11 @@ PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "cal
 # pipelined run about 6, the one with metrics on about 12 (its memory pass and counting pass add
 # two more passes), the three pipelined cheats about 12 together. FS34's two-GPU join tests
 # (``fs34_tests``: a tiny sharded step, a run_loop and the kernel's first build on each card)
-# about 5, an estimate. The exit probe (:data:`EXIT_PROBE_MODULES`, 30 modules) about 42: its
-# modules' times in the fast suite on the pod sum to 14 min, run alone with about 25 s of start-up
-# each (13 min) and again all together (14 min, 1 min of start-up) if none hangs; its limit is
-# 85 min, and a run that hangs costs its 60 s grace.
+# about 5, an estimate.
 PAIR_ESTIMATE_MIN = {"peer_check": 1, "models": 5, "native_build": 2, "fast_suite": 25,
                      "two_gpu_slow": 10, "fs34_tests": 5, "calibrate": 5, "card": 6, "run": 12,
                      "cheat": 12, "run_pipelined": 6, "run_pipelined_metrics": 12,
-                     "cheat_pipelined": 12, "exit_probe": 42}
+                     "cheat_pipelined": 12}
 PAIR_PACK_MIN, PAIR_GRACE_MIN = 1, 20  # the job's packing and grace window, minutes
 PAIR_STEPS = 3
 PAIR_CARDS = 2  # the session refuses a machine with fewer CUDA devices
@@ -1095,20 +1092,6 @@ PAIR_SLOW_SELECT = "two_gpus or two_cuda_devices"
 
 
 FS34_TESTS_FILE = "tests/verification/runs/test_fs34_join_cuda.py"
-
-
-def _exit_probe_part(out: Path, timeout_s: float, output_dir: Path) -> Part:
-    """The exit probe (:func:`run_exit_probe`) as a part: it runs after the fast suite, in the
-    fast suite's environment (``output_dir`` its ``VERIF_OUTPUT_DIR``), writes one JSON report
-    and never counts toward ``pass`` (it is not in :data:`PAIR_PARTS`)."""
-    d = out / "parts" / EXIT_PROBE_NAME
-    return Part(EXIT_PROBE_NAME, ["{python}", "-m", "verification.runs.fs11_session",
-                                  "exit-probe", "--out", str(d), "--budget-s",
-                                  str(timeout_s - EXIT_PROBE_MIN_S)],
-                env={"VERIF_OUTPUT_DIR": str(output_dir), "VERIF_VERIFIER_DEVICES": None,
-                     "VERIF_PIPELINED": None},
-                timeout_s=timeout_s, kind="exit_probe",
-                info={"report": str(d / EXIT_PROBE_REPORT)})
 
 
 def _fs34_tests_part(out: Path, timeout_s: float, output_dir: Path) -> Part:
@@ -1201,7 +1184,6 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
     steps = ("--steps", str(PAIR_STEPS), "--keep-step", str(PAIR_STEPS), "--no-metrics")
     plan = [peer_check_part(out), _models_part(upload, out, t["models"]),
             pytest_part("fast_suite", t["fast_suite"]),
-            _exit_probe_part(out, t["exit_probe"], _run_dir(out, upload, key, "pytest")),
             pytest_part("two_gpu_slow", t["two_gpu_slow"], "-m", "slow", "-k", PAIR_SLOW_SELECT),
             _fs34_tests_part(out, t["fs34_tests"], _run_dir(out, upload, key, "pytest")),
             part("smollm2_calibrate", "calibrate", home, t["calibrate"],
@@ -1688,9 +1670,6 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _pytest_extras(Path(part.info["junit"]))
         if part.kind in ("device_tests", "fs34_tests"):
             return _device_tests_extras(Path(part.info["junit"]))
-        if part.kind == "exit_probe":
-            report = Path(part.info["report"])
-            return {"exit_probe": json.loads(report.read_text()) if report.exists() else None}
         if part.kind == "pair_run":
             return _pair_run_extras(log, Path(part.info["weights"]))
         if part.kind == "cheat":
@@ -2502,7 +2481,6 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
 
 # ---- the exit probe ---------------------------------------------------------------------
 
-EXIT_PROBE_NAME = "exit_probe"
 EXIT_PROBE_REPORT = "exit_probe.json"
 EXIT_PROBE_RUN_S = 900  # the limit of one run alone; the whole-list run gets what is left
 EXIT_PROBE_MIN_S = 120  # no run starts with less of the part's budget left than this
@@ -2706,9 +2684,6 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
         if part.info.get("gpu_peak"):
             rec["extras"]["gpu_peak_mib"] = _read_peaks(d / "gpu_peak.json")
         summary["parts"].append(rec)
-        if part.kind == "exit_probe" and rec["status"] not in ("not_started", "skipped_done"):
-            for line in exit_probe_lines((rec.get("extras") or {}).get("exit_probe")):
-                say(line)
         try:
             ab = fix2_ab(summary["parts"])
         except (ValueError, KeyError, TypeError, AttributeError) as e:
