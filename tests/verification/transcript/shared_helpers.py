@@ -89,10 +89,34 @@ def _warm_up(c, model, w, D, pi, dtree):
         torch.cuda.empty_cache()
 
 
+def _step(conn, c, model, w, D, pi, dtree, t, forged, holds, leaves_of):
+    """One step of the producer: prove, commit, hash, share and send it; returns the next
+    weights. Its own function so that its locals (the leaves, the tree, the proof, the
+    package) end at its return: the command loop's frame names none of a step's objects, and
+    after the loop only ``holds`` and ``leaves_of`` keep a step's leaves, as the prover's own
+    loop does (``pipeline.py`` deletes them every step). A name bound in the loop itself kept
+    step 2's leaves, 283,136 bytes on the one-GPU pair run, past both releases."""
+    idx = list(pi(t))
+    out = prove_step(c, model, w, [D[i] for i in idx])
+    paths = [dtree.path(i) for i in idx]
+    leaves, tree = InMemoryStore.commit_step(c, out)
+    if forged and t == 1:
+        i, obj = forge(forged)(c, leaves)
+        tree.update_leaf(i, leaf_hash(c, i, obj))
+        leaves[i] = obj
+    digests = hash_step_leaves(c, leaves)
+    assert MerkleTree(digests).root == tree.root
+    package, hold = share_step(c, t, leaves, tree, paths)
+    holds[t], leaves_of[t] = hold, leaves
+    conn.send((package, digests, tree.root, len(leaves)))
+    return out.w_next
+
+
 def producer(conn, devices, device, steps, forged=None, layers=None, strategy=None, alloc=None):
     import faulthandler
 
-    faulthandler.enable()
+    if not faulthandler.is_enabled():  # an in-process caller (a test) has its own
+        faulthandler.enable()
     configure(strategy, alloc)
     cuda = torch.device(device).type == "cuda"
     c, D, model, w = setup(devices, device, layers)
@@ -105,21 +129,7 @@ def producer(conn, devices, device, steps, forged=None, layers=None, strategy=No
                   if isinstance(x, torch.Tensor)) if hasattr(w, "values") else 0
     holds, leaves_of = {}, {}
     for t in range(1, steps + 1):
-        idx = list(pi(t))
-        out = prove_step(c, model, w, [D[i] for i in idx])
-        paths = [dtree.path(i) for i in idx]
-        leaves, tree = InMemoryStore.commit_step(c, out)
-        if forged and t == 1:
-            i, obj = forge(forged)(c, leaves)
-            tree.update_leaf(i, leaf_hash(c, i, obj))
-            leaves[i] = obj
-        w = out.w_next
-        digests = hash_step_leaves(c, leaves)
-        assert MerkleTree(digests).root == tree.root
-        package, hold = share_step(c, t, leaves, tree, paths)
-        holds[t], leaves_of[t] = hold, leaves
-        conn.send((package, digests, tree.root, len(leaves)))
-        del package, out
+        w = _step(conn, c, model, w, D, pi, dtree, t, forged, holds, leaves_of)
     while True:
         msg = conn.recv()
         if msg[0] == "quit":
