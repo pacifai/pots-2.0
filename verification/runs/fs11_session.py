@@ -111,6 +111,12 @@ Hugging Face token and no Runpod key in its environment. A part's log is
 ``parts/<name>/DONE`` is written when it succeeds, and a rerun into the same output directory
 skips it. A part that fails doesn't stop the others. A part still running at ``--deadline``
 (or past its own time limit) is killed, and the parts after it are recorded as not started.
+A pytest part that wrote its junit report and has not exited :data:`EXIT_HANG_GRACE_S` (180 s)
+later has hung at exit: its ``/proc`` snapshot (``hang.txt``) is written, SIGUSR1 makes it dump
+every thread's stack into ``stacks.txt`` (``POTS_STACKS_FILE``), it is killed, and its status is
+``exit_hang``, a failure like ``killed_timeout`` and ``killed_deadline``, which get the same
+snapshot first. In ``fs32-pair`` the exit probe (:func:`run_exit_probe`) follows the fast suite
+and names the test module that cannot exit; it never changes ``pass``.
 ``summary.json`` is rewritten after each part.
 
 Before any part, ``run`` prints the environment (GPU, driver, CUDA, torch, free disk and RAM)
@@ -1017,7 +1023,7 @@ def device_leaves_gate(parts: Sequence[Mapping[str, Any]],
 # Time limits, seconds, of its parts; the fast suite's limit allows twice its estimated 25 min.
 PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "calibrate": 900,
                   "card": 900, "run": 900, "run_metrics": 1800, "cheat": 900,
-                  "fs34_tests": 900}
+                  "fs34_tests": 900, "exit_probe": 5100}
 # Estimates, minutes, scaled by hand (none was measured on two cards): the peer-copy byte check
 # 1 (two ordered pairs; its limit is 5), the models part 2-5, the
 # native build 1-2, the fast suite 13-25 on 10 vCPUs (the CUDA tests run on it for the first
@@ -1028,11 +1034,14 @@ PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "cal
 # pipelined run about 6, the one with metrics on about 12 (its memory pass and counting pass add
 # two more passes), the three pipelined cheats about 12 together. FS34's two-GPU join tests
 # (``fs34_tests``: a tiny sharded step, a run_loop and the kernel's first build on each card)
-# about 5, an estimate.
+# about 5, an estimate. The exit probe (:data:`EXIT_PROBE_MODULES`, 30 modules) about 42: its
+# modules' times in the fast suite on the pod sum to 14 min, run alone with about 25 s of start-up
+# each (13 min) and again all together (14 min, 1 min of start-up) if none hangs; its limit is
+# 85 min, and a run that hangs costs its 60 s grace.
 PAIR_ESTIMATE_MIN = {"peer_check": 1, "models": 5, "native_build": 2, "fast_suite": 25,
                      "two_gpu_slow": 10, "fs34_tests": 5, "calibrate": 5, "card": 6, "run": 12,
                      "cheat": 12, "run_pipelined": 6, "run_pipelined_metrics": 12,
-                     "cheat_pipelined": 12}
+                     "cheat_pipelined": 12, "exit_probe": 42}
 PAIR_PACK_MIN, PAIR_GRACE_MIN = 1, 20  # the job's packing and grace window, minutes
 PAIR_STEPS = 3
 PAIR_CARDS = 2  # the session refuses a machine with fewer CUDA devices
@@ -1059,6 +1068,20 @@ PAIR_SLOW_SELECT = "two_gpus or two_cuda_devices"
 
 
 FS34_TESTS_FILE = "tests/verification/runs/test_fs34_join_cuda.py"
+
+
+def _exit_probe_part(out: Path, timeout_s: float, output_dir: Path) -> Part:
+    """The exit probe (:func:`run_exit_probe`) as a part: it runs after the fast suite, in the
+    fast suite's environment (``output_dir`` its ``VERIF_OUTPUT_DIR``), writes one JSON report
+    and never counts toward ``pass`` (it is not in :data:`PAIR_PARTS`)."""
+    d = out / "parts" / EXIT_PROBE_NAME
+    return Part(EXIT_PROBE_NAME, ["{python}", "-m", "verification.runs.fs11_session",
+                                  "exit-probe", "--out", str(d), "--budget-s",
+                                  str(timeout_s - EXIT_PROBE_MIN_S)],
+                env={"VERIF_OUTPUT_DIR": str(output_dir), "VERIF_VERIFIER_DEVICES": None,
+                     "VERIF_PIPELINED": None},
+                timeout_s=timeout_s, kind="exit_probe",
+                info={"report": str(d / EXIT_PROBE_REPORT)})
 
 
 def _fs34_tests_part(out: Path, timeout_s: float, output_dir: Path) -> Part:
@@ -1151,6 +1174,7 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
     steps = ("--steps", str(PAIR_STEPS), "--keep-step", str(PAIR_STEPS), "--no-metrics")
     plan = [peer_check_part(out), _models_part(upload, out, t["models"]),
             pytest_part("fast_suite", t["fast_suite"]),
+            _exit_probe_part(out, t["exit_probe"], _run_dir(out, upload, key, "pytest")),
             pytest_part("two_gpu_slow", t["two_gpu_slow"], "-m", "slow", "-k", PAIR_SLOW_SELECT),
             _fs34_tests_part(out, t["fs34_tests"], _run_dir(out, upload, key, "pytest")),
             part("smollm2_calibrate", "calibrate", home, t["calibrate"],
@@ -1637,6 +1661,9 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _pytest_extras(Path(part.info["junit"]))
         if part.kind in ("device_tests", "fs34_tests"):
             return _device_tests_extras(Path(part.info["junit"]))
+        if part.kind == "exit_probe":
+            report = Path(part.info["report"])
+            return {"exit_probe": json.loads(report.read_text()) if report.exists() else None}
         if part.kind == "pair_run":
             return _pair_run_extras(log, Path(part.info["weights"]))
         if part.kind == "cheat":
@@ -2253,13 +2280,151 @@ def _stop_sampler(handle: Any) -> None:
             pass
 
 
+EXIT_HANG_GRACE_S = 180  # a pytest part's process may outlive its junit report this long
+PROBE_HANG_GRACE_S = 60  # the same, for one run of the exit probe (:func:`run_exit_probe`)
+STACKS_WAIT_S = 5  # after SIGUSR1, the process gets this long to write its stacks
+STACKS_ENV = "POTS_STACKS_FILE"  # ``tests/exit_guard.py``: where a pytest process dumps stacks
+GRACE_ENV = "POTS_EXIT_GRACE_S"  # ``tests/exit_guard.py``: its watchdog's seconds after the run
+# The watchdog's grace under the session: the watch's own grace plus this, so the watch takes the
+# /proc snapshot (every native thread, the kernel's wait) while the process still hangs; the
+# watchdog's dump holds Python threads only and ends the process before the watch could look.
+GUARD_LAG_S = 120
+PROC = "/proc"  # where :func:`proc_snapshot` reads (a test points it at a fake tree)
+
+
+def _proc_text(path: str) -> str:
+    """A ``/proc`` file as one line of text, or ``<ErrorName: reason>`` (a container hides
+    some of them, ``stack`` and ``syscall`` among them)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return f"<{type(e).__name__}: {e.strerror or e}>"
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+
+
+def _stat_fields(path: str) -> tuple[str, str, str] | None:
+    """``(state, ppid, pgrp)`` from a ``/proc/.../stat`` file, or ``None``."""
+    text = _proc_text(path)
+    try:
+        rest = text[text.rindex(")") + 2:].split()
+        return rest[0], rest[1], rest[2]
+    except (ValueError, IndexError):
+        return None
+
+
+def proc_snapshot(pgid: int) -> str:
+    """Every process of process group ``pgid`` from ``/proc``: pid, parent, state and command
+    line; per thread its id, ``comm``, state, ``wchan``, and ``syscall`` and ``stack`` where
+    readable. Standard library only; every read is guarded, an unreadable one is recorded."""
+    lines = [f"snapshot {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} of process "
+             f"group {pgid}"]
+    try:
+        pids = sorted(int(n) for n in os.listdir(PROC) if n.isdigit())
+    except OSError as e:
+        return lines[0] + f"\nno {PROC}: {type(e).__name__}: {e}\n"
+    for pid in pids:
+        fields = _stat_fields(f"{PROC}/{pid}/stat")
+        if fields is None or fields[2] != str(pgid):
+            continue
+        lines.append(f"process {pid} ppid {fields[1]} state {fields[0]} cmdline "
+                     f"{_proc_text(f'{PROC}/{pid}/cmdline')[:400]}")
+        try:
+            tids = sorted(int(n) for n in os.listdir(f"{PROC}/{pid}/task") if n.isdigit())
+        except OSError as e:
+            lines.append(f"  threads unreadable: {type(e).__name__}: {e}")
+            continue
+        for tid in tids:
+            base = f"{PROC}/{pid}/task/{tid}"
+            tf = _stat_fields(f"{base}/stat")
+            lines.append(f"  thread {tid} comm {_proc_text(f'{base}/comm')} state "
+                         f"{tf[0] if tf else '?'} wchan {_proc_text(f'{base}/wchan')} "
+                         f"syscall {_proc_text(f'{base}/syscall')}")
+            stack = _proc_text(f"{base}/stack")
+            if stack:
+                lines.append(f"    stack {stack}")
+    return "\n".join(lines) + "\n"
+
+
+@dataclass
+class Watched:
+    """How :func:`watch_process` ended: ``status`` is ``ok`` or ``failed`` (the process
+    exited by itself, by its exit code), ``exit_hang`` (it outlived its junit report by the
+    grace and was killed) or ``limit`` (the time limit came, and the process was killed);
+    ``junit_to_exit_s`` is the time from the report to the end of the process, when there was
+    a report."""
+    status: str
+    rc: int | None
+    junit_to_exit_s: float | None
+
+
+def _mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def watch_process(proc: subprocess.Popen[bytes], *, t0: float, limit: float,
+                  junit: Path | None = None, grace_s: float = EXIT_HANG_GRACE_S,
+                  hang_file: Path | None = None, stacks: bool = False) -> Watched:
+    """Wait for ``proc`` (the leader of its own process group) until it exits, until ``limit``
+    (Unix time) or, with ``junit``, until ``grace_s`` after that file appears with an mtime
+    after ``t0``: a pytest process that wrote its report and does not exit is hung in its
+    teardown. A process that is still alive then is ended: its group's :func:`proc_snapshot`
+    goes to ``hang_file``, ``SIGUSR1`` asks the leader alone (a spawned child would die of it)
+    for every thread's stack (``stacks``: the process is a pytest run, whose
+    ``tests/exit_guard.py`` writes them to ``POTS_STACKS_FILE``), and after
+    :data:`STACKS_WAIT_S` the group is killed (:func:`_kill`). Both paths, the hang and the
+    limit, leave the same evidence. The one place the session and the exit probe watch a
+    process in; a caller kills the group itself when this raises."""
+    seen: float | None = None  # the report's mtime
+
+    def ended(status: str, rc: int | None) -> Watched:
+        return Watched(status, rc, None if seen is None else max(0.0, time.time() - seen))
+
+    def evidence() -> None:
+        if hang_file is not None:
+            try:
+                with open(hang_file, "a") as h:
+                    h.write(proc_snapshot(proc.pid))
+            except OSError:
+                pass
+        if stacks and hasattr(signal, "SIGUSR1") and proc.poll() is None:
+            try:
+                os.kill(proc.pid, signal.SIGUSR1)
+                proc.wait(timeout=STACKS_WAIT_S)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+
+    while True:
+        try:
+            rc = proc.wait(timeout=max(0.0, min(5.0, limit - time.time())))
+            return ended("ok" if rc == 0 else "failed", rc)
+        except subprocess.TimeoutExpired:
+            pass
+        if junit is not None and seen is None:
+            m = _mtime(junit)
+            if m is not None and m >= t0:
+                seen = m
+        hung = seen is not None and time.time() - seen >= grace_s
+        if hung or time.time() >= limit:
+            evidence()
+            _kill(proc)
+            return ended("exit_hang" if hung else "limit", proc.returncode)
+
+
 def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline: float,
               python: str, current: Path | None = None) -> tuple[str, int | None, float]:
     """Run one part to its end, its time limit or the deadline: (status, exit code, wall s).
 
     ``current``, while the part runs, holds its process group id, so ``fs11_job.sh`` can kill
     the part too when the session itself hangs. A sampler (:func:`_start_sampler`) writes the
-    part's ``samples.jsonl`` beside its log."""
+    part's ``samples.jsonl`` beside its log. A pytest part (``info["junit"]``) gets
+    ``POTS_STACKS_FILE=parts/<name>/stacks.txt``, and :func:`watch_process` ends it as
+    ``exit_hang`` when it outlives its junit report by :data:`EXIT_HANG_GRACE_S`; at that
+    kill and at a time-limit or deadline kill ``parts/<name>/hang.txt`` holds the process
+    snapshot, and, for a pytest part, ``stacks.txt`` every thread's stack."""
     argv = [python if a == "{python}" else a for a in part.argv]
     penv = dict(env)
     for k, v in part.env.items():
@@ -2267,6 +2432,10 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
             penv.pop(k, None)
         else:
             penv[k] = v
+    junit = Path(part.info["junit"]) if part.info.get("junit") else None
+    if junit is not None:
+        penv[STACKS_ENV] = str(log.parent / "stacks.txt")
+        penv[GRACE_ENV] = str(EXIT_HANG_GRACE_S + GUARD_LAG_S)
     t0 = time.time()
     limit = deadline if part.timeout_s is None else min(deadline, t0 + part.timeout_s)
     with open(log, "ab") as f:
@@ -2282,16 +2451,15 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
         sampler = _start_sampler(proc, log.parent / "samples.jsonl", cwd, python)
         peaks = _GpuPeaks(log.parent / "gpu_peak.json") if part.info.get("gpu_peak") else None
         try:
-            while True:
-                try:
-                    rc = proc.wait(timeout=max(0.0, min(5.0, limit - time.time())))
-                    return ("ok" if rc == 0 else "failed"), rc, time.time() - t0
-                except subprocess.TimeoutExpired:
-                    if time.time() >= limit:
-                        _kill(proc)
-                        why = "killed_deadline" if limit == deadline else "killed_timeout"
-                        f.write(f"\n[fs11] {why} after {time.time() - t0:.0f} s\n".encode())
-                        return why, proc.returncode, time.time() - t0
+            w = watch_process(proc, t0=t0, limit=limit, junit=junit, grace_s=EXIT_HANG_GRACE_S,
+                              hang_file=log.parent / "hang.txt", stacks=junit is not None)
+            status = ("killed_deadline" if limit == deadline else "killed_timeout"
+                      ) if w.status == "limit" else w.status
+            if w.status in ("limit", "exit_hang"):
+                what = ("hung at exit, " + f"{w.junit_to_exit_s:.0f} s after its junit report"
+                        if w.status == "exit_hang" else f"after {time.time() - t0:.0f} s")
+                f.write(f"\n[fs11] {status} {what}\n".encode())
+            return status, w.rc, time.time() - t0
         except BaseException:  # SIGTERM to the session (_Stop) or Ctrl-C: take the part down too
             _kill(proc)
             f.write(f"\n[fs11] killed: the session was stopped after {time.time() - t0:.0f} s\n"
@@ -2303,6 +2471,145 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
                 peaks.stop()
             if current is not None:
                 current.unlink(missing_ok=True)
+
+
+# ---- the exit probe ---------------------------------------------------------------------
+
+EXIT_PROBE_NAME = "exit_probe"
+EXIT_PROBE_REPORT = "exit_probe.json"
+EXIT_PROBE_RUN_S = 900  # the limit of one run alone; the whole-list run gets what is left
+EXIT_PROBE_MIN_S = 120  # no run starts with less of the part's budget left than this
+# The modules the exit probe runs, each alone and then all together (30). Chosen from evidence:
+# the fast suite's process hung after its summary on the 2026-10-23 two-A100 session; on one A40
+# the measuring-kernel session ran the last nine of these (and others) through the session's
+# pytest parts and each exited 2-3 s after its summary, as did the two-A100 ``fs34_tests`` and
+# ``two_gpu_slow`` parts. So the suspects come first: the two-device modules that run beside
+# those parts but not in them (``test_shared_cuda``, ``test_sharded_run_cuda``), then the modules
+# that start child processes (the pipelined loop, the shared transcript, FS33d's entry points,
+# the metrics and FS34 modules), then the other modules with CUDA tests or tests that skip on a
+# machine with fewer than two cards. The A40 modules close the list: they are the ones known to
+# exit on one card, so a hang there points at the second card.
+EXIT_PROBE_MODULES = (
+    "tests/verification/transcript/test_shared_cuda.py",
+    "tests/verification/runs/test_sharded_run_cuda.py",
+    "tests/verification/runs/test_pipelined_loop.py",
+    "tests/verification/runs/test_pipelined_loop_tester.py",
+    "tests/verification/transcript/test_shared.py",
+    "tests/verification/transcript/test_shared_tester.py",
+    "tests/verification/runs/test_fs34_join_cuda.py",
+    "tests/verification/runs/test_fs33d_entry_points.py",
+    "tests/verification/runs/test_fs33d_entry_points_tester.py",
+    "tests/verification/runs/test_metrics_devices.py",
+    "tests/verification/runs/test_metrics_devices_tester.py",
+    "tests/verification/commitment/test_fs34_routing.py",
+    "tests/verification/commitment/test_fs34_tester.py",
+    "tests/verification/runs/test_fs33_fix1.py",
+    "tests/verification/runs/test_fs33_fix2.py",
+    "tests/verification/runs/test_peer_check.py",
+    "tests/verification/commitment/test_hostcopy.py",
+    "tests/verification/commitment/test_leaves_native.py",
+    "tests/verification/computation/test_decoder_split_replay.py",
+    "tests/verification/prover/test_capture_routing.py",
+    "tests/verification/runs/test_device_leaves_session_tester.py",
+    "tests/verification/verifier/matmul_check/test_measure_kernel_cuda.py",
+    "tests/verification/verifier/test_kernel_step.py",
+    "tests/verification/prover/test_capture_cuda.py",
+    "tests/verification/verifier/test_check_devices.py",
+    "tests/verification/runs/test_loop.py",
+    "tests/verification/runs/test_pipelined_loop_cuda.py",
+    "tests/verification/runs/test_metrics_devices_cuda.py",
+    "tests/verification/runs/test_device_leaves_cuda.py",
+    "tests/verification/verifier/matmul_check/test_freivalds.py",
+)
+
+
+def run_exit_probe(out: Path, modules: Sequence[str], *, cwd: Path, python: str,
+                   budget_s: float, grace_s: float = PROBE_HANG_GRACE_S,
+                   run_limit_s: float = EXIT_PROBE_RUN_S,
+                   pytest_args: Sequence[str] = ("-rf", "-q"),
+                   say: Callable[[str], None] = _say) -> dict[str, Any]:
+    """Find what keeps a pytest process from exiting (the pair session's fast suite hung for
+    the rest of its time limit after its summary). Each of ``modules`` (test files, relative
+    to ``cwd``) runs alone in its own pytest process, one after another, each with its own
+    junit report, ``POTS_STACKS_FILE`` and :func:`watch_process` at ``grace_s``; if no module
+    hung alone, all of them run in one process last, to see whether the hang needs two of them
+    together. ``out/<run>/`` holds a run's ``junit.xml``, ``log.txt``, ``stacks.txt`` and, for a
+    hang, ``hang.txt``. ``out/exit_probe.json`` (written after every run) has, per run, the
+    modules, the tests, failures, errors and skips, the status (``ok``, ``failed`` when a test
+    or the process failed, ``exit_hang``, ``killed_timeout``), the seconds from the junit
+    report to the exit and the snapshot and stacks files. A diagnostic: a failed test in it is
+    reported, not judged. Returns the report. A run starts only while ``budget_s`` has at least
+    :data:`EXIT_PROBE_MIN_S` left; the rest are recorded as ``not_started``."""
+    t_start = time.time()
+    runs: list[dict[str, Any]] = []
+    report: dict[str, Any] = {"modules": list(modules), "runs": runs, "hung": [],
+                              "whole_list": False}
+
+    def one(name: str, mods: Sequence[str], cap_s: float | None) -> dict[str, Any]:
+        d = out / name
+        d.mkdir(parents=True, exist_ok=True)
+        junit = d / "junit.xml"
+        junit.unlink(missing_ok=True)
+        left = budget_s - (time.time() - t_start)
+        rec: dict[str, Any] = {"name": name, "modules": list(mods)}
+        if left < EXIT_PROBE_MIN_S:
+            return {**rec, "status": "not_started", "reason": "the part's budget was spent"}
+        t0 = time.time()
+        limit = t0 + (left if cap_s is None else min(left, cap_s)) - 5
+        env = {**os.environ, STACKS_ENV: str(d / "stacks.txt"),
+               GRACE_ENV: str(grace_s + GUARD_LAG_S)}
+        with open(d / "log.txt", "ab") as f:
+            proc = subprocess.Popen([python, "-m", "pytest", *pytest_args,
+                                     f"--junitxml={junit}", *mods], cwd=cwd, env=env,
+                                    stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                w = watch_process(proc, t0=t0, limit=limit, junit=junit, grace_s=grace_s,
+                                  hang_file=d / "hang.txt", stacks=True)
+            except BaseException:
+                _kill(proc)
+                raise
+        counts = _pytest_extras(junit)
+        return {**rec, "status": "killed_timeout" if w.status == "limit" else w.status,
+                "exit_code": w.rc, "wall_s": round(time.time() - t0, 1),
+                "tests": counts.get("tests"), "failures": counts.get("failures"),
+                "errors": counts.get("errors"), "skipped": counts.get("skipped"),
+                "junit_to_exit_s": None if w.junit_to_exit_s is None
+                else round(w.junit_to_exit_s, 1),
+                "snapshot": str(d / "hang.txt") if (d / "hang.txt").exists() else None,
+                "stacks": str(d / "stacks.txt") if (d / "stacks.txt").exists() else None,
+                "log": str(d / "log.txt")}
+
+    def record(rec: dict[str, Any]) -> None:
+        runs.append(rec)
+        report["hung"] = [r["name"] for r in runs if r["status"] == "exit_hang"]
+        _write_json(out / EXIT_PROBE_REPORT, report)
+        say(f"exit probe {rec['name']}: {rec['status']}"
+            + ("" if rec.get("tests") is None else f", {rec['tests']} tests"))
+
+    for mod in modules:
+        record(one(Path(mod).stem, [mod], run_limit_s))
+    if not report["hung"] and modules:
+        report["whole_list"] = True
+        record(one("whole_list", modules, None))
+    _write_json(out / EXIT_PROBE_REPORT, report)
+    return report
+
+
+def exit_probe_lines(report: Mapping[str, Any] | None) -> list[str]:
+    """The job log's lines for the probe's report: one per run that hung at exit, then the
+    summary line (``none hung`` when none did). A run that was not started is not counted."""
+    if not report:
+        return ["FS32 exit probe: left no report"]
+    ran = [r for r in report.get("runs", []) if r.get("status") != "not_started"]
+    hung = [r for r in ran if r.get("status") == "exit_hang"]
+    lines = [f"FS32 exit probe: {r['name']} ({', '.join(r['modules'])}) hung at exit, "
+             f"{r.get('junit_to_exit_s')} s after its junit report; snapshot {r.get('snapshot')}, "
+             f"stacks {r.get('stacks')}" for r in hung]
+    skipped = len(report.get("runs", [])) - len(ran)
+    tail = f" ({skipped} not started)" if skipped else ""
+    lines.append(f"FS32 exit probe: {len(hung)} of {len(ran)} runs hung at exit: "
+                 + (", ".join(r["name"] for r in hung) if hung else "none hung") + tail)
+    return lines
 
 
 def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: float, cwd: Path,
@@ -2372,6 +2679,9 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
         if part.info.get("gpu_peak"):
             rec["extras"]["gpu_peak_mib"] = _read_peaks(d / "gpu_peak.json")
         summary["parts"].append(rec)
+        if part.kind == "exit_probe" and rec["status"] not in ("not_started", "skipped_done"):
+            for line in exit_probe_lines((rec.get("extras") or {}).get("exit_probe")):
+                say(line)
         try:
             ab = fix2_ab(summary["parts"])
         except (ValueError, KeyError, TypeError, AttributeError) as e:
@@ -2605,6 +2915,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "(kernel-speed), the two-GPU sharded run's (fs32-pair) or FS30's "
                         "device-leaves check (device-leaves); --plan and --selftest "
                         "replace its parts")
+    x = sub.add_parser("exit-probe", help="run each test module in its own pytest process "
+                                          "and report which one cannot exit")
+    x.add_argument("--out", type=Path, required=True)
+    x.add_argument("--budget-s", type=float, required=True,
+                   help="seconds in all; a run starts only with some of them left")
+    x.add_argument("--modules", nargs="+", default=list(EXIT_PROBE_MODULES),
+                   help="test files, relative to the working directory")
     f = sub.add_parser("fetch-models", help="check the upload, fetch the public weights")
     f.add_argument("--upload", type=Path, required=True)
     f.add_argument("--out", type=Path, required=True)
@@ -2613,6 +2930,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = p.parse_args(argv)
     if args.cmd == "fetch-models":
         return fetch_models(args.upload.resolve(), args.out)
+    if args.cmd == "exit-probe":
+        signal.signal(signal.SIGTERM, _on_term)
+        try:
+            run_exit_probe(args.out.resolve(), args.modules, cwd=Path.cwd(),
+                           python=sys.executable, budget_s=args.budget_s)
+        except _Stop:
+            return 1
+        return 0
     out = args.out.resolve()
     selftest = args.cmd == "run" and args.selftest
     pairing = False

@@ -54,9 +54,9 @@ def test_two_gpus_rows_of_layers_sit_on_different_devices_and_one_window_spans_t
     seen = []
     real = checks._judge_window
 
-    def spy(c, batch, ctx, bands):
+    def spy(c, batch, ctx, bands, *rest, **kw):
         seen.append([checks._rows_device(r.rows) for r in batch if r.rows is not None])
-        return real(c, batch, ctx, bands)
+        return real(c, batch, ctx, bands, *rest, **kw)
 
     monkeypatch.setattr(checks, "_judge_window", spy)
     c, res, _, _ = sr.run(DEVICES, device=PROVER, layers=2 * len(DEVICES))

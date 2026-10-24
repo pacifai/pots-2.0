@@ -269,3 +269,50 @@ def test_package_counts_match_the_table():
     leaves = H.synthetic_leaves()
     _, pkg, _ = _share(leaves)
     assert (pkg.n_leaves, pkg.n_storages) == (8, 4)
+
+
+def test_the_producers_frame_keeps_no_step_after_both_releases(monkeypatch):
+    """The one-GPU pair run found 283,136 bytes "kept" after both steps were released: the
+    producer's loop bound ``leaves`` per step, so its frame, alive in the command loop, still
+    named step 2's. Run the producer in this process on a scripted pipe: share_step and
+    prove_step are wrapped to hold weakrefs to every leaf tensor, both steps are released as
+    the command loop does, and at the loop's next read (its frame as the test sees it after the
+    releases) every leaf tensor that is not the live weights' own must be dead."""
+    import gc
+    import weakref
+
+    refs, live_w = [], set()
+    real_share, real_prove = H.share_step, H.prove_step
+
+    def share(c, t, leaves, tree, paths):
+        refs.extend(weakref.ref(x) for x in leaves if isinstance(x, torch.Tensor))
+        return real_share(c, t, leaves, tree, paths)
+
+    def prove(*a, **k):
+        out = real_prove(*a, **k)
+        live_w.clear()
+        live_w.update(id(x) for x in out.w_next.values())
+        return out
+
+    monkeypatch.setattr(H, "share_step", share)
+    monkeypatch.setattr(H, "prove_step", prove)
+    left = {}
+
+    class Pipe:
+        def __init__(self):
+            self.script = [("release", 1), ("release", 2), ("check",)]
+
+        def send(self, x):
+            pass
+
+        def recv(self):
+            msg = self.script.pop(0)
+            if msg[0] == "check":
+                gc.collect()
+                left["alive"] = [r() for r in refs if r() is not None and id(r()) not in live_w]
+                return ("quit",)
+            return msg
+
+    H.producer(Pipe(), None, "cpu", 2)
+    assert len(refs) > 0
+    assert left["alive"] == [], f"{len(left['alive'])} leaf tensors outlive both releases"
