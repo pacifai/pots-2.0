@@ -1,14 +1,28 @@
 """The sampler: a separate process that reads the machine every 100 ms beside a session part.
 
-    .venv/bin/python -m setup.sampler --pid PID --out PATH [--interval 0.1] [--gpu 0]
-    .venv/bin/python -m setup.sampler --out PATH [--interval 0.1] [--gpu 0] --wrap -- CMD ...
+    .venv/bin/python -m setup.sampler --pid PID --out PATH [--interval 0.1] [--gpus 0,1]
+    .venv/bin/python -m setup.sampler --out PATH [--interval 0.1] [--gpus 0,1] --wrap -- CMD ...
     .venv/bin/python -m setup.sampler ... --no-gpu    # process and machine fields only, no NVML
 
-``samples.jsonl`` (archive/PROFILING_PLAN §5.4) opens with one header line, then one flat line per
+Every NVML GPU is sampled unless ``--gpus`` lists some; ``--gpu N`` is ``--gpus N``.
+
+``samples.jsonl`` (archive/PROFILING_PLAN §5.4, version 1; the version 2 below, FS35, is the
+one written now) opens with one header line, then one flat line per
 sample. A field that can't be read is ``null``, and a rate is the change since the previous
 sample's ``t`` (monotonic ns). Every utilisation field is a fraction (NVML's percent ÷ 100,
 the GPM fields as they come), PCIe is bytes/s. A group that fails is logged once as a ``{"kind": "error"}``
 line (the header holds the start-up failures in ``errors``) and reads ``null`` from then on.
+
+**Version 2 (FS35).** The header's ``gpu`` is replaced by ``gpus``: one ``{"index", "name",
+"uuid", "pci_bus_id"}`` per sampled GPU, in the order sampled (NVML's, or the ``--gpus`` list's);
+``None`` with ``--no-gpu`` or without NVML. A GPU field (``g_*``) of a row is a list, one value per
+header GPU in that order, ``null`` in the slot of a value that couldn't be read; with no GPU
+reader the field is ``null``. Process and machine fields are scalars as before. Each GPU has its
+own handle, GPM buffers and fallback state, and its own error groups: with more than one GPU
+each group carries the NVML index (``g_util[2]``, ``gpu_name[2]``), logged once each.
+``g_other_procs`` counts per GPU the processes outside the sampled tree. The header's ``gpm`` is
+true when every GPU uses GPM, ``gpm_error`` is the first failing GPU's, and ``pcie_source`` is the
+GPUs' common source (``"mixed"`` when they differ).
 
 Only the standard library at import; ``psutil`` and ``pynvml`` load when the sampler starts.
 The loop paces to a deadline, flushes after every line and ends on SIGTERM or when the root
@@ -26,13 +40,13 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import IO, Any
 
 __all__ = ["FIELDS", "Handle", "run", "start_sampler", "main"]
 
-VERSION = 1
+VERSION = 2
 FIELDS = [
     "t", "g_util", "g_mem_util", "g_mem_used", "g_sm_mhz", "g_mem_mhz", "g_power_w", "g_temp_c",
     "g_throttle", "g_pcie_tx", "g_pcie_rx", "g_other_procs",
@@ -46,6 +60,7 @@ FIELDS = [
 STOP_GRACE_S = 5.0
 TREE_REFRESH_S = 1.0
 GPM_FALLBACK_S = 5.0
+GPU_FIELDS = [f for f in FIELDS if f.startswith("g_")]
 MIB = 1 << 20
 _CG = Path("/sys/fs/cgroup")
 # GPM metric name -> (field, scale to the field's unit); the ids are pynvml's NVML_GPM_METRIC_*.
@@ -148,15 +163,31 @@ _TREE: dict[str, tuple[tuple[str, ...], Callable[[Any], tuple[float, ...]]]] = {
 _LEVELS = ("rss", "threads")
 
 
+class _Gpu:
+    """One sampled GPU: its NVML handle, GPM buffers and fallback state."""
+
+    def __init__(self, index: int, tag: str) -> None:
+        self.index, self.tag = index, tag  # tag: the suffix of this GPU's error groups
+        self.handle: Any = None
+        self.gpm: dict[str, Any] | None = None
+        self.gpm_error: str | None = None
+        self.gpm_t0 = 0
+        self.gpm_ok = False
+        self.pcie_source: str | None = None
+        self.info: dict[str, Any] = {"index": index, "name": None, "uuid": None,
+                                     "pci_bus_id": None}
+
+
 class _Sampler:
-    def __init__(self, pid: int, out: IO[str], interval: float, gpu: int, psutil: Any) -> None:
-        self.ps, self.out, self.interval, self.gpu = psutil, out, interval, gpu
+    def __init__(self, pid: int, out: IO[str], interval: float,
+                 gpus: Sequence[int] | int | None, psutil: Any) -> None:
+        """``gpus``: the NVML indices to sample, one index, or ``None`` for every GPU."""
+        self.ps, self.out, self.interval = psutil, out, interval
+        self.gpu_arg = [gpus] if isinstance(gpus, int) else None if gpus is None else list(gpus)
         self.root = psutil.Process(pid)
         self.me = psutil.Process()
         self.cg = _cgroup_dir()
         self.procs: dict[int, Any] = {}
-        self.gpm_t0 = 0
-        self.gpm_ok = False
         self.tree_at = float("-inf")
         self.prev: dict[Any, float] = {}
         self.t_prev = time.monotonic_ns()
@@ -168,11 +199,7 @@ class _Sampler:
         self.started = False
         self.no_gpu = False  # set by ``run``: leave NVML alone, the GPU fields read null
         self.nv: Any = None
-        self.handle: Any = None
-        self.gpm: dict[str, Any] | None = None
-        self.gpm_error: str | None = None
-        self.pcie_source: str | None = None
-        self.gpu_info: dict[str, Any] = {"index": gpu, "name": None, "uuid": None}
+        self.gpus: list[_Gpu] = []
 
     # -- failures ---------------------------------------------------------------------------
 
@@ -208,57 +235,79 @@ class _Sampler:
             self.errors.append({"group": "nvml", "error": f"{type(e).__name__}: {e}"})
             return
         self.nv = nv
-        self.handle = self._try("nvml_handle", lambda: nv.nvmlDeviceGetHandleByIndex(self.gpu))
-        if self.handle is None:
+        indices = self.gpu_arg
+        if indices is None:
+            count = self._try("nvml_count", nv.nvmlDeviceGetCount)
+            indices = [] if count is None else list(range(count))
+        multi = len(indices) > 1
+        self.gpus = [_Gpu(i, f"[{i}]" if multi else "") for i in indices]
+        for g in self.gpus:
+            self._init_one(g)
+
+    def _init_one(self, g: _Gpu) -> None:
+        nv = self.nv
+        g.handle = self._try("nvml_handle" + g.tag, lambda: nv.nvmlDeviceGetHandleByIndex(g.index))
+        if g.handle is None:
             return
 
         def text(v: Any) -> str:
             return v.decode() if isinstance(v, bytes) else str(v)
 
-        self.gpu_info["name"] = self._try("gpu_name",
-                                          lambda: text(nv.nvmlDeviceGetName(self.handle)))
-        self.gpu_info["uuid"] = self._try("gpu_uuid",
-                                          lambda: text(nv.nvmlDeviceGetUUID(self.handle)))
-        self._init_gpm()
-        if self.gpm is not None:
-            self.pcie_source = "gpm"
-        elif self._try("pcie", lambda: nv.nvmlDeviceGetPcieThroughput(
-                self.handle, nv.NVML_PCIE_UTIL_TX_BYTES)) is not None:
-            self.pcie_source = "nvml"
+        g.info["name"] = self._try("gpu_name" + g.tag,
+                                   lambda: text(nv.nvmlDeviceGetName(g.handle)))
+        g.info["uuid"] = self._try("gpu_uuid" + g.tag,
+                                   lambda: text(nv.nvmlDeviceGetUUID(g.handle)))
+        g.info["pci_bus_id"] = self._try("gpu_pci" + g.tag,
+                                         lambda: text(nv.nvmlDeviceGetPciInfo(g.handle).busId))
+        self._init_gpm(g)
+        if g.gpm is not None:
+            g.pcie_source = "gpm"
+        elif self._try("pcie" + g.tag, lambda: nv.nvmlDeviceGetPcieThroughput(
+                g.handle, nv.NVML_PCIE_UTIL_TX_BYTES)) is not None:
+            g.pcie_source = "nvml"
 
-    def _init_gpm(self) -> None:
+    def _init_gpm(self, g: _Gpu) -> None:
         nv = self.nv
         try:
-            if not nv.nvmlGpmQueryDeviceSupport(self.handle).isSupportedDevice:
-                self.gpm_error = "nvmlGpmQueryDeviceSupport: the device doesn't support GPM"
+            if not nv.nvmlGpmQueryDeviceSupport(g.handle).isSupportedDevice:
+                g.gpm_error = "nvmlGpmQueryDeviceSupport: the device doesn't support GPM"
                 return
             ids = {name: getattr(nv, f"NVML_GPM_METRIC_{name}")
                    for name in (*_GPM_FIELDS, *_GPM_PCIE)}
-            self.gpm = {"ids": ids, "bufs": [nv.nvmlGpmSampleAlloc(), nv.nvmlGpmSampleAlloc()],
-                        "n": 0}
-            nv.nvmlGpmSampleGet(self.handle, self.gpm["bufs"][0])
-            self.gpm_t0 = time.monotonic_ns()
+            g.gpm = {"ids": ids, "bufs": [nv.nvmlGpmSampleAlloc(), nv.nvmlGpmSampleAlloc()],
+                     "n": 0}
+            nv.nvmlGpmSampleGet(g.handle, g.gpm["bufs"][0])
+            g.gpm_t0 = time.monotonic_ns()
         except Exception as e:  # noqa: BLE001
-            self.gpm_error = f"{type(e).__name__}: {e}"
-            self.gpm = None
+            g.gpm_error = f"{type(e).__name__}: {e}"
+            g.gpm = None
 
     def header(self) -> dict[str, Any]:
         ps = self.ps
+        live = any(g.handle is not None for g in self.gpus)
+        sources = {g.pcie_source for g in self.gpus if g.handle is not None}
         return {
             "kind": "header", "version": VERSION, "pid": self.root.pid,
             "interval_s": self.interval, "mono_ns": time.monotonic_ns(),
             "wall_unix_s": time.time(), "host": socket.gethostname(),
-            "gpu": self.gpu_info if self.handle is not None else None,
-            "nvml": self.handle is not None, "gpm": self.gpm is not None,
-            "gpm_error": (self.gpm_error if self.nv is not None else
+            "gpus": [g.info for g in self.gpus] if live else None,
+            "nvml": live, "gpm": live and all(g.gpm is not None for g in self.gpus),
+            "gpm_error": (self._gpm_error() if self.nv is not None else
                           "the GPU reader is off (--no-gpu)" if self.no_gpu
                           else "NVML isn't available"),
-            "pcie_source": self.pcie_source,
+            "pcie_source": sources.pop() if len(sources) == 1 else "mixed" if sources else None,
             "cpu_logical": self._try("cpu_count", lambda: ps.cpu_count()),
             "cpu_physical": self._try("cpu_count", lambda: ps.cpu_count(logical=False)),
             "cgroup": self._try("cgroup", lambda: _cgroup_limits(self.cg)) or {"cpu_quota": None, "mem_limit": None},
             "errors": self.errors, "fields": FIELDS,
         }
+
+    def _gpm_error(self) -> str | None:
+        """The first GPU's GPM failure (named by its index when several are sampled)."""
+        for g in self.gpus:
+            if g.gpm_error is not None:
+                return g.gpm_error if len(self.gpus) == 1 else f"GPU {g.index}: {g.gpm_error}"
+        return None
 
     # -- readers ----------------------------------------------------------------------------
 
@@ -367,59 +416,72 @@ class _Sampler:
             row["c_other"] = row["c_busy"] - row["c_tree"]
 
     def _gpu(self, row: dict[str, Any]) -> None:
-        nv, h = self.nv, self.handle
-        if nv is None or h is None:
+        """Every GPU's fields: a list per ``g_*`` field, one slot per GPU, ``None`` where a
+        value couldn't be read (or the GPU has no handle)."""
+        if self.nv is None or not self.gpus:
             return
-        u = self._try("g_util", lambda: nv.nvmlDeviceGetUtilizationRates(h))
+        for f in GPU_FIELDS:
+            row[f] = [None] * len(self.gpus)
+        for pos, g in enumerate(self.gpus):
+            if g.handle is None:
+                continue
+            part: dict[str, Any] = dict.fromkeys(GPU_FIELDS)
+            self._gpu_one(g, part)
+            for f in GPU_FIELDS:
+                row[f][pos] = part[f]
+
+    def _gpu_one(self, g: _Gpu, row: dict[str, Any]) -> None:
+        nv, h, t = self.nv, g.handle, g.tag
+        u = self._try("g_util" + t, lambda: nv.nvmlDeviceGetUtilizationRates(h))
         if u is not None:
             row["g_util"], row["g_mem_util"] = u.gpu / 100, u.memory / 100
-        mem = self._try("g_mem_used", lambda: nv.nvmlDeviceGetMemoryInfo(h))
+        mem = self._try("g_mem_used" + t, lambda: nv.nvmlDeviceGetMemoryInfo(h))
         row["g_mem_used"] = None if mem is None else mem.used
-        row["g_sm_mhz"] = self._try("g_sm_mhz", lambda: nv.nvmlDeviceGetClockInfo(
+        row["g_sm_mhz"] = self._try("g_sm_mhz" + t, lambda: nv.nvmlDeviceGetClockInfo(
             h, nv.NVML_CLOCK_SM))
-        row["g_mem_mhz"] = self._try("g_mem_mhz", lambda: nv.nvmlDeviceGetClockInfo(
+        row["g_mem_mhz"] = self._try("g_mem_mhz" + t, lambda: nv.nvmlDeviceGetClockInfo(
             h, nv.NVML_CLOCK_MEM))
-        mw = self._try("g_power_w", lambda: nv.nvmlDeviceGetPowerUsage(h))
+        mw = self._try("g_power_w" + t, lambda: nv.nvmlDeviceGetPowerUsage(h))
         row["g_power_w"] = None if mw is None else mw / 1000
-        row["g_temp_c"] = self._try("g_temp_c", lambda: nv.nvmlDeviceGetTemperature(
+        row["g_temp_c"] = self._try("g_temp_c" + t, lambda: nv.nvmlDeviceGetTemperature(
             h, nv.NVML_TEMPERATURE_GPU))
         reasons = getattr(nv, "nvmlDeviceGetCurrentClocksEventReasons", None) \
             or getattr(nv, "nvmlDeviceGetCurrentClocksThrottleReasons", None)
-        row["g_throttle"] = self._try("g_throttle", lambda: reasons(h))
-        if self.pcie_source == "nvml":
+        row["g_throttle"] = self._try("g_throttle" + t, lambda: reasons(h))
+        if g.pcie_source == "nvml":
             def pcie(counter: int) -> float:
                 return nv.nvmlDeviceGetPcieThroughput(h, counter) * 1024
-            row["g_pcie_tx"] = self._try("pcie", lambda: pcie(nv.NVML_PCIE_UTIL_TX_BYTES))
-            row["g_pcie_rx"] = self._try("pcie", lambda: pcie(nv.NVML_PCIE_UTIL_RX_BYTES))
-        procs = self._try("g_other_procs", lambda: nv.nvmlDeviceGetComputeRunningProcesses(h))
+            row["g_pcie_tx"] = self._try("pcie" + t, lambda: pcie(nv.NVML_PCIE_UTIL_TX_BYTES))
+            row["g_pcie_rx"] = self._try("pcie" + t, lambda: pcie(nv.NVML_PCIE_UTIL_RX_BYTES))
+        procs = self._try("g_other_procs" + t, lambda: nv.nvmlDeviceGetComputeRunningProcesses(h))
         if procs is not None:
             if procs and not any(self.ps.pid_exists(p.pid) for p in procs):
-                self._log("g_other_procs", "the GPU's process ids don't resolve here "
+                self._log("g_other_procs" + t, "the GPU's process ids don't resolve here "
                           "(another pid namespace), so the count would be wrong")
             else:
                 row["g_other_procs"] = sum(1 for p in procs if p.pid not in self.procs)
-        if self.gpm is not None:
-            ok = self._try("gpm", lambda: self._gpm(row))
-            self.gpm_ok = self.gpm_ok or bool(ok)
-            if not self.gpm_ok and time.monotonic_ns() - self.gpm_t0 >= GPM_FALLBACK_S * 1e9:
-                self.gpm, self.pcie_source = None, "nvml"
-                self._log("gpm_fallback", f"GPM gave no reading in {GPM_FALLBACK_S:g} s; PCIe "
-                          "now comes from nvmlDeviceGetPcieThroughput")
+        if g.gpm is not None:
+            ok = self._try("gpm" + t, lambda: self._gpm(g, row))
+            g.gpm_ok = g.gpm_ok or bool(ok)
+            if not g.gpm_ok and time.monotonic_ns() - g.gpm_t0 >= GPM_FALLBACK_S * 1e9:
+                g.gpm, g.pcie_source = None, "nvml"
+                self._log("gpm_fallback" + t, f"GPM gave no reading in {GPM_FALLBACK_S:g} s; "
+                          "PCIe now comes from nvmlDeviceGetPcieThroughput")
 
-    def _gpm(self, row: dict[str, Any]) -> bool:
-        """One GPM reading into ``row``; a metric that failed stays ``None``. True when any
-        metric answered."""
-        nv, g = self.nv, self.gpm
-        old, new = g["bufs"][g["n"] % 2], g["bufs"][(g["n"] + 1) % 2]
-        nv.nvmlGpmSampleGet(self.handle, new)
-        g["n"] += 1
-        names = list(g["ids"])
+    def _gpm(self, g: _Gpu, row: dict[str, Any]) -> bool:
+        """One GPM reading of ``g`` into ``row``; a metric that failed stays ``None``. True
+        when any metric answered."""
+        nv, gm = self.nv, g.gpm
+        old, new = gm["bufs"][gm["n"] % 2], gm["bufs"][(gm["n"] + 1) % 2]
+        nv.nvmlGpmSampleGet(g.handle, new)
+        gm["n"] += 1
+        names = list(gm["ids"])
         q = nv.c_nvmlGpmMetricsGet_t()
         q.version = nv.NVML_GPM_METRICS_GET_VERSION
         q.numMetrics = len(names)
         q.sample1, q.sample2 = old, new
         for i, name in enumerate(names):
-            q.metrics[i].metricId = g["ids"][name]
+            q.metrics[i].metricId = gm["ids"][name]
         nv.nvmlGpmMetricsGet(q)
         ok = False
         for i, name in enumerate(names):
@@ -446,9 +508,10 @@ class _Sampler:
         if self.nv is None:
             return
         try:
-            if self.gpm is not None:
-                for b in self.gpm["bufs"]:
-                    self.nv.nvmlGpmSampleFree(b)
+            for g in self.gpus:
+                if g.gpm is not None:
+                    for b in g.gpm["bufs"]:
+                        self.nv.nvmlGpmSampleFree(b)
             self.nv.nvmlShutdown()
         except Exception:  # noqa: BLE001
             pass
@@ -461,13 +524,14 @@ def _root_alive(psutil: Any, root: Any) -> bool:
         return False
 
 
-def run(pid: int, out: Path, interval: float = 0.1, gpu: int = 0,
+def run(pid: int, out: Path, interval: float = 0.1, gpus: Sequence[int] | int | None = None,
         stop: threading.Event | None = None,
         alive: Callable[[], bool] | None = None, no_gpu: bool = False) -> int:
     """Sample ``pid``'s tree and the machine to ``out`` until ``stop`` is set, ``alive()`` is
     false or the root process is gone. Returns 0, or 1 when the file can't be opened. Without
     ``psutil`` the file holds the header and its error only. ``no_gpu`` never starts NVML: the
-    header reads ``"nvml": false`` and every GPU field ``null``, on a GPU host too."""
+    header reads ``"nvml": false`` and every GPU field ``null``, on a GPU host too. ``gpus``
+    names the NVML indices to sample (one index or a list); ``None`` samples every GPU."""
     stop = stop or threading.Event()
     try:
         f = open(out, "w")
@@ -477,7 +541,7 @@ def run(pid: int, out: Path, interval: float = 0.1, gpu: int = 0,
     with f:
         try:
             import psutil
-            s = _Sampler(pid, f, interval, gpu, psutil)
+            s = _Sampler(pid, f, interval, gpus, psutil)
         except Exception as e:  # noqa: BLE001 (no psutil, or the root is already gone)
             f.write(json.dumps({"kind": "header", "version": VERSION, "pid": pid,
                                 "interval_s": interval, "mono_ns": time.monotonic_ns(),
@@ -548,12 +612,15 @@ class Handle:
                 return
 
 
-def start_sampler(pid: int, out: Path | str, interval: float = 0.1, *, gpu: int = 0,
-                  cwd: Path | str | None = None, python: str = sys.executable) -> Handle:
+def start_sampler(pid: int, out: Path | str, interval: float = 0.1, *,
+                  gpus: Sequence[int] | int | None = None, cwd: Path | str | None = None, python: str = sys.executable) -> Handle:
     """Start the sampler on ``pid`` in its own session, so a process-group kill of the run
-    doesn't reach it. It ends itself when ``pid`` is gone."""
+    doesn't reach it. It ends itself when ``pid`` is gone. ``gpus`` (an index or a list) limits
+    the NVML GPUs sampled; the default is every one."""
     argv = [python, "-m", "setup.sampler", "--pid", str(pid), "--out", str(out),
-            "--interval", str(interval), "--gpu", str(gpu)]
+            "--interval", str(interval)]
+    if gpus is not None:
+        argv += ["--gpus", ",".join(map(str, [gpus] if isinstance(gpus, int) else gpus))]
     proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True)
     return Handle(proc, Path(out))
@@ -569,10 +636,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pid", type=int)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--interval", type=float, default=0.1)
-    ap.add_argument("--gpu", type=int, default=0)
+    ap.add_argument("--gpus", default=None,
+                    help="comma-separated NVML indices to sample (default: every GPU)")
+    ap.add_argument("--gpu", type=int, default=None, help="one GPU: the same as --gpus N")
     ap.add_argument("--no-gpu", action="store_true", help="don't start NVML: no GPU fields")
     ap.add_argument("--wrap", action="store_true", help="start CMD (after --) and sample it")
     a = ap.parse_args(argv)
+    try:
+        gpus = [int(x) for x in a.gpus.split(",")] if a.gpus else \
+            None if a.gpu is None else [a.gpu]
+    except ValueError:
+        ap.error("--gpus takes comma-separated integers, e.g. 0,1")
     if a.wrap == (a.pid is not None) or (a.wrap and not cmd) or a.interval <= 0:
         ap.error("give --pid, or --wrap -- CMD ...; the interval must be positive")
     stop = threading.Event()
@@ -587,9 +661,9 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, on_term)
     pid = child.pid if child is not None else a.pid
     if child is None:
-        return run(pid, a.out, a.interval, a.gpu, stop, no_gpu=a.no_gpu)
+        return run(pid, a.out, a.interval, gpus, stop, no_gpu=a.no_gpu)
     try:
-        rc = run(pid, a.out, a.interval, a.gpu, stop, alive=lambda: child.poll() is None,
+        rc = run(pid, a.out, a.interval, gpus, stop, alive=lambda: child.poll() is None,
                  no_gpu=a.no_gpu)
     finally:
         _reap(child)

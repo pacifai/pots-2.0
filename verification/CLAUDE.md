@@ -119,7 +119,12 @@ All start with `VERIF_`. Scale is config only, never a code fork (§8.A.5).
 One variable is outside that scheme: `POTS_NATIVE_CACHE`, the directory holding the native
 BLAKE3 sources and library (`commitment/native.py`), default `~/.cache/pots-2.0/native`. `POTS_STACKS_FILE` is the file the exit guard writes stacks to (`fs11_session` sets it for pytest parts) and `POTS_EXIT_GRACE_S` the watchdog's seconds (default 120). Another is `POTS_SAMPLER`: `0` turns off the per-part sampler
 (`setup/sampler.py`) that `fs11_session` starts beside each part; default on. Its file is
-`<part dir>/samples.jsonl`.
+`<part dir>/samples.jsonl`, version 2 since FS35: it records every NVML GPU (`--gpus 0,1` picks
+some, `--gpu N` one). The header lists them in `gpus` (`index`, `name`, `uuid`, `pci_bus_id`),
+and each `g_*` field of a row is a list with one value per header GPU, `null` where a read
+failed; process and machine fields stay scalars. The profile analysis (`evaluation/results/
+profile/analyze.py`) reads versions 1 and 2, takes each section's utilization from the GPU of
+its device (matched by UUID) and its floors from that device's `probe.json` rates.
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch

@@ -70,6 +70,37 @@ clock and :data:`US` turns µs into s; nothing else converts.
   (``P2`` of ``P2.w_t``, ``train_captured`` of ``train.*``) is their sum: it is marked ``rollup``
   and left out of ``share_total``. Clocks, sampler spans and the hook bound
   use the same steps as the time rows.
+- Per-GPU tools (FS35). Samples version 2 holds one value per GPU in each ``g_*`` field, and
+  ``Sampler(samples, gpu=k)`` is GPU ``k``'s view (a version 1 file has only GPU 0).
+- A device maps to a sampler GPU by UUID (the probe's ``per_device``, else ``gpu_roles``, else
+  the machine record's ``gpus``, against the sampler header); with no UUID on either side it
+  maps to the same index, with a warning.
+- A section's ``sec["devices"]`` names its devices. One device: ``util`` is that GPU's. Several:
+  ``util`` is the first device's and ``util_by_device`` has each device's. No list: the run's
+  device (``gpu_roles``' first, else the environment's), GPU 0 of a version 1 file.
+- The bound-lane mark of a multi-device section uses the largest lane utilization over its
+  devices.
+- With a version 2 probe a section's GPU rates and costs are its device's ``per_device``
+  entry; the host-only rates are the top-level ones. A version 1 probe, or a device the probe
+  didn't measure, uses the top level, with one warning naming the device.
+- A multi-device section's GEMM, HBM, PCIe and launch floors use the slowest device's rate
+  (the split replay runs its units one after another, so the work does not divide).
+- The hash floor of a run whose transcript sits on the GPUs (the environment record's config
+  names ``VERIF_VERIFIER_DEVICES``, or ``gpu_roles`` has a verifier-only device) uses each
+  device's ``hash_kernel`` rate on an even share of the bytes and leaves, the slowest time.
+  An even split is an estimate: the placement balances bytes per GPU, not leaves. Else ``hash``.
+  Only the section's devices that hold transcript share it (``gpu_roles`` verifier, or the
+  config's verifier devices), since a sequential run lists every device on every section; with
+  none known to hold, all of its devices share it.
+- Usable memory per device is the machine record's ``gpus[*].memory_bytes``, else the probe's
+  ``per_device`` entry, else ``gpu_memory_bytes``. Where memory rows hold
+  ``device_peak_reserved_bytes`` the memory mark checks each device's peak against its own
+  memory, and ``memory`` adds ``gpu_memory_bytes_by_device`` and each section's ``by_device``.
+- The hook bound counts a section's syncs and events per device, each at that device's
+  ``sync_s`` and ``event_pair_s``; the stamps cost the step's first device's.
+- The timeline has one strip per GPU for ``g_util``, ``g_pcie_tx`` and ``g_pcie_rx``
+  (``strips["gpus"]``, labelled with the device and its role from ``gpu_roles``) when the
+  samples hold several GPUs; ``c_busy`` stays one strip, the top-level ``g_*`` the run's device.
 - Calls folded into a section's ``rest`` count as one span from ``first_us`` to ``last_us``,
   and ``util.truncated`` says so. ``g_throttle`` averages as the fraction of samples with any
   bit set. The check-5 view has no per-class floors: the counting pass has no per-class FLOPs.
@@ -141,15 +172,63 @@ def _mean(xs: Sequence[float]) -> float | None:
     return statistics.fmean(xs) if xs else None
 
 
-class Sampler:
-    """The samples as intervals ``(previous t, t]``; the first starts at the header's ``mono_ns``."""
+NO_GPU = 10 ** 6  # a GPU position no file has: every GPU field reads null
 
-    def __init__(self, samples: io.Samples):
+
+def _slot(v: Any, k: int) -> Any:
+    """A version 2 row's GPU field for the ``k``-th GPU: the list's slot, ``None`` past it or
+    for a field that is a bare null (no GPU reader)."""
+    if isinstance(v, list):
+        return v[k] if 0 <= k < len(v) else None
+    return v if v is None or k == 0 else None
+
+
+class Sampler:
+    """The samples as intervals ``(previous t, t]``; the first starts at the header's ``mono_ns``.
+
+    ``gpu=k`` is one GPU's view (FS35). A version 2 file's GPU fields (``g_*``) are lists, one
+    value per header GPU; the view's rows hold the ``k``-th (``gpu`` unset is GPU 0). A version 1
+    file has one GPU, ``k = 0``, and its rows are used as they are. ``gpus`` is the header's GPU
+    list (version 1's ``gpu`` as a list of one) and ``n_gpus`` the number of GPUs the rows hold.
+    :meth:`view` makes the view of another GPU, cached."""
+
+    def __init__(self, samples: io.Samples, gpu: int | None = None):
+        self.samples = samples
+        head = samples.header
+        self.version = int(head.get("version") or 1)
+        raw = head.get("gpus") if self.version >= 2 else [head.get("gpu")]
+        self.gpus: list[dict[str, Any]] = [g if isinstance(g, dict) else {} for g in raw] \
+            if isinstance(raw, list) and any(isinstance(g, dict) for g in raw) else []
+        self.n_gpus = len(self.gpus) or self._row_gpus()
+        self.gpu = gpu
+        self._views: dict[int, Sampler] = {}
         self.rows = samples.rows
+        if self.version >= 2 or (gpu or 0) != 0:
+            k = gpu or 0
+            self.rows = [{f: (_slot(v, k) if f.startswith("g_") else v) for f, v in r.items()}
+                         for r in samples.rows]
         self.ends = [int(r["t"]) for r in self.rows]
         self.starts = [int(samples.header.get("mono_ns", 0)), *self.ends[:-1]]
         fields = samples.header.get("fields") or (list(self.rows[0]) if self.rows else [])
         self.fields = [f for f in fields if f != "t"]
+
+    def _row_gpus(self) -> int:
+        if self.version < 2:
+            return 1
+        for r in self.samples.rows:
+            for f, v in r.items():
+                if f.startswith("g_") and isinstance(v, list):
+                    return len(v)
+        return 1
+
+    def view(self, gpu: int | None) -> "Sampler":
+        """The same samples as one GPU's view (``None``: the default, GPU 0)."""
+        k = gpu or 0
+        if k == (self.gpu or 0):
+            return self
+        if k not in self._views:
+            self._views[k] = Sampler(self.samples, k)
+        return self._views[k]
 
     def means(self, spans: Sequence[tuple[int, int]]) -> tuple[dict[str, float | None], int]:
         """Each field's mean over ``spans`` (ns), every sample weighted by the overlap of its
@@ -234,6 +313,170 @@ def _pearson(xs: Sequence[float | None], ys: Sequence[float | None]) -> float | 
     return sum((x - mx) * (y - my) for x, y in pairs) / math.sqrt(sxx * syy)
 
 
+# ---- devices -----------------------------------------------------------------------------
+
+
+def _norm_dev(dev: str) -> str:
+    """A bare ``cuda`` is ``cuda:0`` (``metrics.normalize_devices`` resolves it to the current
+    device, which is GPU 0 here)."""
+    return "cuda:0" if dev == "cuda" else dev
+
+
+def _dev_index(dev: str | None) -> int | None:
+    dev = _norm_dev(dev or "")
+    return int(dev[5:]) if dev.startswith("cuda:") and dev[5:].isdigit() else None
+
+
+def _transcript_on_gpus(env: dict[str, Any]) -> bool:
+    """Whether the run's transcript sits on GPUs: the environment record's config names
+    ``VERIF_VERIFIER_DEVICES``, or ``gpu_roles`` has a device that is only a verifier."""
+    cfg = env.get("config")
+    if isinstance(cfg, dict) and (cfg.get("VERIF_VERIFIER_DEVICES") or cfg.get("verifier_devices")):
+        return True
+    return any(isinstance(r, dict) and r.get("roles") == ["verifier"]
+               for r in env.get("gpu_roles") or [])
+
+
+class _Devices:
+    """The run's devices (FS35): the sampler GPU, the probe's measurements and the memory of
+    each, and the one the sections with no device list use (:attr:`primary`). A section names
+    its devices with ``sec["devices"]``; ``named`` below is whether it did."""
+
+    def __init__(self, sampler: Sampler, probe: dict[str, Any], records: list[dict[str, Any]],
+                 header_device: Any, warns: set[str]):
+        self.sampler, self.probe, self.warns = sampler, probe, warns
+        self.env = next((r for r in records if r.get("record") == "environment"), {})
+        roles = self.env.get("gpu_roles")
+        self.roles = {_norm_dev(r["device"]): r for r in roles
+                      if isinstance(r, dict) and r.get("device")} if isinstance(roles, list) else {}
+        self.per_device = probe.get("per_device") if isinstance(probe.get("per_device"), dict) \
+            else {}
+        self.machine_gpus = next((m["gpus"] for m in [probe.get("machine"), self.env.get("machine")]
+                                  if isinstance(m, dict) and isinstance(m.get("gpus"), list)), [])
+        self.gpu_hash = _transcript_on_gpus(self.env)
+        env_dev = str(self.env.get("device") or "")
+        first = next(iter(self.roles), None)
+        self.primary: str | None = first or (_norm_dev(env_dev) if env_dev.startswith("cuda")
+                                              else None) \
+            or ("cuda:0" if header_device == "cuda" else None)
+        self._probes: dict[str, dict[str, Any]] = {}
+        self._pos: dict[tuple[str, bool], int | None] = {}
+
+    def holds_transcript(self, dev: str | None) -> bool:
+        """Whether ``dev`` holds transcript: ``gpu_roles`` gives it the verifier role, or the
+        environment config's verifier devices list it."""
+        if dev is None:
+            return False
+        if "verifier" in ((self.roles.get(dev) or {}).get("roles") or []):
+            return True
+        cfg = self.env.get("config")
+        cfg = cfg if isinstance(cfg, dict) else {}
+        listed = cfg.get("VERIF_VERIFIER_DEVICES") or cfg.get("verifier_devices") or []
+        if isinstance(listed, str):
+            listed = listed.split(",")
+        return dev in {_norm_dev(str(d).strip()) for d in listed}
+
+    def sections_devices(self, listed: list[str] | None) -> tuple[list[str | None], bool]:
+        """A section's devices and whether it named them: the CUDA ones it lists, else the
+        primary device alone (``None`` when the run has no CUDA device)."""
+        cuda = [_norm_dev(d) for d in listed or [] if _dev_index(d) is not None]
+        return (list(dict.fromkeys(cuda)), True) if cuda else ([self.primary], False)
+
+    def uuid_of(self, dev: str) -> str | None:
+        idx = _dev_index(dev)
+        for src in (self.per_device.get(dev), self.roles.get(dev),
+                    next((g for g in self.machine_gpus
+                          if isinstance(g, dict) and g.get("index") == idx), None)):
+            if isinstance(src, dict) and src.get("uuid"):
+                return str(src["uuid"])
+        return None
+
+    # -- the sampler's GPU ------------------------------------------------------------------
+
+    def position(self, dev: str | None, named: bool) -> int | None:
+        """The sampler GPU of ``dev``: matched by UUID (the sampler header's ``gpus`` against the
+        probe's ``per_device`` or the environment record's ``gpu_roles``), else the GPU with the
+        same index, with a warning. ``None`` when no sampler GPU fits."""
+        idx = _dev_index(dev)
+        if dev is None or idx is None:
+            return None
+        if (dev, named) in self._pos:
+            return self._pos[dev, named]
+        sam = self.sampler
+        loud = bool(sam.rows) and (named or sam.version >= 2)
+        uuid, listed = self.uuid_of(dev), [g.get("uuid") for g in sam.gpus]
+        pos: int | None = None
+        if uuid and any(listed):
+            pos = listed.index(uuid) if uuid in listed else None
+            if pos is None and loud:
+                self.warns.add(f"{dev} (UUID {uuid}) is not among the sampler's GPUs: matched by "
+                               "index instead")
+        elif loud:
+            self.warns.add(f"no GPU UUIDs to match {dev} to the sampler's GPUs: used the same "
+                           "index")
+        if pos is None:
+            pos = next((i for i, g in enumerate(sam.gpus) if g.get("index") == idx), None)
+            if pos is None and not sam.gpus and idx < sam.n_gpus:
+                pos = idx
+        self._pos[dev, named] = pos
+        return pos
+
+    def view(self, dev: str | None, named: bool) -> Sampler:
+        pos = self.position(dev, named)
+        if pos is None and named and _dev_index(dev) is not None:
+            if self.sampler.rows:
+                self.warns.add(f"the samples hold no GPU for {dev}: its GPU fields are null")
+            return self.sampler.view(NO_GPU)
+        return self.sampler.view(pos)
+
+    def gpu_of(self, pos: int) -> tuple[str | None, list[str]]:
+        """The run's device and roles of sampler GPU ``pos``, or ``(None, [])``."""
+        names = list(dict.fromkeys([*self.roles, *self.per_device, *(
+            f"cuda:{g['index']}" for g in self.machine_gpus if isinstance(g, dict)
+            and g.get("index") is not None)]))
+        for d in names:
+            if self.position(d, False) == pos:
+                return d, list((self.roles.get(d) or {}).get("roles") or [])
+        return None, []
+
+    # -- the probe's measurements -----------------------------------------------------------
+
+    def probe_of(self, dev: str | None, named: bool) -> dict[str, Any]:
+        """The probe as one device sees it: the host-only rates (top level) beside the device's
+        own ``per_device`` rates, costs and datasheet. A version 1 probe, or a device the probe
+        didn't measure, gives the top level, with one warning naming the device."""
+        if not named or dev is None or _dev_index(dev) is None:
+            return self.probe
+        if dev in self._probes:
+            return self._probes[dev]
+        d = self.per_device.get(dev)
+        if isinstance(d, dict):
+            out = {**self.probe,
+                   "rates": {**(self.probe.get("rates") or {}), **(d.get("rates") or {})},
+                   "costs": {**(self.probe.get("costs") or {}), **(d.get("costs") or {})},
+                   "datasheet": d["datasheet"] if "datasheet" in d else self.probe.get("datasheet")}
+        else:
+            out = self.probe
+            own = _norm_dev(str(self.probe.get("device") or ""))
+            if self.probe.get("rates") and (self.per_device or dev != own):
+                self.warns.add(f"the probe has no measurements of {dev}: the first device's "
+                               "rates and costs are used for it")
+        self._probes[dev] = out
+        return out
+
+    def memory_of(self, dev: str | None, fallback: int | None) -> int | None:
+        """The usable memory of ``dev``: the machine record's ``gpus`` entry, else the probe's
+        ``per_device`` entry, else the machine block's one ``gpu_memory_bytes``."""
+        idx = _dev_index(dev)
+        for g in self.machine_gpus:
+            if isinstance(g, dict) and g.get("index") == idx and g.get("memory_bytes"):
+                return int(g["memory_bytes"])
+        d = self.per_device.get(dev or "")
+        if isinstance(d, dict) and d.get("memory_bytes"):
+            return int(d["memory_bytes"])
+        return fallback
+
+
 # ---- sections ----------------------------------------------------------------------------
 
 
@@ -297,13 +540,35 @@ def _work(name: str, rate_key: str, count: dict[str, Any] | None, leaves: int,
             "syncs": syncs}
 
 
-def _floors(work: dict[str, Any], probe: dict[str, Any], warns: set[str]) -> dict[str, float]:
+def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, Any]],
+            warns: set[str], *, devices: Sequence[str | None] = (), gpu_hash: bool = False,
+            holders: Sequence[bool] = ()) -> dict[str, float]:
     """§6 step 2: one floor per resource that has work. A term with a zero count adds 0
     whatever its rate; a non-zero count with a null rate drops the resource, with a warning.
-    PCIe is the larger of the two directions, since the link is full duplex."""
-    rates, costs = probe.get("rates") or {}, probe.get("costs") or {}
-    hash_rates = rates.get("hash") or {}
+    PCIe is the larger of the two directions, since the link is full duplex.
+
+    ``probes`` is the probe as each of the section's devices sees it (FS35; one dict is one
+    device). The work does not divide over devices (the split replay runs its units one after
+    another), so the GEMM, HBM, PCIe and launch floors use the slowest device's rate or cost.
+    The hash floor, with ``gpu_hash`` (the transcript sits on the GPUs), is each device's
+    ``hash_kernel`` rate on an even share of the bytes and leaves (each owner hashes its own
+    leaves; an even split is an estimate), the slowest device's time; else the host ``hash``.
+    ``holders`` marks the section's devices that hold transcript: a sequential sharded run lists
+    every device on every section, so the share is over the holders only (all the devices when
+    none is known to hold)."""
+    plist = [probes] if isinstance(probes, dict) else list(probes)
+    n_dev = len(plist)
+    names = [d or "the device" for d in (list(devices) + [None] * n_dev)[:n_dev]]
     out: dict[str, float] = {}
+
+    def rate_s(key: str) -> float | None:
+        """Seconds per unit at the slowest device; ``None`` when any device lacks the rate."""
+        rs = [(p.get("rates") or {}).get(key) for p in plist]
+        return None if any(r is None for r in rs) else max(1.0 / r for r in rs)
+
+    def cost_s(key: str) -> float | None:
+        cs = [(p.get("costs") or {}).get(key) for p in plist]
+        return None if any(c is None for c in cs) else max(cs)
 
     def total(resource: str, terms: list[tuple[str, float, Any]], combine=sum) -> None:
         """``terms`` are (label, count, seconds per count); skipped when every count is 0."""
@@ -317,19 +582,42 @@ def _floors(work: dict[str, Any], probe: dict[str, Any], warns: set[str]) -> dic
         out[resource] = combine(n * r for _, n, r in live)
 
     for key, fl in work["flops"].items():
-        rate = rates.get(key)
-        total("gemm", [(key, fl, None if rate is None else 1.0 / rate)])
+        total("gemm", [(key, fl, rate_s(key))])
     b = work["bytes"]
-    r = rates.get("hbm_copy_bytes")
-    total("hbm", [("hbm_copy_bytes", b["hbm"], None if r is None else 1.0 / r)])
-    pc = [(key, b[d], None if rates.get(key) is None else 1.0 / rates[key])
-          for d, key in (("h2d", "h2d_pageable_bytes"), ("d2h", "d2h_pageable_bytes"))]
-    total("pcie", pc, combine=max)
-    total("hash", [("hash.per_byte_s", b["hash"], hash_rates.get("per_byte_s")),
-                   ("hash.per_leaf_s", work["leaves"], hash_rates.get("per_leaf_s"))])
+    total("hbm", [("hbm_copy_bytes", b["hbm"], rate_s("hbm_copy_bytes"))])
+    total("pcie", [(key, b[d], rate_s(key))
+                   for d, key in (("h2d", "h2d_pageable_bytes"), ("d2h", "d2h_pageable_bytes"))],
+          combine=max)
+    kernels = [((p.get("rates") or {}).get("hash_kernel") or {}) for p in plist]
+    keep = [i for i, h in enumerate(list(holders)[:n_dev]) if h] or list(range(n_dev))
+    kernels, hnames = [kernels[i] for i in keep], [names[i] for i in keep]
+    n_hold = len(keep)
+    if gpu_hash and (b["hash"] or work["leaves"]) and all(k for k in kernels):
+        times = []
+        for k, name in zip(kernels, hnames, strict=True):
+            n_bytes, n_leaves = b["hash"] / n_hold, work["leaves"] / n_hold
+            terms = [("hash_kernel.per_byte_s", n_bytes, k.get("per_byte_s")),
+                     ("hash_kernel.per_leaf_s", n_leaves, k.get("per_leaf_s"))]
+            missing = [label for label, c, r in terms if c and r is None]
+            if missing:
+                warns.add(f"the probe has no {', '.join(missing)} for {name}: the hash floor is "
+                          "skipped")
+                times = []
+                break
+            times.append(sum(c * r for _, c, r in terms if c))
+        if times:
+            out["hash"] = max(times)
+    else:
+        if gpu_hash and (b["hash"] or work["leaves"]):
+            warns.add("the probe has no hash_kernel rate for "
+                      f"{', '.join(n for n, k in zip(hnames, kernels, strict=True) if not k)}: "
+                      "the host hash rate is used")
+        hr = [(p.get("rates") or {}).get("hash") or {} for p in plist][0]
+        total("hash", [("hash.per_byte_s", b["hash"], hr.get("per_byte_s")),
+                       ("hash.per_leaf_s", work["leaves"], hr.get("per_leaf_s"))])
     if work["launches"]:  # syncs alone are no evidence of launch-bound work
-        total("launch", [("launch_s", work["launches"], costs.get("launch_s")),
-                         ("sync_s", work["syncs"], costs.get("sync_s"))])
+        total("launch", [("launch_s", work["launches"], cost_s("launch_s")),
+                         ("sync_s", work["syncs"], cost_s("sync_s"))])
     return out
 
 
@@ -420,24 +708,54 @@ def _bin_strips(t_s: list[float], cols: dict[str, list[float | None]]
     return [(b + 1) * width for b in order], out
 
 
-def _strips(sampler: Sampler, t0_ns: int, end_ns: int) -> dict[str, list[Any]] | None:
+def _gpu_strips(sampler: Sampler, dv: _Devices | None) -> list[dict[str, Any]]:
+    """One entry per sampler GPU when there are several (FS35): its view, and the device and
+    roles the run gives it (``gpu_roles``, by UUID), the label the report draws."""
+    out = []
+    for pos in range(sampler.n_gpus if sampler.n_gpus > 1 else 0):
+        dev, roles = dv.gpu_of(pos) if dv else (None, [])
+        label = f"{dev} ({', '.join(roles)})" if dev and roles else dev or f"GPU {pos}"
+        out.append({"gpu": pos, "device": dev, "roles": roles, "label": label,
+                    "view": sampler.view(pos)})
+    return out
+
+
+def _strips(sampler: Sampler, t0_ns: int, end_ns: int, gpus: Sequence[dict[str, Any]] = ()
+            ) -> dict[str, list[Any]] | None:
     """The sampler rows whose interval overlaps the step's spans, as ``t_s`` (row end in s from
     ``t0_ns``) and the fields of :data:`STRIP_FIELDS` that hold a value; ``None`` when no row
-    overlaps or no field has data."""
-    rows = [r for r, a, b in zip(sampler.rows, sampler.starts, sampler.ends)
-            if a < end_ns and b > t0_ns]
-    cols = {f: [r.get(f) for r in rows] for f in STRIP_FIELDS}
+    overlaps or no field has data. With several GPUs (``gpus``, :func:`_gpu_strips`) the strips
+    also hold ``gpus``: one entry per GPU with its ``gpu`` position, ``device``, ``roles``,
+    ``label`` and its own ``g_*`` fields on the same ``t_s``; the ``g_*`` fields at the top are
+    the run's own device's."""
+    idx = [i for i, (a, b) in enumerate(zip(sampler.starts, sampler.ends))
+           if a < end_ns and b > t0_ns]
+    rows = [sampler.rows[i] for i in idx]
+    cols: dict[Any, list[Any]] = {f: [r.get(f) for r in rows] for f in STRIP_FIELDS}
+    for k, g in enumerate(gpus):
+        for f in STRIP_FIELDS:
+            if f.startswith("g_"):
+                cols[k, f] = [g["view"].rows[i].get(f) for i in idx]
     cols = {f: v for f, v in cols.items() if any(x is not None for x in v)}
     if not cols:
         return None
     t_s, cols = _bin_strips([(r["t"] - t0_ns) * 1e-9 for r in rows], cols)
-    return {"t_s": t_s, **cols}
+    out = {"t_s": t_s, **{f: v for f, v in cols.items() if isinstance(f, str)}}
+    per_gpu = [{"gpu": g["gpu"], "device": g["device"], "roles": g["roles"],
+                "label": g["label"],
+                **{f: cols[k, f] for f in STRIP_FIELDS if (k, f) in cols}}
+               for k, g in enumerate(gpus)]
+    if gpus:
+        out["gpus"] = per_gpu
+    return out
 
 
-def _timeline(untraced: list[dict[str, Any]], sampler: Sampler) -> dict[str, Any]:
+def _timeline(untraced: list[dict[str, Any]], sampler: Sampler, dv: _Devices | None = None
+              ) -> dict[str, Any]:
     """One entry per untraced timed step: each section's spans in s from the step's ``t0_ns``
     (a folded ``rest`` as its one span), ``end_s`` the latest span end, and the sampler strips."""
     steps = []
+    gpus = _gpu_strips(sampler, dv)
     for s in untraced:
         t0 = s["t0_ns"]
         order: dict[str, list[tuple[int, int]]] = {}
@@ -451,7 +769,7 @@ def _timeline(untraced: list[dict[str, Any]], sampler: Sampler) -> dict[str, Any
             "sections": [{"name": n, "depth": depth[n],
                           "spans_s": [[(a - t0) * 1e-9, (b - t0) * 1e-9] for a, b in sp]}
                          for n, sp in order.items() if sp],
-            "strips": _strips(sampler, t0, end_ns)})
+            "strips": _strips(sampler, t0, end_ns, gpus)})
     return {"steps": steps}
 
 
@@ -586,27 +904,50 @@ def _gpu_memory(probe: dict[str, Any], records: list[dict[str, Any]]) -> int | N
     return None
 
 
-def _hook_bound(device: Any, steps: list[dict[str, Any]], probe: dict[str, Any]
-                ) -> float | None:
+def _hook_bound(device: Any, steps: list[dict[str, Any]], probe: dict[str, Any],
+                dv: _Devices | None = None) -> float | None:
     """§7: ``(syncs × sync_s + events × event_pair_s) ÷ step time``, the mean over the timed
-    steps; 0 off CUDA, where there are no syncs or events to add."""
-    if device != "cuda":
+    steps; 0 off CUDA, where there are no syncs or events to add. With ``dv`` (FS35) the
+    syncs and events of a section that names its devices are counted per device and cost that
+    device's ``sync_s`` and ``event_pair_s`` (the probe's ``per_device``); the others, and the
+    stamps, cost the first device's. A device's events are its own ``gpu_us`` spans
+    (``gpu_us_by_device``), and a section's top-level syncs are 2 per call on each."""
+    if not str(device).startswith("cuda"):
         return 0.0
-    costs = probe.get("costs") or {}
-    if costs.get("sync_s") is None or costs.get("event_pair_s") is None:
+
+    def costs_of(dev: str | None) -> dict[str, Any]:
+        return (dv.probe_of(dev, dev is not None) if dv else probe).get("costs") or {}
+
+    c0 = costs_of(None)
+    if c0.get("sync_s") is None or c0.get("event_pair_s") is None:
         return None
     vals = []
     for s in steps:
-        syncs = events = 0
+        syncs: dict[str | None, int] = {}
+        events: dict[str | None, int] = {}
         for sec in s["sections"]:
-            if sec["depth"] == 0:
-                syncs += 2 * sec["calls"]
-            if sec.get("gpu_us") is not None:
-                events += len(sec["gpu_us"]) + ((sec.get("rest") or {}).get("calls") or 0)
-        events += len((s.get("stamps") or {}).get("name", []))
+            devs: list[str | None] = [_norm_dev(d) for d in sec.get("devices") or []
+                                      if _dev_index(d) is not None] if dv else []
+            for i, d in enumerate(devs or [None]):
+                if sec["depth"] == 0:
+                    syncs[d] = syncs.get(d, 0) + 2 * sec["calls"]
+                by_dev = sec.get("gpu_us_by_device")
+                spans = by_dev[i] if devs and by_dev and i < len(by_dev) else sec.get("gpu_us")
+                if spans is not None:
+                    events[d] = events.get(d, 0) + len(spans) \
+                        + ((sec.get("rest") or {}).get("calls") or 0)
+        stamp_dev = next((_norm_dev(d) for d in s.get("devices") or []
+                          if dv and _dev_index(d) is not None), None)
+        events[stamp_dev] = events.get(stamp_dev, 0) + len((s.get("stamps") or {}).get("name", []))
         step_s = (s["t1_ns"] - s["t0_ns"]) * 1e-9
+        over = 0.0
+        for d in {*syncs, *events}:
+            c = costs_of(d)
+            if c.get("sync_s") is None or c.get("event_pair_s") is None:
+                return None
+            over += syncs.get(d, 0) * c["sync_s"] + events.get(d, 0) * c["event_pair_s"]
         if step_s > 0:
-            vals.append((syncs * costs["sync_s"] + events * costs["event_pair_s"]) / step_s)
+            vals.append(over / step_s)
     return _mean(vals)
 
 
@@ -696,6 +1037,7 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
               probe: dict[str, Any], trace: dict[str, Any] | None,
               layout: dict[str, Any] | None, compute_bf16: bool, gpu_memory: int | None,
               warns: set[str]) -> dict[str, Any]:
+    dv = _Devices(sampler, probe, records, markers.header.get("device"), warns)
     all_times, sides, levels = _times(records)
     # the hash parts are added seconds, not sections: they feed "hash" below only
     all_parts = {n: all_times.pop(n) for n in [n for n in all_times if _hash_part(n)]}
@@ -711,9 +1053,18 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
     counts = _first_counts(records)
     leaves = _leaves(records)
     peaks: dict[str, int] = {}
+    dev_peaks: dict[str, dict[str, int]] = {}  # component -> device -> reserved peak
     for r in records:
         if r.get("record") == "memory" and r.get("peak_reserved_bytes") is not None:
             peaks[r["component"]] = max(peaks.get(r["component"], 0), r["peak_reserved_bytes"])
+        if r.get("record") == "memory" and isinstance(r.get("devices"), list) \
+                and isinstance(r.get("device_peak_reserved_bytes"), list):
+            mine = dev_peaks.setdefault(r["component"], {})
+            for d, v in zip(r["devices"], r["device_peak_reserved_bytes"]):
+                if v is not None:
+                    mine[_norm_dev(str(d))] = max(mine.get(_norm_dev(str(d)), 0), v)
+    dev_memory = {d: m for d in {d for v in dev_peaks.values() for d in v}
+                  if (m := dv.memory_of(d, gpu_memory))}
     tsec = (trace or {}).get("sections", {})
     c5_scale = _c5_scale((trace or {}).get("c5_slice") or {}, warns)
     transcript = max((r["transcript_bytes"] for r in records if r.get("record") == "storage"),
@@ -773,7 +1124,11 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                 ok = abs(trace_s - host_traced) <= THRESHOLDS["trace_rel"] * host_traced
                 agree = ok if agree is None else agree and ok
             spans = [sp for s, sec in occ for sp in _spans_ns(sec, s["t0_ns"])]
-            means, n = sampler.means(spans)
+            listed = next((sec.get("devices") for _, sec in occ if sec.get("devices")), None)
+            devs, named = dv.sections_devices(listed)
+            per_dev = [dv.view(d, named).means(spans) for d in devs]
+            means, n = per_dev[0]
+            probes = [dv.probe_of(d, named) for d in devs]
             time_stats = _stats(seconds[name])
             mean_t = time_stats["mean"]
             share = mean_t / step_s if step_s and mean_t is not None else None
@@ -782,7 +1137,8 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                          leaves if _hashes_transcript(counts.get(name), transcript) else 0, tr,
                          c5_scale,
                          2 * round(_mean(calls) or 0))
-            floors = _floors(work, probe, warns)
+            floors = _floors(work, probes, warns, devices=devs, gpu_hash=dv.gpu_hash,
+                             holders=[dv.holds_transcript(d) for d in devs])
             floor_s = max(floors.values()) if floors else None
             bound = max(floors, key=floors.__getitem__) if floors else "unknown"
             ratio = mean_t / floor_s if floor_s and mean_t is not None else None
@@ -790,24 +1146,42 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
             if share is not None and ratio is not None and share >= THRESHOLDS["share"] \
                     and ratio >= THRESHOLDS["ratio"]:
                 marks.append("bottleneck")
-            measured = _lane(bound, means, probe, next(iter(work["flops"]), None))
+            rate_key = next(iter(work["flops"]), None)
+            lanes = [m for (dm, _), p in zip(per_dev, probes, strict=True)
+                     if (m := _lane(bound, dm, p, rate_key)) is not None]
+            measured = max(lanes) if lanes else None
             if floor_s and mean_t and measured is not None and n >= THRESHOLDS["min_samples"] \
                     and _differ(floor_s / mean_t, measured):
                 marks.append("utilization")
             if gpu_memory and peaks.get(name) is not None \
-                    and peaks[name] >= THRESHOLDS["reserved"] * gpu_memory:
+                    and peaks[name] >= THRESHOLDS["reserved"] * gpu_memory \
+                    and not dev_memory.keys() & dev_peaks.get(name, {}).keys():
+                marks.append("memory")
+            elif any(v >= THRESHOLDS["reserved"] * dev_memory[d]
+                     for d, v in dev_peaks.get(name, {}).items() if d in dev_memory):
                 marks.append("memory")
             if host_m is not None and host_m >= CLOCK_MIN_S and agree is False:
                 marks.append("clock")
+            util = {**{f: means.get(f) for f in sampler.fields}, "n_samples": n,
+                    "few_samples": n < THRESHOLDS["min_samples"], "truncated": truncated}
+            by_dev = {}
+            if len(devs) > 1:
+                by_dev = {"util_by_device": {d: {**{f: m.get(f) for f in sampler.fields},
+                                                 "n_samples": k,
+                                                 "few_samples": k < THRESHOLDS["min_samples"],
+                                                 "truncated": truncated}
+                                             for d, (m, k) in zip(devs, per_dev, strict=True)}}
             sections[name] = {
                 "depth": depth, "time": time_stats, "share": share,
                 "clocks": {"host_s": host_m, "gpu_s": gpu_m, "trace_s": trace_s, "agree": agree},
-                "util": {**{f: means.get(f) for f in sampler.fields}, "n_samples": n,
-                         "few_samples": n < THRESHOLDS["min_samples"], "truncated": truncated},
+                "util": util, **by_dev,
                 "work": work, "floors_s": floors, "floor_s": floor_s, "bound": bound,
                 "ratio": ratio, "marks": marks, **({"rollup": True} if name in rollups else {})}
         return sections, step_s
 
+    c5_listed = next((sec.get("devices") for s in untraced for sec in s["sections"]
+                      if sec["name"] == "5" and sec.get("devices")), None)
+    c5_dev = dv.sections_devices(c5_listed)[0][0]
     sections, step_s = build(untraced, times)
     warmup = None
     if warm is not None:
@@ -820,14 +1194,22 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
         "share_total": sum(s["share"] or 0.0 for s in sections.values()
                             if s["depth"] == 0 and not s.get("rollup")),
         "sections": sections, "hash": _hash_breakdown(parts, times, sections),
-        "c5": _c5_view(untraced, layout, sampler, warns) if layout else None,
-        "cpu_state": _cpu_state(all_untraced, sampler),
-        "timeline": _timeline(all_untraced, sampler),  # the warm-up step is drawn too
-        "hook_overhead_bound": _hook_bound(markers.header.get("device"), untraced, probe),
+        "c5": _c5_view(untraced, layout, dv.view(c5_dev, bool(c5_listed)), warns)
+        if layout else None,
+        "cpu_state": _cpu_state(all_untraced, dv.view(dv.primary, False)),
+        "timeline": _timeline(all_untraced, sampler, dv),  # the warm-up step is drawn too
+        "hook_overhead_bound": _hook_bound(markers.header.get("device"), untraced, probe, dv),
         "memory": {"gpu_memory_bytes": gpu_memory,
                    "sections": {n: {"peak_reserved_bytes": p,
-                                    "fraction": p / gpu_memory if gpu_memory else None}
-                                for n, p in peaks.items()}}}
+                                    "fraction": p / gpu_memory if gpu_memory else None,
+                                    **({"by_device": {
+                                        d: {"peak_reserved_bytes": v,
+                                            "fraction": v / dev_memory[d] if d in dev_memory
+                                            else None}
+                                        for d, v in dev_peaks[n].items()}}
+                                       if n in dev_peaks else {})}
+                                for n, p in peaks.items()},
+                   **({"gpu_memory_bytes_by_device": dev_memory} if dev_memory else {})}}
 
 
 def _plain_comparison(records: list[dict[str, Any]], plain_dir: Path) -> dict[str, Any]:
