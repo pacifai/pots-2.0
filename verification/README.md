@@ -1296,7 +1296,76 @@ A part that did not run prints `FS32 FAIL: <part> did not run`, one without a re
 one arm are printed and recorded but are outside `pass`. An acceptance failure does not change
 the job's exit code: the `FS32` lines and `summary.json` carry it.
 
+### The four-H100 session (FS35)
+
+`FS11_SESSION=four-h100` is the end of the four-GPU port (F22): on four H100 SXM, GPU 0 trains
+and GPUs 1-3 hold, hash and verify the transcript (`VERIF_DEVICE=cuda:0`,
+`VERIF_VERIFIER_DEVICES=cuda:1,cuda:2,cuda:3`), the layout no card has run yet. For each model
+it runs one verified step three times over, sequential and pipelined, and reports each model's
+step time, the per-GPU peaks and the peer-copy rates; the environment record of each run must
+name all four GPUs. FM6 (the second session's cost estimate) is redone from these step times.
+The session needs 4 CUDA devices, which `FS11_ALLOW_ANY_GPU` does not lift, and an H100 unless
+`FS11_ALLOW_ANY_GPU=1`.
+
+1. **Prep, on the Mac**, after committing, as in step 1 of the first session
+   (`fs11_prep --out DIR`). The upload carries the models, the native sources and the tests.
+2. **The pod**: four H100 SXM on Runpod's secure cloud (NVLink; about $16 per hour), with the
+   image and disks the pair session used and the boot guard of the first session's start
+   command with a `sleep` of 17,100 s in place of 16,200. The arithmetic: the job's parts take
+   about 101 min, packing 1, the grace window 20, so 122 min; setup is about 20 more, 142 min;
+   twice that is 284 min = 17,040 s, rounded up to 17,100 s. The job's own deadline is 2 x 122
+   min = 244 min = 14,640 s, rounded up to 14,700 s (4 h 5 min). A full run bills about 2 hours
+   (about $27); the deadline caps it at about 4 hours.
+3. **Set up** with `fs11_setup.sh` as in step 3 of the first session:
+
+   ```bash
+   bash /workspace/fs11_upload/repo/verification/runs/fs11_setup.sh /workspace/fs11_upload
+   ```
+
+4. **Start the job.** The ssh shell lacks `RUNPOD_POD_ID` and `RUNPOD_API_KEY` (only the pod's
+   process 1 has them), and the job refuses without them, so export them first, printing
+   nothing:
+
+   ```bash
+   eval "$(tr '\0' '\n' < /proc/1/environ \
+       | grep -E '^RUNPOD_(POD_ID|API_KEY)=' | sed 's/^/export /')"
+   FS11_SESSION=four-h100 setsid nohup bash verification/runs/fs11_job.sh /workspace/fs11_upload \
+       /workspace/fs11_out </dev/null > /workspace/fs11_job.out 2>&1 &
+   ```
+
+| part | what it does | estimate |
+|---|---|---|
+| `native_build` | compiles the BLAKE3 library | 2 min |
+| `peer_check` | the byte check of every ordered pair's copies | 1 min |
+| `models` | fetches the public weights | 6 min |
+| `four_tests` | the slow multi-GPU tests, FS34's tests and the three new CUDA test files | 8 min |
+| `probe` | the probe on all four GPUs and the 12 peer pairs, 60 s per device | 8 min |
+| `card_<model>` | `card_identity` on GPU 0 alone: one card's step-1 root | 3 min each |
+| `seq_<model>`, `pipe_<model>` | `llama_step`, 3 steps, sequential and pipelined | 8 min each |
+
+The models run cheapest first: Qwen2.5-0.5B, Llama-3.2-1B, Falcon3-1B, Qwen2.5-1.5B. All of the
+estimates are scaled by hand; none was measured on four GPUs. Each part's time limit is about
+twice its estimate. The counting pass is skipped (`--no-count`): counts do not depend on the GPU
+layout and FS27 measured them on an H100.
+
+**Reading the result.** `summary.json["four_h100"]["pass"]` fails closed. It is true only when
+every part ended `ok`; the tests left a report with tests, no failure or error and no FS34 test
+skipped; and for every model both arms were accepted at all three steps, the two arms' step
+roots are equal step for step, step 1's root is the card part's proved root (the split over
+three GPUs gives one card's bits), and each arm's environment record names four GPUs with
+distinct UUIDs, `cuda:0` as the prover and `cuda:1` to `cuda:3` as verifiers. A rejected arm is
+a result to report, not a thing to work around. Beside `pass` it records, per model and arm,
+each step's prover, verifier, hand-off and total time, the pipelined merged step's wall extent
+and accumulated GPU time, the peak per device and `gpu_peak.json`'s whole-card peaks, and once
+the probe's per-device rates, its 12 peer rates and the peer check's per-pair rates. The job
+log ends with one `FS35 ok:` or `FS35 FAIL:` line per acceptance item, then a line per model
+and arm with the steady step time (the mean of steps 2 and 3; step 1 pays one-off costs) and
+the four GPUs' peaks, then the slowest and fastest peer pair. An acceptance failure does not
+change the job's exit code. If computing the summary raises, `four_h100_error` holds the error
+and the job runs on.
+
 ## Workflow: calibrating the tolerances
+
 
 The thresholds `τ` (matmul residual), `κ` (cancellation) and `τ_W` (update) are set
 from measurement, not guessed. The test-scale procedure:

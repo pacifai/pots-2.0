@@ -2258,7 +2258,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     and counting passes are `PASS_STEPS` and `COUNT_STEPS` honest steps, each of its own. The
     MLP records `h_D` (its synthetic `D`'s root) and a null band-file hash.
 - `llama_step.py` (A10, milestone M3): `.venv/bin/python -m verification.runs.llama_step
-  [--steps T] [--bands PATH] [--metrics | --no-metrics]`, with `T` default 1.
+  [--steps T] [--bands PATH] [--metrics | --no-metrics] [--count | --no-count]`, with `T`
+  default 1.
   `DecoderComputation.from_config`, `W_0` from `build_model()`, `D` from
   `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D` from `meta.json`
   (`load_committed_dataset`, shared by every decoder run). It first calls
@@ -2274,7 +2275,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   prints `residuals.py`'s two tables, `report_costs` each step's prover and verifier wall clock
   and the hand-off between them (`StepRecord.handoff_s`), and, from the memory pass, each
   side's peak (on CUDA with the reserved peak beside it, `, reserved â€¦ GB`). Metrics go to
-  `llama_step/`. Exits 1 unless
+  `llama_step/`. `report_roots` prints `step t root <hex>` for every step after the costs
+  (`StepRecord.root`, in `run_verified`'s format; nothing else in the output changes), so a
+  session can compare roots across runs. `--no-count` skips the counting pass (the default
+  `--count` runs it): counts do not depend on the GPU layout, and FS35's session skips them to
+  save pod time. Exits 1 unless
   accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s
   and `memory_run`'s `release_cache`), not the counting pass. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
   every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
@@ -3097,7 +3102,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     paths (tests: `test_fs11_setup.py`, on stubs).
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
     [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,
-    fs32-pair,device-leaves}]`, `fetch-models` and `env`. `--session` picks the plan from
+    fs32-pair,device-leaves,four-h100}]`, `fetch-models` and `env`. `--session` picks the plan from
     `SESSIONS`, which
     also gives the name `summary.json`'s `session` records: `fs11` (the default, "FS11"),
     `recheck` ("recheck"), `profile-check`, `nvlink-probe` (FS31), `kernel-speed` (FS29:
@@ -3164,6 +3169,30 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     report`. Each arm's plain-against-proved `W_{t+1}` is printed and recorded, outside `pass`.
     An acceptance failure leaves the job's exit code alone. Two A40s: the prover's GPU is then
     one of the verifier devices, so the placement leaving it out runs only on four H100s.
+    `four-h100` (FS35, `four_h100_plan`) is the four-GPU acceptance: `FOUR_PROVER` `cuda:0`
+    trains and `FOUR_VERIFIERS` `cuda:1,cuda:2,cuda:3` verify. `refusal(env, allow, 4,
+    need="the four-H100 session")` refuses fewer than 4 CUDA devices (`FS11_ALLOW_ANY_GPU` does
+    not lift that) and, without `FS11_ALLOW_ANY_GPU=1`, a machine with no H100. Parts: the
+    native build, `peer_check`, `models`, `four_tests` (one pytest part with a junit report:
+    the slow multi-GPU tests, `FS34_TESTS_FILE` and `FOUR_TEST_FILES`, selected by `-k` under
+    `-m "slow or not slow"`), `probe` (on all four GPUs, `--seconds 60`), then per model,
+    cheapest first, `card_<key>` (`card_identity` on GPU 0 alone), `seq_<key>` and `pipe_<key>`
+    (`llama_step --steps 3 --metrics --no-count`, each in its own run directory; only `pipe_*`
+    sets `VERIF_PIPELINED`). `four_h100(parts)` goes to `summary.json["four_h100"]` and
+    `_four_lines` ends the job log (`FS35 ok:` or `FS35 FAIL:` per acceptance item, a steady
+    step time (mean of steps 2-3) and four GPU peaks per model and arm, the peer-rate range).
+    `pass` fails closed: every part in `four_h100_parts()` ended `ok` or `skipped_done`, the
+    peer copies right, the tests' junit with tests and no failure, error or skipped FS34
+    case (and a case from each of `FOUR_TEST_FILES`; `missing_files` names a file absent from
+    the checkout), and per model both arms accepted (`actual: accept`, `PASS`, three root lines,
+    the right `loop mode:`), the arms' step roots equal, step 1's root the card's proved root,
+    and each arm's environment record naming four GPUs (`machine.gpus`, `gpu_roles`: `cuda:0`
+    prover, `cuda:1` to `cuda:3` verifiers, four distinct UUIDs). Recorded outside `pass`: step
+    times, `step_wall_s`, `gpu_held_s`, per-device peaks, `gpu_peak_mib`, the probe's per-device
+    rates and 12 peer rates (`probe.json` version 2), and `peer_check`'s per-pair rate (`gbps`).
+    An acceptance failure leaves the exit code alone; an error in the summary is recorded as
+    `four_h100_error` and the session runs on. `four_default_deadline_s()` is 14,700 s: the
+    estimates (101 min) plus packing 1 and the grace window 20, twice, rounded up to 100 s.
     `--plan` and `--selftest` replace its
     parts. `nvlink-probe` runs `nvlink_probe` once, then `card_identity` per run model and card
     (`FS31_CARDS`, default 4, each part with `CUDA_VISIBLE_DEVICES` set to its card; the probe
@@ -3239,11 +3268,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     included, with `reserved_gb` and `nested_reserved_gb` on CUDA.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
     pod. `FS11_SESSION` (`fs11`, the default, `recheck`, `profile-check`, `nvlink-probe`,
-    `kernel-speed`, `fs32-pair` or `device-leaves`; anything else is a refusal) goes
+    `kernel-speed`, `fs32-pair`, `device-leaves` or `four-h100`; anything else is a refusal) goes
     to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
+    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`, 14,700 s for `four-h100`;
+    `FS31_CARDS` is passed on), the
     session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,
     packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
