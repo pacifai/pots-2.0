@@ -1290,7 +1290,8 @@ def four_default_deadline_s() -> int:
 def four_h100_plan(upload: Path, out: Path) -> list[Part]:
     """The four-H100 session's parts. The F22 peer-copy byte check first (the native build runs
     ahead of it); the models part; ``four_tests``, one pytest part with a junit report running
-    the slow two-GPU tests (:data:`PAIR_SLOW_SELECT`), FS34's file and :data:`FOUR_TEST_FILES`,
+    every two-GPU test, slow or not (:data:`PAIR_SLOW_SELECT`: the non-slow ones put the
+    verifiers on GPUs 1-3 here), FS34's file and :data:`FOUR_TEST_FILES`,
     on SmolLM2's test-scale data (its run
     directory's ``data/`` link, as the pair plan's pytest parts have it);
     the probe on all four GPUs (``VERIF_DEVICE`` GPU 0, :data:`FOUR_VERIFIERS` the rest, 60 s per
@@ -1305,7 +1306,7 @@ def four_h100_plan(upload: Path, out: Path) -> list[Part]:
     small = data_key(pin.repo, SMOLLM2_TASK)
     sharded = {"VERIF_DEVICE": FOUR_PROVER, "VERIF_VERIFIER_DEVICES": FOUR_VERIFIERS}
     junit = out / "parts" / "four_tests" / "junit.xml"
-    expr = " or ".join([f"(slow and ({PAIR_SLOW_SELECT}))",
+    expr = " or ".join([f"({PAIR_SLOW_SELECT})",
                         *(Path(f).stem for f in (FS34_TESTS_FILE, *FOUR_TEST_FILES))])
     tests = Part("four_tests", ["{python}", "-m", "pytest", "-rf", "-q", f"--junitxml={junit}",
                                 "-p", "no:cacheprovider", "-m", "slow or not slow", "-k", expr],

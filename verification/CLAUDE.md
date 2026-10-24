@@ -3190,8 +3190,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     need="the four-H100 session")` refuses fewer than 4 CUDA devices (`FS11_ALLOW_ANY_GPU` does
     not lift that) and, without `FS11_ALLOW_ANY_GPU=1`, a machine with no H100. Parts: the
     native build, `peer_check`, `models`, `four_tests` (one pytest part with a junit report:
-    the slow multi-GPU tests, `FS34_TESTS_FILE` and `FOUR_TEST_FILES`, selected by `-k` under
-    `-m "slow or not slow"`; the `-k` text is built from `PAIR_SLOW_SELECT`; it runs on SmolLM2's
+    every multi-GPU test, slow or not (`PAIR_SLOW_SELECT`), `FS34_TESTS_FILE` and
+    `FOUR_TEST_FILES`, selected by `-k` under `-m "slow or not slow"`; the `-k` text is built
+    from `PAIR_SLOW_SELECT`; it runs on SmolLM2's
     test-scale data: its run directory's `data/` link is the pair plan's `data_key`), `probe`
     (on all four GPUs, `--seconds 60`; it and `four_tests` run with `CUDA_DEVICE_ORDER=PCI_BUS_ID`
     like the card and arm parts, `PCI_ORDER_ENV`), then per model,

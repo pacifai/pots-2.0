@@ -1326,9 +1326,9 @@ The session needs 4 CUDA devices, which `FS11_ALLOW_ANY_GPU` does not lift, and 
    bash /workspace/fs11_upload/repo/verification/runs/fs11_setup.sh /workspace/fs11_upload
    ```
 
-4. **Start the job.** The ssh shell lacks `RUNPOD_POD_ID` and `RUNPOD_API_KEY` (only the pod's
-   process 1 has them), and the job refuses without them, so export them first, printing
-   nothing:
+4. **Start the job**, from `/workspace/fs11_upload/repo`. The ssh shell lacks `RUNPOD_POD_ID`
+   and `RUNPOD_API_KEY` (only the pod's process 1 has them), and the job refuses without them,
+   so export them first, printing nothing:
 
    ```bash
    eval "$(tr '\0' '\n' < /proc/1/environ \
@@ -1342,7 +1342,7 @@ The session needs 4 CUDA devices, which `FS11_ALLOW_ANY_GPU` does not lift, and 
 | `native_build` | compiles the BLAKE3 library | 2 min |
 | `peer_check` | the byte check of every ordered pair's copies | 1 min |
 | `models` | fetches the public weights | 6 min |
-| `four_tests` | the slow multi-GPU tests, FS34's tests and the three new CUDA test files | 8 min |
+| `four_tests` | every multi-GPU test (slow or not), FS34's tests and the three new CUDA test files | 8 min |
 | `probe` | the probe on all four GPUs and the 12 peer pairs, 60 s per device | 8 min |
 | `card_<model>` | `card_identity` on GPU 0 alone: one card's step-1 root | 3 min each |
 | `seq_<model>`, `pipe_<model>` | `llama_step`, 3 steps, sequential and pipelined | 8 min each |
