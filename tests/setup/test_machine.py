@@ -205,3 +205,22 @@ def test_nvml_facts_takes_an_index(monkeypatch):
     setup_machine.nvml_facts()
     setup_machine.nvml_facts(index=3)
     assert seen == [0, 3]
+
+
+def test_gpu_zero_keys_are_torchs_device_zero_not_the_first_smi_row(monkeypatch):
+    smi_rows = [("aaaa", "NVIDIA A100 PCIe", 0x19), ("bbbb", "NVIDIA H100 NVL", 0x3B)]
+    calls = _fake_cuda(monkeypatch, [("H100", 0x3B, "bbbb"), ("A100", 0x19, "aaaa")],
+                       _smi(smi_rows))
+    r = setup_machine._Record()
+    setup_machine._gpu(r)
+    assert r.data["gpu_name"] == "NVIDIA H100 NVL" and r.data["gpu_form_factor"] == "NVL"
+    assert r.data["gpu_pci_bus_id"] == "00000000:3B:00.0"
+    assert r.data["gpu_memory_bytes"] == 80 * 2**30
+    assert len([c for c in calls if "--query-gpu" in " ".join(c)]) == 1
+
+
+def test_gpu_falls_back_to_the_first_row_when_no_row_matches(monkeypatch):
+    _fake_cuda(monkeypatch, [("H100", 0x5D, "zzzz")], _smi([("aaaa", "NVIDIA H100 SXM", 0x19)]))
+    r = setup_machine._Record()
+    setup_machine._gpu(r)
+    assert r.data["gpu_pci_bus_id"] == "00000000:19:00.0"

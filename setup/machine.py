@@ -212,8 +212,9 @@ def _gpu(r: _Record) -> None:
     r.put("gpu_count", torch.cuda.device_count())
     props = torch.cuda.get_device_properties(0)
     r.put("cuda_runtime", torch.version.cuda)
-    smi = _run("nvidia-smi", f"--query-gpu={','.join(_GPU_QUERY)}", "--format=csv,noheader,nounits")
-    row = dict(zip(_GPU_QUERY, (v.strip() for v in smi.splitlines()[0].split(",")))) if smi else {}
+    rows = _smi_rows()
+    # GPU 0 is torch's cuda:0: its row by bus id, then UUID; the first row only if none matches
+    row = _row_for(rows, props) or (rows[0] if rows else {})
     no_smi = "nvidia-smi missing or failed"
 
     def num(key: str) -> float | None:
@@ -266,6 +267,20 @@ def _torch_bus_id(props: Any) -> str | None:
         return None
 
 
+def _row_for(rows: list[dict[str, str]], props: Any) -> dict[str, str] | None:
+    """The ``nvidia-smi`` row of the torch device with ``props``: by PCI bus id, then by UUID;
+    None when no row matches."""
+    bus = (_torch_bus_id(props) or "").upper()
+    uuid = getattr(props, "uuid", None)
+    for row in rows:
+        if bus and (row.get("pci.bus_id") or "").upper() == bus:
+            return row
+    for row in rows:
+        if uuid and row.get("uuid") == f"GPU-{uuid}":
+            return row
+    return None
+
+
 def _gpus(r: _Record) -> None:
     """``gpus``: one dict per CUDA device torch sees, in torch's index order. Each is joined to
     its ``nvidia-smi`` row by PCI bus id (then by UUID), never by position: torch orders devices
@@ -275,14 +290,12 @@ def _gpus(r: _Record) -> None:
               else "no CUDA device visible")
         return
     rows = _smi_rows()
-    by_bus = {row["pci.bus_id"].upper(): row for row in rows if row.get("pci.bus_id")}
-    by_uuid = {row["uuid"]: row for row in rows if row.get("uuid")}
     gpus = []
     for k in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(k)
         bus = _torch_bus_id(props)
         uuid = getattr(props, "uuid", None)
-        row = by_bus.get((bus or "").upper()) or by_uuid.get(f"GPU-{uuid}" if uuid else "") or {}
+        row = _row_for(rows, props) or {}
 
         def num(key: str, row: dict[str, str] = row) -> float | None:
             try:
