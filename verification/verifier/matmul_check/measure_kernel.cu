@@ -75,7 +75,16 @@ static __device__ __forceinline__ double pots_tree_d(double v) {
   return v;
 }
 
-// ---- loads, specialised by dtype and layout ----
+// ---- loads, specialised by dtype and layout; two passes (gather, then scatter) ----
+//
+// Every tile load is two passes over the thread's elements: the global loads go to a small
+// register array (its size a compile-time constant, the loops unrolled), then the shared stores.
+// No shared store sits between two global loads, so the loads of a pass are all in flight
+// together (the compiler can't move a global load past a store through a generic pointer).
+
+#define POTS_NPX ((ROWS_PER_BLOCK * TILE_COLS + POTS_NT - 1u) / POTS_NT) /* x elements per thread */
+#define POTS_NPV ((K_CHUNK * TILE_COLS + POTS_NT - 1u) / POTS_NT)        /* vector elements */
+#define POTS_NPB ((TILE_COLS + POTS_NT - 1u) / POTS_NT)                  /* b2, b1 elements */
 
 // DT 0: fp32, 1: bf16 (the 16 bits shifted left by 16, as pots_mload). LAY 0: row-major
 // (col_stride == 1), 1: transposed (row_stride == 1), 2: any strides.
@@ -85,30 +94,52 @@ static __device__ __forceinline__ float pots_ld(pots_u64 addr, pots_i64 at) {
   return ((const float *)addr)[at];
 }
 
-// Rows r0 .. r0+nrows-1 (nrows <= rbp) and columns c0 .. c0+ncols-1 of view m into
-// sx[r * POTS_XPAD + cc], the block's threads taking consecutive elements along the view's
-// contiguous dimension (for a transposed view the rows, in runs of rbp).
+// Element e of an x tile of nrows rows (nrows <= rbp) and ncols columns: its row r and tile
+// column cc; false when e is no element. The block's threads take consecutive elements along
+// the view's contiguous dimension (for a transposed view the rows, in runs of rbp).
+template <int LAY>
+static __device__ __forceinline__ bool pots_xe(pots_u32 e, pots_u32 nrows, pots_u32 rbp,
+                                               pots_u32 ncols, pots_u32 &r, pots_u32 &cc) {
+  if (LAY == 1) {
+    if (e >= rbp * ncols) return false;
+    r = e % rbp;
+    cc = e / rbp;
+    return r < nrows;
+  }
+  if (e >= nrows * TILE_COLS) return false;
+  r = e / TILE_COLS;
+  cc = e % TILE_COLS;
+  return cc < ncols;
+}
+
+// Pass 1: rows r0 .. r0+nrows-1 and columns c0 .. c0+ncols-1 of view m into the registers v.
 template <int DT, int LAY>
-static __device__ __forceinline__ void pots_load_x(const pots_mview_t *m, pots_i64 r0,
-                                                   pots_u32 nrows, pots_u32 rbp, pots_i64 c0,
-                                                   pots_u32 ncols, float *sx) {
+static __device__ __forceinline__ void pots_gather_x(const pots_mview_t *__restrict__ m,
+                                                     pots_i64 r0, pots_u32 nrows, pots_u32 rbp,
+                                                     pots_i64 c0, pots_u32 ncols,
+                                                     float (&v)[POTS_NPX]) {
   const pots_i64 rs = m->row_stride, cs = m->col_stride;
   const pots_u64 addr = m->addr;
-  if (LAY == 1) {
-    const pots_u32 tot = rbp * ncols;
-    for (pots_u32 e = threadIdx.x; e < tot; e += POTS_NT) {
-      const pots_u32 r = e % rbp, cc = e / rbp;
-      if (r < nrows) sx[r * POTS_XPAD + cc] = pots_ld<DT>(addr, (r0 + r) + (c0 + cc) * cs);
+  _Pragma("unroll") for (pots_u32 i = 0; i < POTS_NPX; i++) {
+    pots_u32 r = 0, cc = 0;
+    v[i] = 0.0f;
+    if (pots_xe<LAY>(threadIdx.x + i * POTS_NT, nrows, rbp, ncols, r, cc)) {
+      const pots_i64 at = LAY == 1 ? (r0 + r) + (c0 + cc) * cs
+                                   : (r0 + r) * rs + (LAY == 0 ? (c0 + cc) : (c0 + cc) * cs);
+      v[i] = pots_ld<DT>(addr, at);
     }
-  } else {
-    const pots_u32 tot = nrows * TILE_COLS;
-    for (pots_u32 e = threadIdx.x; e < tot; e += POTS_NT) {
-      const pots_u32 r = e / TILE_COLS, cc = e % TILE_COLS;
-      if (cc < ncols) {
-        const pots_i64 at = (r0 + r) * rs + (LAY == 0 ? (c0 + cc) : (c0 + cc) * cs);
-        sx[r * POTS_XPAD + cc] = pots_ld<DT>(addr, at);
-      }
-    }
+  }
+}
+
+// Pass 2: the registers into sx[r * POTS_XPAD + cc].
+template <int LAY>
+static __device__ __forceinline__ void pots_scatter_x(pots_u32 nrows, pots_u32 rbp,
+                                                      pots_u32 ncols, const float (&v)[POTS_NPX],
+                                                      float *__restrict__ sx) {
+  _Pragma("unroll") for (pots_u32 i = 0; i < POTS_NPX; i++) {
+    pots_u32 r = 0, cc = 0;
+    if (pots_xe<LAY>(threadIdx.x + i * POTS_NT, nrows, rbp, ncols, r, cc))
+      sx[r * POTS_XPAD + cc] = v[i];
   }
 }
 
@@ -118,17 +149,104 @@ static __device__ __forceinline__ int pots_mode(const pots_mview_t *m) {
 }
 
 // The switch on (dtype, layout), made once per tile outside every compute loop.
-static __device__ __forceinline__ void pots_load_x_mode(int mode, const pots_mview_t *m,
-                                                        pots_i64 r0, pots_u32 nrows,
-                                                        pots_u32 rbp, pots_i64 c0,
-                                                        pots_u32 ncols, float *sx) {
+static __device__ __forceinline__ void pots_gather_x_mode(int mode, const pots_mview_t *m,
+                                                          pots_i64 r0, pots_u32 nrows,
+                                                          pots_u32 rbp, pots_i64 c0,
+                                                          pots_u32 ncols, float (&v)[POTS_NPX]) {
   switch (mode) {
-    case 0: pots_load_x<0, 0>(m, r0, nrows, rbp, c0, ncols, sx); break;
-    case 1: pots_load_x<0, 1>(m, r0, nrows, rbp, c0, ncols, sx); break;
-    case 2: pots_load_x<0, 2>(m, r0, nrows, rbp, c0, ncols, sx); break;
-    case 3: pots_load_x<1, 0>(m, r0, nrows, rbp, c0, ncols, sx); break;
-    case 4: pots_load_x<1, 1>(m, r0, nrows, rbp, c0, ncols, sx); break;
-    default: pots_load_x<1, 2>(m, r0, nrows, rbp, c0, ncols, sx); break;
+    case 0: pots_gather_x<0, 0>(m, r0, nrows, rbp, c0, ncols, v); break;
+    case 1: pots_gather_x<0, 1>(m, r0, nrows, rbp, c0, ncols, v); break;
+    case 2: pots_gather_x<0, 2>(m, r0, nrows, rbp, c0, ncols, v); break;
+    case 3: pots_gather_x<1, 0>(m, r0, nrows, rbp, c0, ncols, v); break;
+    case 4: pots_gather_x<1, 1>(m, r0, nrows, rbp, c0, ncols, v); break;
+    default: pots_gather_x<1, 2>(m, r0, nrows, rbp, c0, ncols, v); break;
+  }
+}
+static __device__ __forceinline__ void pots_scatter_x_mode(int mode, pots_u32 nrows,
+                                                           pots_u32 rbp, pots_u32 ncols,
+                                                           const float (&v)[POTS_NPX],
+                                                           float *__restrict__ sx) {
+  switch (mode % 3) {
+    case 0: pots_scatter_x<0>(nrows, rbp, ncols, v, sx); break;
+    case 1: pots_scatter_x<1>(nrows, rbp, ncols, v, sx); break;
+    default: pots_scatter_x<2>(nrows, rbp, ncols, v, sx); break;
+  }
+}
+
+// The vector tile of one entry: R's columns j0 .. j0+nj-1 at tile columns 0 .. ncols-1 (element
+// e: tile column e / nj, column j0 + e % nj: R's entries are consecutive in memory), or an
+// A-kind entry's stored t rows (element e: row e / TILE_COLS, tile column e % TILE_COLS) and,
+// on `first`, its b2 and b1. Stored at sy[j * POTS_YP + cc] (the +1 pitch: consecutive threads
+// of R's order store consecutive j without bank conflicts).
+static __device__ __forceinline__ void pots_gather_r(const float *__restrict__ r, pots_u32 k,
+                                                     pots_u32 j0, pots_u32 nj, pots_i64 c0,
+                                                     pots_u32 ncols, float (&v)[POTS_NPV]) {
+  const pots_u32 tot = ncols * nj;
+  _Pragma("unroll") for (pots_u32 i = 0; i < POTS_NPV; i++) {
+    const pots_u32 e = threadIdx.x + i * POTS_NT;
+    v[i] = 0.0f;
+    if (e < tot) {
+      const pots_u32 cc = e / nj, j = e - cc * nj;
+      v[i] = r[(pots_u64)(c0 + cc) * k + j0 + j];
+    }
+  }
+}
+static __device__ __forceinline__ void pots_scatter_r(pots_u32 nj, pots_u32 ncols,
+                                                      const float (&v)[POTS_NPV],
+                                                      float *__restrict__ sy) {
+  const pots_u32 tot = ncols * nj;
+  _Pragma("unroll") for (pots_u32 i = 0; i < POTS_NPV; i++) {
+    const pots_u32 e = threadIdx.x + i * POTS_NT;
+    if (e < tot) {
+      const pots_u32 cc = e / nj, j = e - cc * nj;
+      sy[j * POTS_YP + cc] = v[i];
+    }
+  }
+}
+static __device__ __forceinline__ void pots_gather_t(const float *__restrict__ tt, pots_i64 q,
+                                                     pots_u32 j0, pots_u32 nj, pots_i64 c0,
+                                                     pots_u32 ncols, float (&v)[POTS_NPV]) {
+  _Pragma("unroll") for (pots_u32 i = 0; i < POTS_NPV; i++) {
+    const pots_u32 e = threadIdx.x + i * POTS_NT;
+    const pots_u32 j = e / TILE_COLS, cc = e % TILE_COLS;
+    v[i] = 0.0f;
+    if (j < nj && cc < ncols) v[i] = tt[(pots_u64)(j0 + j) * (pots_u64)q + (pots_u64)(c0 + cc)];
+  }
+}
+static __device__ __forceinline__ void pots_scatter_t(pots_u32 nj, pots_u32 ncols,
+                                                      const float (&v)[POTS_NPV],
+                                                      float *__restrict__ sy) {
+  _Pragma("unroll") for (pots_u32 i = 0; i < POTS_NPV; i++) {
+    const pots_u32 e = threadIdx.x + i * POTS_NT;
+    const pots_u32 j = e / TILE_COLS, cc = e % TILE_COLS;
+    if (j < nj && cc < ncols) sy[j * POTS_YP + cc] = v[i];
+  }
+}
+static __device__ __forceinline__ void pots_gather_b(const float *__restrict__ b2,
+                                                     const float *__restrict__ b1, int guard,
+                                                     pots_i64 c0, pots_u32 ncols,
+                                                     float (&v2)[POTS_NPB], float (&v1)[POTS_NPB]) {
+  _Pragma("unroll") for (pots_u32 i = 0; i < POTS_NPB; i++) {
+    const pots_u32 cc = threadIdx.x + i * POTS_NT;
+    v2[i] = 0.0f;
+    v1[i] = 0.0f;
+    if (cc < ncols) {
+      v2[i] = b2[c0 + cc];
+      if (guard) v1[i] = b1[c0 + cc];
+    }
+  }
+}
+static __device__ __forceinline__ void pots_scatter_b(int guard, pots_u32 ncols,
+                                                      const float (&v2)[POTS_NPB],
+                                                      const float (&v1)[POTS_NPB],
+                                                      float *__restrict__ sb2,
+                                                      float *__restrict__ sb1) {
+  _Pragma("unroll") for (pots_u32 i = 0; i < POTS_NPB; i++) {
+    const pots_u32 cc = threadIdx.x + i * POTS_NT;
+    if (cc < ncols) {
+      sb2[cc] = v2[i];
+      if (guard) sb1[cc] = v1[i];
+    }
   }
 }
 
@@ -235,46 +353,90 @@ static __device__ __forceinline__ pots_batch_t pots_make_batch(
 
 // ---- one sweep over a batch ----
 
-// The vector tile of entry b into region b of sy: R's columns j0 .. j0+nj-1 at tile columns
-// 0 .. ncols-1 (sy[(b*K_CHUNK + j)*POTS_YP + cc], consecutive threads taking consecutive j: R's
-// entries are consecutive in memory), or, for an A-kind entry, the stored t's rows (and, with
-// `first`, b2 and b1).
-static __device__ __forceinline__ void pots_load_r(const float *r, pots_u32 k, pots_u32 j0,
-                                                   pots_u32 nj, pots_i64 c0, pots_u32 ncols,
-                                                   float *sy) {
-  const pots_u32 tot = ncols * nj;
-  for (pots_u32 e = threadIdx.x; e < tot; e += POTS_NT) {
-    const pots_u32 cc = e / nj, j = e - cc * nj;
-    sy[j * POTS_YP + cc] = r[(pots_u64)(c0 + cc) * k + j0 + j];
-  }
-}
+// The registers a tile's global loads land in: the x tile, one vector tile per entry, and each
+// entry's b2 and b1. Every index into them is a compile-time constant (the loops over entries
+// are unrolled to E_MAX with a runtime `b < eb` guard), so they stay in registers.
+typedef struct {
+  float x[POTS_NPX];
+  float v[E_MAX][POTS_NPV];
+  float b2[E_MAX][POTS_NPB];
+  float b1[E_MAX][POTS_NPB];
+} pots_tile_regs_t;
 
-static __device__ __forceinline__ void pots_load_t(const pots_mprod_t *t, const pots_mscr_t &sc,
-                                                   pots_u32 j0, pots_u32 nj, pots_i64 c0,
-                                                   pots_u32 ncols, int first, int guard,
-                                                   float *sy, float *sb2, float *sb1) {
-  const pots_i64 q = t->a.cols;
-  for (pots_u32 e = threadIdx.x; e < nj * TILE_COLS; e += POTS_NT) {
-    const pots_u32 j = e / TILE_COLS, cc = e % TILE_COLS;
-    if (cc < ncols) sy[j * POTS_YP + cc] = sc.tt[(pots_u64)(j0 + j) * (pots_u64)q + (pots_u64)(c0 + cc)];
+// Pass 1 of a tile of the shared view `vw` (SW SHARED: every entry's vector tile; BIAS: the one
+// bias row and ent[0]'s R).
+template <int SW>
+static __device__ __forceinline__ void pots_gather_shared(const pots_batch_t &B,
+                                                          const pots_mview_t *vw, int mode,
+                                                          pots_i64 c0, pots_u32 ncols,
+                                                          pots_u32 j0, pots_u32 nj, int first,
+                                                          pots_tile_regs_t &R) {
+  if (SW == POTS_SW_BIAS) {
+    pots_gather_x_mode(mode, vw, 0, 1u, 1u, c0, ncols, R.x);
+    pots_gather_r((const float *)pots_bprod(B, 0)->r_addr, B.k, j0, nj, c0, ncols, R.v[0]);
+    return;
   }
-  if (first) {
-    for (pots_u32 cc = threadIdx.x; cc < ncols; cc += POTS_NT) {
-      sb2[cc] = sc.b2[c0 + cc];
-      if (guard) sb1[cc] = sc.b1[c0 + cc];
+  pots_gather_x_mode(mode, vw, B.r0, B.nld, B.rb, c0, ncols, R.x);
+  _Pragma("unroll") for (pots_u32 b = 0; b < E_MAX; b++) {
+    if (b < B.eb) {
+      const pots_mprod_t *t = pots_bprod(B, b);
+      if (B.ent[b].phase == 0) {
+        pots_gather_r((const float *)t->r_addr, B.k, j0, nj, c0, ncols, R.v[b]);
+      } else {
+        const pots_mscr_t sc = pots_mscr_make(t, B.works[B.ent[b].prod].scratch);
+        pots_gather_t(sc.tt, t->a.cols, j0, nj, c0, ncols, R.v[b]);
+        if (first)
+          pots_gather_b(sc.b2, sc.b1, (t->flags & POTS_M_GUARD) != 0, c0, ncols, R.b2[b],
+                        R.b1[b]);
+      }
     }
   }
 }
 
-// One pass over the batch's view (SW SHARED: the view `vw`, all entries; P: each phase-1
-// entry's own P view; BIAS: the one bias row) for the challenge columns j0 .. j0+nj-1 (`first`:
+// Pass 2 of that tile.
+template <int SW>
+static __device__ __forceinline__ void pots_scatter_shared(
+    const pots_batch_t &B, int mode, pots_u32 ncols, pots_u32 nj, int first,
+    const pots_tile_regs_t &R, float *__restrict__ sx, float *__restrict__ sy,
+    float *__restrict__ sb2, float *__restrict__ sb1) {
+  if (SW == POTS_SW_BIAS) {
+    pots_scatter_x_mode(mode, 1u, 1u, ncols, R.x, sx);
+    pots_scatter_r(nj, ncols, R.v[0], sy);
+    return;
+  }
+  pots_scatter_x_mode(mode, B.nld, B.rb, ncols, R.x, sx);
+  _Pragma("unroll") for (pots_u32 b = 0; b < E_MAX; b++) {
+    if (b < B.eb) {
+      float *yb = sy + b * K_CHUNK * POTS_YP;
+      if (B.ent[b].phase == 0) {
+        pots_scatter_r(nj, ncols, R.v[b], yb);
+      } else {
+        pots_scatter_t(nj, ncols, R.v[b], yb);
+        if (first)
+          pots_scatter_b((pots_bprod(B, b)->flags & POTS_M_GUARD) != 0, ncols, R.b2[b], R.b1[b],
+                         sb2 + b * TILE_COLS, sb1 + b * TILE_COLS);
+      }
+    }
+  }
+}
+
+// One pass over the batch's view (SW SHARED: the view vw, all entries; P: each phase-1
+// entry's own P view; BIAS: the one bias row) for the challenge columns j0 .. j0+nj-1 (first:
 // also the extras), into the lanes' accumulators. Every thread of the block calls it with the
 // same arguments (it has barriers).
+//
+// The compute walks the lane's columns c (increasing) and, for each, the warp's sets: when a
+// set's entry differs from the previous set's, that entry's nj vector values at c (and b2[c],
+// b1[c] of an A-kind entry) go from shared memory into registers once, and every set of the
+// entry uses them. Each accumulator still sees its columns in increasing order with the same
+// operation, so the bits are those of the column-inner order.
 template <int SW>
 static __device__ __forceinline__ void pots_sweep(const pots_batch_t &B, const pots_mview_t *vw,
                                                   pots_u32 j0, pots_u32 nj, int first,
-                                                  pots_lane_t &L, float *sx, float *sy,
-                                                  float *sb2, float *sb1) {
+                                                  pots_lane_t &L, float *__restrict__ sx,
+                                                  float *__restrict__ sy,
+                                                  float *__restrict__ sb2,
+                                                  float *__restrict__ sb1) {
   const pots_u32 lane = threadIdx.x & 31u;
   const pots_u32 live = SW == POTS_SW_P ? B.plive : B.live;
   _Pragma("unroll") for (pots_u32 rr = 0; rr < POTS_RPW; rr++) {
@@ -285,6 +447,7 @@ static __device__ __forceinline__ void pots_sweep(const pots_batch_t &B, const p
   }
   const pots_i64 cols = SW == POTS_SW_P ? B.pmax : vw->cols;
   const int mode = SW == POTS_SW_P ? 0 : pots_mode(vw);
+  pots_tile_regs_t R;
   for (pots_i64 c0 = 0; c0 < cols; c0 += TILE_COLS) {
     const pots_i64 left = cols - c0;
     const pots_u32 ncols = left < (pots_i64)TILE_COLS ? (pots_u32)left : TILE_COLS;
@@ -296,52 +459,48 @@ static __device__ __forceinline__ void pots_sweep(const pots_batch_t &B, const p
         const pots_i64 lf = t->p.cols - c0;
         if (lf <= 0) continue;
         const pots_u32 ncb = lf < (pots_i64)TILE_COLS ? (pots_u32)lf : TILE_COLS;
-        pots_load_x_mode(pots_mode(&t->p), &t->p, B.r0, B.nrows, B.rb, c0, ncb,
-                         sx + b * B.rb * POTS_XPAD);
-        pots_load_r((const float *)t->r_addr, B.k, j0, nj, c0, ncb, sy + b * K_CHUNK * POTS_YP);
+        const int pmode = pots_mode(&t->p);
+        pots_gather_x_mode(pmode, &t->p, B.r0, B.nrows, B.rb, c0, ncb, R.x);
+        pots_gather_r((const float *)t->r_addr, B.k, j0, nj, c0, ncb, R.v[0]);
+        pots_scatter_x_mode(pmode, B.nrows, B.rb, ncb, R.x, sx + b * B.rb * POTS_XPAD);
+        pots_scatter_r(nj, ncb, R.v[0], sy + b * K_CHUNK * POTS_YP);
       }
-    } else if (SW == POTS_SW_BIAS) {
-      const pots_mprod_t *t = pots_bprod(B, 0);
-      pots_load_x_mode(mode, vw, 0, 1u, 1u, c0, ncols, sx);
-      pots_load_r((const float *)t->r_addr, B.k, j0, nj, c0, ncols, sy);
     } else {
-      pots_load_x_mode(mode, vw, B.r0, B.nld, B.rb, c0, ncols, sx);
-      for (pots_u32 b = 0; b < B.eb; b++) {
-        const pots_mprod_t *t = pots_bprod(B, b);
-        float *yb = sy + b * K_CHUNK * POTS_YP;
-        if (B.ent[b].phase == 0) {
-          pots_load_r((const float *)t->r_addr, B.k, j0, nj, c0, ncols, yb);
-        } else {
-          const pots_mscr_t sc = pots_mscr_make(t, B.works[B.ent[b].prod].scratch);
-          pots_load_t(t, sc, j0, nj, c0, ncols, first, (t->flags & POTS_M_GUARD) != 0, yb,
-                      sb2 + b * TILE_COLS, sb1 + b * TILE_COLS);
-        }
-      }
+      pots_gather_shared<SW>(B, vw, mode, c0, ncols, j0, nj, first, R);
+      pots_scatter_shared<SW>(B, mode, ncols, nj, first, R, sx, sy, sb2, sb1);
     }
     __syncthreads();
-    _Pragma("unroll") for (pots_u32 rr = 0; rr < POTS_RPW; rr++) {
-      if ((live >> rr) & 1u) {
-        const pots_u32 b = B.e_of[rr];
-        const int guard = (B.guardm >> rr) & 1u;
-        const float *xr = sx + ((SW == POTS_SW_P ? b * B.rb : 0u) + B.row_of[rr]) * POTS_XPAD;
-        const float *yb = sy + b * K_CHUNK * POTS_YP;
-        pots_u32 ncs = ncols;
-        if (SW == POTS_SW_P) {
-          const pots_i64 lf = B.pcols[rr] - c0;
-          ncs = lf <= 0 ? 0u : (lf < (pots_i64)TILE_COLS ? (pots_u32)lf : TILE_COLS);
-        }
-        for (pots_u32 c = lane; c < ncs; c += 32u) {
-          const float x = xr[c];
-          if (SW == POTS_SW_P) {
-            pots_upd_p(x, yb + c, POTS_YP, nj, L.acc[rr], first, guard, &L.ed[rr], &L.e2[rr]);
-          } else if (SW == POTS_SW_BIAS) {
-            pots_upd_bias(x, yb + c, POTS_YP, nj, L.acc[rr], first, guard, &L.ed[rr], &L.e2[rr]);
-          } else if ((B.akind >> rr) & 1u) {
-            pots_upd_a(x, yb + c, POTS_YP, nj, L.acc[rr], first, guard,
-                       first ? sb2[b * TILE_COLS + c] : 0.0f,
-                       (first && guard) ? sb1[b * TILE_COLS + c] : 0.0f, &L.e1[rr], &L.e2[rr]);
-          } else {
-            pots_upd_b(x, yb + c, POTS_YP, nj, L.acc[rr], first, guard, &L.e1[rr], &L.e2[rr]);
+    for (pots_u32 c = lane; c < ncols; c += 32u) {
+      pots_u32 cur = 0xffffffffu; // the entry whose values are in yv
+      float yv[K_CHUNK];
+      float b2c = 0.0f, b1c = 0.0f;
+      _Pragma("unroll") for (pots_u32 rr = 0; rr < POTS_RPW; rr++) {
+        if ((live >> rr) & 1u) {
+          const pots_u32 b = B.e_of[rr];
+          const int guard = (B.guardm >> rr) & 1u;
+          const int akind = (B.akind >> rr) & 1u;
+          bool in = true;
+          if (SW == POTS_SW_P) in = (pots_i64)c0 + (pots_i64)c < B.pcols[rr];
+          if (in) {
+            if (b != cur) {
+              cur = b;
+              const float *yb = sy + b * K_CHUNK * POTS_YP + c;
+              _Pragma("unroll") for (pots_u32 j = 0; j < K_CHUNK; j++) yv[j] = j < nj ? yb[j * POTS_YP] : 0.0f;
+              if (SW == POTS_SW_SHARED && first && akind) {
+                b2c = sb2[b * TILE_COLS + c];
+                b1c = guard ? sb1[b * TILE_COLS + c] : 0.0f;
+              }
+            }
+            const float x = sx[((SW == POTS_SW_P ? b * B.rb : 0u) + B.row_of[rr]) * POTS_XPAD + c];
+            if (SW == POTS_SW_P) {
+              pots_upd_p(x, yv, 1, nj, L.acc[rr], first, guard, &L.ed[rr], &L.e2[rr]);
+            } else if (SW == POTS_SW_BIAS) {
+              pots_upd_bias(x, yv, 1, nj, L.acc[rr], first, guard, &L.ed[rr], &L.e2[rr]);
+            } else if (akind) {
+              pots_upd_a(x, yv, 1, nj, L.acc[rr], first, guard, b2c, b1c, &L.e1[rr], &L.e2[rr]);
+            } else {
+              pots_upd_b(x, yv, 1, nj, L.acc[rr], first, guard, &L.e1[rr], &L.e2[rr]);
+            }
           }
         }
       }
@@ -455,7 +614,7 @@ static __device__ __forceinline__ void pots_measure_item2(const pots_mprod_t *t,
 // One level (FS38b): a block is a run of RB rows of one read group (a phase-2 group is one
 // block, its warps taking the 5 + k items); the group's entries are run E_MAX at a time, each
 // batch reading the shared view's tiles once for all its entries.
-extern "C" __global__ void __launch_bounds__(POTS_MK_WARPS * 32) pots_measure_level(
+extern "C" __global__ void __launch_bounds__(POTS_MK_WARPS * 32, 2) pots_measure_level(
     pots_mlargs_t A) {
   __shared__ float s_x[ROWS_PER_BLOCK * POTS_XPAD];
   __shared__ float s_y[E_MAX * K_CHUNK * POTS_YP];
