@@ -148,7 +148,7 @@ def test_a_refusal_leaves_the_caches_alone(monkeypatch):
     monkeypatch.setattr(mk.gb, "_nvrtc", lambda: None)
     monkeypatch.setattr(mk.native, "cache_dir", lambda: None)
     mk._built.cache_clear()
-    mk._built((8, 6))
+    mk._built((8, 6), 16)
     with pytest.raises(ValueError):
         mk.set_geometry(tile_cols=33)
     assert mk._built.cache_info().currsize == 1
@@ -161,14 +161,14 @@ def test_a_change_clears_the_loaded_kernel_caches(monkeypatch):
     monkeypatch.setattr(mk.gb, "_nvrtc", lambda: None)
     monkeypatch.setattr(mk.native, "cache_dir", lambda: None)
     mk._built.cache_clear()
-    mk._built((8, 6))
-    mk._built((8, 6))
+    mk._built((8, 6), 16)
+    mk._built((8, 6), 16)
     assert calls == [(8, 6)] and mk._built.cache_info().currsize == 1
     mk.set_geometry()  # no change: the cache stays
     assert mk._built.cache_info().currsize == 1
     mk.set_geometry(tile_cols=96)
     assert mk._built.cache_info().currsize == 0 and mk._kernels.cache_info().currsize == 0
-    mk._built((8, 6))
+    mk._built((8, 6), 16)
     assert calls == [(8, 6), (8, 6)]
     mk._built.cache_clear()
 
@@ -242,3 +242,33 @@ def test_set_geometry_checks_the_shared_memory_with_e_max_and_the_rows_against_i
     mk.set_geometry(rows_per_block=8, tile_cols=64, k_chunk=40)  # 4*40*65 floats fit
     with pytest.raises(ValueError):
         mk.set_geometry(k_chunk=70)  # 4 * 70 * 65 * 4 bytes: over 48 KB
+
+
+# ---- K_CHUNK follows the table's k (the cap is the geometry's) ----
+
+def test_a_build_sizes_k_chunk_to_k_under_the_cap():
+    assert mk.K_CHUNK == 16
+    assert [mk.chunk_for(k) for k in (1, 9, 16, 17, 64)] == [1, 9, 16, 16, 16]
+    assert mk.chunk_for(None) == 16
+    mk.set_geometry(k_chunk=4)
+    assert [mk.chunk_for(k) for k in (1, 3, 4, 9)] == [1, 3, 4, 4]
+
+
+def test_build_options_carry_the_given_k_chunk_and_default_to_the_cap():
+    assert "-DK_CHUNK=16u" in mk.build_options()
+    assert "-DK_CHUNK=9u" in mk.build_options(9)
+    assert "-DK_CHUNK=9u" not in mk.build_options()
+    assert mk.build_options(9) != mk.build_options(16)  # another CUBIN in the cache
+
+
+def test_each_k_chunk_is_its_own_build_and_kernel_object(monkeypatch):
+    seen = []
+    monkeypatch.setattr(mk, "build", lambda nvrtc, cc, **kw: seen.append(kw["k_chunk"]) or object())
+    monkeypatch.setattr(mk.gb, "_nvrtc", lambda: None)
+    monkeypatch.setattr(mk.native, "cache_dir", lambda: None)
+    mk._built.cache_clear()
+    mk._built((8, 6), 9)
+    mk._built((8, 6), 9)
+    mk._built((8, 6), 16)
+    assert seen == [9, 16]
+    mk._built.cache_clear()

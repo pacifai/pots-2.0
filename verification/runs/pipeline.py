@@ -680,7 +680,7 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
         for d in dict.fromkeys(torch.device(x) for x in (c.placement.devices or ())
                                if _is_cuda(x)):
             GpuBlake3().kernels(d)
-            measure_kernel.kernels(d)
+            measure_kernel.kernels(d, verifier.k)
         if verifier.start_run(dataset) is not None:
             link.stop(grace=0)
             result.verdict = verifier.end_run(final)

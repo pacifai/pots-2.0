@@ -62,7 +62,7 @@ OPTIONS = ("--fmad=false",)
 WARPS = 8  # warps per block, POTS_MK_WARPS in the .cu
 ROWS_PER_BLOCK = 32  # rows of a view per block (a multiple of WARPS), a -D option of the .cu
 TILE_COLS = 64  # columns per shared-memory tile (a multiple of 32), a -D option
-K_CHUNK = 16  # challenge columns per sweep, a -D option
+K_CHUNK = 16  # cap on the challenge columns per sweep; a build uses min(k, K_CHUNK) (chunk_for)
 E_MAX = 4  # entries of a read group swept together (one row tile feeds them all), a -D option
 SHARED_LIMIT = 48 * 1024  # static shared memory per block
 MAX_BLOCKS = 1 << 22
@@ -143,11 +143,21 @@ def set_geometry(*, rows_per_block: int | None = None, tile_cols: int | None = N
     return prev
 
 
-def build_options() -> tuple[str, ...]:
+def chunk_for(k: int | None) -> int:
+    """The ``K_CHUNK`` macro of a build for ``k`` challenge columns: ``min(k, K_CHUNK)``, so the
+    accumulator arrays are exactly ``k`` wide when ``k`` is under the cap (``k=9``: nine, not
+    sixteen behind a predicate). ``K_CHUNK`` (:func:`set_geometry`'s ``k_chunk``) stays the cap;
+    without ``k`` the build is the cap's. The chunking never changes a bit."""
+    return K_CHUNK if k is None else max(1, min(int(k), K_CHUNK))
+
+
+def build_options(k_chunk: int | None = None) -> tuple[str, ...]:
     """The NVRTC options of the current geometry: ``--fmad=false`` and the five ``-D`` macros
-    (part of the cache key, so another geometry is another CUBIN)."""
+    (part of the cache key, so another geometry, or another ``k_chunk``, is another CUBIN).
+    ``k_chunk`` is the ``K_CHUNK`` value (default: the cap)."""
+    kc = K_CHUNK if k_chunk is None else k_chunk
     return (*OPTIONS, f"-DPOTS_MK_WARPS={WARPS}u", f"-DROWS_PER_BLOCK={ROWS_PER_BLOCK}u",
-            f"-DTILE_COLS={TILE_COLS}u", f"-DK_CHUNK={K_CHUNK}u", f"-DE_MAX={E_MAX}u")
+            f"-DTILE_COLS={TILE_COLS}u", f"-DK_CHUNK={kc}u", f"-DE_MAX={E_MAX}u")
 
 
 # ---- the build ----
@@ -164,10 +174,11 @@ def source_hash() -> str:
 
 
 def build(nvrtc: gb.Nvrtc, cc: tuple[int, int], *, cache: Path | None = None,
-          use_cache: bool = True) -> gb.Built:
-    """The compiled image for compute capability ``cc`` (cached in ``cache`` when given)."""
+          use_cache: bool = True, k_chunk: int | None = None) -> gb.Built:
+    """The compiled image for compute capability ``cc`` and ``K_CHUNK = k_chunk`` (default: the
+    cap), cached in ``cache`` when given: one image per ``K_CHUNK`` value."""
     return gb.build_image(nvrtc, cc, cache=cache, use_cache=use_cache, source=source(),
-                          extra_options=build_options())
+                          extra_options=build_options(k_chunk))
 
 
 class MeasureKernels:
@@ -196,16 +207,16 @@ class MeasureKernels:
 
 
 @functools.lru_cache(maxsize=None)
-def _built(cc: tuple[int, int]) -> gb.Built:
-    return build(gb._nvrtc(), cc, cache=native.cache_dir())
+def _built(cc: tuple[int, int], kc: int) -> gb.Built:
+    return build(gb._nvrtc(), cc, cache=native.cache_dir(), k_chunk=kc)
 
 
 @functools.lru_cache(maxsize=None)
-def _kernels(ordinal: int) -> MeasureKernels:
+def _kernels(ordinal: int, kc: int) -> MeasureKernels:
     driver = gb._driver()
     dev = driver.device(ordinal)
     cc = driver.compute_capability(dev)
-    built = _built(cc)
+    built = _built(cc, kc)
     try:
         return MeasureKernels(driver, dev, built)
     except RuntimeError:
@@ -213,13 +224,14 @@ def _kernels(ordinal: int) -> MeasureKernels:
             raise
         built.forget()  # a cached image the driver rejects: compile afresh once
         return MeasureKernels(driver, dev, build(gb._nvrtc(), cc, cache=native.cache_dir(),
-                                                 use_cache=False))
+                                                 use_cache=False, k_chunk=kc))
 
 
-def kernels(device: torch.device | str) -> MeasureKernels:
-    """``device``'s kernel, compiled (or loaded from the cache) on the first call."""
+def kernels(device: torch.device | str, k: int | None = None) -> MeasureKernels:
+    """``device``'s kernel for ``k`` challenge columns (``K_CHUNK = chunk_for(k)``; without
+    ``k``, the cap's), compiled (or loaded from the cache) on the first call per ``K_CHUNK``."""
     index = torch.device(device).index
-    return _kernels(torch.cuda.current_device() if index is None else index)
+    return _kernels(torch.cuda.current_device() if index is None else index, chunk_for(k))
 
 
 # ---- the table ----
@@ -697,7 +709,7 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
         plan_out.append(plan)
     with torch.cuda.stream(stream):
         table.copy_(host, non_blocking=True)
-        (run if run is not None else kernels(device).run)(work, stream.cuda_stream)
+        (run if run is not None else kernels(device, k).run)(work, stream.cuda_stream)
         event = torch.cuda.Event()
         event.record(stream)
     inputs = [t for grp in groups for t in (grp.a, grp.b, grp.p, grp.bias) if t is not None]

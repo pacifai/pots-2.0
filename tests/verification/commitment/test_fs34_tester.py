@@ -848,7 +848,7 @@ def _preload_order(monkeypatch, pipelined):
     monkeypatch.setattr(mod, "_is_cuda" if pipelined else "_on_cuda", lambda d: True)
     monkeypatch.setattr(mod, "GpuBlake3", lambda: type(
         "G", (), {"kernels": lambda s, d: order.append(("hash", str(d)))})())
-    monkeypatch.setattr(measure_kernel, "kernels", lambda d: order.append(("measure", str(d))))
+    monkeypatch.setattr(measure_kernel, "kernels", lambda d, k=None: order.append(("measure", str(d))))
     assert _scenario_run(pipelined).loop.verdict.accepted
     return order
 

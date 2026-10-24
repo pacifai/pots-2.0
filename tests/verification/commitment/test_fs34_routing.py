@@ -355,7 +355,7 @@ def test_the_pipelined_parent_builds_both_kernels_once_per_cuda_device_before_st
     monkeypatch.setattr(P, "GpuBlake3",
                         lambda: type("G", (), {"kernels": lambda s, d:
                                                calls.append(("hash", d))})())
-    monkeypatch.setattr(measure_kernel, "kernels", lambda d: calls.append(("measure", d)))
+    monkeypatch.setattr(measure_kernel, "kernels", lambda d, k=None: calls.append(("measure", d)))
     real = Verifier.verify_step
 
     def first(self, t, store):

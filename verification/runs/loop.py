@@ -292,7 +292,7 @@ def run_loop(
     for d in dict.fromkeys(torch.device(x) for x in (device, *(c.placement.devices or ()))
                            if _on_cuda(x)):
         GpuBlake3().kernels(d)
-        measure_kernel.kernels(d)  # check 5's fused measuring kernel (FS37)
+        measure_kernel.kernels(d, verifier.k)  # check 5's fused measuring kernel (FS37)
     if verifier.start_run(dataset) is not None:
         result.verdict = verifier.end_run(final)
         return result

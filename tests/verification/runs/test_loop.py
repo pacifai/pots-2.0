@@ -294,7 +294,7 @@ def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, kernel_calls
     monkeypatch.setattr(loop_mod, "_on_cuda", on_cuda)
     monkeypatch.setattr(loop_mod, "GpuBlake3", Warm)
 
-    def kernels(device):  # FS37's kernel, faked
+    def kernels(device, k=None):  # FS37's kernel, faked
         if kernel_calls is not None:
             kernel_calls.append((torch.device(device), len(log)))
 

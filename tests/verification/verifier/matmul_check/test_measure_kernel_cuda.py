@@ -185,9 +185,9 @@ def test_run_loop_builds_the_measuring_kernel_before_step_1_opens_a_section(monk
     log = []
     real = mk.kernels
 
-    def spy(device):
+    def spy(device, k=None):
         log.append(f"kernels {torch.device(device)}")
-        return real(device)
+        return real(device, k)
 
     monkeypatch.setattr(loop_mod.measure_kernel, "kernels", spy)
 
