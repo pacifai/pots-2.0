@@ -1070,14 +1070,16 @@ PAIR_SLOW_SELECT = "two_gpus or two_cuda_devices"
 FS34_TESTS_FILE = "tests/verification/runs/test_fs34_join_cuda.py"
 
 
-def _exit_probe_part(out: Path, timeout_s: float) -> Part:
-    """The exit probe (:func:`run_exit_probe`) as a part: it runs after the fast suite, writes one
-    JSON report and never counts toward ``pass`` (it is not in :data:`PAIR_PARTS`)."""
+def _exit_probe_part(out: Path, timeout_s: float, output_dir: Path) -> Part:
+    """The exit probe (:func:`run_exit_probe`) as a part: it runs after the fast suite, in the
+    fast suite's environment (``output_dir`` its ``VERIF_OUTPUT_DIR``), writes one JSON report
+    and never counts toward ``pass`` (it is not in :data:`PAIR_PARTS`)."""
     d = out / "parts" / EXIT_PROBE_NAME
     return Part(EXIT_PROBE_NAME, ["{python}", "-m", "verification.runs.fs11_session",
                                   "exit-probe", "--out", str(d), "--budget-s",
                                   str(timeout_s - EXIT_PROBE_MIN_S)],
-                env={"VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
+                env={"VERIF_OUTPUT_DIR": str(output_dir), "VERIF_VERIFIER_DEVICES": None,
+                     "VERIF_PIPELINED": None},
                 timeout_s=timeout_s, kind="exit_probe",
                 info={"report": str(d / EXIT_PROBE_REPORT)})
 
@@ -1171,7 +1173,8 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
     honest = f"honest-{pin.repo.split('/')[-1]}-{SMOLLM2_TASK}-bpr0-s{SMOLLM2_SEED}"
     steps = ("--steps", str(PAIR_STEPS), "--keep-step", str(PAIR_STEPS), "--no-metrics")
     plan = [peer_check_part(out), _models_part(upload, out, t["models"]),
-            pytest_part("fast_suite", t["fast_suite"]), _exit_probe_part(out, t["exit_probe"]),
+            pytest_part("fast_suite", t["fast_suite"]),
+            _exit_probe_part(out, t["exit_probe"], _run_dir(out, upload, key, "pytest")),
             pytest_part("two_gpu_slow", t["two_gpu_slow"], "-m", "slow", "-k", PAIR_SLOW_SELECT),
             _fs34_tests_part(out, t["fs34_tests"], _run_dir(out, upload, key, "pytest")),
             part("smollm2_calibrate", "calibrate", home, t["calibrate"],
@@ -2281,6 +2284,11 @@ EXIT_HANG_GRACE_S = 180  # a pytest part's process may outlive its junit report 
 PROBE_HANG_GRACE_S = 60  # the same, for one run of the exit probe (:func:`run_exit_probe`)
 STACKS_WAIT_S = 5  # after SIGUSR1, the process gets this long to write its stacks
 STACKS_ENV = "POTS_STACKS_FILE"  # ``tests/exit_guard.py``: where a pytest process dumps stacks
+GRACE_ENV = "POTS_EXIT_GRACE_S"  # ``tests/exit_guard.py``: its watchdog's seconds after the run
+# The watchdog's grace under the session: the watch's own grace plus this, so the watch takes the
+# /proc snapshot (every native thread, the kernel's wait) while the process still hangs; the
+# watchdog's dump holds Python threads only and ends the process before the watch could look.
+GUARD_LAG_S = 120
 PROC = "/proc"  # where :func:`proc_snapshot` reads (a test points it at a fake tree)
 
 
@@ -2427,6 +2435,7 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
     junit = Path(part.info["junit"]) if part.info.get("junit") else None
     if junit is not None:
         penv[STACKS_ENV] = str(log.parent / "stacks.txt")
+        penv[GRACE_ENV] = str(EXIT_HANG_GRACE_S + GUARD_LAG_S)
     t0 = time.time()
     limit = deadline if part.timeout_s is None else min(deadline, t0 + part.timeout_s)
     with open(log, "ab") as f:
@@ -2547,7 +2556,8 @@ def run_exit_probe(out: Path, modules: Sequence[str], *, cwd: Path, python: str,
             return {**rec, "status": "not_started", "reason": "the part's budget was spent"}
         t0 = time.time()
         limit = t0 + (left if cap_s is None else min(left, cap_s)) - 5
-        env = {**os.environ, STACKS_ENV: str(d / "stacks.txt")}
+        env = {**os.environ, STACKS_ENV: str(d / "stacks.txt"),
+               GRACE_ENV: str(grace_s + GUARD_LAG_S)}
         with open(d / "log.txt", "ab") as f:
             proc = subprocess.Popen([python, "-m", "pytest", *pytest_args,
                                      f"--junitxml={junit}", *mods], cwd=cwd, env=env,

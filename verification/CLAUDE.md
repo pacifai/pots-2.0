@@ -3099,6 +3099,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `EXIT_HANG_GRACE_S` (180 s) later gets `parts/<name>/hang.txt` (a `/proc` snapshot),
     SIGUSR1 (stacks to `stacks.txt`) and a kill, and ends `exit_hang`, a failure like every status
     other than `ok` and `skipped_done`; `killed_timeout` and `killed_deadline` get the snapshot.
+    Under the session the guard's watchdog (`POTS_EXIT_GRACE_S`) waits `GUARD_LAG_S` (120 s) past
+    the watch's grace, so the snapshot of every native thread is taken while the process hangs.
     Every part's `info["gpu_peak"]` makes `_run_part` run a `_GpuPeaks` sampler
     (`parts/<name>/gpu_peak.json`, `gpu_peak_mib` in the part's extras). `fs32_pair(parts)` goes
     to `summary.json["fs32_pair"]` and `_pair_lines` ends the job log, one line per acceptance

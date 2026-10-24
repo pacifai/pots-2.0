@@ -124,6 +124,7 @@ def test_run_part_ends_an_exit_hang_and_sets_the_stacks_file(tmp_path, monkeypat
     part, junit = _part(tmp_path, "import sys, time, os\n"
                         "open(sys.argv[1], 'w').write('x')\n"
                         "print('STACKS=' + os.environ['POTS_STACKS_FILE'], flush=True)\n"
+                        "print('GRACE=' + os.environ['POTS_EXIT_GRACE_S'], flush=True)\n"
                         "time.sleep(300)")
     log = tmp_path / "parts" / "p" / "log.txt"
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +134,8 @@ def test_run_part_ends_an_exit_hang_and_sets_the_stacks_file(tmp_path, monkeypat
     assert status == "exit_hang" and wall < 60 and time.time() - t0 < 60
     text = log.read_text()
     assert f"STACKS={log.parent / 'stacks.txt'}" in text and "hung at exit" in text
+    # the guard's watchdog waits past the watch, so the watch's /proc snapshot comes first
+    assert f"GRACE={2 + fs.GUARD_LAG_S}" in text and fs.GUARD_LAG_S > 0
     assert (log.parent / "hang.txt").exists()
 
 
