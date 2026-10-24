@@ -448,6 +448,13 @@ static __device__ __forceinline__ void pots_sweep(const pots_batch_t &B, const p
   const pots_i64 cols = SW == POTS_SW_P ? B.pmax : vw->cols;
   const int mode = SW == POTS_SW_P ? 0 : pots_mode(vw);
   pots_tile_regs_t R;
+  // Prefetch (shared and bias sweeps): tile 0's global loads are issued here, and each later
+  // tile's right after the barrier that follows the scatter of the one before, so they are in
+  // flight while the lanes compute. Only the order of the loads changes, never a value.
+  if (SW != POTS_SW_P && cols > 0) {
+    const pots_i64 l0 = cols < (pots_i64)TILE_COLS ? cols : (pots_i64)TILE_COLS;
+    pots_gather_shared<SW>(B, vw, mode, 0, (pots_u32)l0, j0, nj, first, R);
+  }
   for (pots_i64 c0 = 0; c0 < cols; c0 += TILE_COLS) {
     const pots_i64 left = cols - c0;
     const pots_u32 ncols = left < (pots_i64)TILE_COLS ? (pots_u32)left : TILE_COLS;
@@ -466,10 +473,14 @@ static __device__ __forceinline__ void pots_sweep(const pots_batch_t &B, const p
         pots_scatter_r(nj, ncb, R.v[0], sy + b * K_CHUNK * POTS_YP);
       }
     } else {
-      pots_gather_shared<SW>(B, vw, mode, c0, ncols, j0, nj, first, R);
       pots_scatter_shared<SW>(B, mode, ncols, nj, first, R, sx, sy, sb2, sb1);
     }
     __syncthreads();
+    if (SW != POTS_SW_P && c0 + (pots_i64)TILE_COLS < cols) {
+      const pots_i64 ln = cols - (c0 + (pots_i64)TILE_COLS);
+      pots_gather_shared<SW>(B, vw, mode, c0 + (pots_i64)TILE_COLS,
+                             ln < (pots_i64)TILE_COLS ? (pots_u32)ln : TILE_COLS, j0, nj, first, R);
+    }
     for (pots_u32 c = lane; c < ncols; c += 32u) {
       pots_u32 cur = 0xffffffffu; // the entry whose values are in yv
       float yv[K_CHUNK];
