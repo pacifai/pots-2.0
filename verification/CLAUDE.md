@@ -1765,7 +1765,10 @@ interface.
     assertion; rejects `None`, `"provisional"` and mixed hashes).
   - `band_context(cfg, c, *, h_D, k)`: the run a band file is fitted for, which `calibrate`
     writes and every loader compares: model and revision, `(MASTER_DTYPE, COMPUTE_DTYPE)`,
-    `attn_impl`, device, `h_D`, `n_s`, `n`, `η`, `M`, `T_run` (`VERIF_STEPS`) and `k`. It also
+    `attn_impl`, the device type (`torch.device(cfg.device).type`: `cuda` for both `cuda` and
+    `cuda:0`, so a file fitted at the full-scale `VERIF_DEVICE=cuda` judges the four-GPU layout's
+    `cuda:0`; the GPU models are compared beside it), `h_D`, `n_s`, `n`, `η`, `M`, `T_run`
+    (`VERIF_STEPS`) and `k`. It also
     holds `calibration_seed` (`VERIF_SEED`) and `threads` (`VERIF_THREADS`), both in
     `PROVENANCE_KEYS`: kept in the file, never compared. The bands describe rounding noise on
     honest steps, which doesn't depend on `π`, so a run at seed 2–5 loads the file fitted at
