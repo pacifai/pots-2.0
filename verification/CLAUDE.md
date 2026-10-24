@@ -31,10 +31,13 @@ details that don't change what is committed or checked are yours to choose.
   (`-m "not slow"`). Keep the fast suite under about a minute. The full-scale slow tests
   (FS4, `tests/verification/full_scale_helpers.py`) skip when the model's weights aren't in the
   local Hugging Face cache; no test downloads.
-  `tests/conftest.py` arms `tests/exit_guard.py` as pytest's last hook: it kills child
-  processes still running, and 120 s later, if the interpreter has not exited (a non-daemon
-  thread or child holds it), prints every thread's stack to stderr and exits with the run's
-  status. The pair session's fast suite once sat 20 minutes after its summary line.
+  `tests/conftest.py` arms `tests/exit_guard.py` as pytest's last hook (`pytest_unconfigure`): it
+  kills child processes still running and starts faulthandler's C watchdog, which runs without
+  the GIL through interpreter teardown; 120 s later (`POTS_EXIT_GRACE_S`), if the interpreter
+  has not exited, it prints every thread's stack and exits with status 1. A daemon-thread timer
+  cannot run in teardown, which is why the earlier guard printed nothing. The guard also
+  registers SIGUSR1 to dump all stacks on demand. Both write to `POTS_STACKS_FILE` when it is
+  set, else to stderr. The pair session's fast suite sat 20 minutes after its summary line.
 - **Style.**
   - Use ordinary importable libraries with type hints and no import-time side effects (S7b).
   - Entry points read env vars through `setup/config.py` and `verification/parameters.py`,
@@ -109,7 +112,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (ยง8.A.5).
 `setup/backdoorllm.py`, and setting either raises.
 
 One variable is outside that scheme: `POTS_NATIVE_CACHE`, the directory holding the native
-BLAKE3 sources and library (`commitment/native.py`), default `~/.cache/pots-2.0/native`. Another is `POTS_SAMPLER`: `0` turns off the per-part sampler
+BLAKE3 sources and library (`commitment/native.py`), default `~/.cache/pots-2.0/native`. `POTS_STACKS_FILE` is the file the exit guard writes stacks to (`fs11_session` sets it for pytest parts) and `POTS_EXIT_GRACE_S` the watchdog's seconds (default 120). Another is `POTS_SAMPLER`: `0` turns off the per-part sampler
 (`setup/sampler.py`) that `fs11_session` starts beside each part; default on. Its file is
 `<part dir>/samples.jsonl`.
 
@@ -3088,6 +3091,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     `peer_check`, `models` and the native build included, unsets `VERIF_PIPELINED`), and records
     `step_times` (prover, verifier, hand-off, total per step, per arm) and `gpu_peak` (per
     part), outside `pass`. `pair_default_deadline_s()` is the job's default deadline.
+    The exit probe (`exit_probe`, kind `exit_probe`, not in `PAIR_PARTS`, so never in `pass`)
+    follows the fast suite: `run_exit_probe` runs each module of `EXIT_PROBE_MODULES` in its own
+    pytest process, then the whole list in one if none hung, writes `exit_probe.json` and the
+    job-log line `FS32 exit probe: N of M runs hung at exit: ...`. `_run_part` and the probe
+    share `watch_process`: a pytest part whose junit exists and which is still running
+    `EXIT_HANG_GRACE_S` (180 s) later gets `parts/<name>/hang.txt` (a `/proc` snapshot),
+    SIGUSR1 (stacks to `stacks.txt`) and a kill, and ends `exit_hang`, a failure like every status
+    other than `ok` and `skipped_done`; `killed_timeout` and `killed_deadline` get the snapshot.
     Every part's `info["gpu_peak"]` makes `_run_part` run a `_GpuPeaks` sampler
     (`parts/<name>/gpu_peak.json`, `gpu_peak_mib` in the part's extras). `fs32_pair(parts)` goes
     to `summary.json["fs32_pair"]` and `_pair_lines` ends the job log, one line per acceptance
@@ -3182,7 +3193,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
+    21,200 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
     session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,
     packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
