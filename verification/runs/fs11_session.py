@@ -1290,7 +1290,9 @@ def four_default_deadline_s() -> int:
 def four_h100_plan(upload: Path, out: Path) -> list[Part]:
     """The four-H100 session's parts. The F22 peer-copy byte check first (the native build runs
     ahead of it); the models part; ``four_tests``, one pytest part with a junit report running
-    the slow two-GPU tests (:data:`PAIR_SLOW_SELECT`), FS34's file and :data:`FOUR_TEST_FILES`;
+    the slow two-GPU tests (:data:`PAIR_SLOW_SELECT`), FS34's file and :data:`FOUR_TEST_FILES`,
+    on SmolLM2's test-scale data (its run
+    directory's ``data/`` link, as the pair plan's pytest parts have it);
     the probe on all four GPUs (``VERIF_DEVICE`` GPU 0, :data:`FOUR_VERIFIERS` the rest, 60 s per
     device); then, per model cheapest first, on the refusal task at :data:`FULL_SCALE_ENV` plus
     :data:`RECHECK_ENV`: ``card_<key>`` (``card_identity`` on GPU 0 alone, one card's proved
@@ -1299,7 +1301,8 @@ def four_h100_plan(upload: Path, out: Path) -> list[Part]:
     directory. Only the ``pipe_*`` parts set ``VERIF_PIPELINED``. Every part records its GPUs'
     peak memory."""
     t = FOUR_TIMEOUT_S
-    first = data_key(FOUR_PINS[0][0], BRING_UP_TASK)
+    from setup.data import TEST_SCALE_TOKENIZER as pin  # the tests' model: SmolLM2
+    small = data_key(pin.repo, SMOLLM2_TASK)
     sharded = {"VERIF_DEVICE": FOUR_PROVER, "VERIF_VERIFIER_DEVICES": FOUR_VERIFIERS}
     junit = out / "parts" / "four_tests" / "junit.xml"
     expr = " or ".join([f"(slow and ({PAIR_SLOW_SELECT}))",
@@ -1307,7 +1310,7 @@ def four_h100_plan(upload: Path, out: Path) -> list[Part]:
     tests = Part("four_tests", ["{python}", "-m", "pytest", "-rf", "-q", f"--junitxml={junit}",
                                 "-p", "no:cacheprovider", "-m", "slow or not slow", "-k", expr],
                  env={**PCI_ORDER_ENV,
-                      "VERIF_OUTPUT_DIR": str(_run_dir(out, upload, first, "four_pytest")),
+                      "VERIF_OUTPUT_DIR": str(_run_dir(out, upload, small, "four_pytest")),
                       "VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
                  timeout_s=t["four_tests"], kind="four_tests", info={"junit": str(junit)})
     report = out / "probe" / "probe.json"

@@ -149,6 +149,19 @@ def test_the_tests_part_selects_the_slow_tests_fs34_and_the_new_files(tmp_path):
     assert probe.env["VERIF_PIPELINED"] is None
 
 
+def test_the_tests_part_runs_on_smollm2s_test_scale_data(tmp_path):
+    from setup.data import TEST_SCALE_TOKENIZER as pin
+    up, out = tmp_path / "up", tmp_path / "out"
+    plan = {p.name: p for p in fs.four_h100_plan(up, out)}
+    pair = {p.name: p for p in fs.fs32_pair_plan(up, out)}
+    key = fs.data_key(pin.repo, fs.SMOLLM2_TASK)
+    run_dir = Path(plan["four_tests"].env["VERIF_OUTPUT_DIR"])
+    assert (run_dir / "data").resolve() == (up / "data" / key).resolve()
+    pair_dir = next(Path(p.env["VERIF_OUTPUT_DIR"]) for p in pair.values()
+                    if p.argv[:3] == ["{python}", "-m", "pytest"])
+    assert (pair_dir / "data").resolve() == (run_dir / "data").resolve()
+
+
 def test_the_session_is_a_multi_gpu_session_with_a_peer_check_first(tmp_path):
     assert "four-h100" in fs.MULTI_GPU_SESSIONS and "four-h100" in fs.SESSIONS
     name, build = fs.SESSIONS["four-h100"]
@@ -515,7 +528,8 @@ def test_the_log_lines_all_good():
     per = lines[n:-1]
     assert len(per) == 2 * len(KEYS)
     assert per[0] == (f"FS35 {KEYS[0]} seq: steady step 2.5 s (step_wall, mean of steps 2-3); "
-                      "accumulated GPU time 17.0 s (mean of steps 2-3); GPU peaks 0: 39.1 GiB, 1: 19.5 GiB, 2: 20.5 GiB, 3: 21.5 GiB")
+                      "accumulated GPU time 17.0 s (mean of steps 2-3); GPU peaks "
+                      "0: 39.1 GiB, 1: 19.5 GiB, 2: 20.5 GiB, 3: 21.5 GiB")
     assert per[1].startswith(f"FS35 {KEYS[0]} pipe: steady step 2.5 s")
     assert lines[-1].startswith("FS35 peer rates (probe, 12 pairs): slowest cuda:0->cuda:1 ")
     assert "fastest cuda:3->cuda:2" in lines[-1]

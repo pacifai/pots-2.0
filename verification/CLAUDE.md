@@ -2130,7 +2130,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     change nothing. The counting pass and `trace_step` refuse (one process). `step` stays work (the
     sum); a merged step adds the `step_wall` total, its wall extent (its `gpu_held_s` is wall times
     devices, idle gap included: not work). EQ14's numbers read wall time (`step_wall`) beside
-    GPU-seconds (`gpu_held_s`), as F22 says.
+    accumulated GPU time per role, as F22 says. `gpu_held_s` is only an upper bound on held GPU
+    time (a section's time times every device its process lists); the measure is computed by the
+    four-H100 session's summary from the per-side `total` rows and `gpu_roles`
+    (`fs11_session._accumulated_gpu_s`).
   - **Prover rows (EQ1b).**
     - P0, original training: `P0.load`, `P0.forward`, `P0.backward`, `P0.update`, emitted only
       by `plain_step` (the plain baseline, B7).
@@ -2176,10 +2179,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `name`, `uuid` (`GPU-â€¦`, as in the machine record's `gpus`) and `roles` (`["prover"]`,
     `["verifier"]`, or both: an unsharded run, or `cuda:0` in the pair layout). The machine
     record's `gpus` (`setup/machine.py`) lists every torch device, joined to its `nvidia-smi`
-    row by PCI bus id, never by position. Every UUID in the machine record's `gpus`, the
-    environment record's `gpu_roles`, `probe.json`'s `per_device` and `card_identity` comes
-    from one helper, `setup.machine.torch_gpu_uuid` (`smi_uuid_form` adds `GPU-` once, never
-    twice); the pod test `tests/setup/test_machine_cuda.py` checks them equal to
+    row by PCI bus id, never by position. The machine record's `gpus` prefers `nvidia-smi`'s
+    UUID from the matched row and uses `setup.machine.torch_gpu_uuid` to join rows (after the
+    bus id) and as the fallback; the environment record's `gpu_roles`, `probe.json`'s
+    `per_device` and `card_identity` take theirs from that helper (`smi_uuid_form` adds `GPU-`
+    once, never twice); the pod test `tests/setup/test_machine_cuda.py` checks them equal to
     `nvidia-smi`'s by index. `bring_up` prints the allocator settings as a line,
     `allocator: {â€¦}`. Every run that writes `corpus`
     writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
@@ -3187,8 +3191,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     not lift that) and, without `FS11_ALLOW_ANY_GPU=1`, a machine with no H100. Parts: the
     native build, `peer_check`, `models`, `four_tests` (one pytest part with a junit report:
     the slow multi-GPU tests, `FS34_TESTS_FILE` and `FOUR_TEST_FILES`, selected by `-k` under
-    `-m "slow or not slow"`; the `-k` text is built from `PAIR_SLOW_SELECT`), `probe` (on all
-    four GPUs, `--seconds 60`; it and `four_tests` run with `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+    `-m "slow or not slow"`; the `-k` text is built from `PAIR_SLOW_SELECT`; it runs on SmolLM2's
+    test-scale data: its run directory's `data/` link is the pair plan's `data_key`), `probe`
+    (on all four GPUs, `--seconds 60`; it and `four_tests` run with `CUDA_DEVICE_ORDER=PCI_BUS_ID`
     like the card and arm parts, `PCI_ORDER_ENV`), then per model,
     cheapest first, `card_<key>` (`card_identity` on GPU 0 alone), `seq_<key>` and `pipe_<key>`
     (`llama_step --steps 3 --metrics --no-count`, each in its own run directory; only `pipe_*`
