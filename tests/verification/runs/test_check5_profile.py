@@ -160,4 +160,4 @@ def test_profile_of_a_fake_sharded_cpu_run(env, stored):  # noqa: F811
     p = cp.profile(c, ks, env.bands, seed=SEED, h_D=env.h_D, n_records=len(env.D), k=K,
                    repeats=1, out=QUIET)
     assert p.accepted and p.archive_equal and p.cuda is None and p.devices == ["cpu"]
-    assert "devices" in p.as_record()
+    assert "devices" not in p.as_record()  # the record keeps its keys

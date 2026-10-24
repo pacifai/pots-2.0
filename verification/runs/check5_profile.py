@@ -267,7 +267,8 @@ class Profile:
 
     def as_record(self) -> dict[str, Any]:
         return {"record": "check5_profile",
-                **{k: v for k, v in self.__dict__.items() if k != "section_s_per_pass"}}
+                **{k: v for k, v in self.__dict__.items()
+                   if k not in ("section_s_per_pass", "devices")}}
 
 
 def _sync(devices: torch.device | Sequence[torch.device]) -> None:
