@@ -4,8 +4,8 @@ One harness, two engines. ``mac`` switches ``freivalds.kernel_device`` on and re
 ``freivalds.measure_groups_rows`` by an emulation of the kernel: the table built by
 ``measure_kernel.prods_array`` / ``works_array`` exactly as ``enqueue`` builds it, the challenges
 of ``HostChallengeSource`` on the host, the scratch in a host buffer, and the rows from
-``pots_host_measure_phased`` (the kernel's work decomposition run on the host), or, for
-``share=True`` calls, ``pots_host_measure_levels`` (FS38b's level launches). Check 5's kernel
+``pots_host_measure_sweep`` (the level kernel's sweeps run on the host, FS37b) over
+``mk.read_plan`` (``share=True``, FS38b) or ``mk.plain_plan`` (``share=False``). Check 5's kernel
 path (views, blocks, row mapping, drain, verdict) then runs end to end on any machine with the
 kernel's arithmetic. ``cuda`` runs the same step on the GPU through the real kernel, wrapping
 ``measure_groups_rows`` to keep a host copy of every member it was handed.
@@ -91,21 +91,18 @@ def emulation(hostlib):
         scratch = np.zeros(mk.scratch_bytes(prods) + 8, dtype=np.uint8)
         works = mk.works_array(prods, (scratch.ctypes.data + 7) & ~7)
         rows = np.empty((len(prods), mt.row_width(k)), dtype=np.float64)
-        if share:
-            plan = mk.read_plan(prods)
-            hostlib.pots_host_measure_levels.argtypes = [
-                ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
-            hostlib.pots_host_measure_levels.restype = ctypes.c_int
-            err = hostlib.pots_host_measure_levels(
-                prods.ctypes.data, len(prods), works.ctypes.data, plan.reads.ctypes.data,
-                plan.level_off.ctypes.data, plan.n_levels, plan.entries.ctypes.data,
-                rows.ctypes.data, 0)
-            if isinstance(plan_out, list):
-                plan_out.append(plan)
-        else:
-            err = hostlib.pots_host_measure_phased(prods.ctypes.data, len(prods),
-                                                   works.ctypes.data, rows.ctypes.data, 0)
+        plan = mk.read_plan(prods) if share else mk.plain_plan(prods)
+        hostlib.pots_host_measure_sweep.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int]
+        hostlib.pots_host_measure_sweep.restype = ctypes.c_int
+        err = hostlib.pots_host_measure_sweep(
+            prods.ctypes.data, len(prods), works.ctypes.data, plan.reads.ctypes.data,
+            plan.level_off.ctypes.data, plan.n_levels, plan.entries.ctypes.data,
+            rows.ctypes.data, 64, 16, 0)
+        if share and isinstance(plan_out, list):
+            plan_out.append(plan)
         assert err == 0
         return torch.from_numpy(rows)
 

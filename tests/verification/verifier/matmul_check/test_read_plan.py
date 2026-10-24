@@ -411,3 +411,38 @@ def test_read_plan_on_10000_members_takes_under_a_second():
     took = time.perf_counter() - t0
     assert took < 1.0, f"read_plan took {took:.2f} s on {len(arr)} products"
     assert plan.shared_groups == members and plan.n_levels == 4 and not plan.cycle
+
+
+# ---- the plan without shared reads (FS37b) ----
+
+def test_plain_plan_is_three_levels_of_single_node_groups():
+    x = view(0x1000, 6, 5)
+    arr = table([prod(x, view(0x2000, 5, 4), 0x3000), prod(x, view(0x4000, 5, 7), 0x5000,
+                                                            bias_addr=0x6000),
+                 prod(view(0x7000, 3, 5), view(0x2000, 5, 4), 0x8000)])
+    shared = mk.read_plan(arr)
+    assert shared.shared_groups > 0
+    plan = mk.plain_plan(arr)
+    check_partition(arr, plan)
+    assert plan.n_levels == 3 and plan.shared_groups == 0 and not plan.cycle
+    groups = groups_of(plan)
+    assert all(len(es) == 1 for _, es, _, _ in groups)
+    for lv, es, _, count in groups:
+        (t, p), = es
+        assert lv == p
+        want = (int(arr[t]["b"]["rows"]) + (1 if arr[t]["flags"] & M_BIASED else 0), int(arr[t]["a"]["rows"]),
+                mk.ROW_FIXED + int(arr[t]["k"]))[p]
+        assert count == want
+    assert plan.node_level.tolist() == [[0, 1, 2]] * 3
+    for lv in range(3):  # the first of a level's groups starts at item 0, the sentinel totals
+        lo, hi = int(plan.level_off[lv]), int(plan.level_off[lv + 1])
+        assert plan.reads["first"][lo] == 0
+        assert plan.reads["first"][hi - 1] == plan.reads["count"][lo:hi - 1].sum()
+
+
+def test_plain_plan_orders_its_groups_by_address_like_read_plan_does_unshared_ones():
+    arr = table([prod(view(0x9000, 2, 3), view(0x2000, 3, 4), 0x3000),
+                 prod(view(0x1000, 2, 3), view(0x5000, 3, 4), 0x6000)])
+    plan = mk.plain_plan(arr)
+    level1 = [es[0][0] for lv, es, _, _ in groups_of(plan) if lv == 1]
+    assert level1 == [1, 0]  # A's address 0x1000 of product 1 before 0x9000 of product 0

@@ -629,10 +629,10 @@ def test_the_blake3_build_is_unchanged_by_the_source_argument(tmp_path):
 
 def test_the_kernel_file_matches_its_python_side():
     cu = (mk.HERE / mk.CU_NAME).read_text()
-    assert f'extern "C" __global__' in cu and mk.KERNEL in cu
+    assert f'extern "C" __global__' in cu and mk.LEVEL_KERNEL in cu
     assert f"#define POTS_MK_WARPS {mk.WARPS}u" in cu
     for off in (16, 1):
         assert f"off = {off}" in cu or f"off >= {off}" in cu
     assert cu.count("__shfl_down_sync") == 2 and "atomic" not in cu
     assert 'include "measure_core.h"' in cu and 'include "measure_phases.h"' in cu
-    assert ctypes.sizeof(mk.KernelArgs) == 48
+    assert "pots_measure_phase" not in cu
