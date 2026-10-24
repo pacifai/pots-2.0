@@ -613,7 +613,8 @@ class Handle:
 
 
 def start_sampler(pid: int, out: Path | str, interval: float = 0.1, *,
-                  gpus: Sequence[int] | int | None = None, cwd: Path | str | None = None, python: str = sys.executable) -> Handle:
+                  gpus: Sequence[int] | int | None = None, cwd: Path | str | None = None,
+                  python: str = sys.executable) -> Handle:
     """Start the sampler on ``pid`` in its own session, so a process-group kill of the run
     doesn't reach it. It ends itself when ``pid`` is gone. ``gpus`` (an index or a list) limits
     the NVML GPUs sampled; the default is every one."""

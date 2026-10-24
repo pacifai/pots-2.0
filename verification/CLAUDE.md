@@ -1765,7 +1765,10 @@ interface.
     assertion; rejects `None`, `"provisional"` and mixed hashes).
   - `band_context(cfg, c, *, h_D, k)`: the run a band file is fitted for, which `calibrate`
     writes and every loader compares: model and revision, `(MASTER_DTYPE, COMPUTE_DTYPE)`,
-    `attn_impl`, device, `h_D`, `n_s`, `n`, `η`, `M`, `T_run` (`VERIF_STEPS`) and `k`. It also
+    `attn_impl`, the device type (`torch.device(cfg.device).type`: `cuda` for both `cuda` and
+    `cuda:0`, so a file fitted at the full-scale `VERIF_DEVICE=cuda` judges the four-GPU layout's
+    `cuda:0`; the GPU models are compared beside it), `h_D`, `n_s`, `n`, `η`, `M`, `T_run`
+    (`VERIF_STEPS`) and `k`. It also
     holds `calibration_seed` (`VERIF_SEED`) and `threads` (`VERIF_THREADS`), both in
     `PROVENANCE_KEYS`: kept in the file, never compared. The bands describe rounding noise on
     honest steps, which doesn't depend on `π`, so a run at seed 2–5 loads the file fitted at
@@ -2173,7 +2176,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `name`, `uuid` (`GPU-…`, as in the machine record's `gpus`) and `roles` (`["prover"]`,
     `["verifier"]`, or both: an unsharded run, or `cuda:0` in the pair layout). The machine
     record's `gpus` (`setup/machine.py`) lists every torch device, joined to its `nvidia-smi`
-    row by PCI bus id, never by position. `bring_up` prints the allocator settings as a line,
+    row by PCI bus id, never by position. Every UUID in the machine record's `gpus`, the
+    environment record's `gpu_roles`, `probe.json`'s `per_device` and `card_identity` comes
+    from one helper, `setup.machine.torch_gpu_uuid` (`smi_uuid_form` adds `GPU-` once, never
+    twice); the pod test `tests/setup/test_machine_cuda.py` checks them equal to
+    `nvidia-smi`'s by index. `bring_up` prints the allocator settings as a line,
     `allocator: {…}`. Every run that writes `corpus`
     writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
     EVALUATION_SPEC §4.6) raises `ValueError`, in any letter case (`str.casefold`): on a
@@ -3180,21 +3187,38 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     not lift that) and, without `FS11_ALLOW_ANY_GPU=1`, a machine with no H100. Parts: the
     native build, `peer_check`, `models`, `four_tests` (one pytest part with a junit report:
     the slow multi-GPU tests, `FS34_TESTS_FILE` and `FOUR_TEST_FILES`, selected by `-k` under
-    `-m "slow or not slow"`), `probe` (on all four GPUs, `--seconds 60`), then per model,
+    `-m "slow or not slow"`; the `-k` text is built from `PAIR_SLOW_SELECT`), `probe` (on all
+    four GPUs, `--seconds 60`; it and `four_tests` run with `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+    like the card and arm parts, `PCI_ORDER_ENV`), then per model,
     cheapest first, `card_<key>` (`card_identity` on GPU 0 alone), `seq_<key>` and `pipe_<key>`
     (`llama_step --steps 3 --metrics --no-count`, each in its own run directory; only `pipe_*`
     sets `VERIF_PIPELINED`). `four_h100(parts)` goes to `summary.json["four_h100"]` and
-    `_four_lines` ends the job log (`FS35 ok:` or `FS35 FAIL:` per acceptance item, a steady
-    step time (mean of steps 2-3) and four GPU peaks per model and arm, the peer-rate range).
+    `_four_lines` ends the job log (`FS35 ok:` or `FS35 FAIL:` per acceptance item; per model
+    and arm the wall time, a steady step (mean of steps 2-3), beside the accumulated GPU time
+    (steady, mean of steps 2-3) and four GPU peaks; the peer-rate range).
     `pass` fails closed: every part in `four_h100_parts()` ended `ok` or `skipped_done`, the
-    peer copies right, the tests' junit with tests and no failure, error or skipped FS34
-    case (and a case from each of `FOUR_TEST_FILES`; `missing_files` names a file absent from
-    the checkout), and per model both arms accepted (`actual: accept`, `PASS`, three root lines,
+    peer copies right, the tests' junit with tests and no failure, error or skipped case (the
+    log line names the first few skipped cases, then a count; a file of `FOUR_TEST_FILES` with
+    every case skipped, or none, fails; `missing_files` names a file absent from the checkout),
+    and per model both arms accepted (`actual: accept`, `PASS`, three root lines,
     the right `loop mode:`), the arms' step roots equal, step 1's root the card's proved root,
     and each arm's environment record naming four GPUs (`machine.gpus`, `gpu_roles`: `cuda:0`
-    prover, `cuda:1` to `cuda:3` verifiers, four distinct UUIDs). Recorded outside `pass`: step
-    times, `step_wall_s`, `gpu_held_s`, per-device peaks, `gpu_peak_mib`, the probe's per-device
-    rates and 12 peer rates (`probe.json` version 2), and `peer_check`'s per-pair rate (`gbps`).
+    prover, `cuda:1` to `cuda:3` verifiers, four distinct UUIDs), and the reported numbers all
+    there (`_four_missing_numbers`, its own `FS35 ok/FAIL` line naming what is missing: per
+    model and arm a steady step time and a peak for each of the four GPUs, from `gpu_peak_mib`
+    or `device_peaks`; once a finite positive peer rate for all 12 ordered pairs, from the
+    probe's `peer` or else `peer_check`'s `gbps`). Recorded outside `pass`: step times,
+    `step_wall_s`, per-device peaks, `gpu_peak_mib`, the probe's per-device rates and 12 peer
+    rates (`probe.json` version 2), `peer_check`'s per-pair rate (`gbps`), and per arm the GPU
+    time: `accumulated_gpu_s` per step and `accumulated_steady_s` (steps 2-3), as the cost
+    decision defines it (each GPU's held time summed over the GPUs a part holds: three
+    verifier GPUs for 1 s are 3 s), `_accumulated_gpu_s`: the prover side's `total` row
+    `time_s` times the prover GPUs plus the verifier side's times the verifier GPUs, counts
+    from the environment record's `gpu_roles` (the `run` side and harness rows are in
+    neither). `gpu_held_upper_s` per step (`metrics.py`'s `gpu_held_s` on the `step` row: each
+    section's seconds times every device its process lists, so four on the sequential arm) is
+    an upper bound, not that quantity. `four_pins(pins)` puts `FOUR_ORDER`'s models first and
+    any other run model after them without raising.
     An acceptance failure leaves the exit code alone; an error in the summary is recorded as
     `four_h100_error` and the session runs on. `four_default_deadline_s()` is 14,700 s: the
     estimates (101 min) plus packing 1 and the grace window 20, twice, rounded up to 100 s.

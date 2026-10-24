@@ -42,7 +42,8 @@ def _arm(k, arm, roots=None, accepted=True, mode=None, gpus=None, roles=None, wa
     ex = {"accepted": accepted, "actual": "accept" if accepted else "reject",
           "step_roots": ROOTS if roots is None else roots, "loop_mode": mode,
           "step_times": times, "record": "r", "gpus": _gpus() if gpus is None else gpus,
-          "gpu_roles": _roles() if roles is None else roles, "gpu_held_s": [9.0, 8.0, 8.0],
+          "gpu_roles": _roles() if roles is None else roles,
+          "gpu_held_upper_s": [9.0, 8.0, 8.0], "accumulated_gpu_s": [20.0, 18.0, 16.0],
           "step_wall_s": [4.0, 3.0, 2.0] if wall else [],
           "device_peaks": {"cuda:0": {"peak_bytes": 5, "peak_reserved_bytes": 6}},
           "gpu_peak_mib": CARD_MIB}
@@ -155,6 +156,28 @@ def test_the_session_is_a_multi_gpu_session_with_a_peer_check_first(tmp_path):
     assert [p.name for p in plan[:2]] == ["native_build", "peer_check"]
 
 
+def test_the_probe_and_tests_parts_use_the_same_gpu_order_as_the_others(tmp_path):
+    plan = {p.name: p for p in fs.four_h100_plan(tmp_path / "up", tmp_path / "out")}
+    for n, p in plan.items():
+        if n in ("native_build", "peer_check", "models"):
+            continue
+        assert p.env.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID", n
+
+
+def test_the_tests_part_builds_its_k_expression_from_the_pair_constant(tmp_path, monkeypatch):
+    monkeypatch.setattr(fs, "PAIR_SLOW_SELECT", "marker_a or marker_b")
+    t = {p.name: p for p in fs.four_h100_plan(tmp_path / "up", tmp_path / "out")}["four_tests"]
+    assert t.argv[t.argv.index("-k") + 1].startswith("(slow and (marker_a or marker_b)) or ")
+
+
+def test_a_run_model_missing_from_the_order_follows_the_listed_ones_without_raising():
+    pins = [("a/Zeta-9B", "r1"), *reversed(fs.FOUR_PINS), ("b/Alpha-1B", "r2")]
+    got = fs.four_pins(pins)
+    assert [p[0] for p in got[:len(fs.FOUR_PINS)]] == [r for r, _ in fs.FOUR_PINS]
+    assert got[len(fs.FOUR_PINS):] == (("a/Zeta-9B", "r1"), ("b/Alpha-1B", "r2"))
+    assert fs.four_pins([]) == ()
+
+
 # ---- the refusal and the deadline -------------------------------------------------------------
 
 
@@ -196,7 +219,9 @@ def test_everything_good_passes():
     assert all(ok for ok, _ in res["items"])
     arm = res["models"][KEYS[0]]["arms"]["seq"]
     assert arm["steady_s"] == pytest.approx(2.5) and arm["steady_source"] == "step_wall"
-    assert arm["gpu_held_s"] == [9.0, 8.0, 8.0] and arm["gpu_peak_mib"] == CARD_MIB
+    assert arm["gpu_held_upper_s"] == [9.0, 8.0, 8.0] and arm["gpu_peak_mib"] == CARD_MIB
+    assert arm["accumulated_gpu_s"] == [20.0, 18.0, 16.0]
+    assert arm["accumulated_steady_s"] == pytest.approx(17.0) and "gpu_held_s" not in arm
     assert res["probe"]["devices"] == [f"cuda:{i}" for i in range(4)]
     assert len(res["probe"]["peer"]) == 12 and res["peer_check_gbps"]["0->1"] == 380.0
     assert res["gpu_peak"]["seq_" + KEYS[0]] == CARD_MIB
@@ -312,10 +337,41 @@ def test_a_junit_with_a_failure_an_error_or_a_skipped_fs34_case_is_no_pass():
     assert "not in the junit report" in _text(_four(_parts(four_tests=t)))
 
 
-def test_a_skipped_case_of_another_file_does_not_fail_the_tests():
-    t = _tests(skipped=3)
-    t["extras"]["files"][fs.FOUR_TEST_FILES[0]] = {"cases": 2, "skipped": 2}
-    assert _four(_parts(four_tests=t))["pass"]
+def test_a_skipped_case_anywhere_in_the_tests_part_is_no_pass_and_is_named():
+    t = _tests(skipped=1)
+    t["extras"]["cases"]["tests.other::test_a"] = "skipped"
+    t["extras"]["files"][fs.FOUR_TEST_FILES[0]] = {"cases": 3, "skipped": 1}
+    res = _four(_parts(four_tests=t))
+    assert not res["pass"]
+    assert "1 case(s) skipped, none may be on four GPUs: tests.other::test_a" in _text(res)
+    assert not any("every case of" in x for x in res["tests_problems"])
+    lines = fs._four_lines(res)
+    assert any(x.startswith("FS35 FAIL: the tests:") and "test_a" in x for x in lines)
+
+
+def test_skipped_cases_print_the_first_three_then_a_count():
+    t = _tests(skipped=5)
+    for i in range(5):
+        t["extras"]["cases"][f"tests.other::test_{i}"] = "skipped"
+    why = fs._four_tests_problems(t, EXPECTED34)
+    assert len(why) == 1
+    assert why[0] == ("5 case(s) skipped, none may be on four GPUs: tests.other::test_0, "
+                      "tests.other::test_1, tests.other::test_2 and 2 more")
+
+
+def test_a_skip_count_without_case_names_still_fails():
+    why = fs._four_tests_problems(_tests(skipped=2), EXPECTED34)
+    assert why == ["2 case(s) skipped, none may be on four GPUs"]
+
+
+def test_a_file_whose_every_case_skipped_is_no_pass():
+    f = fs.FOUR_TEST_FILES[1]
+    t = _tests()
+    t["extras"]["files"][f] = {"cases": 2, "skipped": 2}
+    why = fs._four_tests_problems(t, EXPECTED34)
+    assert why == [f"every case of {f} was skipped"]
+    res = _four(_parts(four_tests=t))
+    assert not res["pass"] and f"every case of {f} was skipped" in _text(res)
 
 
 def test_a_missing_file_or_no_junit_or_no_tests_is_no_pass_and_says_which():
@@ -337,18 +393,129 @@ def test_an_unreadable_expected_list_is_no_pass(monkeypatch):
     assert not res["pass"] and "could not be collected" in _text(res)
 
 
+# ---- the numbers the plan asks to have reported ----------------------------------------------
+
+
+def test_a_missing_steady_step_time_is_no_pass_and_is_named():
+    k = KEYS[1]
+    arm = _arm(k, "pipe")
+    arm["extras"]["step_wall_s"], arm["extras"]["step_times"] = [], []
+    res = _four(_parts(**{f"pipe_{k}": arm}))
+    assert not res["pass"] and res["missing_numbers"] == [f"{k} pipe: no steady step time"]
+    assert f"FS35 FAIL: numbers missing: {k} pipe: no steady step time" in fs._four_lines(res)
+
+
+def test_a_step_time_from_fewer_than_three_steps_is_missing():
+    k = KEYS[0]
+    arm = _arm(k, "seq")
+    arm["extras"]["step_wall_s"], arm["extras"]["step_times"] = [4.0, 3.0], arm["extras"][
+        "step_times"][:2]
+    assert not _four(_parts(**{f"seq_{k}": arm}))["pass"]
+
+
+def test_a_gpu_without_a_peak_is_no_pass_and_is_named():
+    k = KEYS[2]
+    arm = _arm(k, "seq")
+    arm["extras"]["gpu_peak_mib"] = {"0": 40000, "1": 20000, "3": 22000}
+    res = _four(_parts(**{f"seq_{k}": arm}))
+    assert not res["pass"]
+    assert res["missing_numbers"] == [f"{k} seq: no peak for GPU 2"]
+    arm["extras"]["gpu_peak_mib"] = {str(i): (0 if i == 3 else 5000) for i in range(4)}
+    assert f"{k} seq: no peak for GPU 3" in _text(_four(_parts(**{f"seq_{k}": arm})))
+
+
+def test_no_peaks_anywhere_for_an_arm_is_no_pass():
+    k = KEYS[0]
+    arm = _arm(k, "pipe")
+    arm["extras"]["gpu_peak_mib"], arm["extras"]["device_peaks"] = None, {}
+    res = _four(_parts(**{f"pipe_{k}": arm}))
+    assert not res["pass"] and f"{k} pipe: no peak for GPU 0, 1, 2, 3" in _text(res)
+
+
+def test_the_processes_peaks_stand_in_for_the_whole_cards_when_they_cover_all_four_gpus():
+    k = KEYS[0]
+    arm = _arm(k, "seq")
+    arm["extras"]["gpu_peak_mib"] = None
+    arm["extras"]["device_peaks"] = {f"cuda:{i}": {"peak_bytes": 10 + i} for i in range(4)}
+    assert _four(_parts(**{f"seq_{k}": arm}))["pass"]
+    del arm["extras"]["device_peaks"]["cuda:2"]
+    assert f"{k} seq: no peak for GPU 2" in _text(_four(_parts(**{f"seq_{k}": arm})))
+
+
+def test_missing_peer_rates_are_no_pass_unless_the_peer_check_has_all_twelve():
+    probe = _probe()
+    probe["extras"]["peer"]["cuda:2->cuda:3"] = None
+    res = _four(_parts(probe=probe))
+    assert not res["pass"] and "peer rates: the probe has 11 of 12 pairs" in _text(res)
+    probe["extras"]["peer"]["cuda:2->cuda:3"] = float("nan")
+    assert not _four(_parts(probe=probe))["pass"]
+    probe["extras"]["peer"]["cuda:2->cuda:3"] = 0.0
+    assert not _four(_parts(probe=probe))["pass"]
+    probe["extras"]["peer"] = {}
+    gbps = {f"{a}->{b}": 380.0 for a in range(4) for b in range(4) if a != b}
+    check = _part("peer_check", "peer_check", {"peer_check": {"all_ok": True, "wrong": {},
+                                                              "gbps": gbps}})
+    assert _four(_parts(probe=probe, peer_check=check))["pass"]
+    gbps["3->0"] = None
+    assert not _four(_parts(probe=probe, peer_check=check))["pass"]
+
+
+def test_the_validators_fail_open_cases_all_fail():
+    base = _parts()
+    gone = copy.deepcopy(base)
+    for x in gone:
+        if x["name"] == "probe":
+            x["extras"]["peer"] = {k: None for k in x["extras"]["peer"]}
+        if x["name"] == "peer_check":
+            x["extras"]["peer_check"]["gbps"] = {}
+    assert not _four(gone)["pass"]
+    gone = copy.deepcopy(base)
+    for x in gone:
+        if x["kind"] == "four_run":
+            x["extras"].update(step_times=[], step_wall_s=[], accumulated_gpu_s=[],
+                               device_peaks={}, gpu_peak_mib=None)
+    res = _four(gone)
+    assert not res["pass"] and len(res["missing_numbers"]) == 2 * 2 * len(KEYS)
+    assert any(x.startswith("FS35 FAIL: numbers missing") for x in fs._four_lines(res))
+
+
+# ---- accumulated GPU time ---------------------------------------------------------------------
+
+
+def test_accumulated_gpu_time_counts_the_prover_gpus_and_the_verifier_gpus():
+    side = {"prover": 5.0, "verifier": 7.0}
+    assert fs._accumulated_gpu_s(side, _roles()) == 5.0 * 1 + 7.0 * 3
+    both = [{"device": "cuda:0", "index": 0, "uuid": "GPU-0", "roles": ["prover", "verifier"]}]
+    assert fs._accumulated_gpu_s(side, both) == 12.0
+    two = _roles({1: ["verifier"], 2: ["verifier"]})[:3]
+    assert fs._accumulated_gpu_s(side, two) == 5.0 + 14.0
+
+
+def test_accumulated_gpu_time_is_unknown_without_roles_or_a_side():
+    side = {"prover": 5.0, "verifier": 7.0}
+    assert fs._accumulated_gpu_s(side, None) is None
+    assert fs._accumulated_gpu_s({"prover": 5.0}, _roles()) is None
+    assert fs._accumulated_gpu_s(side, [{"roles": ["verifier"]}]) is None
+
+
+def test_the_accumulated_steady_time_is_the_mean_of_steps_two_and_three():
+    assert fs._steady_mean([100.0, 10.0, 20.0]) == 15.0
+    assert fs._steady_mean([1.0, 2.0]) is None and fs._steady_mean(None) is None
+
+
 # ---- the log lines ----------------------------------------------------------------------------
 
 
 def test_the_log_lines_all_good():
     lines = fs._four_lines(_four())
     assert lines[0].startswith("FS35 ok: every part ran") and "FS35 FAIL" not in "\n".join(lines)
-    n = 3 + 4 * len(KEYS)
+    n = 4 + 4 * len(KEYS)
     assert all(x.startswith("FS35 ok:") for x in lines[:n])
+    assert lines[n - 1] == "FS35 ok: the step times, per-GPU peaks and peer rates are all reported"
     per = lines[n:-1]
     assert len(per) == 2 * len(KEYS)
     assert per[0] == (f"FS35 {KEYS[0]} seq: steady step 2.5 s (step_wall, mean of steps 2-3); "
-                      "GPU peaks 0: 39.1 GiB, 1: 19.5 GiB, 2: 20.5 GiB, 3: 21.5 GiB")
+                      "accumulated GPU time 17.0 s (mean of steps 2-3); GPU peaks 0: 39.1 GiB, 1: 19.5 GiB, 2: 20.5 GiB, 3: 21.5 GiB")
     assert per[1].startswith(f"FS35 {KEYS[0]} pipe: steady step 2.5 s")
     assert lines[-1].startswith("FS35 peer rates (probe, 12 pairs): slowest cuda:0->cuda:1 ")
     assert "fastest cuda:3->cuda:2" in lines[-1]
@@ -366,9 +533,11 @@ def test_unknown_times_and_peaks_and_missing_peer_rates_print_as_such():
     k = KEYS[0]
     arm = _arm(k, "seq", wall=False)
     arm["extras"]["step_times"], arm["extras"]["gpu_peak_mib"] = [], None
+    arm["extras"]["accumulated_gpu_s"] = []
     parts = _parts(**{f"seq_{k}": arm, "probe": _part("probe", "four_probe", {})})
     lines = fs._four_lines(_four(parts))
-    assert f"FS35 {k} seq: steady step unknown; GPU peaks unknown" in lines
+    assert (f"FS35 {k} seq: steady step unknown; accumulated GPU time unknown; "
+            "GPU peaks unknown") in lines
     assert lines[-1] == "FS35 peer rates: none measured" or "peer check" in lines[-1]
     assert fs._four_lines(None) == []
 
@@ -385,6 +554,14 @@ def _write_records(path, gpus=None, roles=None, steps=3, pipelined=True):
         if pipelined:
             rows.append({"record": "time", "level": "total", "component": "step_wall",
                          "step": t, "time_s": 4.0 - t})
+        # the side totals (a side's top-level sections), beside rows that are in no sum
+        for side, secs in (("prover", 5.0 - t), ("verifier", 7.0)):
+            rows.append({"record": "time", "level": "total", "side": side, "component": side,
+                         "step": t, "time_s": secs, "gpu_held_s": 99.0})
+            rows.append({"record": "time", "level": "component", "side": side, "component": "C",
+                         "step": t, "time_s": 1000.0})
+        rows.append({"record": "time", "level": "component", "side": "run",
+                     "component": "handoff.empty_cache", "step": t, "time_s": 1000.0})
         for comp, dev in (("prover", ["cuda:0"]), ("verifier", ["cuda:1", "cuda:2", "cuda:3"])):
             rows.append({"record": "memory", "level": "total", "component": comp, "step": t,
                          "devices": dev, "device_peak_bytes": [t * 10] * len(dev),
@@ -410,7 +587,10 @@ def test_run_extras_reads_the_log_and_the_records(tmp_path):
     assert e["accepted"] and e["step_roots"] == ROOTS and e["loop_mode"] == "pipelined"
     assert [r["total_s"] for r in e["step_times"]] == [12.75] * 3
     assert e["gpus"] == _gpus() and e["gpu_roles"] == _roles()
-    assert e["gpu_held_s"] == [9.0, 8.0, 7.0] and e["step_wall_s"] == [3.0, 2.0, 1.0]
+    assert e["gpu_held_upper_s"] == [9.0, 8.0, 7.0] and "gpu_held_s" not in e
+    assert e["step_wall_s"] == [3.0, 2.0, 1.0]
+    # prover 4, 3, 2 s on one GPU, verifier 7 s on three: only the two side totals count
+    assert e["accumulated_gpu_s"] == [4 + 21, 3 + 21, 2 + 21]
     assert e["device_peaks"]["cuda:0"] == {"peak_bytes": 30, "peak_reserved_bytes": 60}
     assert set(e["device_peaks"]) == {f"cuda:{i}" for i in range(4)}
     assert not _four_gpu(e)
@@ -426,7 +606,8 @@ def test_run_extras_with_a_rejection_or_missing_files(tmp_path):
     assert not fs._four_run_extras(log, tmp_path / "none")["accepted"]
     e = fs._four_run_extras(tmp_path / "nolog", tmp_path / "none")
     assert not e["accepted"] and e["step_roots"] == [] and e["gpus"] is None
-    assert e["record"] is None and e["loop_mode"] is None and e["gpu_held_s"] == []
+    assert e["record"] is None and e["loop_mode"] is None and e["gpu_held_upper_s"] == []
+    assert e["accumulated_gpu_s"] == []
 
 
 def test_tests_extras_counts_cases_per_file_and_names_a_missing_file(tmp_path, monkeypatch):
@@ -497,8 +678,9 @@ def _fake_plan(tmp_path, monkeypatch, bad_arm=None):
         cases += f'<testcase classname="{f.removesuffix(".py").replace("/", ".")}" name="t"/>'
     (src / "junit.xml").write_text(f"<testsuites><testsuite>{cases}</testsuite></testsuites>")
     (src / "probe.json").write_text(json.dumps({
-        "version": 2, "devices": ["cuda:0", "cuda:1"], "per_device": {}, "peer": {
-            "cuda:0->cuda:1": 3e11}, "peer_errors": {}, "rates": {}, "costs": {}, "errors": {},
+        "version": 2, "devices": [f"cuda:{i}" for i in range(4)], "per_device": {}, "peer": {
+            f"cuda:{a}->cuda:{b}": 3e11 for a in range(4) for b in range(4) if a != b},
+        "peer_errors": {}, "rates": {}, "costs": {}, "errors": {},
         "device": "cuda:0", "threads": 4, "wall_s": 1.0}))
     (src / "card.json").write_text(json.dumps({
         "card": {"name": "H100", "uuid": "u", "pci_bus_id": "p"},
@@ -531,7 +713,7 @@ def _fake_plan(tmp_path, monkeypatch, bad_arm=None):
 
 
 def _session(tmp_path, monkeypatch, plan):
-    monkeypatch.setattr(fs, "_gpu_used_mib", lambda: {"0": 1, "1": 2})
+    monkeypatch.setattr(fs, "_gpu_used_mib", lambda: {"0": 1, "1": 2, "2": 3, "3": 4})
     monkeypatch.setattr(fs, "check_upload", lambda up: {"s": 0.0, "packed": [], "models": []})
     lines = []
     s = fs.run_session(plan, upload=tmp_path / "up", out=tmp_path / "out",

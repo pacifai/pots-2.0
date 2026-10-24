@@ -63,7 +63,7 @@ def v2_samples(path: Path, order=DEVS, *, with_uuids=True, n=90) -> None:
     jl(path, [header, *rows])
 
 
-def build(root: Path, *, order=DEVS, gpu_hash=True, roles=True, probe_obj=None,
+def build(root: Path, *, order=DEVS, roles=True, probe_obj=None,
           memory_rows=(), steps=4, with_uuids=True) -> dict[str, Path]:
     root.mkdir(parents=True, exist_ok=True)
     header = {"kind": "header", "version": 1, "run": "honest", "pid": 1, "device": "cuda:0",
@@ -73,8 +73,7 @@ def build(root: Path, *, order=DEVS, gpu_hash=True, roles=True, probe_obj=None,
                   "roles": ["prover"] if i == 0 else ["verifier"]}
                  for i, d in enumerate(DEVS)] if roles else None
     env = {"record": "environment", "run": "honest", "compute_dtype": "float32",
-           "device": "cuda:0", "gpu_roles": gpu_roles,
-           "config": {"VERIF_VERIFIER_DEVICES": "cuda:1,cuda:2,cuda:3"} if gpu_hash else {}}
+           "device": "cuda:0", "gpu_roles": gpu_roles}
     records = [env, {"record": "storage", "run": "honest", "scenario": "honest", "step": 1,
                      "transcript_bytes": 3_000_000_000, "leaves": 3000}]
     for k in range(1, steps + 1):
@@ -131,6 +130,18 @@ def test_the_uuid_maps_when_nvml_order_differs_from_torchs(tmp_path):
     assert gpus[1]["roles"] == ["prover"] and gpus[1]["label"] == "cuda:0 (prover)"
 
 
+def test_the_runs_own_uuid_wins_over_the_probes_and_the_machine_records(tmp_path):
+    order = ["cuda:2", "cuda:0", "cuda:3", "cuda:1"]
+    rot = {d: UUIDS[DEVS[(i + 1) % 4]] for i, d in enumerate(DEVS)}  # a wrong set of UUIDs
+    pr = v2_probe()
+    pr["per_device"] = {d: {**v, "uuid": rot[d]} for d, v in pr["per_device"].items()}
+    pr["machine"] = {"gpus": [{"index": i, "uuid": rot[d]} for i, d in enumerate(DEVS)]}
+    out, s = run(tmp_path, order=order, probe_obj=pr)
+    assert s["Q"]["util"]["g_util"] == pytest.approx(0.2)  # cuda:2 by gpu_roles' UUID
+    assert s["V"]["util_by_device"]["cuda:3"]["g_util"] == pytest.approx(0.3)
+    assert not [w for w in out["warnings"] if "UUID" in w]
+
+
 def test_without_uuids_the_same_index_is_used_with_a_warning(tmp_path):
     out, s = run(tmp_path, roles=False, with_uuids=False,
                  probe_obj={**v2_probe(), "per_device": {d: {**v, "uuid": None} for d, v in
@@ -158,7 +169,7 @@ def test_the_hash_floor_splits_evenly_over_the_devices_and_takes_the_slowest(tmp
 
 
 def test_the_host_hash_rate_is_used_when_the_transcript_is_on_the_host(tmp_path):
-    _, s = run(tmp_path, gpu_hash=False, roles=False)
+    _, s = run(tmp_path, roles=False)
     # probe()'s host hash: 1e-9 s per byte, 0 per leaf
     assert s["H"]["floors_s"]["hash"] == pytest.approx(3e9 * 1e-9)
 

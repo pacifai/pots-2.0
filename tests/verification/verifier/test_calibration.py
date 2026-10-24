@@ -434,8 +434,10 @@ def test_an_unsharded_file_judges_a_sharded_run_on_the_same_model(tmp_path, monk
         return band_context(load_config({"VERIF_ETA": "1e-3", **env}),
                             SimpleNamespace(n_s=4, n=128, eta=1e-3, M=7113),
                             h_D=bytes(range(32)), k=K)
-    one = ctx(VERIF_DEVICE="cuda:0")
+    one = ctx(VERIF_DEVICE="cuda")  # the full-scale settings
     pair = ctx(VERIF_DEVICE="cuda:0", VERIF_VERIFIER_DEVICES="cuda:0,cuda:1")
+    assert one["device"] == pair["device"] == "cuda"
     assert one["gpu_models"] == pair["gpu_models"] == ["H100"]
-    written = _write(tmp_path / "bands.json", {**one, "device": "cuda:0"})
-    assert load_bands(tmp_path / "bands.json", k=K, context={**pair, "device": "cuda:0"}) == written
+    written = _write(tmp_path / "bands.json", one)
+    assert load_bands(tmp_path / "bands.json", k=K, context=pair) == written
+    assert ctx(VERIF_DEVICE="cpu")["device"] == "cpu"

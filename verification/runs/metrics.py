@@ -275,7 +275,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
 
 from setup.config import load_config
-from setup.machine import machine_facts
+from setup.machine import machine_facts, torch_gpu_uuid
 from verification.commitment import native
 from verification.computation.interface import ProductKind
 from verification.verifier.bands import product_class, product_classes
@@ -2636,9 +2636,8 @@ def gpu_roles(device: str | torch.device,
         return None
     out = []
     for d, rs in roles.items():
-        uuid = getattr(torch.cuda.get_device_properties(d.index), "uuid", None)
         out.append({"device": str(d), "index": d.index, "name": torch.cuda.get_device_name(d),
-                    "uuid": None if uuid is None else f"GPU-{uuid}", "roles": rs})
+                    "uuid": torch_gpu_uuid(d.index), "roles": rs})
     return out
 
 

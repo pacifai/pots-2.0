@@ -72,9 +72,9 @@ clock and :data:`US` turns µs into s; nothing else converts.
   use the same steps as the time rows.
 - Per-GPU tools (FS35). Samples version 2 holds one value per GPU in each ``g_*`` field, and
   ``Sampler(samples, gpu=k)`` is GPU ``k``'s view (a version 1 file has only GPU 0).
-- A device maps to a sampler GPU by UUID (the probe's ``per_device``, else ``gpu_roles``, else
-  the machine record's ``gpus``, against the sampler header); with no UUID on either side it
-  maps to the same index, with a warning.
+- A device maps to a sampler GPU by UUID (the run's ``gpu_roles``, else the probe's
+  ``per_device``, else the machine record's ``gpus``, against the sampler header); with no UUID
+  on either side it maps to the same index, with a warning.
 - A section's ``sec["devices"]`` names its devices. One device: ``util`` is that GPU's. Several:
   ``util`` is the first device's and ``util_by_device`` has each device's. No list: the run's
   device (``gpu_roles``' first, else the environment's), GPU 0 of a version 1 file.
@@ -85,15 +85,14 @@ clock and :data:`US` turns µs into s; nothing else converts.
   didn't measure, uses the top level, with one warning naming the device.
 - A multi-device section's GEMM, HBM, PCIe and launch floors use the slowest device's rate
   (the split replay runs its units one after another, so the work does not divide).
-- The hash floor of a run whose transcript sits on the GPUs (the environment record's config
-  names ``VERIF_VERIFIER_DEVICES``, or ``gpu_roles`` has a verifier-only device) uses each
-  device's ``hash_kernel`` rate on an even share of the bytes and leaves, the slowest time.
-  An even split is an estimate: the placement balances bytes per GPU, not leaves. Else ``hash``.
-  Only the section's devices that hold transcript share it (``gpu_roles`` verifier, or the
-  config's verifier devices), since a sequential run lists every device on every section; with
-  none known to hold, all of its devices share it.
-- Usable memory per device is the machine record's ``gpus[*].memory_bytes``, else the probe's
-  ``per_device`` entry, else ``gpu_memory_bytes``. Where memory rows hold
+- The hash floor of a run whose transcript sits on the GPUs (its environment record's
+  ``gpu_roles`` has a verifier-only device) uses each device's ``hash_kernel`` rate on an even
+  share of the bytes and leaves, the slowest time. An even split is an estimate: the placement
+  balances bytes per GPU, not leaves. Else ``hash``. Only the section's devices that hold
+  transcript share it (``gpu_roles`` verifier), since a sequential run lists every device on
+  every section; with none known to hold, all of its devices share it.
+- Usable memory per device is the machine record's ``gpus[*].memory_bytes``, else
+  ``gpu_memory_bytes``. Where memory rows hold
   ``device_peak_reserved_bytes`` the memory mark checks each device's peak against its own
   memory, and ``memory`` adds ``gpu_memory_bytes_by_device`` and each section's ``by_device``.
 - The hook bound counts a section's syncs and events per device, each at that device's
@@ -328,11 +327,8 @@ def _dev_index(dev: str | None) -> int | None:
 
 
 def _transcript_on_gpus(env: dict[str, Any]) -> bool:
-    """Whether the run's transcript sits on GPUs: the environment record's config names
-    ``VERIF_VERIFIER_DEVICES``, or ``gpu_roles`` has a device that is only a verifier."""
-    cfg = env.get("config")
-    if isinstance(cfg, dict) and (cfg.get("VERIF_VERIFIER_DEVICES") or cfg.get("verifier_devices")):
-        return True
+    """Whether the run's transcript sits on GPUs: the environment record's ``gpu_roles`` has a
+    device that is only a verifier (the record keeps ``config_hash`` only, no config)."""
     return any(isinstance(r, dict) and r.get("roles") == ["verifier"]
                for r in env.get("gpu_roles") or [])
 
@@ -363,18 +359,8 @@ class _Devices:
         self._pos: dict[tuple[str, bool], int | None] = {}
 
     def holds_transcript(self, dev: str | None) -> bool:
-        """Whether ``dev`` holds transcript: ``gpu_roles`` gives it the verifier role, or the
-        environment config's verifier devices list it."""
-        if dev is None:
-            return False
-        if "verifier" in ((self.roles.get(dev) or {}).get("roles") or []):
-            return True
-        cfg = self.env.get("config")
-        cfg = cfg if isinstance(cfg, dict) else {}
-        listed = cfg.get("VERIF_VERIFIER_DEVICES") or cfg.get("verifier_devices") or []
-        if isinstance(listed, str):
-            listed = listed.split(",")
-        return dev in {_norm_dev(str(d).strip()) for d in listed}
+        """Whether ``dev`` holds transcript: ``gpu_roles`` gives it the verifier role."""
+        return dev is not None and "verifier" in ((self.roles.get(dev) or {}).get("roles") or [])
 
     def sections_devices(self, listed: list[str] | None) -> tuple[list[str | None], bool]:
         """A section's devices and whether it named them: the CUDA ones it lists, else the
@@ -383,8 +369,10 @@ class _Devices:
         return (list(dict.fromkeys(cuda)), True) if cuda else ([self.primary], False)
 
     def uuid_of(self, dev: str) -> str | None:
+        """``dev``'s UUID: the run's own ``gpu_roles`` entry first, then the probe's
+        ``per_device`` one, then the machine record's."""
         idx = _dev_index(dev)
-        for src in (self.per_device.get(dev), self.roles.get(dev),
+        for src in (self.roles.get(dev), self.per_device.get(dev),
                     next((g for g in self.machine_gpus
                           if isinstance(g, dict) and g.get("index") == idx), None)):
             if isinstance(src, dict) and src.get("uuid"):
@@ -394,9 +382,8 @@ class _Devices:
     # -- the sampler's GPU ------------------------------------------------------------------
 
     def position(self, dev: str | None, named: bool) -> int | None:
-        """The sampler GPU of ``dev``: matched by UUID (the sampler header's ``gpus`` against the
-        probe's ``per_device`` or the environment record's ``gpu_roles``), else the GPU with the
-        same index, with a warning. ``None`` when no sampler GPU fits."""
+        """The sampler GPU of ``dev``: matched by UUID (the sampler header's ``gpus`` against
+        :meth:`uuid_of`), else the GPU with the same index, with a warning. ``None`` when no sampler GPU fits."""
         idx = _dev_index(dev)
         if dev is None or idx is None:
             return None
@@ -465,15 +452,12 @@ class _Devices:
         return out
 
     def memory_of(self, dev: str | None, fallback: int | None) -> int | None:
-        """The usable memory of ``dev``: the machine record's ``gpus`` entry, else the probe's
-        ``per_device`` entry, else the machine block's one ``gpu_memory_bytes``."""
+        """The usable memory of ``dev``: the machine record's ``gpus`` entry, else the machine
+        block's one ``gpu_memory_bytes``."""
         idx = _dev_index(dev)
         for g in self.machine_gpus:
             if isinstance(g, dict) and g.get("index") == idx and g.get("memory_bytes"):
                 return int(g["memory_bytes"])
-        d = self.per_device.get(dev or "")
-        if isinstance(d, dict) and d.get("memory_bytes"):
-            return int(d["memory_bytes"])
         return fallback
 
 

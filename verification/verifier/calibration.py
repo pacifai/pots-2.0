@@ -387,12 +387,16 @@ def band_context(cfg: RunConfig, c: DecoderComputation, *, h_D: bytes, k: int) -
     ``gpu_models`` (:func:`gpu_models`), ``torch`` (``torch.__version__``) and ``cuda``
     (``torch.version.cuda``, ``None`` on a CPU build) name the GPU and the software build the
     rounding noise was measured on; they are compared, so a file fitted on an H100 never
-    judges a B200 run, or another torch or CUDA build, without a refusal.
+    judges a B200 run, or another torch or CUDA build, without a refusal. ``device`` is the
+    device type (``"cuda"``, ``"cpu"``), not the string: the GPU models sit beside it, and a
+    file fitted at ``VERIF_DEVICE=cuda`` (the full-scale settings) judges a run at ``cuda:0``
+    (the four-GPU layout) on the same model.
     """
     return {"model": cfg.model, "model_revision": cfg.model_revision,
             "master_dtype": str(cfg.master_dtype).removeprefix("torch."),
             "compute_dtype": str(cfg.compute_dtype).removeprefix("torch."),
-            "attn_impl": cfg.attn_impl, "device": cfg.device, "h_D": h_D.hex(),
+            "attn_impl": cfg.attn_impl, "device": torch.device(cfg.device).type,
+            "h_D": h_D.hex(),
             "calibration_seed": cfg.seed, "threads": cfg.threads, "n_s": c.n_s, "n": c.n,
             "eta": c.eta, "M": c.M, "T_run": cfg.steps, "k": k,
             "gpu_models": gpu_models(cfg), "torch": torch.__version__,

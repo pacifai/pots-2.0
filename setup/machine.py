@@ -267,16 +267,34 @@ def _torch_bus_id(props: Any) -> str | None:
         return None
 
 
+def smi_uuid_form(raw: Any) -> str | None:
+    """A UUID as ``nvidia-smi`` prints it (``GPU-...``): ``raw`` is torch's ``props.uuid``
+    (a ``_CUuuid`` whose ``str`` has no prefix on some torch builds, already prefixed on
+    others) or a string; ``None`` and the empty string give ``None``. The one place the prefix
+    is added, so no UUID reads ``GPU-GPU-...``."""
+    text = "" if raw is None else str(raw)
+    if not text:
+        return None
+    return text if text.startswith("GPU-") else f"GPU-{text}"
+
+
+def torch_gpu_uuid(device: int | str | torch.device) -> str | None:
+    """The UUID of torch device ``device`` (an index, ``cuda:k`` or a device) in ``nvidia-smi``'s
+    form, or ``None`` where torch exposes none. The machine record's ``gpus``, the environment
+    record's ``gpu_roles`` and the probe's ``per_device`` all take their UUIDs from here."""
+    return smi_uuid_form(getattr(torch.cuda.get_device_properties(device), "uuid", None))
+
+
 def _row_for(rows: list[dict[str, str]], props: Any) -> dict[str, str] | None:
     """The ``nvidia-smi`` row of the torch device with ``props``: by PCI bus id, then by UUID;
     None when no row matches."""
     bus = (_torch_bus_id(props) or "").upper()
-    uuid = getattr(props, "uuid", None)
+    uuid = smi_uuid_form(getattr(props, "uuid", None))
     for row in rows:
         if bus and (row.get("pci.bus_id") or "").upper() == bus:
             return row
     for row in rows:
-        if uuid and row.get("uuid") == f"GPU-{uuid}":
+        if uuid and row.get("uuid") == uuid:
             return row
     return None
 
@@ -294,7 +312,7 @@ def _gpus(r: _Record) -> None:
     for k in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(k)
         bus = _torch_bus_id(props)
-        uuid = getattr(props, "uuid", None)
+        uuid = smi_uuid_form(getattr(props, "uuid", None))
         row = _row_for(rows, props) or {}
 
         def num(key: str, row: dict[str, str] = row) -> float | None:
@@ -312,7 +330,7 @@ def _gpus(r: _Record) -> None:
         bus_id = row.get("pci.bus_id") or bus
         gpus.append({
             "index": k, "name": name,
-            "uuid": row.get("uuid") or (f"GPU-{uuid}" if uuid else None),
+            "uuid": row.get("uuid") or uuid,
             "pci_bus_id": bus_id, "memory_bytes": props.total_memory,
             "power_max_w": power, "form_factor": _form_factor(name, power),
             "numa_node": _numa_node(bus_id),

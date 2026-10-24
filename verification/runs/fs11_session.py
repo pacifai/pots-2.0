@@ -25,10 +25,10 @@ The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
 the upload's ``native_cache/`` into it once, offline, so no later part's timing includes the
-compile). A plan for two or more GPUs (``nvlink-probe``, ``fs32-pair``, ``four-h100``) lists the F22 peer-copy
-byte check, ``peer_check``, first among its own parts, ahead of the models part (the native
-build, which every plan gets, runs ahead of it), and a pair that lands wrong bytes stops the
-session (:func:`peer_check_part`, :func:`peer_check_stop`):
+compile). A plan for two or more GPUs (``nvlink-probe``, ``fs32-pair``, ``four-h100``) lists the
+F22 peer-copy byte check, ``peer_check``, first among its own parts, ahead of the models part
+(the native build, which every plan gets, runs ahead of it), and a pair that lands wrong bytes
+stops the session (:func:`peer_check_part`, :func:`peer_check_stop`):
 
 1. **models.** ``fetch-models``: check every packed file of the upload against the manifest's
    SHA-256, then fetch each public model's weights at its pinned commit with ``token=False``
@@ -141,6 +141,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -1256,8 +1257,18 @@ def four_model_key(repo: str) -> str:
     return repo.split("/")[-1].removesuffix("-Instruct")
 
 
-FOUR_PINS: tuple[tuple[str, str], ...] = tuple(sorted(
-    RUN_PINS, key=lambda p: FOUR_ORDER.index(four_model_key(p[0]))))
+def four_pins(pins: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    """``pins`` with :data:`FOUR_ORDER`'s models first, in its order, and any other model after
+    them in the order given (an unlisted model is not an error: it must not break every
+    session at import)."""
+    def rank(p: tuple[str, str]) -> int:
+        k = four_model_key(p[0])
+        return FOUR_ORDER.index(k) if k in FOUR_ORDER else len(FOUR_ORDER)
+
+    return tuple(sorted(pins, key=rank))
+
+
+FOUR_PINS: tuple[tuple[str, str], ...] = four_pins(RUN_PINS)
 
 
 def four_estimated_min() -> int:
@@ -1291,17 +1302,18 @@ def four_h100_plan(upload: Path, out: Path) -> list[Part]:
     first = data_key(FOUR_PINS[0][0], BRING_UP_TASK)
     sharded = {"VERIF_DEVICE": FOUR_PROVER, "VERIF_VERIFIER_DEVICES": FOUR_VERIFIERS}
     junit = out / "parts" / "four_tests" / "junit.xml"
-    expr = " or ".join(["(slow and (two_gpus or two_cuda_devices))",
+    expr = " or ".join([f"(slow and ({PAIR_SLOW_SELECT}))",
                         *(Path(f).stem for f in (FS34_TESTS_FILE, *FOUR_TEST_FILES))])
     tests = Part("four_tests", ["{python}", "-m", "pytest", "-rf", "-q", f"--junitxml={junit}",
                                 "-p", "no:cacheprovider", "-m", "slow or not slow", "-k", expr],
-                 env={"VERIF_OUTPUT_DIR": str(_run_dir(out, upload, first, "four_pytest")),
+                 env={**PCI_ORDER_ENV,
+                      "VERIF_OUTPUT_DIR": str(_run_dir(out, upload, first, "four_pytest")),
                       "VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
                  timeout_s=t["four_tests"], kind="four_tests", info={"junit": str(junit)})
     report = out / "probe" / "probe.json"
     probe = Part("probe", ["{python}", "-m", "verification.runs.probe", "--out", str(report),
                            "--seconds", "60"],
-                 env={**FULL_SCALE_ENV, **sharded, "VERIF_PIPELINED": None},
+                 env={**FULL_SCALE_ENV, **PCI_ORDER_ENV, **sharded, "VERIF_PIPELINED": None},
                  timeout_s=t["probe"], kind="four_probe", info={"report": str(report)})
     plan = [peer_check_part(out), _models_part(upload, out, t["models"]), tests, probe]
     for repo, rev in FOUR_PINS:
@@ -2189,15 +2201,36 @@ def _four_records(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _accumulated_gpu_s(side_s: Mapping[str, float],
+                       roles: Sequence[Mapping[str, Any]] | None) -> float | None:
+    """One step's accumulated GPU time, as the cost decision defines it (each GPU's held time
+    summed over the GPUs a part holds: three verifier GPUs for 1 s are 3 s): the prover side's
+    time times the number of prover GPUs plus the verifier side's time times the number of
+    verifier GPUs, both counts from the environment record's ``gpu_roles``. ``side_s`` holds the
+    step's ``total`` rows' ``time_s`` by side, each the sum of that side's top-level sections
+    (the ``run`` side and the harness's own sections are in neither). ``None`` when either side's
+    row or a role count is missing."""
+    if not isinstance(roles, list) or not all(s in side_s for s in ("prover", "verifier")):
+        return None
+    n = {s: sum(s in (g.get("roles") or ()) for g in roles if isinstance(g, dict))
+         for s in ("prover", "verifier")}
+    if not all(n.values()):
+        return None
+    return side_s["prover"] * n["prover"] + side_s["verifier"] * n["verifier"]
+
+
 def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
     """A ``llama_step`` arm's result: from its log the verdict (``accepted``: the ``actual:
     accept`` and ``PASS`` lines), each step's transcript root (``step_roots``), each step's
     prover, verifier, hand-off and total time (``step_times``, ``report_costs``' lines) and the
     printed ``loop_mode``; from its ``records.jsonl`` the environment record's GPUs
-    (``machine.gpus``: index and UUID; ``gpu_roles``), the ``step`` rows' ``gpu_held_s`` and the
-    merged step's wall extent (``step_wall`` rows' ``time_s``) per step, and the memory pass's
-    peak per device (``device_peak_bytes`` and ``device_peak_reserved_bytes`` of the prover's and
-    the verifier's ``total`` rows, the larger over the steps)."""
+    (``machine.gpus``: index and UUID; ``gpu_roles``), per step the ``step`` row's
+    ``gpu_held_upper_s`` (``metrics.py``'s ``gpu_held_s``: each section's seconds times every
+    device its process lists, an upper bound, not the cost decision's quantity), the
+    ``accumulated_gpu_s`` (:func:`_accumulated_gpu_s`) and the merged step's wall extent
+    (``step_wall`` rows' ``time_s``), and the memory pass's peak per device
+    (``device_peak_bytes`` and ``device_peak_reserved_bytes`` of the prover's and the verifier's
+    ``total`` rows, the larger over the steps)."""
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
     roots = {int(m[1]): m[2] for x in lines if (m := _PAIR_ROOT.match(x))}
     stripped = [x.strip() for x in lines]
@@ -2207,6 +2240,7 @@ def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
     gpus = (env.get("machine") or {}).get("gpus")
     held: dict[int, float] = {}
     wall: dict[int, float] = {}
+    side_s: dict[int, dict[str, float]] = {}
     peaks: dict[str, dict[str, int | None]] = {}
     for r in rows:
         step = r.get("step")
@@ -2217,6 +2251,8 @@ def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
                 held[step] = r["gpu_held_s"]
             if r.get("component") == "step_wall" and _number(r.get("time_s")):
                 wall[step] = r["time_s"]
+            if r.get("side") in ("prover", "verifier") and _number(r.get("time_s")):
+                side_s.setdefault(step, {})[r["side"]] = r["time_s"]
         if (r.get("record") == "memory" and r.get("level") == "total"
                 and r.get("component") in ("prover", "verifier")
                 and isinstance(r.get("devices"), list)):
@@ -2236,7 +2272,10 @@ def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
                 {"index": g.get("index"), "uuid": g.get("uuid")} for g in gpus
                 if isinstance(g, dict)],
             "gpu_roles": env.get("gpu_roles"),
-            "gpu_held_s": [held[t] for t in sorted(held)],
+            "gpu_held_upper_s": [held[t] for t in sorted(held)],
+            "accumulated_gpu_s": [a for t in sorted(side_s)
+                                  if (a := _accumulated_gpu_s(side_s[t], env.get("gpu_roles")))
+                                  is not None],
             "step_wall_s": [wall[t] for t in sorted(wall)], "device_peaks": peaks}
 
 
@@ -2318,8 +2357,10 @@ def _four_gpu_problems(ex: Mapping[str, Any]) -> list[str]:
 def _four_tests_problems(part: Mapping[str, Any], expected: Sequence[str] | None) -> list[str]:
     """Why the tests part does not count, empty when it does: it ran ``ok``, its junit report
     holds tests and no failure or error, no FS34 case (found by :func:`device_tests_expected`, or
-    given as ``expected``) is missing, failed, errored or skipped, and every file of
-    :data:`FOUR_TEST_FILES` exists and left a case in the report. Fails closed."""
+    given as ``expected``) is missing, failed, errored or skipped, every file of
+    :data:`FOUR_TEST_FILES` exists and left a case in the report, and no selected case at all was
+    skipped (on four GPUs every one runs; the first few skipped cases are named, then a count)
+    and no such file has every case skipped. Fails closed."""
     ex = part.get("extras") or {}
     why = [f"{f} is missing from the checkout" for f in ex.get("missing_files") or ()]
     if part.get("status") not in _PAIR_OK:
@@ -2340,6 +2381,15 @@ def _four_tests_problems(part: Mapping[str, Any], expected: Sequence[str] | None
     why += [f"{f} left no case in the junit report" for f in FOUR_TEST_FILES
             if not (ex.get("files") or {}).get(f, {}).get("cases")
             and f"{f} is missing from the checkout" not in why]
+    skipped = sorted(n for n, o in ex["cases"].items() if o == "skipped")
+    count = max(len(skipped), ex.get("skipped") or 0)
+    if count:
+        shown = ", ".join(skipped[:3]) + (f" and {count - 3} more" if count > 3 else "")
+        why.append(f"{count} case(s) skipped, none may be on four GPUs"
+                   + (f": {shown}" if shown else ""))
+    why += [f"every case of {f} was skipped" for f in FOUR_TEST_FILES
+            if (m := (ex.get("files") or {}).get(f, {})).get("cases")
+            and m.get("skipped") == m["cases"]]
     return why
 
 
@@ -2355,6 +2405,45 @@ def _steady_s(ex: Mapping[str, Any]) -> tuple[float | None, str | None]:
     return None, None
 
 
+def _pos(x: Any) -> bool:
+    """A finite positive number."""
+    return _number(x) and math.isfinite(x) and x > 0
+
+
+def _steady_mean(per_step: Sequence[float] | None) -> float | None:
+    """The mean of steps 2 and 3 of a per-step list of three, else ``None``."""
+    vals = list(per_step or ())
+    return statistics.fmean(vals[1:FOUR_STEPS]) if len(vals) >= FOUR_STEPS else None
+
+
+def _four_missing_numbers(models: Mapping[str, Mapping[str, Any]],
+                          probe: Mapping[str, Any], check_gbps: Mapping[str, Any]) -> list[str]:
+    """What the plan's acceptance ("each model's step time, per-GPU peaks and peer-copy rates
+    reported") lacks, empty when it has all: per model and arm a steady step time and a peak for
+    each of the four GPUs (``gpu_peak_mib``, the whole card's, or else ``device_peaks``, this
+    process's), and once a finite positive peer rate for all 12 ordered pairs (the probe's
+    ``peer``, or else ``peer_check``'s per-pair ``gbps``)."""
+    why: list[str] = []
+    for k, row in models.items():
+        for a, arm in row["arms"].items():
+            if arm["steady_s"] is None:
+                why.append(f"{k} {a}: no steady step time")
+            card = arm.get("gpu_peak_mib") or {}
+            procs = arm.get("device_peaks") or {}
+            lost = [i for i in range(FOUR_CARDS)
+                    if not _pos(card.get(str(i)))
+                    and not _pos((procs.get(f"cuda:{i}") or {}).get("peak_bytes"))]
+            if lost:
+                why.append(f"{k} {a}: no peak for GPU " + ", ".join(map(str, lost)))
+    pairs = [(x, y) for x in range(FOUR_CARDS) for y in range(FOUR_CARDS) if x != y]
+    got_probe = sum(_pos((probe.get("peer") or {}).get(f"cuda:{x}->cuda:{y}")) for x, y in pairs)
+    got_check = sum(_pos(check_gbps.get(f"{x}->{y}")) for x, y in pairs)
+    if max(got_probe, got_check) < len(pairs):
+        why.append(f"peer rates: the probe has {got_probe} of {len(pairs)} pairs, the peer "
+                   f"check {got_check}")
+    return why
+
+
 def four_h100(parts: Sequence[Mapping[str, Any]],
               expected: Sequence[str] | None = None) -> dict[str, Any] | None:
     """The four-H100 session's result, or ``None`` without its parts. ``pass`` fails closed:
@@ -2363,12 +2452,16 @@ def four_h100(parts: Sequence[Mapping[str, Any]],
     arms are accepted at all :data:`FOUR_STEPS` steps and ran in their mode (``loop mode:``
     line), the two arms' step roots are equal step for step, step 1's root is the card part's
     proved root, and each arm's environment record names the four GPUs
-    (:func:`_four_gpu_problems`). ``items`` lists each acceptance item as ``(ok, text)``, in
-    the order the log prints them. Outside ``pass``: per model and arm each step's prover,
-    verifier, hand-off and total time (``step_times``), ``step_wall_s`` and ``gpu_held_s`` per
-    step, ``steady_s`` (steps 2 and 3, :func:`_steady_s`), the memory pass's peak per device
-    (``device_peaks``) and the whole card's peaks (``gpu_peak_mib``, per GPU); and once the
-    probe's per-device headline rates, the 12 peer rates and ``peer_check``'s per-pair rates."""
+    (:func:`_four_gpu_problems`); and the reported numbers are all there
+    (:func:`_four_missing_numbers`: per model and arm a steady step time and a peak per GPU,
+    once 12 peer rates). ``items`` lists each acceptance item as ``(ok, text)``, in the order
+    the log prints them. Outside ``pass``: per model and arm each step's prover, verifier,
+    hand-off and total time (``step_times``), ``step_wall_s`` and ``gpu_held_upper_s`` (an upper
+    bound) per step, ``accumulated_gpu_s`` per step and its steady mean
+    (``accumulated_steady_s``, steps 2 and 3; :func:`_accumulated_gpu_s`), ``steady_s`` (steps 2
+    and 3, :func:`_steady_s`), the memory pass's peak per device (``device_peaks``) and the whole
+    card's peaks (``gpu_peak_mib``, per GPU); and once the probe's per-device headline rates, the
+    12 peer rates and ``peer_check``'s per-pair rates."""
     if not any(p["kind"] == "four_run" for p in parts):
         return None
     names = {p["name"] for p in parts}
@@ -2406,7 +2499,10 @@ def four_h100(parts: Sequence[Mapping[str, Any]],
             "accepted": accepted, "roots_equal": equal, "step1_equals_card": card_ok,
             "card_root": card.get("root"), "gpu_problems": gpu_why,
             "arms": {a: {"step_roots": e.get("step_roots"), "step_times": e.get("step_times"),
-                         "step_wall_s": e.get("step_wall_s"), "gpu_held_s": e.get("gpu_held_s"),
+                         "step_wall_s": e.get("step_wall_s"),
+                         "gpu_held_upper_s": e.get("gpu_held_upper_s"),
+                         "accumulated_gpu_s": e.get("accumulated_gpu_s"),
+                         "accumulated_steady_s": _steady_mean(e.get("accumulated_gpu_s")),
                          "steady_s": steady[a][0], "steady_source": steady[a][1],
                          "device_peaks": e.get("device_peaks"), "loop_mode": e.get("loop_mode"),
                          "gpu_peak_mib": (_pair_part(parts, f"{a}_{k}").get("extras")
@@ -2427,7 +2523,11 @@ def four_h100(parts: Sequence[Mapping[str, Any]],
                  f"{a} arm: " + ", ".join(w) for a, w in gpu_why.items() if w))]
     probe = _pair_part(parts, "probe").get("extras") or {}
     check_rates = (peer or {}).get("gbps") or {}
+    missing = _four_missing_numbers(models, probe, check_rates)
+    items.append((not missing, "the step times, per-GPU peaks and peer rates are all reported"
+                  if not missing else "numbers missing: " + "; ".join(missing)))
     return {"pass": all(ok for ok, _ in items), "items": [[ok, text] for ok, text in items],
+            "missing_numbers": missing,
             "models": models, "part_problems": problems, "peer_bytes_ok": peer_ok,
             "tests": {k: tests_ex.get(k) for k in ("tests", "failures", "errors", "skipped",
                                                    "files", "missing_files")},
@@ -2464,18 +2564,20 @@ def _four_peer_range(res: Mapping[str, Any]) -> str:
 
 def _four_lines(res: Mapping[str, Any] | None) -> list[str]:
     """The session's last job-log lines: one ``FS35 ok`` or ``FS35 FAIL`` per acceptance item,
-    one per model and arm with the steady step time and the four GPUs' whole-card peaks, then
-    the peer-rate range."""
+    one per model and arm with the wall time (the steady step) beside the accumulated GPU time
+    (steady, mean of steps 2-3) and the four GPUs' whole-card peaks, then the peer-rate range."""
     if res is None:
         return []
     lines = [f"FS35 {'ok' if ok else 'FAIL'}: {text}" for ok, text in res["items"]]
     for k, row in res["models"].items():
         for a, arm in row["arms"].items():
-            s, src = arm["steady_s"], arm["steady_source"]
+            s, src, acc = arm["steady_s"], arm["steady_source"], arm.get("accumulated_steady_s")
             peaks = arm.get("gpu_peak_mib") or {}
             lines.append(
                 f"FS35 {k} {a}: steady step "
                 + ("unknown" if s is None else f"{s:.1f} s ({src}, mean of steps 2-3)")
+                + "; accumulated GPU time "
+                + ("unknown" if acc is None else f"{acc:.1f} s (mean of steps 2-3)")
                 + "; GPU peaks "
                 + (", ".join(f"{i}: {peaks[i] / 1024:.1f} GiB" if i in peaks else f"{i}: ?"
                              for i in map(str, range(FOUR_CARDS))) if peaks else "unknown"))
