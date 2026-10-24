@@ -224,3 +224,36 @@ def test_gpu_falls_back_to_the_first_row_when_no_row_matches(monkeypatch):
     r = setup_machine._Record()
     setup_machine._gpu(r)
     assert r.data["gpu_pci_bus_id"] == "00000000:19:00.0"
+
+
+class _CUuuid:
+    """Like torch's ``_CUuuid``: its ``str`` is the bare hex, without the ``GPU-`` prefix."""
+
+    def __init__(self, text):
+        self.text = text
+
+    def __str__(self):
+        return self.text
+
+
+def test_the_uuid_helper_adds_the_prefix_once_and_gives_none_for_none():
+    f = setup_machine.smi_uuid_form
+    assert f(_CUuuid("aaaa-bbbb")) == "GPU-aaaa-bbbb"
+    assert f("aaaa-bbbb") == "GPU-aaaa-bbbb"
+    assert f("GPU-aaaa-bbbb") == "GPU-aaaa-bbbb"
+    assert f(_CUuuid("GPU-aaaa-bbbb")) == "GPU-aaaa-bbbb"
+    assert f(None) is None and f("") is None
+
+
+def test_torch_gpu_uuid_reads_the_devices_properties(monkeypatch):
+    props = {0: types.SimpleNamespace(uuid=_CUuuid("aaaa")),
+             1: types.SimpleNamespace(uuid="GPU-bbbb"), 2: types.SimpleNamespace()}
+    monkeypatch.setattr(setup_machine.torch.cuda, "get_device_properties", lambda d: props[d])
+    assert [setup_machine.torch_gpu_uuid(k) for k in range(3)] == ["GPU-aaaa", "GPU-bbbb", None]
+
+
+def test_a_prefixed_torch_uuid_is_not_prefixed_twice_in_the_machine_record(monkeypatch):
+    # no nvidia-smi row matches (another bus id, another UUID): the UUID is torch's alone
+    _fake_cuda(monkeypatch, [("H100", 0x19, "GPU-aaaa"), ("H100", 0x3B, _CUuuid("bbbb"))],
+               _smi([("zz", "H100", 0x70)]))
+    assert [g["uuid"] for g in _record().data["gpus"]] == ["GPU-aaaa", "GPU-bbbb"]

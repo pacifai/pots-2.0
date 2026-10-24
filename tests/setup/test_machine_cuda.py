@@ -37,3 +37,16 @@ def test_gpu_zero_keys_are_the_first_entry():
     facts = machine_facts()
     assert facts["gpu_count"] == len(facts["gpus"])
     assert facts["gpus"][0]["pci_bus_id"] == facts["gpu_pci_bus_id"]
+
+
+def test_every_devices_role_and_probe_uuid_is_the_machine_records_by_index():
+    from setup.machine import torch_gpu_uuid
+    from verification.runs import metrics
+
+    smi = {g["index"]: g["uuid"] for g in machine_facts()["gpus"]}
+    devs = [f"cuda:{k}" for k in range(torch.cuda.device_count())]
+    roles = metrics.gpu_roles(devs[0], devs[1:])
+    assert [r["device"] for r in roles] == devs
+    assert {r["index"]: r["uuid"] for r in roles} == smi
+    assert {k: torch_gpu_uuid(dev) for k, dev in enumerate(devs)} == smi
+    assert all(u.startswith("GPU-") and not u.startswith("GPU-GPU-") for u in smi.values())

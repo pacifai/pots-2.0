@@ -55,7 +55,7 @@ import torch
 
 from setup.config import load_config, setup_determinism
 
-from setup.machine import machine_facts
+from setup.machine import machine_facts, torch_gpu_uuid
 
 __all__ = ["VERSION", "DATASHEET", "datasheet_for", "fit_hash_rate", "fit_alloc_rate", "run_probe",
            "probe_devices", "main"]
@@ -698,8 +698,7 @@ def run_probe(seconds: float, *, env: dict[str, str] | None = None,
         d_shapes: list[dict[str, Any]] = []
         measure_gpu(dev, seconds, k_cols, d_rates, d_costs, d_errors, d_shapes)
         name = torch.cuda.get_device_name(torch.device(dev))
-        uuid = getattr(torch.cuda.get_device_properties(torch.device(dev)), "uuid", None)
-        per_device[dev] = {"name": name, "uuid": None if uuid is None else f"GPU-{uuid}",
+        per_device[dev] = {"name": name, "uuid": torch_gpu_uuid(torch.device(dev)),
                            "datasheet": datasheet_for(name), "rates": d_rates,
                            "costs": d_costs, "errors": d_errors}
         if dev == first:  # v1's keys: the first device's GPU measures beside the host's
