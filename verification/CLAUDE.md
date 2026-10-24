@@ -1767,6 +1767,12 @@ interface.
     seed 1 (EVALUATION_SPEC §3.2). The thread count changes only the CPU's floating-point
     reduction order, a shift far below `τ = 8·s_h`, while the cost results need it recorded
     (FS2). A file written before `threads` was recorded (`cc7a9bca…`) loads too.
+    Three more keys are compared (FS35, G6): `gpu_models` (`gpu_models(cfg)`: the sorted
+    distinct `get_device_name` of the CUDA devices in `VERIF_DEVICE` and
+    `VERIF_VERIFIER_DEVICES`, `[]` on CPU), `torch` (`torch.__version__`) and `cuda`
+    (`torch.version.cuda`). A set of models, not a layout: a file fitted unsharded judges a
+    sharded run on the same model. A file written before them is refused, and the
+    `BandFileMismatch` message says it lacks them and to rerun `verification.runs.calibrate`.
   - Fitted bands go through `band_file_bytes` → `Bands.from_json` before `freeze`, so their
     `source` is the file's hash, not `"provisional"`.
 
@@ -2157,7 +2163,13 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     (`environment_record`) also holds the allocator's settings (`allocator_settings`): both
     variables of `ALLOC_VARS`, `PYTORCH_ALLOC_CONF` and `PYTORCH_CUDA_ALLOC_CONF` (null when
     unset), and the run's `release_cache` (`VERIF_RELEASE_CACHE` unless the caller passes
-    it). `bring_up` prints the same as a line, `allocator: {…}`. Every run that writes `corpus`
+    it). It also holds `gpu_roles` (FS35, I2): `None` on a CPU run, else one entry per distinct
+    CUDA device, the prover first then the verifiers (`VERIF_VERIFIER_DEVICES`), with `index`,
+    `name`, `uuid` (`GPU-…`, as in the machine record's `gpus`) and `roles` (`["prover"]`,
+    `["verifier"]`, or both: an unsharded run, or `cuda:0` in the pair layout). The machine
+    record's `gpus` (`setup/machine.py`) lists every torch device, joined to its `nvidia-smi`
+    row by PCI bus id, never by position. `bring_up` prints the allocator settings as a line,
+    `allocator: {…}`. Every run that writes `corpus`
     writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
     EVALUATION_SPEC §4.6) raises `ValueError`, in any letter case (`str.casefold`): on a
     case-insensitive file system `Data` is `data`.
@@ -2827,6 +2839,19 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     relative difference is 25 (the residual is rounding noise), and the step is still
     accepted; from `k = 2` every shared residual is bit-equal. 158.6 s, peak footprint
     4.69 GB.
+- `probe.py` (`probe.json` v2, FS35): `.venv/bin/python -m verification.runs.probe
+  [--seconds S] [--devices cuda:0,cuda:1,...]`. The devices are the run's own (`VERIF_DEVICE`,
+  then `VERIF_VERIFIER_DEVICES`, repeats dropped) unless `--devices` replaces them. Per CUDA
+  device it measures the GPU rates (`gemm`, `skinny`, `hbm`, `transfers`, `bf16_transfers`,
+  `costs`, `hash_kernel`: the leaf mixes through `leaf_hashes_of` on device tensors, the
+  kernel built before the clock); once, the host-only ones (`host_memcpy`, `first_touch`,
+  `hash`, `pinned_alloc`, which run first so no cached pinned block breaks its count); then
+  the peer rate of every ordered pair (one 256 MiB copy, synced on both devices).
+  `--seconds` is the budget per device (a four-GPU probe takes about 9 minutes, a one-GPU one
+  about 2.5). The file keeps the v1 top-level keys (the host measures and the first device's
+  GPU measures) and adds `devices`, `per_device` (name, uuid, datasheet, rates, costs,
+  errors), `peer` and `peer_errors` (keyed `cuda:i->cuda:j`). A CPU run has both empty.
+  A failed measure goes into the errors and the rest go on.
 - `check5_profile.py` (O2): `.venv/bin/python -m verification.runs.check5_profile
   [--run-dir DIR] [--step N] [--repeats N] [--json]`. Its docstring has the full flow. It
   judges nothing and writes nothing.
@@ -2840,6 +2865,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     tensor to a CPU one); on CUDA, from `torch.profiler`, kernel launches, kernels and their
     summed device time, and blocking runtime calls (`cuda{Stream,Device,Event}Synchronize`,
     `cudaMemcpy`), each placed in the section whose `record_function` range holds its start.
+  - On a sharded run (FS35) it syncs every device of the run (`run_devices_of`: `VERIF_DEVICE`
+    and the placement's devices) around each timed and profiled pass, and the profile adds
+    `by_device`: kernels and summed device time per `cuda:k`, from the kernel events'
+    `device_index`. Syncs and launches aren't split per device: their events name none.
   - `M` is split into dense and member products, but the counts aren't: check 5's sections
     don't separate them.
   - The digest of the last timed pass's check-5 numbers is compared with the archive's; on a

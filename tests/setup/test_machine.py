@@ -108,3 +108,119 @@ def test_machine_facts_carries_the_loop_benchmark():
     from setup.machine import machine_facts
     facts = machine_facts()
     assert facts["python_loop_ns"] > 0 and "affinity_freq_mhz" in facts
+
+
+# ---- gpus: one entry per CUDA device, joined to nvidia-smi by bus id ----
+
+def _props(name, bus, uuid, mem=80 * 2**30):
+    return types.SimpleNamespace(name=name, total_memory=mem, pci_domain_id=0, pci_bus_id=bus,
+                                 pci_device_id=0, uuid=uuid)
+
+
+def _smi(rows):
+    """nvidia-smi's csv: index, uuid, name, driver, mem MiB, power, bus id, 4 PCIe numbers."""
+    return "\n".join(
+        f"{i}, GPU-{u}, {n}, 550.1, 81559, 700.00, 00000000:{b:02X}:00.0, 5, 5, 16, 16"
+        for i, (u, n, b) in enumerate(rows)) + "\n"
+
+
+def _fake_cuda(monkeypatch, torch_order, smi_text):
+    """torch sees ``torch_order`` (a list of (name, bus, uuid)); nvidia-smi prints ``smi_text``."""
+    cuda = setup_machine.torch.cuda
+    monkeypatch.setattr(cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cuda, "device_count", lambda: len(torch_order))
+    monkeypatch.setattr(cuda, "get_device_properties",
+                        lambda k: _props(torch_order[k][0], torch_order[k][1], torch_order[k][2]))
+    calls = []
+
+    def run(*cmd, timeout=30):
+        calls.append(cmd)
+        return smi_text if "--query-gpu" in " ".join(cmd) else None
+    monkeypatch.setattr(setup_machine, "_run", run)
+    return calls
+
+
+def _record():
+    r = setup_machine._Record()
+    setup_machine._gpus(r)
+    return r
+
+
+def test_gpus_join_by_bus_id_when_torch_orders_differently_from_nvidia_smi(monkeypatch):
+    smi_rows = [("aaaa", "H100", 0x19), ("bbbb", "H100", 0x3B), ("cccc", "H100", 0x5D),
+                ("dddd", "H100", 0x7F)]
+    # torch's cuda:0 is the device at bus 0x5D, cuda:1 is at 0x19, ...
+    torch_order = [("H100", 0x5D, "cccc"), ("H100", 0x19, "aaaa"), ("H100", 0x7F, "dddd"),
+                   ("H100", 0x3B, "bbbb")]
+    calls = _fake_cuda(monkeypatch, torch_order, _smi(smi_rows))
+    r = _record()
+    gpus = r.data["gpus"]
+    assert [g["index"] for g in gpus] == [0, 1, 2, 3]
+    assert [g["uuid"] for g in gpus] == ["GPU-cccc", "GPU-aaaa", "GPU-dddd", "GPU-bbbb"]
+    assert [g["pci_bus_id"] for g in gpus] == [f"00000000:{b:02X}:00.0"
+                                               for b in (0x5D, 0x19, 0x7F, 0x3B)]
+    assert gpus[0]["power_max_w"] == 700 and gpus[0]["pcie_gen_max"] == 5
+    assert gpus[0]["pcie_width_current"] == 16 and gpus[0]["form_factor"].startswith("SXM")
+    assert gpus[0]["memory_bytes"] == 80 * 2**30
+    assert len([c for c in calls if "--query-gpu" in " ".join(c)]) == 1  # one smi call
+
+
+def test_gpus_two_devices_in_another_order_match_by_bus_not_position(monkeypatch):
+    # nvidia-smi rows differ in name by bus, so a positional join would swap the names
+    smi_rows = [("aaaa", "NVIDIA A100 PCIe", 0x19), ("bbbb", "NVIDIA H100 NVL", 0x3B)]
+    torch_order = [("H100", 0x3B, "bbbb"), ("A100", 0x19, "aaaa")]
+    _fake_cuda(monkeypatch, torch_order, _smi(smi_rows))
+    gpus = _record().data["gpus"]
+    assert [(g["name"], g["uuid"], g["form_factor"]) for g in gpus] == [
+        ("NVIDIA H100 NVL", "GPU-bbbb", "NVL"), ("NVIDIA A100 PCIe", "GPU-aaaa", "PCIe")]
+
+
+def test_gpus_without_nvidia_smi_keep_torchs_facts(monkeypatch):
+    _fake_cuda(monkeypatch, [("H100", 0x19, "aaaa"), ("H100", 0x3B, "bbbb")], None)
+    gpus = _record().data["gpus"]
+    assert [g["uuid"] for g in gpus] == ["GPU-aaaa", "GPU-bbbb"]
+    assert gpus[1]["name"] == "H100" and gpus[1]["pci_bus_id"] == "00000000:3B:00.0"
+    assert gpus[0]["power_max_w"] is None and gpus[0]["pcie_gen_max"] is None
+
+
+def test_gpus_is_none_with_a_reason_without_cuda(monkeypatch):
+    monkeypatch.setattr(setup_machine.torch.cuda, "is_available", lambda: False)
+    r = _record()
+    assert r.data["gpus"] is None and "gpus" in r.absent
+
+
+def test_machine_facts_carries_gpus_and_keeps_the_gpu_zero_keys():
+    facts = setup_machine.machine_facts()
+    assert "gpus" in facts and "gpu_name" in facts and "gpu_count" in facts
+
+
+def test_nvml_facts_takes_an_index(monkeypatch):
+    seen = []
+
+    class Nvml(_FakeNvml):
+        def nvmlDeviceGetHandleByIndex(self, i):
+            seen.append(i)
+            return object()
+    monkeypatch.setitem(sys.modules, "pynvml", Nvml())
+    setup_machine.nvml_facts()
+    setup_machine.nvml_facts(index=3)
+    assert seen == [0, 3]
+
+
+def test_gpu_zero_keys_are_torchs_device_zero_not_the_first_smi_row(monkeypatch):
+    smi_rows = [("aaaa", "NVIDIA A100 PCIe", 0x19), ("bbbb", "NVIDIA H100 NVL", 0x3B)]
+    calls = _fake_cuda(monkeypatch, [("H100", 0x3B, "bbbb"), ("A100", 0x19, "aaaa")],
+                       _smi(smi_rows))
+    r = setup_machine._Record()
+    setup_machine._gpu(r)
+    assert r.data["gpu_name"] == "NVIDIA H100 NVL" and r.data["gpu_form_factor"] == "NVL"
+    assert r.data["gpu_pci_bus_id"] == "00000000:3B:00.0"
+    assert r.data["gpu_memory_bytes"] == 80 * 2**30
+    assert len([c for c in calls if "--query-gpu" in " ".join(c)]) == 1
+
+
+def test_gpu_falls_back_to_the_first_row_when_no_row_matches(monkeypatch):
+    _fake_cuda(monkeypatch, [("H100", 0x5D, "zzzz")], _smi([("aaaa", "NVIDIA H100 SXM", 0x19)]))
+    r = setup_machine._Record()
+    setup_machine._gpu(r)
+    assert r.data["gpu_pci_bus_id"] == "00000000:19:00.0"

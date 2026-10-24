@@ -1085,3 +1085,54 @@ def test_environment_record_holds_the_machine_facts():
     probe = metrics.memory_probe(torch.device("cpu"))
     env = metrics.environment_record("r", device="cpu", probe=probe)
     assert env["machine"]["ram_total_bytes"] > 0
+
+
+# ---- the environment record's gpu_roles ----
+
+def _fake_gpus(monkeypatch, n=4):
+    import types
+    cuda = torch.cuda
+    monkeypatch.setattr(cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(cuda, "get_device_name", lambda d: f"H100 #{torch.device(d).index}")
+    monkeypatch.setattr(cuda, "get_device_properties",
+                        lambda i: types.SimpleNamespace(uuid=f"uuid-{i}"))
+
+
+def _roles(env):
+    return None if env["gpu_roles"] is None else [(g["device"], g["roles"])
+                                                  for g in env["gpu_roles"]]
+
+
+def test_gpu_roles_is_none_for_an_unsharded_cpu_run():
+    probe = metrics.memory_probe("cpu")
+    assert metrics.environment_record("r", device="cpu", probe=probe)["gpu_roles"] is None
+    env = metrics.environment_record("r", device="cpu", probe=probe,
+                                     config={"verifier_devices": None})
+    assert env["gpu_roles"] is None
+    assert metrics.gpu_roles("cpu", ("cpu", "cpu")) is None
+
+
+def test_gpu_roles_names_one_device_with_both_roles_when_unsharded(monkeypatch):
+    _fake_gpus(monkeypatch)
+    roles = metrics.gpu_roles("cuda")  # a bare cuda is the current device, cuda:0
+    assert roles == [{"device": "cuda:0", "index": 0, "name": "H100 #0", "uuid": "GPU-uuid-0",
+                      "roles": ["prover", "verifier"]}]
+
+
+def test_gpu_roles_for_a_prover_and_three_verifiers(monkeypatch):
+    _fake_gpus(monkeypatch)
+    roles = metrics.gpu_roles("cuda:0", ("cuda:1", "cuda:2", "cuda:3"))
+    assert [(g["device"], g["index"], g["roles"]) for g in roles] == [
+        ("cuda:0", 0, ["prover"]), ("cuda:1", 1, ["verifier"]), ("cuda:2", 2, ["verifier"]),
+        ("cuda:3", 3, ["verifier"])]
+    assert roles[2]["name"] == "H100 #2" and roles[2]["uuid"] == "GPU-uuid-2"
+
+
+def test_gpu_roles_in_the_pair_layout_gives_cuda0_both_roles(monkeypatch):
+    _fake_gpus(monkeypatch)
+    monkeypatch.setattr(metrics, "machine_facts", dict)  # the machine record has its own tests
+    probe = metrics.memory_probe("cpu")
+    env = metrics.environment_record("r", device="cuda:0", probe=probe,
+                                     config={"verifier_devices": ("cuda:0", "cuda:1")})
+    assert _roles(env) == [("cuda:0", ["prover", "verifier"]), ("cuda:1", ["verifier"])]

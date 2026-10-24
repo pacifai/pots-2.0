@@ -114,6 +114,7 @@ def test_cuda_device_is_set_by_index(monkeypatch, device, index):
         raise Stop
 
     monkeypatch.setattr(probe.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(probe.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(probe.torch.cuda, "set_device", set_device)
     with pytest.raises(Stop):
         probe.run_probe(1, env={"VERIF_DEVICE": device})
@@ -124,7 +125,7 @@ def test_cpu_run_writes_a_valid_file(tmp_path):
     out = tmp_path / "sub" / "probe.json"
     assert probe.main(["--out", str(out), "--seconds", "5"]) == 0
     doc = json.loads(out.read_text())
-    assert doc["version"] == 1 and doc["device"] == "cpu"
+    assert doc["version"] == 2 and doc["device"] == "cpu"
     assert set(doc["rates"]) == set(probe.RATE_KEYS) and set(doc["costs"]) == set(probe.COST_KEYS)
     assert doc["determinism"] == {"tf32": False, "deterministic": True}
     assert doc["datasheet"] is None and doc["machine"] is not None
@@ -164,3 +165,148 @@ def test_probe_part_and_extras(tmp_path):
     assert "hashing 10.0 GB/s" in e["summary"] and "\n" not in e["summary"]
     report.write_text("{")
     assert "extras_error" in fs.part_extras(part, tmp_path / "log.txt")
+
+
+# ---- v2: every device, the peer pairs, hash_kernel ----
+
+def _cfg_env(**kw):
+    from setup.config import load_config
+    return load_config(kw)
+
+
+def test_devices_come_from_the_config_prover_first_without_repeats(monkeypatch):
+    monkeypatch.setattr(probe.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(probe.torch.cuda, "current_device", lambda: 0)
+    cfg = _cfg_env(VERIF_DEVICE="cuda:0", VERIF_VERIFIER_DEVICES="cuda:1,cuda:2,cuda:0")
+    assert probe.probe_devices(cfg) == ["cuda:0", "cuda:1", "cuda:2"]
+    cfg = _cfg_env(VERIF_DEVICE="cuda")  # a bare cuda is the current device
+    assert probe.probe_devices(cfg) == ["cuda:0"]
+    assert probe.probe_devices(_cfg_env(VERIF_DEVICE="cpu")) == ["cpu"]
+
+
+def test_devices_flag_replaces_the_runs_devices(monkeypatch):
+    monkeypatch.setattr(probe.torch.cuda, "current_device", lambda: 0)
+    cfg = _cfg_env(VERIF_DEVICE="cuda:0", VERIF_VERIFIER_DEVICES="cuda:1,cuda:2,cuda:3")
+    assert probe.probe_devices(cfg, "cuda:2, cuda:0,cuda:2") == ["cuda:2", "cuda:0"]
+    assert probe.probe_devices(cfg, "cuda") == ["cuda:0"]
+
+
+def _fake_two_gpus(monkeypatch, fail_pair=None):
+    """Two fake CUDA devices: every measure is replaced, and the calls are recorded."""
+    calls = []
+    cuda = probe.torch.cuda
+    monkeypatch.setattr(cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(cuda, "set_device", lambda i: calls.append(("set_device", i)))
+    monkeypatch.setattr(cuda, "get_device_name", lambda d: f"H100 SXM #{d.index}")
+    monkeypatch.setattr(cuda, "get_device_properties",
+                        lambda d: SimpleNamespace(uuid=f"u{d.index}"))
+    monkeypatch.setattr(probe, "_free", lambda: None)
+    monkeypatch.setattr(probe, "machine_facts", lambda: {})
+
+    def host(name):
+        def fn(share, rates, errors):
+            calls.append((name, None))
+            rates[name] = 1.0
+        return fn
+    for name, key in (("measure_host_memcpy", "host_memcpy_bytes"),
+                      ("measure_first_touch", "host_first_touch_bytes"),
+                      ("measure_pinned_alloc", "pinned_alloc_bytes")):
+        monkeypatch.setattr(probe, name, host(key))
+    state = {"dev": None}
+    monkeypatch.setattr(cuda, "set_device", lambda i: (calls.append(("set_device", i)),
+                                                       state.update(dev=i)))
+
+    def hash_(share, rates, errors, *, device=None):
+        calls.append(("hash_kernel" if device else "hash", device))
+        if device is None:
+            rates["hash"] = {"per_byte_s": 1e-10}
+        elif device == "cuda:1":
+            errors["hash_kernel"] = "RuntimeError: no nvrtc"
+        else:
+            rates["hash_kernel"] = {"per_byte_s": 2e-11}
+    monkeypatch.setattr(probe, "measure_hash", hash_)
+
+    def gemm(share, rates, errors, shapes):
+        calls.append(("gemm", state["dev"]))
+        rates["gemm_bf16_flops"] = 1e14 + state["dev"]
+    monkeypatch.setattr(probe, "measure_gemm", gemm)
+    for name in ("measure_skinny", "measure_hbm", "measure_transfers",
+                 "measure_bf16_transfers"):
+        monkeypatch.setattr(probe, name, lambda *a, **k: None)
+    monkeypatch.setattr(probe, "measure_costs",
+                        lambda share, costs, errors: costs.update(launch_s=state["dev"] + 1.0))
+
+    def peer(src, dst, share):
+        calls.append(("peer", f"{src}->{dst}"))
+        if (str(src), str(dst)) == fail_pair:
+            raise RuntimeError("no peer access")
+        return 3e11 + dst.index
+    monkeypatch.setattr(probe, "measure_peer", peer)
+    return calls
+
+
+def test_two_device_run_gives_per_device_peer_and_host_measures_once(monkeypatch):
+    calls = _fake_two_gpus(monkeypatch)
+    doc = probe.run_probe(1.0, env={"VERIF_DEVICE": "cuda:0", "VERIF_VERIFIER_DEVICES": "cuda:1"})
+    assert doc["version"] == 2 and doc["device"] == "cuda:0"
+    assert doc["devices"] == ["cuda:0", "cuda:1"]
+    assert list(doc["per_device"]) == ["cuda:0", "cuda:1"]
+    d0, d1 = doc["per_device"]["cuda:0"], doc["per_device"]["cuda:1"]
+    assert (d0["name"], d0["uuid"]) == ("H100 SXM #0", "GPU-u0")
+    assert d1["uuid"] == "GPU-u1" and d0["datasheet"]["name"] == "H100 SXM"
+    assert d0["rates"]["gemm_bf16_flops"] == 1e14 and d1["rates"]["gemm_bf16_flops"] == 1e14 + 1
+    assert d0["costs"]["launch_s"] == 1.0 and d1["costs"]["launch_s"] == 2.0
+    assert d0["rates"]["hash_kernel"] == {"per_byte_s": 2e-11}
+    assert d1["rates"]["hash_kernel"] is None and "no nvrtc" in d1["errors"]["hash_kernel"]
+    assert "hash_kernel" not in d0["errors"]
+    # no host-only measure sits in a device's rates
+    assert not set(d0["rates"]) & set(probe.HOST_RATE_KEYS)
+    # the top level is the host measures plus the first device's GPU measures, as v1
+    assert doc["rates"]["gemm_bf16_flops"] == 1e14 and doc["costs"]["launch_s"] == 1.0
+    assert doc["rates"]["hash"] == {"per_byte_s": 1e-10}
+    assert doc["rates"]["hash_kernel"] == {"per_byte_s": 2e-11}
+    assert doc["rates"]["host_memcpy_bytes"] == 1.0 and "hash_kernel" not in doc["errors"]
+    assert doc["peer"] == {"cuda:0->cuda:1": 3e11 + 1, "cuda:1->cuda:0": 3e11}
+    assert doc["peer_errors"] == {}
+    assert doc["datasheet"]["name"] == "H100 SXM"
+    host_calls = [c[0] for c in calls if c[0] in ("host_memcpy_bytes", "host_first_touch_bytes",
+                                                  "hash", "pinned_alloc_bytes")]
+    assert sorted(host_calls) == sorted(["host_memcpy_bytes", "host_first_touch_bytes", "hash",
+                                         "pinned_alloc_bytes"])  # once each
+    assert [c[1] for c in calls if c[0] == "set_device"][-2:] == [0, 1]
+    gemm_devs = [c[1] for c in calls if c[0] == "gemm"]
+    assert gemm_devs == [0, 1]
+    json.dumps(doc)
+
+
+def test_a_failing_peer_pair_fills_peer_errors_and_the_rest_run(monkeypatch):
+    _fake_two_gpus(monkeypatch, fail_pair=("cuda:1", "cuda:0"))
+    doc = probe.run_probe(1.0, devices="cuda:0,cuda:1")
+    assert doc["peer"]["cuda:1->cuda:0"] is None and doc["peer"]["cuda:0->cuda:1"] > 0
+    assert doc["peer_errors"] == {"cuda:1->cuda:0": "RuntimeError: no peer access"}
+
+
+def test_a_one_device_cuda_run_has_no_peer_pairs(monkeypatch):
+    _fake_two_gpus(monkeypatch)
+    doc = probe.run_probe(1.0, devices="cuda:0")
+    assert list(doc["per_device"]) == ["cuda:0"] and doc["peer"] == {}
+
+
+def test_a_cpu_run_has_no_per_device_and_no_peer():
+    doc = probe.run_probe(1.0, env={"VERIF_DEVICE": "cpu"})
+    assert doc["per_device"] == {} and doc["peer"] == {} and doc["peer_errors"] == {}
+    assert doc["devices"] == ["cpu"]
+    assert doc["rates"]["hash_kernel"] is None and "CUDA" in doc["errors"]["hash_kernel"]
+
+
+def test_the_peer_pair_copy_is_timed_between_syncs_of_both_devices(monkeypatch):
+    """On the CPU: the sync calls (fakes) name both devices, the rate is bytes over median."""
+    synced = []
+    monkeypatch.setattr(probe.torch.cuda, "synchronize", lambda d=None: synced.append(str(d)))
+    probe.PEER_BYTES, old = 1 << 20, probe.PEER_BYTES
+    try:
+        rate = probe.measure_peer(probe.torch.device("cpu"), probe.torch.device("cpu"), 0.0)
+    finally:
+        probe.PEER_BYTES = old
+    assert rate > 0 and synced and set(synced) == {"cpu"}
