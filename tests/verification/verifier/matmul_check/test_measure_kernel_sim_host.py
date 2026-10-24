@@ -24,6 +24,8 @@ from tests.verification.verifier.matmul_check.shared_tables import (
     EDITS,
     fwd_and_grad,
     member_stack,
+    prod_of,
+    rnd,
     mixed_table,
     shared_special,
     three_forward,
@@ -283,3 +285,34 @@ def test_the_kernel_reads_nothing_outside_its_buffers(host_measure, sim_dir, tmp
         pytest.skip("the OS ignores the preloaded ASAN runtime (a hardened Python)")
     assert proc.returncode == 0, proc.stderr[-3000:]
     agree(np.load(out), host_measure(pack(mis)), "asan")
+
+
+# ---- sets: more entries than E_MAX, mixed kinds, entries of different widths ----
+
+def wide_group(dtype, guard, n_a, n_b, *, n=19, q=37, k=3, kind="row"):
+    """One stored ``[n, q]`` view ``v`` read as ``A`` by ``n_a`` products (``B`` widths 5, 9,
+    ...) and as ``B`` by ``n_b`` products (``A`` of ``m`` rows): a read group of ``n_a + n_b``
+    entries over one view, every entry with its own P width."""
+    g = torch.Generator().manual_seed(11 + n_a * 7 + n_b)
+    v = layout(rnd(g, n, q, dtype=dtype), kind)
+    out = []
+    for i in range(n_a):
+        out.append(prod_of(v, rnd(g, q, 5 + 4 * i, dtype=dtype), k=k, m=i + 1, guard=guard,
+                           seed=i))
+    for i in range(n_b):
+        out.append(prod_of(rnd(g, 3 + 2 * i, n, dtype=dtype), v, k=k, m=n_a + i + 1,
+                           guard=guard, seed=20 + i))
+    return out
+
+
+@pytest.mark.parametrize("kind", ["row", "t"])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_a_group_wider_than_e_max_runs_in_batches(sim, host_measure, dtype, kind):
+    """Seven entries over one view (batches of E_MAX and of 3, RB = ROWS_PER_BLOCK // E_MAX),
+    five and one for the lone-batch and single-entry cases, and a group of exactly E_MAX."""
+    for n_a, n_b in ((4, 3), (5, 0), (0, 5), (2, 2), (1, 1)):
+        for guard in (True, False):
+            mis = wide_group(dtype, guard, n_a, n_b, kind=kind)
+            want = host_measure(pack(mis))
+            for geometry in (GEOMETRIES[0], GEOMETRIES[1], GEOMETRIES[2]):
+                agree(sim(mis, geometry=geometry), want, f"{n_a}+{n_b} {geometry}")

@@ -63,6 +63,7 @@ WARPS = 8  # warps per block, POTS_MK_WARPS in the .cu
 ROWS_PER_BLOCK = 32  # rows of a view per block (a multiple of WARPS), a -D option of the .cu
 TILE_COLS = 64  # columns per shared-memory tile (a multiple of 32), a -D option
 K_CHUNK = 16  # challenge columns per sweep, a -D option
+E_MAX = 4  # entries of a read group swept together (one row tile feeds them all), a -D option
 SHARED_LIMIT = 48 * 1024  # static shared memory per block
 MAX_BLOCKS = 1 << 22
 PHASES = 3
@@ -101,9 +102,12 @@ assert ctypes.sizeof(LevelArgs) == 72
 # ---- the geometry (FS37b) ----
 
 def shared_bytes(rows_per_block: int, tile_cols: int, k_chunk: int) -> int:
-    """The kernel's static shared memory: the x tile (``rows_per_block`` rows of ``tile_cols +
-    1`` floats), the vector tile (``k_chunk x tile_cols``) and ``b2``, ``b1`` (``tile_cols``)."""
-    return 4 * (rows_per_block * (tile_cols + 1) + k_chunk * tile_cols + 2 * tile_cols)
+    """The kernel's static shared memory, with the module's :data:`E_MAX`: the x tile
+    (``rows_per_block`` rows of ``tile_cols + 1`` floats), one vector tile per entry
+    (``E_MAX x k_chunk x (tile_cols + 1)``) and ``b2``, ``b1`` per entry (``E_MAX x
+    tile_cols`` each)."""
+    return 4 * (rows_per_block * (tile_cols + 1) + E_MAX * k_chunk * (tile_cols + 1)
+                + 2 * E_MAX * tile_cols)
 
 
 def set_geometry(*, rows_per_block: int | None = None, tile_cols: int | None = None,
@@ -112,8 +116,8 @@ def set_geometry(*, rows_per_block: int | None = None, tile_cols: int | None = N
     k_chunk)``; with no argument nothing changes. The values are NVRTC ``-D`` options, so they
     key the cached CUBIN, and the loaded-kernel caches are cleared. ``ValueError`` (nothing
     changed) unless ``tile_cols`` is a positive multiple of 32, ``rows_per_block`` a positive
-    multiple of :data:`WARPS`, ``k_chunk >= 1`` and the static shared memory fits 48 KB. The
-    bits never depend on the geometry."""
+    multiple of :data:`WARPS` and at least :data:`E_MAX`, ``k_chunk >= 1`` and the static
+    shared memory (with :data:`E_MAX`) fits 48 KB. The bits never depend on the geometry."""
     global ROWS_PER_BLOCK, TILE_COLS, K_CHUNK
     prev = (ROWS_PER_BLOCK, TILE_COLS, K_CHUNK)
     rpb = prev[0] if rows_per_block is None else rows_per_block
@@ -125,6 +129,8 @@ def set_geometry(*, rows_per_block: int | None = None, tile_cols: int | None = N
         raise ValueError(f"tile_cols must be a positive multiple of 32, got {tc}")
     if rpb < 1 or rpb % WARPS:
         raise ValueError(f"rows_per_block must be a positive multiple of {WARPS}, got {rpb}")
+    if rpb < E_MAX:
+        raise ValueError(f"rows_per_block must be at least E_MAX ({E_MAX}), got {rpb}")
     if kc < 1:
         raise ValueError(f"k_chunk must be at least 1, got {kc}")
     if shared_bytes(rpb, tc, kc) > SHARED_LIMIT:
@@ -138,10 +144,10 @@ def set_geometry(*, rows_per_block: int | None = None, tile_cols: int | None = N
 
 
 def build_options() -> tuple[str, ...]:
-    """The NVRTC options of the current geometry: ``--fmad=false`` and the four ``-D`` macros
+    """The NVRTC options of the current geometry: ``--fmad=false`` and the five ``-D`` macros
     (part of the cache key, so another geometry is another CUBIN)."""
     return (*OPTIONS, f"-DPOTS_MK_WARPS={WARPS}u", f"-DROWS_PER_BLOCK={ROWS_PER_BLOCK}u",
-            f"-DTILE_COLS={TILE_COLS}u", f"-DK_CHUNK={K_CHUNK}u")
+            f"-DTILE_COLS={TILE_COLS}u", f"-DK_CHUNK={K_CHUNK}u", f"-DE_MAX={E_MAX}u")
 
 
 # ---- the build ----
@@ -520,9 +526,11 @@ def _plan(prods: np.ndarray, share: bool) -> ReadPlan:
 
 def block_starts(plan: ReadPlan, rows_per_block: int | None = None) -> np.ndarray:
     """The row-block starts of every level, uint64, one per entry of ``plan.reads`` (so level
-    ``l``'s array is ``[level_off[l]:level_off[l + 1]]``): group ``g`` takes ``ceil(count_g /
-    rows_per_block)`` blocks (a phase-2 group one: its warps take the ``5 + k`` items), the
-    entry after the last group holds the level's block total."""
+    ``l``'s array is ``[level_off[l]:level_off[l + 1]]``): a phase-0 or phase-1 group takes
+    ``ceil(count_g / RB_g)`` blocks with ``RB_g = rows_per_block // min(n_entries_g, E_MAX)``
+    rows of its view per block (the kernel derives the same ``RB``), a phase-2 group one (its
+    warps take the ``5 + k`` items); the entry after the last group holds the level's block
+    total."""
     rpb = ROWS_PER_BLOCK if rows_per_block is None else rows_per_block
     out = np.zeros(len(plan.reads), dtype=np.uint64)
     off = plan.level_off.astype(np.int64)
@@ -530,7 +538,8 @@ def block_starts(plan: ReadPlan, rows_per_block: int | None = None) -> np.ndarra
         lo, hi = int(off[lv]), int(off[lv + 1])
         r = plan.reads[lo:hi - 1]
         two = plan.entries["phase"][r["entry0"].astype(np.int64)] == 2
-        nb = np.where(two, 1, -(-r["count"].astype(np.int64) // rpb))
+        rb = rpb // np.minimum(np.maximum(r["n_entries"].astype(np.int64), 1), E_MAX)
+        nb = np.where(two, 1, -(-r["count"].astype(np.int64) // rb))
         out[lo + 1:hi] = np.cumsum(nb).astype(np.uint64)
     return out
 
