@@ -3,9 +3,12 @@
 ``measure_core.h`` defines every number of a product's row on logical indices;
 ``measure_phases.h`` splits that work into items and steps (a dot or sum whose 32 partials are
 the 32 lanes) and holds the per-element updates; ``measure_kernel.cu`` runs one sweep per row
-(FS37b): a block takes ``ROWS_PER_BLOCK`` rows of a view, walks the columns in ``TILE_COLS``
-tiles through shared memory and the challenge columns in ``K_CHUNK`` chunks, and reduces each
-lane's accumulators with shuffles. The host test (``measure_core_host.c``) runs the same updates
+(FS37b): a block takes ``ROWS_PER_BLOCK`` sets, a set being one (row, entry) pair of a read
+group (``E_MAX`` entries share one row tile), walks the columns in ``TILE_COLS`` tiles through
+shared memory and the challenge columns in ``K_CHUNK`` chunks, and reduces each lane's
+accumulators with shuffles. ``K_CHUNK`` is ``min(k, cap)`` per build (:func:`chunk_for`), one
+cached image per value. :meth:`MeasureKernels.attributes` reports the build's registers, spills
+and shared bytes. The host test (``measure_core_host.c``) runs the same updates
 in loops (``pots_host_measure_sweep``), so the GPU's bits are testable without a GPU.
 
 Compiled at first use by NVRTC (through ``gpu_blake3``'s :class:`Nvrtc`, :class:`Driver` and

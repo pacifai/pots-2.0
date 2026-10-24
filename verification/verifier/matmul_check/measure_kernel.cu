@@ -10,13 +10,20 @@
 // the block takes RB = ROWS_PER_BLOCK / min(e, E_MAX) rows of the shared view, and set s is
 // entry s / RB, row s % RB. The block walks the view's columns in tiles of TILE_COLS: the view's
 // RB rows are loaded once, coalesced, into shared memory (widened to fp32), with every entry's
-// vector tile; lane p then takes the tile's columns p, p+32, ... in increasing order for each
-// of its sets, so every accumulator sees exactly the operations of its step's partial in
+// vector tile; lane p then takes the tile's columns p, p+32, ... in increasing order. For each
+// column the warp's sets go inside: an entry's vector values (and b2, b1) go into registers
+// once and every set of that entry uses them. Each accumulator still sees exactly the
+// operations of its step's partial in
 // measure_core.h (the per-element updates are measure_phases.h's, shared with the host
 // emulation). A column past the view's end is skipped, never zero-filled. After the last tile
 // the warp's halving tree reduces each accumulator and lane 0 stores through pots_phase_store.
-// A phase-1 entry then sweeps its own P rows (all the batch's P views in one tile). The
-// geometry (the macros below) is passed as -D options and never changes a bit.
+// A phase-1 entry then sweeps its own P rows (all the batch's P views in one tile).
+// Every tile load is two passes: the global loads go to a register array of compile-time size
+// (unrolled), then the shared stores. The shared and bias sweeps prefetch: the next tile's
+// global loads are issued before the compute and stored after its barrier (the P sweep does
+// not: its sub-tile sizes depend on each view's layout). K_CHUNK is min(k, cap) per build, and
+// __launch_bounds__(256, 2) asks for at most 128 registers. The geometry (the macros below) is
+// passed as -D options and never changes a bit.
 #ifndef POTS_MK_WARPS
 #define POTS_MK_WARPS 8u /* warps per block */
 #endif

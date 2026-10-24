@@ -1884,9 +1884,14 @@ interface.
     the 32 lanes), with the per-product scratch layout (`pots_mwork_t`). `measure_kernel.cu`
     maps the work onto blocks, warps, shared-memory tiles and shuffles (FS37b): one kernel,
     `pots_measure_level`, launched once per level of a read plan. A block takes
-    `ROWS_PER_BLOCK` rows of one group's view and walks the columns in `TILE_COLS` tiles
-    (loaded coalesced into shared memory, widened to fp32, specialised by dtype and layout)
-    and the challenge columns in `K_CHUNK` chunks; lane `p` keeps one accumulator per step over
+    `ROWS_PER_BLOCK` sets, a set being one (row, entry) pair of a read group; a group with `e`
+    entries runs in batches of `min(e, E_MAX)`, each batch loading one tile of
+    `RB = ROWS_PER_BLOCK / min(e, E_MAX)` rows for all its entries (FS37b round 2). The block
+    walks the columns in `TILE_COLS` tiles (loaded coalesced into shared memory, widened to
+    fp32, specialised by dtype and layout; two passes, global loads into registers first, and
+    the next tile prefetched in the shared and bias sweeps) and the challenge columns in
+    `K_CHUNK` chunks; an entry's vector values sit in registers once per column for all its
+    sets; lane `p` keeps one accumulator per step over
     columns `p, p+32, ...`, so the per-partial operations are unchanged, and masked columns are
     skipped, never zero-filled. The per-element updates (`pots_upd_*`) are in the header and
     shared with the host emulation `pots_host_measure_sweep`. The header also holds the level layout: `pots_mread_t` (a
@@ -1896,13 +1901,17 @@ interface.
   - **Build.** NVRTC (through `gpu_blake3`'s `Nvrtc`, `Driver` and `build_image`) compiles
     the three sources with `--fmad=false`, so the only fused operation is the core's `fmaf`.
     The CUBIN is cached under `native.cache_dir()`, keyed by the sources, the options (the
-    geometry macros `-DROWS_PER_BLOCK`, `-DTILE_COLS`, `-DK_CHUNK`, `-DPOTS_MK_WARPS` among
-    them), the NVRTC version and architecture. `set_geometry(rows_per_block=, tile_cols=,
+    geometry macros `-DROWS_PER_BLOCK`, `-DTILE_COLS`, `-DK_CHUNK`, `-DE_MAX`,
+    `-DPOTS_MK_WARPS` among them), the NVRTC version and architecture. `K_CHUNK` is
+    `min(k, cap)` per build (`chunk_for(k)`; the cap is 16, or `set_geometry`'s `k_chunk`), so
+    there is one cached image per value. `set_geometry(rows_per_block=, tile_cols=,
     k_chunk=)` changes the geometry for tuning and tests (`ValueError` on a bad value or over
     48 KB of shared memory; it returns the previous triple and clears the build caches only on
-    a change; no arguments changes nothing). Geometry never changes a bit (FS37b). Importing the module compiles and loads nothing. `kernels(device)`
-    builds or loads on first use and returns that device's `MeasureKernels`; a cached image
-    the driver rejects is dropped and compiled afresh once.
+    a change; no arguments changes nothing). Geometry never changes a bit (FS37b). Importing the module compiles and loads nothing. `kernels(device, k)`
+    builds or loads on first use and returns that device's `MeasureKernels` for that
+    `K_CHUNK`; a cached image the driver rejects is dropped and compiled afresh once.
+    `MeasureKernels.attributes()` returns `registers`, `local_bytes` (spills), `shared_bytes`
+    and `max_threads` of the build.
   - **Shared reads (FS38b).** `read_plan(prods)` finds the nodes `(t, 0)` (product `t`'s
     pass over `B`'s rows) and `(t, 1)` (over `A`'s rows) whose view is the same stored one
     (address, shape, both strides, dtype) and groups them, so one row is read once for all.
