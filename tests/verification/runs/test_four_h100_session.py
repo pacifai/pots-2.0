@@ -136,7 +136,7 @@ def test_the_card_and_arm_parts_run_the_right_commands_in_their_own_directories(
     assert plan["seq_" + KEYS[0]].timeout_s == fs.FOUR_TIMEOUT_S["seq"]
 
 
-def test_the_tests_part_selects_the_slow_tests_fs34_and_the_new_files(tmp_path):
+def test_the_tests_part_selects_every_two_gpu_test_fs34_and_the_new_files(tmp_path):
     plan = {p.name: p for p in fs.four_h100_plan(tmp_path / "up", tmp_path / "out")}
     t, probe = plan["four_tests"], plan["probe"]
     assert t.kind == "four_tests" and any(a.startswith("--junitxml=") for a in t.argv)
@@ -145,6 +145,7 @@ def test_the_tests_part_selects_the_slow_tests_fs34_and_the_new_files(tmp_path):
         assert Path(f).stem in expr
     assert "test_check5_profile_cuda" not in expr and len(fs.FOUR_TEST_FILES) == 3
     assert "slow or not slow" in t.argv
+    assert expr.startswith(f"({fs.PAIR_SLOW_SELECT}) or ") and "slow and" not in expr
     assert probe.kind == "four_probe" and probe.argv[-2:] == ["--seconds", "60"]
     assert probe.env["VERIF_PIPELINED"] is None
 
@@ -180,7 +181,8 @@ def test_the_probe_and_tests_parts_use_the_same_gpu_order_as_the_others(tmp_path
 def test_the_tests_part_builds_its_k_expression_from_the_pair_constant(tmp_path, monkeypatch):
     monkeypatch.setattr(fs, "PAIR_SLOW_SELECT", "marker_a or marker_b")
     t = {p.name: p for p in fs.four_h100_plan(tmp_path / "up", tmp_path / "out")}["four_tests"]
-    assert t.argv[t.argv.index("-k") + 1].startswith("(slow and (marker_a or marker_b)) or ")
+    expr = t.argv[t.argv.index("-k") + 1]
+    assert expr.startswith("(marker_a or marker_b) or ") and "slow and" not in expr
 
 
 def test_a_run_model_missing_from_the_order_follows_the_listed_ones_without_raising():
