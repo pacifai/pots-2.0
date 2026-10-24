@@ -1879,16 +1879,25 @@ interface.
   - `measure_phases.h` splits a product's row into three phases (B's rows, A's and P's rows,
     the row's columns) of items, one warp each, and steps (a dot or sum whose 32 partials are
     the 32 lanes), with the per-product scratch layout (`pots_mwork_t`). `measure_kernel.cu`
-    maps items and steps onto warps and shuffles: `pots_measure_phase`, launched once per
-    phase, and (FS38b) `pots_measure_level`, launched once per level of a read plan, both
-    running one per-item helper. The header also holds the level layout: `pots_mread_t` (a
+    maps the work onto blocks, warps, shared-memory tiles and shuffles (FS37b): one kernel,
+    `pots_measure_level`, launched once per level of a read plan. A block takes
+    `ROWS_PER_BLOCK` rows of one group's view and walks the columns in `TILE_COLS` tiles
+    (loaded coalesced into shared memory, widened to fp32, specialised by dtype and layout)
+    and the challenge columns in `K_CHUNK` chunks; lane `p` keeps one accumulator per step over
+    columns `p, p+32, ...`, so the per-partial operations are unchanged, and masked columns are
+    skipped, never zero-filled. The per-element updates (`pots_upd_*`) are in the header and
+    shared with the host emulation `pots_host_measure_sweep`. The header also holds the level layout: `pots_mread_t` (a
     read group: its first item in the level, its rows, its entries), `pots_mentry_t` (a node,
     product and phase) and `pots_rfind` (the group holding an item, a binary search as
     `pots_mfind`). The host test runs the same items and steps in loops.
   - **Build.** NVRTC (through `gpu_blake3`'s `Nvrtc`, `Driver` and `build_image`) compiles
     the three sources with `--fmad=false`, so the only fused operation is the core's `fmaf`.
-    The CUBIN is cached under `native.cache_dir()`, keyed by the sources, the options, the
-    NVRTC version and architecture. Importing the module compiles and loads nothing. `kernels(device)`
+    The CUBIN is cached under `native.cache_dir()`, keyed by the sources, the options (the
+    geometry macros `-DROWS_PER_BLOCK`, `-DTILE_COLS`, `-DK_CHUNK`, `-DPOTS_MK_WARPS` among
+    them), the NVRTC version and architecture. `set_geometry(rows_per_block=, tile_cols=,
+    k_chunk=)` changes the geometry for tuning and tests (`ValueError` on a bad value or over
+    48 KB of shared memory; it returns the previous triple and clears the build caches only on
+    a change; no arguments changes nothing). Geometry never changes a bit (FS37b). Importing the module compiles and loads nothing. `kernels(device)`
     builds or loads on first use and returns that device's `MeasureKernels`; a cached image
     the driver rejects is dropped and compiled afresh once.
   - **Shared reads (FS38b).** `read_plan(prods)` finds the nodes `(t, 0)` (product `t`'s
@@ -1902,18 +1911,21 @@ interface.
     `reads` (`READ_DTYPE`: each level's groups, ordered by the view's address, then a
     sentinel holding the level's item total), `level_off`, `entries` (`ENTRY_DTYPE`),
     `node_level`, `n_levels` (the launches), `shared_groups`, `bytes_fs37` and `bytes_saved`.
-    Numpy only, no loop over members. `enqueue(..., share=True, plan_out=list)` packs the
-    plan after the works array and launches `pots_measure_level` once per level, in order,
-    and appends the plan to `plan_out`; the rows have the same bits as `share=False`. A
-    `run` injected for tests gets the level launches too, each `(LevelArgs, blocks)`
-    (`KernelArgs` for the phases). `freivalds.measure_groups_rows(..., share=, plan_out=)`
-    passes both through.
+    Numpy only, no loop over members. `plain_plan(prods)` is the unshared plan: three
+    levels, every node its own group. `block_starts(plan)` gives each group's first row
+    block (a uint64 array aligned with `plan.reads`; a phase-2 group takes one block); the
+    kernel finds its group by binary search and grid-strides over row blocks.
+    `enqueue(..., share=, plan_out=list)` packs the plan and the starts after the works
+    array and launches `pots_measure_level` once per level, in order (always: `share=False`
+    uses `plain_plan`, and the old per-phase kernel and `KernelArgs` are gone), and with
+    `share=True` appends the plan to `plan_out`; the rows have the same bits either way. A
+    `run` injected for tests gets the level launches, each `(LevelArgs, blocks)`.
+    `freivalds.measure_groups_rows(..., share=, plan_out=)` passes both through.
   - **The call.** `enqueue(groups, *, h, k, guard=True, challenges=None, run=None,
     share=False, plan_out=None)` takes `MeasureGroup`s (`freivalds.py`), packs every member
     into one table in one pinned buffer, copies it up with one non-blocking copy and launches
-    the three phases (with `share=True`, one launch per level of the read plan, which `plan_out`
-    receives) on the current
-    stream. It returns the float64 rows `[Σ n_t, row_width(k)]` on the device and reads
+    the level kernel (one launch per level of the plan: the plain three-level one, or with
+    `share=True` the read plan, which `plan_out` receives) on the current stream. It returns the float64 rows `[Σ n_t, row_width(k)]` on the device and reads
     nothing back. `validate` applies FS36's rules per group first (`ValueError` naming the
     group and its products). `run` replaces the loaded kernel and `challenges` the challenge
     source, for tests.

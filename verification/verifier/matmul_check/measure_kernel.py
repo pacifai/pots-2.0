@@ -1,18 +1,21 @@
 """The fused measuring kernel of check 5 (FS37, decision O2): its table, build and launch.
 
 ``measure_core.h`` defines every number of a product's row on logical indices;
-``measure_phases.h`` splits that work into items (a warp each) and steps (a dot or sum whose 32
-partials are the 32 lanes); ``measure_kernel.cu`` is the thin wrapper that runs the steps with
-shuffles. The host test (``measure_core_host.c``) runs the same items and steps in loops, so the
-GPU's bits are testable without a GPU.
+``measure_phases.h`` splits that work into items and steps (a dot or sum whose 32 partials are
+the 32 lanes) and holds the per-element updates; ``measure_kernel.cu`` runs one sweep per row
+(FS37b): a block takes ``ROWS_PER_BLOCK`` rows of a view, walks the columns in ``TILE_COLS``
+tiles through shared memory and the challenge columns in ``K_CHUNK`` chunks, and reduces each
+lane's accumulators with shuffles. The host test (``measure_core_host.c``) runs the same updates
+in loops (``pots_host_measure_sweep``), so the GPU's bits are testable without a GPU.
 
 Compiled at first use by NVRTC (through ``gpu_blake3``'s :class:`Nvrtc`, :class:`Driver` and
 :func:`build_image`) with ``--fmad=false`` into a CUBIN cached under ``native.cache_dir()``;
 importing this module compiles and loads nothing. One call (:func:`enqueue`) packs every group's
 products into one table in one pinned buffer, copies it up with one non-blocking copy and
-launches three kernels (the phases) on the current stream, or, with ``share=True`` (FS38b),
-one kernel per level of a :func:`read_plan` (products that read one stored view run their rows
-together); the rows stay on the device. Each
+launches one kernel per level of a plan on the current stream: :func:`plain_plan` (every node
+its own group, three levels) or, with ``share=True`` (FS38b), :func:`read_plan` (products that
+read one stored view run their rows together); the rows stay on the device. The tile geometry
+is a set of ``-D`` options in the cache key; :func:`set_geometry` changes it (never a bit). Each
 call's :class:`Pending` holds every tensor and buffer the stream reads, with each input's
 ``_version``, until :func:`drain` has waited for its event and found no input changed.
 """
@@ -162,7 +165,7 @@ def build(nvrtc: gb.Nvrtc, cc: tuple[int, int], *, cache: Path | None = None,
 
 
 class MeasureKernels:
-    """A device's loaded module and its two kernels."""
+    """A device's loaded module and its level kernel."""
 
     def __init__(self, driver: gb.Driver, dev: int, built: gb.Built) -> None:
         self.driver = driver

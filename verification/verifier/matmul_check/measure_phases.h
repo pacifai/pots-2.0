@@ -6,6 +6,9 @@
  * stores the result. Nothing else is shared between lanes, so there are no atomics, and every
  * number is the value of MEASURE_KERNEL_PLAN_DRAFT.md §2.1a on logical indices.
  *
+ * (FS37b: the kernel now runs one sweep per row over tiles, with these same updates; the items
+ * and steps below still define which partial each accumulator is.)
+ *
  * Three phases, each a launch, since a phase reads what the one before it wrote:
  *   0. B's rows, one item per row l of B (and one for the bias, if any): t_j[l] = B[l,.]·R[.,j],
  *      b2[l] = B[l,.]²·1, and with the guard b1[l] = |B[l,.]|·1; the bias item makes ‖b‖²,
