@@ -718,8 +718,8 @@ def _timeline(run: Run) -> str:
                                      for s in steps for key in strips_of(s))]
     top_words = {"g_util": "", "c_busy": f", up to {fmt(maxes.get('c_busy'))}",
                  "pcie": f", up to {fmt(maxes.get('pcie'))} GB/s"}
-    note = (" Lines under each step" + (", one per GPU" if several else "") + ": " + "; ".join(f"{STRIPS[k][0]}, {STRIPS[k][1]}{top_words[k]}"
-                                                    for k in used) + "."
+    strips = "; ".join(f"{STRIPS[k][0]}, {STRIPS[k][1]}{top_words[k]}" for k in used)
+    note = (f" Lines under each step{', one per GPU' if several else ''}: {strips}."
             if used else " No sampler data for this run.")
     return (_legend(names) + _svg(left + pw + 20, y + 34, "".join(out))
             + f'<p class="mute small">Each bar is one timed step, its sections drawn where they '
