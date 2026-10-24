@@ -18,8 +18,8 @@
 #    RUNPOD_POD_ID set, and runpodctl or RUNPOD_API_KEY there (exit 2). A refusal it can act on
 #    (bad deadlines, less than FS11_MIN_FREE_GB free under OUT_DIR) terminates the pod.
 # 2. A deadline timer starts: FS11_DEADLINE_S (default 12600, 3.5 h; 7500, 2 h 5 min, for the
-#    re-check; 19800, 5.5 h, for the profile check; 5400, 1.5 h, for the hardware probe; 21200,
-#    5 h 53 min, for the two-GPU session; 8800, 2 h 27 min, for the device-leaves session)
+#    re-check; 19800, 5.5 h, for the profile check; 5400, 1.5 h, for the hardware probe; 16100,
+#    4 h 28 min, for the two-GPU session; 8800, 2 h 27 min, for the device-leaves session)
 #    after the start it terminates the pod, whatever the job is doing.
 # 3. The session (verification.runs.fs11_session run) prints the environment, refuses a
 #    machine without an H100 (FS11_ALLOW_ANY_GPU=1 overrides; the hardware probe also refuses
@@ -90,7 +90,7 @@ DEFAULT_DEADLINE_S=12600
 [ "$SESSION" = recheck ] && DEFAULT_DEADLINE_S=7500
 [ "$SESSION" = profile-check ] && DEFAULT_DEADLINE_S=19800
 [ "$SESSION" = nvlink-probe ] && DEFAULT_DEADLINE_S=5400
-[ "$SESSION" = fs32-pair ] && DEFAULT_DEADLINE_S=21200
+[ "$SESSION" = fs32-pair ] && DEFAULT_DEADLINE_S=16100
 [ "$SESSION" = kernel-speed ] && DEFAULT_DEADLINE_S=5400
 [ "$SESSION" = device-leaves ] && DEFAULT_DEADLINE_S=8800
 if [ -n "${FS31_CARDS:-}" ]; then export FS31_CARDS; fi

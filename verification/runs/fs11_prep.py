@@ -59,6 +59,7 @@ import hashlib
 import io
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -521,7 +522,7 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
     missing = [x for m in models for x in m.missing] + bench_missing + native_missing
     run_missing = [x for m in models if "run" in m.roles for x in m.missing]
     manifest = {
-        "format": "fs11-upload/1",
+        "format": "fs11-upload/1", "python_version": platform.python_version(),
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "repo": repo_info, "versions": versions, "full_scale_env": FULL_SCALE_ENV,
         "files": dict(sorted(files.items())),
@@ -591,6 +592,7 @@ def prepare_kernel_speed(out: Path, *, sizes: Path, repo_root: Path,
                      else sha256_file(m.src))  # type: ignore[arg-type]
              for m in members if m.link is None}
     manifest = {"format": "fs11-upload/1", "session": "kernel-speed",
+                "python_version": platform.python_version(),
                 "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "repo": repo_info, "versions": versions, "files": dict(sorted(files.items())),
                 "sizes": [{"repo": m.repo, "revision": m.revision, "leaves": len(m.rows),

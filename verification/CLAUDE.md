@@ -38,6 +38,11 @@ details that don't change what is committed or checked are yours to choose.
   cannot run in teardown, which is why the earlier guard printed nothing. The guard also
   registers SIGUSR1 to dump all stacks on demand. Both write to `POTS_STACKS_FILE` when it is
   set, else to stderr. The pair session's fast suite sat 20 minutes after its summary line.
+  The cause was CPython 3.14.0's resource-tracker deadlock (gh-146313), set off by
+  `torch_shm_manager` inheriting the tracker's pipe in `test_shared*.py`; 3.14.7 does not hang.
+  The session refuses a Python other than the manifest's (`fs11_session.python_mismatch`) and
+  `runs/fs11_setup.sh` builds the pod's venv at the Mac's version. `fs11_session exit-probe`
+  is run by hand to find a module that hangs at exit.
 - **Style.**
   - Use ordinary importable libraries with type hints and no import-time side effects (S7b).
   - Entry points read env vars through `setup/config.py` and `verification/parameters.py`,
@@ -1664,7 +1669,9 @@ interface.
     never judged (the rest of its window, `StepState.run_rest`, set by check 5 when it
     rejects, then on the unit pass the host rows of the later windows,
     `StepState.run_rest_rows`, judged in canonical order), since a member measured alone or
-    in a smaller batch is held to agree only to `1e-4` relative; an error check 5 deferred
+    in a smaller batch agrees with check 5's batch only to rounding (on an AMD EPYC 7742,
+    torch 2.9.1's CPU wheel, an honest member's raw residual moved by about 5%), so the record
+    pass records check 5's own measured rows rather than measuring again; an error check 5 deferred
     (`StepState.run_rest_error`) is raised after them. Every product still unmeasured is then
     served and measured from check 5's own replay, as check 5 does it (none remain after a
     unit pass). A 6a rejection measures
@@ -3042,15 +3049,23 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     included; a public model's weights left out, their SHA-256 recorded), the benchmark's BLAKE3
     sources, the native library's pinned sources (`native_cache/blake3-1.8.7/`, from the Mac's
     native cache, checked with `native.bad_sources`; run `python -m verification.commitment.native`
-    first), `requirements-fs11.txt` and `manifest.json` (every packed file's SHA-256). Every cached file
-    is checked against its blob name first. It never downloads and never packs the cache's
-    token; a pinned model missing from the cache is reported (exit 1 for a run model). The
+    first), `requirements-fs11.txt` and `manifest.json` (every packed file's SHA-256, and
+    `python_version`, the Mac's `platform.python_version()`, also in the kernel-speed upload's).
+    Every cached file is checked against its blob name first. It never downloads and never
+    packs the cache's token; a pinned model missing from the cache is reported (exit 1 for a run model). The
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
     in its place.
     `--session kernel-speed --sizes FILE` (FS29) packs only `git archive HEAD`, the native
     sources, the sizes file at the top (checked with `kernel_speed.read_sizes`),
     `requirements-fs11.txt` and `manifest.json`: no `hf/`, `data/` or `bench_cache/`, and no
     `HF_HUB_OFFLINE` needed. `PACKAGES` includes pytest and matplotlib for it.
+  - `fs11_setup.sh UPLOAD_DIR`: the pod's environment in one command. It reads `python_version`
+    from the upload's `manifest.json` (system `python3`, standard library), installs a current uv
+    into `/root/uvnew` (the image's uv 0.9.0 has no 3.14.7), runs `uv python install` and `uv venv`
+    at that version into `/root/venv`, links `repo/.venv` to it, installs
+    `requirements-fs11.txt` and prints the venv's Python and torch. Reruns are safe; a manifest
+    without the version stops it. `FS11_SETUP_PYTHON3`, `_UVDIR`, `_UV` and `_VENV` override its
+    paths (tests: `test_fs11_setup.py`, on stubs).
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
     [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,
     fs32-pair,device-leaves}]`, `fetch-models` and `env`. `--session` picks the plan from
@@ -3091,11 +3106,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `peer_check`, `models` and the native build included, unsets `VERIF_PIPELINED`), and records
     `step_times` (prover, verifier, hand-off, total per step, per arm) and `gpu_peak` (per
     part), outside `pass`. `pair_default_deadline_s()` is the job's default deadline.
-    The exit probe (`exit_probe`, kind `exit_probe`, not in `PAIR_PARTS`, so never in `pass`)
-    follows the fast suite: `run_exit_probe` runs each module of `EXIT_PROBE_MODULES` in its own
-    pytest process, then the whole list in one if none hung, writes `exit_probe.json` and the
-    job-log line `FS32 exit probe: N of M runs hung at exit: ...`. `_run_part` and the probe
-    share `watch_process`: a pytest part whose junit exists and which is still running
+    The exit probe is a tool, no longer a part of the plan (the hang's cause is known; the watch
+    catches a new one): `fs11_session exit-probe` runs each module of `EXIT_PROBE_MODULES` in its
+    own pytest process by hand, to find a module that hangs at exit, then the whole list in one
+    if none hung, writes `exit_probe.json` and prints `FS32 exit probe: N of M runs hung at
+    exit: ...` (`exit_probe_lines`). `_run_part` and the probe share `watch_process`: a pytest
+    part whose junit exists and which is still running
     `EXIT_HANG_GRACE_S` (180 s) later gets `parts/<name>/hang.txt` (a `/proc` snapshot),
     SIGUSR1 (stacks to `stacks.txt`) and a kill, and ends `exit_hang`, a failure like every status
     other than `ok` and `skipped_done`; `killed_timeout` and `killed_deadline` get the snapshot.
@@ -3146,7 +3162,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     the later parts of its model (of every model, for a file no model owns) `not_started`. The
     benchmark is done only when its report is `complete` and no result holds `error:`
     (`benchmark_failure`). It refuses a machine without CUDA and an H100
-    (`FS11_ALLOW_ANY_GPU=1` overrides; `EXIT_REFUSED` 4). `selftest_plan` is two stand-in parts
+    (`FS11_ALLOW_ANY_GPU=1` overrides; `EXIT_REFUSED` 4). It also refuses a running Python whose
+    version differs from the manifest's `python_version`, or an upload without one
+    (`python_mismatch`, in `main` before any part; the self-test is exempt;
+    `FS11_ALLOW_PYTHON_MISMATCH=1` overrides). `selftest_plan` is two stand-in parts
     that need only the standard library, which the module keeps to at import, so `--selftest`
     runs on a bare pod's `python3`.
   - The re-check (`recheck_plan`, 22 parts, no benchmark): the models part; `bring_up
@@ -3195,7 +3214,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    21,200 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
+    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
     session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,
     packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch

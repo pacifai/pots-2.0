@@ -886,18 +886,18 @@ that both start commands parse (`bash -n`) and, on stub `runpodctl`, `curl` and 
    was created without the start command, or restarted), run `sh fs11_guard.sh` from the
    upload once it is there, or paste the one-line form in `fs11_guard.sh`'s header first.
    Upload the tarball, check its SHA-256 against step 1's, and extract it into `/workspace`,
-   giving `/workspace/fs11_upload/`. Then make the venv with Python 3.14, as on the Mac. The
-   image has uv (from the base image) but not Python 3.14, so uv fetches its own build, a
-   public download:
+   giving `/workspace/fs11_upload/`. Then make the venv with `fs11_setup.sh`, which gives the
+   pod the Mac's exact Python (the upload's `manifest.json` records its version):
 
    ```bash
-   cd /workspace/fs11_upload/repo
-   uv python install 3.14
-   uv venv --python 3.14 /root/venv
-   ln -s /root/venv .venv
-   uv pip install --python .venv/bin/python -r ../requirements-fs11.txt
+   bash /workspace/fs11_upload/repo/verification/runs/fs11_setup.sh /workspace/fs11_upload
    ```
 
+   The version is pinned because CPython 3.14.0 can hang at exit (the resource tracker's
+   deadlock, gh-146313) and the session refuses any Python other than the manifest's
+   (`FS11_ALLOW_PYTHON_MISMATCH=1` overrides). The image's uv 0.9.0 offers no 3.14.7, so the
+   script installs a current uv into `/root/uvnew`, then runs `uv python install` (a public
+   download), `uv venv` and `uv pip install -r ../requirements-fs11.txt`.
    `requirements-fs11.txt` holds the Mac's versions; on Linux x86_64, PyPI's torch wheel is a
    CUDA build. The venv lives on the container disk and `.venv` links to it. On the profiling
    check's pod `/workspace` was a network file system (MooseFS, through FUSE) where each file
@@ -1090,8 +1090,8 @@ from the cached configs; it reads no weights), then
 The upload it packs holds only `repo/` (`git archive HEAD`), `native_cache/blake3-1.8.7/`, the
 sizes file at the top, `requirements-fs11.txt` (which lists pytest and matplotlib besides the
 run's packages) and `manifest.json`; no `hf/`, `data/` or `bench_cache/`. On the pod the steps
-are the usual ones: extract it, make the venv, `uv pip install -r ../requirements-fs11.txt`
-(the requirements file sits beside `repo/`), then the job. The session builds the native
+are the usual ones: extract it, make the venv with `fs11_setup.sh` (it installs
+`../requirements-fs11.txt`, which sits beside `repo/`), then the job. The session builds the native
 library, runs `test_gpu_blake3.py` and `test_gpu_blake3_edges.py` on the card, then
 `kernel_speed run`. The run times each table `--repeats` (5) times, whole call and kernels
 alone, and reports the median and the best; the gate reads the slowest model's median
@@ -1156,8 +1156,9 @@ first captured CUDA matmul, so `run_loop` calls `GpuBlake3().kernels(device)` on
 
 1. **Prep, on the Mac**, after committing: `HF_HUB_OFFLINE=1 .venv/bin/python -m
    verification.runs.fs11_prep --out DIR`, the default upload, which carries the four models.
-2. **On the pod**, as in the first session: extract the upload, make the venv, install, run the
-   job with `FS11_SESSION=device-leaves`. The default deadline is 8,800 s: the parts take about
+2. **On the pod**, as in the first session: extract the upload, make the venv with
+   `fs11_setup.sh`, run the job with `FS11_SESSION=device-leaves`. The default deadline is
+   8,800 s: the parts take about
    52 minutes (models 5, native build 2, CUDA tests 8, four bring-ups about 37: Llama-3.2-1B
    and Falcon3-1B about 10 each, Qwen2.5-0.5B about 3, Qwen2.5-1.5B about 14), packing about
    1 and the grace window 20, so about 73 minutes; twice that is 146 minutes, rounded up to the
@@ -1221,9 +1222,10 @@ transcript and run the verifier.
    fetches every public one (a few minutes it doesn't need; a filter would be a change to
    `fs11_session.py`).
 2. **The pod**: two GPUs of the same type, the image and disks of step 2, the boot guard with
-   `sleep 23600;` (setup about 20 min plus the job's 176: 2 x 196 min = 392 min, rounded up).
-3. **Set up** as in step 3. `requirements-fs11.txt` carries `pytest` and `matplotlib` (the fast
-   suite and the plotting tests need them), so nothing is installed by hand.
+   `sleep 18500;` (setup about 20 min plus the job's 134: 2 x 154 min = 308 min, rounded up).
+3. **Set up** as in step 3, with `fs11_setup.sh`. `requirements-fs11.txt` carries `pytest` and
+   `matplotlib` (the fast suite and the plotting tests need them), so nothing is installed by
+   hand.
 4. **Start the job**:
 
    ```bash
@@ -1247,7 +1249,6 @@ transcript and run the verifier.
 | `native_build` | compiles the BLAKE3 library from the upload | 2 min |
 | `fast_suite` | the whole fast suite, `-rf`; the two-GPU tests run here first | 25 min |
 | `two_gpu_slow` | the slow two-GPU tests (a SmolLM2 run, sharded against unsharded) | 10 min |
-| `exit_probe` | each of 30 test modules in its own pytest process, then all together; names the one that cannot exit; never judged | 42 min |
 | `fs34_tests` | FS34's CUDA tests (`test_fs34_join_cuda.py`): the kernel hashes on the owner GPUs | 5 min |
 | `smollm2_calibrate` | the band file, written even when the bf16 guard fails | 5 min |
 | `card_unsharded`, `card_sharded` | `card_identity`: step 1's root, `W_{t+1}`, loss | 6 min |
@@ -1258,8 +1259,8 @@ transcript and run the verifier.
 | `<cheat>_pipelined` (three) | the judged cheats, sharded and pipelined | 12 min |
 
 The estimates are scaled by hand from the earlier sessions; none was measured on two cards.
-The parts sum to about 155 min, packing about 1, the grace window 20: about 176 min, so the
-default deadline is 2 x 176 = 352 min, rounded up to 21,200 s. The pipelined arms (FS33d) are
+The parts sum to about 113 min, packing about 1, the grace window 20: about 134 min, so the
+default deadline is 2 x 134 = 268 min, rounded up to 16,100 s. The pipelined arms (FS33d) are
 estimated at their sequential counterparts' time, since the pipelined loop overlaps prover and
 verifier and is no slower; that is an estimate, not a measurement. Each part's time limit is a
 cap; the fast suite's is 3,600 s, the metrics run's 1,800 s.

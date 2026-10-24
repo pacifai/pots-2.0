@@ -67,15 +67,26 @@ def _close(x, y, rel=1e-4):
     return x == pytest.approx(y, rel=rel, abs=0.0)
 
 
-def _assert_match(batched, single):
+def _assert_match(batched, single, *, forged=(), band_abs=None):
+    """Every field to 1e-4 relative; with ``band_abs``, an honest member's residuals are held
+    only as normalized values, to ``band_abs`` band units. An honest member's raw residual is
+    rounding noise: it moved by about 5% on an AMD EPYC 7742 (torch 2.9.1's CPU wheel), so a
+    relative tolerance on it holds only by luck of the BLAS path. A member in ``forged`` has a
+    residual the forgery dominates, and keeps the relative tolerance."""
     assert len(batched) == len(single)
-    for mb, ms in zip(batched, single):
+    for i, (mb, ms) in enumerate(zip(batched, single)):
         for field in ("nu", "p_abs1", "kappa", "p_norm", "u", "unit"):
             assert _close(getattr(mb, field), getattr(ms, field)), (field, mb, ms)
+        honest_in_bands = band_abs is not None and i not in forged
         for xs in ("residuals", "normalized"):
             assert len(getattr(mb, xs)) == K
+            if honest_in_bands and xs == "residuals":
+                continue
             for x, y in zip(getattr(mb, xs), getattr(ms, xs)):
-                assert _close(x, y), (xs, mb, ms)
+                if honest_in_bands:
+                    assert abs(x - y) < band_abs, (xs, i, x, y)
+                else:
+                    assert _close(x, y), (xs, mb, ms)
 
 
 @pytest.mark.parametrize("shape", [(12, 8, 12), (12, 12, 8), (100, 30, 70), (128, 64, 128),
@@ -84,7 +95,8 @@ def test_batched_numbers_match_single(shape):
     a, b, p = _batch(9, *shape, forge=(4,))
     ms = list(range(101, 110))
     batched, single = _both(a, b, p, ms)
-    _assert_match(batched, single)
+    # 0.1 band unit is far below any τ (8·s_h, 2.5 to 40 at our scales).
+    _assert_match(batched, single, forged=(4,), band_abs=0.1)
     # Each member keys its own challenges: the forged member stands out, the others don't.
     assert max(batched[4].normalized) > 100 * max(max(x.normalized) for x in batched[:4])
 

@@ -987,9 +987,9 @@ def test_the_pair_deadline_is_twice_the_estimate_rounded_up_to_100_s():
     from verification.runs import fs11_session as fs
 
     d = fs.pair_default_deadline_s()
-    assert d == 21200 and "DEFAULT_DEADLINE_S=21200" in (
+    assert d == 16100 and "DEFAULT_DEADLINE_S=16100" in (
         ROOT / "verification/runs/fs11_job.sh").read_text()
-    assert sum(fs.PAIR_ESTIMATE_MIN.values()) + fs.PAIR_PACK_MIN + fs.PAIR_GRACE_MIN == 176
+    assert sum(fs.PAIR_ESTIMATE_MIN.values()) + fs.PAIR_PACK_MIN + fs.PAIR_GRACE_MIN == 134
 
 
 # ---- scope of the check and the keyword ------------------------------------------------------
