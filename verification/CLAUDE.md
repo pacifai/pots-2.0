@@ -1910,7 +1910,8 @@ interface.
     levels). It returns a `ReadPlan`:
     `reads` (`READ_DTYPE`: each level's groups, ordered by the view's address, then a
     sentinel holding the level's item total), `level_off`, `entries` (`ENTRY_DTYPE`),
-    `node_level`, `n_levels` (the launches), `shared_groups`, `bytes_fs37` and `bytes_saved`.
+    `node_level`, `n_levels` (the launches) and `shared_groups` (FS37b dropped the two byte
+    counts, which served FS38b's acceptance only).
     Numpy only, no loop over members. `plain_plan(prods)` is the unshared plan: three
     levels, every node its own group. `block_starts(plan)` gives each group's first row
     block (a uint64 array aligned with `plan.reads`; a phase-2 group takes one block); the
