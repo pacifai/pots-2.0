@@ -306,7 +306,7 @@ static __host__ __device__ __forceinline__ void pots_upd_bias(float x, const flo
   pots_upd_dots(x, y, jstride, nj, acc);
   if (first) {
     const double xd = (double)x;
-    *sq = *sq + xd * xd;
+    *sq = fma(xd, xd, *sq); /* xd * xd is exact in float64, so the fma gives the same value */
     if (guard) *b1 = fmaf(fabsf(x), 1.0f, *b1);
   }
 }
@@ -335,7 +335,7 @@ static __host__ __device__ __forceinline__ void pots_upd_p(float x, const float 
   pots_upd_dots(x, y, jstride, nj, acc);
   if (first) {
     const double xd = (double)x;
-    *pp = *pp + xd * xd;
+    *pp = fma(xd, xd, *pp); /* xd * xd is exact in float64, so the fma gives the same value */
     if (guard) *p1 = fmaf(fabsf(x), 1.0f, *p1);
   }
 }
