@@ -57,6 +57,10 @@ LEVEL_KERNEL = "pots_measure_level"
 OPTIONS = ("--fmad=false",)
 """Extra NVRTC options, part of the cache key: no fused multiply-add but the core's ``fmaf``."""
 WARPS = 8  # warps per block, POTS_MK_WARPS in the .cu
+ROWS_PER_BLOCK = 32  # rows of a view per block (a multiple of WARPS), a -D option of the .cu
+TILE_COLS = 64  # columns per shared-memory tile (a multiple of 32), a -D option
+K_CHUNK = 16  # challenge columns per sweep, a -D option
+SHARED_LIMIT = 48 * 1024  # static shared memory per block
 MAX_BLOCKS = 1 << 22
 PHASES = 3
 ROW_FIXED = 5
@@ -78,15 +82,63 @@ assert _MVIEW.itemsize == ctypes.sizeof(MView) and MPROD_DTYPE.itemsize == ctype
 
 
 class LevelArgs(ctypes.Structure):
-    """``pots_mlargs_t``: one level launch's argument (FS38b)."""
+    """``pots_mlargs_t``: one level launch's argument (FS38b, FS37b): the tables, the level's
+    groups and ``starts`` (uint64 ``[n_groups + 1]``, each group's first row block and then the
+    level's block total, ``n_blocks``)."""
 
     _fields_ = [("prods", ctypes.c_uint64), ("works", ctypes.c_uint64), ("rows", ctypes.c_uint64),
                 ("reads", ctypes.c_uint64), ("entries", ctypes.c_uint64),
-                ("n_groups", ctypes.c_uint64), ("total", ctypes.c_uint64),
-                ("k", ctypes.c_uint32), ("pad", ctypes.c_uint32)]
+                ("starts", ctypes.c_uint64), ("n_groups", ctypes.c_uint64),
+                ("n_blocks", ctypes.c_uint64), ("k", ctypes.c_uint32), ("pad", ctypes.c_uint32)]
 
 
-assert ctypes.sizeof(LevelArgs) == 64
+assert ctypes.sizeof(LevelArgs) == 72
+
+
+# ---- the geometry (FS37b) ----
+
+def shared_bytes(rows_per_block: int, tile_cols: int, k_chunk: int) -> int:
+    """The kernel's static shared memory: the x tile (``rows_per_block`` rows of ``tile_cols +
+    1`` floats), the vector tile (``k_chunk x tile_cols``) and ``b2``, ``b1`` (``tile_cols``)."""
+    return 4 * (rows_per_block * (tile_cols + 1) + k_chunk * tile_cols + 2 * tile_cols)
+
+
+def set_geometry(*, rows_per_block: int | None = None, tile_cols: int | None = None,
+                 k_chunk: int | None = None) -> tuple[int, int, int]:
+    """Set the kernel's geometry and return the previous ``(rows_per_block, tile_cols,
+    k_chunk)``; with no argument nothing changes. The values are NVRTC ``-D`` options, so they
+    key the cached CUBIN, and the loaded-kernel caches are cleared. ``ValueError`` (nothing
+    changed) unless ``tile_cols`` is a positive multiple of 32, ``rows_per_block`` a positive
+    multiple of :data:`WARPS`, ``k_chunk >= 1`` and the static shared memory fits 48 KB. The
+    bits never depend on the geometry."""
+    global ROWS_PER_BLOCK, TILE_COLS, K_CHUNK
+    prev = (ROWS_PER_BLOCK, TILE_COLS, K_CHUNK)
+    rpb = prev[0] if rows_per_block is None else rows_per_block
+    tc = prev[1] if tile_cols is None else tile_cols
+    kc = prev[2] if k_chunk is None else k_chunk
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (rpb, tc, kc)):
+        raise ValueError("the geometry values must be integers")
+    if tc < 1 or tc % 32:
+        raise ValueError(f"tile_cols must be a positive multiple of 32, got {tc}")
+    if rpb < 1 or rpb % WARPS:
+        raise ValueError(f"rows_per_block must be a positive multiple of {WARPS}, got {rpb}")
+    if kc < 1:
+        raise ValueError(f"k_chunk must be at least 1, got {kc}")
+    if shared_bytes(rpb, tc, kc) > SHARED_LIMIT:
+        raise ValueError(f"geometry ({rpb}, {tc}, {kc}) needs {shared_bytes(rpb, tc, kc)} bytes "
+                         f"of shared memory, over {SHARED_LIMIT}")
+    if (rpb, tc, kc) != prev:
+        ROWS_PER_BLOCK, TILE_COLS, K_CHUNK = rpb, tc, kc
+        _kernels.cache_clear()
+        _built.cache_clear()
+    return prev
+
+
+def build_options() -> tuple[str, ...]:
+    """The NVRTC options of the current geometry: ``--fmad=false`` and the four ``-D`` macros
+    (part of the cache key, so another geometry is another CUBIN)."""
+    return (*OPTIONS, f"-DPOTS_MK_WARPS={WARPS}u", f"-DROWS_PER_BLOCK={ROWS_PER_BLOCK}u",
+            f"-DTILE_COLS={TILE_COLS}u", f"-DK_CHUNK={K_CHUNK}u")
 
 
 # ---- the build ----
@@ -106,7 +158,7 @@ def build(nvrtc: gb.Nvrtc, cc: tuple[int, int], *, cache: Path | None = None,
           use_cache: bool = True) -> gb.Built:
     """The compiled image for compute capability ``cc`` (cached in ``cache`` when given)."""
     return gb.build_image(nvrtc, cc, cache=cache, use_cache=use_cache, source=source(),
-                          extra_options=OPTIONS)
+                          extra_options=build_options())
 
 
 class MeasureKernels:
@@ -463,19 +515,38 @@ def _plan(prods: np.ndarray, share: bool) -> ReadPlan:
                     0 if cycle else int(shared.sum()), bool(cycle))
 
 
+def block_starts(plan: ReadPlan, rows_per_block: int | None = None) -> np.ndarray:
+    """The row-block starts of every level, uint64, one per entry of ``plan.reads`` (so level
+    ``l``'s array is ``[level_off[l]:level_off[l + 1]]``): group ``g`` takes ``ceil(count_g /
+    rows_per_block)`` blocks (a phase-2 group one: its warps take the ``5 + k`` items), the
+    entry after the last group holds the level's block total."""
+    rpb = ROWS_PER_BLOCK if rows_per_block is None else rows_per_block
+    out = np.zeros(len(plan.reads), dtype=np.uint64)
+    off = plan.level_off.astype(np.int64)
+    for lv in range(plan.n_levels):
+        lo, hi = int(off[lv]), int(off[lv + 1])
+        r = plan.reads[lo:hi - 1]
+        two = plan.entries["phase"][r["entry0"].astype(np.int64)] == 2
+        nb = np.where(two, 1, -(-r["count"].astype(np.int64) // rpb))
+        out[lo + 1:hi] = np.cumsum(nb).astype(np.uint64)
+    return out
+
+
 def level_launches(prods_addr: int, works_addr: int, rows_addr: int, reads_addr: int,
-                   entries_addr: int, plan: ReadPlan, k: int) -> list[tuple[LevelArgs, int]]:
+                   entries_addr: int, starts_addr: int, plan: ReadPlan, k: int,
+                   starts: np.ndarray) -> list[tuple[LevelArgs, int]]:
     """One ``(argument, blocks)`` per level of ``plan``, in level order; ``reads_addr`` is the
-    address of ``plan.reads[0]`` and ``entries_addr`` that of ``plan.entries[0]``."""
+    address of ``plan.reads[0]``, ``entries_addr`` that of ``plan.entries[0]`` and
+    ``starts_addr`` that of ``starts[0]`` (:func:`block_starts`)."""
     out = []
     off = plan.level_off.astype(np.int64)
     for lv in range(plan.n_levels):
         lo, hi = int(off[lv]), int(off[lv + 1])
-        total = int(plan.reads["first"][hi - 1])
-        blocks = min(-(-total // WARPS), MAX_BLOCKS)
+        n_blocks = int(starts[hi - 1])
         out.append((LevelArgs(prods_addr, works_addr, rows_addr,
-                              reads_addr + lo * READ_DTYPE.itemsize, entries_addr, hi - lo - 1,
-                              total, k, 0), blocks))
+                              reads_addr + lo * READ_DTYPE.itemsize, entries_addr,
+                              starts_addr + lo * 8, hi - lo - 1, n_blocks, k, 0),
+                    min(n_blocks, MAX_BLOCKS)))
     return out
 
 
@@ -592,7 +663,9 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
     plan = read_plan(prods) if share else plain_plan(prods)
     at_reads = -(-end_works // 16) * 16
     at_entries = -(-(at_reads + plan.reads.nbytes) // 16) * 16
-    total = at_entries + plan.entries.nbytes
+    at_starts = -(-(at_entries + plan.entries.nbytes) // 16) * 16
+    starts = block_starts(plan)
+    total = at_starts + starts.nbytes
     with torch.cuda.stream(stream):
         rows = torch.empty(n, row_width(k), dtype=torch.float64, device=device)
         scratch = torch.empty(max(scratch_n, 8), dtype=torch.uint8, device=device)
@@ -603,9 +676,11 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
     hb[:prods.nbytes] = prods.view(np.uint8).reshape(-1)
     hb[at_works:end_works] = works.view(np.uint8).reshape(-1)
     hb[at_reads:at_reads + plan.reads.nbytes] = plan.reads.view(np.uint8).reshape(-1)
-    hb[at_entries:] = plan.entries.view(np.uint8).reshape(-1)
+    hb[at_entries:at_entries + plan.entries.nbytes] = plan.entries.view(np.uint8).reshape(-1)
+    hb[at_starts:] = starts.view(np.uint8).reshape(-1)
     work = level_launches(table.data_ptr(), table.data_ptr() + at_works, rows.data_ptr(),
-                          table.data_ptr() + at_reads, table.data_ptr() + at_entries, plan, k)
+                          table.data_ptr() + at_reads, table.data_ptr() + at_entries,
+                          table.data_ptr() + at_starts, plan, k, starts)
     if share and plan_out is not None:
         plan_out.append(plan)
     with torch.cuda.stream(stream):
