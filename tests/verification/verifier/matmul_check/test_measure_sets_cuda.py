@@ -1,7 +1,6 @@
 """FS37b round 2's sets on a GPU: the real kernel (``freivalds.measure_groups_rows`` then
 ``freivalds.drain``) against the host build's rows, bit for bit (NaN equal to NaN), with
-``share=True`` and ``share=False``, over read groups of 2, 3, 4, 5, 9 and 17 entries (``E_MAX``
-= 4: one batch, several batches, a smaller last one), phase-0 and phase-1 entries mixed over
+``share=True`` and ``share=False``, over read groups of 2, 3, 4, 5, 9 and 17 entries (the entries run one after another over a block's rows), phase-0 and phase-1 entries mixed over
 one view, ``k`` around ``K_CHUNK``, row counts off ``RB``, many-row views (many blocks per
 group), special values, a biased product beside a group, and several geometries. Skipped without
 CUDA; the tables are ``sets_tables.shared_view``'s, each checked against ``mk.read_plan``."""
@@ -15,7 +14,6 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 from tests.verification.verifier.matmul_check.sets_tables import (  # noqa: E402
-    E_MAX,
     group_of,
     phases_of,
     rb_of,

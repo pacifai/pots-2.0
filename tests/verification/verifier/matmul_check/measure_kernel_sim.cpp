@@ -78,6 +78,17 @@ static T __shfl_down_sync(unsigned, T v, unsigned off) {
   return out;
 }
 
+// Lane l reads lane (l ^ off)'s value, between two warp barriers.
+template <typename T>
+static T __shfl_xor_sync(unsigned, T v, unsigned off) {
+  const unsigned w = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+  g_slot[w][lane] = (double)v;
+  g_warp[w]->wait();
+  T out = (T)g_slot[w][lane ^ off];
+  g_warp[w]->wait();
+  return out;
+}
+
 #include "measure_kernel.cu"
 
 extern "C" void sim_launch(const pots_mlargs_t *args, unsigned grid) {

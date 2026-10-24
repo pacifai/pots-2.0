@@ -1,15 +1,13 @@
-"""FS37b round 2: the kernel's (row, entry) sets, through the simulator, bit for bit.
+"""FS37b round 3: a shared group's entries, through the simulator, bit for bit.
 
-A block holds ``ROWS_PER_BLOCK`` sets; a shared group's ``e_b = min(e, E_MAX)`` entries read one
-row tile together (``RB = ROWS_PER_BLOCK // e_b`` rows of the view per block), groups over
-``E_MAX`` entries run in batches, and phase-0 and phase-1 entries mix over one view. Every table
+A block takes ``ROWS_PER_BLOCK`` rows of a group's view and runs the group's entries one after
+another over them, phase-0 and phase-1 entries mixed over one view. Every table
 here is built with ``sets_tables.shared_view`` and the group it names is read back from
 ``mk.read_plan`` before the rows are compared, with ``share=True`` and ``share=False``, against
 ``host_measure``. The simulator runs one OS thread per CUDA thread, so shapes are small and the
-geometries few. ``E_MAX`` is read with ``getattr`` (round 1's kernel has none: 4).
+geometries few.
 
-The block-count and shared-memory tests at the end are plain Mac tests (not slow); they fail on
-round 1's kernel, which has no sets."""
+The block-count and shared-memory tests at the end are plain Mac tests (not slow)."""
 
 import contextlib
 import shutil
@@ -19,7 +17,6 @@ import pytest
 import torch
 
 from tests.verification.verifier.matmul_check.sets_tables import (
-    E_MAX,
     group_of,
     phases_of,
     plan_of,
@@ -50,8 +47,8 @@ def sim_test(fn):
     return pytest.mark.slow(pytest.mark.skipif(CXX is None, reason="needs a C++ compiler")(fn))
 
 
-DEFAULT = (32, 64, 16)
-SMALL = (8, 32, 4)       # RB = 2 at e >= 4
+DEFAULT = (16, 256, 16)
+SMALL = (8, 32, 4)
 ODD = (16, 96, 3)
 WIDE = (64, 128, 1)
 
@@ -79,8 +76,7 @@ def check(sim, host_measure, mis, *, geometry=DEFAULT, label=""):
 @pytest.mark.parametrize("mode", ["A", "B", "mix"])
 @sim_test
 def test_a_group_of_e_entries(sim, host_measure, e, mode):
-    """Below, at and above ``E_MAX``: one batch, and batches of ``E_MAX`` with a smaller last
-    one (5 = 4 + 1, 9 = 4 + 4 + 1)."""
+    """Groups of 2 to 9 entries, run one after another over a block's rows."""
     n = 2 * rb_of(DEFAULT[0], e) + 3
     mis, _ = shared_view(e, mode, n=n, q=70, dtype=torch.bfloat16, seed=e)
     group_of(mis, e, n=n, phases=phases_of(e, mode))
@@ -161,7 +157,7 @@ def test_a_mixed_group_with_k_around_the_default_chunk(sim, host_measure, k):
 @pytest.mark.parametrize("which", ["not a multiple", "fewer than RB"])
 @sim_test
 def test_row_counts_off_the_block_size(sim, host_measure, e, which):
-    rb = rb_of(SMALL[0], e)   # 4 at e = 2, 2 at e >= 4 (and at 3: 8 // 3)
+    rb = rb_of(SMALL[0], e)
     n = 2 * rb + 1 if which == "not a multiple" else max(1, rb - 1)
     assert (n % rb != 0) if which == "not a multiple" else (n < rb)
     mis, _ = shared_view(e, "mix", n=n, q=70, dtype=torch.bfloat16, seed=n + e)
@@ -255,7 +251,7 @@ def tables_for_blocks():
 @pytest.mark.parametrize("rpb", [8, 16, 32, 64])
 @pytest.mark.parametrize("share", [True, False])
 def test_block_starts_count_blocks_by_the_sets_mapping(rpb, share):
-    """Phase 0 and 1 groups take ``ceil(count / (rpb // min(n_entries, E_MAX)))`` blocks; a
+    """Phase 0 and 1 groups take ``ceil(count / rpb)`` blocks, one entry per batch; a
     phase-2 group (``k = 40``: 45 items, over every ``rpb``) takes one."""
     saw_shared = False
     for mis in tables_for_blocks():
@@ -275,8 +271,7 @@ def test_block_starts_count_blocks_by_the_sets_mapping(rpb, share):
                 if phase == 2:
                     want = 1
                 else:
-                    rb = rpb // min(ne, E_MAX)
-                    want = -(-count // rb)
+                    want = -(-count // rpb)
                 assert starts[lo + g + 1] - starts[lo + g] == want, (lv, g, ne, count, rpb)
     assert saw_shared == share
 
@@ -286,24 +281,21 @@ def test_block_starts_default_rows_per_block_is_the_modules():
     assert np.array_equal(mk.block_starts(plan), mk.block_starts(plan, mk.ROWS_PER_BLOCK))
 
 
-def test_shared_bytes_has_the_e_max_terms():
-    """``s_x`` + ``E_MAX`` vector regions of pitch ``tile + 1`` + ``E_MAX`` ``b2`` and ``b1``."""
-    assert hasattr(mk, "E_MAX")
+def test_shared_bytes_counts_every_shared_array():
     for rpb, tile, kc in (DEFAULT, SMALL, ODD, WIDE):
-        want = 4 * (rpb * (tile + 1) + E_MAX * kc * (tile + 1) + 2 * E_MAX * tile)
+        want = 224 + 8 * rpb + 4 * (rpb * (tile + 1) + kc * (tile + 1) + 2 * tile
+                                    + 2 * rpb * (kc + 2))
         assert mk.shared_bytes(rpb, tile, kc) == want
 
 
-def test_set_geometry_refuses_a_geometry_over_48k_with_e_max():
-    assert hasattr(mk, "E_MAX")
+def test_set_geometry_refuses_a_geometry_over_48k():
     before = mk.set_geometry()
-    # without E_MAX's terms this fits (26 KB); with them: 4*(32*129 + 4*16*129 + 8*128) = 53 KB
-    assert mk.shared_bytes(32, 128, 16) > mk.SHARED_LIMIT
+    assert mk.shared_bytes(32, 256, 16) > mk.SHARED_LIMIT >= mk.shared_bytes(*DEFAULT)
     with pytest.raises(ValueError):
-        mk.set_geometry(rows_per_block=32, tile_cols=128, k_chunk=16)
+        mk.set_geometry(rows_per_block=32, tile_cols=256, k_chunk=16)
     assert mk.set_geometry() == before
 
 
-def test_the_default_e_max_is_four():
-    assert getattr(mk, "E_MAX", None) == 4
-    assert any("E_MAX" in o for o in mk.build_options())
+def test_there_is_no_e_max():
+    assert not hasattr(mk, "E_MAX")
+    assert not any("E_MAX" in o for o in mk.build_options())

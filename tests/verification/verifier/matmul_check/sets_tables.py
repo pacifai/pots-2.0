@@ -1,4 +1,4 @@
-"""Tables for FS37b round 2's (row, entry) sets (``test_measure_sets_sim_host.py``,
+"""Tables for FS37b's read groups of several entries (``test_measure_sets_sim_host.py``,
 ``test_measure_sets_cuda.py``): one stored tensor ``X`` of shape ``[n, q]`` read as one view by
 ``e`` entries of a read group, each an ``A``-kind entry (``X`` is ``A`` of a product, phase 1) or
 a ``B``-kind entry (``X`` is ``B`` of a product, phase 0), with the same address, shape, strides
@@ -12,12 +12,10 @@ from tests.verification.verifier.matmul_check.shared_tables import prod_of, rnd
 from verification.verifier.matmul_check import measure_kernel as mk
 from verification.verifier.matmul_check.measure_table import MeasureInput, pack
 
-E_MAX = getattr(mk, "E_MAX", 4)
-
-
 def rb_of(rows_per_block, e):
-    """The rows a block takes of a group of ``e`` entries."""
-    return rows_per_block // min(e, E_MAX)
+    """The rows a block takes of a group of ``e`` entries: one entry per batch, so all
+    ``rows_per_block`` whatever ``e``."""
+    return rows_per_block
 
 
 def kinds_of(e, mode):

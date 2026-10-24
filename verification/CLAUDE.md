@@ -1884,24 +1884,37 @@ interface.
     the 32 lanes), with the per-product scratch layout (`pots_mwork_t`). `measure_kernel.cu`
     maps the work onto blocks, warps, shared-memory tiles and shuffles (FS37b): one kernel,
     `pots_measure_level`, launched once per level of a read plan. A block takes
-    `ROWS_PER_BLOCK` sets, a set being one (row, entry) pair of a read group; a group with `e`
-    entries runs in batches of `min(e, E_MAX)`, each batch loading one tile of
-    `RB = ROWS_PER_BLOCK / min(e, E_MAX)` rows for all its entries (FS37b round 2). The block
-    walks the columns in `TILE_COLS` tiles (loaded coalesced into shared memory, widened to
-    fp32, specialised by dtype and layout; two passes, global loads into registers first, and
-    the next tile prefetched in the shared and bias sweeps) and the challenge columns in
-    `K_CHUNK` chunks; an entry's vector values sit in registers once per column for all its
-    sets; lane `p` keeps one accumulator per step over
-    columns `p, p+32, ...`, so the per-partial operations are unchanged, and masked columns are
+    `ROWS_PER_BLOCK` (16) consecutive rows of one read group, warp `w` owning rows
+    `w*RPW ..` (`RPW = ROWS_PER_BLOCK / 8`), and runs the group's entries one after another
+    over them, one entry per batch (FS37b round 3; round 2's `E_MAX` batches are gone). Per
+    entry the block copies the product descriptor into shared memory (consecutive threads,
+    4-byte words) and reads the product only from that copy. The block walks the columns in
+    `TILE_COLS` (256) tiles (loaded coalesced into shared memory, widened to fp32, specialised
+    by dtype and layout; two passes, global loads into registers first, and the next tile
+    prefetched in every sweep, the P sweep too) and the challenge columns in `K_CHUNK` chunks;
+    a column's vector values sit in registers once for the warp's `RPW` rows; lane `p` keeps
+    one accumulator per step over columns `p, p+32, ...`, so the per-partial operations are unchanged, and masked columns are
     skipped, never zero-filled. The per-element updates (`pots_upd_*`) are in the header and
-    shared with the host emulation `pots_host_measure_sweep`. The header also holds the level layout: `pots_mread_t` (a
-    read group: its first item in the level, its rows, its entries), `pots_mentry_t` (a node,
-    product and phase) and `pots_rfind` (the group holding an item, a binary search as
-    `pots_mfind`). The host test runs the same items and steps in loops.
+    shared with the host emulation `pots_host_measure_sweep`. `pots_upd_p` and `pots_upd_bias` use `fma` for the float64 square (exact, so the same
+    bits). The header also holds the level layout: `pots_mread_t` (a read group: its first
+    item in the level, its rows, its entries), `pots_mentry_t` (a node, product and phase) and
+    `pots_rfind` (the group holding an item, a binary search as `pots_mfind`; the kernel no
+    longer searches, it reads its block's group from the block table). The host test runs the
+    same items and steps in loops.
+  - **Stores (FS37b round 3).** After a sweep chunk each lane holds the warp's rows' dots and
+    each row's e1, e2 as fp32 accumulators; a transposed butterfly (`__shfl_xor_sync`, five
+    stages, the lower lane's value on the left) reduces up to 32 of them per pass with the
+    halving tree's pairings, leaving accumulator `m` in lane `m`. The values go to a shared
+    staging array (row, slot), and after `__syncthreads()` consecutive threads write them to
+    consecutive rows. The float64 sums keep the lane-0 tree. An A sweep's dots `s_j` stay in
+    shared memory until the same chunk's P sweep, whose write-out forms `d_j` with
+    `pots_phase_store`'s fp32 operations (the `+ beta_j` for a biased product, then `- pi_j`)
+    and writes it; `s_j` never goes to scratch. The bias item and phase 2 keep the lane-0
+    path.
   - **Build.** NVRTC (through `gpu_blake3`'s `Nvrtc`, `Driver` and `build_image`) compiles
     the three sources with `--fmad=false`, so the only fused operation is the core's `fmaf`.
     The CUBIN is cached under `native.cache_dir()`, keyed by the sources, the options (the
-    geometry macros `-DROWS_PER_BLOCK`, `-DTILE_COLS`, `-DK_CHUNK`, `-DE_MAX`,
+    geometry macros `-DROWS_PER_BLOCK`, `-DTILE_COLS`, `-DK_CHUNK`,
     `-DPOTS_MK_WARPS` among them), the NVRTC version and architecture. `K_CHUNK` is
     `min(k, cap)` per build (`chunk_for(k)`; the cap is 16, or `set_geometry`'s `k_chunk`), so
     there is one cached image per value. `set_geometry(rows_per_block=, tile_cols=,
@@ -1926,9 +1939,11 @@ interface.
     counts, which served FS38b's acceptance only).
     Numpy only, no loop over members. `plain_plan(prods)` is the unshared plan: three
     levels, every node its own group. `block_starts(plan)` gives each group's first row
-    block (a uint64 array aligned with `plan.reads`; a phase-2 group takes one block); the
-    kernel finds its group by binary search and grid-strides over row blocks.
-    `enqueue(..., share=, plan_out=list)` packs the plan and the starts after the works
+    block (a uint64 array aligned with `plan.reads`; a group takes `ceil(count /
+    ROWS_PER_BLOCK)` blocks, a phase-2 group one). `block_table(plan)` expands it, per level,
+    into `pots_mblk_t {group, rbk}` rows (numpy `repeat`); `LevelArgs.blocks` points at the
+    level's rows and the kernel reads `blk[b]`, searching nothing, and grid-strides over the
+    blocks (`LevelArgs` stays 72 bytes). `enqueue(..., share=, plan_out=list)` packs the plan and the block table after the works
     array and launches `pots_measure_level` once per level, in order (always: `share=False`
     uses `plain_plan`, and the old per-phase kernel and `KernelArgs` are gone), and with
     `share=True` appends the plan to `plan_out`; the rows have the same bits either way. A

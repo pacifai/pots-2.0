@@ -48,7 +48,7 @@ CXX = shutil.which("c++") or shutil.which("clang++") or shutil.which("g++")
 
 pytestmark = [pytest.mark.slow, pytest.mark.skipif(CXX is None, reason="needs a C++ compiler")]
 
-GEOMETRIES = [(32, 64, 16), (8, 32, 4), (16, 96, 3), (64, 128, 1)]
+GEOMETRIES = [(16, 256, 16), (8, 32, 4), (16, 96, 3), (64, 128, 1), (16, 256, 9)]
 
 
 @pytest.fixture(scope="module")
@@ -62,7 +62,7 @@ def build_sim(out_dir, geometry, asan=False):
     cmd = [CXX, "-std=c++17", "-O1", "-ffp-contract=off", "-shared", "-fPIC",
            f"-I{ROOT / 'verification/verifier/matmul_check'}",
            f"-DPOTS_MK_WARPS={mk.WARPS}u", f"-DROWS_PER_BLOCK={rpb}u", f"-DTILE_COLS={tile}u",
-           f"-DK_CHUNK={kc}u", f"-DE_MAX={getattr(mk, 'E_MAX', 4)}u",
+           f"-DK_CHUNK={kc}u",
            str(HERE / "measure_kernel_sim.cpp"), "-o", str(out)]
     if asan:
         cmd[1:1] = ["-fsanitize=address", "-fno-omit-frame-pointer", "-g"]
@@ -76,7 +76,7 @@ def build_sim(out_dir, geometry, asan=False):
 
 
 def simulate(lib, mis, *, share=True, geometry=GEOMETRIES[0], grid=3):
-    """The rows of ``mis`` by the simulated kernel: the plan, its row-block starts and its level
+    """The rows of ``mis`` by the simulated kernel: the plan, its block table and its level
     launches as ``enqueue`` makes them, with host addresses. The scratch is an exact-size
     allocation (the tables and the plan are numpy arrays of exact size), so an out-of-bounds
     read lands outside every buffer (under ASAN, a report)."""
@@ -87,11 +87,12 @@ def simulate(lib, mis, *, share=True, geometry=GEOMETRIES[0], grid=3):
     works = mk.works_array(prods, scratch.ctypes.data)
     plan = mk.read_plan(prods) if share else mk.plain_plan(prods)
     starts = mk.block_starts(plan, geometry[0])
+    blocks = mk.block_table(plan, geometry[0])
     rows = mt.empty_rows(table)
     k = int(prods["k"][0])
     launches = mk.level_launches(prods.ctypes.data, works.ctypes.data, rows.ctypes.data,
                                  plan.reads.ctypes.data, plan.entries.ctypes.data,
-                                 starts.ctypes.data, plan, k, starts)
+                                 blocks.ctypes.data, plan, k, starts)
     faulthandler.dump_traceback_later(300, exit=True)
     try:
         for args, blocks in launches:
@@ -287,7 +288,7 @@ def test_the_kernel_reads_nothing_outside_its_buffers(host_measure, sim_dir, tmp
     agree(np.load(out), host_measure(pack(mis)), "asan")
 
 
-# ---- sets: more entries than E_MAX, mixed kinds, entries of different widths ----
+# ---- groups of several entries: mixed kinds, entries of different widths ----
 
 def wide_group(dtype, guard, n_a, n_b, *, n=19, q=37, k=3, kind="row"):
     """One stored ``[n, q]`` view ``v`` read as ``A`` by ``n_a`` products (``B`` widths 5, 9,
@@ -307,9 +308,8 @@ def wide_group(dtype, guard, n_a, n_b, *, n=19, q=37, k=3, kind="row"):
 
 @pytest.mark.parametrize("kind", ["row", "t"])
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_a_group_wider_than_e_max_runs_in_batches(sim, host_measure, dtype, kind):
-    """Seven entries over one view (batches of E_MAX and of 3, RB = ROWS_PER_BLOCK // E_MAX),
-    five and one for the lone-batch and single-entry cases, and a group of exactly E_MAX."""
+def test_a_group_of_several_entries_runs_them_in_turn(sim, host_measure, dtype, kind):
+    """Seven entries over one view, then five, two and one, one entry per batch."""
     for n_a, n_b in ((4, 3), (5, 0), (0, 5), (2, 2), (1, 1)):
         for guard in (True, False):
             mis = wide_group(dtype, guard, n_a, n_b, kind=kind)
