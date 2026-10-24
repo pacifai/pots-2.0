@@ -395,7 +395,7 @@ def test_main_refuses_fewer_than_two_gpus_and_not_by_type(tmp_path, monkeypatch,
 def test_the_job_script_switches_on_the_session(tmp_path):
     text = JOB.read_text()
     assert re.search(
-        r"fs11\|recheck\|profile-check\|nvlink-probe\|kernel-speed\|fs32-pair\|device-leaves\)",
+        r"fs11\|recheck\|profile-check\|nvlink-probe\|kernel-speed\|fs32-pair\|device-leaves\|four-h100\)",
         text)
     assert subprocess.run(["bash", "-n", str(JOB)]).returncode == 0
 

@@ -266,8 +266,8 @@ def test_the_other_sessions_have_no_kernel_parts(tmp_path):
     # the two-GPU session runs pytest parts of its own, but no kernel part
     for p in fs.SESSIONS["fs32-pair"][1](tmp_path / "up", tmp_path / "out"):
         assert p.kind != "kernel_speed" and not any("test_gpu_blake3" in a for a in p.argv)
-    assert sorted(fs.SESSIONS) == ["device-leaves", "fs11", "fs32-pair", "kernel-speed",
-                                   "nvlink-probe", "profile-check", "recheck"]
+    assert sorted(fs.SESSIONS) == ["device-leaves", "four-h100", "fs11", "fs32-pair",
+                                   "kernel-speed", "nvlink-probe", "profile-check", "recheck"]
 
 
 def test_the_extras_carry_the_gate_into_the_summary(tmp_path):

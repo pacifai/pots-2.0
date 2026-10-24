@@ -206,7 +206,8 @@ def test_main_prints_each_steps_root_and_skips_the_count_on_request(
     out = capsys.readouterr().out.splitlines()
     roots = [x for x in out if re.fullmatch(r"step\s+\d+ root [0-9a-f]{64}", x)]
     assert [x.split()[1] for x in roots] == ["1", "2"] and roots[0] != roots[1]
-    assert out.index(roots[0]) > max(i for i, x in enumerate(out) if x.startswith("process lifetime"))
+    last_cost = max(i for i, x in enumerate(out) if x.startswith("process lifetime"))
+    assert out.index(roots[0]) > last_cost
     assert "   actual:   accept" in out and "   PASS" in out
     assert bool(calls) is counted
 
