@@ -346,12 +346,12 @@ def test_plan_every_part_has_a_timeout_and_the_two_arms_differ_only_in_the_setti
 
 def test_the_default_deadline_is_about_twice_the_estimates_and_inside_the_guard(tmp_path):
     est = sum(fs.PAIR_ESTIMATE_MIN.values())
-    assert 100 <= est <= 115  # FS33d's pipelined arms added 30 minutes
+    assert 150 <= est <= 160  # FS33d added 30 minutes, the exit probe 42
     text = JOB.read_text()
     m = re.search(r"\[ \"\$SESSION\" = fs32-pair \] && DEFAULT_DEADLINE_S=(\d+)", text)
     assert m and int(m[1]) >= 2 * est * 60 * 0.95
-    assert int(m[1]) < 4.5 * 3600
-    guard = re.search(r"sleep (\d+)", README.read_text())
+    assert int(m[1]) < 6 * 3600
+    guard = re.search(r"`sleep (\d+);` \(setup about 20 min", README.read_text())  # the pair's
     assert guard and int(guard[1]) > int(m[1])
 
 

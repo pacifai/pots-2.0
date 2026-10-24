@@ -1221,7 +1221,7 @@ transcript and run the verifier.
    fetches every public one (a few minutes it doesn't need; a filter would be a change to
    `fs11_session.py`).
 2. **The pod**: two GPUs of the same type, the image and disks of step 2, the boot guard with
-   `sleep 18500;` (setup about 20 min plus the job's 134: 2 x 154 min = 308 min, rounded up).
+   `sleep 23600;` (setup about 20 min plus the job's 176: 2 x 196 min = 392 min, rounded up).
 3. **Set up** as in step 3. `requirements-fs11.txt` carries `pytest` and `matplotlib` (the fast
    suite and the plotting tests need them), so nothing is installed by hand.
 4. **Start the job**:
@@ -1247,6 +1247,7 @@ transcript and run the verifier.
 | `native_build` | compiles the BLAKE3 library from the upload | 2 min |
 | `fast_suite` | the whole fast suite, `-rf`; the two-GPU tests run here first | 25 min |
 | `two_gpu_slow` | the slow two-GPU tests (a SmolLM2 run, sharded against unsharded) | 10 min |
+| `exit_probe` | each of 30 test modules in its own pytest process, then all together; names the one that cannot exit; never judged | 42 min |
 | `fs34_tests` | FS34's CUDA tests (`test_fs34_join_cuda.py`): the kernel hashes on the owner GPUs | 5 min |
 | `smollm2_calibrate` | the band file, written even when the bf16 guard fails | 5 min |
 | `card_unsharded`, `card_sharded` | `card_identity`: step 1's root, `W_{t+1}`, loss | 6 min |
@@ -1257,8 +1258,8 @@ transcript and run the verifier.
 | `<cheat>_pipelined` (three) | the judged cheats, sharded and pipelined | 12 min |
 
 The estimates are scaled by hand from the earlier sessions; none was measured on two cards.
-The parts sum to about 113 min, packing about 1, the grace window 20: about 134 min, so the
-default deadline is 2 x 134 = 268 min, rounded up to 16,100 s. The pipelined arms (FS33d) are
+The parts sum to about 155 min, packing about 1, the grace window 20: about 176 min, so the
+default deadline is 2 x 176 = 352 min, rounded up to 21,200 s. The pipelined arms (FS33d) are
 estimated at their sequential counterparts' time, since the pipelined loop overlaps prover and
 verifier and is no slower; that is an estimate, not a measurement. Each part's time limit is a
 cap; the fast suite's is 3,600 s, the metrics run's 1,800 s.

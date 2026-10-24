@@ -269,8 +269,8 @@ def test_pipelined_arms_use_the_same_steps_and_kept_step_and_own_directories(tmp
     for c in ("poisoned_step", "hidden_steps", "flipped_matmul"):
         assert plan[c + "_pipelined"].argv[:3] == plan[c].argv[:3]
         assert plan[c + "_pipelined"].argv[3:] == plan[c].argv[3:]
-    dirs = [p.env["VERIF_OUTPUT_DIR"] for p in plan.values() if p.kind != "pytest"
-            and p.name not in ("models", "peer_check")]
+    dirs = [p.env["VERIF_OUTPUT_DIR"] for p in plan.values()
+            if p.kind not in ("pytest", "exit_probe") and p.name not in ("models", "peer_check")]
     assert len(set(dirs)) == len(dirs)
     assert list(plan)[0] == "peer_check"
     assert plan["run_pipelined_metrics"].timeout_s >= plan["run_pipelined"].timeout_s
