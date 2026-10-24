@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import torch
 
 from verification.verifier.bands import TAU_W0, Bands
 from verification.verifier.context import StepStats
@@ -65,7 +66,7 @@ if TYPE_CHECKING:
 
 __all__ = ["KAPPA_MARGIN", "GUARD_FRACTION", "TAU_W_MARGIN", "Calibration", "RealizedFloor",
            "LargestEm", "StepFloor", "fit", "realized_floor", "largest_e_m", "step_floor",
-           "band_file_bytes", "write_band_file", "BandFileMismatch",
+           "band_file_bytes", "write_band_file", "BandFileMismatch", "gpu_models",
            "PROVENANCE_KEYS", "band_context", "load_bands", "assert_same_band_source"]
 
 # κ_max = KAPPA_MARGIN × the largest honest κ of the class. The spec asks only that κ_max sit
@@ -358,6 +359,21 @@ class BandFileMismatch(ValueError):
 PROVENANCE_KEYS: frozenset[str] = frozenset({"calibration_seed", "threads"})
 
 
+def gpu_models(cfg: RunConfig) -> list[str]:
+    """The sorted distinct GPU model names (``torch.cuda.get_device_name``) of every CUDA device
+    the run uses (``VERIF_DEVICE`` and ``VERIF_VERIFIER_DEVICES``); ``[]`` on a CPU run. A set
+    of models, not a device layout: a sharded replay is bit-identical to the one-GPU replay, so
+    a file fitted unsharded judges a sharded run on the same model."""
+    if not torch.cuda.is_available():
+        return []
+    names = set()
+    for d in map(torch.device, [cfg.device, *(cfg.verifier_devices or ())]):
+        if d.type == "cuda":
+            names.add(torch.cuda.get_device_name(
+                torch.cuda.current_device() if d.index is None else d.index))
+    return sorted(names)
+
+
 def band_context(cfg: RunConfig, c: DecoderComputation, *, h_D: bytes, k: int) -> dict[str, Any]:
     """The run a band file is fitted for, as JSON values.
 
@@ -368,13 +384,19 @@ def band_context(cfg: RunConfig, c: DecoderComputation, *, h_D: bytes, k: int) -
     ``calibration_seed`` is ``cfg.seed``, and ``threads`` is ``cfg.threads``
     (``VERIF_THREADS``). In the file they are the calibration run's seed and thread count,
     kept as provenance, and :func:`load_bands` compares neither (:data:`PROVENANCE_KEYS`).
+    ``gpu_models`` (:func:`gpu_models`), ``torch`` (``torch.__version__``) and ``cuda``
+    (``torch.version.cuda``, ``None`` on a CPU build) name the GPU and the software build the
+    rounding noise was measured on; they are compared, so a file fitted on an H100 never
+    judges a B200 run, or another torch or CUDA build, without a refusal.
     """
     return {"model": cfg.model, "model_revision": cfg.model_revision,
             "master_dtype": str(cfg.master_dtype).removeprefix("torch."),
             "compute_dtype": str(cfg.compute_dtype).removeprefix("torch."),
             "attn_impl": cfg.attn_impl, "device": cfg.device, "h_D": h_D.hex(),
             "calibration_seed": cfg.seed, "threads": cfg.threads, "n_s": c.n_s, "n": c.n,
-            "eta": c.eta, "M": c.M, "T_run": cfg.steps, "k": k}
+            "eta": c.eta, "M": c.M, "T_run": cfg.steps, "k": k,
+            "gpu_models": gpu_models(cfg), "torch": torch.__version__,
+            "cuda": torch.version.cuda}
 
 
 _ABSENT = object()
@@ -394,7 +416,8 @@ def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, An
     The file must have been calibrated at ``k``, so a run can't pair the bands with a
     ``VERIF_K`` that P10d's recompute did not approve. Its ``context`` must equal ``context``
     (:func:`band_context`) key for key, so a file fitted on another ``D``, model or setup, or
-    one written before a compared key existed, is refused. Either mismatch raises
+    one written before a compared key existed (``gpu_models``, ``torch``, ``cuda`` since FS35),
+    is refused. Either mismatch raises
     :class:`BandFileMismatch`. The two :data:`PROVENANCE_KEYS`, the calibration seed and the
     thread count, are never compared: a run at another seed or thread count loads the file,
     and so does a file that lacks either key. A ``.guard_failed.json`` sidecar next to the file
@@ -421,7 +444,10 @@ def load_bands(path: str | os.PathLike[str], *, k: int, context: Mapping[str, An
         def show(d: Mapping[str, Any], key: str) -> str:
             return repr(d[key]) if key in d else "missing"
         detail = "; ".join(f"{key}: file {show(got, key)}, run {show(want, key)}" for key in diff)
-        raise BandFileMismatch(f"band file {path} was fitted for another run ({detail}): "
+        old = sorted(key for key in diff if key in want and key not in got)
+        note = (f"; a file written before {', '.join(old)} existed lacks "
+                f"{'it' if len(old) == 1 else 'them'}" if old else "")
+        raise BandFileMismatch(f"band file {path} was fitted for another run ({detail}){note}: "
                                f"{rerun}")
     return bands
 
