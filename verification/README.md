@@ -1314,8 +1314,12 @@ The session needs 4 CUDA devices, which `FS11_ALLOW_ANY_GPU` does not lift, and 
    command with a `sleep` of 17,100 s in place of 16,200. The arithmetic: the job's parts take
    about 101 min, packing 1, the grace window 20, so 122 min; setup is about 20 more, 142 min;
    twice that is 284 min = 17,040 s, rounded up to 17,100 s. The job's own deadline is 2 x 122
-   min = 244 min = 14,640 s, rounded up to 14,700 s (4 h 5 min). A full run bills about 2 hours
-   (about $27); the deadline caps it at about 4 hours.
+   min = 244 min = 14,640 s, rounded up to 14,700 s (4 h 5 min). The estimated cost at $16 per
+   hour: the parts' estimates sum to 2 + 1 + 6 + 8 + 8 + 4 x (3 + 8 + 8) = 25 + 76 = 101 min,
+   setup 20 min (the venv with `fs11_setup.sh` and the unpacking, as the pair session counts
+   it), packing 1 min: 122 min = 2.03 hours, about $33 (122 / 60 x 16 = $32.5). The job's
+   deadline caps the job at 14,700 s = 4.08 hours = $65 (14,700 / 3600 x 16 = $65.3), and the
+   boot guard's 17,100 s caps the pod's whole life at 4.75 hours = $76.
 3. **Set up** with `fs11_setup.sh` as in step 3 of the first session:
 
    ```bash
@@ -1347,6 +1351,16 @@ The models run cheapest first: Qwen2.5-0.5B, Llama-3.2-1B, Falcon3-1B, Qwen2.5-1
 estimates are scaled by hand; none was measured on four GPUs. Each part's time limit is about
 twice its estimate. The counting pass is skipped (`--no-count`): counts do not depend on the GPU
 layout and FS27 measured them on an H100.
+
+The result reports each model's cost two ways, as the cost decision asks. The wall time is the
+steady step (the merged step's wall extent, mean of steps 2 and 3). The accumulated GPU time is
+each GPU's held time summed over the GPUs a part holds (three verifier GPUs for 1 s are 3 s):
+per step, the prover side's time times the prover GPUs plus the verifier side's time times the
+verifier GPUs, the counts from the environment record's `gpu_roles`. The log prints both per
+model and arm. `metrics.py`'s `gpu_held_s` multiplies each section's time by every device its
+process lists (four on the sequential arm), so it only bounds that quantity from above; the
+summary keeps it as `gpu_held_upper_s`. The session fails if any of the step times, per-GPU peaks
+or 12 peer rates is missing, or if any test case was skipped.
 
 **Reading the result.** `summary.json["four_h100"]["pass"]` fails closed. It is true only when
 every part ended `ok`; the tests left a report with tests, no failure or error and no FS34 test
