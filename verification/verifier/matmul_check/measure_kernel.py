@@ -195,6 +195,18 @@ class MeasureKernels:
         finally:
             driver.pop()
 
+    def attributes(self) -> dict[str, int]:
+        """The level kernel's build, read through ``cuFuncGetAttribute``: ``registers`` per
+        thread, ``local_bytes`` per thread (nonzero means registers spilled), ``shared_bytes``
+        (static) and ``max_threads`` per block. Printed by the A40 run, so a spill shows."""
+        attrs = {"max_threads": 0, "shared_bytes": 1, "local_bytes": 3, "registers": 4}
+        self.driver.push(self.dev)
+        try:
+            return {name: self.driver.function_attribute(self.level_fn, a)
+                    for name, a in attrs.items()}
+        finally:
+            self.driver.pop()
+
     def run(self, launches: Sequence[tuple[LevelArgs, int]], stream: int) -> None:
         """Launch each ``(args, blocks)`` in order on the raw ``stream``: ``pots_measure_level``
         on the :class:`LevelArgs`."""

@@ -248,6 +248,7 @@ DRIVER_SIGNATURES: dict[str, tuple[Any, list[Any]]] = {
     "cuCtxPopCurrent_v2": (_I, [_P(_V)]),
     "cuModuleLoadData": (_I, [_P(_V), _V]),
     "cuModuleGetFunction": (_I, [_P(_V), _V, _S]),
+    "cuFuncGetAttribute": (_I, [_P(_I), _I, _V]),
     "cuLaunchKernel": (_I, [_V, _U, _U, _U, _U, _U, _U, _U, _V, _P(_V), _P(_V)]),
 }
 
@@ -422,6 +423,13 @@ class Driver:
         self.check(self.lib.cuModuleGetFunction(ctypes.byref(fn), mod, name.encode()),
                    f"cuModuleGetFunction({name})")
         return fn
+
+    def function_attribute(self, fn: Any, attr: int) -> int:
+        """``cuFuncGetAttribute`` of the loaded function ``fn`` (``attr``: 0 max threads per
+        block, 1 static shared bytes, 3 local bytes per thread, 4 registers per thread)."""
+        v = ctypes.c_int()
+        self.check(self.lib.cuFuncGetAttribute(ctypes.byref(v), attr, fn), "cuFuncGetAttribute")
+        return v.value
 
     def launch(self, fn: Any, grid: int, block: int, params: Params, stream: int) -> None:
         argv = (ctypes.c_void_p * 1)(ctypes.addressof(params))  # one pointer to the one argument

@@ -272,3 +272,44 @@ def test_each_k_chunk_is_its_own_build_and_kernel_object(monkeypatch):
     mk._built((8, 6), 16)
     assert seen == [9, 16]
     mk._built.cache_clear()
+
+
+# ---- the kernel's build attributes ----
+
+def test_attributes_read_the_four_function_attributes_through_the_driver():
+    class Driver:
+        def __init__(self):
+            self.log = []
+
+        def push(self, dev):
+            self.log.append(("push", dev))
+
+        def pop(self):
+            self.log.append(("pop",))
+
+        def function_attribute(self, fn, attr):
+            self.log.append(("attr", fn, attr))
+            return {0: 256, 1: 27008, 3: 0, 4: 128}[attr]
+
+    drv = Driver()
+    k = mk.MeasureKernels.__new__(mk.MeasureKernels)
+    k.driver, k.dev, k.level_fn = drv, 3, "fn"
+    assert k.attributes() == {"max_threads": 256, "shared_bytes": 27008, "local_bytes": 0,
+                              "registers": 128}
+    assert drv.log[0] == ("push", 3) and drv.log[-1] == ("pop",)
+
+
+def test_the_driver_reads_a_function_attribute_with_cu_func_get_attribute():
+    import ctypes
+
+    class Lib:
+        def cuInit(self, flags):
+            return 0
+
+        def cuFuncGetAttribute(self, v, attr, fn):
+            assert isinstance(v._obj, ctypes.c_int) and fn == "f"
+            v._obj.value = {0: 256, 4: 96}[attr]
+            return 0
+
+    d = mk.gb.Driver(Lib())
+    assert (d.function_attribute("f", 4), d.function_attribute("f", 0)) == (96, 256)
