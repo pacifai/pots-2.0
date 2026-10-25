@@ -2905,6 +2905,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   - Three passes: timed (`--repeats` rounds, default 3, each a full step and then every `k`,
     ascending in odd rounds and descending in even ones; the median per `k`), memory (the
     footprint's peak less its value just before the call, after `gc.collect()`) and counts.
+    On CUDA every swept `k`'s measuring kernel is built first, outside the timed rounds
+    (`prebuild_measure_kernels(c, device, ks)`: one image per chunk size, on every CUDA device
+    the step measures on).
     Every pass must accept; κ, ν, `‖|P|·1‖` and `‖P‖_F` must be bit-equal at every `k`; the
     configured `k` must reproduce the archive and the step record's `ρ_5`; and every pass's
     numbers must be equal across rounds. Predicted counts: `5.measure` FLOPs `S·(k+1) + S_U`
@@ -2954,7 +2957,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `section=`. It uses only those public entry points, not check 5's internals.
   - Per section (`5.glue`, `5.measure`, `other` = the rest of check 5), totals and per product
     of all `M`: the median wall time of `--repeats` passes (default 5; on CUDA synchronized
-    before and after each); aten ops and host reads under a `TorchDispatchMode` (a host read:
+    before and after each, the measuring kernel for its `k` built first by
+    `k_tunability.prebuild_measure_kernels`); aten ops and host reads under a `TorchDispatchMode` (a host read:
     `_local_scalar_dense`, `Tensor.tolist`/`numpy` counted once each, a copy from a non-CPU
     tensor to a CPU one); on CUDA, from `torch.profiler`, kernel launches, kernels and their
     summed device time, and blocking runtime calls (`cuda{Stream,Device,Event}Synchronize`,
