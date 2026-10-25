@@ -2422,7 +2422,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   counting passes are never traced. With `--no-count` it writes the shape-derived work rows
   after the timed run: `work_rows(c, run, scenario, step_rows)` (moved here from `bring_up`,
   which imports it back) gives the `count` and `storage` rows from the declared products and
-  each `step` record's `transcript_bytes` and `leaves` (both loops write them), because the
+  each `step` record's `transcript_bytes` and `leaves` (both loops write them; check 2's row
+  and, on a CPU run, the commit's row hash every leaf; on a CUDA run `c.device` the commit's
+  row counts only the batch records, `W_t`, `W_{t+1}` and the `dK` products, since the other
+  products' digests come from arrival hashing on their owner GPUs inside `train.*`, whose rows
+  carry FLOPs only; every hashing row carries `hash_leaves`, the leaf count), because the
   counting pass is never run beside a timed run; with `--count` no work rows are written, so a
   component and step has one `count` row. Exits 1 unless
   accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s

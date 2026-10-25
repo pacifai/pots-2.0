@@ -2,6 +2,7 @@
 the real step as a slow test."""
 
 import json
+import math
 import re
 from types import SimpleNamespace
 
@@ -358,3 +359,49 @@ def test_real_smollm2_step_is_accepted(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "largest class RMS" in out and "check 6b: max ρ" in out
     print(out)
+
+
+def _tiny_leaf_counts(c):
+    n_w = len(c.weight_names)
+    dk = [q for q in c.products if c.product_class(q) == "dK"]
+    psize = torch.empty((), dtype=c.product_dtype).element_size()
+    wsize = torch.empty((), dtype=c.weight_dtype).element_size()
+    w_bytes = sum(wsize * math.prod(s) for s in c.weight_shapes.values())
+    p_bytes = [psize * math.prod(q.p_shape) for q in c.products]
+    return n_w, dk, w_bytes, p_bytes
+
+
+def test_work_rows_on_cuda_commit_hashes_records_weights_and_dk_only(tiny, monkeypatch):
+    """With the prover on CUDA the commit's row counts the records, W_t, W_{t+1} and the dK
+    products (the rest come from arrival digests); check 2's row keeps every leaf."""
+    c = tiny[0]
+    monkeypatch.setattr(c, "device", torch.device("cuda"))
+    n_w, dk, w_bytes, p_bytes = _tiny_leaf_counts(c)
+    rec_n, rec_bytes = c.n_s, 1234  # the batch records, a made-up byte total
+    leaves = rec_n + 2 * n_w + len(c.products)
+    nbytes = rec_bytes + 2 * w_bytes + sum(p_bytes)
+    step = {"step": 1, "leaves": leaves, "transcript_bytes": nbytes}
+    rows = llama_step.work_rows(c, "r", "honest", [step])
+    by = {r["component"]: r for r in rows if r["record"] == "count"}
+    want_n = rec_n + 2 * n_w + len(dk)
+    want_bytes = (rec_bytes + 2 * w_bytes
+                  + sum(b for q, b in zip(c.products, p_bytes) if c.product_class(q) == "dK"))
+    com = by["P3.commit"]
+    assert len(dk) > 0 and want_n < leaves
+    assert com["hash_leaves"] == com["hash_calls"] == want_n
+    assert com["hash_in_bytes"] == want_bytes + want_n and com["hash_out_bytes"] == 32 * want_n
+    chk = by["2"]
+    assert chk["hash_leaves"] == chk["hash_calls"] == leaves
+    assert chk["hash_in_bytes"] == nbytes + leaves and chk["hash_out_bytes"] == 32 * leaves
+
+
+def test_work_rows_on_cpu_commit_keeps_the_whole_transcript(tiny):
+    c = tiny[0]
+    assert c.device.type == "cpu"
+    step = {"step": 1, "leaves": 100, "transcript_bytes": 5000}
+    by = {r["component"]: r for r in llama_step.work_rows(c, "r", "honest", [step])
+          if r["record"] == "count"}
+    for name in ("P3.commit", "2"):
+        assert by[name]["hash_leaves"] == by[name]["hash_calls"] == 100
+        assert by[name]["hash_in_bytes"] == 5100 and by[name]["hash_out_bytes"] == 3200
+    assert by["train.forward"]["hash_leaves"] == 0
