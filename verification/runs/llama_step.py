@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -196,9 +197,19 @@ def work_rows(c: DecoderComputation, run: str, scenario: str,
     ``leaves``): ``train.forward`` and ``train.backward`` get the matmul FLOPs the inventory
     declares (``2·rows·contracted·cols`` per product, the forward kind in the first, the three
     gradient kinds in the second; a bias's ones column and the elementwise glue are left out);
-    ``P3.commit`` (prover) and ``2`` (verifier) get the leaf hashing, ``transcript_bytes`` plus
-    the ``0x00`` prefix byte per leaf in, 32 bytes per leaf out; and a ``storage`` row carries
-    ``transcript_bytes`` and ``leaves``. Nothing is read from the device."""
+    ``2`` (verifier) gets the leaf hashing of the whole transcript, ``transcript_bytes`` plus
+    the ``0x00`` prefix byte per leaf in, 32 bytes per leaf out, ``hash_calls`` and
+    ``hash_leaves`` the leaf count (check 2 rehashes every leaf). ``P3.commit`` (prover) counts
+    what the commit itself hashes. On a CPU run that is the whole transcript, as for check 2.
+    On a CUDA run (``c.device``) the products are hashed on arrival, on their owner GPUs inside
+    ``train.*`` (those rows carry FLOPs only), and the commit takes those digests as ``known``,
+    so it hashes the batch records, ``W_t``, ``W_{t+1}`` and the ``dK`` products (the committed
+    ``δK̃`` leaf is the contiguous transpose made in labeling, so its arrival digest goes
+    unused): ``hash_leaves`` and ``hash_calls`` are ``leaves`` minus the other products,
+    ``hash_in_bytes`` their bytes (``transcript_bytes`` minus those products' bytes, each
+    ``prod(p_shape)`` times the product dtype's size) plus the prefix byte per leaf,
+    ``hash_out_bytes`` 32 per leaf. A ``storage`` row carries ``transcript_bytes`` and
+    ``leaves``. Nothing is read from the device."""
     fwd = bwd = 0
     for q in c.products:
         f = 2 * q.a_shape[0] * q.a_shape[1] * q.b_shape[1]
@@ -206,19 +217,29 @@ def work_rows(c: DecoderComputation, run: str, scenario: str,
             fwd += f
         else:
             bwd += f
+    skipped_n = skipped_bytes = 0  # the products the commit takes from arrival digests
+    if c.device.type == "cuda":
+        psize = torch.empty((), dtype=c.product_dtype).element_size()
+        for q in c.products:
+            if c.product_class(q) != "dK":
+                skipped_n += 1
+                skipped_bytes += psize * math.prod(q.p_shape)
     rows: list[dict[str, Any]] = []
     for r in step_rows:
         t, leaves, nbytes = r["step"], r["leaves"], r["transcript_bytes"]
+        c_leaves, c_bytes = leaves - skipped_n, nbytes - skipped_bytes
         base = {"record": "count", "run": run, "scenario": scenario, "step": t,
                 "calls": 1, "derived": False}
-        for side, name, level, flops, h_in, h_out, h_calls in (
-                ("prover", "train.forward", "phase", fwd, 0, 0, 0),
-                ("prover", "train.backward", "phase", bwd, 0, 0, 0),
-                ("prover", "P3.commit", "component", 0, nbytes + leaves, 32 * leaves, leaves),
-                ("verifier", "2", "component", 0, nbytes + leaves, 32 * leaves, leaves)):
+        for side, name, level, flops, h_in, h_out, h_calls, h_leaves in (
+                ("prover", "train.forward", "phase", fwd, 0, 0, 0, 0),
+                ("prover", "train.backward", "phase", bwd, 0, 0, 0, 0),
+                ("prover", "P3.commit", "component", 0, c_bytes + c_leaves, 32 * c_leaves,
+                 c_leaves, c_leaves),
+                ("verifier", "2", "component", 0, nbytes + leaves, 32 * leaves, leaves,
+                 leaves)):
             rows.append({**base, "side": side, "component": name, "level": level,
                          "flops": flops, "hash_in_bytes": h_in, "hash_out_bytes": h_out,
-                         "hash_calls": h_calls})
+                         "hash_calls": h_calls, "hash_leaves": h_leaves})
         rows.append({"record": "storage", "run": run, "scenario": scenario, "step": t,
                      "transcript_bytes": nbytes, "leaves": leaves})
     return rows

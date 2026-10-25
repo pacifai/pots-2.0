@@ -36,8 +36,10 @@ class KeptStepHandoff(StoreHandoff):
     keeps a reference to step ``step``'s committed leaves and tree; :meth:`write`, called once
     the step has closed, writes them to ``directory/step_<t>/`` with ``DiskHandoff(keep=True)``
     and checks that the root recomputed from the written files is the step's ``h``. The write
-    falls outside every timed section and the loop's step clock, so the stored step costs what
-    an in-memory step costs."""
+    falls outside every timed section but inside a step interval: in the sequential loop it runs
+    in the caller's ``on_step`` after the recorder's close, so it lands in step ``step + 1``'s
+    interval; in the pipelined loop it runs before ``on_step(step)``, in step ``step``'s own. The
+    ``step`` work totals are an in-memory step's either way."""
 
     def __init__(self, directory: str | Path, step: int) -> None:
         self.disk = DiskHandoff(directory, keep=True)

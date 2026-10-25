@@ -441,3 +441,28 @@ def test_trace_slice_takes_a_class_first_seen_in_a_later_group(tiny, monkeypatch
     assert only
     assert set(only) <= set(f["trace_slice"])
     assert f["trace_slice"] == sorted(set(f["trace_slice"]))
+
+
+def test_work_after_a_step_closes_lands_in_the_next_steps_interval(tiny):
+    """A caller's on_step that runs after the recorder's (as the stored step's write does) is
+    in no section: it lengthens the next step's ``step_interval`` and not any ``step`` total."""
+    import time
+
+    c, D, w0 = tiny
+    T, SLEEP = 3, 0.05
+    final = honest_final(c, D, w0, T, seed=SEED)
+    rec = metrics.TimeRecorder("tiny", "honest")
+
+    def slow_after_recorder(r):
+        if r.t == 2:
+            time.sleep(SLEEP)
+
+    run_scenario(c, D, w0, HONEST, T=T, k=K, final=final, recorder=rec, seed=SEED,
+                 on_step=slow_after_recorder)
+    rows = [r for r in rec.rows if r["record"] == "time" and r["level"] == "total"]
+    col = "time_s"
+    iv = {r["step"]: r[col] for r in rows if r["component"] == "step_interval"}
+    work = {r["step"]: r[col] for r in rows if r["component"] == "step" and r["side"] == "run"}
+    assert sorted(iv) == [1, 2, 3]
+    assert iv[3] - iv[2] > 0.7 * SLEEP and iv[3] > work[3] + 0.7 * SLEEP
+    assert work[3] < work[2] + 0.5 * SLEEP and iv[2] < work[2] + 0.5 * SLEEP

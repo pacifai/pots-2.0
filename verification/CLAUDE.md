@@ -2105,7 +2105,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `full_scale`'s cheats and hidden stages. Each computes every honest final weight first and
     calls `ReusedModel.drop()`, so the parent's GPU 0 holds no prover model while the child
     runs. The stored step (`--keep-step`) is written by the parent after `verify_step(t)`,
-    outside every clock; it delays `release(t)`. `poisoned_step` reads `W_{t+1}` from
+    outside every section but inside step `t`'s `step_interval` (it runs before `on_step(t)`); it delays `release(t)`. `poisoned_step` reads `W_{t+1}` from
     `LoopResult.w_final`. Refused with one line naming the entry point: `bring_up`,
     `store_crosscheck`, `mlp_smoke`, `metrics_overhead`, and `flipped_matmul_sweep` without
     `--no-sweep` (with it, `--source in-process` runs pipelined; the source is unused).
@@ -2250,6 +2250,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     loops, adds the `step_interval` total (FS42): the step's close (`t1_ns` of its markers line)
     minus the step before's (step 1: minus its own `t0_ns`). EQ14 reads `step_interval` as the wall
     time per step (amended 2026-10-25), beside accumulated GPU time per role, as F22 says.
+    The recorder takes `t1` in `on_step`; what runs after it falls in the next step's interval
+    and in no section: the rows, the markers line, the residual archive, a traced step's
+    profiler stop, export and gzip, a caller's `on_step` after the recorder's (the stored
+    step's write, sequential loop), and at a rejected step the record pass.
     `gpu_held_s` is only an upper bound on held GPU time (a section's time times every device its
     process lists); the measure is computed by the four-H100 session's summary from the per-side
     `total` rows and `gpu_roles` (`fs11_session._accumulated_gpu_s`).
@@ -2422,7 +2426,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   counting passes are never traced. With `--no-count` it writes the shape-derived work rows
   after the timed run: `work_rows(c, run, scenario, step_rows)` (moved here from `bring_up`,
   which imports it back) gives the `count` and `storage` rows from the declared products and
-  each `step` record's `transcript_bytes` and `leaves` (both loops write them), because the
+  each `step` record's `transcript_bytes` and `leaves` (both loops write them; check 2's row
+  and, on a CPU run, the commit's row hash every leaf; on a CUDA run `c.device` the commit's
+  row counts only the batch records, `W_t`, `W_{t+1}` and the `dK` products, since the other
+  products' digests come from arrival hashing on their owner GPUs inside `train.*`, whose rows
+  carry FLOPs only; every hashing row carries `hash_leaves`, the leaf count), because the
   counting pass is never run beside a timed run; with `--count` no work rows are written, so a
   component and step has one `count` row. Exits 1 unless
   accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s
@@ -2781,7 +2789,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     has closed, writes them with `DiskHandoff(keep=True)` to `directory/step_<t>/` and
     raises `RuntimeError` unless the root recomputed from the files is the step's `h`. The
     verifier reads that step from memory too, and the write falls outside every timed
-    section and the step clock. `--keep-step` defaults by the seed
+    section, not outside the step interval: in the sequential loop it runs in the caller's
+    `on_step` after the recorder's, so it lands in step `t + 1`'s interval (the `step` total
+    is unchanged); in the pipelined loop it is in step `t`'s own. `--keep-step` defaults by the seed
     (`default_keep_step(bands, seed)`): `KEEP_STEP = 4` (H1's first judged step) at the band
     file's calibration seed, none at any other seed, which the run prints; `0` stores none.
     The step goes under `transcripts/` (`TRANSCRIPTS_DIR`) in the run
