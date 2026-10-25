@@ -112,7 +112,8 @@ def test_each_sections_utilization_is_its_own_gpus(tmp_path):
     assert s["Q"]["util"]["g_util"] == pytest.approx(0.2)  # cuda:2 alone
     assert s["N"]["util"]["g_util"] == pytest.approx(0.9)  # no device list: the run's device
     v = s["V"]
-    assert v["util"]["g_util"] == pytest.approx(0.1)  # the first device's
+    assert v["util"]["g_util"] == pytest.approx(0.2)  # the mean of its verifier devices (FS42c)
+    assert v["util_devices"] == VERIFIER and s["P1"]["util_devices"] == ["cuda:0"]
     assert {d: u["g_util"] for d, u in v["util_by_device"].items()} == pytest.approx(
         {"cuda:1": 0.1, "cuda:2": 0.2, "cuda:3": 0.3})
     assert v["util_by_device"]["cuda:3"]["n_samples"] >= 3
@@ -265,3 +266,202 @@ def test_the_hash_floor_splits_over_the_verifier_devices_only(tmp_path):
     assert h["floors_s"]["hash"] == pytest.approx(max(each.values()))
     # the other floors still use the slowest of all four listed devices
     assert len(h["util_by_device"]) == 4
+
+
+# ---- FS42c: the headline by role, and the step time as the interval between verified steps ----
+
+INTERVAL = {1: 2.0, 2: 0.8, 3: 0.9, 4: 1.0}  # step 1 is the warm-up
+WALL = {k: 1.0 + 0.1 * k for k in INTERVAL}
+
+
+def _rewrite(paths: dict[str, Path], *, devices: dict[str, list[str]] | None = None,
+             merged: bool = False, extra_rows=None, add_secs=()) -> None:
+    """Edit the built run: set each section's devices, mark steps merged, add time rows and
+    marker sections."""
+    mp = paths["run_dir"] / "markers.jsonl"
+    lines = [json.loads(x) for x in mp.read_text().splitlines()]
+    for ln in lines:
+        if ln.get("kind") != "step":
+            continue
+        ln["merged"] = merged or None
+        ln["sections"] += [dict(s) for s in add_secs]
+        for sec in ln["sections"]:
+            if devices and sec["name"] in devices:
+                sec["devices"] = devices[sec["name"]]
+    jl(mp, lines)
+    if extra_rows:
+        rp = paths["run_dir"] / "records.jsonl"
+        recs = [json.loads(x) for x in rp.read_text().splitlines()]
+        jl(rp, recs + extra_rows(sorted(INTERVAL)))
+
+
+def _sequential(tmp_path: Path, **kw) -> dict:
+    """Every section lists all four devices, as the sequential loop's one process does."""
+    paths = build(tmp_path / "run", **kw)
+    _rewrite(paths, devices={n: DEVS for n in SECS})
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    return out["runs"]["honest"]
+
+
+def _pipelined_rows(steps):
+    rows = []
+    for k in steps:
+        rows += [time_row(k, "step_interval", INTERVAL[k], "run", "total"),
+                 time_row(k, "step_wall", WALL[k], "run", "total"),
+                 time_row(k, "prover", 0.4, "prover", "total"),
+                 time_row(k, "verifier", 0.8, "verifier", "total")]
+    return rows
+
+
+def _pipelined(tmp_path: Path, *, plain: bool = False):
+    paths = build(tmp_path / "run")  # the build's step total is the sum of the sections, 1.01
+    _rewrite(paths, devices={"P1": ["cuda:0"], "V": VERIFIER, "Q": ["cuda:2"], "H": VERIFIER},
+             merged=True, extra_rows=_pipelined_rows)
+    kw = {}
+    if plain:
+        pd = tmp_path / "plain"
+        pd.mkdir()
+        jl(pd / "records.jsonl", [time_row(1, "step", 0.3, "prover", "total")])
+        kw["plain"] = pd
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], **kw)
+    return out, out["runs"]["honest"]
+
+
+def test_a_sequential_verifier_sections_headline_is_the_mean_of_the_verifier_gpus(tmp_path):
+    s = _sequential(tmp_path)["sections"]
+    v = s["V"]  # lists all four devices: GPU 0 (the idle training GPU, 0.9 here) is not averaged
+    assert v["util"]["g_util"] == pytest.approx((0.1 + 0.2 + 0.3) / 3)
+    assert v["util"]["g_sm_active"] == pytest.approx(0.2)
+    assert v["util_devices"] == VERIFIER
+    assert list(v["util_by_device"]) == DEVS
+    assert v["util_by_device"]["cuda:0"]["g_util"] == pytest.approx(0.9)
+    assert v["util"]["n_samples"] == min(u["n_samples"] for d, u in v["util_by_device"].items()
+                                         if d in VERIFIER)
+
+
+def test_a_sequential_prover_sections_headline_is_gpu_0s(tmp_path):
+    p = _sequential(tmp_path)["sections"]["P1"]
+    assert p["util"]["g_util"] == pytest.approx(0.9) and p["util_devices"] == ["cuda:0"]
+    assert list(p["util_by_device"]) == DEVS
+
+
+def test_a_run_side_section_or_a_run_without_roles_keeps_the_first_device(tmp_path):
+    view = _sequential(tmp_path, roles=False)
+    assert view["sections"]["V"]["util"]["g_util"] == pytest.approx(0.9)
+    assert view["sections"]["V"]["util_devices"] == ["cuda:0"]
+    # a section with no time row has no side: the first device too
+    paths = build(tmp_path / "r2")
+    _rewrite(paths, devices={"X": DEVS}, add_secs=[section("X", 0.97, 0.01)])
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    x = out["runs"]["honest"]["sections"]["X"]
+    assert x["util"]["g_util"] == pytest.approx(0.9) and x["util_devices"] == ["cuda:0"]
+
+
+def test_the_lane_mark_of_a_sequential_section_is_taken_over_its_role_devices(tmp_path):
+    # Q lists all four devices: its floor (1e10 flops at the slowest GPU's 1e11) is 0.1 s over
+    # its 0.1 s, so 1.0; the verifier GPUs measure at most 0.3, a 3x difference. Over all four
+    # devices the largest lane, GPU 0's 0.9, would hide it.
+    assert "utilization" in _sequential(tmp_path)["sections"]["Q"]["marks"]
+
+
+def test_the_check_5_view_reads_the_verifier_gpus(tmp_path):
+    from tests.evaluation.results.profile.test_analyze import c5_inputs
+    names, st, layout = c5_inputs(tmp_path)
+    paths = build(tmp_path / "run")
+    _rewrite(paths, devices={n: DEVS for n in SECS},
+             add_secs=[{**section("5", 0.0, 0.0002), "devices": DEVS}],
+             extra_rows=lambda steps: [time_row(k, "5", 0.0002) for k in steps])
+    lines = [json.loads(x) for x in (paths["run_dir"] / "markers.jsonl").read_text().splitlines()]
+    for ln in lines[1:]:
+        ln["stamps"], ln["stamp_names"] = st, names
+    jl(paths["run_dir"] / "markers.jsonl", lines)
+    (paths["run_dir"] / "c5_layout.json").write_text(json.dumps(layout))
+    # a g_sm_mhz per GPU: 1000 on GPU 0 (the training GPU), 1100-1300 on the verifier GPUs
+    sm = [1000 + 100 * i for i in range(4)]
+    header, *rows = [json.loads(x) for x in paths["samples"].read_text().splitlines()]
+    header["fields"] = [*header["fields"], "g_sm_mhz"]
+    jl(paths["samples"], [header, *({**r, "g_sm_mhz": sm} for r in rows)])
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    steps = out["runs"]["honest"]["c5"]["variance"]["steps"]
+    assert steps and all(t["sampler"]["g_sm_mhz"] == pytest.approx(1200) for t in steps)
+
+
+def test_mean_view_is_one_view_for_one_device_and_the_field_mean_for_several():
+    samples = io.Samples({"kind": "header", "version": 2, "mono_ns": 0, "fields": ["t", "g_util"],
+                          "gpus": [{"index": 0}, {"index": 1}]},
+                         [{"t": 10, "g_util": [0.2, None]}, {"t": 20, "g_util": [0.4, 0.5]}])
+    sam = analyze.Sampler(samples)
+    one = analyze._mean_means([sam.view(0).means([(0, 20)])])
+    assert one == sam.view(0).means([(0, 20)])
+    both, n = analyze._MeanView([sam.view(0), sam.view(1)]).means([(0, 20)])
+    # GPU 0: (0.2 + 0.4) / 2 = 0.3; GPU 1: only the second sample, 0.5; the mean of the two
+    assert both["g_util"] == pytest.approx(0.4) and n == 2
+
+
+def test_a_pipelined_runs_step_time_is_the_interval_between_verified_steps(tmp_path):
+    _, v = _pipelined(tmp_path)
+    assert v["step_source"] == "step_interval" and v["pipelined"] is True
+    assert v["step_s"] == pytest.approx((0.8 + 0.9 + 1.0) / 3)  # the warm-up step 1 is left out
+    assert v["work_s"] == pytest.approx(1.01)  # the step total row's mean
+    assert v["latency_s"] == pytest.approx((1.2 + 1.3 + 1.4) / 3)
+    assert v["sections"]["P1"]["share"] == pytest.approx(0.2 / v["step_s"])
+    assert v["share_by_side"]["prover"] == pytest.approx(0.2 / v["step_s"])
+    assert v["share_by_side"]["verifier"] == pytest.approx(0.81 / v["step_s"])
+    assert v["warmup"]["step_s"] == pytest.approx(2.0) and v["warmup"]["latency_s"] == \
+        pytest.approx(1.1)
+    # the interval and latency rows are not sections
+    assert not {"step_interval", "step_wall", "prover", "verifier"} & set(v["sections"])
+    # prover sections list one GPU, verifier sections the verifier GPUs
+    assert v["sections"]["P1"]["util_devices"] == ["cuda:0"]
+    assert v["sections"]["V"]["util_devices"] == VERIFIER
+
+
+def test_the_plain_comparison_holds_the_interval_and_the_side_totals(tmp_path):
+    out, _ = _pipelined(tmp_path, plain=True)
+    st = out["comparisons"]["step"]
+    assert st["interval_s"] == pytest.approx(0.9)
+    assert st["prover_side_s"] == pytest.approx(0.4) and st["verifier_side_s"] == pytest.approx(0.8)
+    assert st["prover_s"] == pytest.approx(1.01) and st["plain_s"] == pytest.approx(0.3)
+
+
+def test_the_report_says_the_pipelined_step_time_and_compares_the_sides_with_plain(tmp_path):
+    import html as htmllib
+    out, _ = _pipelined(tmp_path, plain=True)
+    secs = out["runs"]["honest"]["sections"]  # give two sections names the report knows
+    out["runs"]["honest"]["sections"] = {{"P1": "P1.label", "V": "4"}.get(n, n): v
+                                         for n, v in secs.items()}
+    page = htmllib.unescape(report.build([out]))
+    assert "Verified steps closed every" in page and "0.90 s" in page
+    assert "prover trains the next step while the verifier checks this one" in page
+    assert "latency" in page and "1.3 s" in page
+    assert "the prover worked 0.20 s" in page and "the verifier 0.60 s" in page
+    assert "sum to at most about 100%" in page
+    assert "Whole step: interval between verified steps against plain" in page
+    assert "Prover's work per step against plain" in page
+    assert "Verifier's work per step against plain" in page
+    assert "GPU busy 20% (mean of cuda:1, cuda:2, cuda:3)" in page
+
+
+def test_the_report_of_a_sequential_interval_run_says_so_in_the_old_sentence(tmp_path):
+    import html as htmllib
+    paths = build(tmp_path / "run")
+    _rewrite(paths, extra_rows=lambda steps: [time_row(k, "step_interval", 1.0, "run", "total")
+                                              for k in steps])
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    assert out["runs"]["honest"]["pipelined"] is False
+    assert out["runs"]["honest"]["latency_s"] is None
+    page = htmllib.unescape(report.build([out]))
+    assert "(interval between verified steps)" in page and "Verified steps closed" not in page
+    assert "the mean interval between verified steps" in page
+
+
+def test_records_without_step_interval_keep_the_step_total_and_its_shares(tmp_path):
+    from tests.evaluation.results.profile.helpers import build_run
+    paths = build_run(tmp_path / "run")
+    v = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])["runs"]["honest"]
+    assert v["step_source"] == "step" and v["step_s"] == pytest.approx(1.0)
+    assert v["work_s"] == v["step_s"] and v["pipelined"] is False and v["latency_s"] is None
+    assert v["sections"]["D"]["share"] == pytest.approx(0.55)
+    assert v["share_total"] == pytest.approx(1.0)
+    assert v["share_by_side"] == {"verifier": pytest.approx(1.0)}
+    assert v["sections"]["A"]["util_devices"] is None  # a CPU run has no device

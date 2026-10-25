@@ -70,13 +70,36 @@ clock and :data:`US` turns µs into s; nothing else converts.
   (``P2`` of ``P2.w_t``, ``train_captured`` of ``train.*``) is their sum: it is marked ``rollup``
   and left out of ``share_total``. Clocks, sampler spans and the hook bound
   use the same steps as the time rows.
+- Step time (FS42c, EQ14): a run's wall time per step is the interval between consecutive
+  verified steps, the ``step_interval`` time row (``side`` ``run``, level ``total``). ``step_s``
+  (run view and warm-up block) is its mean over the same steps; without the row it is the
+  ``step`` total row's mean, else the sum of the top-level sections (``step_source``:
+  ``"step_interval"``, ``"step"`` or ``"sections"``). ``work_s`` is the mean of the ``step``
+  total row (the summed work of both sides; null without it). ``share`` stays each section's
+  mean over ``step_s``, and ``share_by_side`` sums ``share`` per side (``prover``, ``verifier``,
+  ``run``) over the depth-0, non-rollup sections: in a pipelined run the two sides overlap, so
+  each side's sum is at most about 1, not the two together. A pipelined run (a ``step_wall``
+  time row, or a markers step line with ``merged``) has ``pipelined`` true and ``latency_s``,
+  the mean ``step_wall`` (a step's first prover section to its last verifier section); else
+  false and null. ``step_interval`` and ``step_wall`` are not sections.
+- Headline utilization by role (FS42c): for a section whose side (its time rows') is ``prover``
+  or ``verifier``, ``util`` is the mean, field by field, of the means of its listed devices
+  whose ``gpu_roles`` entry has that role (a field's mean over the devices with a value,
+  ``n_samples`` the smallest), and ``util_devices`` names them; the ``utilization`` mark's lane
+  is taken over them too. With no such device (no ``gpu_roles``, side ``run``, no time rows)
+  the first listed device is the headline, as before, and ``util_devices`` is that device
+  (null with none). ``util_by_device`` keeps every listed device. The check-5 view reads the
+  same mean over check 5's verifier devices.
+- The plain comparison's ``step`` also holds ``interval_s`` (the verified run's steady mean
+  ``step_interval``), ``prover_side_s`` and ``verifier_side_s`` (its steady ``prover`` and
+  ``verifier`` side totals); ``prover_s`` stays the ``step`` total.
 - Per-GPU tools (FS35). Samples version 2 holds one value per GPU in each ``g_*`` field, and
   ``Sampler(samples, gpu=k)`` is GPU ``k``'s view (a version 1 file has only GPU 0).
 - A device maps to a sampler GPU by UUID (the run's ``gpu_roles``, else the probe's
   ``per_device``, else the machine record's ``gpus``, against the sampler header); with no UUID
   on either side it maps to the same index, with a warning.
 - A section's ``sec["devices"]`` names its devices. One device: ``util`` is that GPU's. Several:
-  ``util`` is the first device's and ``util_by_device`` has each device's. No list: the run's
+  ``util`` follows the role rule below and ``util_by_device`` has each device's. No list: the run's
   device (``gpu_roles``' first, else the environment's), GPU 0 of a version 1 file.
 - The bound-lane mark of a multi-device section uses the largest lane utilization over its
   devices.
@@ -813,7 +836,42 @@ def _extent_ns(rows: list[dict[str, Any]], t0_ns: int) -> list[tuple[int, int]]:
              _abs_ns(t0_ns, max(r["h1"] for r in rows) / US))]
 
 
-def _c5_view(steps: list[dict[str, Any]], layout: dict[str, Any], sampler: Sampler,
+class _MeanView:
+    """Several GPUs' views as one: :meth:`means` is, field by field, the mean of the views'
+    means over the views that have a value, and the number of samples is the smallest of
+    theirs (the same rule as a section's headline utilization)."""
+
+    def __init__(self, views: Sequence[Sampler]):
+        self.views = list(views)
+        self.fields = self.views[0].fields
+
+    def means(self, spans: Sequence[tuple[int, int]]) -> tuple[dict[str, float | None], int]:
+        return _mean_means([v.means(spans) for v in self.views])
+
+
+def _mean_means(per_dev: Sequence[tuple[dict[str, float | None], int]]
+                ) -> tuple[dict[str, float | None], int]:
+    """The headline of several devices: each field's mean over the devices with a non-null
+    value, and the smallest sample count. One device is returned as it is."""
+    if len(per_dev) == 1:
+        return per_dev[0]
+    out: dict[str, float | None] = {}
+    for f in per_dev[0][0]:
+        vals = [m[f] for m, _ in per_dev if m.get(f) is not None]
+        out[f] = statistics.fmean(vals) if vals else None
+    return out, min(n for _, n in per_dev)
+
+
+def _role_devices(dv: "_Devices", devs: Sequence[str | None], side: str | None) -> list[str]:
+    """The listed devices whose ``gpu_roles`` entry has the role of ``side`` (``prover`` or
+    ``verifier``); empty for any other side or when no device has it."""
+    if side not in ("prover", "verifier"):
+        return []
+    return [d for d in devs if d is not None
+            and side in ((dv.roles.get(d) or {}).get("roles") or [])]
+
+
+def _c5_view(steps: list[dict[str, Any]], layout: dict[str, Any], sampler: Sampler | _MeanView,
              warns: set[str]) -> dict[str, Any]:
     per_step: list[dict[str, Any]] = []
     windows: list[dict[str, Any]] = []
@@ -1029,12 +1087,19 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
     for n in all_parts:
         sides.pop(n, None)
         levels.pop(n, None)
+    # the step interval and a pipelined step's latency are per-step rows, not sections
+    special = {n: all_times.pop(n) for n in ("step_interval", "step_wall") if n in all_times}
+    for n in special:
+        sides.pop(n, None)
+        levels.pop(n, None)
+    pipelined = "step_wall" in special or any(s.get("merged") for s in markers.steps)
     all_untraced = [s for s in markers.steps if not s["traced"] and s["step"] >= 1]
     # the warm-up step: from the time rows' untraced steps, else from the markers'
     warm = _warm_step([t for v in all_times.values() for t in v]
                       or [s["step"] for s in all_untraced])
     times = _only(all_times, lambda t: t != warm)
     parts = _only(all_parts, lambda t: t != warm)
+    steady_special = _only(special, lambda t: t != warm)
     counts = _first_counts(records)
     leaves = _leaves(records)
     peaks: dict[str, int] = {}
@@ -1078,17 +1143,24 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
         if absent:
             warns.add(f"the trace summary has no section {', '.join(absent)}")
 
-    def build(untraced: list[dict[str, Any]], times: dict[str, dict[int, float]]
-              ) -> tuple[dict[str, Any], float]:
-        """The section table and the step's seconds over ``untraced`` marker steps and the
-        time rows ``times`` (one phase: the steady steps, or the warm-up)."""
+    def build(untraced: list[dict[str, Any]], times: dict[str, dict[int, float]],
+              extra: dict[str, dict[int, float]]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The section table and the step's numbers over ``untraced`` marker steps and the
+        time rows ``times`` and ``extra`` (the interval and latency rows; one phase: the steady
+        steps, or the warm-up)."""
         seconds: dict[str, list[float]] = {}
         for name in depths:
             host = [_clock_s(sec, "host_us", "host_s") or 0.0
                     for _, sec in _occurrences(untraced, name)]
             seconds[name] = list(times[name].values()) if name in times else host
-        step_s = _mean(list(times["step"].values())) if "step" in times else \
-            sum(_mean(seconds[n]) or 0.0 for n, d in depths.items() if d == 0)
+        work_s = _mean(list(times["step"].values())) if "step" in times else None
+        if "step_interval" in extra:
+            step_s, source = _mean(list(extra["step_interval"].values())), "step_interval"
+        elif work_s is not None:
+            step_s, source = work_s, "step"
+        else:
+            step_s = sum(_mean(seconds[n]) or 0.0 for n, d in depths.items() if d == 0)
+            source = "sections"
 
         sections: dict[str, Any] = {}
         for name, depth in depths.items():
@@ -1112,8 +1184,12 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
             listed = next((sec.get("devices") for _, sec in occ if sec.get("devices")), None)
             devs, named = dv.sections_devices(listed)
             per_dev = [dv.view(d, named).means(spans) for d in devs]
-            means, n = per_dev[0]
             probes = [dv.probe_of(d, named) for d in devs]
+            # the headline is the mean over the devices of the section's side (its role GPUs)
+            role = _role_devices(dv, devs, sides.get(name))
+            pick = [i for i, d in enumerate(devs) if d in role] or [0]
+            means, n = _mean_means([per_dev[i] for i in pick])
+            util_devices = [devs[i] for i in pick] if devs[pick[0]] is not None else None
             time_stats = _stats(seconds[name])
             mean_t = time_stats["mean"]
             share = mean_t / step_s if step_s and mean_t is not None else None
@@ -1132,8 +1208,8 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                     and ratio >= THRESHOLDS["ratio"]:
                 marks.append("bottleneck")
             rate_key = next(iter(work["flops"]), None)
-            lanes = [m for (dm, _), p in zip(per_dev, probes, strict=True)
-                     if (m := _lane(bound, dm, p, rate_key)) is not None]
+            lanes = [m for i, ((dm, _), p) in enumerate(zip(per_dev, probes, strict=True))
+                     if i in pick and (m := _lane(bound, dm, p, rate_key)) is not None]
             measured = max(lanes) if lanes else None
             if floor_s and mean_t and measured is not None and n >= THRESHOLDS["min_samples"] \
                     and _differ(floor_s / mean_t, measured):
@@ -1159,27 +1235,39 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
             sections[name] = {
                 "depth": depth, "time": time_stats, "share": share,
                 "clocks": {"host_s": host_m, "gpu_s": gpu_m, "trace_s": trace_s, "agree": agree},
-                "util": util, **by_dev,
+                "util": util, "util_devices": util_devices, **by_dev,
                 "work": work, "floors_s": floors, "floor_s": floor_s, "bound": bound,
                 "ratio": ratio, "marks": marks, **({"rollup": True} if name in rollups else {})}
-        return sections, step_s
+        by_side: dict[str, float] = {}
+        for name, sec in sections.items():
+            if sec["depth"] == 0 and not sec.get("rollup"):
+                side = sides.get(name) or "run"
+                by_side[side] = by_side.get(side, 0.0) + (sec["share"] or 0.0)
+        wall = extra.get("step_wall")
+        return sections, {"step_s": step_s, "work_s": work_s, "step_source": source,
+                          "share_by_side": by_side, "pipelined": pipelined,
+                          "latency_s": _mean(list(wall.values())) if pipelined and wall else None}
 
     c5_listed = next((sec.get("devices") for s in untraced for sec in s["sections"]
                       if sec["name"] == "5" and sec.get("devices")), None)
-    c5_dev = dv.sections_devices(c5_listed)[0][0]
-    sections, step_s = build(untraced, times)
+    c5_devs, c5_named = dv.sections_devices(c5_listed)
+    c5_role = _role_devices(dv, c5_devs, "verifier") or [c5_devs[0]]
+    c5_sampler = _MeanView([dv.view(d, c5_named) for d in c5_role]) if len(c5_role) > 1 \
+        else dv.view(c5_role[0], c5_named)
+    sections, info = build(untraced, times, steady_special)
     warmup = None
     if warm is not None:
-        w_sections, w_step_s = build(warm_marks, _only(all_times, lambda t: t == warm))
-        warmup = {"step": warm, "n_steps": 1, "step_s": w_step_s, "sections": w_sections}
+        w_sections, w_info = build(warm_marks, _only(all_times, lambda t: t == warm),
+                                   _only(special, lambda t: t == warm))
+        warmup = {"step": warm, "n_steps": 1, **w_info, "sections": w_sections}
 
     return {
         "device": markers.header.get("device"), "n_steps": len(untraced),
-        "warmup_excluded": warm is not None, "warmup": warmup, "step_s": step_s,
+        "warmup_excluded": warm is not None, "warmup": warmup, **info,
         "share_total": sum(s["share"] or 0.0 for s in sections.values()
                             if s["depth"] == 0 and not s.get("rollup")),
         "sections": sections, "hash": _hash_breakdown(parts, times, sections),
-        "c5": _c5_view(untraced, layout, dv.view(c5_dev, bool(c5_listed)), warns)
+        "c5": _c5_view(untraced, layout, c5_sampler, warns)
         if layout else None,
         "cpu_state": _cpu_state(all_untraced, dv.view(dv.primary, False)),
         "timeline": _timeline(all_untraced, sampler, dv),  # the warm-up step is drawn too
@@ -1214,6 +1302,9 @@ def _plain_comparison(records: list[dict[str, Any]], plain_dir: Path) -> dict[st
                          "warmup_plain_s": plain_warm.get(other)}
     return {"plain_run_dir": str(plain_dir), "sections": out,
             "step": {"prover_s": prover.get("step"), "plain_s": plain.get("step"),
+                     "interval_s": prover.get("step_interval"),
+                     "prover_side_s": prover.get("prover"),
+                     "verifier_side_s": prover.get("verifier"),
                      "warmup_prover_s": prover_warm.get("step"),
                      "warmup_plain_s": plain_warm.get("step")},
             "warmup_excluded": {"prover": prover_step is not None,
