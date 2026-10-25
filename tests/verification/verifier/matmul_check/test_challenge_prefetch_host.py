@@ -1,7 +1,8 @@
 """The host challenge source's prefetch (FS39, ``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.5) on the
 Mac: the worker thread's pool of two pinned-or-plain buffers, ``draw(prefetched=)``'s offsets
-and bytes against ``challenge_matrix``, the fall-back to the inline draw, the worker's
-exception, and the slot's wait on the events of earlier copies. A CPU device copies nothing."""
+and bytes against ``challenge_matrix``, the fall-back to the inline draw (a request the
+prefetch doesn't cover, or a slot refilled since), the worker's exception, and the slot's wait
+on the events of earlier copies. A CPU device copies nothing."""
 
 import numpy as np
 import pytest
@@ -51,6 +52,17 @@ def test_a_prefetch_that_does_not_cover_the_request_falls_back_to_the_inline_dra
         assert ev is None and np.array_equal(offs, inline_offs)
         assert _equal(buf, inline)
         _check(buf, offs, ms, widths, h=h, k=k)
+
+
+def test_a_prefetch_whose_slot_was_refilled_covers_nothing_and_draws_inline():
+    src = cs.HostChallengeSource()
+    first = src.prefetch(H, [1, 2], K, [6, 6])
+    src.prefetch(H, [3], K, [6])  # the other slot
+    again = src.prefetch(H, [1, 2], K + 1, [6, 6])  # refills ``first``'s slot with other bytes
+    assert again.slot == first.slot
+    assert not first.covers(H, [1, 2], K, [6, 6]) and again.covers(H, [1, 2], K + 1, [6, 6])
+    buf, offs, _ = src.draw(H, [1, 2], K, [6, 6], stream=None, prefetched=first)
+    _check(buf, offs, [1, 2], [6, 6])
 
 
 def test_the_workers_exception_is_raised_by_draw(monkeypatch):

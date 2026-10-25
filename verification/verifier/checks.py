@@ -1021,8 +1021,7 @@ def _measure_served(c: DeclaredComputation, specs: Sequence[ProductSpec], ctx: S
             rows.append(_measure_rows(specs, [group], h=h, k=k, scratch=scratch,
                                       guard=guard).rows)
         del group  # the operands; only the rows are kept
-    return _Rows(specs, [i for idx in groups for i in idx],
-                 rows[0] if len(rows) == 1 else torch.cat(rows)), None
+    return _Rows(specs, [i for idx in groups for i in idx], _join_rows(rows)), None
 
 
 def _served_group(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Sequence[int],
@@ -1116,12 +1115,7 @@ def _measure_served_kernel(c: DeclaredComputation, specs: Sequence[ProductSpec],
             rows.append(freivalds.measure_groups_rows(served, h=h, k=k, guard=guard))
         orders.append(order)
         del served  # the views; the kernel holds what it still reads
-    if len(rows) == 1:
-        joined = rows[0]
-    else:  # on the measure stream, which writes the rows; a read drains it first (FS39)
-        with measure_kernel.stream_for(rows[0].device):
-            joined = torch.cat(rows)
-    return _Rows(specs, [i for o in orders for i in o], joined), None
+    return _Rows(specs, [i for o in orders for i in o], _join_rows(rows)), None
 
 
 def _served_view(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay: Replay,
@@ -1270,8 +1264,11 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
                                      guard=guard).rows)
         del group
         order += keep
+    kernel = bool(out) and freivalds.kernel_device(out[0].device)
+    if kernel:  # the members measured above are kernel rows too: finished before the join
+        freivalds.drain()
     joined = torch.cat(out) if out else None
-    if orders is not None and joined is not None and joined.device.type == "cuda":
+    if kernel and joined is not None and joined.device.type == "cuda":
         # the join reads measure-stream blocks on the current stream; once the caller drops
         # them, a measure-stream allocation could reuse one under the join, so wait (rare path)
         torch.cuda.synchronize(joined.device)
@@ -1338,8 +1335,18 @@ def _measure_rows(specs: Sequence[ProductSpec], groups: Sequence[_Group], *, h: 
             rows.append(measure_products_rows(g.a, g.b, g.p, h=h, ms=[specs[i].m for i in g.idx],
                                               k=k, scratch=scratch, guard=guard))
         order += g.idx
-    return _Rows(specs, order, None if not rows else rows[0] if len(rows) == 1
-                 else torch.cat(rows))
+    return _Rows(specs, order, _join_rows(rows) if rows else None)
+
+
+def _join_rows(rows: Sequence[torch.Tensor]) -> torch.Tensor:
+    """One run's row blocks as one tensor. The kernel writes its rows on the device's measure
+    stream, so they are joined there, after the kernel; every read drains the streams first
+    (FS39). Rows from the torch path are joined on the current stream, as before."""
+    if len(rows) == 1:
+        return rows[0]
+    dev = rows[0].device
+    with measure_kernel.stream_for(dev) if freivalds.kernel_device(dev) else nullcontext():
+        return torch.cat(list(rows))
 
 
 def _finished(r: _Rows, host: Sequence[Sequence[float]], *, eps_in: float, eps_acc: float,

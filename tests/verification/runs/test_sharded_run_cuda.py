@@ -164,12 +164,20 @@ def test_two_gpus_smollm2_sharded_run_equals_unsharded():
 @pytest.mark.parametrize("which", [None, "product"])
 def test_two_gpus_overlap_stats_roots_and_verdicts_equal_the_one_gpu_run(which):
     """FS39: with the measure streams on, the sharded run's check-5 stats, every step's root and
-    the verdicts equal the one-GPU run's, honest and with a flipped product."""
+    the verdicts equal the one-GPU run's and the sharded run's with them off, honest and with a
+    flipped product."""
     from verification.verifier.matmul_check import measure_kernel
 
     edit = None if which is None else sr.forge(which)
     with measure_kernel.overlap(True):
         one, many = sr.run(None, edit, device=PROVER), _sharded(edit)
+    with measure_kernel.overlap(False):
+        off = _sharded(edit)
     assert (one[1].rejection is None) == (which is None)
-    assert many[1].rejection == one[1].rejection
+    assert many[1].rejection == one[1].rejection == off[1].rejection
     sr._same(one, many)
+    (_, r_on, v_on, h_on), (_, r_off, v_off, h_off) = many, off
+    step = lambda r: [(s.t, s.loss, s.rejection, s.root) for s in r.steps]  # noqa: E731
+    assert h_on.roots == h_off.roots and step(r_on) == step(r_off)
+    assert r_on.verdict == r_off.verdict and v_on.record_pass == v_off.record_pass
+    assert sr._numbers(v_on) == sr._numbers(v_off)

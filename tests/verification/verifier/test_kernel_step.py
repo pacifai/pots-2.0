@@ -130,6 +130,9 @@ class Recorder:
     def wrap(self, fn):
         def measure(groups, *, h, k, guard=True, share=False, plan_out=None,
                     prefetched=None):
+            dev = groups[0].a.device if groups else None
+            if dev is not None and dev.type == "cuda":
+                torch.cuda.synchronize(dev)  # ``P`` lands on the measure stream (FS39)
             mine = [dict(m=int(m), a=_host(g.a[t]), b=_host(g.b[t]), p=_host(g.p[t]),
                          bias=_host(g.bias)) for g in groups for t, m in enumerate(g.ms)]
             self.prefetched.append(prefetched)

@@ -19,8 +19,9 @@ draw of a later call to one worker thread (the native call releases the GIL), wh
 pinned buffer of a pool of two; ``draw(..., prefetched=)`` then only copies that buffer to the
 device. A slot is refilled only after every copy out of it has completed (its events are taken
 at submission and waited for by the worker, as the capture's staging does instead of
-``record_stream``). The bytes of each product are the same whatever the buffer's layout: the
-kernel reads each product at its offset.
+``record_stream``). A prefetch whose slot a later one refilled covers nothing, so its draw runs
+inline. The bytes of each product are the same whatever the buffer's layout: the kernel reads
+each product at its offset.
 """
 
 from __future__ import annotations
@@ -60,9 +61,12 @@ class Prefetch:
     slot: int  # the pool index, for tests and logs
     future: Future = field(repr=False)
     holder: Any = field(default=None, repr=False)  # the slot, so any source can draw from it
+    fill: int = 0  # the slot's fill count at submission: a later prefetch refills it
 
     def covers(self, h: bytes, ms: Sequence[int], k: int, widths: Sequence[int]) -> bool:
-        return (bytes(h) == self.h and k == self.k
+        """Whether the slot still holds this draw and it has every product of the request."""
+        return (getattr(self.holder, "fills", 0) == self.fill and bytes(h) == self.h
+                and k == self.k
                 and all((int(m), int(w)) in self.offsets for m, w in zip(ms, widths)))
 
 
@@ -72,6 +76,7 @@ class _Slot:
     def __init__(self) -> None:
         self.buf: torch.Tensor | None = None
         self.events: list[Any] = []
+        self.fills = 0  # prefetches submitted into it
 
 
 class HostChallengeSource:
@@ -115,11 +120,12 @@ class HostChallengeSource:
         self._next_slot = 1 - slot_ix
         slot = self._pool[slot_ix]
         waits, slot.events = slot.events, []
+        slot.fills += 1
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="challenges")
         key = bytes(h)
         future = self._executor.submit(self._fill, slot, waits, key, k, layout, total)
-        return Prefetch(key, k, offsets, total, slot_ix, future, slot)
+        return Prefetch(key, k, offsets, total, slot_ix, future, slot, slot.fills)
 
     @staticmethod
     def _fill(slot: _Slot, waits: list[Any], h: bytes, k: int,

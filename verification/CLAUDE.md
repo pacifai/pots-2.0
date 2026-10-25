@@ -1984,13 +1984,14 @@ interface.
     `run` injected for tests gets the level launches, each `(LevelArgs, blocks)`.
     `freivalds.measure_groups_rows(..., share=, plan_out=, prefetched=)` passes them through (FS39).
   - **The call.** `enqueue(groups, *, h, k, guard=True, challenges=None, run=None,
-    share=False, plan_out=None)` takes `MeasureGroup`s (`freivalds.py`), packs every member
-    into one table in one pinned buffer, copies it up with one non-blocking copy and launches
-    the level kernel (one launch per level of the plan: the plain three-level one, or with
-    `share=True` the read plan, which `plan_out` receives) on the current stream. It returns the float64 rows `[Σ n_t, row_width(k)]` on the device and reads
-    nothing back. `validate` applies FS36's rules per group first (`ValueError` naming the
-    group and its products). `run` replaces the loaded kernel and `challenges` the challenge
-    source, for tests.
+    share=False, plan_out=None, prefetched=None)` takes `MeasureGroup`s (`freivalds.py`), packs
+    every member into one table in one pinned buffer, copies it up with one non-blocking copy
+    and launches the level kernel (one launch per level of the plan: the plain three-level one,
+    or with `share=True` the read plan, which `plan_out` receives) on the device's measure
+    stream (the current stream while `overlap` is off; below). It returns the float64 rows
+    `[Σ n_t, row_width(k)]` on the device and reads nothing back. `validate` applies FS36's
+    rules per group first (`ValueError` naming the group and its products). `run` replaces the
+    loaded kernel and `challenges` the challenge source, for tests.
   - **Holds.** Each call is a `Pending`: its event, every input (`a`, `b`, `p`, `bias`) with
     its `_version` as enqueued, and the buffers the stream reads. `retire(device)` releases
     the entries whose event has completed, as each `enqueue` does first. `drain(device=None)`
@@ -2008,8 +2009,11 @@ interface.
     the measure streams (every row read drains first, so a row join check 5 enqueues there,
     `_measure_served_kernel`'s, is finished before any stream reads it); `drain(dev)`, the unit
     pass's one step in flight, waits for the entries only. `_read_rows(pinned=True)` makes the
-    measure stream wait on the current stream first (torch-path rows under `reference()`);
-    `_measure_to_failure`'s kernel joins drain before and synchronize after (a rare path).
+    measure stream wait on the current stream first (torch-path rows under `reference()`).
+    Check 5 joins a run's kernel rows on the measure stream (`_join_rows`);
+    `_measure_to_failure` drains before its gathers and again before its join, and synchronizes
+    after it (a rare path). A test spies the launches' stream, and another has the measure
+    stream wait for writes queued behind a long sleep on the current stream.
   - `challenge_source.py`: `ChallengeSource.draw(h, ms, k, widths, *, stream)` returns one
     float32 buffer holding each product's `challenge_matrix(h, m, k, width)`, the byte offset
     of each, and an event recorded after the work that fills it (`None` on the CPU). It is the
@@ -2020,8 +2024,9 @@ interface.
     FS39: `prefetch(h, ms, k, widths)` fills one of a pool of two pinned buffers on a single
     worker thread and returns a `Prefetch` (layout keyed `(m, width)`, the future, its slot);
     `draw(prefetched=)` waits for it and makes the one device copy, or draws inline when the
-    prefetch doesn't cover the request. A slot's copy events are waited for before it is
-    refilled. A worker error is raised at the draw.
+    prefetch doesn't cover the request or a later prefetch has refilled its slot
+    (`Prefetch.fill`). A slot's copy events are waited for before it is refilled. A worker error
+    is raised at the draw.
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m(q, eps_in, eps_acc, u_ratio=1.0)` is F18's split, `√2·ε_in + √q·ε_acc·max(1,

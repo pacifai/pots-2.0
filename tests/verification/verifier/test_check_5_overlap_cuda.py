@@ -6,7 +6,9 @@ collects anywhere.
 The reference of every comparison is ``measure_kernel.overlap(False)``, the kernel path as it
 ran before FS39 (everything on the current stream, the challenges drawn inline, the plain read),
 and the canonical path. Rows, every :class:`ProductStat` field, rejections and the record status
-are equal bit for bit; a write to an operand a pending measurement holds is raised.
+are equal bit for bit; a write to an operand a pending measurement holds is raised. Tests
+without the recorder check the stream ordering itself: the launches' stream, the measure stream's
+wait for the current stream's writes, and the stats with nothing syncing the host.
 """
 
 import numpy as np
@@ -99,6 +101,60 @@ def test_llama_3_2_1b_shapes_two_layers_rows_equal_with_overlap_on_and_off(dtype
     assert_same(on, off)
 
 
+@pytest.mark.parametrize("which", [pytest.param("tiny", id="tiny"),
+                                   pytest.param("llama", id="llama", marks=pytest.mark.slow)])
+@pytest.mark.parametrize("dtype", list(DTYPES))
+def test_stats_with_overlap_equal_without_when_no_recorder_syncs_the_host(which, dtype):
+    """Check 5 alone, no spy: the recorder's host copies of every operand wait for the current
+    stream before each call and would hide a missing wait of the measure stream."""
+    setup = tiny(CHEAP, dtype, ENGINE) if which == "tiny" else llama_setup(dtype, "cuda")
+    with mk.overlap(True):
+        on = run_check5(setup)
+    with mk.overlap(False):
+        off = run_check5(setup)
+    assert on.rejection is None and on.error is None
+    assert_same(on, off)
+
+
+def test_check_5s_launches_run_on_the_measure_stream_and_without_overlap_on_the_current():
+    """Every launch of the measuring kernel goes to the device's measure stream; under
+    ``overlap(False)`` to the current stream, as before FS39."""
+    setup = tiny(CHEAP, "fp32", ENGINE)
+    real, seen = mk.MeasureKernels.run, []
+
+    def run_(self, launches, stream):
+        seen.append(stream)
+        return real(self, launches, stream)
+
+    with pytest.MonkeyPatch.context() as cm:
+        cm.setattr(mk.MeasureKernels, "run", run_)
+        for on in (True, False):
+            seen.clear()
+            with mk.overlap(on):
+                side, cur = mk.measure_stream(DEV), torch.cuda.current_stream(DEV)
+                res = run_check5(setup)
+            assert res.rejection is None and res.error is None and seen
+            assert (side is not None) == on and (not on or side != cur)
+            assert set(seen) == {(side if on else cur).cuda_stream}
+
+
+def test_the_measure_stream_waits_for_the_current_streams_writes_to_its_inputs():
+    """The inputs' last writes sit behind a long wait on the current stream; the kernel on the
+    measure stream reads them only after (``enqueue``'s event), so its rows are the plain ones."""
+    freivalds.drain()
+    ref = _group(3)
+    with mk.overlap(False):
+        want = freivalds.measure_groups_rows([ref], h=H, k=3)
+        freivalds.drain()
+    a, b, p = (torch.zeros_like(x) for x in (ref.a, ref.b, ref.p))
+    torch.cuda._sleep(int(5e8))  # the glue, slow, on the current stream
+    for dst, src in ((a, ref.a), (b, ref.b), (p, ref.p)):
+        dst.copy_(src)
+    got = freivalds.measure_groups_rows([MeasureGroup(a, b, p, ref.ms)], h=H, k=3)
+    freivalds.drain()
+    assert np.array_equal(bits(got.cpu().numpy()), bits(want.cpu().numpy()))
+
+
 # ---- a write to a held operand ----
 
 def _group(seed=0, k=3, dtype=torch.float32):
@@ -159,8 +215,19 @@ def test_a_write_by_the_replay_to_an_operand_the_pending_step_holds_falls_back(h
             held[0].add_(0.0)
             wrote.append(True)
 
+    raised = []  # the devices of the drains that raised
+    real_drain = freivalds.drain
+
+    def drain(device=None):
+        try:
+            return real_drain(device)
+        except ReplayError:
+            raised.append(device)
+            raise
+
     with pytest.MonkeyPatch.context() as cm:
         rec, spy = install_spy(cm, hostlib, ENGINE)
+        cm.setattr(freivalds, "drain", drain)
 
         def operands(self, m):
             touch(spy.calls)
@@ -181,6 +248,7 @@ def test_a_write_by_the_replay_to_an_operand_the_pending_step_holds_falls_back(h
         with mk.overlap(True):
             res = run_check5(setup)
     assert wrote, "the patched replay never wrote"
+    assert any(d is not None for d in raised), "the step's own drain did not raise"
     assert any(not x.share for x in spy.calls), "the canonical rerun did not run"
     assert res.rejection is None and res.error is None
     assert res.stats == clean.stats
