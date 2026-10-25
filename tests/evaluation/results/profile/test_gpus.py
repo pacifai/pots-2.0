@@ -473,3 +473,13 @@ def test_records_without_step_interval_keep_the_step_total_and_its_shares(tmp_pa
     assert v["share_total"] == pytest.approx(1.0)
     assert v["share_by_side"] == {"verifier": pytest.approx(1.0)}
     assert v["sections"]["A"]["util_devices"] is None  # a CPU run has no device
+
+
+def test_the_flow_notes_that_prover_side_gpu_use_understates_with_several_role_gpus(tmp_path):
+    import html as htmllib
+    out, _ = _pipelined(tmp_path)
+    assert "understates them" in htmllib.unescape(report.build([out]))
+    from tests.evaluation.results.profile.helpers import build_run
+    paths = build_run(tmp_path / "one", device="cuda:0")
+    one = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    assert "understates them" not in htmllib.unescape(report.build([one]))

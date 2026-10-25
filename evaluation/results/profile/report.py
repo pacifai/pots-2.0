@@ -632,6 +632,11 @@ def _flow(run: Run) -> str:
     w = per_row * bw + (per_row - 1) * gap
     gpu_words = "" if cpu else ("GPU: the share of the section's time in which a GPU kernel "
                                 "was running. ")
+    if not cpu and any(len(s.get("util_by_device") or {}) > 1 for s in top.values()):
+        gpu_words += ("With four GPUs, the commit's hashing of the weights and the dK leaves "
+                      "and the copies of the next weights run on the verifier GPUs, so a "
+                      "prover-side section's GPU figure here understates them; "
+                      "the profile's util_by_device holds each GPU. ")
     return (_svg(w + 2, y, "".join(out))
             + f'<p class="mute small">Each box is one section of the step, in the order it runs '
               f"(left to right, then down); its color strip is the one the overview and the "
@@ -870,7 +875,7 @@ def _plain(run: Run) -> str:
     cmp = run.profile.get("comparisons")
     if not cmp:
         return ""
-    rows = [[PLAIN_ROWS.get(n, n), fmt(c.get("prover_s")), fmt(c.get("plain_s")),
+    rows = [[PLAIN_ROWS.get(n, n) + " (prover, with matmul capture)", fmt(c.get("prover_s")), fmt(c.get("plain_s")),
              fmt(c.get("ratio"))] for n, c in (cmp.get("sections") or {}).items()]
     st = cmp.get("step") or {}
     pr, pl = st.get("prover_s"), st.get("plain_s")
@@ -885,8 +890,7 @@ def _plain(run: Run) -> str:
     else:
         rows.append(["Whole step: verified (prover, hand-off, verifier) against plain", fmt(pr),
                      fmt(pl), fmt(pr / pl if pr and pl else None)])
-    return (_table(["Training part", "Prover, with matmul capture (s)", "Plain training (s)",
-                    "Prover ÷ plain"], rows)
+    return (_table(["Row", "Verified run (s)", "Plain training (s)", "÷ plain"], rows)
             + '<p class="mute small">Plain training runs the same steps on the same model '
               "without the protocol. The whole-step row puts the verified step beside one plain "
               "step: with an interval, the time between verified steps; else the prover and "
