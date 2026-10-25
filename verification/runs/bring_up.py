@@ -82,7 +82,7 @@ import statistics
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -98,13 +98,17 @@ from verification.computation.instances.decoder import DecoderComputation
 from verification.commitment.merkle import MerkleTree
 from verification.computation.interface import (
     DeclaredComputation,
-    ProductKind,
     snapshot_weights,
 )
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF, load_protocol_config
 from verification.prover.step import prove_step
 from verification.runs.check5_profile import profile_step, record_line
-from verification.runs.llama_step import load_committed_dataset, report_costs
+from verification.runs.llama_step import (  # noqa: F401 (work_rows: moved, still importable here)
+    _step_records,
+    load_committed_dataset,
+    report_costs,
+    work_rows,
+)
 from verification.runs.loop import release_cache_setting, release_device_cache, run_devices
 from verification.runs.metrics import (
     SCORE_FAMILIES,
@@ -413,53 +417,6 @@ def device_leaves_missing_line(b: BringUp, *, T: int) -> str:
     kinds = ", ".join(f"{k} {n}" for k, n in (ah.get("missing") or {}).items()) or "none"
     first = ", ".join(ah.get("missing_first") or ()) or "none"
     return f"device leaves missing: {kinds}; first others: {first}"
-
-
-# ---- the timed run's work counts ----------------------------------------------------------
-
-
-def work_rows(c: DecoderComputation, run: str, scenario: str,
-              step_rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """The ``count`` and ``storage`` rows of a timed run, from shapes, for the profile
-    analyzer's floors: the counting pass is never run beside a timed run, and it slows the code.
-
-    Per step in ``step_rows`` (the run's ``step`` records, which hold ``transcript_bytes`` and
-    ``leaves``): ``train.forward`` and ``train.backward`` get the matmul FLOPs the inventory
-    declares (``2·rows·contracted·cols`` per product, the forward kind in the first, the three
-    gradient kinds in the second; a bias's ones column and the elementwise glue are left out);
-    ``P3.commit`` (prover) and ``2`` (verifier) get the leaf hashing, ``transcript_bytes`` plus
-    the ``0x00`` prefix byte per leaf in, 32 bytes per leaf out; and a ``storage`` row carries
-    ``transcript_bytes`` and ``leaves``. Nothing is read from the device."""
-    fwd = bwd = 0
-    for q in c.products:
-        f = 2 * q.a_shape[0] * q.a_shape[1] * q.b_shape[1]
-        if q.kind is ProductKind.FORWARD:
-            fwd += f
-        else:
-            bwd += f
-    rows: list[dict[str, Any]] = []
-    for r in step_rows:
-        t, leaves, nbytes = r["step"], r["leaves"], r["transcript_bytes"]
-        base = {"record": "count", "run": run, "scenario": scenario, "step": t,
-                "calls": 1, "derived": False}
-        for side, name, level, flops, h_in, h_out, h_calls in (
-                ("prover", "train.forward", "phase", fwd, 0, 0, 0),
-                ("prover", "train.backward", "phase", bwd, 0, 0, 0),
-                ("prover", "P3.commit", "component", 0, nbytes + leaves, 32 * leaves, leaves),
-                ("verifier", "2", "component", 0, nbytes + leaves, 32 * leaves, leaves)):
-            rows.append({**base, "side": side, "component": name, "level": level,
-                         "flops": flops, "hash_in_bytes": h_in, "hash_out_bytes": h_out,
-                         "hash_calls": h_calls})
-        rows.append({"record": "storage", "run": run, "scenario": scenario, "step": t,
-                     "transcript_bytes": nbytes, "leaves": leaves})
-    return rows
-
-
-def _step_records(run_dir: Path) -> list[dict[str, Any]]:
-    """The ``step`` records the run has written so far (the writer flushes each)."""
-    with open(run_dir / "records.jsonl") as f:
-        rows = (json.loads(line) for line in f if line.strip())
-        return [r for r in rows if r.get("record") == "step"]
 
 
 # ---- the scores against a reference band file --------------------------------------------
