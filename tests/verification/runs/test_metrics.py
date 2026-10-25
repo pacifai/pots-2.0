@@ -1165,3 +1165,13 @@ def test_every_step_has_a_step_interval_row_equal_to_the_markers_close_differenc
     mem = MemoryRecorder("r", "s", memory_probe("cpu"))
     run_scenario(c, D, w0, s, T=2, k=K, final=final, recorder=mem, seed=SEED)
     assert not [r for r in mem.rows if r.get("component") == metrics.STEP_INTERVAL]
+
+
+@pytest.mark.parametrize("devs", [["cuda:0"], ["cuda:0", "cuda:1", "cuda:2"]])
+def test_trace_sync_waits_on_every_device_of_the_recorder(monkeypatch, tmp_path, devs):
+    """The trace's sync around a check-5 sample run covers every GPU the recorder times."""
+    rec = metrics.TimeRecorder("r", "s", devices=devs)
+    seen = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda d=None: seen.append(str(d)))
+    metrics._Trace(rec, 2, "slice", tmp_path).sync()
+    assert seen == devs

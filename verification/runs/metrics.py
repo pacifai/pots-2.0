@@ -1133,7 +1133,8 @@ class _Trace:
 
     def sync(self) -> None:
         if self.rec._cuda:
-            torch.cuda.synchronize(self.rec._device)
+            for d in self.rec._devices:  # check 5 of a sharded run runs on the other GPUs
+                torch.cuda.synchronize(d)
         elif self.rec._device.type == "mps":
             torch.mps.synchronize()
 
@@ -1169,7 +1170,7 @@ class _Trace:
                 self.dir.mkdir(parents=True, exist_ok=True)
                 raw = self.dir / f"step_{self.step:05d}.json"
                 prof.export_chrome_trace(str(raw))
-                with open(raw, "rb") as src, gzip.open(f"{raw}.gz", "wb") as dst:
+                with open(raw, "rb") as src, gzip.open(f"{raw}.gz", "wb", compresslevel=1) as dst:
                     shutil.copyfileobj(src, dst)
                 raw.unlink()
             except Exception as e:  # noqa: BLE001
