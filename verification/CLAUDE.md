@@ -1515,7 +1515,10 @@ interface.
 
 ### `verification/verifier/`
 
-- `context.py`: what the checks share within a step.
+- `context.py`: what the checks share within a step. `StepContext.timed(name, host=False)` opens a
+  metrics section; `host=True` asks the seam's `host(name)` for a section timed on the host
+  clock (FS39: the kernel path's `5.measure`, whose body only enqueues), falling back to the
+  plain section.
   - `Rejection(step, check_id, detail, kind)`, with `kind` `"malformed"` (prover data failed to
     read, decode, hash or validate) or `"failed"` (a check's test failed).
   - `StepContext.for_computation(c, step=, indices=, h_D=, n_records=, prev_w_hashes=,
@@ -1624,13 +1627,13 @@ interface.
     5 measured before 2026-10-14; the byte limit cuts one only past 32,768 members at
     128×128×64 (Llama-3.2-1B's largest at `n_s = 128` has 12,288, 1.5 GiB). On SmolLM2 each
     layer has four: `S` and `O` (36 members each), `dA` (36) and `dV`+`dQ`+`dK` (108).
-  - **Check 5 on the kernel (FS37, O2).** `_measure_served` takes the kernel path for a run
+  - **Check 5 on the kernel (FS37, O2; overlap FS39).** `_measure_served` takes the kernel path for a run
     whose operands' device (`Replay.operand_device`, asked before serving anything) satisfies
     `freivalds.kernel_device`: CUDA outside `reference()`. Every other device keeps the fp32
     serving above, bit for bit. A run of one is served by `_served_view`: the operands as the
     replay gives them in the operand dtype, `P` moved to the device as stored (non-blocking,
     never widened), and for a biased product the committed `W_t` bias leaf rounded to the
-    operand dtype there. A member run is served group by group by `_served_blocks`: one
+    operand dtype there (FS39: the `P` copies go under `measure_kernel.stream_for`). A member run is served group by group by `_served_blocks`: one
     `MeasureGroup` per block of `Replay.operand_blocks`, views over the replay's tensors, `P`
     a view of the committed leaves (`product_run` when a block's labels form a progression,
     else `product_block`), with one `c5.copy` stamp per group around all its blocks' copies.
@@ -1643,7 +1646,7 @@ interface.
     (below). A read outside it drains too: `_record_rest_5` drains in a `finally` around its measuring loop, so a later run's
     serving error or a judged product that raises leaves no hold, and `_measure_run` (the
     planted-error sweep) drains before it reads its rows.
-  - **Check 5's unit pass and judging window (FS38a, 2026-10-14).** When the replay has a
+  - **Check 5's unit pass and judging window (FS38a, 2026-10-14; FS39 overlap).** When the replay has a
     `unit_schedule()`, `check_5_matmuls` maps each canonical run (`_member_runs`) to the step
     that holds it (`_schedule_runs`; a run split across steps, or an `m` missed or repeated,
     is a verifier bug and raises `RuntimeError`) and `_check_5_units` measures the runs in the
@@ -1657,10 +1660,16 @@ interface.
     (the step's first run, -1), and the rows are split back into one `_Rows` per run. A
     serving error raises `_UnitPassError` at that run, a measuring error at the step's first
     run (no `_measure_to_failure` on this path: the canonical rerun keeps it). A step with
-    any other run keeps FS38a's per-run measuring. Every run's float64 row
+    any other run keeps FS38a's per-run measuring. FS39: before each device's call
+    `freivalds.drain(dev)` leaves one step in flight per device (a moved operand `_version`
+    raises `ReplayError`, so the unit pass falls back); the coming step's challenges are
+    prefetched on the worker thread (`_prefetch_step`, only when every run of it is a kernel
+    run and overlap is on) and passed as `prefetched=`; the `5.measure` sections are host
+    timed. Every run's float64 row
     (`freivalds.ROW`) stays on the device. At window 0, inside its `c5.judge` stamp and
     `5.measure` section, `_ReadOnce` makes the one read of the whole step (`_read_rows`: one
-    drain, one read per device). The windows (`_judge_windows`, at least `_JUDGE_WINDOW`
+    drain, one read per device; with `pinned=True` a device with a measure stream is joined
+    under it, copied non-blocking into pinned float64 and waited on by one event). The windows (`_judge_windows`, at least `_JUDGE_WINDOW`
     (1024) products, closed at the end of a run, shared with `_layout`) are then judged in
     canonical order from the host rows (`_judge_window`), each in its own `c5.judge` stamp, so
     the first failing product and its message are those of one-at-a-time judging, and
@@ -1970,7 +1979,7 @@ interface.
     uses `plain_plan`, and the old per-phase kernel and `KernelArgs` are gone), and with
     `share=True` appends the plan to `plan_out`; the rows have the same bits either way. A
     `run` injected for tests gets the level launches, each `(LevelArgs, blocks)`.
-    `freivalds.measure_groups_rows(..., share=, plan_out=)` passes both through.
+    `freivalds.measure_groups_rows(..., share=, plan_out=, prefetched=)` passes them through (FS39).
   - **The call.** `enqueue(groups, *, h, k, guard=True, challenges=None, run=None,
     share=False, plan_out=None)` takes `MeasureGroup`s (`freivalds.py`), packs every member
     into one table in one pinned buffer, copies it up with one non-blocking copy and launches
@@ -1985,6 +1994,14 @@ interface.
     waits for every entry, releases them all, then raises `ReplayError` (invariant 6) if an
     input's `_version` moved, since a read that outlives its call must see the values it was
     enqueued with. An inference tensor has no version and isn't checked.
+  - Overlap (FS39): `measure_stream(device)` is one side stream per CUDA device (`None` on the CPU
+    or inside `overlap(False)`). `enqueue` records an event on the current stream, makes the
+    measure stream wait on it and does its work there, so the glue on the current stream goes
+    on while the kernel runs; inputs stay held in `Pending` until the event completes, which is
+    the allocator's safety. `stream_for(device)` is the stream a caller's own copies of kernel
+    inputs go on. `prefetch(h, ms, k, widths)` starts the challenge draw of a coming step on a
+    worker thread (`None` when overlap is off or the source isn't a `HostChallengeSource`);
+    `enqueue(prefetched=)` passes it to `draw`.
   - `challenge_source.py`: `ChallengeSource.draw(h, ms, k, widths, *, stream)` returns one
     float32 buffer holding each product's `challenge_matrix(h, m, k, width)`, the byte offset
     of each, and an event recorded after the work that fills it (`None` on the CPU). It is the
@@ -1992,6 +2009,11 @@ interface.
     the native library draws the entries on the host into a pinned buffer, once per distinct
     width, and one non-blocking copy sends it up; the staging buffer lives until that copy's
     event completes.
+    FS39: `prefetch(h, ms, k, widths)` fills one of a pool of two pinned buffers on a single
+    worker thread and returns a `Prefetch` (layout keyed `(m, width)`, the future, its slot);
+    `draw(prefetched=)` waits for it and makes the one device copy, or draws inline when the
+    prefetch doesn't cover the request. A slot's copy events are waited for before it is
+    refilled. A worker error is raised at the draw.
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m(q, eps_in, eps_acc, u_ratio=1.0)` is F18's split, `√2·ε_in + √q·ε_acc·max(1,
