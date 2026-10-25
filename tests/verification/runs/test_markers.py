@@ -166,6 +166,19 @@ def test_layout_trace_slice_and_windows(tiny, monkeypatch):
     assert sum(e["members"] for e in checks.check5_layout(c)) == c.M
 
 
+@pytest.mark.parametrize("dtype, item", [(torch.float32, 4), (torch.bfloat16, 2)])
+def test_served_bytes_are_the_products_in_their_stored_dtype(tiny, monkeypatch, dtype, item):
+    c, _, _ = tiny
+    monkeypatch.setattr(type(c), "product_dtype", property(lambda self: dtype))
+    entries = checks.check5_layout(c)
+    assert entries
+    for e in entries:
+        n, w = e["a_shape"][0], e["b_shape"][1]
+        assert e["served_bytes"] == e["product_bytes"] == item * e["members"] * n * w
+        assert e["operand_bytes"] == 4 * e["members"] * (
+            e["a_shape"][0] * e["a_shape"][1] + e["b_shape"][0] * e["b_shape"][1])
+
+
 def test_recorder_on_and_off_are_bit_identical_on_a_decoder(tiny, tmp_path):
     c, D, w0 = tiny
     final = honest_final(c, D, w0, 2, seed=SEED)
@@ -321,7 +334,7 @@ def test_cuda_section_alloc_and_no_sync_inside(fake_cuda):
     top, nested = rec._step["5"], rec._step["5.glue"]
     # the counters read 1 then 2 (retries), 10 then 20 (allocs), 100 then 200 (frees)
     assert top.alloc == [1, 10, 100, 0] and nested.alloc is None
-    rec._step_stamps = (rec._stamps, rec._stamp_gpu)  # what on_step hands over
+    rec._step_stamps = rec._stamps  # what on_step hands over
     line = rec._marker_line(1, rec._step, type("R", (), {"t": 1})())
     sec = {s["name"]: s for s in line["sections"]}
     assert sec["5"]["alloc"] == {"retries": 1, "device_alloc": 10, "device_free": 100, "ooms": 0}
@@ -332,8 +345,8 @@ def test_cuda_section_alloc_and_no_sync_inside(fake_cuda):
     assert top_g[0] == pytest.approx(0.0, abs=1e-3)  # the anchor is the section's start
     assert top_g[1] > g[1] > g[0] > top_g[0]
     st = line["stamps"]
-    assert len(st["g0"]) == 2 and all(x is not None for x in st["g0"] + st["g1"])
-    assert rec._pending == [] and rec._stamp_pending == []
+    assert len(st["name"]) == 2 and st["g0"] is None and st["g1"] is None  # host spans only
+    assert rec._pending == []
     assert rec._step["5.glue"].time > 0  # the event pair's elapsed time, in seconds
 
 

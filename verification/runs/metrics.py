@@ -76,10 +76,13 @@ prover and the verifier run on separate machines.
 **Time (timed run).** Wall-clock seconds from ``monotonic_ns`` and nothing else. On CUDA the
 device is synchronized at top-level section boundaries and nested sections are timed with
 ``torch.cuda.Event`` pairs, read after the enclosing top-level sync; on MPS the device is
-synchronized at every boundary. So on CUDA a nested row is device time (the Event pair) while
-a top-level row is host time across a synchronized interval; the two clocks are not checked
-against each other yet, which the first CUDA run must do. Test-scale times are rehearsal only
-(EQ14).
+synchronized at every boundary. So on CUDA a nested row is device time (the Event pair) except
+a section opened through ``seam.host(name)``, which is timed by the host clock with no events
+(check 5's kernel path uses it for ``5.measure``: the host time spent enqueuing, waiting for an
+in-flight unit and reading rows back, since the kernel runs on its own stream beside the glue;
+plan §2.7), while a top-level row is host time across a synchronized interval; the two clocks
+are not checked against each other yet, which the first CUDA run must do. Test-scale times are
+rehearsal only (EQ14).
 
 **Markers.** The timed run also writes each section's spans and check 5's stamps
 (``archive/PROFILING_PLAN.md`` §5.1) to ``markers.jsonl``, one ``kind`` line per step (``step``) and
@@ -90,7 +93,9 @@ CUDA events resolved against the top-level section's anchor event by :func:`reso
 ``rest`` aggregate for the calls beyond them, and on CUDA a top-level section's allocator counters
 (``alloc``). Its ``stamps`` are column lists: a stamp is a span inside a check-5 section
 (``seam.stamp(name, run=, group=, window=)``) with ids that don't apply set to -1; ``name`` indexes
-``stamp_names``. Nothing synchronizes inside a nested section or a stamp. ``c5_layout.json``
+``stamp_names``. A stamp is a host span: it records no CUDA events, so ``g0`` and ``g1`` are null
+on every device (as off CUDA), and a section opened through ``seam.host`` has a null ``gpu_us``
+entry per span. Nothing synchronizes inside a nested section or a stamp. ``c5_layout.json``
 (:func:`~verification.verifier.checks.check5_layout`, written by ``run_verified``) says what each
 run, group and window of check 5 holds.
 
@@ -577,8 +582,9 @@ class Seam:
     """The seam a run passes as ``section=``: ``seam(name)`` is ``recorder.section(name)``, and
     ``seam.stamp(name, run, group, window)`` is ``recorder.stamp`` itself (a span inside a
     check-5 section; a no-op context on every recorder but the timed run's), bound at
-    construction so a stamp costs no forwarding frame. One per recorder
-    (:meth:`_Recorder.seam`), so a run's ``section is`` checks hold."""
+    construction so a stamp costs no forwarding frame. ``seam.host(name)`` is
+    ``recorder.host(name)``. One per recorder (:meth:`_Recorder.seam`), so a run's
+    ``section is`` checks hold."""
 
     __slots__ = ("_rec", "stamp")
 
@@ -588,6 +594,11 @@ class Seam:
 
     def __call__(self, name: str) -> Any:
         return self._rec.section(name)
+
+    def host(self, name: str) -> Any:
+        """:meth:`__call__` with a nested section timed by the host clock on CUDA (no events,
+        no device span); on every other backend and recorder it is ``seam(name)``."""
+        return self._rec.host(name)
 
     def add(self, name: str, seconds: float) -> None:
         """Record a duration measured elsewhere as one call of section ``name``, nested when a
@@ -712,6 +723,11 @@ class _Recorder:
             acc.depth = self._depth
             acc.c5 = table is self._step and (name == "5" or name.startswith("5."))
         return self._Section(self, acc)
+
+    def host(self, name: str) -> Any:
+        """The seam's host-timed section: the same as :meth:`section` on every recorder but the
+        timed run's CUDA one."""
+        return self.section(name)
 
     def add(self, name: str, seconds: float) -> None:
         """A measured duration as a section call; ignored unless the recorder times."""
@@ -986,32 +1002,55 @@ class _MultiCudaTimeSection:
         rec._resolve()
 
 
-class _Stamp:
-    """One check-5 stamp: host ``monotonic_ns`` at entry and exit and, on CUDA, an event pair
-    (no synchronize). Appends to the recorder's step columns as it closes. Both events go on the
-    stream of the recorder's first device, where the section's anchor is: a stamp times that
-    device only (the top-level sections wait on every device)."""
+class _HostNestedSection:
+    """CUDA, a nested section opened through ``seam.host`` (plan §2.7): timed by the host clock,
+    ``acc.time += t1 - t0`` at exit, with a span and no events (its ``gpu_us`` entry stays
+    null, on every device) and nothing pending. For work that runs on another stream, where an
+    event pair on the current stream would measure nothing."""
 
-    __slots__ = ("rec", "col", "run", "group", "window", "h0", "e0")
+    __slots__ = ("rec", "acc", "t0")
+
+    def __init__(self, rec: TimeRecorder, acc: _Acc) -> None:
+        self.rec, self.acc = rec, acc
+        if rec._multi and acc.gpu_more is None:
+            acc.gpu_more = [[] for _ in rec._devices[1:]]
+
+    def __enter__(self) -> None:
+        rec = self.rec
+        rec._depth += 1
+        if self.acc.c5:
+            rec._c5_open += 1
+        self.t0 = time.monotonic_ns()
+
+    def __exit__(self, *exc: Any) -> None:
+        t1 = time.monotonic_ns()
+        acc, rec = self.acc, self.rec
+        acc.time += (t1 - self.t0) / 1e9
+        acc.calls += 1
+        slot = _span(acc, self.t0, t1, gpu=True)
+        if slot >= 0:
+            for lst in acc.gpu_more or ():
+                lst.append(None)
+        rec._depth -= 1
+        if acc.c5:
+            rec._c5_open -= 1
+
+
+class _Stamp:
+    """One check-5 stamp: host ``monotonic_ns`` at entry and exit, nothing else (no CUDA events,
+    no synchronize; plan §2.7). Appends to the recorder's step columns as it closes."""
+
+    __slots__ = ("rec", "col", "run", "group", "window", "h0")
 
     def __init__(self, rec: TimeRecorder, col: int, run: int, group: int, window: int) -> None:
         self.rec, self.col, self.run, self.group, self.window = rec, col, run, group, window
 
     def __enter__(self) -> None:
-        if self.rec._cuda:
-            self.e0 = torch.cuda.Event(enable_timing=True)
-            self.e0.record(torch.cuda.current_stream(self.rec._device))
         self.h0 = time.monotonic_ns()
 
     def __exit__(self, *exc: Any) -> None:
         h1 = time.monotonic_ns()
-        rec = self.rec
-        rows = rec._stamps
-        if rec._cuda:
-            e1 = torch.cuda.Event(enable_timing=True)
-            e1.record(torch.cuda.current_stream(rec._device))
-            rec._stamp_pending.append((len(rows), self.e0, e1))
-        rows.append((self.col, self.run, self.group, self.window, self.h0, h1))
+        self.rec._stamps.append((self.col, self.run, self.group, self.window, self.h0, h1))
 
 
 class _Trace:
@@ -1280,16 +1319,13 @@ class TimeRecorder(_Recorder):
             self._Section = _SyncTimeSection
             self._sync = torch.mps.synchronize
         self._cuda = self._device.type == "cuda"
-        # CUDA: (acc, slot, start event, end event, nested) per closed section and (column,
-        # start, end) per stamp, read at the top-level exit; ``_anchor`` is (host us, event)
+        # CUDA: (acc, slot, start event, end event, nested) per closed section, read at the
+        # top-level exit; ``_anchor`` is (host us, event)
         self._pending: list[tuple[_Acc, int, Any, Any, bool]] = []
-        self._stamp_pending: list[tuple[int, Any, Any]] = []
         self._anchor: tuple[float, Any] | None = None
-        # one row (column, run, group, window, host start, host end) per stamp; ``_stamp_gpu``
-        # maps a row's index to its device span on CUDA
+        # one row (column, run, group, window, host start, host end) per stamp
         self._stamps: list[tuple[int, ...]] = []
-        self._stamp_gpu: dict[int, tuple[float, float]] = {}
-        self._step_stamps: tuple[list[tuple[int, ...]], dict[int, tuple[float, float]]] = ([], {})
+        self._step_stamps: list[tuple[int, ...]] = []
         self._stamp_names = list(STAMP_NAMES)
         self._stamp_col = {n: i for i, n in enumerate(self._stamp_names)}
         self._t1 = 0
@@ -1333,8 +1369,26 @@ class TimeRecorder(_Recorder):
             r[1] += seconds
             r[4] = now
 
+    def host(self, name: str) -> Any:
+        """The seam's host-timed section (plan §2.7): on CUDA, a nested section is timed by the
+        host clock (:class:`_HostNestedSection`); a top-level one, and every other backend, is
+        :meth:`section`."""
+        if not self._cuda or self._depth == 0 or name.startswith(RUN_PREFIX):
+            return self.section(name)
+        return self._wrap_traced(name, self._host_section(name))
+
+    def _host_section(self, name: str) -> Any:
+        acc = self._step.get(name)
+        if acc is None:
+            acc = self._step[name] = _Acc(True)
+            acc.depth = self._depth
+            acc.c5 = name == "5" or name.startswith("5.")
+        return _HostNestedSection(self, acc)
+
     def _traced_section(self, name: str) -> Any:
-        sec = super().section(name)
+        return self._wrap_traced(name, super().section(name))
+
+    def _wrap_traced(self, name: str, sec: Any) -> Any:
         t = self._trace
         if t is None or name.startswith(RUN_PREFIX):
             return sec
@@ -1366,7 +1420,7 @@ class TimeRecorder(_Recorder):
 
     def _resolve(self) -> None:
         """After a top-level synchronize: the time of every nested section's events, and every
-        span's and stamp's device times against the section's anchor."""
+        span's device times against the section's anchor."""
         anchor = self._anchor
         for acc, slot, e0, e1, nested in self._pending:
             if nested:
@@ -1378,11 +1432,7 @@ class TimeRecorder(_Recorder):
                 acc.gpu[slot] = g
             elif acc.rest is not None:
                 acc.rest[2] += (g[1] - g[0]) / 1e6
-        if anchor is not None:
-            for i, e0, e1 in self._stamp_pending:
-                self._stamp_gpu[i] = resolve_gpu_us(anchor[0], anchor[1], (e0, e1))
         self._pending.clear()
-        self._stamp_pending.clear()
 
     def _record_events(self) -> list[Any]:
         """One event per device, each recorded on the device's current stream."""
@@ -1412,12 +1462,7 @@ class TimeRecorder(_Recorder):
                 # GPU time of the call over every listed device (the sum, as ``gpu_held_s``
                 # counts devices); the overflow row has no room for a list per device
                 acc.rest[2] += sum(g[1] - g[0] for g in gs) / 1e6
-        anchor = self._anchor
-        if anchor is not None:
-            for i, e0, e1 in self._stamp_pending:
-                self._stamp_gpu[i] = resolve_gpu_us(anchor[0], anchor[1], (e0, e1))
         self._pending.clear()
-        self._stamp_pending.clear()
 
     def _refuse_trace(self, what: str) -> None:
         if self._trace is not None:
@@ -1437,7 +1482,7 @@ class TimeRecorder(_Recorder):
         part = self._close(t)
         if self._pending:
             self._resolve()
-        self._stamps, self._stamp_gpu = [], {}
+        self._stamps = []
         return part
 
     def merge_step(self, t: int, part: StepPart) -> None:
@@ -1450,8 +1495,8 @@ class TimeRecorder(_Recorder):
 
     def on_step(self, rec: Any) -> None:
         self._t1 = time.monotonic_ns()
-        self._step_stamps = (self._stamps, self._stamp_gpu)
-        self._stamps, self._stamp_gpu = [], {}
+        self._step_stamps = self._stamps
+        self._stamps = []
         t = self._trace
         self._steps_closed = rec.t
         if t is not None and rec.t == t.step:
@@ -1507,18 +1552,14 @@ class TimeRecorder(_Recorder):
         if rec is None:
             line["sections"] = sections
             return line
-        rows, gpu = self._step_stamps
+        rows = self._step_stamps
         cols = list(zip(*rows, strict=True)) if rows else [()] * 6
-        g = [gpu.get(i) for i in range(len(rows))] if self._cuda else None
         line.update({"step": t, "traced": self._tracing_step, "t1_ns": t1, "sections": sections,
                      "stamps": {
                          "name": list(cols[0]), "run": list(cols[1]), "group": list(cols[2]),
                          "window": list(cols[3]), "h0": [us(x) for x in cols[4]],
                          "h1": [us(x) for x in cols[5]],
-                         "g0": None if g is None else
-                         [None if x is None else round(x[0] - base, 3) for x in g],
-                         "g1": None if g is None else
-                         [None if x is None else round(x[1] - base, 3) for x in g]},
+                         "g0": None, "g1": None},
                      "stamp_names": list(self._stamp_names)})
         return line
 

@@ -2160,10 +2160,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
   - **The seam.** `section(name) -> context manager`, `None` by default, accepted by
     `prove_step`, `plain_step`, `run_loop` and `Verifier`. With `None` nothing is observed and
     the run is bit-identical (tested). A `run:` prefix marks a once-per-run section, reported
-    at step 0. A section opened inside another is nested (a `sub` row).
+    at step 0. A section opened inside another is nested (a `sub` row). `seam.host(name)` (FS39,
+    plan ยง2.7) is `seam(name)` except that on CUDA a nested section it opens is timed by the host
+    clock, with a span and no events (`gpu_us` entry null on every device, nothing pending): check
+    5's kernel path uses it for `5.measure`, whose work runs on the measure stream. A top-level
+    one, every other backend and the memory and counting recorders: plain `section`.
   - **Three passes.** The timed run reads only `perf_counter` (`TimeRecorder`; CUDA syncs at
-    top-level boundaries and times nested sections with event pairs, MPS syncs at every
-    boundary). Memory (`MemoryRecorder`, `memory_pass`) and counts (`CountRecorder`,
+    top-level boundaries and times nested sections with event pairs, except `seam.host` ones,
+    which take the host clock; MPS syncs at every boundary). Memory (`MemoryRecorder`, `memory_pass`) and counts (`CountRecorder`,
     `count_pass`, `counting()`) are separate untimed runs; every section, nested included,
     gets all three axes. On CUDA every memory row also holds `peak_reserved_bytes`, the
     caching allocator's reserved peak over the same interval
@@ -2194,8 +2198,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     lists the verifier devices too: `loop.run_devices(c, pipelined=)` (`None` unsharded, so rows
     stay; the verifier devices when pipelined; the prover's device first when sequential), passed
     as `devices=` to `MetricsWriter.recorder` and `memory_run` by every verified entry point.
-    Check 5's stamps time the recorder's first device only (their events go on its stream, where
-    the anchor is); the top-level sections still wait on every device.
+    Check 5's stamps are host spans (FS39, plan ยง2.7): no events on any device, `g0` and `g1`
+    null; the top-level sections still wait on every device. `c5_layout.json`'s `served_bytes`
+    counts the products as measured, in their stored dtype (equal to `product_bytes`; FS37).
   - **Two processes (FS33c).** The child `close_step(t) -> StepPart` (no section open); the parent
     `merge_step(t, part)` before `on_step(t)`: one set of rows and one markers line for both sides.
     One merge per step, after the parent's own sections and before `on_step(t)`; a part of another
