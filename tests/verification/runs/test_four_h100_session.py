@@ -35,7 +35,7 @@ def _roles(roles=None):
              "roles": roles.get(i, ["prover"] if i == 0 else ["verifier"])} for i in range(4)]
 
 
-def _arm(k, arm, roots=None, accepted=True, mode=None, gpus=None, roles=None, wall=True):
+def _arm(k, arm, roots=None, accepted=True, mode=None, gpus=None, roles=None, wall=True, interval=None):
     mode = mode or {"seq": "sequential", "pipe": "pipelined"}[arm]
     times = [{"prover_s": 1.0, "verifier_s": 2.0, "handoff_s": 0.5, "total_s": 3.5 + i}
              for i in range(3)]
@@ -45,6 +45,7 @@ def _arm(k, arm, roots=None, accepted=True, mode=None, gpus=None, roles=None, wa
           "gpu_roles": _roles() if roles is None else roles,
           "gpu_held_upper_s": [9.0, 8.0, 8.0], "accumulated_gpu_s": [20.0, 18.0, 16.0],
           "step_wall_s": [4.0, 3.0, 2.0] if wall else [],
+          "step_interval_s": interval or [],
           "device_peaks": {"cuda:0": {"peak_bytes": 5, "peak_reserved_bytes": 6}},
           "gpu_peak_mib": CARD_MIB}
     return _part(f"{arm}_{k}", "four_run", ex, arm=arm)
@@ -768,3 +769,58 @@ def test_an_error_in_the_summary_is_recorded_and_the_session_runs_on(tmp_path, m
     assert any(x.startswith("FS35 FAIL: the comparison raised (KeyError") for x in lines)
     assert s["finished"] and [p["name"] for p in s["parts"]] == [p.name for p in plan]
     assert copy.deepcopy(s["four_h100"])
+
+
+# ---- FS42: the step time is the interval between verified steps -------------------------------
+
+
+def test_the_steady_time_prefers_the_step_interval_then_step_wall_then_the_total():
+    ex = {"step_interval_s": [3.0, 2.0, 1.0], "step_wall_s": [4.0, 3.0, 2.0],
+          "step_times": [{"total_s": 3.5 + i} for i in range(3)]}
+    assert fs._steady_s(ex) == (pytest.approx(1.5), "step_interval")
+    assert fs._steady_s({**ex, "step_interval_s": []}) == (pytest.approx(2.5), "step_wall")
+    assert fs._steady_s({**ex, "step_interval_s": [], "step_wall_s": []}) == (
+        pytest.approx(5.0), "total")
+
+
+def test_the_summary_keeps_the_latency_beside_the_interval_for_the_pipelined_arm_only():
+    k = KEYS[0]
+    res = _four(_parts(**{f"seq_{k}": _arm(k, "seq", interval=[3.0, 2.0, 1.0]),
+                          f"pipe_{k}": _arm(k, "pipe", interval=[2.0, 1.0, 0.5])}))
+    seq, pipe = (res["models"][k]["arms"][a] for a in ("seq", "pipe"))
+    assert seq["steady_s"] == pytest.approx(1.5) and seq["steady_source"] == "step_interval"
+    assert seq["step_interval_s"] == [3.0, 2.0, 1.0] and seq["latency_steady_s"] is None
+    assert pipe["steady_s"] == pytest.approx(0.75) and pipe["latency_steady_s"] == pytest.approx(2.5)
+    assert pipe["step_wall_s"] == [4.0, 3.0, 2.0]
+    per = [x for x in fs._four_lines(res) if x.startswith(f"FS35 {k} ")]
+    assert per[0].startswith(
+        f"FS35 {k} seq: steady step 1.5 s (interval between verified steps, mean of steps 2-3); "
+        "accumulated GPU time")
+    assert "latency" not in per[0]
+    assert per[1].startswith(
+        f"FS35 {k} pipe: steady step 0.8 s (interval between verified steps, mean of steps 2-3);"
+        " latency 2.5 s (step_wall); accumulated GPU time")
+
+
+def test_interval_only_records_have_a_steady_step_and_pass():
+    k = KEYS[0]
+    arms = {f"{a}_{k}": _arm(k, a, wall=False, interval=[3.0, 2.0, 1.0]) for a in ("seq", "pipe")}
+    for p in arms.values():
+        p["extras"]["step_times"] = []
+    res = _four(_parts(**arms))
+    assert res["missing_numbers"] == [] and res["pass"]
+    assert res["models"][k]["arms"]["pipe"]["latency_steady_s"] is None
+    line = [x for x in fs._four_lines(res) if x.startswith(f"FS35 {k} pipe:")][0]
+    assert "latency unknown" in line
+
+
+def test_run_extras_reads_the_interval_rows_and_skips_bad_ones(tmp_path):
+    log, rec = tmp_path / "log", tmp_path / "d" / "llama_step" / "records.jsonl"
+    log.write_text(_log())
+    _write_records(rec)
+    with open(rec, "a") as f:
+        f.write("\n" + "\n".join(json.dumps(
+            {"record": "time", "level": "total", "component": "step_interval", "step": t,
+             "time_s": v}) for t, v in ((1, 6.0), (2, 5.0), (3, "bad"))) + "\n")
+    e = fs._four_run_extras(log, rec)
+    assert e["step_interval_s"] == [6.0, 5.0] and e["step_wall_s"] == [3.0, 2.0, 1.0]

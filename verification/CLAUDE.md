@@ -2202,11 +2202,13 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     step, a second part for a step, a merge after `finish` and a name in both raise `ValueError` and
     change nothing. The counting pass and `trace_step` refuse (one process). `step` stays work (the
     sum); a merged step adds the `step_wall` total, its wall extent (its `gpu_held_s` is wall times
-    devices, idle gap included: not work). EQ14's numbers read wall time (`step_wall`) beside
-    accumulated GPU time per role, as F22 says. `gpu_held_s` is only an upper bound on held GPU
-    time (a section's time times every device its process lists); the measure is computed by the
-    four-H100 session's summary from the per-side `total` rows and `gpu_roles`
-    (`fs11_session._accumulated_gpu_s`).
+    devices, idle gap included: not work; it is the latency). Every step from 1, in both
+    loops, adds the `step_interval` total (FS42): the step's close (`t1_ns` of its markers line)
+    minus the step before's (step 1: minus its own `t0_ns`). EQ14 reads `step_interval` as the wall
+    time per step (amended 2026-10-25), beside accumulated GPU time per role, as F22 says.
+    `gpu_held_s` is only an upper bound on held GPU time (a section's time times every device its
+    process lists); the measure is computed by the four-H100 session's summary from the per-side
+    `total` rows and `gpu_roles` (`fs11_session._accumulated_gpu_s`).
   - **Prover rows (EQ1b).**
     - P0, original training: `P0.load`, `P0.forward`, `P0.backward`, `P0.update`, emitted only
       by `plain_step` (the plain baseline, B7).
@@ -3277,7 +3279,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     (`llama_step --steps 3 --metrics --no-count`, each in its own run directory; only `pipe_*`
     sets `VERIF_PIPELINED`). `four_h100(parts)` goes to `summary.json["four_h100"]` and
     `_four_lines` ends the job log (`FS35 ok:` or `FS35 FAIL:` per acceptance item; per model
-    and arm the wall time, a steady step (mean of steps 2-3), beside the accumulated GPU time
+    and arm the wall time, a steady step (the mean of steps 2-3 of the interval between verified
+    steps, `step_interval`; a pipelined arm also prints its latency, the `step_wall` mean, beside
+    it), beside the accumulated GPU time
     (steady, mean of steps 2-3) and four GPU peaks; the peer-rate range).
     `pass` fails closed: every part in `four_h100_parts()` ended `ok` or `skipped_done`, the
     peer copies right, the tests' junit with tests and no failure, error or skipped case (the

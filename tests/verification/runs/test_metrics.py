@@ -1136,3 +1136,32 @@ def test_gpu_roles_in_the_pair_layout_gives_cuda0_both_roles(monkeypatch):
     env = metrics.environment_record("r", device="cuda:0", probe=probe,
                                      config={"verifier_devices": ("cuda:0", "cuda:1")})
     assert _roles(env) == [("cuda:0", ["prover", "verifier"]), ("cuda:1", ["verifier"])]
+
+
+def test_every_step_has_a_step_interval_row_equal_to_the_markers_close_differences(
+        c, D, w0, final, tmp_path):
+    """FS42: ``step_interval`` is step t's ``t1_ns`` minus step t-1's (step 1: minus its
+    ``t0_ns``); the ``step`` work totals stay."""
+    s = next(x for x in scenarios(c, D, SEED) if x.name == "honest")
+    with MetricsWriter(tmp_path, "iv", model="mlp", corpus="synthetic", seed=0,
+                       config={"a": 1}) as mw:
+        rec = mw.recorder("honest")
+        run_scenario(c, D, w0, s, T=T, k=K, final=final, recorder=rec, seed=SEED)
+    lines = {m["step"]: m for m in metrics.read_markers(tmp_path / "markers.jsonl")
+             if m["kind"] == "step"}
+    assert sorted(lines) == list(range(1, T + 1))
+    iv = {r["step"]: r for r in rec.rows if r.get("component") == metrics.STEP_INTERVAL}
+    assert sorted(iv) == list(range(1, T + 1))
+    assert all(r["level"] == "total" and r["side"] == "run" and r["record"] == "time"
+               for r in iv.values())
+    for t in range(1, T + 1):
+        start = lines[1]["t0_ns"] if t == 1 else lines[t - 1]["t1_ns"]
+        assert iv[t]["time_s"] == pytest.approx((lines[t]["t1_ns"] - start) / 1e9, abs=1e-9)
+        assert iv[t]["time_s"] > 0
+    work = {r["step"]: r for r in rec.rows if r.get("component") == "step"}
+    assert sorted(work) == list(range(T + 1))  # step 0 holds the run sections, no interval
+    assert not [r for r in rec.rows if r.get("component") == metrics.STEP_WALL]
+    # a memory recorder gets no such row
+    mem = MemoryRecorder("r", "s", memory_probe("cpu"))
+    run_scenario(c, D, w0, s, T=2, k=K, final=final, recorder=mem, seed=SEED)
+    assert not [r for r in mem.rows if r.get("component") == metrics.STEP_INTERVAL]

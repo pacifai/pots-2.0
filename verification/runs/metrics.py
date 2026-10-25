@@ -180,9 +180,15 @@ sit on one axis. How to read a merged step ``t``:
 - Totals. ``step`` stays the **work**: the sum of both sides' top-level sections, as in the
   sequential loop, where it is also the wall time. A merged step adds a ``total`` row ``step_wall``
   (side ``run``): the step's wall extent, from the first section start to the last section end of
-  both sides, gaps included. Pipelined, ``step_wall`` is shorter than ``step`` by the overlap.
-  The paper's EQ14 numbers should read both, as F22 decides: wall time (``step_wall`` per step,
-  the run's wall across steps) beside accumulated GPU time per role, since "one role at a time"
+  both sides, gaps included. Pipelined, ``step_wall`` is shorter than ``step`` by the overlap; it
+  is the step's latency, which includes the wait behind the step before. Every step ``t >= 1``,
+  in both loops, also carries a ``total`` row ``step_interval`` (side ``run``, FS42): step ``t``'s
+  close minus step ``t - 1``'s close, each close the step line's ``t1_ns`` (step 1: its ``t1_ns``
+  minus its ``t0_ns``); its ``devices`` are the ones ``step_wall`` lists and its ``gpu_held_s`` is
+  the interval times them. ``step_interval`` is the per-step wall time EQ14 reads (amended
+  2026-10-25), in both loops; ``step_wall`` is a pipelined step's latency, recorded beside it.
+  The paper's EQ14 numbers should read: wall time (``step_interval`` per step, the run's wall
+  across steps) beside accumulated GPU time per role, since "one role at a time"
   no longer holds. ``gpu_held_s`` (a merged row's seconds times the devices its side held) is
   only an upper bound on it; the four-H100 session's summary computes the measure from the
   per-side ``total`` rows and ``gpu_roles`` (``fs11_session._accumulated_gpu_s``).
@@ -299,7 +305,7 @@ __all__ = [
     "MemoryProbe", "memory_probe", "reserved_peak",
     "normalize_devices", "TimeRecorder", "MemoryRecorder", "CountRecorder", "Seam",
     "resolve_gpu_us", "MAX_SPANS",
-    "StepPart", "STEP_WALL",
+    "StepPart", "STEP_WALL", "STEP_INTERVAL",
     "STAMP_NAMES", "read_markers", "c5_layout_file",
     "memory_pass", "count_pass", "counting",
     "derive_capture", "step_record", "record_pass", "judged_step", "in_sample_step",
@@ -320,6 +326,7 @@ RECORD_TYPES = ("environment", "step", "verdict", "time", "memory", "count", "st
                 "capture", "run_end")
 RUN_PREFIX = "run:"
 STEP_WALL = "step_wall"  # the merged step's wall-extent row (FS33c)
+STEP_INTERVAL = "step_interval"  # every step's close minus the step before's close (EQ14, FS42)
 TRACE_DIR = "trace"  # the traced step's files in a run directory (FS23)
 # Host spans kept per section per step in markers.jsonl; the calls past them fold into ``rest``.
 MAX_SPANS = 64
@@ -1293,6 +1300,7 @@ class TimeRecorder(_Recorder):
         self._stamp_names = list(STAMP_NAMES)
         self._stamp_col = {n: i for i, n in enumerate(self._stamp_names)}
         self._t1 = 0
+        self._prev_t1: int | None = None  # the step before's close, for ``step_interval``
         self.writer = writer
         self.step_fields = dict(step_fields or {})
         # FS23: the traced step. Off, the hot path is untouched; on, the two seam entry points
@@ -1461,6 +1469,7 @@ class TimeRecorder(_Recorder):
             super().on_step(rec)
         finally:
             self._tracing_step = False
+            self._prev_t1 = self._t1
 
     def _marker_line(self, t: int, table: dict[str, _Acc], rec: Any) -> dict[str, Any]:
         """The step's (or, with ``rec`` None, the run sections') ``markers.jsonl`` line."""
@@ -1544,6 +1553,16 @@ class TimeRecorder(_Recorder):
                 wall.time, wall.calls = (hi - lo) / 1e9, 1
                 wall.devs = tuple(dict.fromkeys(n for _, a in top for n in (a.devs or self._names)))
                 rows.append(self._row(step, "run", STEP_WALL, "total", [wall]))
+        top = [a for n, a in table.items() if not a.nested and _side(n) != "run"]
+        if step >= 1 and top:
+            # FS42: the step's interval, from the same ``t1`` and ``t0`` the markers line holds
+            firsts = [a.first_ns for a in table.values() if a.first_ns is not None]
+            start = self._prev_t1 if self._prev_t1 is not None else (
+                min(firsts) if firsts else self._t1)
+            iv = _Acc(False)
+            iv.time, iv.calls = (self._t1 - start) / 1e9, 1
+            iv.devs = tuple(dict.fromkeys(n for a in top for n in (a.devs or self._names)))
+            rows.append(self._row(step, "run", STEP_INTERVAL, "total", [iv]))
         return rows
 
     def _emit(self, t: int, table: dict[str, _Acc], rec: Any) -> None:
