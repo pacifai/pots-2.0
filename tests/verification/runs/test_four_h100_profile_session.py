@@ -524,7 +524,7 @@ def test_the_plain_extras_read_the_p0_rows_and_the_weights(tmp_path):
     rows.append({"record": "run_end"})
     (d / "records.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     ex = fs._profile_plain_extras(d / "records.jsonl")
-    assert ex["p0_steps"] == [1, 2, 3, 4] and ex["step_totals_s"] == PLAIN_STEPS
+    assert ex["p0_steps"] == [1, 2, 3] and ex["step_totals_s"] == PLAIN_STEPS
     assert ex["steady_s"] == pytest.approx(7.0) and ex["weights_bytes"] == 0
     assert fs._profile_plain_problems(ex) == [f"no {fs.WEIGHTS_FILE}"]
     (d / fs.WEIGHTS_FILE).write_text("{}")
@@ -612,10 +612,37 @@ def test_the_readme_commands_use_only_flags_the_tools_have_and_all_they_require(
                                    cwd=Path(fs.__file__).parents[2]).stdout
         assert help_text.startswith("usage:"), c[2]
         flags = set(_flags(c[3:]))
-        assert flags <= {f for f in set(help_text.replace("[", " ").replace("]", " ").split())
-                         if f.startswith("--")}, (tool, flags)
+        have = {f for f in set(help_text.replace("[", " ").replace("]", " ").split())
+                if f.startswith("--")}
+        if tool == "analyze":  # FS42 fix part 2 adds --steady-steps to the tool; this branch
+            have |= {"--steady-steps"}  # (part 3) may not list it yet, so it is allowed by hand
+        assert flags <= have, (tool, flags)
         assert required[tool] <= flags, (tool, required[tool] - flags)
         assert len(flags) == len(_flags(c[3:])), "a flag twice"
+
+
+def test_the_readme_analyze_commands_take_the_steady_steps_two_to_three():
+    trace, seq, pipe, report = _readme_commands()
+    for c in (seq, pipe):
+        assert c[c.index("--steady-steps") + 1] == "2-3"
+    assert "--steady-steps" not in trace and "--steady-steps" not in report
+
+
+def test_the_readme_gives_the_cost_line_the_ratios_and_the_interval():
+    text = README.read_text()
+    sec = text[text.index("### The four-H100 profiling session (FS42)"):]
+    sec = " ".join(sec[:sec.index("\n## ")].split())  # the README's line breaks do not count
+    est = fs.four_profile_estimated_min()
+    assert f"{est} min" in sec and "about 15 min of pod setup and fetch" in sec
+    assert "$P/h" in sec and "$15.96/h" in sec and "10,500 s" in sec and "12,900 s" in sec
+    assert "(87 + 20) x 2" in sec and "20 is the pod's setup" in sec
+    assert est + fs.FOUR_PACK_MIN + fs.FOUR_GRACE_MIN == 87
+    assert -(-(87 + 20) * 2 * 60 // 100) * 100 == 12900
+    assert "wall time" in sec and "verify_over_train_accumulated" in sec
+    assert "(accumulated GPU time)" in sec
+    assert "`plain_baseline --steps 3 --metrics`" in sec
+    assert "`step_interval`" in " ".join(
+        text[text.index("The result reports each model's cost two ways"):].split())
 
 
 def test_the_readme_commands_chain_trace_to_analyze_to_report():

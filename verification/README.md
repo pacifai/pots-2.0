@@ -477,7 +477,9 @@ replaced:
   the device's use by all processes (sampled, so a lower bound). When the prover runs in a child
   process, it closes each step's sections (`close_step`) and the parent merges them (`merge_step`,
   once per step, before that step closes; a stray part is refused) into one set of rows on one
-  clock, with the step's wall extent beside its work. A run's last record, `run_end`, is
+  clock, with the step's wall extent beside its work and a `step_interval` row, the interval
+  between verified steps (the time the loop spends per step, what a throughput comparison
+  uses). A run's last record, `run_end`, is
   written only when the run finished, whatever its verdict: a run that crashed or was
   interrupted leaves none, so a driver that skips finished run directories reruns it.
 - **`materialize_data.py`** builds `D` and `D̃` for one model, task, seed and poisoning
@@ -1353,7 +1355,9 @@ twice its estimate. The counting pass is skipped (`--no-count`): counts do not d
 layout and FS27 measured them on an H100.
 
 The result reports each model's cost two ways, as the cost decision asks. The wall time is the
-steady step (the merged step's wall extent, mean of steps 2 and 3). The accumulated GPU time is
+steady step (the interval between verified steps, the `step_interval` row, mean of steps 2 and
+3; the pipelined arm's latency, the merged step's wall extent, is reported beside it and is not
+the step time). The accumulated GPU time is
 each GPU's held time summed over the GPUs a part holds (three verifier GPUs for 1 s are 3 s):
 per step, the prover side's time times the prover GPUs plus the verifier side's time times the
 verifier GPUs, the counts from the environment record's `gpu_roles`. It counts held time per
@@ -1378,7 +1382,7 @@ and arm a steady step time and a peak for each of the four GPUs; once, 12 peer r
 rejected arm is a result to report, not a thing to work around. Beside `pass` it records, per
 model and arm, each step's prover, verifier, hand-off and total time, the accumulated GPU time
 for both arms (not only the pipelined merged step; the per-arm log line shows the wall time
-beside it), the pipelined merged step's wall extent, the peak per device and
+beside it), the pipelined latency (the merged step's wall extent), the peak per device and
 `gpu_peak.json`'s whole-card peaks, and once
 the probe's per-device rates, its 12 peer rates and the peer check's per-pair rates. The job
 log ends with one `FS35 ok:` or `FS35 FAIL:` line per acceptance item, then a line per model
@@ -1394,20 +1398,32 @@ trains, GPUs 1-3 verify), from which the cost comparison with PoTS and the bottl
 made. It uses the same machine, refusal, prep, pod and set-up steps as the session above (steps
 1-3), and step 4's start command with `FS11_SESSION=four-h100-profile`. It runs three models,
 Qwen2.5-0.5B, Llama-3.2-1B and Falcon3-1B (Qwen2.5-1.5B is dropped from the full-scale runs,
-F24: it runs out of memory pipelined), at four verified steps per arm. Step 1 is the warm-up,
-steps 2 and 3 are the steady steps (untraced in both arms) and the sequential arm traces step 4.
+F24: it runs out of memory pipelined), at four verified steps per arm and three plain steps.
+Step 1 is the warm-up, steps 2 and 3 are the steady steps (untraced in both arms; the profile's
+analysis takes `--steady-steps 2-3`, so the pipelined arm's drain step 4 stays out) and the
+sequential arm traces step 4.
 
-Its parts, in order: `native_build` (1 min), `peer_check` (1), `models` (2; it fetches the
-whole manifest, not only these three models), `four_tests` (6), `probe` (7), then per model
-`plain_<model>` (3), `card_<model>` (2), `seq_<model>` (4) and `pipe_<model>` (4). The estimates
-are FS35's measured times of 2026-10-25 scaled to four steps; the plain run's is a guess. In
-all, 17 + 3 x 13 = 56 min, plus packing 1 and the grace window 20, 77 min; the job's default
-deadline is twice that, 9,240 s rounded up to 9,300 s (2 h 35 min), set in `fs11_job.sh` and
-`four_profile_default_deadline_s()`, which a test holds equal. The pod's boot guard is
-(77 + 20) x 2 = 194 min = 11,640 s, rounded up to 11,700 s. Each part's time limit is about
-twice its estimate.
+Its parts, in order: `native_build` (1 min), `peer_check` (1), `models` (6, FS35's estimate; it
+fetches the whole manifest, not only these three models, and a slow download fails the part, so
+its limit is FS35's 720 s), `four_tests` (6), `probe` (7), then per model `plain_<model>` (3),
+`card_<model>` (2), `seq_<model>` (6) and `pipe_<model>` (4). The estimates are FS35's
+measured times of 2026-10-25 scaled to four steps (FS35's card measured 37-62 s); the plain
+run's is a guess, and the sequential arm's 6 adds an estimated 2-3 minutes for the trace of
+one full-scale step (a JSON of about 1-1.5 GB, gzipped at level 9) to a step of about 195 s,
+so its limit is 720 s. In all, 21 + 3 x 15 = 66 min, plus packing 1 and the grace window 20,
+87 min; the job's default deadline is twice that, 10,440 s rounded up to 10,500 s (2 h
+55 min), set in `fs11_job.sh` and `four_profile_default_deadline_s()`, which a test holds
+equal. The pod's boot guard is (87 + 20) x 2 = 214 min = 12,840 s, rounded up to 12,900 s: 87
+is the job's estimated runtime with its packing and grace window (the job deadline's own
+basis), 20 is the pod's setup (image pull, set-up script, upload), and the 2 is the margin.
+Each part's time limit is about twice its estimate.
 
-- `plain_<model>`: `plain_baseline --steps 4 --metrics` on GPU 0 alone (`VERIF_DEVICE=cuda:0`,
+**Expected cost.** The parts' estimated runtime, 66 min, plus about 15 min of pod setup and
+fetch, is about 81 min, so a run costs about 81 / 60 x $P/h, at $P/h the pod's hourly price;
+at FS35's $15.96/h that is about $22. The job deadline caps the job at 10,500 s, about
+$47 at that price, and the boot guard caps the whole pod at 12,900 s, about $57.
+
+- `plain_<model>`: `plain_baseline --steps 3 --metrics` on GPU 0 alone (`VERIF_DEVICE=cuda:0`,
   no verifier devices, no pipelining): the plain training step the verifier's cost is compared
   with.
 - `card_<model>`: `card_identity` on GPU 0, as in FS35.
@@ -1421,7 +1437,7 @@ only when: every part ended `ok` (or was done earlier); the peer copies landed t
 the tests' junit is clean (FS35's rules); per model FS35's items hold at four steps (both arms
 accepted at all four steps with the right `loop mode:` line, equal step roots, step 1's root the
 card's, the four GPUs and their roles in each arm's environment record); the plain run has
-`P0.*` time rows and a `step` total for every step and its `final_weights.json`; each arm has a
+`P0.*` time rows and a `step` total for each of its three steps and its `final_weights.json`; each arm has a
 `markers.jsonl` line per step, a `step_interval` time row per step, `count` rows for
 `train.forward`, `train.backward`, `P3.commit` and `2` and a `storage` row, and its
 `c5_layout.json`; the sequential arm's markers show step 4 traced and no other step, and
@@ -1432,10 +1448,13 @@ missing. Beside `pass` it records, per model and arm, FS35's numbers (the steady
 step interval, the pipelined latency, the accumulated GPU time, the four GPUs' peaks),
 `verifier_steady_s` (the verifier side's `total` row, mean of steps 2-3), per model the plain
 run's `steady_s` (the `time` / `total` / `step` row, mean of steps 2-3), and per arm
-`verify_over_train` (verifier over the plain step) and `wall_over_train` (the arm's step
-interval over the plain step). The job log ends with one `FS42 ok:` or `FS42 FAIL:` line per
-item, then per model and arm
-`FS42 <model> <arm>: step X s (interval between verified steps), verifier Y s per step, plain training Z s per step; verifier ÷ training A, step ÷ training B`.
+`verify_over_train` (the verifier side's step time over the plain step: wall time, whatever the
+number of verifier GPUs), `verify_over_train_accumulated` (the verifier side's step time times
+its GPUs, counted from the arm's `gpu_roles`, over the plain step on its one GPU: the
+accumulated GPU time ratio, the one EQ14 puts beside PoTS's verify over train) and
+`wall_over_train` (the arm's step interval over the plain step). The job log ends with one
+`FS42 ok:` or `FS42 FAIL:` line per item, then per model and arm
+`FS42 <model> <arm>: step X s (interval between verified steps), verifier Y s per step, plain training Z s per step; verifier ÷ training A (wall time), B (accumulated GPU time); step ÷ training C`.
 An acceptance failure does not change the job's exit code; if computing it raises,
 `four_h100_profile_error` holds the error and the job runs on.
 
@@ -1458,7 +1477,9 @@ python -m evaluation.results.profile.trace \
 ```
 
 Then each arm's profile, the plain run's directory as `--plain` (the sequential arm also takes
-its trace summary; `--compute-dtype` is used only when no environment record names it):
+its trace summary; `--steady-steps 2-3` takes the steady step from steps 2 and 3, leaving out
+step 1, the warm-up, the sequential arm's traced step 4 and the pipelined arm's drain step 4;
+`--compute-dtype` is used only when no environment record names it):
 
 ```bash
 python -m evaluation.results.profile.analyze \
@@ -1467,13 +1488,13 @@ python -m evaluation.results.profile.analyze \
     --samples $OUT/parts/seq_${MODEL}/samples.jsonl --probe $OUT/probe/probe.json \
     --trace-summary $PROFILES/${MODEL}_seq_trace.json \
     --plain $OUT/runs/four_${KEY}_plain/plain_baseline \
-    --compute-dtype bfloat16 --out $PROFILES/${MODEL}_seq.json
+    --steady-steps 2-3 --compute-dtype bfloat16 --out $PROFILES/${MODEL}_seq.json
 python -m evaluation.results.profile.analyze \
     --run-dir $OUT/runs/four_${KEY}_pipe/llama_step --session $LABEL \
     --markers $OUT/runs/four_${KEY}_pipe/llama_step/markers.jsonl \
     --samples $OUT/parts/pipe_${MODEL}/samples.jsonl --probe $OUT/probe/probe.json \
     --plain $OUT/runs/four_${KEY}_plain/plain_baseline \
-    --compute-dtype bfloat16 --out $PROFILES/${MODEL}_pipe.json
+    --steady-steps 2-3 --compute-dtype bfloat16 --out $PROFILES/${MODEL}_pipe.json
 ```
 
 That is three trace summaries and six profiles in all (the commands above, once per model).
