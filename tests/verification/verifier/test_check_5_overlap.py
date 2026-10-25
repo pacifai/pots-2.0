@@ -1,4 +1,5 @@
-"""Check 5's overlap with the glue (FS39, ``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.5–§2.7) on the Mac.
+"""Check 5's overlap with the glue on the Mac (FS39, ``MEASURE_KERNEL_PLAN_DRAFT.md``
+§2.5–§2.7).
 
 The stand-in kernel of ``test_kernel_views`` measures on the host, ``freivalds.kernel_device``
 is switched on, and every seam the overlap uses is spied: ``freivalds.drain``,

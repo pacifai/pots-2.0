@@ -108,7 +108,8 @@ def _group(seed=0, k=3, dtype=torch.float32):
 
 def test_a_write_to_a_held_operand_during_the_read_is_raised(phased):  # noqa: F811
     """The measurement is enqueued on the measure stream behind a slow wait; an in-place write on
-    the current stream while it is pending moves the operand's ``_version``, and the drain raises."""
+    the current stream while it is pending moves the operand's ``_version``, and the drain
+    raises."""
     freivalds.drain()
     group = _group()
     side = mk.measure_stream(DEV)

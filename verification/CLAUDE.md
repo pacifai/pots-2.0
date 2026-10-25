@@ -1627,13 +1627,14 @@ interface.
     5 measured before 2026-10-14; the byte limit cuts one only past 32,768 members at
     128×128×64 (Llama-3.2-1B's largest at `n_s = 128` has 12,288, 1.5 GiB). On SmolLM2 each
     layer has four: `S` and `O` (36 members each), `dA` (36) and `dV`+`dQ`+`dK` (108).
-  - **Check 5 on the kernel (FS37, O2; overlap FS39).** `_measure_served` takes the kernel path for a run
-    whose operands' device (`Replay.operand_device`, asked before serving anything) satisfies
-    `freivalds.kernel_device`: CUDA outside `reference()`. Every other device keeps the fp32
-    serving above, bit for bit. A run of one is served by `_served_view`: the operands as the
-    replay gives them in the operand dtype, `P` moved to the device as stored (non-blocking,
-    never widened), and for a biased product the committed `W_t` bias leaf rounded to the
-    operand dtype there (FS39: the `P` copies go under `measure_kernel.stream_for`). A member run is served group by group by `_served_blocks`: one
+  - **Check 5 on the kernel (FS37, O2; overlap FS39).** `_measure_served` takes the kernel path
+    for a run whose operands' device (`Replay.operand_device`, asked before serving anything)
+    satisfies `freivalds.kernel_device`: CUDA outside `reference()`. Every other device keeps
+    the fp32 serving above, bit for bit. A run of one is served by `_served_view`: the operands
+    as the replay gives them in the operand dtype, `P` moved to the device as stored
+    (non-blocking, never widened), and for a biased product the committed `W_t` bias leaf
+    rounded to the operand dtype there (FS39: the `P` copies go under
+    `measure_kernel.stream_for`). A member run is served group by group by `_served_blocks`: one
     `MeasureGroup` per block of `Replay.operand_blocks`, views over the replay's tensors, `P`
     a view of the committed leaves (`product_run` when a block's labels form a progression,
     else `product_block`), with one `c5.copy` stamp per group around all its blocks' copies.
@@ -1646,8 +1647,9 @@ interface.
     (below). A read outside it drains too: `_record_rest_5` drains in a `finally` around its measuring loop, so a later run's
     serving error or a judged product that raises leaves no hold, and `_measure_run` (the
     planted-error sweep) drains before it reads its rows.
-  - **Check 5's unit pass and judging window (FS38a, 2026-10-14; FS39 overlap).** When the replay has a
-    `unit_schedule()`, `check_5_matmuls` maps each canonical run (`_member_runs`) to the step
+  - **Check 5's unit pass and judging window (FS38a, 2026-10-14; FS39 overlap).** When the
+    replay has a `unit_schedule()`, `check_5_matmuls` maps each canonical run (`_member_runs`)
+    to the step
     that holds it (`_schedule_runs`; a run split across steps, or an `m` missed or repeated,
     is a verifier bug and raises `RuntimeError`) and `_check_5_units` measures the runs in the
     steps' order. Each run keeps its canonical index (`c5.run`) and group ids, so CPU runs keep
@@ -1669,8 +1671,9 @@ interface.
     (`freivalds.ROW`) stays on the device. At window 0, inside its `c5.judge` stamp and
     `5.measure` section, `_ReadOnce` makes the one read of the whole step (`_read_rows`: one
     drain, one read per device; with `pinned=True` a device with a measure stream is joined
-    under it, copied non-blocking into pinned float64 and waited on by one event). The windows (`_judge_windows`, at least `_JUDGE_WINDOW`
-    (1024) products, closed at the end of a run, shared with `_layout`) are then judged in
+    under it, copied non-blocking into pinned float64 and waited on by one event). The windows
+    (`_judge_windows`, at least `_JUDGE_WINDOW` (1024) products, closed at the end of a run,
+    shared with `_layout`) are then judged in
     canonical order from the host rows (`_judge_window`), each in its own `c5.judge` stamp, so
     the first failing product and its message are those of one-at-a-time judging, and
     `5.measure`'s call count is the number of groups (on the kernel's unit path, the number of

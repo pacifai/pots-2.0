@@ -782,11 +782,12 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
     measured by the kernel on the device's measure stream (the current stream while
     :func:`overlap` is off), after the work the current stream has enqueued; nothing is read
     back and nothing waits for the device (see :func:`drain`). ``prefetched`` (:func:`prefetch`)
-    supplies the challenges when it covers them. ``run`` replaces the loaded kernel (``run(launches, stream)``)
-    and ``challenges`` the host source. Every call is one launch per level of a plan through
-    ``pots_measure_level`` (the launches of ``run`` carry :class:`LevelArgs`): :func:`read_plan`
-    for ``share=True`` (which also appends the plan to ``plan_out``, a list) and
-    :func:`plain_plan` (three levels, no shared reads) otherwise; the rows are the same bits."""
+    supplies the challenges when it covers them. ``run`` replaces the loaded kernel
+    (``run(launches, stream)``) and ``challenges`` the host source. Every call is one launch per
+    level of a plan through ``pots_measure_level`` (the launches of ``run`` carry
+    :class:`LevelArgs`): :func:`read_plan` for ``share=True`` (which also appends the plan to
+    ``plan_out``, a list) and :func:`plain_plan` (three levels, no shared reads) otherwise; the
+    rows are the same bits."""
     device, counts = validate(groups, k)
     if device.type != "cuda":
         raise ValueError(f"the measuring kernel needs CUDA tensors, got {device}")
