@@ -192,6 +192,11 @@ sit on one axis. How to read a merged step ``t``:
   minus its ``t0_ns``); its ``devices`` are the ones ``step_wall`` lists and its ``gpu_held_s`` is
   the interval times them. ``step_interval`` is the per-step wall time EQ14 reads (amended
   2026-10-25), in both loops; ``step_wall`` is a pipelined step's latency, recorded beside it.
+  What runs after the recorder takes ``t1`` is in no section and in the **next** step's
+  interval, not ``step`` (``step`` sums sections only): the rows, the markers line, the residual
+  archive, a traced step's profiler stop, export and gzip, and whatever a caller's ``on_step``
+  does after the recorder's (the stored step's write, in the sequential loop); at a rejected
+  step the record pass. So an interval can exceed the step's work by more than the idle gap.
   The paper's EQ14 numbers should read: wall time (``step_interval`` per step, the run's wall
   across steps) beside accumulated GPU time per role, since "one role at a time"
   no longer holds. ``gpu_held_s`` (a merged row's seconds times the devices its side held) is
@@ -331,7 +336,8 @@ RECORD_TYPES = ("environment", "step", "verdict", "time", "memory", "count", "st
                 "capture", "run_end")
 RUN_PREFIX = "run:"
 STEP_WALL = "step_wall"  # the merged step's wall-extent row (FS33c)
-STEP_INTERVAL = "step_interval"  # every step's close minus the step before's close (EQ14, FS42)
+STEP_INTERVAL = "step_interval"  # every step's close minus the step before's close (EQ14, FS42);
+# work after a step's close (rows, markers, archive, trace export, a caller's on_step) lands in the next interval
 TRACE_DIR = "trace"  # the traced step's files in a run directory (FS23)
 # Host spans kept per section per step in markers.jsonl; the calls past them fold into ``rest``.
 MAX_SPANS = 64
