@@ -20,7 +20,7 @@ PKEYS = [fs.four_model_key(r) for r, _ in fs.FOUR_PROFILE_PINS]
 ROOTS4 = ["%064x" % i for i in (1, 2, 3, 4)]
 EXPECTED34 = base.EXPECTED34
 UUIDS = base.UUIDS
-PLAIN_STEPS = [10.0, 8.0, 6.0, 8.5]  # the plain run's per-step totals: the steady step is 7.0 s
+PLAIN_STEPS = [10.0, 8.0, 6.0]  # the plain run's per-step totals: the steady step is 7.0 s
 ARM_INTERVAL = {"seq": [30.0, 21.0, 19.0, 25.0], "pipe": [20.0, 12.0, 10.0, 14.0]}
 ARM_VERIFIER = {"seq": [18.0, 14.0, 12.0, 16.0], "pipe": [18.0, 14.0, 12.0, 16.0]}
 
@@ -52,7 +52,7 @@ def _arm(k, arm, roots=None, profile=None, samples=None, **over):
 
 
 def _plain(k, **over):
-    ex = {"record": "p", "completed": True, "step_s": PLAIN_STEPS, "p0_steps": [1, 2, 3, 4],
+    ex = {"record": "p", "completed": True, "step_s": PLAIN_STEPS, "p0_steps": [1, 2, 3],
           "step_totals_s": PLAIN_STEPS, "steady_s": 7.0, "weights_bytes": 100,
           "samples": {"version": 2, "gpus": 4}}
     return base._part(f"plain_{k}", "profile_plain", {**ex, **over})
@@ -129,7 +129,8 @@ def test_each_part_has_its_environment_and_command(tmp_path):
     for k in PKEYS:
         plain, card, seq, pipe = (plan[f"{a}_{k}"] for a in ("plain", "card", "seq", "pipe"))
         assert plain.kind == "profile_plain" and "verification.runs.plain_baseline" in plain.argv
-        assert plain.argv[plain.argv.index("--steps") + 1] == "4" and "--metrics" in plain.argv
+        assert plain.argv[plain.argv.index("--steps") + 1] == "3" and "--metrics" in plain.argv
+        assert fs.FOUR_PROFILE_PLAIN_STEPS == 3 and fs.FOUR_PROFILE_STEPS == 4
         assert plain.env["VERIF_DEVICE"] == "cuda:0"
         assert plain.env["VERIF_VERIFIER_DEVICES"] is None and plain.env["VERIF_PIPELINED"] is None
         assert plain.info["records"].endswith("plain_baseline/records.jsonl")
@@ -151,9 +152,9 @@ def test_each_part_has_its_environment_and_command(tmp_path):
 
 def test_the_estimates_are_the_briefs_and_the_limits_about_twice_them():
     e = fs.FOUR_PROFILE_ESTIMATE_MIN
-    assert e == {"native_build": 1, "peer_check": 1, "models": 2, "four_tests": 6, "probe": 7,
-                 "plain": 3, "card": 2, "seq": 4, "pipe": 4}
-    assert fs.four_profile_estimated_min() == 17 + 3 * 13 == 56
+    assert e == {"native_build": 1, "peer_check": 1, "models": 6, "four_tests": 6, "probe": 7,
+                 "plain": 3, "card": 2, "seq": 6, "pipe": 4}
+    assert fs.four_profile_estimated_min() == 21 + 3 * 15 == 66
     for part, limit in fs.FOUR_PROFILE_TIMEOUT_S.items():
         assert limit == 2 * 60 * e[part], part
 
@@ -185,7 +186,7 @@ def test_the_refusal_is_the_same_as_four_h100s():
 
 
 def test_the_deadline_is_twice_the_estimate_and_the_job_holds_it():
-    assert fs.four_profile_default_deadline_s() == 9300  # (56 + 1 + 20) * 2 * 60 = 9240, up 100
+    assert fs.four_profile_default_deadline_s() == 10500  # (66 + 1 + 20) * 2 * 60 = 10440, up 100
     text = JOB.read_text()
     want = f"[ \"$SESSION\" = four-h100-profile ] && DEFAULT_DEADLINE_S=" \
            f"{fs.four_profile_default_deadline_s()}"
@@ -280,7 +281,7 @@ def test_missing_markers_fail():
 
 
 def test_a_missing_plain_run_fails():
-    for ex in ({"record": None}, {"weights_bytes": 0}, {"p0_steps": [1, 2, 3]},
+    for ex in ({"record": None}, {"weights_bytes": 0}, {"p0_steps": [1, 2]},
                {"completed": False}):
         part = _plain(K, **ex)
         res = _prof(_parts(**{f"plain_{K}": part}))
@@ -371,6 +372,42 @@ def test_the_step_wall_fallback_leaves_the_wall_ratio_unset():
     assert arm["verify_over_train"] == pytest.approx(13.0 / 7.0)
 
 
+def test_the_verifier_ratio_is_given_in_wall_time_and_in_accumulated_gpu_time():
+    arm = _prof()["models"][K]["arms"]["seq"]
+    # verifier side 13 s a step (steps 2-3), the plain step 7 s on its one GPU
+    assert arm["verify_over_train"] == pytest.approx(13.0 / 7.0)  # wall time
+    n_verifier = sum("verifier" in g["roles"] for g in base._roles())
+    assert n_verifier == 3
+    assert arm["verify_over_train_accumulated"] == pytest.approx(13.0 * 3 / 7.0)
+    # the verifier GPUs come from the arm's own gpu_roles
+    roles = base._roles({1: ["verifier"], 2: ["prover"], 3: ["verifier"]})
+    res = _prof(_parts(**{f"seq_{K}": _arm(K, "seq", gpu_roles=roles)}))
+    arm = res["models"][K]["arms"]["seq"]
+    assert arm["verify_over_train"] == pytest.approx(13.0 / 7.0)
+    assert arm["verify_over_train_accumulated"] == pytest.approx(13.0 * 2 / 7.0)
+
+
+def test_the_accumulated_ratio_is_unknown_without_roles_a_verifier_time_or_a_plain_step():
+    for over in ({"gpu_roles": None}, {"verifier_s": []}):
+        res = _prof(_parts(**{f"seq_{K}": _arm(K, "seq", **over)}))
+        assert res["models"][K]["arms"]["seq"]["verify_over_train_accumulated"] is None, over
+    res = _prof(_parts(**{f"plain_{K}": _plain(K, steady_s=None)}))
+    assert res["models"][K]["arms"]["seq"]["verify_over_train_accumulated"] is None
+
+
+def test_a_refused_profile_run_names_its_own_session(tmp_path, monkeypatch):
+    monkeypatch.delenv("FS11_ALLOW_ANY_GPU", raising=False)
+    if len(fs.environment(tmp_path / "e")["gpus"]) >= fs.FOUR_CARDS:
+        pytest.skip("this machine has four CUDA devices")
+    for session in ("four-h100", "four-h100-profile"):
+        out = tmp_path / session
+        rc = fs.main(["run", "--upload", str(tmp_path / "up"), "--out", str(out), "--deadline",
+                      str(time.time() + 30), "--session", session])
+        s = json.loads((out / "summary.json").read_text())
+        assert rc == fs.EXIT_REFUSED
+        assert f"the {session} session needs 4" in s["refused"], s["refused"]
+
+
 def test_nothing_in_a_result_is_shared_with_the_parts():
     parts = _parts()
     before = copy.deepcopy(parts)
@@ -387,9 +424,9 @@ def test_the_log_lines_hold_the_numbers_and_ratios():
     per = [x for x in lines if x.startswith(f"FS42 {K} ")]
     assert per == [
         f"FS42 {K} seq: step 20.0 s (interval between verified steps), verifier 13.0 s per "
-        "step, plain training 7.0 s per step; verifier ÷ training 1.9, step ÷ training 2.9",
+        "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), 5.6 (accumulated GPU time); step ÷ training 2.9",
         f"FS42 {K} pipe: step 11.0 s (interval between verified steps), verifier 13.0 s per "
-        "step, plain training 7.0 s per step; verifier ÷ training 1.9, step ÷ training 1.6"]
+        "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), 5.6 (accumulated GPU time); step ÷ training 1.6"]
     assert sum(" plain training " in x for x in lines) == 2 * len(PKEYS)
     assert lines[-1].startswith(f"FS42 {PKEYS[-1]} pipe:")
 
@@ -558,12 +595,12 @@ def test_the_readme_has_the_runbook_commands_with_placeholders():
     assert mods == ["evaluation.results.profile.trace", "evaluation.results.profile.analyze",
                     "evaluation.results.profile.analyze", "evaluation.results.profile.report"]
     text = README.read_text()
-    assert "FS11_SESSION=four-h100-profile" in text and "9,300 s" in text
+    assert "FS11_SESSION=four-h100-profile" in text and "10,500 s" in text
     assert "summary.json[\"four_h100_profile\"]" in text
     for c in cmds:
         assert any("$PROFILES" in a for a in c) and any("--out" == a for a in c)
         assert c[2].endswith("report") or any("$OUT" in a for a in c)
-    assert str(fs.four_profile_default_deadline_s()) == "9300"
+    assert str(fs.four_profile_default_deadline_s()) == "10500"
 
 
 def test_the_readme_commands_use_only_flags_the_tools_have_and_all_they_require():
