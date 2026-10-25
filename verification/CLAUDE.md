@@ -3377,28 +3377,39 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `_four_plan`; same refusal) is the profiling run on that layout: `FOUR_PROFILE_ORDER`
     (Qwen2.5-0.5B, Llama-3.2-1B, Falcon3-1B; F24 dropped Qwen2.5-1.5B), four steps per arm, and
     after the native build, `peer_check`, `models` (still the whole manifest), `four_tests` and
-    `probe`, per model `plain_<k>` (`plain_baseline --steps 4 --metrics` on `cuda:0` alone, kind
+    `probe`, per model `plain_<k>` (`plain_baseline --steps 3 --metrics`, `FOUR_PROFILE_PLAIN_STEPS`,
+    on `cuda:0` alone, kind
     `profile_plain`), `card_<k>`, `seq_<k>` (`llama_step --steps 4 --metrics --no-count`,
     `VERIF_TRACE_STEP=4`) and `pipe_<k>` (the same, `VERIF_PIPELINED=1`, no trace), the arms of
     kind `profile_run`; every part has `gpu_peak` and a `samples.jsonl` header check
     (`info["samples_check"]`, `extras["samples"]`). Estimates in minutes (`FOUR_PROFILE_ESTIMATE_MIN`:
-    1, 1, 2, 6, 7, then 3, 2, 4, 4 per model, 56 in all) come from FS35's 2026-10-25 times, the
-    plain run's a guess; `four_profile_default_deadline_s()` is 9,300 s ((56 + 1 + 20) x 2 min,
-    up to 100 s), equal to `fs11_job.sh`'s. `four_h100_profile(parts)` goes to
+    1, 1, 6, 6, 7, then 3, 2, 6, 4 per model, 66 in all) come from FS35's 2026-10-25 times (the
+    card's 37-62 s), the plain run's a guess, the models part FS35's estimate and the sequential
+    arm's 6 an estimate with the trace's 2-3 min; limits (`FOUR_PROFILE_TIMEOUT_S`) about twice
+    them: models 720 s (FS35's), `seq` 720 s, `pipe` 480 s; `_models_part` still fetches the
+    whole manifest (a list of repos for `fetch_models` was left: the tests and the data
+    tokenizers may need other models). `four_profile_default_deadline_s()` is 10,500 s
+    ((66 + 1 + 20) x 2 min, up to 100 s), equal to `fs11_job.sh`'s. `four_h100_profile(parts)` goes to
     `summary.json["four_h100_profile"]` (an error: `four_h100_profile_error`) and the log ends
     with `FS42 ok:` / `FS42 FAIL:` lines. `pass` fails closed: every part `ok` or `skipped_done`,
     the peer check and the tests as FS35's, per model `_four_model_items` at 4 steps, the plain
-    run (`_profile_plain_problems`: `P0.*` rows and a `step` total per step, `final_weights.json`),
+    run (`_profile_plain_problems`: `P0.*` rows and a `step` total for each of its 3 steps,
+    `final_weights.json`),
     each arm's inputs (`_profile_arm_problems`, read into `extras["profile"]` from the run
     directory by `_profile_run_extras`: markers line per step, `step_interval` row per step,
     `count` rows for `train.forward`, `train.backward`, `P3.commit` and `2`, a `storage` row,
     `c5_layout.json`, the sequential arm's trace of step 4 alone and no traced step pipelined),
     every part's `samples.jsonl` at version 2 with four GPUs, the probe at version 2 with four
     `per_device` entries. Beside `pass`: FS35's numbers, per arm `verifier_steady_s`,
-    `verify_over_train` and `wall_over_train` (the interval over the plain steady step, the mean
-    of the `step` total over steps 2-3), and the log's `FS42 <model> <arm>: step X s ...`
-    lines (`_profile_lines`). README: "The four-H100 profiling session (FS42)" holds the Mac-side
-    commands (`profile.trace`, `profile.analyze`, `profile.report`).
+    `verify_over_train` (verifier side's step time over the plain step: wall time),
+    `verify_over_train_accumulated` (the verifier time times its GPUs from the arm's `gpu_roles`,
+    `_role_gpus`, over the plain step on its one GPU) and `wall_over_train` (the interval over
+    the plain steady step, the mean of the `step` total over steps 2-3), and the log's
+    `FS42 <model> <arm>: step X s ...` lines (`_profile_lines`, both verifier ratios labelled
+    wall time and accumulated GPU time). The refusal on fewer than four CUDA devices names its
+    session (`four-h100` or `four-h100-profile`). README: "The four-H100 profiling session
+    (FS42)" holds the Mac-side commands (`profile.trace`, `profile.analyze` with
+    `--steady-steps 2-3`, `profile.report`), the boot guard's terms and the expected cost.
     `--plan` and `--selftest` replace its
     parts. `nvlink-probe` runs `nvlink_probe` once, then `card_identity` per run model and card
     (`FS31_CARDS`, default 4, each part with `CUDA_VISIBLE_DEVICES` set to its card; the probe
@@ -3479,7 +3490,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`, 14,700 s for `four-h100`, 9,300 s
+    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`, 14,700 s for `four-h100`, 10,500 s
     for `four-h100-profile`;
     `FS31_CARDS` is passed on), the
     session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,

@@ -1295,27 +1295,31 @@ def four_default_deadline_s() -> int:
 
 # FS42 (d)'s profiling run (``four-h100-profile``): the same machine and head as ``four-h100``,
 # three models (F24, 2026-10-25, dropped Qwen2.5-1.5B from the full-scale runs: it runs out of
-# memory pipelined) and, per model, a plain training run, the card and the two arms at four
-# steps, the sequential arm tracing its step 4. Step 1 is the warm-up, steps 2-3 are the steady
+# memory pipelined) and, per model, a plain training run (three steps), the card and the two
+# arms at four steps, the sequential arm tracing its step 4. Step 1 is the warm-up, steps 2-3 are the steady
 # steps (untraced in both arms), the traced step is the last.
 FOUR_PROFILE_ORDER = ("Qwen2.5-0.5B", "Llama-3.2-1B", "Falcon3-1B")
 FOUR_PROFILE_STEPS = 4
 FOUR_PROFILE_TRACE_STEP = 4  # VERIF_TRACE_STEP of the sequential arms
+FOUR_PROFILE_PLAIN_STEPS = 3  # the plain run: step 1 the warm-up, steps 2-3 the steady steps
 FOUR_PROFILE_PINS: tuple[tuple[str, str], ...] = tuple(sorted(
     (p for p in RUN_PINS if four_model_key(p[0]) in FOUR_PROFILE_ORDER),
     key=lambda p: FOUR_PROFILE_ORDER.index(four_model_key(p[0]))))
 # Estimates, minutes, from the parts FS35's four-H100 session measured on 2026-10-25 (four H100
 # SXM): the native build 3 s, the peer check 12 s, the models 39 s, the four-GPU tests 246 s, the
-# probe 334 s, per model the card 37-41 s and the sequential arm 91-156 s, the pipelined arm
-# 109-178 s (three steps each, the memory pass included). Here the arms run four steps (a step
-# is about a quarter of those times, plus the memory pass and the start-up) and the trace of
-# one step adds to the sequential arm, so 4 minutes each; the plain run (four steps and a memory
-# pass on one GPU) is estimated, not measured, at 3.
-FOUR_PROFILE_ESTIMATE_MIN = {"native_build": 1, "peer_check": 1, "models": 2, "four_tests": 6,
-                             "probe": 7, "plain": 3, "card": 2, "seq": 4, "pipe": 4}
+# probe 334 s, per model the card 37-62 s and the sequential arm 91-156 s, the pipelined arm
+# 109-178 s (three steps each, the memory pass included). Here the pipelined arm runs four steps
+# (a step is about a quarter of those times, plus the memory pass and the start-up), so 4
+# minutes; the models part is FS35's estimate, 6, and limit, 720 s (it fetches the whole
+# manifest, and a slow download fails the part); the sequential arm adds the trace of one step (a full-scale
+# step's trace is a JSON of about 1-1.5 GB, gzipped at level 9: an estimate, adding 2-3 minutes
+# to a step of about 195 s), so 6 minutes and 720 s; the plain run (three steps and a memory pass on one GPU) is estimated, not measured,
+# at 3.
+FOUR_PROFILE_ESTIMATE_MIN = {"native_build": 1, "peer_check": 1, "models": 6, "four_tests": 6,
+                             "probe": 7, "plain": 3, "card": 2, "seq": 6, "pipe": 4}
 # Time limits, seconds, about twice the estimates (the native build's is the build part's own).
-FOUR_PROFILE_TIMEOUT_S = {"models": 240, "four_tests": 720, "probe": 840, "plain": 360,
-                          "card": 240, "seq": 480, "pipe": 480}
+FOUR_PROFILE_TIMEOUT_S = {"models": 720, "four_tests": 720, "probe": 840, "plain": 360,
+                          "card": 240, "seq": 720, "pipe": 480}
 
 
 def four_profile_estimated_min() -> int:
@@ -1339,7 +1343,7 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
                t: Mapping[str, int], steps: int, profile: bool) -> list[Part]:
     """The parts of the four-H100 sessions: ``pins``' models, ``steps`` verified steps per arm,
     time limits ``t``; with ``profile`` (``four-h100-profile``, :func:`four_h100_profile_plan`)
-    a ``plain_<key>`` run (``plain_baseline`` on GPU 0 alone, the same steps, metrics) before
+    a ``plain_<key>`` run (``plain_baseline`` on GPU 0 alone, :data:`FOUR_PROFILE_PLAIN_STEPS` steps, metrics) before
     each model's card, the sequential arm traced at :data:`FOUR_PROFILE_TRACE_STEP` and a
     ``samples.jsonl`` check on every part. Otherwise :func:`four_h100_plan`'s.
     The F22 peer-copy byte check first (the native build runs ahead of it); the models part;
@@ -1382,7 +1386,7 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
             d = _run_dir(out, upload, key, f"four_{key}_plain")
             plan.append(Part(
                 f"plain_{k}", ["{python}", "-m", "verification.runs.plain_baseline", "--steps",
-                               str(steps), "--metrics"],
+                               str(FOUR_PROFILE_PLAIN_STEPS), "--metrics"],
                 env={**base, "VERIF_DEVICE": FOUR_PROVER, "VERIF_OUTPUT_DIR": str(d),
                      "VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
                 timeout_s=t["plain"], kind="profile_plain",
@@ -2292,6 +2296,14 @@ def _four_records(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _role_gpus(roles: Sequence[Mapping[str, Any]] | None, side: str) -> int:
+    """The GPUs of the environment record's ``gpu_roles`` that hold ``side`` (``prover`` or
+    ``verifier``); 0 without the record."""
+    if not isinstance(roles, list):
+        return 0
+    return sum(side in (g.get("roles") or ()) for g in roles if isinstance(g, dict))
+
+
 def _accumulated_gpu_s(side_s: Mapping[str, float],
                        roles: Sequence[Mapping[str, Any]] | None) -> float | None:
     """One step's accumulated GPU time, as the cost decision defines it (each GPU's held time
@@ -2303,8 +2315,7 @@ def _accumulated_gpu_s(side_s: Mapping[str, float],
     row or a role count is missing."""
     if not isinstance(roles, list) or not all(s in side_s for s in ("prover", "verifier")):
         return None
-    n = {s: sum(s in (g.get("roles") or ()) for g in roles if isinstance(g, dict))
-         for s in ("prover", "verifier")}
+    n = {s: _role_gpus(roles, s) for s in ("prover", "verifier")}
     if not all(n.values()):
         return None
     return side_s["prover"] * n["prover"] + side_s["verifier"] * n["verifier"]
@@ -2870,7 +2881,7 @@ def _profile_plain_problems(ex: Mapping[str, Any]) -> list[str]:
     why: list[str] = []
     if not ex.get("completed"):
         why.append("the plain run did not complete")
-    steps = FOUR_PROFILE_STEPS
+    steps = FOUR_PROFILE_PLAIN_STEPS
     if len(set(ex.get("p0_steps") or ()) & set(range(1, steps + 1))) < steps:
         why.append("no P0.* time row for " + _missing_steps(ex.get("p0_steps") or ()))
     if len(ex.get("step_totals_s") or ()) < steps or ex.get("steady_s") is None:
@@ -2910,8 +2921,12 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
     from the step interval, the pipelined latency, the accumulated GPU time, the four GPUs'
     peaks), ``verifier_steady_s`` (the verifier side's ``total`` row, mean of steps 2-3), the
     plain run's ``steady_s`` (mean of the ``step`` total over steps 2-3) and per arm
-    ``verify_over_train`` (verifier over the plain step) and ``wall_over_train`` (the arm's
-    step interval over the plain step)."""
+    ``verify_over_train`` (verifier over the plain step, in wall time: the verifier side's step
+    time over the plain step's, whatever the number of verifier GPUs),
+    ``verify_over_train_accumulated`` (the verifier side's step time times its GPUs, from the
+    arm's ``gpu_roles``, over the plain step on its one GPU: the accumulated GPU time ratio
+    that EQ14 puts beside PoTS's verify over train) and ``wall_over_train`` (the arm's step
+    interval over the plain step)."""
     if not any(p.get("kind") == "profile_run" for p in parts):
         return None
     names = {p["name"] for p in parts}
@@ -2949,6 +2964,10 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
             why = _profile_arm_problems(ex, a)
             row["inputs"][a] = why
             arm["verify_over_train"] = _ratio(arm["verifier_steady_s"], steady_plain)
+            n_ver = _role_gpus(ex.get("gpu_roles"), "verifier")
+            arm["verify_over_train_accumulated"] = _ratio(
+                arm["verifier_steady_s"] * n_ver if arm["verifier_steady_s"] is not None
+                and n_ver else None, steady_plain)
             arm["wall_over_train"] = (_ratio(arm["steady_s"], steady_plain)
                                       if arm["steady_source"] == "step_interval" else None)
             items.append((not why, f"{k} {a}: the profile's inputs are there" if not why
@@ -3004,7 +3023,8 @@ def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
             lines.append(
                 f"FS42 {k} {a}: step {sec(arm.get('steady_s'))} ({what}), verifier "
                 f"{sec(arm.get('verifier_steady_s'))} per step, plain training {sec(plain)} per "
-                f"step; verifier ÷ training {rat(arm.get('verify_over_train'))}, step "
+                f"step; verifier ÷ training {rat(arm.get('verify_over_train'))} (wall time), "
+                f"{rat(arm.get('verify_over_train_accumulated'))} (accumulated GPU time); step "
                 f"÷ training {rat(arm.get('wall_over_train'))}")
     return lines
 
@@ -3950,7 +3970,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         why = refusal(env_doc, allow, fs31_cards() if probing else PAIR_CARDS if pairing
                       else FOUR_CARDS if four else None,
                       need="the fs32-pair session" if pairing
-                      else "the four-H100 session" if four else None)
+                      else f"the {args.session} session" if four else None)
     except ValueError as e:
         why = str(e)
     py_refused = False
