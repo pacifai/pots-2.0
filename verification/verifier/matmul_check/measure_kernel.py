@@ -684,7 +684,12 @@ def retire(device: torch.device) -> None:
 
 def drain(device: torch.device | str | None = None) -> None:
     """Wait for every entry of ``device`` (all devices when ``None``), then check versions and
-    release them. Every entry is waited for and released before the first error is raised."""
+    release them. Every entry is waited for and released before the first error is raised.
+    With no device it is also a barrier for the measure streams (FS39): everything enqueued on
+    them is waited for, the row joins check 5 makes there after a call's event included, so a
+    read on any stream afterwards sees finished rows. With a device (check 5's one step in
+    flight per device) only the entries are waited for, so the ``P`` copies of the step being
+    served keep running."""
     devs = list(_inflight) if device is None else [torch.device(device)]
     errors = []
     for d in devs:
@@ -698,6 +703,9 @@ def drain(device: torch.device | str | None = None) -> None:
                 err = _judge(e)
                 if err is not None:
                     errors.append(err)
+    if device is None:
+        for stream in _streams.values():
+            stream.synchronize()
     if errors:
         raise errors[0]
 

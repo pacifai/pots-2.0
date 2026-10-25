@@ -1114,8 +1114,12 @@ def _measure_served_kernel(c: DeclaredComputation, specs: Sequence[ProductSpec],
             rows.append(freivalds.measure_groups_rows(served, h=h, k=k, guard=guard))
         orders.append(order)
         del served  # the views; the kernel holds what it still reads
-    return _Rows(specs, [i for o in orders for i in o],
-                 rows[0] if len(rows) == 1 else torch.cat(rows)), None
+    if len(rows) == 1:
+        joined = rows[0]
+    else:  # on the measure stream, which writes the rows; a read drains it first (FS39)
+        with measure_kernel.stream_for(rows[0].device):
+            joined = torch.cat(rows)
+    return _Rows(specs, [i for o in orders for i in o], joined), None
 
 
 def _served_view(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, replay: Replay,
@@ -1239,6 +1243,8 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
             end, error = i, e
             break
     out, order = [], []
+    if orders is not None:  # kernel rows, written on the measure stream: finished first (FS39)
+        freivalds.drain()
     for idx, r in zip(groups if orders is None else orders, rows):
         keep = [i for i in idx if i < end]  # a prefix: a group is in run order
         if orders is None or len(keep) == len(idx):
@@ -1262,7 +1268,12 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
                                      guard=guard).rows)
         del group
         order += keep
-    return _Rows(specs[:end], order, torch.cat(out) if out else None), error
+    joined = torch.cat(out) if out else None
+    if orders is not None and joined is not None and joined.device.type == "cuda":
+        # the join reads measure-stream blocks on the current stream; once the caller drops
+        # them, a measure-stream allocation could reuse one under the join, so wait (rare path)
+        torch.cuda.synchronize(joined.device)
+    return _Rows(specs[:end], order, joined), error
 
 
 Served = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
@@ -1372,7 +1383,10 @@ def _read_rows(rows: Sequence[torch.Tensor], *, pinned: bool = False) -> list[np
     sent: list[tuple[list[int], torch.Tensor, Any, torch.Tensor]] = []
     for idx in by_device.values():
         dev = rows[idx[0]].device
-        if pinned and measure_kernel.measure_stream(dev) is not None:
+        side = measure_kernel.measure_stream(dev) if pinned else None
+        if side is not None:
+            # rows the torch path measured (``reference()``) were written on the current stream
+            side.wait_stream(torch.cuda.current_stream(dev))
             with measure_kernel.stream_for(dev):
                 joined = rows[idx[0]] if len(idx) == 1 else torch.cat([rows[i] for i in idx])
                 host_t = torch.empty(joined.shape, dtype=torch.float64, pin_memory=True)

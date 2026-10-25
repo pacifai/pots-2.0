@@ -2001,7 +2001,12 @@ interface.
     the allocator's safety. `stream_for(device)` is the stream a caller's own copies of kernel
     inputs go on. `prefetch(h, ms, k, widths)` starts the challenge draw of a coming step on a
     worker thread (`None` when overlap is off or the source isn't a `HostChallengeSource`);
-    `enqueue(prefetched=)` passes it to `draw`.
+    `enqueue(prefetched=)` passes it to `draw`. `drain()` with no device is also a barrier for
+    the measure streams (every row read drains first, so a row join check 5 enqueues there,
+    `_measure_served_kernel`'s, is finished before any stream reads it); `drain(dev)`, the unit
+    pass's one step in flight, waits for the entries only. `_read_rows(pinned=True)` makes the
+    measure stream wait on the current stream first (torch-path rows under `reference()`);
+    `_measure_to_failure`'s kernel joins drain before and synchronize after (a rare path).
   - `challenge_source.py`: `ChallengeSource.draw(h, ms, k, widths, *, stream)` returns one
     float32 buffer holding each product's `challenge_matrix(h, m, k, width)`, the byte offset
     of each, and an event recorded after the work that fills it (`None` on the CPU). It is the
