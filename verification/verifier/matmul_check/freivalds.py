@@ -70,7 +70,7 @@ import math
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -335,21 +335,24 @@ def kernel_device(device: torch.device | str) -> bool:
 
 def measure_groups_rows(groups: Sequence[MeasureGroup], *, h: bytes, k: int,
                         guard: bool = True, share: bool = False,
-                        plan_out: list | None = None) -> torch.Tensor:
+                        plan_out: list | None = None,
+                        prefetched: Any = None) -> torch.Tensor:
     """Every member's row (:data:`ROW`) as float64 ``[Σ n_t, row_width(k)]`` on the groups'
     device, groups in order and members in order within each, from one table and one launch
-    set on the current stream, with no host read. Challenges come from the host challenge
+    set on the device's measure stream (the current stream outside ``measure_kernel.overlap``),
+    with no host read. Challenges come from the host challenge
     source (§2.6). The inputs, the table and the challenge buffer are held, with each input's
     ``_version`` as enqueued, until :func:`drain`. Each call first releases the entries
     whose event has completed. A group the rules refuse (dtype, shapes, device, a bias with
     several members, ``k``) raises ``ValueError`` naming it, before anything is launched; the
     tensors must be on a CUDA device. ``share=True`` runs the table in levels with one-sided
     shared reads (``measure_kernel.read_plan``, FS38b), with the same bits; ``plan_out``, a
-    list, then gets that table's ``ReadPlan``."""
+    list, then gets that table's ``ReadPlan``. ``prefetched`` (``measure_kernel.prefetch``, FS39)
+    supplies the challenges drawn on the source's worker thread when it covers them."""
     from verification.verifier.matmul_check import measure_kernel
 
     return measure_kernel.enqueue(groups, h=h, k=k, guard=guard, share=share,
-                                  plan_out=plan_out)
+                                  plan_out=plan_out, prefetched=prefetched)
 
 
 def drain(device: torch.device | str | None = None) -> None:

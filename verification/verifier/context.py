@@ -650,9 +650,16 @@ class StepContext:
     stats: StepStats = field(default_factory=StepStats)
     section: Section | None = None  # B6 metrics seam; None runs the checks unobserved
 
-    def timed(self, name: str) -> AbstractContextManager[Any]:
-        """``section(name)``, or a no-op when no metrics seam is set."""
-        return _NO_SECTION if self.section is None else self.section(name)
+    def timed(self, name: str, host: bool = False) -> AbstractContextManager[Any]:
+        """``section(name)``, or a no-op when no metrics seam is set. ``host=True`` (the
+        kernel path's ``5.measure``, whose row is the host time of enqueuing, waiting for the
+        unit in flight and reading back, ``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.7) asks the seam's
+        ``host(name)`` for the section when it has one, else a plain callable seam's."""
+        if self.section is None:
+            return _NO_SECTION
+        if host and hasattr(self.section, "host"):
+            return self.section.host(name)
+        return self.section(name)
 
     def hash_stats(self) -> HashStats | None:
         """A fresh :class:`HashStats` when the seam can ``add`` a measured duration, else

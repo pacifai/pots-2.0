@@ -22,6 +22,19 @@ read one stored view run their rows together); the rows stay on the device. The 
 is a set of ``-D`` options in the cache key; :func:`set_geometry` changes it (never a bit). Each
 call's :class:`Pending` holds every tensor and buffer the stream reads, with each input's
 ``_version``, until :func:`drain` has waited for its event and found no input changed.
+
+Overlap (FS39, ``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.5): every CUDA device has one *measure
+stream* (:func:`measure_stream`). :func:`enqueue` makes it wait on an event recorded on the
+current stream (the producer of the operands) and then draws the challenges, copies the table,
+launches the levels and records the call's event there, so the glue that follows on the current
+stream runs beside the measuring. The measure stream's tensors (``rows``, the table, the
+challenge buffer, and the ``P`` copies of check 5 made under :func:`stream_for`) are used only
+on that stream until a :func:`drain` has waited for the call's event, so the caching allocator
+reusing their blocks is stream-ordered and needs no ``record_stream``; the inputs made on the
+current stream are held by :class:`Pending` until that event, which is what keeps their blocks
+out of reuse (the capture's staging does the same, ``prover/capture.py``). :func:`overlap`
+turns the whole thing off for tests. :func:`prefetch` hands the draw of a later call to the
+challenge source's worker thread (``challenge_source``).
 """
 
 from __future__ import annotations
@@ -29,7 +42,8 @@ from __future__ import annotations
 import ctypes
 import functools
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -42,6 +56,7 @@ from verification.commitment import native
 from verification.verifier.matmul_check.challenge_source import (
     ChallengeSource,
     HostChallengeSource,
+    Prefetch,
 )
 from verification.verifier.matmul_check.measure_table import (
     DT_BF16,
@@ -687,6 +702,66 @@ def drain(device: torch.device | str | None = None) -> None:
         raise errors[0]
 
 
+# ---- the measure stream ----
+
+_overlap_on = True
+_streams: dict[int, torch.cuda.Stream] = {}
+
+
+@contextmanager
+def overlap(enabled: bool = False) -> Iterator[None]:
+    """Inside, the measure stream is on (``True``) or off (``False``, the default argument):
+    off, the kernel path runs everything on the current stream with no prefetched challenges
+    and the plain row read, as before FS39, for the comparison tests. Nests; outside any
+    ``overlap`` it is on."""
+    global _overlap_on
+    before, _overlap_on = _overlap_on, bool(enabled)
+    try:
+        yield
+    finally:
+        _overlap_on = before
+
+
+def overlap_on() -> bool:
+    return _overlap_on
+
+
+def measure_stream(device: torch.device | str) -> torch.cuda.Stream | None:
+    """The device's measure stream, created at first use (one per CUDA device per process), or
+    ``None`` for a non-CUDA device or while :func:`overlap` is off."""
+    dev = torch.device(device)
+    if dev.type != "cuda" or not _overlap_on:
+        return None
+    index = torch.cuda.current_device() if dev.index is None else dev.index
+    stream = _streams.get(index)
+    if stream is None:
+        stream = _streams[index] = torch.cuda.Stream(device=index)
+    return stream
+
+
+@contextmanager
+def stream_for(device: torch.device | str) -> Iterator[None]:
+    """Makes the device's measure stream current inside, when it has one; else nothing."""
+    stream = measure_stream(device)
+    if stream is None:
+        yield
+        return
+    with torch.cuda.stream(stream):
+        yield
+
+
+def prefetch(h: bytes, ms: Sequence[int], k: int, widths: Sequence[int],
+             challenges: ChallengeSource | None = None) -> Prefetch | None:
+    """Submit the draw of the challenges of ``ms`` (matrix widths ``widths``, as
+    :func:`enqueue` takes them: each product's ``P`` columns) to the source's worker thread, for
+    a later call's ``prefetched=``. ``None`` while :func:`overlap` is off or when the source
+    cannot prefetch."""
+    source = challenges if challenges is not None else _DEFAULT_SOURCE
+    if not _overlap_on or not isinstance(source, HostChallengeSource):
+        return None
+    return source.prefetch(h, ms, k, widths)
+
+
 # ---- the call ----
 
 _DEFAULT_SOURCE = HostChallengeSource()
@@ -694,10 +769,12 @@ _DEFAULT_SOURCE = HostChallengeSource()
 
 def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool = True,
             challenges: ChallengeSource | None = None, run: Any = None, share: bool = False,
-            plan_out: list | None = None) -> torch.Tensor:
+            plan_out: list | None = None, prefetched: Prefetch | None = None) -> torch.Tensor:
     """Every member's row as float64 ``[Σ n_t, row_width(k)]`` on the groups' CUDA device,
-    measured by the kernel on the current stream; nothing is read back and nothing waits for the
-    device (see :func:`drain`). ``run`` replaces the loaded kernel (``run(launches, stream)``)
+    measured by the kernel on the device's measure stream (the current stream while
+    :func:`overlap` is off), after the work the current stream has enqueued; nothing is read
+    back and nothing waits for the device (see :func:`drain`). ``prefetched`` (:func:`prefetch`)
+    supplies the challenges when it covers them. ``run`` replaces the loaded kernel (``run(launches, stream)``)
     and ``challenges`` the host source. Every call is one launch per level of a plan through
     ``pots_measure_level`` (the launches of ``run`` carry :class:`LevelArgs`): :func:`read_plan`
     for ``share=True`` (which also appends the plan to ``plan_out``, a list) and
@@ -707,10 +784,19 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
         raise ValueError(f"the measuring kernel needs CUDA tensors, got {device}")
     retire(device)
     stream = torch.cuda.current_stream(device)
+    side = measure_stream(device)
+    if side is not None and side != stream:
+        produced = torch.cuda.Event()
+        produced.record(stream)
+        side.wait_event(produced)
+        stream = side
     source = challenges if challenges is not None else _DEFAULT_SOURCE
     ms = [int(m) for grp in groups for m in grp.ms]
     widths = np.repeat([grp.b.shape[2] for grp in groups], counts)
-    buf, offsets, ev = source.draw(h, ms, k, widths.tolist(), stream=stream)
+    extra = {}
+    if prefetched is not None and isinstance(source, HostChallengeSource):
+        extra["prefetched"] = prefetched
+    buf, offsets, ev = source.draw(h, ms, k, widths.tolist(), stream=stream, **extra)
     if ev is not None:
         stream.wait_event(ev)
     prods = prods_array(groups, np.uint64(buf.data_ptr()) + offsets.astype(np.uint64), k, guard)
