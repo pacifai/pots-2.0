@@ -60,7 +60,7 @@ def _inits(tmp_path) -> int:
 def test_no_gpu_never_touches_nvml(tmp_path, wrap):
     head, rows = _run(tmp_path, "--no-gpu", wrap=wrap)
     assert _inits(tmp_path) == 0
-    assert head["nvml"] is False and head["gpm"] is False and head["gpu"] is None
+    assert head["nvml"] is False and head["gpm"] is False and head["gpus"] is None
     assert "--no-gpu" in head["gpm_error"]
     assert not any(e.get("group") == "nvml" for e in head["errors"])
     assert rows and all(r["g_util"] is None for r in rows)

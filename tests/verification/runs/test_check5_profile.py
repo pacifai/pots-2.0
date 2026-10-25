@@ -107,3 +107,57 @@ def test_out_appends_one_line_per_call_and_stdout_is_unchanged(env, stored, monk
         assert all(len(v) == 2 for v in line["section_s_per_pass"].values())
         assert line["machine_facts"]["ram_total_bytes"] > 0
     assert len((tmp_path / "x.jsonl").read_text().splitlines()) == 1
+
+
+def _ev(name, start, end, cuda=False, index=None):
+    dt = torch.autograd.DeviceType.CUDA if cuda else torch.autograd.DeviceType.CPU
+    return SimpleNamespace(name=name, time_range=SimpleNamespace(start=start, end=end),
+                           device_type=dt, device_index=index)
+
+
+def test_cuda_counts_splits_kernels_and_device_time_per_device():
+    events = [_ev("section:5.measure", 0, 100), _ev("cudaLaunchKernel", 5, 6),
+              _ev("k0", 10, 40, cuda=True, index=0), _ev("k0b", 50, 60, cuda=True, index=0),
+              _ev("k1", 10, 25, cuda=True, index=1), _ev("k?", 70, 71, cuda=True)]
+    r = cp.cuda_counts(events)
+    assert r["total"] == {"kernels": 4, "kernel_us": 56}
+    assert r["by_device"] == {"cuda:0": {"kernels": 2, "kernel_us": 40},
+                              "cuda:1": {"kernels": 1, "kernel_us": 15}}
+    assert r["5.measure"] == {"launches": 1}
+    assert cp.cuda_counts([])["by_device"] == {}
+
+
+def test_every_device_of_the_run_is_synced_around_each_pass(monkeypatch):
+    synced = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda d=None: synced.append(str(d)))
+    devs = tuple(torch.device("cuda", i) for i in range(3))
+    cp._sync(devs)
+    cp._sync(torch.device("cuda", 1))
+    cp._sync((torch.device("cpu"),))
+    assert synced == ["cuda:0", "cuda:1", "cuda:2", "cuda:1"]
+
+
+def test_run_devices_are_the_runs_own_then_the_verifier_devices():
+    plc = SimpleNamespace(devices=(torch.device("cuda", 1), torch.device("cuda", 2),
+                                   torch.device("cuda", 0)))
+    c = SimpleNamespace(placement=plc)
+    assert cp.run_devices_of(c, "cuda:0") == tuple(torch.device("cuda", i) for i in (0, 1, 2))
+    assert cp.run_devices_of(SimpleNamespace(placement=SimpleNamespace(devices=None)),
+                             "cpu") == (torch.device("cpu"),)
+    assert cp.run_devices_of(SimpleNamespace(), "cpu") == (torch.device("cpu"),)
+
+
+def test_profile_of_a_fake_sharded_cpu_run(env, stored):  # noqa: F811
+    """A computation sharded over ``cpu,cpu`` (one device, twice) profiles as an unsharded one:
+    accepted, equal to the archive, and the devices it names are ``["cpu"]``."""
+    import copy
+    c = copy.copy(env.c)
+    from verification.computation.placement import placement_for
+    cpu = torch.device("cpu")
+    c.__dict__["placement"] = placement_for(c, cpu, (cpu, cpu))  # the MLP has no verifier_devices
+    assert c.placement.sharded
+    ks = rv.load_kept_step(c, stored, step=fs.SWEEP_STEP)
+    p = cp.profile(c, ks, env.bands, seed=SEED, h_D=env.h_D, n_records=len(env.D), k=K,
+                   repeats=1, out=QUIET)
+    assert p.accepted and p.archive_equal and p.cuda is None and p.devices == ["cpu"]
+    assert "devices" not in p.as_record()  # the record keeps its keys

@@ -650,27 +650,39 @@ def _timeline(run: Run) -> str:
                        and sec["name"] not in TOTALS])
     ticks = _ticks(max((s.get("end_s") or 0.0) for s in steps) or 1.0, 8)
     axis_s = ticks[-1]
-    left, pw, span_h, strip_h = 78.0, 900.0, 18.0, 20.0
+    several = any((s.get("strips") or {}).get("gpus") for s in steps)
+    left, pw, span_h, strip_h = 200.0 if several else 78.0, 900.0, 18.0, 20.0
 
     def strips_of(s: dict[str, Any]) -> dict[str, dict[str, list[float | None]]]:
+        """The strips of a step, by id: ``base`` or ``base#k`` (the k-th GPU, with several)."""
         st = s.get("strips") or {}
+        gpus = st.get("gpus") or [st]  # one strip per GPU; the top level for a one-GPU run
+        keyed = [("" if len(gpus) == 1 else f"#{k}", g) for k, g in enumerate(gpus)]
         out: dict[str, Any] = {}
-        if "g_util" in st:
-            out["g_util"] = {"g_util": st["g_util"]}
+        for suffix, g in keyed:
+            if "g_util" in g:
+                out["g_util" + suffix] = {"g_util": g["g_util"]}
         if "c_busy" in st:
             out["c_busy"] = {"c_busy": st["c_busy"]}
-        pc = {k: [None if v is None else v / 1e9 for v in st[k]]
-              for k in ("g_pcie_rx", "g_pcie_tx") if k in st}
-        if pc:
-            out["pcie"] = pc
+        for suffix, g in keyed:
+            pc = {k: [None if v is None else v / 1e9 for v in g[k]]
+                  for k in ("g_pcie_rx", "g_pcie_tx") if k in g}
+            if pc:
+                out["pcie" + suffix] = pc
         return out
+
+    def label_of(key: str, s: dict[str, Any]) -> str:
+        base, _, k = key.partition("#")
+        gpus = (s.get("strips") or {}).get("gpus") or []
+        return STRIPS[base][0] + (f" {gpus[int(k)]['label']}" if k else "")
 
     maxes: dict[str, float] = {"g_util": 1.0}
     for s in steps:
         for key, cols in strips_of(s).items():
-            if key != "g_util":
+            base = key.partition("#")[0]
+            if base != "g_util":
                 m = max((v for c in cols.values() for v in c if v is not None), default=0.0)
-                maxes[key] = max(maxes.get(key, 0.0), m)
+                maxes[base] = max(maxes.get(base, 0.0), m)
 
     def x(t: float) -> float:
         return left + pw * min(t / axis_s, 1.0)
@@ -689,24 +701,25 @@ def _timeline(run: Run) -> str:
                                  ' stroke="var(--bg)" stroke-width="0.6"'))
         y += span_h + 4
         for key, cols in strips_of(s).items():
-            top = maxes[key] or 1.0
+            top = maxes[key.partition("#")[0]] or 1.0
             out.append(f'<line class="axis" x1="{left}" x2="{left + pw}" y1="{y + strip_h}" '
                        f'y2="{y + strip_h}"/>')
-            out.append(_text(left - 8, y + 14, STRIPS[key][0], "mute", "end"))
+            out.append(_text(left - 8, y + 14, label_of(key, s), "mute", "end"))
             for fld, vals in cols.items():
                 word = {"g_pcie_rx": "into the GPU", "g_pcie_tx": "out of the GPU"}.get(fld, "")
                 out.append(_polylines(s["strips"]["t_s"], vals, x,
                                       lambda v, y=y, top=top: y + strip_h - strip_h * v / top,
-                                      f"{STRIPS[key][0]} {word}".strip() + f"\nstep {s['step']}",
+                                      f"{label_of(key, s)} {word}".strip() + f"\nstep {s['step']}",
                                       fld == "g_pcie_tx"))
             y += strip_h + 3
         y += 10
     out.append(_axis(left, left + pw, y, 0, ticks, "seconds from the step's start"))
-    used = [k for k in STRIPS if any(k in strips_of(s) for s in steps)]
+    used = [k for k in STRIPS if any(key.partition("#")[0] == k
+                                     for s in steps for key in strips_of(s))]
     top_words = {"g_util": "", "c_busy": f", up to {fmt(maxes.get('c_busy'))}",
                  "pcie": f", up to {fmt(maxes.get('pcie'))} GB/s"}
-    note = (" Lines under each step: " + "; ".join(f"{STRIPS[k][0]}, {STRIPS[k][1]}{top_words[k]}"
-                                                    for k in used) + "."
+    strips = "; ".join(f"{STRIPS[k][0]}, {STRIPS[k][1]}{top_words[k]}" for k in used)
+    note = (f" Lines under each step{', one per GPU' if several else ''}: {strips}."
             if used else " No sampler data for this run.")
     return (_legend(names) + _svg(left + pw + 20, y + 34, "".join(out))
             + f'<p class="mute small">Each bar is one timed step, its sections drawn where they '

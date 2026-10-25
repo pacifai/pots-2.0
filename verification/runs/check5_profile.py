@@ -11,7 +11,8 @@ judges nothing and writes only the line below; it prints, per product and per se
 
 1. **Time.** ``--repeats`` timed passes (default 5), the median. On CUDA the device is
    synchronized before and after each pass, so the wall clock holds the GPU's work; the
-   section times are host times, which on CUDA can run ahead of the device.
+   section times are host times, which on CUDA can run ahead of the device. A sharded run
+   syncs every device it uses: the run's own, then the verifier devices of ``c.placement``.
 2. **Ops and host reads** (one untimed pass under a ``TorchDispatchMode``). Every aten op the
    dispatcher sees, on every thread (the replay's backward runs on autograd's workers). A host
    read is any call that makes the host wait for a value: ``aten._local_scalar_dense``
@@ -24,7 +25,9 @@ judges nothing and writes only the line below; it prints, per product and per se
    themselves and their summed device time (the GPU's busy time), and the runtime calls that
    block the host (``cudaStreamSynchronize``, ``cudaDeviceSynchronize``,
    ``cudaEventSynchronize``, ``cudaMemcpy``) and ``cudaMemcpyAsync`` apart. Each runtime call
-   goes to the section whose time range holds its start, whatever its thread.
+   goes to the section whose time range holds its start, whatever its thread. The kernel count
+   and device time are also split per device (``by_device``, by the device each kernel event
+   names), and printed per device.
 
 The step must be accepted, and its check-5 numbers are compared with the archive's (equal bit
 for bit on the machine that wrote it; another device rounds differently, so a difference
@@ -63,6 +66,7 @@ from verification.computation.interface import DeclaredComputation
 from verification.parameters import load_protocol_config
 from verification.runs.k_tunability import base_context, check5_pass, full_step
 from verification.runs.llama_step import load_committed_dataset
+from verification.runs.metrics import normalize_devices
 from verification.runs.run_verified import (
     KEEP_STEP,
     KeptStep,
@@ -207,21 +211,29 @@ def _attribute(ranges: list[tuple[float, float, str]], t: float) -> str:
 
 def cuda_counts(events: Sequence[Any]) -> dict[str, Counter[str]]:
     """From a profile's events: per section, ``launches``, ``syncs`` and ``async_copies``
-    (runtime calls placed by start time), and in all ``kernels`` and ``kernel_us``."""
+    (runtime calls placed by start time), and in all ``kernels`` and ``kernel_us``. Under
+    ``by_device``, the same kernels and device time split by the device each kernel event names
+    (``cuda:k``). The runtime calls are not split: their names carry no device."""
     ranges = [(e.time_range.start, e.time_range.end, e.name.removeprefix("section:"))
               for e in events if e.name.startswith("section:")]
-    out: dict[str, Counter[str]] = {s: Counter() for s in SECTIONS}
+    out: dict[str, Any] = {s: Counter() for s in SECTIONS}
     total: Counter[str] = Counter()
+    by_device: dict[str, Counter[str]] = {}
     for e in events:
         if getattr(e, "device_type", None) == torch.autograd.DeviceType.CUDA:
             total["kernels"] += 1
             total["kernel_us"] += int(e.time_range.end - e.time_range.start)
+            dev = getattr(e, "device_index", None)
+            if isinstance(dev, int) and dev >= 0:
+                by_device.setdefault(f"cuda:{dev}", Counter()).update(
+                    kernels=1, kernel_us=int(e.time_range.end - e.time_range.start))
             continue
         key = ("launches" if e.name in _LAUNCHES else "syncs" if e.name in _SYNCS
                else "async_copies" if e.name in _ASYNC_COPIES else None)
         if key is not None:
             out.setdefault(_attribute(ranges, e.time_range.start), Counter())[key] += 1
     out["total"] = total
+    out["by_device"] = by_device
     return out
 
 
@@ -249,17 +261,29 @@ class Profile:
     ops: dict[str, int]
     reads: dict[str, int]
     top_ops: dict[str, list[tuple[str, int]]]
-    cuda: dict[str, dict[str, int]] | None
+    cuda: dict[str, Any] | None  # per section and "total": counts; "by_device": per device
+    devices: list[str] = field(default_factory=list)  # every device synced around a pass
     section_s_per_pass: dict[str, list[float]] = field(default_factory=dict)  # file only
 
     def as_record(self) -> dict[str, Any]:
         return {"record": "check5_profile",
-                **{k: v for k, v in self.__dict__.items() if k != "section_s_per_pass"}}
+                **{k: v for k, v in self.__dict__.items()
+                   if k not in ("section_s_per_pass", "devices")}}
 
 
-def _sync(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+def _sync(devices: torch.device | Sequence[torch.device]) -> None:
+    """Wait for the GPU work of ``devices`` (one device, or every device the run uses)."""
+    for d in [devices] if isinstance(devices, torch.device) else devices:
+        if d.type == "cuda":
+            torch.cuda.synchronize(d)
+
+
+def run_devices_of(c: DeclaredComputation, device: str | torch.device
+                   ) -> tuple[torch.device, ...]:
+    """Every device check 5 may use: ``device`` (the run's) then the verifier devices of
+    ``c.placement``, normalized and without repeats."""
+    placement = getattr(c, "placement", None)
+    return normalize_devices((device, *(getattr(placement, "devices", None) or ())))
 
 
 def profile(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, h_D: bytes,
@@ -280,7 +304,7 @@ def profile_step(c: DeclaredComputation, store: TranscriptStore, step: int,
     """:func:`profile` on a step held in memory, with no band-hash check: ``bands`` are the
     caller's own (``bring_up``'s in-sample fit has no stored hash). ``honest`` is the run's
     archive for the step, or ``None``."""
-    dev = torch.device(device)
+    devs = run_devices_of(c, device)
     base = base_context(c, store, step=step, seed=seed, h_D=h_D, n_records=n_records, k=k)
     t0 = time.perf_counter()
     rej, slots, ready = full_step(store, c, base, bands)
@@ -294,10 +318,10 @@ def profile_step(c: DeclaredComputation, store: TranscriptStore, step: int,
     accepted, st = True, StepStats()
     for _ in range(repeats):
         tr = SectionTracker()
-        _sync(dev)
+        _sync(devs)
         t0 = time.perf_counter()
         rej, st = check5_pass(store, c, ready, bands, k, section=tr)
-        _sync(dev)
+        _sync(devs)
         times.append(dt := time.perf_counter() - t0)
         accepted &= rej is None
         named = 0.0
@@ -315,21 +339,22 @@ def profile_step(c: DeclaredComputation, store: TranscriptStore, step: int,
     accepted &= rej is None
 
     cuda = None
-    if dev.type == "cuda":
+    if any(d.type == "cuda" for d in devs):
         tr = SectionTracker(ranges=True)
         acts = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
-        _sync(dev)
+        _sync(devs)
         with torch.profiler.profile(activities=acts) as prof:
             rej, _ = check5_pass(store, c, ready, bands, k, section=tr)
-            _sync(dev)
+            _sync(devs)
         accepted &= rej is None
-        cuda = {s: dict(v) for s, v in cuda_counts(prof.events()).items()}
+        cuda = {s: ({d: dict(x) for d, x in v.items()} if s == "by_device" else dict(v))
+                for s, v in cuda_counts(prof.events()).items()}
 
     member = sum(1 for s in c.products if s.member is not None)
     top = {s: [(n, v) for (sec, n), v in counts.kinds.most_common() if sec == s][:15]
            for s in SECTIONS}
     return Profile(M=c.M, dense=c.M - member, member=member, accepted=accepted, digest=digest,
-                   archive_equal=archive, check5_s=times,
+                   archive_equal=archive, check5_s=times, devices=[str(d) for d in devs],
                    section_s={s: statistics.median(v) for s, v in per_section.items()},
                    section_s_per_pass=per_section,
                    section_calls=section_calls, ops=dict(counts.ops), reads=dict(counts.reads),
@@ -367,6 +392,9 @@ def report(p: Profile, out: Callable[[str], None] = print) -> None:
         tot = p.cuda["total"]
         out(f"CUDA: {tot.get('kernels', 0)} kernels ({tot.get('kernels', 0) / M:.2f}/product), "
             f"device busy {tot.get('kernel_us', 0) / 1e6:.3f} s")
+        for d, v in p.cuda.get("by_device", {}).items():
+            out(f"  {d}: {v.get('kernels', 0)} kernels, device busy "
+                f"{v.get('kernel_us', 0) / 1e6:.3f} s")
         for s in SECTIONS:
             r = p.cuda.get(s, {})
             out(f"  {s:<10} launches {r.get('launches', 0):>8} "

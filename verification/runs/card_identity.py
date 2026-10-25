@@ -35,6 +35,7 @@ import torch
 
 from setup import data
 from setup.config import load_config, setup_determinism
+from setup.machine import smi_uuid_form
 from verification.commitment.leaves import leaf_hashes_of
 from verification.commitment.merkle import merkle_root
 from verification.computation.interface import DeclaredComputation, snapshot_weights
@@ -52,11 +53,7 @@ SMI_FIELDS = "name,uuid,pci.bus_id"
 
 def _torch_uuid(props: Any) -> str | None:
     """torch's UUID of the device, in ``nvidia-smi``'s ``GPU-...`` form, where torch exposes one."""
-    raw = getattr(props, "uuid", None)
-    if raw is None:
-        return None
-    text = str(raw)
-    return text if text.startswith("GPU-") else f"GPU-{text}"
+    return smi_uuid_form(getattr(props, "uuid", None))
 
 
 def card_facts(device: str, run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:

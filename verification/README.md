@@ -886,18 +886,18 @@ that both start commands parse (`bash -n`) and, on stub `runpodctl`, `curl` and 
    was created without the start command, or restarted), run `sh fs11_guard.sh` from the
    upload once it is there, or paste the one-line form in `fs11_guard.sh`'s header first.
    Upload the tarball, check its SHA-256 against step 1's, and extract it into `/workspace`,
-   giving `/workspace/fs11_upload/`. Then make the venv with Python 3.14, as on the Mac. The
-   image has uv (from the base image) but not Python 3.14, so uv fetches its own build, a
-   public download:
+   giving `/workspace/fs11_upload/`. Then make the venv with `fs11_setup.sh`, which gives the
+   pod the Mac's exact Python (the upload's `manifest.json` records its version):
 
    ```bash
-   cd /workspace/fs11_upload/repo
-   uv python install 3.14
-   uv venv --python 3.14 /root/venv
-   ln -s /root/venv .venv
-   uv pip install --python .venv/bin/python -r ../requirements-fs11.txt
+   bash /workspace/fs11_upload/repo/verification/runs/fs11_setup.sh /workspace/fs11_upload
    ```
 
+   The version is pinned because CPython 3.14.0 can hang at exit (the resource tracker's
+   deadlock, gh-146313) and the session refuses any Python other than the manifest's
+   (`FS11_ALLOW_PYTHON_MISMATCH=1` overrides). The image's uv 0.9.0 offers no 3.14.7, so the
+   script installs a current uv into `/root/uvnew`, then runs `uv python install` (a public
+   download), `uv venv` and `uv pip install -r ../requirements-fs11.txt`.
    `requirements-fs11.txt` holds the Mac's versions; on Linux x86_64, PyPI's torch wheel is a
    CUDA build. The venv lives on the container disk and `.venv` links to it. On the profiling
    check's pod `/workspace` was a network file system (MooseFS, through FUSE) where each file
@@ -1090,8 +1090,8 @@ from the cached configs; it reads no weights), then
 The upload it packs holds only `repo/` (`git archive HEAD`), `native_cache/blake3-1.8.7/`, the
 sizes file at the top, `requirements-fs11.txt` (which lists pytest and matplotlib besides the
 run's packages) and `manifest.json`; no `hf/`, `data/` or `bench_cache/`. On the pod the steps
-are the usual ones: extract it, make the venv, `uv pip install -r ../requirements-fs11.txt`
-(the requirements file sits beside `repo/`), then the job. The session builds the native
+are the usual ones: extract it, make the venv with `fs11_setup.sh` (it installs
+`../requirements-fs11.txt`, which sits beside `repo/`), then the job. The session builds the native
 library, runs `test_gpu_blake3.py` and `test_gpu_blake3_edges.py` on the card, then
 `kernel_speed run`. The run times each table `--repeats` (5) times, whole call and kernels
 alone, and reports the median and the best; the gate reads the slowest model's median
@@ -1156,8 +1156,9 @@ first captured CUDA matmul, so `run_loop` calls `GpuBlake3().kernels(device)` on
 
 1. **Prep, on the Mac**, after committing: `HF_HUB_OFFLINE=1 .venv/bin/python -m
    verification.runs.fs11_prep --out DIR`, the default upload, which carries the four models.
-2. **On the pod**, as in the first session: extract the upload, make the venv, install, run the
-   job with `FS11_SESSION=device-leaves`. The default deadline is 8,800 s: the parts take about
+2. **On the pod**, as in the first session: extract the upload, make the venv with
+   `fs11_setup.sh`, run the job with `FS11_SESSION=device-leaves`. The default deadline is
+   8,800 s: the parts take about
    52 minutes (models 5, native build 2, CUDA tests 8, four bring-ups about 37: Llama-3.2-1B
    and Falcon3-1B about 10 each, Qwen2.5-0.5B about 3, Qwen2.5-1.5B about 14), packing about
    1 and the grace window 20, so about 73 minutes; twice that is 146 minutes, rounded up to the
@@ -1221,9 +1222,10 @@ transcript and run the verifier.
    fetches every public one (a few minutes it doesn't need; a filter would be a change to
    `fs11_session.py`).
 2. **The pod**: two GPUs of the same type, the image and disks of step 2, the boot guard with
-   `sleep 23600;` (setup about 20 min plus the job's 176: 2 x 196 min = 392 min, rounded up).
-3. **Set up** as in step 3. `requirements-fs11.txt` carries `pytest` and `matplotlib` (the fast
-   suite and the plotting tests need them), so nothing is installed by hand.
+   `sleep 18500;` (setup about 20 min plus the job's 134: 2 x 154 min = 308 min, rounded up).
+3. **Set up** as in step 3, with `fs11_setup.sh`. `requirements-fs11.txt` carries `pytest` and
+   `matplotlib` (the fast suite and the plotting tests need them), so nothing is installed by
+   hand.
 4. **Start the job**:
 
    ```bash
@@ -1247,7 +1249,6 @@ transcript and run the verifier.
 | `native_build` | compiles the BLAKE3 library from the upload | 2 min |
 | `fast_suite` | the whole fast suite, `-rf`; the two-GPU tests run here first | 25 min |
 | `two_gpu_slow` | the slow two-GPU tests (a SmolLM2 run, sharded against unsharded) | 10 min |
-| `exit_probe` | each of 30 test modules in its own pytest process, then all together; names the one that cannot exit; never judged | 42 min |
 | `fs34_tests` | FS34's CUDA tests (`test_fs34_join_cuda.py`): the kernel hashes on the owner GPUs | 5 min |
 | `smollm2_calibrate` | the band file, written even when the bf16 guard fails | 5 min |
 | `card_unsharded`, `card_sharded` | `card_identity`: step 1's root, `W_{t+1}`, loss | 6 min |
@@ -1258,8 +1259,8 @@ transcript and run the verifier.
 | `<cheat>_pipelined` (three) | the judged cheats, sharded and pipelined | 12 min |
 
 The estimates are scaled by hand from the earlier sessions; none was measured on two cards.
-The parts sum to about 155 min, packing about 1, the grace window 20: about 176 min, so the
-default deadline is 2 x 176 = 352 min, rounded up to 21,200 s. The pipelined arms (FS33d) are
+The parts sum to about 113 min, packing about 1, the grace window 20: about 134 min, so the
+default deadline is 2 x 134 = 268 min, rounded up to 16,100 s. The pipelined arms (FS33d) are
 estimated at their sequential counterparts' time, since the pipelined loop overlaps prover and
 verifier and is no slower; that is an estimate, not a measurement. Each part's time limit is a
 cap; the fast suite's is 3,600 s, the metrics run's 1,800 s.
@@ -1295,7 +1296,99 @@ A part that did not run prints `FS32 FAIL: <part> did not run`, one without a re
 one arm are printed and recorded but are outside `pass`. An acceptance failure does not change
 the job's exit code: the `FS32` lines and `summary.json` carry it.
 
+### The four-H100 session (FS35)
+
+`FS11_SESSION=four-h100` is the end of the four-GPU port (F22): on four H100 SXM, GPU 0 trains
+and GPUs 1-3 hold, hash and verify the transcript (`VERIF_DEVICE=cuda:0`,
+`VERIF_VERIFIER_DEVICES=cuda:1,cuda:2,cuda:3`), the layout no card has run yet. For each model
+it runs one verified step three times over, sequential and pipelined, and reports each model's
+step time, the per-GPU peaks and the peer-copy rates; the environment record of each run must
+name all four GPUs. FM6 (the second session's cost estimate) is redone from these step times.
+The session needs 4 CUDA devices, which `FS11_ALLOW_ANY_GPU` does not lift, and an H100 unless
+`FS11_ALLOW_ANY_GPU=1`.
+
+1. **Prep, on the Mac**, after committing, as in step 1 of the first session
+   (`fs11_prep --out DIR`). The upload carries the models, the native sources and the tests.
+2. **The pod**: four H100 SXM on Runpod's secure cloud (NVLink; about $16 per hour), with the
+   image and disks the pair session used and the boot guard of the first session's start
+   command with a `sleep` of 17,100 s in place of 16,200. The arithmetic: the job's parts take
+   about 101 min, packing 1, the grace window 20, so 122 min; setup is about 20 more, 142 min;
+   twice that is 284 min = 17,040 s, rounded up to 17,100 s. The job's own deadline is 2 x 122
+   min = 244 min = 14,640 s, rounded up to 14,700 s (4 h 5 min). The estimated cost at $16 per
+   hour: the parts' estimates sum to 2 + 1 + 6 + 8 + 8 + 4 x (3 + 8 + 8) = 25 + 76 = 101 min,
+   setup 20 min (the venv with `fs11_setup.sh` and the unpacking, as the pair session counts
+   it), packing 1 min: 122 min = 2.03 hours, about $33 (122 / 60 x 16 = $32.5). The job's
+   deadline caps the job at 14,700 s = 4.08 hours = $65 (14,700 / 3600 x 16 = $65.3), and the
+   boot guard's 17,100 s caps the pod's whole life at 4.75 hours = $76.
+3. **Set up** with `fs11_setup.sh` as in step 3 of the first session:
+
+   ```bash
+   bash /workspace/fs11_upload/repo/verification/runs/fs11_setup.sh /workspace/fs11_upload
+   ```
+
+4. **Start the job**, from `/workspace/fs11_upload/repo`. The ssh shell lacks `RUNPOD_POD_ID`
+   and `RUNPOD_API_KEY` (only the pod's process 1 has them), and the job refuses without them,
+   so export them first, printing nothing:
+
+   ```bash
+   eval "$(tr '\0' '\n' < /proc/1/environ \
+       | grep -E '^RUNPOD_(POD_ID|API_KEY)=' | sed 's/^/export /')"
+   FS11_SESSION=four-h100 setsid nohup bash verification/runs/fs11_job.sh /workspace/fs11_upload \
+       /workspace/fs11_out </dev/null > /workspace/fs11_job.out 2>&1 &
+   ```
+
+| part | what it does | estimate |
+|---|---|---|
+| `native_build` | compiles the BLAKE3 library | 2 min |
+| `peer_check` | the byte check of every ordered pair's copies | 1 min |
+| `models` | fetches the public weights | 6 min |
+| `four_tests` | every multi-GPU test (slow or not), FS34's tests and the three new CUDA test files | 8 min |
+| `probe` | the probe on all four GPUs and the 12 peer pairs, 60 s per device | 8 min |
+| `card_<model>` | `card_identity` on GPU 0 alone: one card's step-1 root | 3 min each |
+| `seq_<model>`, `pipe_<model>` | `llama_step`, 3 steps, sequential and pipelined | 8 min each |
+
+The models run cheapest first: Qwen2.5-0.5B, Llama-3.2-1B, Falcon3-1B, Qwen2.5-1.5B. All of the
+estimates are scaled by hand; none was measured on four GPUs. Each part's time limit is about
+twice its estimate. The counting pass is skipped (`--no-count`): counts do not depend on the GPU
+layout and FS27 measured them on an H100.
+
+The result reports each model's cost two ways, as the cost decision asks. The wall time is the
+steady step (the merged step's wall extent, mean of steps 2 and 3). The accumulated GPU time is
+each GPU's held time summed over the GPUs a part holds (three verifier GPUs for 1 s are 3 s):
+per step, the prover side's time times the prover GPUs plus the verifier side's time times the
+verifier GPUs, the counts from the environment record's `gpu_roles`. It counts held time per
+role: the prover side's time once per prover GPU and the verifier side's once per verifier GPU;
+the prover's arrival and commit hashing run on GPUs 1-3 but sit inside the prover side's
+sections, so they count under the prover side, once.
+The log prints both per model and arm. `metrics.py`'s `gpu_held_s` multiplies
+each section's time by every device its
+process lists (four on the sequential arm), so it only bounds that quantity from above; the
+summary keeps it as `gpu_held_upper_s`. The session fails if any of the step times, per-GPU peaks
+or 12 peer rates is missing, or if any test case was skipped.
+
+**Reading the result.** `summary.json["four_h100"]["pass"]` fails closed. It is true only when
+every part ended `ok` (or was done in an earlier run); the peer copies landed the right bytes;
+the tests left a report with tests and no failure, error or skipped case (any skip fails, and a
+test file of the session's list with every case skipped fails); for every model both arms were
+accepted at all three steps in their loop mode, the two arms' step roots are equal step for
+step, step 1's root is the card part's proved root (the split over three GPUs gives one card's
+bits), and each arm's environment record names four GPUs with distinct UUIDs, `cuda:0` as the
+prover and `cuda:1` to `cuda:3` as verifiers; and the reported numbers are all there (per model
+and arm a steady step time and a peak for each of the four GPUs; once, 12 peer rates). A
+rejected arm is a result to report, not a thing to work around. Beside `pass` it records, per
+model and arm, each step's prover, verifier, hand-off and total time, the accumulated GPU time
+for both arms (not only the pipelined merged step; the per-arm log line shows the wall time
+beside it), the pipelined merged step's wall extent, the peak per device and
+`gpu_peak.json`'s whole-card peaks, and once
+the probe's per-device rates, its 12 peer rates and the peer check's per-pair rates. The job
+log ends with one `FS35 ok:` or `FS35 FAIL:` line per acceptance item, then a line per model
+and arm with the steady step time (the mean of steps 2 and 3; step 1 pays one-off costs) and
+the four GPUs' peaks, then the slowest and fastest peer pair. An acceptance failure does not
+change the job's exit code. If computing the summary raises, `four_h100_error` holds the error
+and the job runs on.
+
 ## Workflow: calibrating the tolerances
+
 
 The thresholds `τ` (matmul residual), `κ` (cancellation) and `τ_W` (update) are set
 from measurement, not guessed. The test-scale procedure:
@@ -1326,7 +1419,9 @@ from measurement, not guessed. The test-scale procedure:
 Every later run loads the band file read-only with `calibration.load_bands(path, k=k,
 context=...)`. It refuses a missing file, a file calibrated at another `k`, and a file whose
 recorded run (`band_context`: model, dtypes, attention, device, `h_D`, batch shape, `η`, `M`,
-`T` and `k`) differs from the run loading it. The file also records the calibration run's
+`T` and `k`, plus the GPU model names, `torch` and CUDA versions) differs from the run
+loading it; a file from before those three keys is refused until refitted. The file also
+records the calibration run's
 seed and thread count but doesn't compare them. The bands don't depend on `π`, so the file
 fitted at seed 1 judges the runs at every seed. The thread count changes only the order of
 the CPU's floating-point sums, a shift far below `τ`, and the cost results need it recorded.

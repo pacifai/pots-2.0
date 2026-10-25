@@ -91,7 +91,7 @@ def test_plan_has_the_pipelined_arms_sharded_and_only_they_set_the_mode(tmp_path
     piped = {"run_pipelined", "run_pipelined_metrics", "poisoned_step_pipelined",
              "hidden_steps_pipelined", "flipped_matmul_pipelined"}
     assert piped <= set(plan) and list(plan)[0] == "peer_check"
-    assert set(fs.PAIR_PARTS) - {"native_build"} == set(plan) - {"exit_probe"}  # not judged
+    assert set(fs.PAIR_PARTS) - {"native_build"} == set(plan)
     assert {n for n, p in plan.items() if p.env.get("VERIF_PIPELINED")} == piped
     assert all(plan[n].env["VERIF_PIPELINED"] == "1"
                and plan[n].env["VERIF_VERIFIER_DEVICES"] == fs.PAIR_DEVICES for n in piped)
@@ -111,8 +111,8 @@ def test_plan_has_the_pipelined_arms_sharded_and_only_they_set_the_mode(tmp_path
 
 
 def test_the_default_deadline_is_twice_the_estimate_and_the_job_holds_it():
-    assert fs.pair_default_deadline_s() == 21200
-    assert "DEFAULT_DEADLINE_S=21200" in JOB.read_text()
+    assert fs.pair_default_deadline_s() == 16100
+    assert "DEFAULT_DEADLINE_S=16100" in JOB.read_text()
 
 
 def test_two_cards_of_any_type_pass_and_one_is_refused():
@@ -563,14 +563,10 @@ def test_a_fast_suite_that_hung_at_exit_is_no_pass_but_its_counts_still_read():
     assert "FS32 FAIL: fast_suite ended exit_hang" in "\n".join(fs._pair_lines(pair))
 
 
-def test_the_exit_probe_follows_the_fast_suite_and_never_changes_pass(tmp_path):
+def test_the_exit_probe_is_a_tool_and_no_part_of_the_plan(tmp_path):
     plan = {p.name: p for p in fs.fs32_pair_plan(tmp_path / "up", tmp_path / "out")}
-    names = list(plan)
-    assert names[names.index("fast_suite") + 1] == "exit_probe"
-    assert "exit_probe" not in fs.PAIR_PARTS and "exit_probe" in fs.PAIR_ESTIMATE_MIN
-    assert plan["exit_probe"].timeout_s == fs.PAIR_TIMEOUT_S["exit_probe"]
+    assert "exit_probe" not in plan and not [p for p in plan.values() if p.kind == "exit_probe"]
+    assert "exit_probe" not in fs.PAIR_ESTIMATE_MIN and "exit_probe" not in fs.PAIR_TIMEOUT_S
     assert set(fs.EXIT_PROBE_MODULES) and len(set(fs.EXIT_PROBE_MODULES)) == len(
         fs.EXIT_PROBE_MODULES)
-    hung = _part("exit_probe", "exit_probe", {"exit_probe": {"hung": ["x"], "runs": []}},
-                 status="exit_hang")
-    assert fs.fs32_pair([*_parts(), hung])["pass"] is True
+    assert callable(fs.run_exit_probe) and callable(fs.exit_probe_lines)

@@ -216,7 +216,8 @@ def test_band_context_holds_the_run_it_was_fitted_for():
                    "master_dtype": "float32", "compute_dtype": "float32",
                    "attn_impl": "eager", "device": "cpu", "h_D": bytes(range(32)).hex(),
                    "calibration_seed": 1, "threads": 8, "n_s": 4, "n": 128, "eta": 1e-3,
-                   "M": 7113, "T_run": 10, "k": K}
+                   "M": 7113, "T_run": 10, "k": K, "gpu_models": [],
+                   "torch": torch.__version__, "cuda": torch.version.cuda}
     assert json.loads(json.dumps(CTX)) == CTX
     assert band_context(load_config({"VERIF_ETA": "1e-3", "VERIF_THREADS": "3"}),
                         SimpleNamespace(n_s=4, n=128, eta=1e-3, M=7113),
@@ -245,6 +246,10 @@ def test_band_file_round_trip_and_hash(tmp_path):
 
 
 def _changed(v):
+    if v is None:
+        return "12.0"
+    if isinstance(v, list):
+        return [*v, "another model"]
     return v + "x" if isinstance(v, str) else 2 * v if isinstance(v, float) else v + 1
 
 
@@ -377,3 +382,62 @@ def test_the_bands_judge_what_they_were_fitted_on(mlp, tmp_path):
     bands = Bands.from_json(band_file_bytes(cal))
     rej = v.freeze(bands)
     assert rej is not None and rej.check_id == "5"
+
+
+NEW_KEYS = ("gpu_models", "torch", "cuda")
+
+
+@pytest.mark.parametrize("key", NEW_KEYS)
+def test_a_file_fitted_on_another_gpu_or_build_is_refused_naming_the_key(tmp_path, key):
+    assert key in CTX and key not in PROVENANCE_KEYS
+    _write(tmp_path / "bands.json", {**CTX, key: _changed(CTX[key])})
+    with pytest.raises(BandFileMismatch, match=rf"\({key}: file .*, run .*\): rerun"):
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
+
+
+def test_a_file_from_before_the_gpu_keys_is_refused_with_the_rerun_message(tmp_path):
+    old = {x: v for x, v in CTX.items() if x not in NEW_KEYS}
+    _write(tmp_path / "bands.json", old)
+    with pytest.raises(BandFileMismatch) as e:
+        load_bands(tmp_path / "bands.json", k=K, context=CTX)
+    msg = str(e.value)
+    for key in NEW_KEYS:
+        assert f"{key}: file missing" in msg
+    assert "written before cuda, gpu_models, torch existed lacks them" in msg
+    assert msg.endswith("rerun verification.runs.calibrate (P10a)")
+
+
+def _fake_gpus(monkeypatch, names):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda i: names[i])
+
+
+def test_gpu_models_are_the_sorted_distinct_names_of_the_cuda_devices_in_use(monkeypatch):
+    _fake_gpus(monkeypatch, ["H100", "H100", "B200", "H100"])
+    ctx = lambda **env: band_context(  # noqa: E731
+        load_config({"VERIF_ETA": "1e-3", **env}),
+        SimpleNamespace(n_s=4, n=128, eta=1e-3, M=7113), h_D=bytes(range(32)), k=K)
+    assert ctx(VERIF_DEVICE="cuda:0")["gpu_models"] == ["H100"]
+    assert ctx(VERIF_DEVICE="cuda")["gpu_models"] == ["H100"]
+    assert ctx(VERIF_DEVICE="cuda:0", VERIF_VERIFIER_DEVICES="cuda:1,cuda:3")["gpu_models"] \
+        == ["H100"]
+    assert ctx(VERIF_DEVICE="cuda:0", VERIF_VERIFIER_DEVICES="cuda:1,cuda:2")["gpu_models"] \
+        == ["B200", "H100"]
+    assert ctx(VERIF_DEVICE="cpu")["gpu_models"] == []
+
+
+def test_an_unsharded_file_judges_a_sharded_run_on_the_same_model(tmp_path, monkeypatch):
+    """The split replay is bit-identical to the one-GPU replay, so the layout is not compared."""
+    _fake_gpus(monkeypatch, ["H100", "H100"])
+    def ctx(**env):
+        return band_context(load_config({"VERIF_ETA": "1e-3", **env}),
+                            SimpleNamespace(n_s=4, n=128, eta=1e-3, M=7113),
+                            h_D=bytes(range(32)), k=K)
+    one = ctx(VERIF_DEVICE="cuda")  # the full-scale settings
+    pair = ctx(VERIF_DEVICE="cuda:0", VERIF_VERIFIER_DEVICES="cuda:0,cuda:1")
+    assert one["device"] == pair["device"] == "cuda"
+    assert one["gpu_models"] == pair["gpu_models"] == ["H100"]
+    written = _write(tmp_path / "bands.json", one)
+    assert load_bands(tmp_path / "bands.json", k=K, context=pair) == written
+    assert ctx(VERIF_DEVICE="cpu")["device"] == "cpu"

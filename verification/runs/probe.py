@@ -2,11 +2,29 @@
 (archive/PROFILING_PLAN §5.5).
 
     .venv/bin/python -m verification.runs.probe --out probe.json [--seconds 120]
+        [--devices cuda:0,cuda:1,...]
 
 Runs at the session's settings (``setup_determinism`` and ``VERIF_THREADS``, read through
 ``load_config``), so a rate holds for the run that follows. It writes ``probe.json``, whose
 rates and costs the bottleneck rule divides a section's work by. A measure the device can't
 make is ``null`` with its reason under ``errors``: every CUDA measure on a CPU run.
+
+It measures every device the run uses (``VERIF_DEVICE``, then ``VERIF_VERIFIER_DEVICES``,
+normalized, repeats dropped), or the ``--devices`` list instead. The host-only measures
+(``host_memcpy``, ``first_touch``, ``hash``, ``pinned_alloc``) run once, first. Each CUDA device,
+in order, runs the GPU measures (``gemm``, ``skinny``, ``hbm``, ``transfers``,
+``bf16_transfers``, ``costs``, and ``hash_kernel``, the BLAKE3 kernel on device tensors through
+``leaf_hashes_of``) with ``torch.cuda.set_device`` on it. Last, every ordered pair of CUDA
+devices gets a peer rate: one direct copy of a 256 MiB buffer to a buffer made and filled
+before the clock, timed between syncs of both devices. Version 2 of the file keeps every v1
+key, with v1's meaning for the first device, and adds ``devices``, ``per_device`` (name, UUID,
+datasheet, rates, costs and errors of each CUDA device), ``peer`` (bytes/s per ordered pair,
+``null`` when it failed) and ``peer_errors``.
+
+``--seconds`` is the budget of each device's GPU measures. The host measures take about 28/101
+of it once, and a peer pair 1% of it. A four-GPU probe at the default 120 s takes about
+4 * 120 + 33 + 12 * 1.2 = 530 s of measures, with each device's allocations and warm-ups on top
+(about 9 minutes); the one-GPU probe takes about 2.5.
 
 Each measure runs two warm-ups, then repeats until its share of ``--seconds`` is spent (at
 least 3 repeats, fewer if they run past 3 times the share) and reports the median. A measure
@@ -37,12 +55,12 @@ import torch
 
 from setup.config import load_config, setup_determinism
 
-from setup.machine import machine_facts
+from setup.machine import machine_facts, torch_gpu_uuid
 
 __all__ = ["VERSION", "DATASHEET", "datasheet_for", "fit_hash_rate", "fit_alloc_rate", "run_probe",
-           "main"]
+           "probe_devices", "main"]
 
-VERSION = 1
+VERSION = 2
 GIB = 1 << 30
 WARMUPS = 2
 MIN_REPS = 3
@@ -56,7 +74,11 @@ RATE_KEYS = ("gemm_bf16_flops", "gemm_fp32_flops", "skinny_bmm_fp32_flops", "hbm
              "hbm_reduce_bytes", "h2d_pinned_bytes", "d2h_pinned_bytes", "h2d_pageable_bytes",
              "d2h_pageable_bytes", "h2d_bf16_to_fp32_blocking_bytes",
              "h2d_bf16_cast_on_gpu_bytes", "host_first_touch_bytes", "hash", "host_memcpy_bytes",
-             "pinned_alloc_bytes", "pinned_alloc_per_call_s")
+             "pinned_alloc_bytes", "pinned_alloc_per_call_s", "hash_kernel")
+# The host-only measures (run once), and those of them that need no CUDA.
+HOST_RATE_KEYS = ("host_memcpy_bytes", "host_first_touch_bytes", "hash", "pinned_alloc_bytes",
+                  "pinned_alloc_per_call_s")
+HOST_DONE_KEYS = ("host_first_touch_bytes", "hash", "host_memcpy_bytes")
 COST_KEYS = ("launch_s", "sync_s", "event_pair_s", "tolist_s", "empty_cache_s")
 
 # GPU name -> peaks. H100 SXM, from NVIDIA's datasheet: dense bf16 and tf32 (the 1979 and 989
@@ -510,103 +532,215 @@ def _hash_computation() -> Any:
     return DecoderComputation(cfg, n_s=1, n=8, eta=1.0)
 
 
-def measure_hash(share_s: float, rates: dict, errors: dict) -> None:
+def measure_hash(share_s: float, rates: dict, errors: dict, *,
+                 device: torch.device | str | None = None) -> None:
     """Time leaf mixes through ``leaf_hashes_of`` (native hasher on) and fit the per-byte and
-    per-leaf cost."""
+    per-leaf cost. On the host (``device`` None) the mixes are host tensors and the result is
+    ``rates["hash"]``. On a CUDA ``device`` they are tensors there, the kernel route
+    (``kernel=True``, the default) hashes them in place, each call is timed between device
+    syncs, and the result is ``rates["hash_kernel"]`` (no ``threads``: the kernel's rate is the
+    GPU's). The kernel is built before the clock, so the NVRTC build isn't timed."""
     from verification.commitment import native
     from verification.commitment.leaves import _tensor_slot, leaf_hashes_of
+    key_out = "hash" if device is None else "hash_kernel"
+    cuda = device is not None
     try:
         if not native.enabled():
             raise RuntimeError("the native hasher isn't available (build it with "
                                "python -m verification.commitment.native)")
         c = _hash_computation()
+        if cuda:
+            from verification.commitment.gpu_blake3 import GpuBlake3
+            GpuBlake3().kernels(torch.device(device))
         pools, slot = {}, {}
         g = torch.Generator().manual_seed(0)
         for key, name in _HASH_SLOTS.items():
             slot[key] = c.n_s + c.weight_names.index(name)
             _, shape, dtype, _ = _tensor_slot(c, slot[key])
             pools[key] = [torch.randn(shape, generator=g).to(dtype) for _ in range(_HASH_POOL)]
+            if cuda:
+                pools[key] = [t.to(device) for t in pools[key]]
         per = share_s / len(_HASH_MIXES)
         mixes = []
         for key, count in _HASH_MIXES:
             pool, idx = pools[key], slot[key]
             items = [(idx, pool[i % _HASH_POOL]) for i in range(count)]
             nbytes = count * pool[0].numel() * pool[0].element_size()
-            t = Clock(per).median(lambda: _timed(lambda: leaf_hashes_of(c, items), False))
+            t = Clock(per).median(lambda: _timed(lambda: leaf_hashes_of(c, items), cuda))
             mixes.append((nbytes, count, t))
         per_byte, per_leaf = fit_hash_rate(mixes)
         if per_byte <= 0:
             raise RuntimeError(f"fit gave per_byte_s = {per_byte:.3g}; mixes {mixes}")
-        rates["hash"] = {"per_byte_s": per_byte, "per_leaf_s": per_leaf,
-                         "threads": torch.get_num_threads(),
-                         "per_leaf_refit_to_zero": per_leaf == 0.0,
-                         "residual": fit_residual(mixes, per_byte, per_leaf),
-                         "mixes": [{"leaves": n, "bytes": b, "seconds": t}
-                                   for b, n, t in mixes]}
+        rate = {"per_byte_s": per_byte, "per_leaf_s": per_leaf,
+                "per_leaf_refit_to_zero": per_leaf == 0.0,
+                "residual": fit_residual(mixes, per_byte, per_leaf),
+                "mixes": [{"leaves": n, "bytes": b, "seconds": t} for b, n, t in mixes]}
+        if not cuda:
+            rate["threads"] = torch.get_num_threads()
+        rates[key_out] = rate
     except Exception as e:  # noqa: BLE001
-        errors["hash"] = f"{type(e).__name__}: {e}"
+        errors[key_out] = f"{type(e).__name__}: {e}"
 
 
 # ---- the probe ------------------------------------------------------------------------
 
 
-def run_probe(seconds: float, *, env: dict[str, str] | None = None) -> dict[str, Any]:
-    """The probe's document, at the settings ``env`` (default: the process's) names."""
-    t_start = time.perf_counter()
-    cfg = load_config(env)
-    setup_determinism(cfg)
-    from verification.parameters import load_protocol_config
-    k_cols = load_protocol_config(env).k
-    cuda = cfg.device.startswith("cuda") and torch.cuda.is_available()
-    rates: dict[str, Any] = {k: None for k in RATE_KEYS}
-    costs: dict[str, Any] = {k: None for k in COST_KEYS}
-    errors: dict[str, str] = {}
-    shapes: list[dict[str, Any]] = []
+# What a device's GPU measures weigh in its ``--seconds`` budget, and what the host-only
+# measures weigh against the same unit (their share is ``seconds * weight / 101``, as the
+# one-GPU probe's was, so the default 120 s gives the host measures about 33 s in all).
+_GPU_WEIGHTS = {"gemm": 30, "skinny": 5, "hbm": 8, "transfers": 12, "bf16_transfers": 8,
+                "costs": 10, "hash_kernel": 8}
+_HOST_WEIGHTS = {"host_memcpy": 4, "first_touch": 4, "hash": 14, "pinned_alloc": 6}
+_HOST_UNIT = 101
+PEER_BYTES = 256 << 20
+PEER_SHARE = 0.01  # of ``--seconds``, per ordered pair (1.2 s at the default; at least 3 copies)
+GPU_RATE_KEYS = tuple(k for k in RATE_KEYS if k not in HOST_RATE_KEYS)
 
-    measures: list[tuple[str, float, Callable[[float], None]]] = [
-        ("host_memcpy", 4, lambda s: measure_host_memcpy(s, rates, errors)),
-        ("first_touch", 4, lambda s: measure_first_touch(s, rates, errors)),
-        ("hash", 14, lambda s: measure_hash(s, rates, errors)),
-    ]
-    if cuda:
-        torch.cuda.set_device(torch.device(cfg.device).index or 0)
-        measures += [
-            ("gemm", 30, lambda s: measure_gemm(s, rates, errors, shapes)),
-            ("skinny", 5, lambda s: measure_skinny(s, k_cols, rates, errors, shapes)),
-            ("hbm", 8, lambda s: measure_hbm(s, rates, errors)),
-            ("pinned_alloc", 6, lambda s: measure_pinned_alloc(s, rates, errors)),
-            ("transfers", 12, lambda s: measure_transfers(s, rates, errors)),
-            ("bf16_transfers", 8, lambda s: measure_bf16_transfers(s, rates, errors)),
-            ("costs", 10, lambda s: measure_costs(s, costs, errors)),
-        ]
-    else:
-        shapes += listed_shapes(gemm_todo(errors))
-        why = ("CUDA is not available" if cfg.device.startswith("cuda")
-               else f"no CUDA device (device={cfg.device})")
-        for key in (*RATE_KEYS, *COST_KEYS):
-            if key not in ("host_first_touch_bytes", "hash", "host_memcpy_bytes"):
-                errors[key] = why
-    total = sum(w for _, w, _ in measures)
-    for name, weight, fn in measures:
+
+def probe_devices(cfg: Any, override: str | None = None) -> list[str]:
+    """The devices the probe measures, normalized (a bare ``cuda`` is the current device's
+    index) and without repeats: ``override`` (``--devices``, comma-separated) when given, else
+    the run's own: the prover's ``cfg.device``, then ``cfg.verifier_devices``."""
+    from verification.runs.metrics import normalize_devices
+    names = ([d.strip() for d in override.split(",") if d.strip()] if override
+             else [cfg.device, *(cfg.verifier_devices or ())])
+    return [str(d) for d in normalize_devices(names)]
+
+
+def measure_peer(src: torch.device, dst: torch.device, share_s: float) -> float:
+    """Bytes per second of one direct copy of a 256 MiB buffer from ``src`` to a buffer on
+    ``dst`` made and filled before the clock, timed between syncs of both devices (the median
+    of the repeats)."""
+    a = torch.empty(PEER_BYTES, dtype=torch.uint8, device=src)
+    b = torch.empty(PEER_BYTES, dtype=torch.uint8, device=dst)
+    a.fill_(1)
+    b.fill_(0)
+
+    def once() -> float:
+        torch.cuda.synchronize(src)
+        torch.cuda.synchronize(dst)
+        t0 = time.perf_counter()
+        b.copy_(a)
+        torch.cuda.synchronize(src)
+        torch.cuda.synchronize(dst)
+        return time.perf_counter() - t0
+    return PEER_BYTES / Clock(share_s).median(once)
+
+
+def measure_gpu(device: str, share_s: float, k_cols: int, rates: dict, costs: dict,
+                errors: dict, shapes: list) -> None:
+    """One CUDA device's measures (``torch.cuda.set_device`` on it first): ``share_s`` is the
+    device's whole GPU budget, split by :data:`_GPU_WEIGHTS`. A measure that raises records
+    its error and the others run on."""
+    torch.cuda.set_device(torch.device(device).index)
+    total = sum(_GPU_WEIGHTS.values())
+    measures: dict[str, Callable[[float], None]] = {
+        "gemm": lambda s: measure_gemm(s, rates, errors, shapes),
+        "skinny": lambda s: measure_skinny(s, k_cols, rates, errors, shapes),
+        "hbm": lambda s: measure_hbm(s, rates, errors),
+        "transfers": lambda s: measure_transfers(s, rates, errors),
+        "bf16_transfers": lambda s: measure_bf16_transfers(s, rates, errors),
+        "costs": lambda s: measure_costs(s, costs, errors),
+        "hash_kernel": lambda s: measure_hash(s, rates, errors, device=device),
+    }
+    for name, fn in measures.items():
         try:
-            fn(seconds * weight / total)
+            fn(share_s * _GPU_WEIGHTS[name] / total)
         except Exception as e:  # noqa: BLE001 - what a measure's own handlers missed
             errors[f"measure:{name}"] = f"{type(e).__name__}: {e}"
         finally:
             _free()
 
-    gpu_name = torch.cuda.get_device_name(torch.device(cfg.device)) if cuda else None
+
+def run_probe(seconds: float, *, env: dict[str, str] | None = None,
+              devices: str | None = None) -> dict[str, Any]:
+    """The probe's document, at the settings ``env`` (default: the process's) names, for the
+    run's devices or for ``devices`` (:func:`probe_devices`)."""
+    t_start = time.perf_counter()
+    cfg = load_config(env)
+    setup_determinism(cfg)
+    from verification.parameters import load_protocol_config
+    k_cols = load_protocol_config(env).k
+    names = probe_devices(cfg, devices)
+    cuda_ok = torch.cuda.is_available()
+    cuda_devs = [d for d in names if d.startswith("cuda")] if cuda_ok else []
+    first = names[0]
+    cuda = first.startswith("cuda") and cuda_ok  # the first device's GPU measures are v1's
+    rates: dict[str, Any] = {k: None for k in RATE_KEYS}
+    costs: dict[str, Any] = {k: None for k in COST_KEYS}
+    errors: dict[str, str] = {}
+    shapes: list[dict[str, Any]] = []
+    per_device: dict[str, dict[str, Any]] = {}
+    peer: dict[str, float | None] = {}
+    peer_errors: dict[str, str] = {}
+
+    def host_measure(name: str, fn: Callable[[float], None]) -> None:
+        try:
+            fn(seconds * _HOST_WEIGHTS[name] / _HOST_UNIT)
+        except Exception as e:  # noqa: BLE001 - what a measure's own handlers missed
+            errors[f"measure:{name}"] = f"{type(e).__name__}: {e}"
+        finally:
+            _free()
+
+    # The host-only measures run first, once. The pinned allocations must come before any
+    # transfer measure: a transfer's freed 1 GiB pinned block stays cached and would answer them.
+    if cuda_devs:
+        torch.cuda.set_device(torch.device(cuda_devs[0]).index)
+    host_measure("host_memcpy", lambda s: measure_host_memcpy(s, rates, errors))
+    host_measure("first_touch", lambda s: measure_first_touch(s, rates, errors))
+    host_measure("hash", lambda s: measure_hash(s, rates, errors))
+    if cuda_devs:
+        host_measure("pinned_alloc", lambda s: measure_pinned_alloc(s, rates, errors))
+    for dev in cuda_devs:
+        d_rates: dict[str, Any] = {k: None for k in GPU_RATE_KEYS}
+        d_costs: dict[str, Any] = {k: None for k in COST_KEYS}
+        d_errors: dict[str, str] = {}
+        d_shapes: list[dict[str, Any]] = []
+        measure_gpu(dev, seconds, k_cols, d_rates, d_costs, d_errors, d_shapes)
+        name = torch.cuda.get_device_name(torch.device(dev))
+        per_device[dev] = {"name": name, "uuid": torch_gpu_uuid(torch.device(dev)),
+                           "datasheet": datasheet_for(name), "rates": d_rates,
+                           "costs": d_costs, "errors": d_errors}
+        if dev == first:  # v1's keys: the first device's GPU measures beside the host's
+            rates.update(d_rates)
+            costs.update(d_costs)
+            errors.update(d_errors)
+            shapes += d_shapes
+    if not cuda:
+        shapes += listed_shapes(gemm_todo(errors))
+        why = ("CUDA is not available" if first.startswith("cuda")
+               else f"no CUDA device (device={first})")
+        done = (*HOST_DONE_KEYS, *(HOST_RATE_KEYS[3:] if cuda_devs else ()))
+        for key in (*RATE_KEYS, *COST_KEYS):
+            if key not in done:
+                errors[key] = why
+    for src in cuda_devs:
+        for dst in cuda_devs:
+            if src == dst:
+                continue
+            key = f"{src}->{dst}"
+            try:
+                peer[key] = measure_peer(torch.device(src), torch.device(dst),
+                                         seconds * PEER_SHARE)
+            except Exception as e:  # noqa: BLE001 - one pair's failure leaves the rest
+                peer[key] = None
+                peer_errors[key] = f"{type(e).__name__}: {e}"
+            finally:
+                _free()
+
+    gpu_name = per_device[first]["name"] if cuda else None
     try:
         facts = machine_facts()
     except Exception as e:  # noqa: BLE001
         facts = None
         errors["machine"] = f"{type(e).__name__}: {e}"
-    return {"version": VERSION, "device": cfg.device, "machine": facts,
+    return {"version": VERSION, "device": first, "devices": names, "machine": facts,
             "threads": torch.get_num_threads(),
             "determinism": {"tf32": bool(torch.backends.cuda.matmul.allow_tf32),
                             "deterministic": bool(torch.are_deterministic_algorithms_enabled())},
             "rates": rates, "costs": costs, "shapes": shapes,
             "datasheet": datasheet_for(gpu_name), "errors": errors,
+            "per_device": per_device, "peer": peer, "peer_errors": peer_errors,
             "wall_s": time.perf_counter() - t_start}
 
 
@@ -614,9 +748,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", type=Path, required=True, help="where to write probe.json")
     ap.add_argument("--seconds", type=float, default=120.0,
-                    help="the probe's time budget, shared between its measures")
+                    help="the budget of each device's GPU measures; the host measures and the "
+                         "peer pairs take their own small shares")
+    ap.add_argument("--devices", default=None,
+                    help="comma-separated devices to measure (cuda:0,cuda:1,...), in place of "
+                         "the run's own (VERIF_DEVICE, then VERIF_VERIFIER_DEVICES)")
     args = ap.parse_args(argv)
-    doc = run_probe(args.seconds)
+    doc = run_probe(args.seconds, devices=args.devices)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(doc, indent=2) + "\n")
     print(f"probe: wrote {args.out} ({doc['wall_s']:.1f} s, {len(doc['errors'])} unmeasured)",

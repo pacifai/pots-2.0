@@ -4,6 +4,7 @@ a round trip through the session's own upload check on a fake Hugging Face cache
 import hashlib
 import json
 import os
+import platform
 import shutil
 import tarfile
 from pathlib import Path
@@ -228,6 +229,8 @@ def test_prepare_round_trips_through_the_session_check(tmp_path, home):
         t.extractall(tmp_path / "pod", filter="data")
     up = tmp_path / "pod" / prep.TOP
     assert (up / "requirements-fs11.txt").read_text().count("torch==") == 1
+    assert json.loads((up / "manifest.json").read_text())["python_version"] == \
+        man["python_version"] == platform.python_version()
     assert (up / "hf/hub" / f"models--Qwen--Qwen2.5-0.5B-Instruct/.no_exist/{QWEN05[1]}"
             / "added_tokens.json").is_file()
     assert (up / "bench_cache" / prep.BLAKE3_DIR / "blake3.c").is_file()

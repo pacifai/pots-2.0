@@ -2,7 +2,7 @@
 
     .venv/bin/python -m verification.runs.fs11_session run --upload DIR --out DIR --deadline EPOCH
         [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,fs32-pair,
-                    device-leaves}]
+                    device-leaves,four-h100}]
     .venv/bin/python -m verification.runs.fs11_session fetch-models --upload DIR --out DIR
     .venv/bin/python -m verification.runs.fs11_session env --out DIR
 
@@ -16,15 +16,19 @@ check (:func:`profile_check_plan`, below), or ``nvlink-probe``, the four-card ha
 H100 (:func:`kernel_speed_plan`, below: the upload holds the repo, the native sources and the
 Mac's ``kernel_speed_sizes.json``, no models; ``fs11_prep --session kernel-speed`` packs it),
 ``fs32-pair``, the sharded run on two GPUs (:func:`fs32_pair_plan`, below), or
-``device-leaves``, FS30's check of the device leaves (:func:`device_leaves_plan`, below).
+``device-leaves``, FS30's check of the device leaves (:func:`device_leaves_plan`, below), or
+``four-h100``, FS35's sequential and pipelined steps on four H100s (:func:`four_h100_plan`,
+below; it refuses a machine with fewer than four CUDA devices, and one without an H100 unless
+``FS11_ALLOW_ANY_GPU=1``; ``summary.json["four_h100"]`` is :func:`four_h100`'s result and its
+log ends with :func:`_four_lines`'s ``FS35 ok`` / ``FS35 FAIL`` lines).
 The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
 the upload's ``native_cache/`` into it once, offline, so no later part's timing includes the
-compile). A plan for two or more GPUs (``nvlink-probe``, ``fs32-pair``) lists the F22 peer-copy
-byte check, ``peer_check``, first among its own parts, ahead of the models part (the native
-build, which every plan gets, runs ahead of it), and a pair that lands wrong bytes stops the
-session (:func:`peer_check_part`, :func:`peer_check_stop`):
+compile). A plan for two or more GPUs (``nvlink-probe``, ``fs32-pair``, ``four-h100``) lists the
+F22 peer-copy byte check, ``peer_check``, first among its own parts, ahead of the models part
+(the native build, which every plan gets, runs ahead of it), and a pair that lands wrong bytes
+stops the session (:func:`peer_check_part`, :func:`peer_check_stop`):
 
 1. **models.** ``fetch-models``: check every packed file of the upload against the manifest's
    SHA-256, then fetch each public model's weights at its pinned commit with ``token=False``
@@ -115,8 +119,8 @@ A pytest part that wrote its junit report and has not exited :data:`EXIT_HANG_GR
 later has hung at exit: its ``/proc`` snapshot (``hang.txt``) is written, SIGUSR1 makes it dump
 every thread's stack into ``stacks.txt`` (``POTS_STACKS_FILE``), it is killed, and its status is
 ``exit_hang``, a failure like ``killed_timeout`` and ``killed_deadline``, which get the same
-snapshot first. In ``fs32-pair`` the exit probe (:func:`run_exit_probe`) follows the fast suite
-and names the test module that cannot exit; it never changes ``pass``.
+snapshot first. ``exit-probe`` (:func:`run_exit_probe`) is run by hand to find a module that
+hangs at exit: each test module in its own pytest process.
 ``summary.json`` is rewritten after each part.
 
 Before any part, ``run`` prints the environment (GPU, driver, CUDA, torch, free disk and RAM)
@@ -125,6 +129,11 @@ to ``environment.json`` and refuses to start unless CUDA is available and the GP
 and runs :func:`selftest_plan`'s stand-in parts, which need only the standard library. Exits 0
 when every part succeeded, 1 when any failed, and :data:`EXIT_REFUSED` when the environment
 check refused.
+
+``run`` also refuses when the running Python's version is not the one the upload's manifest
+records (:func:`python_mismatch`; the self-test is exempt): 3.14.0 hangs at exit (gh-146313), and
+``fs11_setup.sh`` builds the pod's venv at the Mac's version. ``FS11_ALLOW_PYTHON_MISMATCH=1``
+overrides.
 """
 
 from __future__ import annotations
@@ -132,6 +141,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -154,6 +164,7 @@ __all__ = ["PROFILE_CHECK_TIMEOUT_S", "PROFILE_HELD", "PROFILE_PINS", "SMOLLM2_E
            "kernel_speed_plan", "device_leaves_plan", "device_leaves_gate",
            "kernel_speed_gate", "SIZES_NAME", "load_plan",
            "selftest_plan", "fs31_cards", "hw3_cards", "fs32_pair_plan", "fs32_pair",
+           "four_h100_plan", "four_h100", "four_default_deadline_s", "FOUR_TEST_FILES",
            "with_native_build",
            "choose_plan", "run_session", "fix2_ab",
            "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
@@ -350,6 +361,29 @@ def refusal(env: Mapping[str, Any], allow_any_gpu: bool, min_cards: int | None =
     return None
 
 
+PYTHON_MISMATCH_ENV = "FS11_ALLOW_PYTHON_MISMATCH"
+
+
+def python_mismatch(upload: Path, running: str) -> str | None:
+    """Why the pod's Python is not the packing machine's, or ``None``. The upload's manifest
+    records the Mac's version (``python_version``). CPython 3.14.0 can hang at exit (the
+    resource tracker's deadlock, gh-146313), and the cure, 3.14.7, is only a venv built with
+    ``fs11_setup.sh`` away. An older upload without the key is refused with its own message."""
+    try:
+        want = json.loads((upload / "manifest.json").read_text()).get("python_version")
+    except (OSError, ValueError, AttributeError) as e:
+        return (f"the upload's manifest.json is unreadable ({type(e).__name__}: {e}), so the "
+                "Python version it records can't be checked")
+    if not want:
+        return ("the upload's manifest.json records no Python version (an older upload): "
+                "repack it with fs11_prep, which records the Mac's")
+    if want != running:
+        return (f"the pod's Python {running} is not the Mac's {want}: another Python can behave "
+                "differently at exit (3.14.0 hangs there, gh-146313); build the venv with "
+                "fs11_setup.sh")
+    return None
+
+
 def _gib(x: int | None) -> str:
     return "?" if x is None else f"{x / 2**30:.1f} GiB"
 
@@ -468,6 +502,7 @@ def _peer_check_extras(report: Path) -> dict[str, Any]:
         "all_ok": doc.get("all_ok") is True, "reason": doc.get("reason"),
         "wrong": wrong, "raised": raised, "card_suspect": suspect, "cannot": cannot,
         "min_gbps": min(rates) if rates else None, "seconds": doc.get("seconds"),
+        "gbps": {k: p["gbps"] for k, p in pairs.items() if p.get("gbps")},
         "devices": doc.get("devices")}}
 
 
@@ -1023,7 +1058,7 @@ def device_leaves_gate(parts: Sequence[Mapping[str, Any]],
 # Time limits, seconds, of its parts; the fast suite's limit allows twice its estimated 25 min.
 PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "calibrate": 900,
                   "card": 900, "run": 900, "run_metrics": 1800, "cheat": 900,
-                  "fs34_tests": 900, "exit_probe": 5100}
+                  "fs34_tests": 900}
 # Estimates, minutes, scaled by hand (none was measured on two cards): the peer-copy byte check
 # 1 (two ordered pairs; its limit is 5), the models part 2-5, the
 # native build 1-2, the fast suite 13-25 on 10 vCPUs (the CUDA tests run on it for the first
@@ -1034,14 +1069,11 @@ PAIR_TIMEOUT_S = {"models": 1800, "fast_suite": 3600, "two_gpu_slow": 1800, "cal
 # pipelined run about 6, the one with metrics on about 12 (its memory pass and counting pass add
 # two more passes), the three pipelined cheats about 12 together. FS34's two-GPU join tests
 # (``fs34_tests``: a tiny sharded step, a run_loop and the kernel's first build on each card)
-# about 5, an estimate. The exit probe (:data:`EXIT_PROBE_MODULES`, 30 modules) about 42: its
-# modules' times in the fast suite on the pod sum to 14 min, run alone with about 25 s of start-up
-# each (13 min) and again all together (14 min, 1 min of start-up) if none hangs; its limit is
-# 85 min, and a run that hangs costs its 60 s grace.
+# about 5, an estimate.
 PAIR_ESTIMATE_MIN = {"peer_check": 1, "models": 5, "native_build": 2, "fast_suite": 25,
                      "two_gpu_slow": 10, "fs34_tests": 5, "calibrate": 5, "card": 6, "run": 12,
                      "cheat": 12, "run_pipelined": 6, "run_pipelined_metrics": 12,
-                     "cheat_pipelined": 12, "exit_probe": 42}
+                     "cheat_pipelined": 12}
 PAIR_PACK_MIN, PAIR_GRACE_MIN = 1, 20  # the job's packing and grace window, minutes
 PAIR_STEPS = 3
 PAIR_CARDS = 2  # the session refuses a machine with fewer CUDA devices
@@ -1068,20 +1100,6 @@ PAIR_SLOW_SELECT = "two_gpus or two_cuda_devices"
 
 
 FS34_TESTS_FILE = "tests/verification/runs/test_fs34_join_cuda.py"
-
-
-def _exit_probe_part(out: Path, timeout_s: float, output_dir: Path) -> Part:
-    """The exit probe (:func:`run_exit_probe`) as a part: it runs after the fast suite, in the
-    fast suite's environment (``output_dir`` its ``VERIF_OUTPUT_DIR``), writes one JSON report
-    and never counts toward ``pass`` (it is not in :data:`PAIR_PARTS`)."""
-    d = out / "parts" / EXIT_PROBE_NAME
-    return Part(EXIT_PROBE_NAME, ["{python}", "-m", "verification.runs.fs11_session",
-                                  "exit-probe", "--out", str(d), "--budget-s",
-                                  str(timeout_s - EXIT_PROBE_MIN_S)],
-                env={"VERIF_OUTPUT_DIR": str(output_dir), "VERIF_VERIFIER_DEVICES": None,
-                     "VERIF_PIPELINED": None},
-                timeout_s=timeout_s, kind="exit_probe",
-                info={"report": str(d / EXIT_PROBE_REPORT)})
 
 
 def _fs34_tests_part(out: Path, timeout_s: float, output_dir: Path) -> Part:
@@ -1174,7 +1192,6 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
     steps = ("--steps", str(PAIR_STEPS), "--keep-step", str(PAIR_STEPS), "--no-metrics")
     plan = [peer_check_part(out), _models_part(upload, out, t["models"]),
             pytest_part("fast_suite", t["fast_suite"]),
-            _exit_probe_part(out, t["exit_probe"], _run_dir(out, upload, key, "pytest")),
             pytest_part("two_gpu_slow", t["two_gpu_slow"], "-m", "slow", "-k", PAIR_SLOW_SELECT),
             _fs34_tests_part(out, t["fs34_tests"], _run_dir(out, upload, key, "pytest")),
             part("smollm2_calibrate", "calibrate", home, t["calibrate"],
@@ -1210,6 +1227,125 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
     return plan
 
 
+# FS35's four-H100 session (``four-h100``): F22's machine, GPU 0 trains and GPUs 1-3 hold, hash
+# and verify the transcript, sequential and pipelined, one verified step per model.
+FOUR_PROVER = "cuda:0"
+FOUR_VERIFIERS = "cuda:1,cuda:2,cuda:3"  # VERIF_VERIFIER_DEVICES of the sharded arms
+FOUR_CARDS = 4  # the session refuses a machine with fewer CUDA devices
+FOUR_STEPS = 3  # step 1 pays one-off costs; steps 2-3 give the steady step time
+# Cheapest first (the order the models' parts run in), by the short name the parts carry.
+FOUR_ORDER = ("Qwen2.5-0.5B", "Llama-3.2-1B", "Falcon3-1B", "Qwen2.5-1.5B")
+# Test files the session runs beside FS34's: the per-device tools' CUDA- and NVML-only tests
+# (the check-5 profile's CUDA file is left out until it exists). A missing file is named in the
+# summary.
+FOUR_TEST_FILES = ("tests/verification/runs/test_probe_cuda.py",
+                   "tests/setup/test_machine_cuda.py", "tests/setup/test_sampler_gpus.py")
+FOUR_RUN_NAME = "llama_step"  # the metrics directory of ``llama_step`` under VERIF_OUTPUT_DIR
+# Estimates, minutes, none measured on four GPUs: the native build 2, the peer check 1, the
+# models part 6, the tests 8, the probe 8 (60 s per device and the 12 pairs), each card part 3,
+# each sequential and each pipelined run 8 (three steps, no counting pass, one memory pass).
+FOUR_ESTIMATE_MIN = {"native_build": 2, "peer_check": 1, "models": 6, "four_tests": 8,
+                     "probe": 8, "card": 3, "seq": 8, "pipe": 8}
+# Time limits, seconds, about twice the estimates (the native build's is the build part's own).
+FOUR_TIMEOUT_S = {"models": 720, "four_tests": 960, "probe": 960, "card": 360, "seq": 960,
+                  "pipe": 960}
+FOUR_PACK_MIN, FOUR_GRACE_MIN = 1, 20  # the job's packing and grace window, minutes
+
+
+def four_model_key(repo: str) -> str:
+    """The short name a model's parts carry: ``Qwen/Qwen2.5-0.5B-Instruct`` is ``Qwen2.5-0.5B``."""
+    return repo.split("/")[-1].removesuffix("-Instruct")
+
+
+def four_pins(pins: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    """``pins`` with :data:`FOUR_ORDER`'s models first, in its order, and any other model after
+    them in the order given (an unlisted model is not an error: it must not break every
+    session at import)."""
+    def rank(p: tuple[str, str]) -> int:
+        k = four_model_key(p[0])
+        return FOUR_ORDER.index(k) if k in FOUR_ORDER else len(FOUR_ORDER)
+
+    return tuple(sorted(pins, key=rank))
+
+
+FOUR_PINS: tuple[tuple[str, str], ...] = four_pins(RUN_PINS)
+
+
+def four_estimated_min() -> int:
+    """The plan's estimated runtime, minutes: every part's estimate, the models' parts once per
+    model."""
+    e = FOUR_ESTIMATE_MIN
+    return (e["native_build"] + e["peer_check"] + e["models"] + e["four_tests"] + e["probe"]
+            + len(FOUR_PINS) * (e["card"] + e["seq"] + e["pipe"]))
+
+
+def four_default_deadline_s() -> int:
+    """The session's default deadline: twice the estimated runtime (the parts' estimates, the
+    job's packing and its grace window), in seconds, rounded up to 100 s. ``fs11_job.sh`` holds
+    the same figure as ``DEFAULT_DEADLINE_S`` for ``four-h100`` and a test holds them equal."""
+    minutes = four_estimated_min() + FOUR_PACK_MIN + FOUR_GRACE_MIN
+    return -(-2 * minutes * 60 // 100) * 100
+
+
+def four_h100_plan(upload: Path, out: Path) -> list[Part]:
+    """The four-H100 session's parts. The F22 peer-copy byte check first (the native build runs
+    ahead of it); the models part; ``four_tests``, one pytest part with a junit report running
+    every two-GPU test, slow or not (:data:`PAIR_SLOW_SELECT`: the non-slow ones put the
+    verifiers on GPUs 1-3 here), FS34's file and :data:`FOUR_TEST_FILES`,
+    on SmolLM2's test-scale data (its run
+    directory's ``data/`` link, as the pair plan's pytest parts have it);
+    the probe on all four GPUs (``VERIF_DEVICE`` GPU 0, :data:`FOUR_VERIFIERS` the rest, 60 s per
+    device); then, per model cheapest first, on the refusal task at :data:`FULL_SCALE_ENV` plus
+    :data:`RECHECK_ENV`: ``card_<key>`` (``card_identity`` on GPU 0 alone, one card's proved
+    step-1 root), ``seq_<key>`` (``llama_step``, three steps, metrics, no counting pass, sharded
+    over GPUs 1-3) and ``pipe_<key>`` (the same with ``VERIF_PIPELINED=1``), each in its own run
+    directory. Only the ``pipe_*`` parts set ``VERIF_PIPELINED``. Every part records its GPUs'
+    peak memory."""
+    t = FOUR_TIMEOUT_S
+    from setup.data import TEST_SCALE_TOKENIZER as pin  # the tests' model: SmolLM2
+    small = data_key(pin.repo, SMOLLM2_TASK)
+    sharded = {"VERIF_DEVICE": FOUR_PROVER, "VERIF_VERIFIER_DEVICES": FOUR_VERIFIERS}
+    junit = out / "parts" / "four_tests" / "junit.xml"
+    expr = " or ".join([f"({PAIR_SLOW_SELECT})",
+                        *(Path(f).stem for f in (FS34_TESTS_FILE, *FOUR_TEST_FILES))])
+    tests = Part("four_tests", ["{python}", "-m", "pytest", "-rf", "-q", f"--junitxml={junit}",
+                                "-p", "no:cacheprovider", "-m", "slow or not slow", "-k", expr],
+                 env={**PCI_ORDER_ENV,
+                      "VERIF_OUTPUT_DIR": str(_run_dir(out, upload, small, "four_pytest")),
+                      "VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
+                 timeout_s=t["four_tests"], kind="four_tests", info={"junit": str(junit)})
+    report = out / "probe" / "probe.json"
+    probe = Part("probe", ["{python}", "-m", "verification.runs.probe", "--out", str(report),
+                           "--seconds", "60"],
+                 env={**FULL_SCALE_ENV, **PCI_ORDER_ENV, **sharded, "VERIF_PIPELINED": None},
+                 timeout_s=t["probe"], kind="four_probe", info={"report": str(report)})
+    plan = [peer_check_part(out), _models_part(upload, out, t["models"]), tests, probe]
+    for repo, rev in FOUR_PINS:
+        k, key = four_model_key(repo), data_key(repo, BRING_UP_TASK)
+        base = {**FULL_SCALE_ENV, **RECHECK_ENV, **_run_env(repo, rev, BRING_UP_TASK),
+                **PCI_ORDER_ENV}
+        info = {"model": repo, "task": BRING_UP_TASK}
+        d = _run_dir(out, upload, key, f"four_{key}_card")
+        plan.append(Part(f"card_{k}", ["{python}", "-m", "verification.runs.card_identity",
+                                       "--out", str(d / "card.json")],
+                         env={**base, "CUDA_VISIBLE_DEVICES": "0", "VERIF_OUTPUT_DIR": str(d),
+                              "VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
+                         timeout_s=t["card"], kind="four_card",
+                         info={**info, "run_dir": str(d), "report": str(d / "card.json")}))
+        for arm, piped in (("seq", None), ("pipe", "1")):  # only the pipelined arm sets the mode
+            d = _run_dir(out, upload, key, f"four_{key}_{arm}")
+            plan.append(Part(
+                f"{arm}_{k}", ["{python}", "-m", "verification.runs.llama_step", "--steps",
+                               str(FOUR_STEPS), "--metrics", "--no-count"],
+                env={**base, **sharded, "VERIF_OUTPUT_DIR": str(d), "VERIF_PIPELINED": piped},
+                timeout_s=t[arm], kind="four_run",
+                info={**info, "arm": arm, "model_key": k, "run_dir": str(d),
+                      "records": str(d / FOUR_RUN_NAME / "records.jsonl")}))
+    for p in plan:
+        p.info["gpu_peak"] = True
+    return plan
+
+
 # Each session: its name in summary.json, and its plan.
 SESSIONS: dict[str, tuple[str, Callable[[Path, Path], list[Part]]]] = {
     "fs11": ("FS11", default_plan),
@@ -1219,10 +1355,11 @@ SESSIONS: dict[str, tuple[str, Callable[[Path, Path], list[Part]]]] = {
     "kernel-speed": ("kernel-speed", kernel_speed_plan),
     "fs32-pair": ("fs32-pair", fs32_pair_plan),
     "device-leaves": ("device-leaves", device_leaves_plan),
+    "four-h100": ("four-h100", four_h100_plan),
 }
 # The sessions that need two or more GPUs: each plan starts (after the native build) with
 # ``peer_check_part``. A new multi-GPU session is listed here, and a test holds it to that.
-MULTI_GPU_SESSIONS = ("nvlink-probe", "fs32-pair")
+MULTI_GPU_SESSIONS = ("nvlink-probe", "fs32-pair", "four-h100")
 
 
 def _run_env(repo: str, rev: str, task: str) -> dict[str, str | None]:
@@ -1655,15 +1792,18 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _nvlink_extras(Path(part.info["report"]))
         if part.kind == "kernel_speed":
             return _kernel_speed_extras(Path(part.info["report"]))
-        if part.kind in ("card", "pair_card"):
+        if part.kind in ("card", "pair_card", "four_card"):
             return _card_extras(Path(part.info["report"]))
+        if part.kind == "four_tests":
+            return _four_tests_extras(Path(part.info["junit"]))
+        if part.kind == "four_probe":
+            return _four_probe_extras(Path(part.info["report"]))
+        if part.kind == "four_run":
+            return _four_run_extras(log, Path(part.info["records"]))
         if part.kind == "pytest":
             return _pytest_extras(Path(part.info["junit"]))
         if part.kind in ("device_tests", "fs34_tests"):
             return _device_tests_extras(Path(part.info["junit"]))
-        if part.kind == "exit_probe":
-            report = Path(part.info["report"])
-            return {"exit_probe": json.loads(report.read_text()) if report.exists() else None}
         if part.kind == "pair_run":
             return _pair_run_extras(log, Path(part.info["weights"]))
         if part.kind == "cheat":
@@ -2046,6 +2186,406 @@ def _pair_lines(pair: Mapping[str, Any] | None) -> list[str]:
     s = pair["slowest_failing"]
     lines.append("FS32 slowest failing test: " + ("none" if s is None else
                  f"{s['name']} ({s['time_s']:.1f} s, {s['part']})"))
+    return lines
+
+
+# ---- FS35's four-H100 session: the parts' extras and the result ------------------------------
+
+
+def _four_records(path: Path) -> list[dict[str, Any]]:
+    """The JSON objects of a ``records.jsonl`` (a line cut short by a kill is skipped)."""
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(errors="replace").splitlines() if path.exists() else []:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _accumulated_gpu_s(side_s: Mapping[str, float],
+                       roles: Sequence[Mapping[str, Any]] | None) -> float | None:
+    """One step's accumulated GPU time, as the cost decision defines it (each GPU's held time
+    summed over the GPUs a part holds: three verifier GPUs for 1 s are 3 s): the prover side's
+    time times the number of prover GPUs plus the verifier side's time times the number of
+    verifier GPUs, both counts from the environment record's ``gpu_roles``. ``side_s`` holds the
+    step's ``total`` rows' ``time_s`` by side, each the sum of that side's top-level sections
+    (the ``run`` side and the harness's own sections are in neither). ``None`` when either side's
+    row or a role count is missing."""
+    if not isinstance(roles, list) or not all(s in side_s for s in ("prover", "verifier")):
+        return None
+    n = {s: sum(s in (g.get("roles") or ()) for g in roles if isinstance(g, dict))
+         for s in ("prover", "verifier")}
+    if not all(n.values()):
+        return None
+    return side_s["prover"] * n["prover"] + side_s["verifier"] * n["verifier"]
+
+
+def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
+    """A ``llama_step`` arm's result: from its log the verdict (``accepted``: the ``actual:
+    accept`` and ``PASS`` lines), each step's transcript root (``step_roots``), each step's
+    prover, verifier, hand-off and total time (``step_times``, ``report_costs``' lines) and the
+    printed ``loop_mode``; from its ``records.jsonl`` the environment record's GPUs
+    (``machine.gpus``: index and UUID; ``gpu_roles``), per step the ``step`` row's
+    ``gpu_held_upper_s`` (``metrics.py``'s ``gpu_held_s``: each section's seconds times every
+    device its process lists, an upper bound, not the cost decision's quantity), the
+    ``accumulated_gpu_s`` (:func:`_accumulated_gpu_s`) and the merged step's wall extent
+    (``step_wall`` rows' ``time_s``), and the memory pass's peak per device
+    (``device_peak_bytes`` and ``device_peak_reserved_bytes`` of the prover's and the verifier's
+    ``total`` rows, the larger over the steps)."""
+    lines = log.read_text(errors="replace").splitlines() if log.exists() else []
+    roots = {int(m[1]): m[2] for x in lines if (m := _PAIR_ROOT.match(x))}
+    stripped = [x.strip() for x in lines]
+    actual = next((x[len("actual:"):].strip() for x in stripped if x.startswith("actual:")), None)
+    rows = _four_records(records)
+    env = next((r for r in rows if r.get("record") == "environment"), None) or {}
+    gpus = (env.get("machine") or {}).get("gpus")
+    held: dict[int, float] = {}
+    wall: dict[int, float] = {}
+    side_s: dict[int, dict[str, float]] = {}
+    peaks: dict[str, dict[str, int | None]] = {}
+    for r in rows:
+        step = r.get("step")
+        if not isinstance(step, int) or step < 1:
+            continue
+        if r.get("record") == "time" and r.get("level") == "total":
+            if r.get("component") == "step" and _number(r.get("gpu_held_s")):
+                held[step] = r["gpu_held_s"]
+            if r.get("component") == "step_wall" and _number(r.get("time_s")):
+                wall[step] = r["time_s"]
+            if r.get("side") in ("prover", "verifier") and _number(r.get("time_s")):
+                side_s.setdefault(step, {})[r["side"]] = r["time_s"]
+        if (r.get("record") == "memory" and r.get("level") == "total"
+                and r.get("component") in ("prover", "verifier")
+                and isinstance(r.get("devices"), list)):
+            for field, key in (("device_peak_bytes", "peak_bytes"),
+                               ("device_peak_reserved_bytes", "peak_reserved_bytes")):
+                vals = r.get(field)
+                if not isinstance(vals, list) or len(vals) != len(r["devices"]):
+                    continue
+                for dev, v in zip(r["devices"], vals, strict=True):
+                    row = peaks.setdefault(dev, {"peak_bytes": None, "peak_reserved_bytes": None})
+                    if _number(v) and (row[key] is None or v > row[key]):
+                        row[key] = v
+    return {"accepted": actual == "accept" and "PASS" in stripped, "actual": actual,
+            "step_roots": [roots[t] for t in sorted(roots)], "loop_mode": _loop_mode(lines),
+            "step_times": _step_times(lines), "record": str(records) if rows else None,
+            "gpus": None if not isinstance(gpus, list) else [
+                {"index": g.get("index"), "uuid": g.get("uuid")} for g in gpus
+                if isinstance(g, dict)],
+            "gpu_roles": env.get("gpu_roles"),
+            "gpu_held_upper_s": [held[t] for t in sorted(held)],
+            "accumulated_gpu_s": [a for t in sorted(side_s)
+                                  if (a := _accumulated_gpu_s(side_s[t], env.get("gpu_roles")))
+                                  is not None],
+            "step_wall_s": [wall[t] for t in sorted(wall)], "device_peaks": peaks}
+
+
+def _four_tests_extras(junit: Path) -> dict[str, Any]:
+    """The tests part's cases (:func:`_device_tests_extras`) and, for FS34's file and each of
+    :data:`FOUR_TEST_FILES`, how many cases the junit report holds and how many were skipped
+    (``files``); ``missing_files`` names a file that does not exist in the checkout (the run
+    selects them by name, so a missing one collects nothing, and says nothing)."""
+    out = _device_tests_extras(junit)
+    wanted = (FS34_TESTS_FILE, *FOUR_TEST_FILES)
+    out["missing_files"] = [f for f in wanted if not (_REPO_ROOT / f).exists()]
+    cases = out.get("cases")
+    if cases is not None:
+        files = {}
+        for f in wanted:
+            mod = f.removesuffix(".py").replace("/", ".") + "::"
+            mine = [o for n, o in cases.items() if n.startswith(mod)]
+            files[f] = {"cases": len(mine), "skipped": sum(o == "skipped" for o in mine)}
+        out["files"] = files
+    return out
+
+
+def _four_probe_extras(report: Path) -> dict[str, Any]:
+    """:func:`_probe_extras` and, from the probe's version 2 report (I3), each measured device's
+    headline rates (``per_device``: bf16 GEMM, HBM copy, the hash kernel's seconds per byte) and
+    the ordered pairs' peer rates in bytes/s (``peer``, ``peer_errors``)."""
+    out = _probe_extras(report)
+    if not report.exists():
+        return out
+    doc = json.loads(report.read_text())
+    per: dict[str, Any] = {}
+    for name in doc.get("devices") or []:
+        rates = (doc.get("per_device", {}).get(name) or {}).get("rates") or {}
+        per[name] = {"gemm_bf16_flops": rates.get("gemm_bf16_flops"),
+                     "hbm_copy_bytes": rates.get("hbm_copy_bytes"),
+                     "hash_kernel_per_byte_s": (rates.get("hash_kernel") or {}).get("per_byte_s")}
+    return {**out, "version": doc.get("version"), "devices": doc.get("devices"),
+            "per_device": per, "peer": doc.get("peer") or {},
+            "peer_errors": doc.get("peer_errors") or {}}
+
+
+FOUR_ARMS = ("seq", "pipe")
+
+
+def _four_gpu_problems(ex: Mapping[str, Any]) -> list[str]:
+    """Why an arm's environment record does not name the four GPUs as the session lays them out
+    (empty when it does): ``machine.gpus`` four entries with distinct UUIDs, ``gpu_roles`` with
+    ``cuda:0`` the prover and ``cuda:1`` to ``cuda:3`` verifiers, each role entry's UUID the
+    machine record's for its index."""
+    why: list[str] = []
+    gpus = ex.get("gpus")
+    uuids = {g.get("index"): g.get("uuid") for g in gpus or []}
+    if gpus is None:
+        return ["the record has no machine.gpus"]
+    if len(gpus) != FOUR_CARDS or len(uuids) != FOUR_CARDS or not all(uuids.values()):
+        why.append(f"machine.gpus has {len(gpus)} entries ({len(uuids)} indices)")
+    if len(set(uuids.values())) != len(uuids):
+        why.append("machine.gpus has a UUID twice")
+    roles = ex.get("gpu_roles")
+    if not isinstance(roles, list):
+        return [*why, "the record has no gpu_roles"]
+    want = {"cuda:0": ["prover"], **{f"cuda:{i}": ["verifier"] for i in (1, 2, 3)}}
+    got = {r.get("device"): r for r in roles if isinstance(r, dict)}
+    if len(roles) != FOUR_CARDS or set(got) != set(want):
+        why.append(f"gpu_roles lists {sorted(map(str, got))}")
+    for dev, role in want.items():
+        r = got.get(dev)
+        if r is None:
+            continue
+        if r.get("roles") != role:
+            why.append(f"{dev} has roles {r.get('roles')}, not {role}")
+        if uuids.get(r.get("index")) != r.get("uuid") or not r.get("uuid"):
+            why.append(f"{dev}'s UUID is not the machine record's")
+    if len({r.get("uuid") for r in got.values()}) != len(got):
+        why.append("gpu_roles has a UUID twice")
+    return why
+
+
+def _four_tests_problems(part: Mapping[str, Any], expected: Sequence[str] | None) -> list[str]:
+    """Why the tests part does not count, empty when it does: it ran ``ok``, its junit report
+    holds tests and no failure or error, no FS34 case (found by :func:`device_tests_expected`, or
+    given as ``expected``) is missing, failed, errored or skipped, every file of
+    :data:`FOUR_TEST_FILES` exists and left a case in the report, and no selected case at all was
+    skipped (on four GPUs every one runs; the first few skipped cases are named, then a count)
+    and no such file has every case skipped. Fails closed."""
+    ex = part.get("extras") or {}
+    why = [f"{f} is missing from the checkout" for f in ex.get("missing_files") or ()]
+    if part.get("status") not in _PAIR_OK:
+        why.append(f"the tests part is {part.get('status', 'not_started')}")
+    if ex.get("junit", 0) is None or "cases" not in ex:
+        return [*why, "the tests left no junit report"]
+    if not ex.get("tests"):
+        why.append("the junit report has no tests")
+    if ex.get("failures") or ex.get("errors"):
+        why.append(f"{ex.get('failures')} failures and {ex.get('errors')} errors")
+    if expected is None:
+        expected, err = device_tests_expected(FS34_TESTS_FILE)
+        if err:
+            why.append(f"FS34's expected tests could not be collected: {err}")
+    why += [f"FS34 case {n}: " + ("not in the junit report" if n not in ex["cases"]
+                                  else ex["cases"][n]) for n in expected
+            if ex["cases"].get(n) != "passed"]
+    why += [f"{f} left no case in the junit report" for f in FOUR_TEST_FILES
+            if not (ex.get("files") or {}).get(f, {}).get("cases")
+            and f"{f} is missing from the checkout" not in why]
+    skipped = sorted(n for n, o in ex["cases"].items() if o == "skipped")
+    count = max(len(skipped), ex.get("skipped") or 0)
+    if count:
+        shown = ", ".join(skipped[:3]) + (f" and {count - 3} more" if count > 3 else "")
+        why.append(f"{count} case(s) skipped, none may be on four GPUs"
+                   + (f": {shown}" if shown else ""))
+    why += [f"every case of {f} was skipped" for f in FOUR_TEST_FILES
+            if (m := (ex.get("files") or {}).get(f, {})).get("cases")
+            and m.get("skipped") == m["cases"]]
+    return why
+
+
+def _steady_s(ex: Mapping[str, Any]) -> tuple[float | None, str | None]:
+    """An arm's steady step time, the mean of steps 2 and 3, and what it is: the merged step's
+    wall extent (``step_wall``) where the records hold it, else the three times' total."""
+    wall = ex.get("step_wall_s") or []
+    if len(wall) >= FOUR_STEPS:
+        return statistics.fmean(wall[1:FOUR_STEPS]), "step_wall"
+    times = ex.get("step_times") or []
+    if len(times) >= FOUR_STEPS and all(r.get("total_s") is not None for r in times):
+        return statistics.fmean(r["total_s"] for r in times[1:FOUR_STEPS]), "total"
+    return None, None
+
+
+def _pos(x: Any) -> bool:
+    """A finite positive number."""
+    return _number(x) and math.isfinite(x) and x > 0
+
+
+def _steady_mean(per_step: Sequence[float] | None) -> float | None:
+    """The mean of steps 2 and 3 of a per-step list of three, else ``None``."""
+    vals = list(per_step or ())
+    return statistics.fmean(vals[1:FOUR_STEPS]) if len(vals) >= FOUR_STEPS else None
+
+
+def _four_missing_numbers(models: Mapping[str, Mapping[str, Any]],
+                          probe: Mapping[str, Any], check_gbps: Mapping[str, Any]) -> list[str]:
+    """What the plan's acceptance ("each model's step time, per-GPU peaks and peer-copy rates
+    reported") lacks, empty when it has all: per model and arm a steady step time and a peak for
+    each of the four GPUs (``gpu_peak_mib``, the whole card's, or else ``device_peaks``, this
+    process's), and once a finite positive peer rate for all 12 ordered pairs (the probe's
+    ``peer``, or else ``peer_check``'s per-pair ``gbps``)."""
+    why: list[str] = []
+    for k, row in models.items():
+        for a, arm in row["arms"].items():
+            if arm["steady_s"] is None:
+                why.append(f"{k} {a}: no steady step time")
+            card = arm.get("gpu_peak_mib") or {}
+            procs = arm.get("device_peaks") or {}
+            lost = [i for i in range(FOUR_CARDS)
+                    if not _pos(card.get(str(i)))
+                    and not _pos((procs.get(f"cuda:{i}") or {}).get("peak_bytes"))]
+            if lost:
+                why.append(f"{k} {a}: no peak for GPU " + ", ".join(map(str, lost)))
+    pairs = [(x, y) for x in range(FOUR_CARDS) for y in range(FOUR_CARDS) if x != y]
+    got_probe = sum(_pos((probe.get("peer") or {}).get(f"cuda:{x}->cuda:{y}")) for x, y in pairs)
+    got_check = sum(_pos(check_gbps.get(f"{x}->{y}")) for x, y in pairs)
+    if max(got_probe, got_check) < len(pairs):
+        why.append(f"peer rates: the probe has {got_probe} of {len(pairs)} pairs, the peer "
+                   f"check {got_check}")
+    return why
+
+
+def four_h100(parts: Sequence[Mapping[str, Any]],
+              expected: Sequence[str] | None = None) -> dict[str, Any] | None:
+    """The four-H100 session's result, or ``None`` without its parts. ``pass`` fails closed:
+    every part of :func:`four_h100_parts` ran ``ok`` (or was done earlier); the peer copies
+    landed right bytes; the tests part counts (:func:`_four_tests_problems`); and per model both
+    arms are accepted at all :data:`FOUR_STEPS` steps and ran in their mode (``loop mode:``
+    line), the two arms' step roots are equal step for step, step 1's root is the card part's
+    proved root, and each arm's environment record names the four GPUs
+    (:func:`_four_gpu_problems`); and the reported numbers are all there
+    (:func:`_four_missing_numbers`: per model and arm a steady step time and a peak per GPU,
+    once 12 peer rates). ``items`` lists each acceptance item as ``(ok, text)``, in the order
+    the log prints them. Outside ``pass``: per model and arm each step's prover, verifier,
+    hand-off and total time (``step_times``), ``step_wall_s`` and ``gpu_held_upper_s`` (an upper
+    bound) per step, ``accumulated_gpu_s`` per step and its steady mean
+    (``accumulated_steady_s``, steps 2 and 3; :func:`_accumulated_gpu_s`), ``steady_s`` (steps 2
+    and 3, :func:`_steady_s`), the memory pass's peak per device (``device_peaks``) and the whole
+    card's peaks (``gpu_peak_mib``, per GPU); and once the probe's per-device headline rates, the
+    12 peer rates and ``peer_check``'s per-pair rates."""
+    if not any(p["kind"] == "four_run" for p in parts):
+        return None
+    names = {p["name"] for p in parts}
+    models = {four_model_key(r): {} for r, _ in FOUR_PINS}
+    want = four_h100_parts()
+    problems = {n: _pair_part(parts, n).get("status", "not_started") for n in want
+                if n not in names or _pair_part(parts, n).get("status") not in _PAIR_OK}
+    peer = (_pair_part(parts, PEER_CHECK_NAME).get("extras") or {}).get("peer_check")
+    peer_ok = bool(peer) and peer.get("all_ok") is True
+    tests_problems = _four_tests_problems(_pair_part(parts, "four_tests"), expected)
+    tests_ex = _pair_part(parts, "four_tests").get("extras") or {}
+    items: list[tuple[bool, str]] = [
+        (not problems, "every part ran and succeeded" if not problems else "; ".join(
+            f"{n} " + ("did not run" if s == "not_started" else f"ended {s}")
+            for n, s in problems.items())),
+        (peer_ok, "the peer copies landed the right bytes" if peer_ok else
+         f"peer copies: {peer_wrong_text(peer)}"),
+        (not tests_problems,
+         f"the tests: {tests_ex.get('tests')} tests, {tests_ex.get('failures')} failed, "
+         f"{tests_ex.get('errors')} errors, {tests_ex.get('skipped')} skipped; FS34's cases "
+         "all passed" if not tests_problems else "the tests: " + "; ".join(tests_problems))]
+    for k, row in models.items():
+        card = (_pair_part(parts, f"card_{k}").get("extras") or {})
+        arm_ex = {a: (_pair_part(parts, f"{a}_{k}").get("extras") or {}) for a in FOUR_ARMS}
+        mode = {"seq": "sequential", "pipe": "pipelined"}
+        accepted = {a: bool(e.get("accepted")) and len(e.get("step_roots") or ()) == FOUR_STEPS
+                    and e.get("loop_mode") == mode[a] for a, e in arm_ex.items()}
+        seq_roots, pipe_roots = (arm_ex[a].get("step_roots") or [] for a in FOUR_ARMS)
+        equal = len(seq_roots) == FOUR_STEPS and seq_roots == pipe_roots
+        card_ok = bool(card.get("root")) and bool(seq_roots) and seq_roots[0] == card["root"] \
+            and bool(pipe_roots) and pipe_roots[0] == card["root"]
+        gpu_why = {a: _four_gpu_problems(e) for a, e in arm_ex.items()}
+        steady = {a: _steady_s(e) for a, e in arm_ex.items()}
+        row.update({
+            "accepted": accepted, "roots_equal": equal, "step1_equals_card": card_ok,
+            "card_root": card.get("root"), "gpu_problems": gpu_why,
+            "arms": {a: {"step_roots": e.get("step_roots"), "step_times": e.get("step_times"),
+                         "step_wall_s": e.get("step_wall_s"),
+                         "gpu_held_upper_s": e.get("gpu_held_upper_s"),
+                         "accumulated_gpu_s": e.get("accumulated_gpu_s"),
+                         "accumulated_steady_s": _steady_mean(e.get("accumulated_gpu_s")),
+                         "steady_s": steady[a][0], "steady_source": steady[a][1],
+                         "device_peaks": e.get("device_peaks"), "loop_mode": e.get("loop_mode"),
+                         "gpu_peak_mib": (_pair_part(parts, f"{a}_{k}").get("extras")
+                                          or {}).get("gpu_peak_mib")}
+                     for a, e in arm_ex.items()}})
+        items += [
+            (all(accepted.values()),
+             f"{k}: both arms accepted at all {FOUR_STEPS} steps" if all(accepted.values())
+             else f"{k}: " + ", ".join(f"the {a} arm was not accepted at all {FOUR_STEPS} steps "
+                                       "in its loop mode" for a, ok in accepted.items()
+                                       if not ok)),
+            (equal, f"{k}: the arms' step roots are equal" if equal
+             else f"{k}: the sequential and pipelined arms' step roots differ"),
+            (card_ok, f"{k}: step 1's root is the card's proved root" if card_ok
+             else f"{k}: step 1's root differs from card_{k}'s proved root"),
+            (not any(gpu_why.values()), f"{k}: the environment records name the four GPUs"
+             if not any(gpu_why.values()) else f"{k}: " + "; ".join(
+                 f"{a} arm: " + ", ".join(w) for a, w in gpu_why.items() if w))]
+    probe = _pair_part(parts, "probe").get("extras") or {}
+    check_rates = (peer or {}).get("gbps") or {}
+    missing = _four_missing_numbers(models, probe, check_rates)
+    items.append((not missing, "the step times, per-GPU peaks and peer rates are all reported"
+                  if not missing else "numbers missing: " + "; ".join(missing)))
+    return {"pass": all(ok for ok, _ in items), "items": [[ok, text] for ok, text in items],
+            "missing_numbers": missing,
+            "models": models, "part_problems": problems, "peer_bytes_ok": peer_ok,
+            "tests": {k: tests_ex.get(k) for k in ("tests", "failures", "errors", "skipped",
+                                                   "files", "missing_files")},
+            "tests_problems": tests_problems,
+            "probe": {k: probe.get(k) for k in ("version", "devices", "per_device", "peer",
+                                                "peer_errors")},
+            "peer_check_gbps": check_rates,
+            "gpu_peak": {n: (_pair_part(parts, n).get("extras") or {}).get("gpu_peak_mib")
+                         for n in want}}
+
+
+def four_h100_parts() -> tuple[str, ...]:
+    """The names of the session's parts, the native build and the peer check first."""
+    return (NATIVE_BUILD_NAME, PEER_CHECK_NAME, "models", "four_tests", "probe",
+            *(f"{a}_{four_model_key(r)}" for r, _ in FOUR_PINS for a in ("card", "seq", "pipe")))
+
+
+def _four_peer_range(res: Mapping[str, Any]) -> str:
+    """The slowest and fastest ordered pair, from the probe's 12 rates (else from the peer
+    check's per-pair rates), in GB/s."""
+    rates = {k: v / 1e9 for k, v in ((res.get("probe") or {}).get("peer") or {}).items()
+             if _number(v)}
+    src = "probe"
+    if not rates:
+        rates = {k: float(v) for k, v in (res.get("peer_check_gbps") or {}).items()
+                 if _number(v)}
+        src = "peer check"
+    if not rates:
+        return "FS35 peer rates: none measured"
+    lo, hi = min(rates, key=lambda k: rates[k]), max(rates, key=lambda k: rates[k])
+    return (f"FS35 peer rates ({src}, {len(rates)} pairs): slowest {lo} {rates[lo]:.1f} GB/s, "
+            f"fastest {hi} {rates[hi]:.1f} GB/s")
+
+
+def _four_lines(res: Mapping[str, Any] | None) -> list[str]:
+    """The session's last job-log lines: one ``FS35 ok`` or ``FS35 FAIL`` per acceptance item,
+    one per model and arm with the wall time (the steady step) beside the accumulated GPU time
+    (steady, mean of steps 2-3) and the four GPUs' whole-card peaks, then the peer-rate range."""
+    if res is None:
+        return []
+    lines = [f"FS35 {'ok' if ok else 'FAIL'}: {text}" for ok, text in res["items"]]
+    for k, row in res["models"].items():
+        for a, arm in row["arms"].items():
+            s, src, acc = arm["steady_s"], arm["steady_source"], arm.get("accumulated_steady_s")
+            peaks = arm.get("gpu_peak_mib") or {}
+            lines.append(
+                f"FS35 {k} {a}: steady step "
+                + ("unknown" if s is None else f"{s:.1f} s ({src}, mean of steps 2-3)")
+                + "; accumulated GPU time "
+                + ("unknown" if acc is None else f"{acc:.1f} s (mean of steps 2-3)")
+                + "; GPU peaks "
+                + (", ".join(f"{i}: {peaks[i] / 1024:.1f} GiB" if i in peaks else f"{i}: ?"
+                             for i in map(str, range(FOUR_CARDS))) if peaks else "unknown"))
+    lines.append(_four_peer_range(res))
     return lines
 
 
@@ -2475,7 +3015,6 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
 
 # ---- the exit probe ---------------------------------------------------------------------
 
-EXIT_PROBE_NAME = "exit_probe"
 EXIT_PROBE_REPORT = "exit_probe.json"
 EXIT_PROBE_RUN_S = 900  # the limit of one run alone; the whole-list run gets what is left
 EXIT_PROBE_MIN_S = 120  # no run starts with less of the part's budget left than this
@@ -2679,9 +3218,6 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
         if part.info.get("gpu_peak"):
             rec["extras"]["gpu_peak_mib"] = _read_peaks(d / "gpu_peak.json")
         summary["parts"].append(rec)
-        if part.kind == "exit_probe" and rec["status"] not in ("not_started", "skipped_done"):
-            for line in exit_probe_lines((rec.get("extras") or {}).get("exit_probe")):
-                say(line)
         try:
             ab = fix2_ab(summary["parts"])
         except (ValueError, KeyError, TypeError, AttributeError) as e:
@@ -2707,6 +3243,13 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
             pair = {"fs32_pair_error": f"{type(e).__name__}: {e}"}
         if pair is not None:
             summary["fs32_pair"] = pair
+        try:
+            four = four_h100(summary["parts"])
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError,
+                statistics.StatisticsError) as e:
+            four = {"four_h100_error": f"{type(e).__name__}: {e}"}
+        if four is not None:
+            summary["four_h100"] = four
         if part.kind == "peer_check" and rec["status"] != "not_started":
             # Wrong bytes between the cards: nothing after this part counts. A rerun that
             # skipped the part (DONE) reads its report again.
@@ -2736,6 +3279,12 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
         say(f"FS32 FAIL: the comparison raised ({pair['fs32_pair_error']})")
     else:
         for line in _pair_lines(pair):
+            say(line)
+    four = summary.get("four_h100")
+    if four is not None and "four_h100_error" in four:
+        say(f"FS35 FAIL: the comparison raised ({four['four_h100_error']})")
+    else:
+        for line in _four_lines(four):
             say(line)
     summary["finished"] = True
     summary["ended_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -2912,8 +3461,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="FS11_SESSION: the first session's plan (fs11, the default), the "
                         "re-check's (recheck), the profile check's (profile-check), the "
                         "four-card hardware probe's (nvlink-probe), the BLAKE3 kernel's speed "
-                        "(kernel-speed), the two-GPU sharded run's (fs32-pair) or FS30's "
-                        "device-leaves check (device-leaves); --plan and --selftest "
+                        "(kernel-speed), the two-GPU sharded run's (fs32-pair), FS30's "
+                        "device-leaves check (device-leaves) or the four-H100 session's "
+                        "(four-h100); --plan and --selftest "
                         "replace its parts")
     x = sub.add_parser("exit-probe", help="run each test module in its own pytest process "
                                           "and report which one cannot exit")
@@ -2956,24 +3506,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         probing = args.cmd == "run" and args.session == "nvlink-probe" and not selftest
         pairing = args.cmd == "run" and args.session == "fs32-pair" and not selftest
+        four = args.cmd == "run" and args.session == "four-h100" and not selftest
         if pairing:  # any GPU type, but two of them
             allow = True
-        why = refusal(env_doc, allow, fs31_cards() if probing else PAIR_CARDS if pairing else None,
-                      need="the fs32-pair session" if pairing else None)
+        # the four-H100 session needs four CUDA devices (FS11_ALLOW_ANY_GPU does not lift that)
+        # and H100s unless FS11_ALLOW_ANY_GPU=1
+        why = refusal(env_doc, allow, fs31_cards() if probing else PAIR_CARDS if pairing
+                      else FOUR_CARDS if four else None,
+                      need="the fs32-pair session" if pairing
+                      else "the four-H100 session" if four else None)
     except ValueError as e:
         why = str(e)
+    py_refused = False
+    if args.cmd == "run" and not selftest and not why:
+        why = python_mismatch(args.upload.resolve(), platform.python_version())
+        py_refused = bool(why)
+        if why and os.environ.get(PYTHON_MISMATCH_ENV) == "1":
+            _say(f"{PYTHON_MISMATCH_ENV}=1: {why}")
+            why, py_refused = None, False
     if selftest:
         _say(f"self-test: stand-in parts in place of the {label} session's, the H100 check is "
              "skipped")
     elif pairing:
         _say("fs32-pair: any GPU type, at least 2 CUDA devices")
+    elif four and allow:
+        _say(f"FS11_ALLOW_ANY_GPU=1: the H100 check is overridden, {FOUR_CARDS} CUDA devices "
+             "are still needed")
     elif allow:
         _say("FS11_ALLOW_ANY_GPU=1: the H100 check is overridden")
     if args.cmd == "env":
         _say("refused: " + why if why else "the H100 check passes")
         return EXIT_REFUSED if why else 0
     if why:
-        _say(f"refused to start: {why} (FS11_ALLOW_ANY_GPU=1 overrides)")
+        override = PYTHON_MISMATCH_ENV if py_refused else "FS11_ALLOW_ANY_GPU"
+        _say(f"refused to start: {why} ({override}=1 overrides)")
         _write_json(out / "summary.json", {"session": label, "refused": why,
                                            "environment": env_doc, "parts": [],
                                            "finished": True})

@@ -272,23 +272,24 @@ def test_cli_writes_profile_json(tmp_path):
 def test_a_wrong_version_is_rejected(tmp_path):
     paths = build_run(tmp_path / "run")
     d = paths["run_dir"]
-    bad = {"markers.jsonl": io.read_markers, "samples.jsonl": io.read_samples}
-    for name, reader in bad.items():
+    bad = {"markers.jsonl": (io.read_markers, 2), "samples.jsonl": (io.read_samples, 3)}
+    for name, (reader, version) in bad.items():
         lines = (d / name).read_text().splitlines()
         h = json.loads(lines[0])
-        h["version"] = 2
+        h["version"] = version
         (d / name).write_text("\n".join([json.dumps(h), *lines[1:]]) + "\n")
-        with pytest.raises(ValueError, match="version 2"):
+        with pytest.raises(ValueError, match=f"version {version}"):
             reader(d / name)
-    for name, reader in (("probe.json", io.read_probe), ("c5_layout.json", io.read_c5_layout),
-                         ("trace_summary.json", io.read_trace_summary)):
-        (d / name).write_text(json.dumps({"version": 2, "sections": {}}))
-        with pytest.raises(ValueError, match="version 2"):
+    for name, reader, version in (("probe.json", io.read_probe, 3),
+                                  ("c5_layout.json", io.read_c5_layout, 2),
+                                  ("trace_summary.json", io.read_trace_summary, 2)):
+        (d / name).write_text(json.dumps({"version": version, "sections": {}}))
+        with pytest.raises(ValueError, match=f"version {version}"):
             reader(d / name)
     (d / "probe.json").write_text(json.dumps(probe() | {"version": None}))
     with pytest.raises(ValueError, match="version"):
         io.read_probe(d / "probe.json")
-    with pytest.raises(ValueError, match="version 2"):
+    with pytest.raises(ValueError, match="version"):
         analyze.analyze(d, d / "samples.jsonl", d / "probe.json")
 
 

@@ -299,6 +299,73 @@ def test_refusal():
     assert fs.refusal({"cuda_available": False, "gpus": []}, True) is None
 
 
+def _upload_with_python(tmp_path, version):
+    up = tmp_path / "up"
+    up.mkdir(parents=True, exist_ok=True)
+    doc = {} if version is None else {"python_version": version}
+    (up / "manifest.json").write_text(json.dumps(doc))
+    return up
+
+
+def test_python_mismatch_names_both_versions_and_the_cause(tmp_path):
+    up = _upload_with_python(tmp_path, "3.14.7")
+    assert fs.python_mismatch(up, "3.14.7") is None
+    why = fs.python_mismatch(up, "3.14.0")
+    assert why == ("the pod's Python 3.14.0 is not the Mac's 3.14.7: another Python can behave "
+                   "differently at exit (3.14.0 hangs there, gh-146313); build the venv with "
+                   "fs11_setup.sh")
+    assert "3.14.9 is not the Mac's 3.14.7" in fs.python_mismatch(up, "3.14.9")
+    old = fs.python_mismatch(_upload_with_python(tmp_path, None), "3.14.7")
+    assert "records no Python version" in old and "fs11_prep" in old
+    (tmp_path / "up" / "manifest.json").write_text("{")
+    assert "unreadable" in fs.python_mismatch(tmp_path / "up", "3.14.7")
+    assert "unreadable" in fs.python_mismatch(tmp_path / "nowhere", "3.14.7")
+
+
+def _main_on_a_pod(tmp_path, monkeypatch, version, *, selftest=False):
+    """``main run`` with an H100 that torch reports and a manifest recording ``version``."""
+    real = fs.environment(tmp_path / "e")
+    monkeypatch.setattr(fs, "environment", lambda out: {**real, "cuda_available": True,
+                                                        "gpus": ["NVIDIA H100 80GB HBM3"]})
+    monkeypatch.setattr(fs, "pin_to_gpu_numa", lambda *a, **k: {"pinned": False,
+                                                                 "message": "no pin"})
+    ran = []
+    monkeypatch.setattr(fs, "run_session", lambda *a, **k: ran.append(1) or {"failed": []})
+    up = _upload_with_python(tmp_path, version)
+    out = tmp_path / "out"
+    args = ["run", "--upload", str(up), "--out", str(out), "--deadline", str(time.time() + 60)]
+    rc = fs.main(args + (["--selftest"] if selftest else []))
+    return rc, out, ran
+
+
+def test_main_refuses_a_python_other_than_the_manifests(tmp_path, monkeypatch):
+    monkeypatch.setattr(fs.platform, "python_version", lambda: "3.14.0")
+    rc, out, ran = _main_on_a_pod(tmp_path, monkeypatch, "3.14.7")
+    summary = json.loads((out / "summary.json").read_text())
+    assert rc == fs.EXIT_REFUSED and not ran and summary["parts"] == []
+    assert "3.14.0 is not the Mac's 3.14.7" in summary["refused"]
+
+
+def test_main_refuses_an_upload_without_a_python_version(tmp_path, monkeypatch):
+    rc, out, ran = _main_on_a_pod(tmp_path, monkeypatch, None)
+    assert rc == fs.EXIT_REFUSED and not ran
+    assert "records no Python version" in json.loads((out / "summary.json").read_text())["refused"]
+
+
+def test_main_runs_on_the_manifests_python(tmp_path, monkeypatch):
+    rc, out, ran = _main_on_a_pod(tmp_path, monkeypatch, fs.platform.python_version())
+    assert rc == 0 and ran == [1]
+
+
+def test_the_python_override_and_the_selftest_run_anyway(tmp_path, monkeypatch):
+    monkeypatch.setenv("FS11_ALLOW_PYTHON_MISMATCH", "1")
+    rc, out, ran = _main_on_a_pod(tmp_path, monkeypatch, "0.0.0")
+    assert rc == 0 and ran == [1]
+    monkeypatch.delenv("FS11_ALLOW_PYTHON_MISMATCH")
+    rc, out, ran = _main_on_a_pod(tmp_path / "s", monkeypatch, "0.0.0", selftest=True)
+    assert rc == 0 and ran == [1]
+
+
 def test_cupqc_status(monkeypatch, tmp_path):
     monkeypatch.delenv(fs.CUPQC_ENV, raising=False)
     assert not fs.cupqc_status()["found"] and "not set" in fs.cupqc_status()["reason"]
@@ -924,7 +991,9 @@ def test_job_survives_a_dead_reader_on_its_stdout(tmp_path):
 
 def test_job_runs_without_its_log_file(tmp_path):
     (tmp_path / "out" / "job.log").mkdir(parents=True)
-    r, out = _job(tmp_path, plan=OK_PLAN, extra={"FS11_ALLOW_ANY_GPU": "1"})
+    # The deadline leaves a loaded machine room to start the session: at 6 s its part could be
+    # killed at the work deadline, and the job exit 1 (as in the dead-reader test below).
+    r, out = _job(tmp_path, plan=OK_PLAN, deadline=60, extra={"FS11_ALLOW_ANY_GPU": "1"})
     assert r.returncode == 0, r.stdout + r.stderr
     assert "cannot append to" in r.stdout and "ok: ok, exit 0" in r.stdout
     assert "DRY_RUN: terminate (end of job" in r.stdout and Path(f"{out}.TERMINATED").exists()
@@ -1126,13 +1195,23 @@ def test_job_hands_a_failing_terminate_to_the_timer(tmp_path):
     """Every call fails: the job gives up at the deadline without the TERMINATED flag, and the
     timer goes on trying (stop included) until it is killed."""
     env, log = _stubs(tmp_path)
-    p, out = _job(tmp_path, plan=OK_PLAN, deadline=6, grace=1, reserve=2, popen=True,
+    # The deadline leaves a loaded machine room to start the session. If the timer fired before
+    # the job reached its own terminate, the timer would take the lock first, and the job would
+    # give up without writing TERMINATE FAILED.
+    p, out = _job(tmp_path, plan=OK_PLAN, deadline=12, grace=1, reserve=2, popen=True,
                   extra={**REAL, **env, "FS11_DELETE_ROUNDS": "2"})
+
+    def everything_the_assertions_read():
+        # The job's TERMINATE FAILED (written when its own attempts run out at the deadline), the
+        # timer's start and its stop attempts: the kill must wait for all three.
+        if not (out / "job.log").exists():
+            return False
+        text = _log(out)
+        return ("TERMINATE FAILED" in text and "terminating pod test-pod (deadline)" in text
+                and text.split("(deadline)")[1].count("trying: runpodctl pod stop") >= 2)
+
     try:
-        assert _wait_for(lambda: (out / "job.log").exists()
-                         and "terminating pod test-pod (deadline)" in _log(out)
-                         and _log(out).split("(deadline)")[1].count("trying: runpodctl pod stop")
-                         >= 2, timeout=40), _log(out)
+        assert _wait_for(everything_the_assertions_read, timeout=40), _log(out)
         assert p.poll() is None  # the job waits on the timer
     finally:
         os.killpg(p.pid, signal.SIGKILL)

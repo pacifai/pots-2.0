@@ -179,6 +179,25 @@ def _frequency(r: _Record, system: str, cpuinfo: str | None) -> None:
     r.put("cpu_governor", None, f"no cpufreq governor on {system}")
 
 
+def _form_factor(name: str, power: float | None) -> str | None:
+    if "PCIe" in name:
+        return "PCIe"
+    if "NVL" in name:
+        return "NVL"
+    if power is not None and power >= 600:
+        return "SXM (inferred from a power limit of 600 W or more)"
+    return None
+
+
+def _numa_node(bus: str | None) -> int | None:
+    """The NUMA node of the PCI device at ``bus`` (``nvidia-smi``'s form), from sysfs."""
+    if not bus:
+        return None
+    sysfs = bus.lower()[-12:]  # "00000000:19:00.0" -> "0000:19:00.0"
+    text = _read(f"/sys/bus/pci/devices/{sysfs}/numa_node")
+    return int(text) if text and text.strip().lstrip("-").isdigit() else None
+
+
 def _gpu(r: _Record) -> None:
     keys = ("gpu_count", "gpu_name", "gpu_form_factor", "gpu_memory_bytes", "gpu_power_max_w",
             "driver_version", "cuda_runtime", "cuda_driver_supports", "pcie_gen_current",
@@ -193,8 +212,9 @@ def _gpu(r: _Record) -> None:
     r.put("gpu_count", torch.cuda.device_count())
     props = torch.cuda.get_device_properties(0)
     r.put("cuda_runtime", torch.version.cuda)
-    smi = _run("nvidia-smi", f"--query-gpu={','.join(_GPU_QUERY)}", "--format=csv,noheader,nounits")
-    row = dict(zip(_GPU_QUERY, (v.strip() for v in smi.splitlines()[0].split(",")))) if smi else {}
+    rows = _smi_rows()
+    # GPU 0 is torch's cuda:0: its row by bus id, then UUID; the first row only if none matches
+    row = _row_for(rows, props) or (rows[0] if rows else {})
     no_smi = "nvidia-smi missing or failed"
 
     def num(key: str) -> float | None:
@@ -205,14 +225,7 @@ def _gpu(r: _Record) -> None:
 
     name = row.get("name") or props.name
     power = num("power.max_limit")
-    if "PCIe" in name:
-        form = "PCIe"
-    elif "NVL" in name:
-        form = "NVL"
-    elif power is not None and power >= 600:
-        form = "SXM (inferred from a power limit of 600 W or more)"
-    else:
-        form = None
+    form = _form_factor(name, power)
     r.put("gpu_name", name)
     r.put("gpu_form_factor", form, "not in the name and not inferable from the power limit")
     r.put("gpu_memory_bytes", props.total_memory)
@@ -229,13 +242,103 @@ def _gpu(r: _Record) -> None:
         r.put(key, int(v) if v is not None else None, no_smi)
     bus = row.get("pci.bus_id")
     r.put("gpu_pci_bus_id", bus, no_smi)
-    node = None
-    if bus:
-        sysfs = bus.lower()[-12:]  # "00000000:19:00.0" -> "0000:19:00.0"
-        text = _read(f"/sys/bus/pci/devices/{sysfs}/numa_node")
-        node = int(text) if text and text.strip().lstrip("-").isdigit() else None
-    r.put("gpu_numa_node", node, "no numa_node for the GPU in sysfs")
+    r.put("gpu_numa_node", _numa_node(bus), "no numa_node for the GPU in sysfs")
     r.put("gpu_topology", _run("nvidia-smi", "topo", "-m"), no_smi)
+
+
+_ALL_QUERY = ("index", "uuid") + _GPU_QUERY
+
+
+def _smi_rows() -> list[dict[str, str]]:
+    """Every GPU's ``nvidia-smi`` row, from one call; [] when it is missing or fails."""
+    smi = _run("nvidia-smi", f"--query-gpu={','.join(_ALL_QUERY)}",
+               "--format=csv,noheader,nounits")
+    if not smi:
+        return []
+    return [dict(zip(_ALL_QUERY, (v.strip() for v in line.split(","))))
+            for line in smi.splitlines() if line.strip()]
+
+
+def _torch_bus_id(props: Any) -> str | None:
+    """A torch device's PCI bus id in ``nvidia-smi``'s form (``00000000:19:00.0``)."""
+    try:
+        return f"{props.pci_domain_id:08X}:{props.pci_bus_id:02X}:{props.pci_device_id:02X}.0"
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def smi_uuid_form(raw: Any) -> str | None:
+    """A UUID as ``nvidia-smi`` prints it (``GPU-...``): ``raw`` is torch's ``props.uuid``
+    (a ``_CUuuid`` whose ``str`` has no prefix on some torch builds, already prefixed on
+    others) or a string; ``None`` and the empty string give ``None``. The one place the prefix
+    is added, so no UUID reads ``GPU-GPU-...``."""
+    text = "" if raw is None else str(raw)
+    if not text:
+        return None
+    return text if text.startswith("GPU-") else f"GPU-{text}"
+
+
+def torch_gpu_uuid(device: int | str | torch.device) -> str | None:
+    """The UUID of torch device ``device`` (an index, ``cuda:k`` or a device) in ``nvidia-smi``'s
+    form, or ``None`` where torch exposes none. The machine record's ``gpus``, the environment
+    record's ``gpu_roles`` and the probe's ``per_device`` all take their UUIDs from here."""
+    return smi_uuid_form(getattr(torch.cuda.get_device_properties(device), "uuid", None))
+
+
+def _row_for(rows: list[dict[str, str]], props: Any) -> dict[str, str] | None:
+    """The ``nvidia-smi`` row of the torch device with ``props``: by PCI bus id, then by UUID;
+    None when no row matches."""
+    bus = (_torch_bus_id(props) or "").upper()
+    uuid = smi_uuid_form(getattr(props, "uuid", None))
+    for row in rows:
+        if bus and (row.get("pci.bus_id") or "").upper() == bus:
+            return row
+    for row in rows:
+        if uuid and row.get("uuid") == uuid:
+            return row
+    return None
+
+
+def _gpus(r: _Record) -> None:
+    """``gpus``: one dict per CUDA device torch sees, in torch's index order. Each is joined to
+    its ``nvidia-smi`` row by PCI bus id (then by UUID), never by position: torch orders devices
+    fastest-first unless ``CUDA_DEVICE_ORDER=PCI_BUS_ID``, ``nvidia-smi`` by bus id."""
+    if not torch.cuda.is_available():
+        r.put("gpus", None, "torch has no CUDA build" if torch.version.cuda is None
+              else "no CUDA device visible")
+        return
+    rows = _smi_rows()
+    gpus = []
+    for k in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(k)
+        bus = _torch_bus_id(props)
+        uuid = smi_uuid_form(getattr(props, "uuid", None))
+        row = _row_for(rows, props) or {}
+
+        def num(key: str, row: dict[str, str] = row) -> float | None:
+            try:
+                return float(row[key])
+            except (KeyError, ValueError):
+                return None
+
+        def whole(key: str) -> int | None:
+            v = num(key)
+            return int(v) if v is not None else None
+
+        name = row.get("name") or props.name
+        power = num("power.max_limit")
+        bus_id = row.get("pci.bus_id") or bus
+        gpus.append({
+            "index": k, "name": name,
+            "uuid": row.get("uuid") or uuid,
+            "pci_bus_id": bus_id, "memory_bytes": props.total_memory,
+            "power_max_w": power, "form_factor": _form_factor(name, power),
+            "numa_node": _numa_node(bus_id),
+            "pcie_gen_current": whole("pcie.link.gen.current"),
+            "pcie_gen_max": whole("pcie.link.gen.max"),
+            "pcie_width_current": whole("pcie.link.width.current"),
+            "pcie_width_max": whole("pcie.link.width.max")})
+    r.put("gpus", gpus)
 
 
 def _numa(r: _Record) -> None:
@@ -252,9 +355,10 @@ def _numa(r: _Record) -> None:
     r.put("numa_nodes", out)
 
 
-def nvml_facts() -> dict[str, Any] | None:
-    """GPU 0's driver, power limit, clocks, PCIe link and UUID from NVML, or None without
-    ``pynvml`` or a GPU. One failed read is None for that field only."""
+def nvml_facts(index: int = 0) -> dict[str, Any] | None:
+    """GPU ``index``'s (default 0) driver, power limit, clocks, PCIe link and UUID from NVML,
+    or None without ``pynvml`` or that GPU. NVML indexes GPUs by bus id, as ``nvidia-smi``
+    does, not as torch does: join by the UUID. One failed read is None for that field only."""
     try:
         import pynvml
 
@@ -262,7 +366,7 @@ def nvml_facts() -> dict[str, Any] | None:
     except Exception:
         return None
     try:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(index)
     except Exception:
         handle = None
     try:
@@ -349,11 +453,13 @@ def _ram_total() -> int | None:
 
 
 def machine_facts() -> dict[str, Any]:
-    """The CPU, GPU and NUMA facts, plus ``ram_total_bytes``, the process's CPU affinity
+    """The CPU, GPU (``gpu_*`` keys are GPU 0's; ``gpus`` lists every CUDA device in torch's
+    order) and NUMA facts, plus ``ram_total_bytes``, the process's CPU affinity
     (Linux only) and an ``nvml`` block (None without ``pynvml`` or a GPU)."""
     r = _Record()
     _cpu(r)
     _gpu(r)
+    _gpus(r)
     _numa(r)
     r.put("ram_total_bytes", _ram_total(), "no os.sysconf RAM size on this OS")
     affinity = getattr(os, "sched_getaffinity", None)

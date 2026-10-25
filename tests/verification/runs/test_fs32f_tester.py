@@ -346,7 +346,7 @@ def test_plan_every_part_has_a_timeout_and_the_two_arms_differ_only_in_the_setti
 
 def test_the_default_deadline_is_about_twice_the_estimates_and_inside_the_guard(tmp_path):
     est = sum(fs.PAIR_ESTIMATE_MIN.values())
-    assert 150 <= est <= 160  # FS33d added 30 minutes, the exit probe 42
+    assert 110 <= est <= 120  # FS33d added 30 minutes; the exit probe's 42 are out again
     text = JOB.read_text()
     m = re.search(r"\[ \"\$SESSION\" = fs32-pair \] && DEFAULT_DEADLINE_S=(\d+)", text)
     assert m and int(m[1]) >= 2 * est * 60 * 0.95
@@ -383,6 +383,7 @@ def test_main_refuses_fewer_than_two_gpus_and_not_by_type(tmp_path, monkeypatch,
     monkeypatch.setattr(fs, "choose_plan", lambda *a, **k: [])
     monkeypatch.delenv("FS11_ALLOW_ANY_GPU", raising=False)
     monkeypatch.delenv("FS31_CARDS", raising=False)
+    monkeypatch.setenv("FS11_ALLOW_PYTHON_MISMATCH", "1")  # the fake upload has no manifest
     out = tmp_path / "out"
     rc = fs.main(["run", "--upload", str(tmp_path / "up"), "--out", str(out),
                   "--deadline", str(time.time() + 60), "--session", "fs32-pair"])
@@ -394,7 +395,7 @@ def test_main_refuses_fewer_than_two_gpus_and_not_by_type(tmp_path, monkeypatch,
 def test_the_job_script_switches_on_the_session(tmp_path):
     text = JOB.read_text()
     assert re.search(
-        r"fs11\|recheck\|profile-check\|nvlink-probe\|kernel-speed\|fs32-pair\|device-leaves\)",
+        r"fs11\|recheck\|profile-check\|nvlink-probe\|kernel-speed\|fs32-pair\|device-leaves\|four-h100\)",
         text)
     assert subprocess.run(["bash", "-n", str(JOB)]).returncode == 0
 

@@ -2,6 +2,7 @@
 Everything here runs on the CPU; the timed GPU pass is the session's."""
 
 import json
+import platform
 import sys
 from pathlib import Path
 
@@ -265,8 +266,8 @@ def test_the_other_sessions_have_no_kernel_parts(tmp_path):
     # the two-GPU session runs pytest parts of its own, but no kernel part
     for p in fs.SESSIONS["fs32-pair"][1](tmp_path / "up", tmp_path / "out"):
         assert p.kind != "kernel_speed" and not any("test_gpu_blake3" in a for a in p.argv)
-    assert sorted(fs.SESSIONS) == ["device-leaves", "fs11", "fs32-pair", "kernel-speed",
-                                   "nvlink-probe", "profile-check", "recheck"]
+    assert sorted(fs.SESSIONS) == ["device-leaves", "four-h100", "fs11", "fs32-pair",
+                                   "kernel-speed", "nvlink-probe", "profile-check", "recheck"]
 
 
 def test_the_extras_carry_the_gate_into_the_summary(tmp_path):
@@ -470,6 +471,9 @@ def test_the_kernel_speed_prep_packs_only_repo_native_sizes_requirements_and_man
     assert not [n for n in names if n.split("/")[1] in ("hf", "data", "bench_cache")]
     assert f"{fs11_prep.TOP}/{ks.SIZES_NAME}" in names and f"{fs11_prep.TOP}/manifest.json" in names
     assert set(man["files"]) >= {ks.SIZES_NAME, "requirements-fs11.txt", "repo/a.py"}
+    with tarfile.open(man["tarball"]) as t:  # the pod's Python is pinned to this one
+        packed = json.load(t.extractfile(f"{fs11_prep.TOP}/manifest.json"))
+    assert man["python_version"] == packed["python_version"] == platform.python_version()
     assert fs11_prep.main(["--session", "kernel-speed", "--out", str(tmp_path / "o")]) == 2
 
 

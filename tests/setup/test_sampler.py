@@ -42,7 +42,7 @@ def _busy_run(tmp_path, *flags):
 def _check_busy_rows(out):
     head, *_ = _lines(out)
     rows = _samples(out)
-    assert head["kind"] == "header" and head["version"] == 1 and head["fields"] == sampler.FIELDS
+    assert head["kind"] == "header" and head["version"] == 2 and head["fields"] == sampler.FIELDS
     assert head["interval_s"] == 0.1
     assert 15 <= len(rows) <= 22
     assert sum(r["c_tree"] for r in rows) / len(rows) > 0.5
@@ -55,7 +55,7 @@ def _check_busy_rows(out):
 def test_wrap_a_busy_loop_without_the_gpu_reader(tmp_path):
     """``--no-gpu`` reads the same on every host: no NVML, every GPU field null."""
     head, rows = _check_busy_rows(_busy_run(tmp_path, "--no-gpu"))
-    assert head["gpu"] is None and head["nvml"] is False and "--no-gpu" in head["gpm_error"]
+    assert head["gpus"] is None and head["nvml"] is False and "--no-gpu" in head["gpm_error"]
     assert all(r["g_util"] is None and r["g_sm_active"] is None for r in rows)
 
 
@@ -64,9 +64,10 @@ def test_wrap_a_busy_loop(tmp_path):
     naming the GPU on one with a GPU (the FS32 pod's A40 failed the old no-GPU assertion)."""
     head, rows = _check_busy_rows(_busy_run(tmp_path))
     if head["nvml"]:
-        assert head["gpu"] is not None and head["gpu"]["name"]
+        assert head["gpus"] and all(g["name"] for g in head["gpus"])
+        assert all(len(r["g_util"]) == len(head["gpus"]) for r in rows)
     else:
-        assert head["gpu"] is None
+        assert head["gpus"] is None
         assert all(r["g_util"] is None and r["g_sm_active"] is None for r in rows)
 
 
@@ -172,18 +173,27 @@ class _Obj:
         self.__dict__.update(kw)
 
 
-def _fake_nvml(*, gpm: bool, pids=(1,), bad=()) -> types.ModuleType:
-    """``bad``: GPM metric ids whose reading comes back with an error code."""
+def _fake_nvml(*, gpm: bool, pids=(1,), bad=(), n=1, fail_util=()) -> types.ModuleType:
+    """``bad``: GPM metric ids whose reading comes back with an error code. ``n`` devices; device
+    ``i`` reads utilization ``80 - 10 i`` percent, and ``fail_util`` lists the devices whose
+    utilization call raises."""
     m = types.ModuleType("pynvml")
     m.NVML_CLOCK_SM, m.NVML_CLOCK_MEM, m.NVML_TEMPERATURE_GPU = 1, 2, 0
     m.NVML_PCIE_UTIL_TX_BYTES, m.NVML_PCIE_UTIL_RX_BYTES = 0, 1
     m.nvmlInit = lambda: None
     m.nvmlShutdown = lambda: None
-    m.nvmlDeviceGetHandleByIndex = lambda i: "h"
+    m.nvmlDeviceGetCount = lambda: n
+    m.nvmlDeviceGetHandleByIndex = lambda i: i
     m.nvmlDeviceGetName = lambda h: b"Fake GPU"
-    m.nvmlDeviceGetUUID = lambda h: "GPU-fake"
-    m.nvmlDeviceGetUtilizationRates = lambda h: _Obj(gpu=80, memory=30)
-    m.nvmlDeviceGetMemoryInfo = lambda h: _Obj(used=123456)
+    m.nvmlDeviceGetUUID = lambda h: f"GPU-fake-{h}"
+    m.nvmlDeviceGetPciInfo = lambda h: _Obj(busId=b"00000000:%02X:00.0" % (h + 25))
+
+    def util(h):
+        if h in fail_util:
+            raise RuntimeError(f"no util on {h}")
+        return _Obj(gpu=80 - 10 * h, memory=30)
+    m.nvmlDeviceGetUtilizationRates = util
+    m.nvmlDeviceGetMemoryInfo = lambda h: _Obj(used=123456 + h)
     m.nvmlDeviceGetClockInfo = lambda h, c: 1700 if c == 1 else 2600
     m.nvmlDeviceGetPowerUsage = lambda h: 250000
     m.nvmlDeviceGetTemperature = lambda h, k: 55
@@ -192,8 +202,8 @@ def _fake_nvml(*, gpm: bool, pids=(1,), bad=()) -> types.ModuleType:
     m.nvmlDeviceGetComputeRunningProcesses = lambda h: [_Obj(pid=p) for p in pids]
     names = ("SM_UTIL", "SM_OCCUPANCY", "ANY_TENSOR_UTIL", "DRAM_BW_UTIL", "PCIE_TX_PER_SEC",
              "PCIE_RX_PER_SEC")
-    for i, n in enumerate(names):
-        setattr(m, f"NVML_GPM_METRIC_{n}", i + 1)
+    for i, mname in enumerate(names):
+        setattr(m, f"NVML_GPM_METRIC_{mname}", i + 1)
     if gpm:
         m.NVML_GPM_METRICS_GET_VERSION = 1
         m.nvmlGpmQueryDeviceSupport = lambda h: _Obj(isSupportedDevice=1)
@@ -225,14 +235,16 @@ def test_a_fake_nvml_fills_the_gpu_fields(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "pynvml", _fake_nvml(gpm=False))
     head, *rest = _run_briefly(tmp_path)
     rows = [r for r in rest if "t" in r]
-    assert head["nvml"] is True and head["gpu"]["name"] == "Fake GPU"
-    assert head["gpu"]["uuid"] == "GPU-fake" and head["gpm"] is False
+    assert head["nvml"] is True and head["gpus"] == [
+        {"index": 0, "name": "Fake GPU", "uuid": "GPU-fake-0", "pci_bus_id": "00000000:19:00.0"}]
+    assert head["gpm"] is False
     assert "doesn't support GPM" in head["gpm_error"] and head["pcie_source"] == "nvml"
     r = rows[-1]
-    assert (r["g_util"], r["g_mem_util"], r["g_mem_used"]) == (0.8, 0.3, 123456)
-    assert (r["g_sm_mhz"], r["g_mem_mhz"], r["g_power_w"], r["g_temp_c"]) == (1700, 2600, 250, 55)
-    assert (r["g_throttle"], r["g_pcie_tx"], r["g_pcie_rx"]) == (4, 10240, 20480)
-    assert r["g_other_procs"] == 1 and r["g_sm_active"] is None
+    assert (r["g_util"], r["g_mem_util"], r["g_mem_used"]) == ([0.8], [0.3], [123456])
+    assert (r["g_sm_mhz"], r["g_mem_mhz"], r["g_power_w"], r["g_temp_c"]) == (
+        [1700], [2600], [250], [55])
+    assert (r["g_throttle"], r["g_pcie_tx"], r["g_pcie_rx"]) == ([4], [10240], [20480])
+    assert r["g_other_procs"] == [1] and r["g_sm_active"] == [None]
 
 
 def test_a_fake_gpm_fills_the_gpm_fields_and_pcie(tmp_path, monkeypatch):
@@ -240,8 +252,8 @@ def test_a_fake_gpm_fills_the_gpm_fields_and_pcie(tmp_path, monkeypatch):
     head, *rest = _run_briefly(tmp_path)
     r = [r for r in rest if "t" in r][-1]
     assert head["gpm"] is True and head["gpm_error"] is None and head["pcie_source"] == "gpm"
-    assert r["g_sm_active"] == pytest.approx(0.1) and r["g_dram_bw"] == pytest.approx(0.4)
-    assert r["g_pcie_tx"] == 50 * (1 << 20) and r["g_pcie_rx"] == 60 * (1 << 20)
+    assert r["g_sm_active"] == [pytest.approx(0.1)] and r["g_dram_bw"] == [pytest.approx(0.4)]
+    assert r["g_pcie_tx"] == [50 * (1 << 20)] and r["g_pcie_rx"] == [60 * (1 << 20)]
 
 
 def test_a_failing_nvml_call_gives_null_and_one_error(tmp_path, monkeypatch):
@@ -253,7 +265,7 @@ def test_a_failing_nvml_call_gives_null_and_one_error(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "pynvml", m)
     lines = _run_briefly(tmp_path)
     rows = [r for r in lines if "t" in r]
-    assert all(r["g_power_w"] is None for r in rows) and rows[-1]["g_util"] == 0.8
+    assert all(r["g_power_w"] == [None] for r in rows) and rows[-1]["g_util"] == [0.8]
     # the baseline sample runs before the header, so the first failure lands in its errors
     errors = [e for e in lines[0]["errors"] if e["group"] != "nvml"] \
         + [r for r in lines if r.get("kind") == "error"]
@@ -300,7 +312,7 @@ def test_gpu_pids_that_do_not_resolve_give_null_and_one_error(tmp_path, monkeypa
     monkeypatch.setitem(sys.modules, "pynvml", _fake_nvml(gpm=False, pids=(4194000, 4194001)))
     lines = _run_briefly(tmp_path)
     rows = [r for r in lines if "t" in r]
-    assert all(r["g_other_procs"] is None for r in rows)
+    assert all(r["g_other_procs"] == [None] for r in rows)
     errs = [e for e in _errors(lines) if e["group"] == "g_other_procs"]
     assert len(errs) == 1 and "pid namespace" in errs[0]["error"]
 
@@ -308,7 +320,8 @@ def test_gpu_pids_that_do_not_resolve_give_null_and_one_error(tmp_path, monkeypa
 def test_a_gpm_metric_with_an_error_code_is_null(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "pynvml", _fake_nvml(gpm=True, bad=(2,)))  # SM_OCCUPANCY
     rows = [r for r in _run_briefly(tmp_path) if "t" in r]
-    assert rows[-1]["g_occupancy"] is None and rows[-1]["g_sm_active"] == pytest.approx(0.1)
+    assert rows[-1]["g_occupancy"] == [None]
+    assert rows[-1]["g_sm_active"] == [pytest.approx(0.1)]
 
 
 def test_gpm_that_keeps_failing_falls_back_to_the_nvml_pcie_counters(tmp_path, monkeypatch):
@@ -316,8 +329,8 @@ def test_gpm_that_keeps_failing_falls_back_to_the_nvml_pcie_counters(tmp_path, m
     monkeypatch.setattr(sampler, "GPM_FALLBACK_S", 0.3)
     lines = _run_briefly(tmp_path, 1.2)
     rows = [r for r in lines if "t" in r]
-    assert rows[0]["g_pcie_tx"] is None and rows[-1]["g_pcie_tx"] == 10240
-    assert all(r["g_sm_active"] is None for r in rows)
+    assert rows[0]["g_pcie_tx"] == [None] and rows[-1]["g_pcie_tx"] == [10240]
+    assert all(r["g_sm_active"] == [None] for r in rows)
     assert [e["group"] for e in _errors(lines)].count("gpm_fallback") == 1
 
 
@@ -413,3 +426,94 @@ def test_cgroup_throttle_falls_back_to_v1(tmp_path, monkeypatch):
     monkeypatch.setattr(sampler, "_CG", tmp_path)
     assert sampler._cgroup_throttle(tmp_path / "missing") == (4000, 1)
     assert sampler._cgroup_throttle(tmp_path / "empty") == (4000, 1)
+
+
+# -- every GPU (FS35) ------------------------------------------------------------------------
+
+
+def test_a_four_device_fake_gives_four_entries_per_gpu_field(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", _fake_nvml(gpm=False, n=4))
+    head, *rest = _run_briefly(tmp_path)  # run(..., gpus=0) in _run_briefly: one GPU
+    assert len(head["gpus"]) == 1
+    out = tmp_path / "all.jsonl"
+    stop = threading.Event()
+    threading.Timer(0.6, stop.set).start()
+    sampler.run(os.getpid(), out, 0.1, None, stop)  # the default: every GPU
+    head, *rest = _lines(out)
+    rows = [r for r in rest if "t" in r]
+    assert [g["index"] for g in head["gpus"]] == [0, 1, 2, 3]
+    assert [g["uuid"] for g in head["gpus"]] == [f"GPU-fake-{i}" for i in range(4)]
+    assert head["gpus"][2]["pci_bus_id"] == "00000000:1B:00.0" and head["nvml"] is True
+    for f in sampler.GPU_FIELDS:
+        assert all(isinstance(r[f], list) and len(r[f]) == 4 for r in rows), f
+    assert rows[-1]["g_util"] == [0.8, 0.7, 0.6, 0.5]
+    assert rows[-1]["g_mem_used"] == [123456, 123457, 123458, 123459]
+    assert rows[-1]["g_other_procs"] == [1, 1, 1, 1]
+    assert isinstance(rows[-1]["rss"], (int, float))  # process fields stay scalars
+
+
+def test_one_gpus_failing_read_leaves_its_slot_null(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", _fake_nvml(gpm=False, n=4, fail_util=(2,)))
+    out = tmp_path / "s.jsonl"
+    stop = threading.Event()
+    threading.Timer(0.6, stop.set).start()
+    sampler.run(os.getpid(), out, 0.1, None, stop)
+    lines = _lines(out)
+    rows = [r for r in lines if "t" in r]
+    assert all(r["g_util"] == [0.8, 0.7, None, 0.5] for r in rows)
+    assert rows[-1]["g_mem_used"][2] == 123458  # the other fields of that GPU still read
+    errs = [e["group"] for e in _errors(lines) if e["group"].startswith("g_util")]
+    assert errs == ["g_util[2]"]  # logged once, naming the GPU
+
+
+def test_gpus_lists_a_subset_in_the_given_order(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "pynvml", _fake_nvml(gpm=False, n=4))
+    out = tmp_path / "s.jsonl"
+    stop = threading.Event()
+    threading.Timer(0.5, stop.set).start()
+    sampler.run(os.getpid(), out, 0.1, [3, 1], stop)
+    head, *rest = _lines(out)
+    assert [g["index"] for g in head["gpus"]] == [3, 1]
+    assert [r for r in rest if "t" in r][-1]["g_util"] == [0.5, 0.7]
+
+
+def test_a_gpu_without_a_handle_keeps_its_slot_null(tmp_path, monkeypatch):
+    m = _fake_nvml(gpm=False, n=2)
+
+    def handle(i):
+        if i == 1:
+            raise RuntimeError("no such device")
+        return i
+    m.nvmlDeviceGetHandleByIndex = handle
+    monkeypatch.setitem(sys.modules, "pynvml", m)
+    out = tmp_path / "s.jsonl"
+    stop = threading.Event()
+    threading.Timer(0.5, stop.set).start()
+    sampler.run(os.getpid(), out, 0.1, None, stop)
+    head, *rest = _lines(out)
+    assert head["gpus"][1] == {"index": 1, "name": None, "uuid": None, "pci_bus_id": None}
+    assert [r for r in rest if "t" in r][-1]["g_util"] == [0.8, None]
+
+
+@pytest.mark.parametrize("flags,want", [(["--gpus", "0,1"], [0, 1]), (["--gpu", "2"], [2]),
+                                         ([], None)])
+def test_the_gpus_flag_and_the_old_gpu_flag(tmp_path, monkeypatch, flags, want):
+    seen = []
+    monkeypatch.setattr(sampler, "run", lambda pid, out, interval, gpus, *a, **k: seen.append(gpus) or 0)
+    sampler.main(["--pid", str(os.getpid()), "--out", str(tmp_path / "x"), *flags])
+    assert seen == [want]
+
+
+def test_one_sample_of_four_gpus_stays_well_inside_the_interval(tmp_path, monkeypatch):
+    """The fake NVML answers at once, so this is the sampler's own bookkeeping for four GPUs."""
+    import io
+    import psutil
+    monkeypatch.setitem(sys.modules, "pynvml", _fake_nvml(gpm=True, n=4))
+    s = sampler._Sampler(os.getpid(), io.StringIO(), 0.1, None, psutil)
+    s._init_gpu()
+    s.sample(time.monotonic_ns())
+    t0 = time.perf_counter()
+    for _ in range(50):
+        s.sample(time.monotonic_ns())
+    per = (time.perf_counter() - t0) / 50
+    assert per < 0.02, f"{per * 1e3:.1f} ms a sample"  # a fifth of the 100 ms interval

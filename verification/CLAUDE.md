@@ -38,6 +38,11 @@ details that don't change what is committed or checked are yours to choose.
   cannot run in teardown, which is why the earlier guard printed nothing. The guard also
   registers SIGUSR1 to dump all stacks on demand. Both write to `POTS_STACKS_FILE` when it is
   set, else to stderr. The pair session's fast suite sat 20 minutes after its summary line.
+  The cause was CPython 3.14.0's resource-tracker deadlock (gh-146313), set off by
+  `torch_shm_manager` inheriting the tracker's pipe in `test_shared*.py`; 3.14.7 does not hang.
+  The session refuses a Python other than the manifest's (`fs11_session.python_mismatch`) and
+  `runs/fs11_setup.sh` builds the pod's venv at the Mac's version. `fs11_session exit-probe`
+  is run by hand to find a module that hangs at exit.
 - **Style.**
   - Use ordinary importable libraries with type hints and no import-time side effects (S7b).
   - Entry points read env vars through `setup/config.py` and `verification/parameters.py`,
@@ -114,7 +119,12 @@ All start with `VERIF_`. Scale is config only, never a code fork (Â§8.A.5).
 One variable is outside that scheme: `POTS_NATIVE_CACHE`, the directory holding the native
 BLAKE3 sources and library (`commitment/native.py`), default `~/.cache/pots-2.0/native`. `POTS_STACKS_FILE` is the file the exit guard writes stacks to (`fs11_session` sets it for pytest parts) and `POTS_EXIT_GRACE_S` the watchdog's seconds (default 120). Another is `POTS_SAMPLER`: `0` turns off the per-part sampler
 (`setup/sampler.py`) that `fs11_session` starts beside each part; default on. Its file is
-`<part dir>/samples.jsonl`.
+`<part dir>/samples.jsonl`, version 2 since FS35: it records every NVML GPU (`--gpus 0,1` picks
+some, `--gpu N` one). The header lists them in `gpus` (`index`, `name`, `uuid`, `pci_bus_id`),
+and each `g_*` field of a row is a list with one value per header GPU, `null` where a read
+failed; process and machine fields stay scalars. The profile analysis (`evaluation/results/
+profile/analyze.py`) reads versions 1 and 2, takes each section's utilization from the GPU of
+its device (matched by UUID) and its floors from that device's `probe.json` rates.
 
 Data artifacts (`D`, `DÌƒ`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch
@@ -1675,7 +1685,9 @@ interface.
     never judged (the rest of its window, `StepState.run_rest`, set by check 5 when it
     rejects, then on the unit pass the host rows of the later windows,
     `StepState.run_rest_rows`, judged in canonical order), since a member measured alone or
-    in a smaller batch is held to agree only to `1e-4` relative; an error check 5 deferred
+    in a smaller batch agrees with check 5's batch only to rounding (on an AMD EPYC 7742,
+    torch 2.9.1's CPU wheel, an honest member's raw residual moved by about 5%), so the record
+    pass records check 5's own measured rows rather than measuring again; an error check 5 deferred
     (`StepState.run_rest_error`) is raised after them. Every product still unmeasured is then
     served and measured from check 5's own replay, as check 5 does it (none remain after a
     unit pass). A 6a rejection measures
@@ -1764,13 +1776,22 @@ interface.
     assertion; rejects `None`, `"provisional"` and mixed hashes).
   - `band_context(cfg, c, *, h_D, k)`: the run a band file is fitted for, which `calibrate`
     writes and every loader compares: model and revision, `(MASTER_DTYPE, COMPUTE_DTYPE)`,
-    `attn_impl`, device, `h_D`, `n_s`, `n`, `Î·`, `M`, `T_run` (`VERIF_STEPS`) and `k`. It also
+    `attn_impl`, the device type (`torch.device(cfg.device).type`: `cuda` for both `cuda` and
+    `cuda:0`, so a file fitted at the full-scale `VERIF_DEVICE=cuda` judges the four-GPU layout's
+    `cuda:0`; the GPU models are compared beside it), `h_D`, `n_s`, `n`, `Î·`, `M`, `T_run`
+    (`VERIF_STEPS`) and `k`. It also
     holds `calibration_seed` (`VERIF_SEED`) and `threads` (`VERIF_THREADS`), both in
     `PROVENANCE_KEYS`: kept in the file, never compared. The bands describe rounding noise on
     honest steps, which doesn't depend on `Ï€`, so a run at seed 2â€“5 loads the file fitted at
     seed 1 (EVALUATION_SPEC Â§3.2). The thread count changes only the CPU's floating-point
     reduction order, a shift far below `Ï„ = 8Â·s_h`, while the cost results need it recorded
     (FS2). A file written before `threads` was recorded (`cc7a9bcaâ€¦`) loads too.
+    Three more keys are compared (FS35, G6): `gpu_models` (`gpu_models(cfg)`: the sorted
+    distinct `get_device_name` of the CUDA devices in `VERIF_DEVICE` and
+    `VERIF_VERIFIER_DEVICES`, `[]` on CPU), `torch` (`torch.__version__`) and `cuda`
+    (`torch.version.cuda`). A set of models, not a layout: a file fitted unsharded judges a
+    sharded run on the same model. A file written before them is refused, and the
+    `BandFileMismatch` message says it lacks them and to rerun `verification.runs.calibrate`.
   - Fitted bands go through `band_file_bytes` â†’ `Bands.from_json` before `freeze`, so their
     `source` is the file's hash, not `"provisional"`.
 
@@ -2182,7 +2203,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     change nothing. The counting pass and `trace_step` refuse (one process). `step` stays work (the
     sum); a merged step adds the `step_wall` total, its wall extent (its `gpu_held_s` is wall times
     devices, idle gap included: not work). EQ14's numbers read wall time (`step_wall`) beside
-    GPU-seconds (`gpu_held_s`), as F22 says.
+    accumulated GPU time per role, as F22 says. `gpu_held_s` is only an upper bound on held GPU
+    time (a section's time times every device its process lists); the measure is computed by the
+    four-H100 session's summary from the per-side `total` rows and `gpu_roles`
+    (`fs11_session._accumulated_gpu_s`).
   - **Prover rows (EQ1b).**
     - P0, original training: `P0.load`, `P0.forward`, `P0.backward`, `P0.update`, emitted only
       by `plain_step` (the plain baseline, B7).
@@ -2223,7 +2247,18 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     (`environment_record`) also holds the allocator's settings (`allocator_settings`): both
     variables of `ALLOC_VARS`, `PYTORCH_ALLOC_CONF` and `PYTORCH_CUDA_ALLOC_CONF` (null when
     unset), and the run's `release_cache` (`VERIF_RELEASE_CACHE` unless the caller passes
-    it). `bring_up` prints the same as a line, `allocator: {â€¦}`. Every run that writes `corpus`
+    it). It also holds `gpu_roles` (FS35, I2): `None` on a CPU run, else one entry per distinct
+    CUDA device, the prover first then the verifiers (`VERIF_VERIFIER_DEVICES`), with `index`,
+    `name`, `uuid` (`GPU-â€¦`, as in the machine record's `gpus`) and `roles` (`["prover"]`,
+    `["verifier"]`, or both: an unsharded run, or `cuda:0` in the pair layout). The machine
+    record's `gpus` (`setup/machine.py`) lists every torch device, joined to its `nvidia-smi`
+    row by PCI bus id, never by position. The machine record's `gpus` prefers `nvidia-smi`'s
+    UUID from the matched row and uses `setup.machine.torch_gpu_uuid` to join rows (after the
+    bus id) and as the fallback; the environment record's `gpu_roles`, `probe.json`'s
+    `per_device` and `card_identity` take theirs from that helper (`smi_uuid_form` adds `GPU-`
+    once, never twice); the pod test `tests/setup/test_machine_cuda.py` checks them equal to
+    `nvidia-smi`'s by index. `bring_up` prints the allocator settings as a line,
+    `allocator: {â€¦}`. Every run that writes `corpus`
     writes `attack`. A run or directory named `data` or `evaluation` (`RESERVED_NAMES`,
     EVALUATION_SPEC Â§4.6) raises `ValueError`, in any letter case (`str.casefold`): on a
     case-insensitive file system `Data` is `data`.
@@ -2312,7 +2347,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     and counting passes are `PASS_STEPS` and `COUNT_STEPS` honest steps, each of its own. The
     MLP records `h_D` (its synthetic `D`'s root) and a null band-file hash.
 - `llama_step.py` (A10, milestone M3): `.venv/bin/python -m verification.runs.llama_step
-  [--steps T] [--bands PATH] [--metrics | --no-metrics]`, with `T` default 1.
+  [--steps T] [--bands PATH] [--metrics | --no-metrics] [--count | --no-count]`, with `T`
+  default 1.
   `DecoderComputation.from_config`, `W_0` from `build_model()`, `D` from
   `$VERIF_OUTPUT_DIR/data/D.bin` and the published `h_D` from `meta.json`
   (`load_committed_dataset`, shared by every decoder run). It first calls
@@ -2328,7 +2364,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   prints `residuals.py`'s two tables, `report_costs` each step's prover and verifier wall clock
   and the hand-off between them (`StepRecord.handoff_s`), and, from the memory pass, each
   side's peak (on CUDA with the reserved peak beside it, `, reserved â€¦ GB`). Metrics go to
-  `llama_step/`. Exits 1 unless
+  `llama_step/`. `report_roots` prints `step t root <hex>` for every step after the costs
+  (`StepRecord.root`, in `run_verified`'s format; nothing else in the output changes), so a
+  session can compare roots across runs. `--no-count` skips the counting pass (the default
+  `--count` runs it): counts do not depend on the GPU layout, and FS35's session skips them to
+  save pod time. Exits 1 unless
   accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s
   and `memory_run`'s `release_cache`), not the counting pass. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
   every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
@@ -2893,6 +2933,19 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     relative difference is 25 (the residual is rounding noise), and the step is still
     accepted; from `k = 2` every shared residual is bit-equal. 158.6 s, peak footprint
     4.69 GB.
+- `probe.py` (`probe.json` v2, FS35): `.venv/bin/python -m verification.runs.probe
+  [--seconds S] [--devices cuda:0,cuda:1,...]`. The devices are the run's own (`VERIF_DEVICE`,
+  then `VERIF_VERIFIER_DEVICES`, repeats dropped) unless `--devices` replaces them. Per CUDA
+  device it measures the GPU rates (`gemm`, `skinny`, `hbm`, `transfers`, `bf16_transfers`,
+  `costs`, `hash_kernel`: the leaf mixes through `leaf_hashes_of` on device tensors, the
+  kernel built before the clock); once, the host-only ones (`host_memcpy`, `first_touch`,
+  `hash`, `pinned_alloc`, which run first so no cached pinned block breaks its count); then
+  the peer rate of every ordered pair (one 256 MiB copy, synced on both devices).
+  `--seconds` is the budget per device (a four-GPU probe takes about 9 minutes, a one-GPU one
+  about 2.5). The file keeps the v1 top-level keys (the host measures and the first device's
+  GPU measures) and adds `devices`, `per_device` (name, uuid, datasheet, rates, costs,
+  errors), `peer` and `peer_errors` (keyed `cuda:i->cuda:j`). A CPU run has both empty.
+  A failed measure goes into the errors and the rest go on.
 - `check5_profile.py` (O2): `.venv/bin/python -m verification.runs.check5_profile
   [--run-dir DIR] [--step N] [--repeats N] [--json]`. Its docstring has the full flow. It
   judges nothing and writes nothing.
@@ -2906,6 +2959,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     tensor to a CPU one); on CUDA, from `torch.profiler`, kernel launches, kernels and their
     summed device time, and blocking runtime calls (`cuda{Stream,Device,Event}Synchronize`,
     `cudaMemcpy`), each placed in the section whose `record_function` range holds its start.
+  - On a sharded run (FS35) it syncs every device of the run (`run_devices_of`: `VERIF_DEVICE`
+    and the placement's devices) around each timed and profiled pass, and the profile adds
+    `by_device`: kernels and summed device time per `cuda:k`, from the kernel events'
+    `device_index`. Syncs and launches aren't split per device: their events name none.
   - `M` is split into dense and member products, but the counts aren't: check 5's sections
     don't separate them.
   - The digest of the last timed pass's check-5 numbers is compared with the archive's; on a
@@ -3115,18 +3172,26 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     included; a public model's weights left out, their SHA-256 recorded), the benchmark's BLAKE3
     sources, the native library's pinned sources (`native_cache/blake3-1.8.7/`, from the Mac's
     native cache, checked with `native.bad_sources`; run `python -m verification.commitment.native`
-    first), `requirements-fs11.txt` and `manifest.json` (every packed file's SHA-256). Every cached file
-    is checked against its blob name first. It never downloads and never packs the cache's
-    token; a pinned model missing from the cache is reported (exit 1 for a run model). The
+    first), `requirements-fs11.txt` and `manifest.json` (every packed file's SHA-256, and
+    `python_version`, the Mac's `platform.python_version()`, also in the kernel-speed upload's).
+    Every cached file is checked against its blob name first. It never downloads and never
+    packs the cache's token; a pinned model missing from the cache is reported (exit 1 for a run model). The
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
     in its place.
     `--session kernel-speed --sizes FILE` (FS29) packs only `git archive HEAD`, the native
     sources, the sizes file at the top (checked with `kernel_speed.read_sizes`),
     `requirements-fs11.txt` and `manifest.json`: no `hf/`, `data/` or `bench_cache/`, and no
     `HF_HUB_OFFLINE` needed. `PACKAGES` includes pytest and matplotlib for it.
+  - `fs11_setup.sh UPLOAD_DIR`: the pod's environment in one command. It reads `python_version`
+    from the upload's `manifest.json` (system `python3`, standard library), installs a current uv
+    into `/root/uvnew` (the image's uv 0.9.0 has no 3.14.7), runs `uv python install` and `uv venv`
+    at that version into `/root/venv`, links `repo/.venv` to it, installs
+    `requirements-fs11.txt` and prints the venv's Python and torch. Reruns are safe; a manifest
+    without the version stops it. `FS11_SETUP_PYTHON3`, `_UVDIR`, `_UV` and `_VENV` override its
+    paths (tests: `test_fs11_setup.py`, on stubs).
   - `fs11_session.py`: `run --upload DIR --out DIR --deadline EPOCH [--plan FILE]
     [--selftest] [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,
-    fs32-pair,device-leaves}]`, `fetch-models` and `env`. `--session` picks the plan from
+    fs32-pair,device-leaves,four-h100}]`, `fetch-models` and `env`. `--session` picks the plan from
     `SESSIONS`, which
     also gives the name `summary.json`'s `session` records: `fs11` (the default, "FS11"),
     `recheck` ("recheck"), `profile-check`, `nvlink-probe` (FS31), `kernel-speed` (FS29:
@@ -3164,11 +3229,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `peer_check`, `models` and the native build included, unsets `VERIF_PIPELINED`), and records
     `step_times` (prover, verifier, hand-off, total per step, per arm) and `gpu_peak` (per
     part), outside `pass`. `pair_default_deadline_s()` is the job's default deadline.
-    The exit probe (`exit_probe`, kind `exit_probe`, not in `PAIR_PARTS`, so never in `pass`)
-    follows the fast suite: `run_exit_probe` runs each module of `EXIT_PROBE_MODULES` in its own
-    pytest process, then the whole list in one if none hung, writes `exit_probe.json` and the
-    job-log line `FS32 exit probe: N of M runs hung at exit: ...`. `_run_part` and the probe
-    share `watch_process`: a pytest part whose junit exists and which is still running
+    The exit probe is a tool, no longer a part of the plan (the hang's cause is known; the watch
+    catches a new one): `fs11_session exit-probe` runs each module of `EXIT_PROBE_MODULES` in its
+    own pytest process by hand, to find a module that hangs at exit, then the whole list in one
+    if none hung, writes `exit_probe.json` and prints `FS32 exit probe: N of M runs hung at
+    exit: ...` (`exit_probe_lines`). `_run_part` and the probe share `watch_process`: a pytest
+    part whose junit exists and which is still running
     `EXIT_HANG_GRACE_S` (180 s) later gets `parts/<name>/hang.txt` (a `/proc` snapshot),
     SIGUSR1 (stacks to `stacks.txt`) and a kill, and ends `exit_hang`, a failure like every status
     other than `ok` and `skipped_done`; `killed_timeout` and `killed_deadline` get the snapshot.
@@ -3192,6 +3258,49 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     report`. Each arm's plain-against-proved `W_{t+1}` is printed and recorded, outside `pass`.
     An acceptance failure leaves the job's exit code alone. Two A40s: the prover's GPU is then
     one of the verifier devices, so the placement leaving it out runs only on four H100s.
+    `four-h100` (FS35, `four_h100_plan`) is the four-GPU acceptance: `FOUR_PROVER` `cuda:0`
+    trains and `FOUR_VERIFIERS` `cuda:1,cuda:2,cuda:3` verify. `refusal(env, allow, 4,
+    need="the four-H100 session")` refuses fewer than 4 CUDA devices (`FS11_ALLOW_ANY_GPU` does
+    not lift that) and, without `FS11_ALLOW_ANY_GPU=1`, a machine with no H100. Parts: the
+    native build, `peer_check`, `models`, `four_tests` (one pytest part with a junit report:
+    every multi-GPU test, slow or not (`PAIR_SLOW_SELECT`), `FS34_TESTS_FILE` and
+    `FOUR_TEST_FILES`, selected by `-k` under `-m "slow or not slow"`; the `-k` text is built
+    from `PAIR_SLOW_SELECT`; it runs on SmolLM2's
+    test-scale data: its run directory's `data/` link is the pair plan's `data_key`), `probe`
+    (on all four GPUs, `--seconds 60`; it and `four_tests` run with `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+    like the card and arm parts, `PCI_ORDER_ENV`), then per model,
+    cheapest first, `card_<key>` (`card_identity` on GPU 0 alone), `seq_<key>` and `pipe_<key>`
+    (`llama_step --steps 3 --metrics --no-count`, each in its own run directory; only `pipe_*`
+    sets `VERIF_PIPELINED`). `four_h100(parts)` goes to `summary.json["four_h100"]` and
+    `_four_lines` ends the job log (`FS35 ok:` or `FS35 FAIL:` per acceptance item; per model
+    and arm the wall time, a steady step (mean of steps 2-3), beside the accumulated GPU time
+    (steady, mean of steps 2-3) and four GPU peaks; the peer-rate range).
+    `pass` fails closed: every part in `four_h100_parts()` ended `ok` or `skipped_done`, the
+    peer copies right, the tests' junit with tests and no failure, error or skipped case (the
+    log line names the first few skipped cases, then a count; a file of `FOUR_TEST_FILES` with
+    every case skipped, or none, fails; `missing_files` names a file absent from the checkout),
+    and per model both arms accepted (`actual: accept`, `PASS`, three root lines,
+    the right `loop mode:`), the arms' step roots equal, step 1's root the card's proved root,
+    and each arm's environment record naming four GPUs (`machine.gpus`, `gpu_roles`: `cuda:0`
+    prover, `cuda:1` to `cuda:3` verifiers, four distinct UUIDs), and the reported numbers all
+    there (`_four_missing_numbers`, its own `FS35 ok/FAIL` line naming what is missing: per
+    model and arm a steady step time and a peak for each of the four GPUs, from `gpu_peak_mib`
+    or `device_peaks`; once a finite positive peer rate for all 12 ordered pairs, from the
+    probe's `peer` or else `peer_check`'s `gbps`). Recorded outside `pass`: step times,
+    `step_wall_s`, per-device peaks, `gpu_peak_mib`, the probe's per-device rates and 12 peer
+    rates (`probe.json` version 2), `peer_check`'s per-pair rate (`gbps`), and per arm the GPU
+    time: `accumulated_gpu_s` per step and `accumulated_steady_s` (steps 2-3), as the cost
+    decision defines it (each GPU's held time summed over the GPUs a part holds: three
+    verifier GPUs for 1 s are 3 s), `_accumulated_gpu_s`: the prover side's `total` row
+    `time_s` times the prover GPUs plus the verifier side's times the verifier GPUs, counts
+    from the environment record's `gpu_roles` (the `run` side and harness rows are in
+    neither). `gpu_held_upper_s` per step (`metrics.py`'s `gpu_held_s` on the `step` row: each
+    section's seconds times every device its process lists, so four on the sequential arm) is
+    an upper bound, not that quantity. `four_pins(pins)` puts `FOUR_ORDER`'s models first and
+    any other run model after them without raising.
+    An acceptance failure leaves the exit code alone; an error in the summary is recorded as
+    `four_h100_error` and the session runs on. `four_default_deadline_s()` is 14,700 s: the
+    estimates (101 min) plus packing 1 and the grace window 20, twice, rounded up to 100 s.
     `--plan` and `--selftest` replace its
     parts. `nvlink-probe` runs `nvlink_probe` once, then `card_identity` per run model and card
     (`FS31_CARDS`, default 4, each part with `CUDA_VISIBLE_DEVICES` set to its card; the probe
@@ -3219,7 +3328,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     the later parts of its model (of every model, for a file no model owns) `not_started`. The
     benchmark is done only when its report is `complete` and no result holds `error:`
     (`benchmark_failure`). It refuses a machine without CUDA and an H100
-    (`FS11_ALLOW_ANY_GPU=1` overrides; `EXIT_REFUSED` 4). `selftest_plan` is two stand-in parts
+    (`FS11_ALLOW_ANY_GPU=1` overrides; `EXIT_REFUSED` 4). It also refuses a running Python whose
+    version differs from the manifest's `python_version`, or an upload without one
+    (`python_mismatch`, in `main` before any part; the self-test is exempt;
+    `FS11_ALLOW_PYTHON_MISMATCH=1` overrides). `selftest_plan` is two stand-in parts
     that need only the standard library, which the module keeps to at import, so `--selftest`
     runs on a bare pod's `python3`.
   - The re-check (`recheck_plan`, 22 parts, no benchmark): the models part; `bring_up
@@ -3264,11 +3376,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     included, with `reserved_gb` and `nested_reserved_gb` on CUDA.
   - `fs11_job.sh`: `bash verification/runs/fs11_job.sh UPLOAD_DIR OUT_DIR`, the job on the
     pod. `FS11_SESSION` (`fs11`, the default, `recheck`, `profile-check`, `nvlink-probe`,
-    `kernel-speed`, `fs32-pair` or `device-leaves`; anything else is a refusal) goes
+    `kernel-speed`, `fs32-pair`, `device-leaves` or `four-h100`; anything else is a refusal) goes
     to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    21,200 s for `fs32-pair`, 8,800 s for `device-leaves`; `FS31_CARDS` is passed on), the
+    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`, 14,700 s for `four-h100`;
+    `FS31_CARDS` is passed on), the
     session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,
     packing into `OUT_DIR.tar` with
     `OUT_DIR.READY` (or `OUT_DIR.PACK_FAILED`), a grace window (`FS11_GRACE_S`, 1,200 s; touch
