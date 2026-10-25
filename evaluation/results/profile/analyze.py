@@ -102,7 +102,7 @@ clock and :data:`US` turns µs into s; nothing else converts.
   ``util`` follows the role rule below and ``util_by_device`` has each device's. No list: the run's
   device (``gpu_roles``' first, else the environment's), GPU 0 of a version 1 file.
 - The bound-lane mark of a multi-device section uses the largest lane utilization over its
-  devices.
+  role devices (the headline's ``util_devices``).
 - With a version 2 probe a section's GPU rates and costs are its device's ``per_device``
   entry; the host-only rates are the top-level ones. A version 1 probe, or a device the probe
   didn't measure, uses the top level, with one warning naming the device.
