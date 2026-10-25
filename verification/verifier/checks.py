@@ -553,7 +553,8 @@ def check5_layout(c: DeclaredComputation) -> list[dict[str, Any]]:
     ``a_shape`` and ``b_shape``, ``operand_bytes`` (``A`` and ``B`` as fp32, the group's total),
     ``product_bytes`` (``P`` in the stored dtype, ``product_dtype``) and ``served_bytes`` (the
     products as measured on the device, in the same dtype: equal to ``product_bytes``, since the
-    kernel reads ``P`` as stored, FS37; plan §2.7). The serving after an error (:func:`_measure_to_failure`) is not described."""
+    kernel reads ``P`` as stored, FS37; plan §2.7). The serving after an error
+    (:func:`_measure_to_failure`) is not described."""
     return _layout(c)[0]
 
 

@@ -2167,8 +2167,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     one, every other backend and the memory and counting recorders: plain `section`.
   - **Three passes.** The timed run reads only `perf_counter` (`TimeRecorder`; CUDA syncs at
     top-level boundaries and times nested sections with event pairs, except `seam.host` ones,
-    which take the host clock; MPS syncs at every boundary). Memory (`MemoryRecorder`, `memory_pass`) and counts (`CountRecorder`,
-    `count_pass`, `counting()`) are separate untimed runs; every section, nested included,
+    which take the host clock; MPS syncs at every boundary). Memory (`MemoryRecorder`,
+    `memory_pass`) and counts (`CountRecorder`, `count_pass`, `counting()`) are separate untimed
+    runs; every section, nested included,
     gets all three axes. On CUDA every memory row also holds `peak_reserved_bytes`, the
     caching allocator's reserved peak over the same interval
     (`torch.cuda.max_memory_reserved`, read through `reserved_peak(probe)`); it is null on
