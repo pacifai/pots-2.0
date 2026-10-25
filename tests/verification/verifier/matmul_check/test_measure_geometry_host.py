@@ -139,13 +139,13 @@ def test_the_grid_is_capped_and_the_args_size_is_the_cus():
 
 def test_set_geometry_with_no_argument_changes_nothing():
     before = (mk.ROWS_PER_BLOCK, mk.TILE_COLS, mk.K_CHUNK)
-    assert before == (16, 256, 16)
+    assert before == (16, 64, 16)
     assert mk.set_geometry() == before
     assert (mk.ROWS_PER_BLOCK, mk.TILE_COLS, mk.K_CHUNK) == before
 
 
 def test_set_geometry_returns_the_previous_values_and_sets_the_new():
-    assert mk.set_geometry(rows_per_block=64, tile_cols=128, k_chunk=4) == (16, 256, 16)
+    assert mk.set_geometry(rows_per_block=64, tile_cols=128, k_chunk=4) == (16, 64, 16)
     assert (mk.ROWS_PER_BLOCK, mk.TILE_COLS, mk.K_CHUNK) == (64, 128, 4)
     assert mk.set_geometry(k_chunk=1) == (64, 128, 4)
     assert mk.set_geometry() == (64, 128, 1)
@@ -201,7 +201,7 @@ def test_build_options_carry_fmad_off_and_the_four_macros():
     assert "--fmad=false" in opts and opts[:len(mk.OPTIONS)] == mk.OPTIONS
     macros = dict(o[2:].split("=") for o in opts if o.startswith("-D"))
     assert macros == {"POTS_MK_WARPS": f"{mk.WARPS}u", "ROWS_PER_BLOCK": "16u",
-                      "TILE_COLS": "256u", "K_CHUNK": "16u"}
+                      "TILE_COLS": "64u", "K_CHUNK": "16u"}
     mk.set_geometry(rows_per_block=16, tile_cols=32, k_chunk=3)
     macros = dict(o[2:].split("=") for o in mk.build_options() if o.startswith("-D"))
     assert macros["ROWS_PER_BLOCK"] == "16u" and macros["TILE_COLS"] == "32u"
@@ -211,13 +211,13 @@ def test_build_options_carry_fmad_off_and_the_four_macros():
 def test_each_geometry_is_its_own_cache_entry_and_the_options_reach_nvrtc(tmp_path):
     nv = FakeNvrtc()
     mk.build(nv, (8, 6), cache=tmp_path)
-    assert "-DTILE_COLS=256u" in nv.calls[0][2] and "-DK_CHUNK=16u" in nv.calls[0][2]
+    assert "-DTILE_COLS=64u" in nv.calls[0][2] and "-DK_CHUNK=16u" in nv.calls[0][2]
     mk.build(nv, (8, 6), cache=tmp_path)
     assert len(nv.calls) == 1  # the same geometry: the cache
     mk.set_geometry(tile_cols=96)
     mk.build(nv, (8, 6), cache=tmp_path)
     assert len(nv.calls) == 2 and "-DTILE_COLS=96u" in nv.calls[1][2]
-    mk.set_geometry(tile_cols=256)
+    mk.set_geometry(tile_cols=64)
     mk.build(nv, (8, 6), cache=tmp_path)
     assert len(nv.calls) == 2 and len(list(tmp_path.iterdir())) == 2
 
@@ -266,7 +266,7 @@ def test_set_geometry_checks_the_shared_memory_of_every_array():
     mk.set_geometry(rows_per_block=8, tile_cols=64, k_chunk=40)  # fits
     with pytest.raises(ValueError):
         mk.set_geometry(k_chunk=200)  # 200 * 65 floats of vector tile: over 48 KB
-    with pytest.raises(ValueError):  # the default plus 8 more rows is over
+    with pytest.raises(ValueError):  # 256 columns with 32 rows is over
         mk.set_geometry(rows_per_block=32, tile_cols=256, k_chunk=16)
     assert mk.shared_bytes(16, 256, 16) <= mk.SHARED_LIMIT < mk.shared_bytes(32, 256, 16)
 

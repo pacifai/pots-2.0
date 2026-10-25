@@ -1889,7 +1889,8 @@ interface.
     over them, one entry per batch (FS37b round 3; round 2's `E_MAX` batches are gone). Per
     entry the block copies the product descriptor into shared memory (consecutive threads,
     4-byte words) and reads the product only from that copy. The block walks the columns in
-    `TILE_COLS` (256) tiles (loaded coalesced into shared memory, widened to fp32, specialised
+    `TILE_COLS` (64: on the 2026-10-24 A40 run 16 × 256 spilled and ran slower, plan §2.2b) tiles
+    (loaded coalesced into shared memory, widened to fp32, specialised
     by dtype and layout; two passes, global loads into registers first, and the next tile
     prefetched in every sweep, the P sweep too) and the challenge columns in `K_CHUNK` chunks;
     a column's vector values sit in registers once for the warp's `RPW` rows; lane `p` keeps

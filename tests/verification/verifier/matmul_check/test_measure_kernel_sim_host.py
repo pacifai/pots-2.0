@@ -48,7 +48,7 @@ CXX = shutil.which("c++") or shutil.which("clang++") or shutil.which("g++")
 
 pytestmark = [pytest.mark.slow, pytest.mark.skipif(CXX is None, reason="needs a C++ compiler")]
 
-GEOMETRIES = [(16, 256, 16), (8, 32, 4), (16, 96, 3), (64, 128, 1), (16, 256, 9)]
+GEOMETRIES = [(16, 64, 16), (16, 256, 16), (8, 32, 4), (16, 96, 3), (64, 128, 1), (16, 256, 9)]
 
 
 @pytest.fixture(scope="module")

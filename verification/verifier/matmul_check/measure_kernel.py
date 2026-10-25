@@ -65,7 +65,7 @@ OPTIONS = ("--fmad=false",)
 """Extra NVRTC options, part of the cache key: no fused multiply-add but the core's ``fmaf``."""
 WARPS = 8  # warps per block, POTS_MK_WARPS in the .cu
 ROWS_PER_BLOCK = 16  # rows of a view per block (a multiple of WARPS), a -D option of the .cu
-TILE_COLS = 256  # columns per shared-memory tile (a multiple of 32), a -D option
+TILE_COLS = 64  # columns per shared-memory tile (a multiple of 32), a -D option
 K_CHUNK = 16  # cap on the challenge columns per sweep; a build uses min(k, K_CHUNK) (chunk_for)
 SDESC_BYTES = 208 + 16  # the product copy in shared memory (pots_sdesc_t)
 SHARED_LIMIT = 48 * 1024  # static shared memory per block

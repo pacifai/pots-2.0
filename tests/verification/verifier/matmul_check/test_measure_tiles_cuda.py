@@ -44,7 +44,7 @@ from verification.verifier.matmul_check import measure_kernel as mk  # noqa: E40
 from verification.verifier.matmul_check.freivalds import MeasureGroup  # noqa: E402
 from verification.verifier.matmul_check.measure_table import MeasureInput, pack  # noqa: E402
 
-GEOMETRIES = [(16, 256, 16), (8, 64, 4), (32, 128, 8)]   # (rows_per_block, tile_cols, k_chunk)
+GEOMETRIES = [(16, 64, 16), (16, 256, 16), (8, 64, 4), (32, 128, 8)]   # (rows_per_block, tile_cols, k_chunk)
 
 
 def groups_of(mis):

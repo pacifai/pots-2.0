@@ -38,7 +38,7 @@
 #define ROWS_PER_BLOCK 16u /* rows of a view per block */
 #endif
 #ifndef TILE_COLS
-#define TILE_COLS 256u /* columns per tile, a multiple of 32 */
+#define TILE_COLS 64u /* columns per tile, a multiple of 32 */
 #endif
 #ifndef K_CHUNK
 #define K_CHUNK 16u /* challenge columns per sweep */

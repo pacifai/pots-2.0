@@ -47,7 +47,8 @@ def sim_test(fn):
     return pytest.mark.slow(pytest.mark.skipif(CXX is None, reason="needs a C++ compiler")(fn))
 
 
-DEFAULT = (16, 256, 16)
+DEFAULT = (16, 64, 16)
+TILE256 = (16, 256, 16)  # the former default, still a supported geometry
 SMALL = (8, 32, 4)
 ODD = (16, 96, 3)
 WIDE = (64, 128, 1)
@@ -84,7 +85,7 @@ def test_a_group_of_e_entries(sim, host_measure, e, mode):
 
 
 @pytest.mark.parametrize("e", [3, 5])
-@pytest.mark.parametrize("geometry", [SMALL, ODD, WIDE])
+@pytest.mark.parametrize("geometry", [SMALL, ODD, WIDE, TILE256])
 @sim_test
 def test_groups_across_geometries(sim, host_measure, e, geometry):
     """Several geometries through ``set_geometry`` (restored in a ``finally``): ``RB`` changes
@@ -282,7 +283,7 @@ def test_block_starts_default_rows_per_block_is_the_modules():
 
 
 def test_shared_bytes_counts_every_shared_array():
-    for rpb, tile, kc in (DEFAULT, SMALL, ODD, WIDE):
+    for rpb, tile, kc in (DEFAULT, TILE256, SMALL, ODD, WIDE):
         want = 224 + 8 * rpb + 4 * (rpb * (tile + 1) + kc * (tile + 1) + 2 * tile
                                     + 2 * rpb * (kc + 2))
         assert mk.shared_bytes(rpb, tile, kc) == want
