@@ -425,7 +425,7 @@ def edit_markers(paths, edit):
     jl(f, lines)
 
 
-def test_hook_bound_counts_stamps_and_rest_calls(tmp_path):
+def test_hook_bound_counts_rest_calls_and_no_stamp_events(tmp_path):
     paths = build_run(tmp_path / "run", steps=2, secs={"A": (0.0, 0.5, 0.5)}, device="cuda")
 
     def edit(ln):
@@ -434,8 +434,30 @@ def test_hook_bound_counts_stamps_and_rest_calls(tmp_path):
 
     edit_markers(paths, edit)
     out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
-    # per 1 s step: 2 syncs; 1 gpu span + 3 rest calls + 5 stamps = 9 events
-    assert out["runs"]["honest"]["hook_overhead_bound"] == pytest.approx(2 * 1.5e-5 + 9 * 4e-6)
+    # per 1 s step: 2 syncs; 1 gpu span + 3 rest calls = 4 events, the 5 stamps none (plan 2.7)
+    assert out["runs"]["honest"]["hook_overhead_bound"] == pytest.approx(2 * 1.5e-5 + 4 * 4e-6)
+
+
+def test_hook_bound_counts_no_events_for_host_timed_spans(tmp_path):
+    paths = build_run(tmp_path / "run", steps=2, secs={"A": (0.0, 0.5, 0.5)}, device="cuda")
+
+    def edit(ln):
+        sec = ln["sections"][0]
+        sec["gpu_us"] = [None, None]  # seam.host spans: no events
+        sec["host_us"] = sec["host_us"] * 2
+        sec["rest"] = {"calls": 3, "first_us": 0.0, "last_us": 1.0}
+
+    edit_markers(paths, edit)
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    # only the 2 syncs: null spans and the calls folded behind them hold no events
+    assert out["runs"]["honest"]["hook_overhead_bound"] == pytest.approx(2 * 1.5e-5)
+
+
+def test_clock_s_skips_null_device_spans():
+    sec = {"gpu_us": [[0.0, 1e6], None], "rest": {"gpu_s": 0.5}}
+    assert analyze._clock_s(sec, "gpu_us", "gpu_s") == pytest.approx(1.5)
+    assert analyze._clock_s({"gpu_us": [None, None], "rest": None}, "gpu_us", "gpu_s") is None
+    assert analyze._clock_s({"gpu_us": None}, "gpu_us", "gpu_s") is None
 
 
 def test_a_rest_folded_section_keeps_a_span_and_is_flagged(tmp_path):

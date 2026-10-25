@@ -1,4 +1,4 @@
-"""FS33 fix round 2: check-5 stamps on the recorder's first device, and the two entry points
+"""FS33 fix round 2: check-5 stamps (host spans since FS39, plan §2.7), and the two entry points
 (``bring_up``, ``store_crosscheck``) that pass ``run_devices`` to their recorders."""
 
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ from verification.runs import store_crosscheck as sc
 from verification.runs.metrics import MetricsWriter, TimeRecorder
 
 
-# ---- item 1: a stamp records on the device its anchor is on --------------------------------
+# ---- item 1: a stamp is a host span, whatever the recorder's first device ------------------
 
 def _fake_with_current_device_zero(mp, n=4):
     """The FS33c stand-in with two torch behaviors: ``record()`` with no stream goes to the
@@ -38,7 +38,7 @@ def _fake_with_current_device_zero(mp, n=4):
 
 
 @pytest.mark.parametrize("devs", [("cuda:1",), ("cuda:1", "cuda:2", "cuda:3")])
-def test_a_stamp_in_check_5_resolves_when_the_first_device_is_not_zero(monkeypatch, devs):
+def test_a_stamp_in_check_5_records_a_host_span_when_the_first_device_is_not_zero(monkeypatch, devs):
     fake = _fake_with_current_device_zero(monkeypatch)
     rec = TimeRecorder("r", "s", devices=devs)
     seam = rec.seam()
@@ -46,13 +46,12 @@ def test_a_stamp_in_check_5_resolves_when_the_first_device_is_not_zero(monkeypat
         with seam("5.measure"):
             with rec.stamp("c5.run", 0):
                 pass
-    assert 0 in rec._stamp_gpu
-    start, end = rec._stamp_gpu[0]
-    assert end >= start
+    assert len(rec._stamps) == 1 and rec._stamps[0][5] >= rec._stamps[0][4]
+    assert rec._pending == [] and not hasattr(rec, "_stamp_gpu")
     del fake
 
 
-def test_the_single_device_section_records_on_its_device_too(monkeypatch):
+def test_the_single_device_stamp_is_a_host_span_too(monkeypatch):
     _fake_with_current_device_zero(monkeypatch)
     rec = TimeRecorder("r", "s", device="cuda:1")
     seam = rec.seam()
@@ -60,12 +59,12 @@ def test_the_single_device_section_records_on_its_device_too(monkeypatch):
         with seam("5.measure"):
             with rec.stamp("c5.run", 0):
                 pass
-    assert 0 in rec._stamp_gpu
+    assert len(rec._stamps) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2,
                     reason="needs two CUDA devices")
-def test_a_stamp_on_cuda_1_resolves_with_two_gpus():
+def test_a_stamp_on_cuda_1_is_a_host_span_with_two_gpus():
     assert torch.cuda.current_device() == 0
     rec = TimeRecorder("r", "s", devices=("cuda:1",))
     seam = rec.seam()
@@ -74,7 +73,7 @@ def test_a_stamp_on_cuda_1_resolves_with_two_gpus():
         with seam("5.measure"):
             with rec.stamp("c5.run", 0):
                 x = x @ x
-    assert 0 in rec._stamp_gpu and rec._stamp_gpu[0][1] >= rec._stamp_gpu[0][0]
+    assert len(rec._stamps) == 1 and rec._stamps[0][5] >= rec._stamps[0][4]
 
 
 # ---- item 2: bring_up and store_crosscheck pass run_devices to their recorders --------------

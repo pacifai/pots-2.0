@@ -551,8 +551,10 @@ def check5_layout(c: DeclaredComputation) -> list[dict[str, Any]]:
     An entry holds ``run``, ``group``, ``window``, ``kind`` (``"dense"`` for a run of one,
     ``"members"``), ``first`` (the group's first product's ``m``), ``members``, the declared
     ``a_shape`` and ``b_shape``, ``operand_bytes`` (``A`` and ``B`` as fp32, the group's total),
-    ``product_bytes`` (``P`` in the stored dtype, ``product_dtype``) and ``served_bytes`` (``P`` in
-    fp32). The serving after an error (:func:`_measure_to_failure`) is not described."""
+    ``product_bytes`` (``P`` in the stored dtype, ``product_dtype``) and ``served_bytes`` (the
+    products as measured on the device, in the same dtype: equal to ``product_bytes``, since the
+    kernel reads ``P`` as stored, FS37; plan §2.7). The serving after an error
+    (:func:`_measure_to_failure`) is not described."""
     return _layout(c)[0]
 
 
@@ -579,7 +581,7 @@ def _layout(c: DeclaredComputation) -> tuple[list[dict[str, Any]], int]:
                 "operand_bytes": 4 * len(specs) * (n * q + q * w),
                 "product_bytes": item * len(specs) * n * w,
                 "product_dtype": str(c.product_dtype).removeprefix("torch."),
-                "served_bytes": 4 * len(specs) * n * w})
+                "served_bytes": item * len(specs) * n * w})
     return out, len(windows)
 
 
