@@ -105,8 +105,9 @@ def test_llama_3_2_1b_shapes_two_layers_rows_equal_with_overlap_on_and_off(dtype
                                    pytest.param("llama", id="llama", marks=pytest.mark.slow)])
 @pytest.mark.parametrize("dtype", list(DTYPES))
 def test_stats_with_overlap_equal_without_when_no_recorder_syncs_the_host(which, dtype):
-    """Check 5 alone, no spy: the recorder's host copies of every operand wait for the current
-    stream before each call and would hide a missing wait of the measure stream."""
+    """Check 5 alone, with no spy copying every operand to the host before each call: the
+    replay's own reads still sync the host, so this is a bit-equality test, not a test of the
+    wait (the next two are)."""
     setup = tiny(CHEAP, dtype, ENGINE) if which == "tiny" else llama_setup(dtype, "cuda")
     with mk.overlap(True):
         on = run_check5(setup)
@@ -140,16 +141,21 @@ def test_check_5s_launches_run_on_the_measure_stream_and_without_overlap_on_the_
 
 def test_the_measure_stream_waits_for_the_current_streams_writes_to_its_inputs():
     """The inputs' last writes sit behind a long wait on the current stream; the kernel on the
-    measure stream reads them only after (``enqueue``'s event), so its rows are the plain ones."""
+    measure stream reads them only after (``enqueue``'s event), so its rows are the plain ones.
+    The measure stream's pool is warmed first and the writes are kernels, not copies: a
+    ``cudaMalloc`` or a device-to-device copy between the two would serialize the streams anyway
+    and hide a missing wait."""
     freivalds.drain()
     ref = _group(3)
     with mk.overlap(False):
         want = freivalds.measure_groups_rows([ref], h=H, k=3)
         freivalds.drain()
+    freivalds.measure_groups_rows([ref], h=H, k=3)  # warms the measure stream's pool
+    freivalds.drain()
     a, b, p = (torch.zeros_like(x) for x in (ref.a, ref.b, ref.p))
     torch.cuda._sleep(int(5e8))  # the glue, slow, on the current stream
     for dst, src in ((a, ref.a), (b, ref.b), (p, ref.p)):
-        dst.copy_(src)
+        torch.mul(src, 1, out=dst)  # exact, -0.0 included
     got = freivalds.measure_groups_rows([MeasureGroup(a, b, p, ref.ms)], h=H, k=3)
     freivalds.drain()
     assert np.array_equal(bits(got.cpu().numpy()), bits(want.cpu().numpy()))
