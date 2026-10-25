@@ -369,7 +369,7 @@ def test_the_job_accepts_the_session_with_its_deadline(tmp_path):
 
 def test_the_job_script_switches_on_the_session():
     text = fs.Path(t11.JOB).read_text()
-    assert re.search(r"\|fs32-pair\|device-leaves\|four-h100\) ;;", text)
+    assert re.search(r"\|fs32-pair\|device-leaves\|four-h100\|\\\s*four-h100-profile\) ;;", text)
     assert subprocess.run(["bash", "-n", str(t11.JOB)]).returncode == 0
 
 

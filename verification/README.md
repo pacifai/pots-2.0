@@ -1387,6 +1387,109 @@ the four GPUs' peaks, then the slowest and fastest peer pair. An acceptance fail
 change the job's exit code. If computing the summary raises, `four_h100_error` holds the error
 and the job runs on.
 
+### The four-H100 profiling session (FS42)
+
+`FS11_SESSION=four-h100-profile` is a working, profiled run of the four-H100 layout (GPU 0
+trains, GPUs 1-3 verify), from which the cost comparison with PoTS and the bottleneck list are
+made. It uses the same machine, refusal, prep, pod and set-up steps as the session above (steps
+1-3), and step 4's start command with `FS11_SESSION=four-h100-profile`. It runs three models,
+Qwen2.5-0.5B, Llama-3.2-1B and Falcon3-1B (Qwen2.5-1.5B is dropped from the full-scale runs,
+F24: it runs out of memory pipelined), at four verified steps per arm. Step 1 is the warm-up,
+steps 2 and 3 are the steady steps (untraced in both arms) and the sequential arm traces step 4.
+
+Its parts, in order: `native_build` (1 min), `peer_check` (1), `models` (2; it fetches the
+whole manifest, not only these three models), `four_tests` (6), `probe` (7), then per model
+`plain_<model>` (3), `card_<model>` (2), `seq_<model>` (4) and `pipe_<model>` (4). The estimates
+are FS35's measured times of 2026-10-25 scaled to four steps; the plain run's is a guess. In
+all, 17 + 3 x 13 = 56 min, plus packing 1 and the grace window 20, 77 min; the job's default
+deadline is twice that, 9,240 s rounded up to 9,300 s (2 h 35 min), set in `fs11_job.sh` and
+`four_profile_default_deadline_s()`, which a test holds equal. The pod's boot guard is
+(77 + 20) x 2 = 194 min = 11,640 s, rounded up to 11,700 s. Each part's time limit is about
+twice its estimate.
+
+- `plain_<model>`: `plain_baseline --steps 4 --metrics` on GPU 0 alone (`VERIF_DEVICE=cuda:0`,
+  no verifier devices, no pipelining): the plain training step the verifier's cost is compared
+  with.
+- `card_<model>`: `card_identity` on GPU 0, as in FS35.
+- `seq_<model>`: `llama_step --steps 4 --metrics --no-count` with `VERIF_TRACE_STEP=4`.
+- `pipe_<model>`: the same with `VERIF_PIPELINED=1` and no `VERIF_TRACE_STEP`.
+
+Every part records its GPUs' peaks and a `samples.jsonl` with four GPUs in its header.
+
+**Reading the result.** `summary.json["four_h100_profile"]["pass"]` fails closed. It is true
+only when: every part ended `ok` (or was done earlier); the peer copies landed the right bytes;
+the tests' junit is clean (FS35's rules); per model FS35's items hold at four steps (both arms
+accepted at all four steps with the right `loop mode:` line, equal step roots, step 1's root the
+card's, the four GPUs and their roles in each arm's environment record); the plain run has
+`P0.*` time rows and a `step` total for every step and its `final_weights.json`; each arm has a
+`markers.jsonl` line per step, a `step_interval` time row per step, `count` rows for
+`train.forward`, `train.backward`, `P3.commit` and `2` and a `storage` row, and its
+`c5_layout.json`; the sequential arm's markers show step 4 traced and no other step, and
+`trace/step_00004.json.gz` is there and not empty; the pipelined arm traced nothing; every part's
+`samples.jsonl` is version 2 with four GPUs; and `probe.json` is version 2 with four
+`per_device` entries. Each failed item gets its own line naming the model, the arm and what is
+missing. Beside `pass` it records, per model and arm, FS35's numbers (the steady step from the
+step interval, the pipelined latency, the accumulated GPU time, the four GPUs' peaks),
+`verifier_steady_s` (the verifier side's `total` row, mean of steps 2-3), per model the plain
+run's `steady_s` (the `time` / `total` / `step` row, mean of steps 2-3), and per arm
+`verify_over_train` (verifier over the plain step) and `wall_over_train` (the arm's step
+interval over the plain step). The job log ends with one `FS42 ok:` or `FS42 FAIL:` line per
+item, then per model and arm
+`FS42 <model> <arm>: step X s (interval between verified steps), verifier Y s per step, plain training Z s per step; verifier ÷ training A, step ÷ training B`.
+An acceptance failure does not change the job's exit code; if computing it raises,
+`four_h100_profile_error` holds the error and the job runs on.
+
+**Turning the output into profiles, on the Mac.** Fetch `/workspace/fs11_out` to `$OUT`. A part's
+run directory is `$OUT/runs/four_${KEY}_<plain|card|seq|pipe>`, where `$KEY` is the model's data
+key (`Qwen2.5-0.5B-Instruct_refusal`, `Llama-3.2-1B-Instruct_refusal`,
+`Falcon3-1B-Instruct_refusal`) and `$MODEL` its part key (`Qwen2.5-0.5B`, `Llama-3.2-1B`,
+`Falcon3-1B`); its metrics are in `llama_step/` (the plain run's in `plain_baseline/`); a part's
+`samples.jsonl` is in `$OUT/parts/<part>/`; the probe's report is `$OUT/probe/probe.json`.
+`$PROFILES` is an output directory of your choice and `$LABEL` the session's label with its
+date (`four-h100-profile-2026-10-26`). For each model, the trace summary of the sequential arm
+(the pipelined arm has no trace):
+
+```bash
+python -m evaluation.results.profile.trace \
+    --trace $OUT/runs/four_${KEY}_seq/llama_step/trace/step_00004.json.gz \
+    --layout $OUT/runs/four_${KEY}_seq/llama_step/c5_layout.json \
+    --markers $OUT/runs/four_${KEY}_seq/llama_step/markers.jsonl \
+    --out $PROFILES/${MODEL}_seq_trace.json
+```
+
+Then each arm's profile, the plain run's directory as `--plain` (the sequential arm also takes
+its trace summary; `--compute-dtype` is used only when no environment record names it):
+
+```bash
+python -m evaluation.results.profile.analyze \
+    --run-dir $OUT/runs/four_${KEY}_seq/llama_step --session $LABEL \
+    --markers $OUT/runs/four_${KEY}_seq/llama_step/markers.jsonl \
+    --samples $OUT/parts/seq_${MODEL}/samples.jsonl --probe $OUT/probe/probe.json \
+    --trace-summary $PROFILES/${MODEL}_seq_trace.json \
+    --plain $OUT/runs/four_${KEY}_plain/plain_baseline \
+    --compute-dtype bfloat16 --out $PROFILES/${MODEL}_seq.json
+python -m evaluation.results.profile.analyze \
+    --run-dir $OUT/runs/four_${KEY}_pipe/llama_step --session $LABEL \
+    --markers $OUT/runs/four_${KEY}_pipe/llama_step/markers.jsonl \
+    --samples $OUT/parts/pipe_${MODEL}/samples.jsonl --probe $OUT/probe/probe.json \
+    --plain $OUT/runs/four_${KEY}_plain/plain_baseline \
+    --compute-dtype bfloat16 --out $PROFILES/${MODEL}_pipe.json
+```
+
+That is three trace summaries and six profiles in all (the commands above, once per model).
+Last, one report over all six profiles:
+
+```bash
+python -m evaluation.results.profile.report \
+    $PROFILES/Qwen2.5-0.5B_seq.json $PROFILES/Qwen2.5-0.5B_pipe.json \
+    $PROFILES/Llama-3.2-1B_seq.json $PROFILES/Llama-3.2-1B_pipe.json \
+    $PROFILES/Falcon3-1B_seq.json $PROFILES/Falcon3-1B_pipe.json \
+    --out $PROFILES/profile.html
+```
+
+A test (`test_four_h100_profile_session.py`) checks these commands against the three tools'
+`--help`; no run has executed them yet.
+
 ## Workflow: calibrating the tolerances
 
 

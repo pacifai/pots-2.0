@@ -2,7 +2,7 @@
 
     .venv/bin/python -m verification.runs.fs11_session run --upload DIR --out DIR --deadline EPOCH
         [--session {fs11,recheck,profile-check,nvlink-probe,kernel-speed,fs32-pair,
-                    device-leaves,four-h100}]
+                    device-leaves,four-h100,four-h100-profile}]
     .venv/bin/python -m verification.runs.fs11_session fetch-models --upload DIR --out DIR
     .venv/bin/python -m verification.runs.fs11_session env --out DIR
 
@@ -20,12 +20,17 @@ Mac's ``kernel_speed_sizes.json``, no models; ``fs11_prep --session kernel-speed
 ``four-h100``, FS35's sequential and pipelined steps on four H100s (:func:`four_h100_plan`,
 below; it refuses a machine with fewer than four CUDA devices, and one without an H100 unless
 ``FS11_ALLOW_ANY_GPU=1``; ``summary.json["four_h100"]`` is :func:`four_h100`'s result and its
-log ends with :func:`_four_lines`'s ``FS35 ok`` / ``FS35 FAIL`` lines).
+log ends with :func:`_four_lines`'s ``FS35 ok`` / ``FS35 FAIL`` lines), or
+``four-h100-profile``, FS42 (d)'s profiling run on the same layout (:func:`four_h100_profile_plan`:
+per model a plain run, the card and the two arms at four steps, the sequential arm tracing
+step 4; ``summary.json["four_h100_profile"]`` is :func:`four_h100_profile`'s result and the log
+ends with :func:`_profile_lines`'s ``FS42 ok`` / ``FS42 FAIL`` lines).
 The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
 the upload's ``native_cache/`` into it once, offline, so no later part's timing includes the
-compile). A plan for two or more GPUs (``nvlink-probe``, ``fs32-pair``, ``four-h100``) lists the
+compile). A plan for two or more GPUs (``nvlink-probe``, ``fs32-pair``, ``four-h100``,
+``four-h100-profile``) lists the
 F22 peer-copy byte check, ``peer_check``, first among its own parts, ahead of the models part
 (the native build, which every plan gets, runs ahead of it), and a pair that lands wrong bytes
 stops the session (:func:`peer_check_part`, :func:`peer_check_stop`):
@@ -165,6 +170,7 @@ __all__ = ["PROFILE_CHECK_TIMEOUT_S", "PROFILE_HELD", "PROFILE_PINS", "SMOLLM2_E
            "kernel_speed_gate", "SIZES_NAME", "load_plan",
            "selftest_plan", "fs31_cards", "hw3_cards", "fs32_pair_plan", "fs32_pair",
            "four_h100_plan", "four_h100", "four_default_deadline_s", "FOUR_TEST_FILES",
+           "four_h100_profile_plan", "four_h100_profile", "four_profile_default_deadline_s",
            "with_native_build",
            "choose_plan", "run_session", "fix2_ab",
            "fetch_models", "check_upload", "benchmark_failure", "environment", "cupqc_status",
@@ -1287,9 +1293,57 @@ def four_default_deadline_s() -> int:
     return -(-2 * minutes * 60 // 100) * 100
 
 
-def four_h100_plan(upload: Path, out: Path) -> list[Part]:
-    """The four-H100 session's parts. The F22 peer-copy byte check first (the native build runs
-    ahead of it); the models part; ``four_tests``, one pytest part with a junit report running
+# FS42 (d)'s profiling run (``four-h100-profile``): the same machine and head as ``four-h100``,
+# three models (F24, 2026-10-25, dropped Qwen2.5-1.5B from the full-scale runs: it runs out of
+# memory pipelined) and, per model, a plain training run, the card and the two arms at four
+# steps, the sequential arm tracing its step 4. Step 1 is the warm-up, steps 2-3 are the steady
+# steps (untraced in both arms), the traced step is the last.
+FOUR_PROFILE_ORDER = ("Qwen2.5-0.5B", "Llama-3.2-1B", "Falcon3-1B")
+FOUR_PROFILE_STEPS = 4
+FOUR_PROFILE_TRACE_STEP = 4  # VERIF_TRACE_STEP of the sequential arms
+FOUR_PROFILE_PINS: tuple[tuple[str, str], ...] = tuple(sorted(
+    (p for p in RUN_PINS if four_model_key(p[0]) in FOUR_PROFILE_ORDER),
+    key=lambda p: FOUR_PROFILE_ORDER.index(four_model_key(p[0]))))
+# Estimates, minutes, from the parts FS35's four-H100 session measured on 2026-10-25 (four H100
+# SXM): the native build 3 s, the peer check 12 s, the models 39 s, the four-GPU tests 246 s, the
+# probe 334 s, per model the card 37-41 s and the sequential arm 91-156 s, the pipelined arm
+# 109-178 s (three steps each, the memory pass included). Here the arms run four steps (a step
+# is about a quarter of those times, plus the memory pass and the start-up) and the trace of
+# one step adds to the sequential arm, so 4 minutes each; the plain run (four steps and a memory
+# pass on one GPU) is estimated, not measured, at 3.
+FOUR_PROFILE_ESTIMATE_MIN = {"native_build": 1, "peer_check": 1, "models": 2, "four_tests": 6,
+                             "probe": 7, "plain": 3, "card": 2, "seq": 4, "pipe": 4}
+# Time limits, seconds, about twice the estimates (the native build's is the build part's own).
+FOUR_PROFILE_TIMEOUT_S = {"models": 240, "four_tests": 720, "probe": 840, "plain": 360,
+                          "card": 240, "seq": 480, "pipe": 480}
+
+
+def four_profile_estimated_min() -> int:
+    """``four-h100-profile``'s estimated runtime, minutes: every part's estimate, the models'
+    parts once per model."""
+    e = FOUR_PROFILE_ESTIMATE_MIN
+    return (e["native_build"] + e["peer_check"] + e["models"] + e["four_tests"] + e["probe"]
+            + len(FOUR_PROFILE_PINS) * (e["plain"] + e["card"] + e["seq"] + e["pipe"]))
+
+
+def four_profile_default_deadline_s() -> int:
+    """``four-h100-profile``'s default deadline: twice the estimated runtime (the parts'
+    estimates, the job's packing and its grace window), in seconds, rounded up to 100 s.
+    ``fs11_job.sh`` holds the same figure as ``DEFAULT_DEADLINE_S`` for the session and a test
+    holds them equal."""
+    minutes = four_profile_estimated_min() + FOUR_PACK_MIN + FOUR_GRACE_MIN
+    return -(-2 * minutes * 60 // 100) * 100
+
+
+def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
+               t: Mapping[str, int], steps: int, profile: bool) -> list[Part]:
+    """The parts of the four-H100 sessions: ``pins``' models, ``steps`` verified steps per arm,
+    time limits ``t``; with ``profile`` (``four-h100-profile``, :func:`four_h100_profile_plan`)
+    a ``plain_<key>`` run (``plain_baseline`` on GPU 0 alone, the same steps, metrics) before
+    each model's card, the sequential arm traced at :data:`FOUR_PROFILE_TRACE_STEP` and a
+    ``samples.jsonl`` check on every part. Otherwise :func:`four_h100_plan`'s.
+    The F22 peer-copy byte check first (the native build runs ahead of it); the models part;
+    ``four_tests``, one pytest part with a junit report running
     every two-GPU test, slow or not (:data:`PAIR_SLOW_SELECT`: the non-slow ones put the
     verifiers on GPUs 1-3 here), FS34's file and :data:`FOUR_TEST_FILES`,
     on SmolLM2's test-scale data (its run
@@ -1297,11 +1351,10 @@ def four_h100_plan(upload: Path, out: Path) -> list[Part]:
     the probe on all four GPUs (``VERIF_DEVICE`` GPU 0, :data:`FOUR_VERIFIERS` the rest, 60 s per
     device); then, per model cheapest first, on the refusal task at :data:`FULL_SCALE_ENV` plus
     :data:`RECHECK_ENV`: ``card_<key>`` (``card_identity`` on GPU 0 alone, one card's proved
-    step-1 root), ``seq_<key>`` (``llama_step``, three steps, metrics, no counting pass, sharded
+    step-1 root), ``seq_<key>`` (``llama_step``, ``steps`` steps, metrics, no counting pass, sharded
     over GPUs 1-3) and ``pipe_<key>`` (the same with ``VERIF_PIPELINED=1``), each in its own run
     directory. Only the ``pipe_*`` parts set ``VERIF_PIPELINED``. Every part records its GPUs'
     peak memory."""
-    t = FOUR_TIMEOUT_S
     from setup.data import TEST_SCALE_TOKENIZER as pin  # the tests' model: SmolLM2
     small = data_key(pin.repo, SMOLLM2_TASK)
     sharded = {"VERIF_DEVICE": FOUR_PROVER, "VERIF_VERIFIER_DEVICES": FOUR_VERIFIERS}
@@ -1320,11 +1373,20 @@ def four_h100_plan(upload: Path, out: Path) -> list[Part]:
                  env={**FULL_SCALE_ENV, **PCI_ORDER_ENV, **sharded, "VERIF_PIPELINED": None},
                  timeout_s=t["probe"], kind="four_probe", info={"report": str(report)})
     plan = [peer_check_part(out), _models_part(upload, out, t["models"]), tests, probe]
-    for repo, rev in FOUR_PINS:
+    for repo, rev in pins:
         k, key = four_model_key(repo), data_key(repo, BRING_UP_TASK)
         base = {**FULL_SCALE_ENV, **RECHECK_ENV, **_run_env(repo, rev, BRING_UP_TASK),
                 **PCI_ORDER_ENV}
         info = {"model": repo, "task": BRING_UP_TASK}
+        if profile:  # the plain training the verifier's cost is compared with, on GPU 0 alone
+            d = _run_dir(out, upload, key, f"four_{key}_plain")
+            plan.append(Part(
+                f"plain_{k}", ["{python}", "-m", "verification.runs.plain_baseline", "--steps",
+                               str(steps), "--metrics"],
+                env={**base, "VERIF_DEVICE": FOUR_PROVER, "VERIF_OUTPUT_DIR": str(d),
+                     "VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
+                timeout_s=t["plain"], kind="profile_plain",
+                info={**info, "run_dir": str(d), "records": str(d / PLAIN_RUN / "records.jsonl")}))
         d = _run_dir(out, upload, key, f"four_{key}_card")
         plan.append(Part(f"card_{k}", ["{python}", "-m", "verification.runs.card_identity",
                                        "--out", str(d / "card.json")],
@@ -1334,16 +1396,36 @@ def four_h100_plan(upload: Path, out: Path) -> list[Part]:
                          info={**info, "run_dir": str(d), "report": str(d / "card.json")}))
         for arm, piped in (("seq", None), ("pipe", "1")):  # only the pipelined arm sets the mode
             d = _run_dir(out, upload, key, f"four_{key}_{arm}")
+            env = {**base, **sharded, "VERIF_OUTPUT_DIR": str(d), "VERIF_PIPELINED": piped}
+            if profile:  # only the sequential arm is traced, at its last step
+                env["VERIF_TRACE_STEP"] = str(FOUR_PROFILE_TRACE_STEP) if arm == "seq" else None
             plan.append(Part(
                 f"{arm}_{k}", ["{python}", "-m", "verification.runs.llama_step", "--steps",
-                               str(FOUR_STEPS), "--metrics", "--no-count"],
-                env={**base, **sharded, "VERIF_OUTPUT_DIR": str(d), "VERIF_PIPELINED": piped},
-                timeout_s=t[arm], kind="four_run",
+                               str(steps), "--metrics", "--no-count"],
+                env=env, timeout_s=t[arm], kind="profile_run" if profile else "four_run",
                 info={**info, "arm": arm, "model_key": k, "run_dir": str(d),
                       "records": str(d / FOUR_RUN_NAME / "records.jsonl")}))
     for p in plan:
         p.info["gpu_peak"] = True
+        if profile:
+            p.info["samples_check"] = True
     return plan
+
+
+def four_h100_plan(upload: Path, out: Path) -> list[Part]:
+    """The four-H100 session's parts (:func:`_four_plan`): three verified steps per arm,
+    :data:`FOUR_ORDER`'s models."""
+    return _four_plan(upload, out, pins=FOUR_PINS, t=FOUR_TIMEOUT_S, steps=FOUR_STEPS,
+                      profile=False)
+
+
+def four_h100_profile_plan(upload: Path, out: Path) -> list[Part]:
+    """The ``four-h100-profile`` session's parts (:func:`_four_plan`): the same head, then per
+    model of :data:`FOUR_PROFILE_ORDER` a plain run, the card, and the two arms at
+    :data:`FOUR_PROFILE_STEPS` steps, the sequential one tracing step
+    :data:`FOUR_PROFILE_TRACE_STEP`."""
+    return _four_plan(upload, out, pins=FOUR_PROFILE_PINS, t=FOUR_PROFILE_TIMEOUT_S,
+                      steps=FOUR_PROFILE_STEPS, profile=True)
 
 
 # Each session: its name in summary.json, and its plan.
@@ -1356,10 +1438,11 @@ SESSIONS: dict[str, tuple[str, Callable[[Path, Path], list[Part]]]] = {
     "fs32-pair": ("fs32-pair", fs32_pair_plan),
     "device-leaves": ("device-leaves", device_leaves_plan),
     "four-h100": ("four-h100", four_h100_plan),
+    "four-h100-profile": ("four-h100-profile", four_h100_profile_plan),
 }
 # The sessions that need two or more GPUs: each plan starts (after the native build) with
 # ``peer_check_part``. A new multi-GPU session is listed here, and a test holds it to that.
-MULTI_GPU_SESSIONS = ("nvlink-probe", "fs32-pair", "four-h100")
+MULTI_GPU_SESSIONS = ("nvlink-probe", "fs32-pair", "four-h100", "four-h100-profile")
 
 
 def _run_env(repo: str, rev: str, task: str) -> dict[str, str | None]:
@@ -1800,6 +1883,10 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
             return _four_probe_extras(Path(part.info["report"]))
         if part.kind == "four_run":
             return _four_run_extras(log, Path(part.info["records"]))
+        if part.kind == "profile_run":
+            return _profile_run_extras(log, Path(part.info["records"]))
+        if part.kind == "profile_plain":
+            return _profile_plain_extras(Path(part.info["records"]))
         if part.kind == "pytest":
             return _pytest_extras(Path(part.info["junit"]))
         if part.kind in ("device_tests", "fs34_tests"):
@@ -2233,7 +2320,8 @@ def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
     device its process lists, an upper bound, not the cost decision's quantity), the
     ``accumulated_gpu_s`` (:func:`_accumulated_gpu_s`) and the merged step's wall extent
     (``step_wall`` rows' ``time_s``, the latency) and every step's interval to the step before's
-    close (``step_interval`` rows' ``time_s``, FS42), and the memory pass's peak per device
+    close (``step_interval`` rows' ``time_s``, FS42), the verifier side's ``total`` row per
+    step (``verifier_s``) and the memory pass's peak per device
     (``device_peak_bytes`` and ``device_peak_reserved_bytes`` of the prover's and the verifier's
     ``total`` rows, the larger over the steps)."""
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
@@ -2284,8 +2372,104 @@ def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
             "accumulated_gpu_s": [a for t in sorted(side_s)
                                   if (a := _accumulated_gpu_s(side_s[t], env.get("gpu_roles")))
                                   is not None],
+            "verifier_s": [side_s[t]["verifier"] for t in sorted(side_s)
+                           if "verifier" in side_s[t]],
             "step_wall_s": [wall[t] for t in sorted(wall)],
             "step_interval_s": [interval[t] for t in sorted(interval)], "device_peaks": peaks}
+
+
+# FS42 (``four-h100-profile``): the profile's inputs, as the metrics module names them in a
+# run directory (``<part run dir>/llama_step/`` for an arm, ``.../plain_baseline/`` for the
+# plain run).
+PROFILE_MARKERS = "markers.jsonl"  # metrics.MetricsWriter.write_markers
+PROFILE_LAYOUT = "c5_layout.json"  # metrics.MetricsWriter.write_c5_layout
+PROFILE_TRACE_DIR = "trace"  # metrics.TRACE_DIR; the traced step's step_NNNNN.json.gz in it
+# The work rows' sections: the ``count`` rows the analysis' floors read (shape-derived under
+# ``--no-count``, FS42 (b)); a ``storage`` row beside them holds the transcript bytes.
+PROFILE_WORK_SECTIONS = ("train.forward", "train.backward", "P3.commit", "2")
+
+
+def _samples_header(path: Path) -> dict[str, Any] | None:
+    """A part's ``samples.jsonl`` header: its ``version`` and how many GPUs it names (``gpus``,
+    ``None`` when the header has none); ``None`` when there is no file or its first line is not
+    a header."""
+    try:
+        with open(path) as f:
+            head = json.loads(f.readline())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(head, dict) or head.get("kind") != "header":
+        return None
+    gpus = head.get("gpus")
+    return {"version": head.get("version"), "gpus": len(gpus) if isinstance(gpus, list) else None}
+
+
+def _profile_markers(path: Path) -> dict[str, Any]:
+    """``markers.jsonl``'s ``step`` lines: ``markers_steps`` (the steps with a line) and
+    ``traced_steps`` (those whose line says ``traced``); a line cut short is skipped."""
+    steps: dict[int, bool] = {}
+    for line in path.read_text(errors="replace").splitlines() if path.is_file() else []:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("kind") == "step" and isinstance(row.get("step"), int):
+            steps[row["step"]] = bool(row.get("traced"))
+    return {"markers_file": path.is_file(), "markers_steps": sorted(steps),
+            "traced_steps": sorted(t for t, v in steps.items() if v)}
+
+
+def _profile_run_extras(log: Path, records: Path) -> dict[str, Any]:
+    """:func:`_four_run_extras` and, under ``profile``, what the profile reads from the arm's
+    run directory (``records``' directory): the markers' steps and the traced ones, the steps
+    with a ``step_interval`` time row, the work sections with a ``count`` row and the number of
+    ``storage`` rows, whether the layout file exists and is not empty, and the non-empty trace
+    files (``trace_files``) with the trace's own ``error`` from ``trace/meta.json``."""
+    out = _four_run_extras(log, records)
+    d = records.parent
+    rows = _four_records(records)
+    trace = d / PROFILE_TRACE_DIR
+    meta: Any = None
+    try:
+        meta = json.loads((trace / "meta.json").read_text())
+    except (OSError, ValueError):
+        pass
+    layout = d / PROFILE_LAYOUT
+    out["profile"] = {
+        **_profile_markers(d / PROFILE_MARKERS),
+        "interval_steps": sorted({r["step"] for r in rows if r.get("record") == "time"
+                                  and r.get("level") == "total"
+                                  and r.get("component") == "step_interval"
+                                  and isinstance(r.get("step"), int) and _number(r.get("time_s"))}),
+        "count_sections": sorted({r["component"] for r in rows if r.get("record") == "count"
+                                  and r.get("component") in PROFILE_WORK_SECTIONS}),
+        "storage_rows": sum(r.get("record") == "storage" for r in rows),
+        "layout": layout.is_file() and layout.stat().st_size > 0,
+        "trace_files": sorted(p.name for p in trace.glob("step_*.json.gz")
+                              if p.stat().st_size > 0) if trace.is_dir() else [],
+        "trace_error": meta.get("error") if isinstance(meta, dict) else None}
+    return out
+
+
+def _profile_plain_extras(report: Path) -> dict[str, Any]:
+    """:func:`_plain_extras` and what the profile reads of the plain run: the steps with a
+    ``P0.*`` time row (``p0_steps``), the ``step`` total row per step (``step_totals_s``, the
+    row ``time`` / ``total`` / ``step``), their ``steady_s`` (mean of steps 2 and 3, ``None``
+    without both) and the size of ``final_weights.json`` beside the records."""
+    out = _plain_extras(report)
+    rows = _four_records(report)
+    time_rows = [r for r in rows if r.get("record") == "time" and isinstance(r.get("step"), int)
+                 and r["step"] >= 1 and _number(r.get("time_s"))]
+    totals = {r["step"]: r["time_s"] for r in time_rows
+              if r.get("level") == "total" and r.get("component") == "step"}
+    weights = report.parent / WEIGHTS_FILE
+    out.update({"p0_steps": sorted({r["step"] for r in time_rows
+                                    if str(r.get("component", "")).startswith("P0.")}),
+                "step_totals_s": [totals[t] for t in sorted(totals)],
+                "steady_s": statistics.fmean([totals[2], totals[3]])
+                if 2 in totals and 3 in totals else None,
+                "weights_bytes": weights.stat().st_size if weights.is_file() else 0})
+    return out
 
 
 def _four_tests_extras(junit: Path) -> dict[str, Any]:
@@ -2402,20 +2586,20 @@ def _four_tests_problems(part: Mapping[str, Any], expected: Sequence[str] | None
     return why
 
 
-def _steady_s(ex: Mapping[str, Any]) -> tuple[float | None, str | None]:
-    """An arm's steady step time, the mean of steps 2 and 3, and what it is: the interval
-    between consecutive verified steps (``step_interval``, EQ14's wall time per step, FS42)
-    where the records hold it, else the merged step's wall extent (``step_wall``, records written
-    before FS42), else the three times' total."""
+def _steady_s(ex: Mapping[str, Any], steps: int = FOUR_STEPS) -> tuple[float | None, str | None]:
+    """An arm's steady step time, the mean of steps 2 and 3 of its ``steps`` steps, and what it
+    is: the interval between consecutive verified steps (``step_interval``, EQ14's wall time per
+    step, FS42) where the records hold it, else the merged step's wall extent (``step_wall``,
+    records written before FS42), else the times' total."""
     ivs = ex.get("step_interval_s") or []
-    if len(ivs) >= FOUR_STEPS:
-        return statistics.fmean(ivs[1:FOUR_STEPS]), "step_interval"
+    if len(ivs) >= steps:
+        return statistics.fmean(ivs[1:3]), "step_interval"
     wall = ex.get("step_wall_s") or []
-    if len(wall) >= FOUR_STEPS:
-        return statistics.fmean(wall[1:FOUR_STEPS]), "step_wall"
+    if len(wall) >= steps:
+        return statistics.fmean(wall[1:3]), "step_wall"
     times = ex.get("step_times") or []
-    if len(times) >= FOUR_STEPS and all(r.get("total_s") is not None for r in times):
-        return statistics.fmean(r["total_s"] for r in times[1:FOUR_STEPS]), "total"
+    if len(times) >= steps and all(r.get("total_s") is not None for r in times):
+        return statistics.fmean(r["total_s"] for r in times[1:3]), "total"
     return None, None
 
 
@@ -2424,10 +2608,10 @@ def _pos(x: Any) -> bool:
     return _number(x) and math.isfinite(x) and x > 0
 
 
-def _steady_mean(per_step: Sequence[float] | None) -> float | None:
-    """The mean of steps 2 and 3 of a per-step list of three, else ``None``."""
+def _steady_mean(per_step: Sequence[float] | None, steps: int = FOUR_STEPS) -> float | None:
+    """The mean of steps 2 and 3 of a per-step list of ``steps`` values, else ``None``."""
     vals = list(per_step or ())
-    return statistics.fmean(vals[1:FOUR_STEPS]) if len(vals) >= FOUR_STEPS else None
+    return statistics.fmean(vals[1:3]) if len(vals) >= steps else None
 
 
 def _four_missing_numbers(models: Mapping[str, Mapping[str, Any]],
@@ -2456,6 +2640,58 @@ def _four_missing_numbers(models: Mapping[str, Mapping[str, Any]],
         why.append(f"peer rates: the probe has {got_probe} of {len(pairs)} pairs, the peer "
                    f"check {got_check}")
     return why
+
+
+def _four_model_items(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any],
+                      steps: int) -> list[tuple[bool, str]]:
+    """One model's acceptance items of the four-H100 sessions (``steps`` verified steps per
+    arm): both arms accepted at all ``steps`` steps in their loop mode, the arms' step roots
+    equal step for step, step 1's root the card's proved root, and the four GPUs named in each
+    arm's environment record. Fills ``row`` (the model's entry in the result) and returns the
+    items. The arms' parts are ``seq_<k>`` and ``pipe_<k>``, the card's ``card_<k>``."""
+    items: list[tuple[bool, str]] = []
+    card = (_pair_part(parts, f"card_{k}").get("extras") or {})
+    arm_ex = {a: (_pair_part(parts, f"{a}_{k}").get("extras") or {}) for a in FOUR_ARMS}
+    mode = {"seq": "sequential", "pipe": "pipelined"}
+    accepted = {a: bool(e.get("accepted")) and len(e.get("step_roots") or ()) == steps
+                and e.get("loop_mode") == mode[a] for a, e in arm_ex.items()}
+    seq_roots, pipe_roots = (arm_ex[a].get("step_roots") or [] for a in FOUR_ARMS)
+    equal = len(seq_roots) == steps and seq_roots == pipe_roots
+    card_ok = bool(card.get("root")) and bool(seq_roots) and seq_roots[0] == card["root"] \
+        and bool(pipe_roots) and pipe_roots[0] == card["root"]
+    gpu_why = {a: _four_gpu_problems(e) for a, e in arm_ex.items()}
+    steady = {a: _steady_s(e, steps) for a, e in arm_ex.items()}
+    row.update({
+        "accepted": accepted, "roots_equal": equal, "step1_equals_card": card_ok,
+        "card_root": card.get("root"), "gpu_problems": gpu_why,
+        "arms": {a: {"step_roots": e.get("step_roots"), "step_times": e.get("step_times"),
+                     "step_wall_s": e.get("step_wall_s"),
+                     "step_interval_s": e.get("step_interval_s"),
+                     "latency_steady_s": _steady_mean(e.get("step_wall_s"), steps)
+                     if a == "pipe" else None,
+                     "gpu_held_upper_s": e.get("gpu_held_upper_s"),
+                     "accumulated_gpu_s": e.get("accumulated_gpu_s"),
+                     "verifier_steady_s": _steady_mean(e.get("verifier_s"), steps),
+                     "accumulated_steady_s": _steady_mean(e.get("accumulated_gpu_s"), steps),
+                     "steady_s": steady[a][0], "steady_source": steady[a][1],
+                     "device_peaks": e.get("device_peaks"), "loop_mode": e.get("loop_mode"),
+                     "gpu_peak_mib": (_pair_part(parts, f"{a}_{k}").get("extras")
+                                      or {}).get("gpu_peak_mib")}
+                 for a, e in arm_ex.items()}})
+    items += [
+        (all(accepted.values()),
+         f"{k}: both arms accepted at all {steps} steps" if all(accepted.values())
+         else f"{k}: " + ", ".join(f"the {a} arm was not accepted at all {steps} steps "
+                                   "in its loop mode" for a, ok in accepted.items()
+                                   if not ok)),
+        (equal, f"{k}: the arms' step roots are equal" if equal
+         else f"{k}: the sequential and pipelined arms' step roots differ"),
+        (card_ok, f"{k}: step 1's root is the card's proved root" if card_ok
+         else f"{k}: step 1's root differs from card_{k}'s proved root"),
+        (not any(gpu_why.values()), f"{k}: the environment records name the four GPUs"
+         if not any(gpu_why.values()) else f"{k}: " + "; ".join(
+             f"{a} arm: " + ", ".join(w) for a, w in gpu_why.items() if w))]
+    return items
 
 
 def four_h100(parts: Sequence[Mapping[str, Any]],
@@ -2499,46 +2735,7 @@ def four_h100(parts: Sequence[Mapping[str, Any]],
          f"{tests_ex.get('errors')} errors, {tests_ex.get('skipped')} skipped; FS34's cases "
          "all passed" if not tests_problems else "the tests: " + "; ".join(tests_problems))]
     for k, row in models.items():
-        card = (_pair_part(parts, f"card_{k}").get("extras") or {})
-        arm_ex = {a: (_pair_part(parts, f"{a}_{k}").get("extras") or {}) for a in FOUR_ARMS}
-        mode = {"seq": "sequential", "pipe": "pipelined"}
-        accepted = {a: bool(e.get("accepted")) and len(e.get("step_roots") or ()) == FOUR_STEPS
-                    and e.get("loop_mode") == mode[a] for a, e in arm_ex.items()}
-        seq_roots, pipe_roots = (arm_ex[a].get("step_roots") or [] for a in FOUR_ARMS)
-        equal = len(seq_roots) == FOUR_STEPS and seq_roots == pipe_roots
-        card_ok = bool(card.get("root")) and bool(seq_roots) and seq_roots[0] == card["root"] \
-            and bool(pipe_roots) and pipe_roots[0] == card["root"]
-        gpu_why = {a: _four_gpu_problems(e) for a, e in arm_ex.items()}
-        steady = {a: _steady_s(e) for a, e in arm_ex.items()}
-        row.update({
-            "accepted": accepted, "roots_equal": equal, "step1_equals_card": card_ok,
-            "card_root": card.get("root"), "gpu_problems": gpu_why,
-            "arms": {a: {"step_roots": e.get("step_roots"), "step_times": e.get("step_times"),
-                         "step_wall_s": e.get("step_wall_s"),
-                         "step_interval_s": e.get("step_interval_s"),
-                         "latency_steady_s": _steady_mean(e.get("step_wall_s"))
-                         if a == "pipe" else None,
-                         "gpu_held_upper_s": e.get("gpu_held_upper_s"),
-                         "accumulated_gpu_s": e.get("accumulated_gpu_s"),
-                         "accumulated_steady_s": _steady_mean(e.get("accumulated_gpu_s")),
-                         "steady_s": steady[a][0], "steady_source": steady[a][1],
-                         "device_peaks": e.get("device_peaks"), "loop_mode": e.get("loop_mode"),
-                         "gpu_peak_mib": (_pair_part(parts, f"{a}_{k}").get("extras")
-                                          or {}).get("gpu_peak_mib")}
-                     for a, e in arm_ex.items()}})
-        items += [
-            (all(accepted.values()),
-             f"{k}: both arms accepted at all {FOUR_STEPS} steps" if all(accepted.values())
-             else f"{k}: " + ", ".join(f"the {a} arm was not accepted at all {FOUR_STEPS} steps "
-                                       "in its loop mode" for a, ok in accepted.items()
-                                       if not ok)),
-            (equal, f"{k}: the arms' step roots are equal" if equal
-             else f"{k}: the sequential and pipelined arms' step roots differ"),
-            (card_ok, f"{k}: step 1's root is the card's proved root" if card_ok
-             else f"{k}: step 1's root differs from card_{k}'s proved root"),
-            (not any(gpu_why.values()), f"{k}: the environment records name the four GPUs"
-             if not any(gpu_why.values()) else f"{k}: " + "; ".join(
-                 f"{a} arm: " + ", ".join(w) for a, w in gpu_why.items() if w))]
+        items += _four_model_items(parts, k, row, FOUR_STEPS)
     probe = _pair_part(parts, "probe").get("extras") or {}
     check_rates = (peer or {}).get("gbps") or {}
     missing = _four_missing_numbers(models, probe, check_rates)
@@ -2605,6 +2802,210 @@ def _four_lines(res: Mapping[str, Any] | None) -> list[str]:
                 + (", ".join(f"{i}: {peaks[i] / 1024:.1f} GiB" if i in peaks else f"{i}: ?"
                              for i in map(str, range(FOUR_CARDS))) if peaks else "unknown"))
     lines.append(_four_peer_range(res))
+    return lines
+
+
+def four_profile_parts() -> tuple[str, ...]:
+    """The names of ``four-h100-profile``'s parts, the native build and the peer check first;
+    per model the plain run, the card, then the two arms."""
+    return (NATIVE_BUILD_NAME, PEER_CHECK_NAME, "models", "four_tests", "probe",
+            *(f"{a}_{four_model_key(r)}" for r, _ in FOUR_PROFILE_PINS
+              for a in ("plain", "card", "seq", "pipe")))
+
+
+def _missing_steps(have: Sequence[int], steps: int = FOUR_PROFILE_STEPS) -> str:
+    """``"steps 2, 4"``: the steps of 1..``steps`` not in ``have``."""
+    gone = [t for t in range(1, steps + 1) if t not in set(have)]
+    return "step" + ("s " if len(gone) > 1 else " ") + ", ".join(map(str, gone))
+
+
+def _profile_arm_problems(ex: Mapping[str, Any], arm: str) -> list[str]:
+    """What an arm's output lacks of the profile's inputs (empty when none): a markers line, a
+    ``step_interval`` time row for every step; a ``count`` row for each of
+    :data:`PROFILE_WORK_SECTIONS` and a ``storage`` row; the layout file; the sequential arm's
+    trace of step :data:`FOUR_PROFILE_TRACE_STEP` (its markers line ``traced`` and no other
+    step's, the trace file there and not empty, the trace's own error empty); and for the
+    pipelined arm no traced step."""
+    pr = ex.get("profile")
+    if not isinstance(pr, dict):
+        return ["no profile inputs read (the arm left no output)"]
+    why: list[str] = []
+    steps = FOUR_PROFILE_STEPS
+    if not pr.get("markers_file"):
+        why.append(f"no {PROFILE_MARKERS}")
+    elif len(set(pr.get("markers_steps") or ()) & set(range(1, steps + 1))) < steps:
+        why.append(f"{PROFILE_MARKERS} has no line for "
+                   + _missing_steps(pr.get("markers_steps") or ()))
+    if len(set(pr.get("interval_steps") or ()) & set(range(1, steps + 1))) < steps:
+        why.append("no step_interval time row for "
+                   + _missing_steps(pr.get("interval_steps") or ()))
+    lost = [s for s in PROFILE_WORK_SECTIONS if s not in (pr.get("count_sections") or ())]
+    if lost:
+        why.append("no count row for " + ", ".join(lost))
+    if not pr.get("storage_rows"):
+        why.append("no storage row")
+    if not pr.get("layout"):
+        why.append(f"no {PROFILE_LAYOUT} (or it is empty)")
+    traced = list(pr.get("traced_steps") or ())
+    name = f"step_{FOUR_PROFILE_TRACE_STEP:05d}.json.gz"
+    if arm == "seq":
+        if traced != [FOUR_PROFILE_TRACE_STEP]:
+            why.append(f"the markers trace {traced or 'no step'}, not step "
+                       f"{FOUR_PROFILE_TRACE_STEP} alone")
+        if name not in (pr.get("trace_files") or ()):
+            why.append(f"no trace file {PROFILE_TRACE_DIR}/{name} (or it is empty)")
+        if pr.get("trace_error"):
+            why.append(f"the trace reports an error: {pr['trace_error']}")
+    elif traced:
+        why.append(f"the markers show a traced step ({', '.join(map(str, traced))}), "
+                   "a pipelined run is never traced")
+    return why
+
+
+def _profile_plain_problems(ex: Mapping[str, Any]) -> list[str]:
+    """What the plain run lacks (empty when nothing): its records, a completed run, ``P0.*``
+    time rows and a ``step`` total for every step, ``final_weights.json``."""
+    if not ex.get("record"):
+        return ["no plain run records"]
+    why: list[str] = []
+    if not ex.get("completed"):
+        why.append("the plain run did not complete")
+    steps = FOUR_PROFILE_STEPS
+    if len(set(ex.get("p0_steps") or ()) & set(range(1, steps + 1))) < steps:
+        why.append("no P0.* time row for " + _missing_steps(ex.get("p0_steps") or ()))
+    if len(ex.get("step_totals_s") or ()) < steps or ex.get("steady_s") is None:
+        why.append(f"fewer than {steps} step total rows (or none for steps 2 and 3)")
+    if not ex.get("weights_bytes"):
+        why.append(f"no {WEIGHTS_FILE}")
+    return why
+
+
+def _samples_problem(ex: Mapping[str, Any]) -> str | None:
+    """Why a part's ``samples.jsonl`` does not count (version 2, four GPUs in its header)."""
+    s = ex.get("samples")
+    if not isinstance(s, dict):
+        return "no samples.jsonl"
+    if s.get("version") != 2 or s.get("gpus") != FOUR_CARDS:
+        return (f"samples.jsonl is version {s.get('version')} with {s.get('gpus')} GPUs in its "
+                f"header, not version 2 with {FOUR_CARDS}")
+    return None
+
+
+def _ratio(a: float | None, b: float | None) -> float | None:
+    return a / b if a is not None and b is not None and _pos(a) and _pos(b) else None
+
+
+def four_h100_profile(parts: Sequence[Mapping[str, Any]],
+                      expected: Sequence[str] | None = None) -> dict[str, Any] | None:
+    """The ``four-h100-profile`` session's result, or ``None`` without its parts. ``pass``
+    fails closed: every part of :func:`four_profile_parts` ran ``ok`` (or was done earlier); the
+    peer copies landed right bytes; the tests part counts (:func:`_four_tests_problems`); per
+    model FS35's items at :data:`FOUR_PROFILE_STEPS` steps (:func:`_four_model_items`); the
+    plain run's records and weights (:func:`_profile_plain_problems`) and each arm's profile
+    inputs (:func:`_profile_arm_problems`); every part's ``samples.jsonl``
+    (:func:`_samples_problem`; one line per part that fails); the probe's version 2 report with
+    four ``per_device`` entries; and the reported numbers (:func:`_four_missing_numbers`).
+    ``items`` lists each acceptance item as ``(ok, text)``, in the order the log prints them.
+    Outside ``pass``, per model: each arm's numbers as the FS35 result has them (the steady step
+    from the step interval, the pipelined latency, the accumulated GPU time, the four GPUs'
+    peaks), ``verifier_steady_s`` (the verifier side's ``total`` row, mean of steps 2-3), the
+    plain run's ``steady_s`` (mean of the ``step`` total over steps 2-3) and per arm
+    ``verify_over_train`` (verifier over the plain step) and ``wall_over_train`` (the arm's
+    step interval over the plain step)."""
+    if not any(p.get("kind") == "profile_run" for p in parts):
+        return None
+    names = {p["name"] for p in parts}
+    models = {four_model_key(r): {} for r, _ in FOUR_PROFILE_PINS}
+    want = four_profile_parts()
+    problems = {n: _pair_part(parts, n).get("status", "not_started") for n in want
+                if n not in names or _pair_part(parts, n).get("status") not in _PAIR_OK}
+    peer = (_pair_part(parts, PEER_CHECK_NAME).get("extras") or {}).get("peer_check")
+    peer_ok = bool(peer) and peer.get("all_ok") is True
+    tests_problems = _four_tests_problems(_pair_part(parts, "four_tests"), expected)
+    tests_ex = _pair_part(parts, "four_tests").get("extras") or {}
+    items: list[tuple[bool, str]] = [
+        (not problems, "every part ran and succeeded" if not problems else "; ".join(
+            f"{n} " + ("did not run" if s == "not_started" else f"ended {s}")
+            for n, s in problems.items())),
+        (peer_ok, "the peer copies landed the right bytes" if peer_ok else
+         f"peer copies: {peer_wrong_text(peer)}"),
+        (not tests_problems,
+         f"the tests: {tests_ex.get('tests')} tests, {tests_ex.get('failures')} failed, "
+         f"{tests_ex.get('errors')} errors, {tests_ex.get('skipped')} skipped; FS34's cases "
+         "all passed" if not tests_problems else "the tests: " + "; ".join(tests_problems))]
+    for k, row in models.items():
+        items += _four_model_items(parts, k, row, FOUR_PROFILE_STEPS)
+        plain = _pair_part(parts, f"plain_{k}").get("extras") or {}
+        why_plain = _profile_plain_problems(plain)
+        steady_plain = plain.get("steady_s")
+        row["plain"] = {"steady_s": steady_plain, "steady_row": "time / total / step, mean of "
+                        "steps 2-3", "step_totals_s": plain.get("step_totals_s"),
+                        "problems": why_plain}
+        items.append((not why_plain, f"{k} plain: the records and final weights are there"
+                      if not why_plain else f"{k} plain: " + "; ".join(why_plain)))
+        row["inputs"] = {}
+        for a, arm in row["arms"].items():
+            ex = _pair_part(parts, f"{a}_{k}").get("extras") or {}
+            why = _profile_arm_problems(ex, a)
+            row["inputs"][a] = why
+            arm["verify_over_train"] = _ratio(arm["verifier_steady_s"], steady_plain)
+            arm["wall_over_train"] = (_ratio(arm["steady_s"], steady_plain)
+                                      if arm["steady_source"] == "step_interval" else None)
+            items.append((not why, f"{k} {a}: the profile's inputs are there" if not why
+                          else f"{k} {a}: " + "; ".join(why)))
+    sample_why = {n: w for n in want if n != NATIVE_BUILD_NAME
+                  and (w := _samples_problem(_pair_part(parts, n).get("extras") or {}))}
+    items += [(False, f"{n}: {w}") for n, w in sample_why.items()]
+    if not sample_why:
+        items.append((True, "every part left a version 2 samples.jsonl with four GPUs"))
+    probe = _pair_part(parts, "probe").get("extras") or {}
+    probe_ok = probe.get("version") == 2 and len(probe.get("per_device") or {}) == FOUR_CARDS
+    items.append((probe_ok, "the probe report is version 2 with four per_device entries"
+                  if probe_ok else f"probe.json is version {probe.get('version')} with "
+                  f"{len(probe.get('per_device') or {})} per_device entries, not version 2 "
+                  f"with {FOUR_CARDS}"))
+    check_rates = (peer or {}).get("gbps") or {}
+    missing = _four_missing_numbers(models, probe, check_rates)
+    items.append((not missing, "the step times, per-GPU peaks and peer rates are all reported"
+                  if not missing else "numbers missing: " + "; ".join(missing)))
+    return {"pass": all(ok for ok, _ in items), "items": [[ok, text] for ok, text in items],
+            "missing_numbers": missing, "models": models, "part_problems": problems,
+            "peer_bytes_ok": peer_ok,
+            "tests": {k: tests_ex.get(k) for k in ("tests", "failures", "errors", "skipped",
+                                                   "files", "missing_files")},
+            "tests_problems": tests_problems, "samples_problems": sample_why,
+            "probe": {k: probe.get(k) for k in ("version", "devices", "per_device", "peer",
+                                                "peer_errors")},
+            "peer_check_gbps": check_rates,
+            "gpu_peak": {n: (_pair_part(parts, n).get("extras") or {}).get("gpu_peak_mib")
+                         for n in want}}
+
+
+def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
+    """The job log's last lines of ``four-h100-profile``: one ``FS42 ok`` or ``FS42 FAIL`` per
+    acceptance item, then per model and arm the step (the interval between verified steps), the
+    verifier side's time per step, the plain run's step and the two ratios."""
+    if res is None:
+        return []
+
+    def sec(x: float | None) -> str:
+        return "unknown" if x is None else f"{x:.1f} s"
+
+    def rat(x: float | None) -> str:
+        return "unknown" if x is None else f"{x:.2g}"
+
+    lines = [f"FS42 {'ok' if ok else 'FAIL'}: {text}" for ok, text in res["items"]]
+    for k, row in res["models"].items():
+        plain = (row.get("plain") or {}).get("steady_s")
+        for a, arm in row["arms"].items():
+            src = arm.get("steady_source")
+            what = ("interval between verified steps" if src == "step_interval"
+                    else f"{src}, not the interval" if src else "no step time")
+            lines.append(
+                f"FS42 {k} {a}: step {sec(arm.get('steady_s'))} ({what}), verifier "
+                f"{sec(arm.get('verifier_steady_s'))} per step, plain training {sec(plain)} per "
+                f"step; verifier ÷ training {rat(arm.get('verify_over_train'))}, step "
+                f"÷ training {rat(arm.get('wall_over_train'))}")
     return lines
 
 
@@ -3236,6 +3637,8 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
         rec["extras"] = part_extras(part, d / "log.txt")
         if part.info.get("gpu_peak"):
             rec["extras"]["gpu_peak_mib"] = _read_peaks(d / "gpu_peak.json")
+        if part.info.get("samples_check"):
+            rec["extras"]["samples"] = _samples_header(d / "samples.jsonl")
         summary["parts"].append(rec)
         try:
             ab = fix2_ab(summary["parts"])
@@ -3269,6 +3672,13 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
             four = {"four_h100_error": f"{type(e).__name__}: {e}"}
         if four is not None:
             summary["four_h100"] = four
+        try:
+            profile = four_h100_profile(summary["parts"])
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError,
+                statistics.StatisticsError) as e:
+            profile = {"four_h100_profile_error": f"{type(e).__name__}: {e}"}
+        if profile is not None:
+            summary["four_h100_profile"] = profile
         if part.kind == "peer_check" and rec["status"] != "not_started":
             # Wrong bytes between the cards: nothing after this part counts. A rerun that
             # skipped the part (DONE) reads its report again.
@@ -3304,6 +3714,12 @@ def run_session(plan: Sequence[Part], *, upload: Path, out: Path, deadline: floa
         say(f"FS35 FAIL: the comparison raised ({four['four_h100_error']})")
     else:
         for line in _four_lines(four):
+            say(line)
+    prof = summary.get("four_h100_profile")
+    if prof is not None and "four_h100_profile_error" in prof:
+        say(f"FS42 FAIL: the acceptance raised ({prof['four_h100_profile_error']})")
+    else:
+        for line in _profile_lines(prof):
             say(line)
     summary["finished"] = True
     summary["ended_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -3481,9 +3897,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "re-check's (recheck), the profile check's (profile-check), the "
                         "four-card hardware probe's (nvlink-probe), the BLAKE3 kernel's speed "
                         "(kernel-speed), the two-GPU sharded run's (fs32-pair), FS30's "
-                        "device-leaves check (device-leaves) or the four-H100 session's "
-                        "(four-h100); --plan and --selftest "
-                        "replace its parts")
+                        "device-leaves check (device-leaves), the four-H100 session's "
+                        "(four-h100) or its profiling run's (four-h100-profile); --plan and "
+                        "--selftest replace its parts")
     x = sub.add_parser("exit-probe", help="run each test module in its own pytest process "
                                           "and report which one cannot exit")
     x.add_argument("--out", type=Path, required=True)
@@ -3525,7 +3941,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         probing = args.cmd == "run" and args.session == "nvlink-probe" and not selftest
         pairing = args.cmd == "run" and args.session == "fs32-pair" and not selftest
-        four = args.cmd == "run" and args.session == "four-h100" and not selftest
+        four = (args.cmd == "run" and args.session in ("four-h100", "four-h100-profile")
+                and not selftest)
         if pairing:  # any GPU type, but two of them
             allow = True
         # the four-H100 session needs four CUDA devices (FS11_ALLOW_ANY_GPU does not lift that)
