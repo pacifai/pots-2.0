@@ -332,6 +332,20 @@ def test_leaves_go_to_sections_hashing_half_the_transcript(tmp_path):
     assert s["A"]["floors_s"]["hash"] == pytest.approx(499e-9)
 
 
+def test_a_count_rows_hash_leaves_set_the_sections_leaves_and_hash_floor(tmp_path):
+    from tests.evaluation.results.profile.helpers import count_row
+    storage = {"record": "storage", "run": "honest", "scenario": "honest", "step": 1,
+               "transcript_bytes": 1000, "leaves": 100}
+    secs = {"P3.commit": (0.0, 0.2), "2": (0.2, 0.2), "D": (0.6, 0.4)}
+    extra = [storage, count_row(1, "P3.commit", hash_in_bytes=100, hash_leaves=17),
+             count_row(1, "2", hash_in_bytes=500)]
+    rates = probe()["rates"] | {"hash": {"per_byte_s": 1e-9, "per_leaf_s": 1e-6, "threads": 8}}
+    _, s = run(tmp_path, secs=secs, records_extra=extra, probe_over={"rates": rates})
+    assert s["P3.commit"]["work"]["leaves"] == 17  # its own count, though it hashes < half
+    assert s["P3.commit"]["floors_s"]["hash"] == pytest.approx(100e-9 + 17e-6)
+    assert s["2"]["work"]["leaves"] == 100  # no hash_leaves: today's rule
+
+
 def test_check_5_trace_work_scales_by_run_time(tmp_path):
     secs = {"5": (0.0, 0.5), "4": (0.5, 0.5)}
     paths = build_run(tmp_path / "run", secs=secs)
@@ -882,3 +896,72 @@ def test_cpu_state_is_none_without_the_counters(tmp_path):
     state = view["cpu_state"]
     assert state["mean_throttled_frac"] is None and state["mean_mhz"] is None
     assert all(r["throttled_frac"] is None for r in state["steps"])
+
+
+# ---- FS42: explicit steady steps ----
+
+def _four_steps(tmp_path, traced_step, *, intervals=(9.0, 1.0, 2.0, 5.0)):
+    """A sequential run of 4 steps with step_interval rows, one step traced."""
+    paths = build_run(tmp_path / "run", steps=4)
+    mp = paths["run_dir"] / "markers.jsonl"
+    lines = [json.loads(x) for x in mp.read_text().splitlines()]
+    for ln in lines:
+        if ln.get("kind") == "step":
+            ln["traced"] = ln["step"] == traced_step
+    jl(mp, lines)
+    rp = paths["run_dir"] / "records.jsonl"
+    recs = [json.loads(x) for x in rp.read_text().splitlines()]
+    recs = [r for r in recs if not (r.get("record") == "time" and r["step"] == traced_step)]
+    recs += [time_row(k, "step_interval", intervals[k - 1], "run", "total")
+             for k in (1, 2, 3, 4) if k != traced_step]
+    jl(rp, recs)
+    return paths
+
+
+def _view(paths, **kw):
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], **kw)
+    return out, out["runs"]["honest"]
+
+
+def test_a_traced_last_step_leaves_a_sequential_steady_set_of_steps_2_and_3(tmp_path):
+    out, v = _view(_four_steps(tmp_path, 4))
+    assert v["steady_steps"] == [2, 3] and v["warmup"]["step"] == 1
+    assert v["step_s"] == pytest.approx(1.5)
+    assert not [w for w in out["warnings"] if "steady" in w]
+
+
+def test_the_default_rule_warns_about_a_steady_step_after_a_traced_one(tmp_path):
+    out, v = _view(_four_steps(tmp_path, 2))
+    assert v["steady_steps"] == [3, 4] and v["step_s"] == pytest.approx(3.5)
+    assert any("steady step 3 follows traced step 2" in w for w in out["warnings"])
+
+
+def test_steady_steps_override_the_default_set_and_the_plain_comparison_follows(tmp_path):
+    paths = _four_steps(tmp_path, 99)
+    pd = tmp_path / "plain"
+    pd.mkdir()
+    jl(pd / "records.jsonl", [time_row(k, "step", t, "prover", "total")
+                              for k, t in ((1, 7.0), (2, 1.0), (3, 3.0), (4, 100.0))])
+    out, v = _view(paths, plain=pd, steady_steps=analyze.parse_steps("2-3"))
+    assert v["steady_steps"] == [2, 3] and v["step_s"] == pytest.approx(1.5)
+    assert v["warmup"]["step"] == 1 and v["n_steps"] == 2
+    st = out["comparisons"]["step"]
+    assert st["interval_s"] == pytest.approx(1.5) and st["plain_s"] == pytest.approx(2.0)
+    assert not [w for w in out["warnings"] if "steady" in w or "plain run lacks" in w]
+    # a plain run lacking a requested step: its own rule (all but warm-up), with a warning
+    jl(pd / "records.jsonl", [time_row(k, "step", t, "prover", "total")
+                              for k, t in ((1, 7.0), (2, 1.0))])
+    out, _ = _view(paths, plain=pd, steady_steps=[2, 3])
+    assert any("plain run lacks" in w for w in out["warnings"])
+
+
+def test_a_missing_or_traced_requested_step_is_warned_about_and_left_out(tmp_path):
+    out, v = _view(_four_steps(tmp_path, 4), steady_steps=[2, 3, 4, 9])
+    assert v["steady_steps"] == [2, 3]
+    ws = " ".join(out["warnings"])
+    assert "steady step 4 is traced" in ws and "steady step 9 is missing" in ws
+
+
+def test_parse_steps_reads_ranges_and_lists():
+    assert analyze.parse_steps("2-4") == [2, 3, 4] and analyze.parse_steps("2,3,5-6") == \
+        [2, 3, 5, 6]

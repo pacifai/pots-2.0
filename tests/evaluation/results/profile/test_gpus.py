@@ -313,11 +313,11 @@ def _pipelined_rows(steps):
     return rows
 
 
-def _pipelined(tmp_path: Path, *, plain: bool = False):
+def _pipelined(tmp_path: Path, *, plain: bool = False, steady_steps=None):
     paths = build(tmp_path / "run")  # the build's step total is the sum of the sections, 1.01
     _rewrite(paths, devices={"P1": ["cuda:0"], "V": VERIFIER, "Q": ["cuda:2"], "H": VERIFIER},
              merged=True, extra_rows=_pipelined_rows)
-    kw = {}
+    kw = {"steady_steps": steady_steps}
     if plain:
         pd = tmp_path / "plain"
         pd.mkdir()
@@ -398,12 +398,20 @@ def test_mean_view_is_one_view_for_one_device_and_the_field_mean_for_several():
     assert both["g_util"] == pytest.approx(0.4) and n == 2
 
 
-def test_a_pipelined_runs_step_time_is_the_interval_between_verified_steps(tmp_path):
-    _, v = _pipelined(tmp_path)
-    assert v["step_source"] == "step_interval" and v["pipelined"] is True
+def test_the_default_steady_rule_includes_a_pipelined_runs_last_step_and_warns(tmp_path):
+    out, v = _pipelined(tmp_path)
+    assert v["steady_steps"] == [2, 3, 4]
     assert v["step_s"] == pytest.approx((0.8 + 0.9 + 1.0) / 3)  # the warm-up step 1 is left out
+    assert any("last step (4)" in w and "--steady-steps" in w for w in out["warnings"])
+
+
+def test_a_pipelined_runs_step_time_is_the_interval_between_verified_steps(tmp_path):
+    _, v = _pipelined(tmp_path, steady_steps=[2, 3])  # step 4 is the drain step
+    assert v["step_source"] == "step_interval" and v["pipelined"] is True
+    assert v["steady_steps"] == [2, 3] and v["n_steps"] == 2
+    assert v["step_s"] == pytest.approx((0.8 + 0.9) / 2)  # the warm-up step 1 is left out
     assert v["work_s"] == pytest.approx(1.01)  # the step total row's mean
-    assert v["latency_s"] == pytest.approx((1.2 + 1.3 + 1.4) / 3)
+    assert v["latency_s"] == pytest.approx((1.2 + 1.3) / 2)
     assert v["sections"]["P1"]["share"] == pytest.approx(0.2 / v["step_s"])
     assert v["share_by_side"]["prover"] == pytest.approx(0.2 / v["step_s"])
     assert v["share_by_side"]["verifier"] == pytest.approx(0.81 / v["step_s"])
@@ -465,3 +473,13 @@ def test_records_without_step_interval_keep_the_step_total_and_its_shares(tmp_pa
     assert v["share_total"] == pytest.approx(1.0)
     assert v["share_by_side"] == {"verifier": pytest.approx(1.0)}
     assert v["sections"]["A"]["util_devices"] is None  # a CPU run has no device
+
+
+def test_the_flow_notes_that_prover_side_gpu_use_understates_with_several_role_gpus(tmp_path):
+    import html as htmllib
+    out, _ = _pipelined(tmp_path)
+    assert "understates them" in htmllib.unescape(report.build([out]))
+    from tests.evaluation.results.profile.helpers import build_run
+    paths = build_run(tmp_path / "one", device="cuda:0")
+    one = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    assert "understates them" not in htmllib.unescape(report.build([one]))

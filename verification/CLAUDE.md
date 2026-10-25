@@ -127,7 +127,7 @@ profile/analyze.py`) reads versions 1 and 2 and matches each device to its GPU b
 a section's headline utilization from the GPUs of the section's role (`gpu_roles`: the mean over
 the section's listed prover or verifier devices; `util_by_device` keeps each GPU), its floors
 from each device's `probe.json` rates, and its step time as the interval between verified steps
-when the run has one (the `step_interval` time row).
+when the run has one (the `step_interval` time row). `--steady-steps A-B` (or `2,3`) names the steady steps; without it every untraced step after the warm-up counts, with a warning when a pipelined run's set includes its last step (verified with the prover idle) or a step that follows a traced one.
 
 Data artifacts (`D`, `D̃`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch

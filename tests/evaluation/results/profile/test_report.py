@@ -226,7 +226,7 @@ def test_plain_comparison_is_a_per_run_panel_before_the_comparisons():
     out = page(with_plain("A", 2.0), with_plain("B", 7.0))
     a, b = panel(out, "r0-plain"), panel(out, "r1-plain")
     assert "<td>2.0</td>" in a and "<td>7.0</td>" not in a and "<td>7.0</td>" in b
-    assert "Forward pass" in a and "Prover ÷ plain" in a and "Whole step" in a
+    assert "Forward pass" in a and "÷ plain" in a and "Verified run (s)" in a and "Whole step" in a
     assert '<span data-run="1"><a href="#r1-plain">' in out  # the picker switches it
     assert out.index('id="r1-plain"') < out.index('id="compare-models"')
     assert "-plain" not in page(profile())
