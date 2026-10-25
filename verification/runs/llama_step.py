@@ -37,7 +37,7 @@ import argparse
 import dataclasses
 import json
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +46,11 @@ import torch
 from setup import backdoorllm
 from setup.config import load_config, setup_determinism
 from setup.data import load_dataset_records
-from verification.computation.interface import DeclaredComputation, snapshot_weights
+from verification.computation.interface import (
+    DeclaredComputation,
+    ProductKind,
+    snapshot_weights,
+)
 from verification.computation.instances.decoder import DecoderComputation
 from verification.parameters import load_protocol_config
 from verification.runs.loop import run_devices
@@ -180,6 +184,53 @@ def report_roots(r: ScenarioResult, out: Callable[[str], None] = print) -> None:
             out(f"step {s.t:>2} root {s.root.hex()}")
 
 
+# ---- the timed run's work counts ----------------------------------------------------------
+
+
+def work_rows(c: DecoderComputation, run: str, scenario: str,
+              step_rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The ``count`` and ``storage`` rows of a timed run, from shapes, for the profile
+    analyzer's floors: the counting pass is never run beside a timed run, and it slows the code.
+
+    Per step in ``step_rows`` (the run's ``step`` records, which hold ``transcript_bytes`` and
+    ``leaves``): ``train.forward`` and ``train.backward`` get the matmul FLOPs the inventory
+    declares (``2·rows·contracted·cols`` per product, the forward kind in the first, the three
+    gradient kinds in the second; a bias's ones column and the elementwise glue are left out);
+    ``P3.commit`` (prover) and ``2`` (verifier) get the leaf hashing, ``transcript_bytes`` plus
+    the ``0x00`` prefix byte per leaf in, 32 bytes per leaf out; and a ``storage`` row carries
+    ``transcript_bytes`` and ``leaves``. Nothing is read from the device."""
+    fwd = bwd = 0
+    for q in c.products:
+        f = 2 * q.a_shape[0] * q.a_shape[1] * q.b_shape[1]
+        if q.kind is ProductKind.FORWARD:
+            fwd += f
+        else:
+            bwd += f
+    rows: list[dict[str, Any]] = []
+    for r in step_rows:
+        t, leaves, nbytes = r["step"], r["leaves"], r["transcript_bytes"]
+        base = {"record": "count", "run": run, "scenario": scenario, "step": t,
+                "calls": 1, "derived": False}
+        for side, name, level, flops, h_in, h_out, h_calls in (
+                ("prover", "train.forward", "phase", fwd, 0, 0, 0),
+                ("prover", "train.backward", "phase", bwd, 0, 0, 0),
+                ("prover", "P3.commit", "component", 0, nbytes + leaves, 32 * leaves, leaves),
+                ("verifier", "2", "component", 0, nbytes + leaves, 32 * leaves, leaves)):
+            rows.append({**base, "side": side, "component": name, "level": level,
+                         "flops": flops, "hash_in_bytes": h_in, "hash_out_bytes": h_out,
+                         "hash_calls": h_calls})
+        rows.append({"record": "storage", "run": run, "scenario": scenario, "step": t,
+                     "transcript_bytes": nbytes, "leaves": leaves})
+    return rows
+
+
+def _step_records(run_dir: Path) -> list[dict[str, Any]]:
+    """The ``step`` records the run has written so far (the writer flushes each)."""
+    with open(run_dir / "records.jsonl") as f:
+        rows = (json.loads(line) for line in f if line.strip())
+        return [r for r in rows if r.get("record") == "step"]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=1, help="T, at least 1 (default 1)")
@@ -228,6 +279,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     cache = dict(release_cache=cfg.release_cache)  # not count_run's: it counts, on any device
     mem_rows = None
     if not use_metrics:
+        if cfg.trace_step > 0:
+            print(f"trace: VERIF_TRACE_STEP={cfg.trace_step} needs --metrics; nothing is traced",
+                  flush=True)
         r = run_honest(c, D, w0, **run_args, **cache, **mode)
     else:
         llama = {"n_s": c.n_s, "n": c.n, "eta": c.eta, "k": k, "T": T, "n_records": len(D),
@@ -243,9 +297,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                            band_file_hash=None if make is None else bands.source, h_D=h_D,
                            extra={"band_source": "provisional" if make is None
                                   else str(args.bands), **llama}) as mw:
+            mw.write_c5_layout(c)  # what the markers' check-5 stamps index
             devs = run_devices(c, pipelined=pl)
+            # Only the timed run is traced: the memory and counting passes get no trace_step.
+            trace = dict(trace_step=cfg.trace_step, trace_c5=cfg.trace_c5)
+            if pl and cfg.trace_step > 0:
+                print(f"trace: VERIF_TRACE_STEP={cfg.trace_step} is not traced in the pipelined "
+                      "loop (the profiler records one process)", flush=True)
+                trace = dict(trace_step=0)
             r = run_honest(c, D, w0, **run_args, **cache, **mode,
-                           recorder=mw.recorder(HONEST.name, devices=devs))
+                           recorder=mw.recorder(HONEST.name, devices=devs, **trace))
+            if not args.count:
+                # The counting pass is never run beside a timed run (it slows the code); the
+                # profile analysis' floors come from shapes, one count row per component and
+                # step. With --count the pass's rows are the only ones.
+                mw.write(work_rows(c, RUN_NAME, HONEST.name, _step_records(mw.dir)))
             mem_rows = memory_run(c, D, w0, run=RUN_NAME, **run_args, **cache, **mode,
                                   device=mw.device, devices=devs)
             mw.write(mem_rows)
