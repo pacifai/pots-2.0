@@ -2232,7 +2232,8 @@ def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
     ``gpu_held_upper_s`` (``metrics.py``'s ``gpu_held_s``: each section's seconds times every
     device its process lists, an upper bound, not the cost decision's quantity), the
     ``accumulated_gpu_s`` (:func:`_accumulated_gpu_s`) and the merged step's wall extent
-    (``step_wall`` rows' ``time_s``), and the memory pass's peak per device
+    (``step_wall`` rows' ``time_s``, the latency) and every step's interval to the step before's
+    close (``step_interval`` rows' ``time_s``, FS42), and the memory pass's peak per device
     (``device_peak_bytes`` and ``device_peak_reserved_bytes`` of the prover's and the verifier's
     ``total`` rows, the larger over the steps)."""
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
@@ -2244,6 +2245,7 @@ def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
     gpus = (env.get("machine") or {}).get("gpus")
     held: dict[int, float] = {}
     wall: dict[int, float] = {}
+    interval: dict[int, float] = {}
     side_s: dict[int, dict[str, float]] = {}
     peaks: dict[str, dict[str, int | None]] = {}
     for r in rows:
@@ -2255,6 +2257,8 @@ def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
                 held[step] = r["gpu_held_s"]
             if r.get("component") == "step_wall" and _number(r.get("time_s")):
                 wall[step] = r["time_s"]
+            if r.get("component") == "step_interval" and _number(r.get("time_s")):
+                interval[step] = r["time_s"]
             if r.get("side") in ("prover", "verifier") and _number(r.get("time_s")):
                 side_s.setdefault(step, {})[r["side"]] = r["time_s"]
         if (r.get("record") == "memory" and r.get("level") == "total"
@@ -2280,7 +2284,8 @@ def _four_run_extras(log: Path, records: Path) -> dict[str, Any]:
             "accumulated_gpu_s": [a for t in sorted(side_s)
                                   if (a := _accumulated_gpu_s(side_s[t], env.get("gpu_roles")))
                                   is not None],
-            "step_wall_s": [wall[t] for t in sorted(wall)], "device_peaks": peaks}
+            "step_wall_s": [wall[t] for t in sorted(wall)],
+            "step_interval_s": [interval[t] for t in sorted(interval)], "device_peaks": peaks}
 
 
 def _four_tests_extras(junit: Path) -> dict[str, Any]:
@@ -2398,8 +2403,13 @@ def _four_tests_problems(part: Mapping[str, Any], expected: Sequence[str] | None
 
 
 def _steady_s(ex: Mapping[str, Any]) -> tuple[float | None, str | None]:
-    """An arm's steady step time, the mean of steps 2 and 3, and what it is: the merged step's
-    wall extent (``step_wall``) where the records hold it, else the three times' total."""
+    """An arm's steady step time, the mean of steps 2 and 3, and what it is: the interval
+    between consecutive verified steps (``step_interval``, EQ14's wall time per step, FS42)
+    where the records hold it, else the merged step's wall extent (``step_wall``, records written
+    before FS42), else the three times' total."""
+    ivs = ex.get("step_interval_s") or []
+    if len(ivs) >= FOUR_STEPS:
+        return statistics.fmean(ivs[1:FOUR_STEPS]), "step_interval"
     wall = ex.get("step_wall_s") or []
     if len(wall) >= FOUR_STEPS:
         return statistics.fmean(wall[1:FOUR_STEPS]), "step_wall"
@@ -2460,10 +2470,11 @@ def four_h100(parts: Sequence[Mapping[str, Any]],
     (:func:`_four_missing_numbers`: per model and arm a steady step time and a peak per GPU,
     once 12 peer rates). ``items`` lists each acceptance item as ``(ok, text)``, in the order
     the log prints them. Outside ``pass``: per model and arm each step's prover, verifier,
-    hand-off and total time (``step_times``), ``step_wall_s`` and ``gpu_held_upper_s`` (an upper
-    bound) per step, ``accumulated_gpu_s`` per step and its steady mean
+    hand-off and total time (``step_times``), ``step_wall_s``, ``step_interval_s`` and ``gpu_held_upper_s`` (an
+    upper bound) per step, ``accumulated_gpu_s`` per step and its steady mean
     (``accumulated_steady_s``, steps 2 and 3; :func:`_accumulated_gpu_s`), ``steady_s`` (steps 2
-    and 3, :func:`_steady_s`), the memory pass's peak per device (``device_peaks``) and the whole
+    and 3, :func:`_steady_s`: the step interval; ``latency_steady_s``, the pipelined arm's
+    ``step_wall`` mean), the memory pass's peak per device (``device_peaks``) and the whole
     card's peaks (``gpu_peak_mib``, per GPU); and once the probe's per-device headline rates, the
     12 peer rates and ``peer_check``'s per-pair rates."""
     if not any(p["kind"] == "four_run" for p in parts):
@@ -2504,6 +2515,9 @@ def four_h100(parts: Sequence[Mapping[str, Any]],
             "card_root": card.get("root"), "gpu_problems": gpu_why,
             "arms": {a: {"step_roots": e.get("step_roots"), "step_times": e.get("step_times"),
                          "step_wall_s": e.get("step_wall_s"),
+                         "step_interval_s": e.get("step_interval_s"),
+                         "latency_steady_s": _steady_mean(e.get("step_wall_s"))
+                         if a == "pipe" else None,
                          "gpu_held_upper_s": e.get("gpu_held_upper_s"),
                          "accumulated_gpu_s": e.get("accumulated_gpu_s"),
                          "accumulated_steady_s": _steady_mean(e.get("accumulated_gpu_s")),
@@ -2576,10 +2590,15 @@ def _four_lines(res: Mapping[str, Any] | None) -> list[str]:
     for k, row in res["models"].items():
         for a, arm in row["arms"].items():
             s, src, acc = arm["steady_s"], arm["steady_source"], arm.get("accumulated_steady_s")
+            lat = arm.get("latency_steady_s")
             peaks = arm.get("gpu_peak_mib") or {}
             lines.append(
                 f"FS35 {k} {a}: steady step "
-                + ("unknown" if s is None else f"{s:.1f} s ({src}, mean of steps 2-3)")
+                + ("unknown" if s is None else
+                   f"{s:.1f} s (interval between verified steps, mean of steps 2-3)"
+                   if src == "step_interval" else f"{s:.1f} s ({src}, mean of steps 2-3)")
+                + ("" if a != "pipe" else "; latency " + (
+                    "unknown" if lat is None else f"{lat:.1f} s (step_wall)"))
                 + "; accumulated GPU time "
                 + ("unknown" if acc is None else f"{acc:.1f} s (mean of steps 2-3)")
                 + "; GPU peaks "
