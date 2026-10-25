@@ -264,11 +264,11 @@ def test_a_failing_read_falls_back_before_anything_is_recorded(monkeypatch):
     c, out = _step()
     n, real = [], checks._read_rows
 
-    def read(rows):
+    def read(rows, **kw):
         n.append(len(ctx_holder[0].stats.products))
         if len(n) == 1:
             raise RuntimeError("read bug")
-        return real(rows)
+        return real(rows, **kw)
 
     ctx_holder = []
     monkeypatch.setattr(checks, "_read_rows", read)

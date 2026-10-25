@@ -62,7 +62,8 @@ class Spy:
     fault: object = None  # a callable raising, run in front of a share=True call
 
     def wrap(self, fn):
-        def measure(groups, *, h, k, guard=True, share=False, plan_out=None):
+        def measure(groups, *, h, k, guard=True, share=False, plan_out=None,
+                    prefetched=None):
             ms = [int(m) for g in groups for m in g.ms]
             if share and self.fault is not None:
                 self.fault()

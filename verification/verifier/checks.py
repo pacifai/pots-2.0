@@ -87,7 +87,7 @@ from verification.verifier.context import (
     _is_digest,
     _Rejected,
 )
-from verification.verifier.matmul_check import freivalds
+from verification.verifier.matmul_check import freivalds, measure_kernel
 from verification.verifier.matmul_check.freivalds import (
     MeasureColumns,
     MeasureGroup,
@@ -790,7 +790,8 @@ class _ReadOnce:
         """``r``'s rows as a float64 array, in the order of ``r.order``."""
         if self._host is None:
             try:
-                read = _read_rows([x.rows for x in self._present])  # type: ignore[misc]
+                read = _read_rows([x.rows for x in self._present],  # type: ignore[misc]
+                                  pinned=True)
             except Exception as e:
                 raise _UnitPassError(None) from e
             self._host = {id(x): h for x, h in zip(self._present, read)}
@@ -821,12 +822,16 @@ def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, repla
     scratch = MeasureScratch()
     rows: list[_Rows | None] = [None] * len(runs)
     try:
-        for step in steps:
+        ahead = _prefetch_step(replay, runs, steps, 0, root, ctx.k)
+        for s, step in enumerate(steps):
+            # the next step's challenges are drawn on the worker thread while this one is served
+            prefetched, ahead = ahead, _prefetch_step(replay, runs, steps, s + 1, root, ctx.k)
             if all(_kernel_run(replay, runs[i]) for i in step):
                 for i, r in zip(step, _measure_step_kernel(c, [runs[i] for i in step], step, ctx,
                                                            replay, view, h=root, k=ctx.k,
                                                            guard=ctx.kappa_guard,
-                                                           group0=group0)):
+                                                           group0=group0,
+                                                           prefetched=prefetched)):
                     rows[i] = r
                 continue
             for i in step:
@@ -861,10 +866,29 @@ def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, repla
         raise
 
 
+def _prefetch_step(replay: Replay, runs: Sequence[Sequence[ProductSpec]],
+                   steps: Sequence[Sequence[int]], s: int, h: bytes, k: int) -> Any:
+    """The challenge prefetch (``measure_kernel.prefetch``, FS39) of step ``s``'s products,
+    each at its ``P``'s column count, which is the width :func:`measure_kernel.enqueue` draws
+    its challenges at; ``None`` for a step past the last, one with a run off the kernel, or
+    while overlap is off. A failure to decide (a replay that can't tell its device yet) is
+    ``None``: the step then draws inline, and the serving raises what it raises."""
+    if s >= len(steps) or not measure_kernel.overlap_on():
+        return None
+    try:
+        if not all(_kernel_run(replay, runs[i]) for i in steps[s]):
+            return None
+        specs = [spec for i in steps[s] for spec in runs[i]]
+        return measure_kernel.prefetch(h, [spec.m for spec in specs], k,
+                                       [spec.width for spec in specs])
+    except Exception:
+        return None
+
+
 def _measure_step_kernel(c: DeclaredComputation, runs: Sequence[Sequence[ProductSpec]],
                          step: Sequence[int], ctx: StepContext, replay: Replay,
                          view: TranscriptView, *, h: bytes, k: int, guard: bool,
-                         group0: Sequence[int]) -> list[_Rows]:
+                         group0: Sequence[int], prefetched: Any = None) -> list[_Rows]:
     """One schedule step on the kernel path (FS38b): every run of ``runs`` (the step's runs, at
     canonical indices ``step``, ``group0`` indexed by those) served as FS37's views, in order
     (a run of one by :func:`_served_view`, a member run group by group by
@@ -872,7 +896,14 @@ def _measure_step_kernel(c: DeclaredComputation, runs: Sequence[Sequence[Product
     ``freivalds.measure_groups_rows(..., share=True)`` call per device (normally the step's
     one), so a stored matrix several products read is read once per level. The rows come back
     as one :class:`_Rows` per run, in the step's run order. A serving error raises
-    :class:`_UnitPassError` at that run, a measuring error at the step's first run."""
+    :class:`_UnitPassError` at that run, a measuring error at the step's first run.
+
+    One step's measuring is in flight per device (FS39): before a device's call, the step
+    before's measuring on that device is waited for (``freivalds.drain(dev)``, inside
+    ``5.measure``, whose row on the kernel path is host time), so step ``s - 1`` measures on the
+    device's measure stream while step ``s`` is served; a held input that moved raises
+    ``ReplayError`` there, a measuring error. ``prefetched`` is the step's challenge prefetch,
+    shared by every device's call."""
     served: list[tuple[list[MeasureGroup], list[int]]] = []
     for i, specs in zip(step, runs):
         groups: list[MeasureGroup] = []
@@ -907,9 +938,11 @@ def _measure_step_kernel(c: DeclaredComputation, runs: Sequence[Sequence[Product
     try:
         for dev in devices:
             table = [mg for groups, _ in served for mg in groups if mg.a.device == dev]
-            with ctx.timed("5.measure"), ctx.stamp("c5.measure", step[0], -1):
+            with ctx.timed("5.measure", host=True), ctx.stamp("c5.measure", step[0], -1):
+                freivalds.drain(dev)
                 tables[dev] = freivalds.measure_groups_rows(table, h=h, k=k, guard=guard,
-                                                            share=True)
+                                                            share=True,
+                                                            prefetched=prefetched)
     except Exception as e:
         raise _UnitPassError(step[0]) from e
     taken = {dev: 0 for dev in devices}  # rows of each device's table already given to a run
@@ -1063,7 +1096,8 @@ def _measure_served_kernel(c: DeclaredComputation, specs: Sequence[ProductSpec],
             group = _served_view(c, specs[0], ctx, replay, view, run=run, group=group0, st=st)
         except Exception as e:
             return _Rows(specs[:0], [], None), e
-        with ctx.timed("5.measure"), (st("c5.measure", run, group0) if st else _NO_STAMP):
+        with ctx.timed("5.measure", host=True), \
+                (st("c5.measure", run, group0) if st else _NO_STAMP):
             rows = freivalds.measure_groups_rows([group], h=h, k=k, guard=guard)
         return _Rows(specs, [0], rows), None
     groups, rows, orders = _measure_groups(specs), [], []
@@ -1075,7 +1109,8 @@ def _measure_served_kernel(c: DeclaredComputation, specs: Sequence[ProductSpec],
             return _measure_to_failure(c, specs, groups, rows, ctx, replay, view, h=h, k=k,
                                        scratch=scratch, guard=guard, run=run, group0=group0,
                                        orders=orders)
-        with ctx.timed("5.measure"), (st("c5.measure", run, group0 + g) if st else _NO_STAMP):
+        with ctx.timed("5.measure", host=True), \
+                (st("c5.measure", run, group0 + g) if st else _NO_STAMP):
             rows.append(freivalds.measure_groups_rows(served, h=h, k=k, guard=guard))
         orders.append(order)
         del served  # the views; the kernel holds what it still reads
@@ -1101,7 +1136,8 @@ def _served_view(c: DeclaredComputation, spec: ProductSpec, ctx: StepContext, re
                            f"!= declared {spec.a_shape}·{spec.b_shape}")
     with (st("c5.serve", run, group) if st else _NO_STAMP):
         with (st("c5.copy", run, group) if st else _NO_STAMP):
-            p_dev = p.detach().to(a.device, non_blocking=True)
+            with measure_kernel.stream_for(a.device):  # the copy runs beside the glue (FS39)
+                p_dev = p.detach().to(a.device, non_blocking=True)
     return MeasureGroup(a.detach()[None], b.detach()[None], p_dev[None], [spec.m], bias)
 
 
@@ -1150,7 +1186,8 @@ def _served_blocks(c: DeclaredComputation, specs: Sequence[ProductSpec], idx: Se
             views.append((blk, p, labels))
         with (st("c5.copy", run, group) if st else _NO_STAMP):  # one stamp per group
             for blk, p, labels in views:
-                p_dev = p.detach().to(blk.a.device, non_blocking=True)
+                with measure_kernel.stream_for(blk.a.device):  # beside the glue (FS39)
+                    p_dev = p.detach().to(blk.a.device, non_blocking=True)
                 out.append(MeasureGroup(blk.a, blk.b, p_dev, labels))
     return [idx[t] for blk in blocks for t in blk.pos], out
 
@@ -1219,7 +1256,8 @@ def _measure_to_failure(c: DeclaredComputation, specs: Sequence[ProductSpec],
                   for i in keep]
         group = _Group(keep, *(torch.stack([x[j] for x in served]) for j in range(3)), None)
         del served
-        with ctx.timed("5.measure"), (st("c5.measure", run, group0 + g) if st else _NO_STAMP):
+        with ctx.timed("5.measure", host=orders is not None), \
+                (st("c5.measure", run, group0 + g) if st else _NO_STAMP):
             out.append(_measure_rows(specs, [group], h=h, k=k, scratch=scratch,
                                      guard=guard).rows)
         del group
@@ -1309,19 +1347,49 @@ def _rows_device(rows: torch.Tensor) -> Hashable:
     return rows.device
 
 
-def _read_rows(rows: Sequence[torch.Tensor]) -> list[np.ndarray]:
+def _from_kernel(batch: Sequence[_Rows]) -> bool:
+    """Whether any of the batch's rows (present ones) were measured by the fused kernel: their
+    device is one it takes. The read of such rows is host time in ``5.measure`` (§2.7)."""
+    return any(r.rows is not None and freivalds.kernel_device(r.rows.device) for r in batch)
+
+
+def _read_rows(rows: Sequence[torch.Tensor], *, pinned: bool = False) -> list[np.ndarray]:
     """Each run's rows as a float64 array on the host, in the order given, with one read per
     device: the rows of runs on one device (a run is on one device, F22) are joined there, read
     once and cut back, so a window may span devices. Values and order are the rows'. Kernel
-    measurements still in flight are waited for first (``freivalds.drain``)."""
+    measurements still in flight are waited for first (``freivalds.drain``).
+
+    ``pinned=True`` (the unit pass's one read, FS39) reads a device that has a measure stream
+    differently: its rows are joined on that stream, copied non-blocking into one pinned
+    float64 host tensor, and one event is recorded; every device is enqueued before any event
+    is waited for. The values and their order are the plain read's."""
     freivalds.drain()
     by_device: dict[Hashable, list[int]] = {}
     for i, r in enumerate(rows):
         by_device.setdefault(_rows_device(r), []).append(i)
     out: list[np.ndarray | None] = [None] * len(rows)
+    # (indices, host tensor, event, joined device rows held until the event): a pinned read
+    sent: list[tuple[list[int], torch.Tensor, Any, torch.Tensor]] = []
     for idx in by_device.values():
+        dev = rows[idx[0]].device
+        if pinned and measure_kernel.measure_stream(dev) is not None:
+            with measure_kernel.stream_for(dev):
+                joined = rows[idx[0]] if len(idx) == 1 else torch.cat([rows[i] for i in idx])
+                host_t = torch.empty(joined.shape, dtype=torch.float64, pin_memory=True)
+                host_t.copy_(joined, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(dev))
+            sent.append((idx, host_t, event, joined))
+            continue
         joined = rows[idx[0]] if len(idx) == 1 else torch.cat([rows[i] for i in idx])
         host = joined.cpu().double().numpy()
+        base = 0
+        for i in idx:
+            out[i] = host[base:base + len(rows[i])]
+            base += len(rows[i])
+    for idx, host_t, event, _ in sent:
+        event.synchronize()
+        host = host_t.numpy()
         base = 0
         for i in idx:
             out[i] = host[base:base + len(rows[i])]
@@ -1335,7 +1403,7 @@ def _finish(batch: Sequence[_Rows], ctx: StepContext) -> list[tuple[ProductSpec,
     present = [r for r in batch if r.rows is not None]
     if not present:
         return []
-    with ctx.timed("5.measure"):
+    with ctx.timed("5.measure", host=_from_kernel(present)):
         read = iter(_read_rows([r.rows for r in present]))  # type: ignore[misc]
         out: list[tuple[ProductSpec, ProductMeasure]] = []
         for r in present:
@@ -1352,7 +1420,7 @@ def _finish_columns(batch: Sequence[_Rows], ctx: StepContext, once: _ReadOnce | 
     present = [r for r in batch if r.rows is not None]
     if not present:
         return [], None
-    with ctx.timed("5.measure"):
+    with ctx.timed("5.measure", host=_from_kernel(present)):
         read = ([once.host(r) for r in present] if once is not None
                 else _read_rows([r.rows for r in present]))  # type: ignore[misc]
         host = read[0] if len(read) == 1 else np.concatenate(read)

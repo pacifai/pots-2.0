@@ -57,8 +57,9 @@ class Prefetch:
     k: int
     offsets: dict[tuple[int, int], int]
     total: int
-    slot: int
+    slot: int  # the pool index, for tests and logs
     future: Future = field(repr=False)
+    holder: Any = field(default=None, repr=False)  # the slot, so any source can draw from it
 
     def covers(self, h: bytes, ms: Sequence[int], k: int, widths: Sequence[int]) -> bool:
         return (bytes(h) == self.h and k == self.k
@@ -118,7 +119,7 @@ class HostChallengeSource:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="challenges")
         key = bytes(h)
         future = self._executor.submit(self._fill, slot, waits, key, k, layout, total)
-        return Prefetch(key, k, offsets, total, slot_ix, future)
+        return Prefetch(key, k, offsets, total, slot_ix, future, slot)
 
     @staticmethod
     def _fill(slot: _Slot, waits: list[Any], h: bytes, k: int,
@@ -183,7 +184,7 @@ class HostChallengeSource:
     def _draw_prefetched(self, pf: Prefetch, ms: Sequence[int], widths: Sequence[int],
                          stream: Any, dev: torch.device) -> tuple[torch.Tensor, np.ndarray, Any]:
         pf.future.result()  # re-raises the worker's exception
-        slot = self._pool[pf.slot]
+        slot = pf.holder
         offsets = np.asarray([pf.offsets[(int(m), int(w))] for m, w in zip(ms, widths)],
                              dtype=np.int64)
         used = slot.buf[:pf.total]

@@ -40,7 +40,8 @@ class Kernel:
         self.events = []  # "measure", "drain", "read" in order
         self.views = []  # every served MeasureGroup
 
-    def measure(self, groups, *, h, k, guard=True, share=False, plan_out=None):
+    def measure(self, groups, *, h, k, guard=True, share=False, plan_out=None,
+                prefetched=None):
         self.events.append("measure")
         self.calls.append([(list(g.ms), g.bias is not None) for g in groups])
         rows = []
@@ -74,9 +75,9 @@ def kernel(monkeypatch):
     monkeypatch.setattr(freivalds, "drain", kern.drain)
     real_read = checks._read_rows
 
-    def read(rows):
+    def read(rows, **kw):
         kern.events.append("read")
-        return real_read(rows)
+        return real_read(rows, **kw)
 
     monkeypatch.setattr(checks, "_read_rows", read)
     return kern
