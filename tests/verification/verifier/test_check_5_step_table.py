@@ -69,7 +69,8 @@ class Spy:
                 self.fault()
             mine = plan_out if isinstance(plan_out, list) else []
             rows = fn(groups, h=h, k=k, guard=guard, share=share,
-                      plan_out=mine if share else None)
+                      plan_out=mine if share else None,
+                      **({} if prefetched is None else {"prefetched": prefetched}))
             self.calls.append(Call(share, ms, mine[-1] if share else None))
             return rows
         return measure

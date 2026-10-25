@@ -158,3 +158,18 @@ def test_two_gpus_smollm2_sharded_run_equals_unsharded():
     one, many = sr.smollm2_run(PROVER, None), sr.smollm2_run(PROVER, DEVICES)
     assert many[0].placement.sharded
     assert one[1:4] == many[1:4] and one[4] == many[4]
+
+
+@needs_two
+@pytest.mark.parametrize("which", [None, "product"])
+def test_two_gpus_overlap_stats_roots_and_verdicts_equal_the_one_gpu_run(which):
+    """FS39: with the measure streams on, the sharded run's check-5 stats, every step's root and
+    the verdicts equal the one-GPU run's, honest and with a flipped product."""
+    from verification.verifier.matmul_check import measure_kernel
+
+    edit = None if which is None else sr.forge(which)
+    with measure_kernel.overlap(True):
+        one, many = sr.run(None, edit, device=PROVER), _sharded(edit)
+    assert (one[1].rejection is None) == (which is None)
+    assert many[1].rejection == one[1].rejection
+    sr._same(one, many)
