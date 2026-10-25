@@ -36,7 +36,8 @@ clock and :data:`US` turns µs into s; nothing else converts.
   every section whose ``hash_in_bytes`` is at least half the step's ``transcript_bytes``
   (the commit and check 2).
 - Syncs are 2 per top-level section call on CUDA. The hook bound's events are the ``gpu_us``
-  spans (with the folded calls) plus one event pair per stamp; both are 0 off CUDA.
+  spans that hold events (with the folded calls), none for a stamp or a host-timed span
+  (``seam.host``, null ``gpu_us`` entries: no events); both are 0 off CUDA.
 - The launch floor needs positive evidence: it exists only for a section whose trace counts
   launches (then launches × ``launch_s`` + syncs × ``sync_s``). Without trace launches the
   syncs alone are no evidence of launch-bound work, so there is no launch floor, and a section
@@ -96,7 +97,7 @@ clock and :data:`US` turns µs into s; nothing else converts.
   ``device_peak_reserved_bytes`` the memory mark checks each device's peak against its own
   memory, and ``memory`` adds ``gpu_memory_bytes_by_device`` and each section's ``by_device``.
 - The hook bound counts a section's syncs and events per device, each at that device's
-  ``sync_s`` and ``event_pair_s``; the stamps cost the step's first device's.
+  ``sync_s`` and ``event_pair_s``; stamps and host-timed spans have no events and cost none.
 - The timeline has one strip per GPU for ``g_util``, ``g_pcie_tx`` and ``g_pcie_rx``
   (``strips["gpus"]``, labelled with the device and its role from ``gpu_roles``) when the
   samples hold several GPUs; ``c_busy`` stays one strip, the top-level ``g_*`` the run's device.
@@ -467,9 +468,9 @@ class _Devices:
 
 def _clock_s(sec: dict[str, Any], key: str, rest_key: str) -> float | None:
     spans = sec.get(key)
-    if spans is None:
-        return None
-    s = sum(b - a for a, b in spans) * US
+    if spans is None or spans and all(sp is None for sp in spans):
+        return None  # off CUDA, or host-timed: no device clock
+    s = sum(sp[1] - sp[0] for sp in spans if sp is not None) * US
     if sec.get("rest"):
         s += sec["rest"].get(rest_key) or 0.0
     return s
@@ -894,9 +895,11 @@ def _hook_bound(device: Any, steps: list[dict[str, Any]], probe: dict[str, Any],
     """§7: ``(syncs × sync_s + events × event_pair_s) ÷ step time``, the mean over the timed
     steps; 0 off CUDA, where there are no syncs or events to add. With ``dv`` (FS35) the
     syncs and events of a section that names its devices are counted per device and cost that
-    device's ``sync_s`` and ``event_pair_s`` (the probe's ``per_device``); the others, and the
-    stamps, cost the first device's. A device's events are its own ``gpu_us`` spans
-    (``gpu_us_by_device``), and a section's top-level syncs are 2 per call on each."""
+    device's ``sync_s`` and ``event_pair_s`` (the probe's ``per_device``); the others cost the
+    first device's. A device's events are its own ``gpu_us`` spans (``gpu_us_by_device``) that
+    are not null, and a section's top-level syncs are 2 per call on each. Stamps record no
+    events (plan §2.7), nor does a host-timed span (null entry; a section whose kept spans are
+    all null counts none of its folded calls either)."""
     if not str(device).startswith("cuda"):
         return 0.0
 
@@ -919,11 +922,10 @@ def _hook_bound(device: Any, steps: list[dict[str, Any]], probe: dict[str, Any],
                 by_dev = sec.get("gpu_us_by_device")
                 spans = by_dev[i] if devs and by_dev and i < len(by_dev) else sec.get("gpu_us")
                 if spans is not None:
-                    events[d] = events.get(d, 0) + len(spans) \
-                        + ((sec.get("rest") or {}).get("calls") or 0)
-        stamp_dev = next((_norm_dev(d) for d in s.get("devices") or []
-                          if dv and _dev_index(d) is not None), None)
-        events[stamp_dev] = events.get(stamp_dev, 0) + len((s.get("stamps") or {}).get("name", []))
+                    timed = sum(g is not None for g in spans)
+                    if timed or not spans:
+                        events[d] = events.get(d, 0) + timed \
+                            + ((sec.get("rest") or {}).get("calls") or 0)
         step_s = (s["t1_ns"] - s["t0_ns"]) * 1e-9
         over = 0.0
         for d in {*syncs, *events}:
