@@ -2206,9 +2206,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     loops, adds the `step_interval` total (FS42): the step's close (`t1_ns` of its markers line)
     minus the step before's (step 1: minus its own `t0_ns`). EQ14 reads `step_interval` as the wall
     time per step (amended 2026-10-25), beside accumulated GPU time per role, as F22 says.
-    `gpu_held_s` is only an upper bound on held GPU time (a section's time times every device its process lists); the measure is computed by the
-    four-H100 session's summary from the per-side `total` rows and `gpu_roles`
-    (`fs11_session._accumulated_gpu_s`).
+    `gpu_held_s` is only an upper bound on held GPU time (a section's time times every device its
+    process lists); the measure is computed by the four-H100 session's summary from the per-side
+    `total` rows and `gpu_roles` (`fs11_session._accumulated_gpu_s`).
   - **Prover rows (EQ1b).**
     - P0, original training: `P0.load`, `P0.forward`, `P0.backward`, `P0.update`, emitted only
       by `plain_step` (the plain baseline, B7).

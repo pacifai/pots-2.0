@@ -2470,8 +2470,8 @@ def four_h100(parts: Sequence[Mapping[str, Any]],
     (:func:`_four_missing_numbers`: per model and arm a steady step time and a peak per GPU,
     once 12 peer rates). ``items`` lists each acceptance item as ``(ok, text)``, in the order
     the log prints them. Outside ``pass``: per model and arm each step's prover, verifier,
-    hand-off and total time (``step_times``), ``step_wall_s``, ``step_interval_s`` and ``gpu_held_upper_s`` (an
-    upper bound) per step, ``accumulated_gpu_s`` per step and its steady mean
+    hand-off and total time (``step_times``), ``step_wall_s``, ``step_interval_s`` and
+    ``gpu_held_upper_s`` (an upper bound) per step, ``accumulated_gpu_s`` per step and its steady mean
     (``accumulated_steady_s``, steps 2 and 3; :func:`_accumulated_gpu_s`), ``steady_s`` (steps 2
     and 3, :func:`_steady_s`: the step interval; ``latency_steady_s``, the pipelined arm's
     ``step_wall`` mean), the memory pass's peak per device (``device_peaks``) and the whole
