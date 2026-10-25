@@ -21,6 +21,9 @@ hardware they kept busy, the timeline, check 5's phases and the comparisons (§1
   stay out of ``share_total``; nested sections stay in the file.
 - The step-flow diagram is one box per depth-0 section in run order, in three bands (prover,
   hand-off, verifier), with the sampler's GPU busy fraction and the run's CPU cores.
+- The step time is the interval between verified steps when the profile has one (FS42c); a
+  pipelined run's overview also says each step's latency and each side's work. The flow's GPU
+  gauge is the headline ``util`` (by the section's role GPUs), and its tooltip names them.
 - Legends carry plain names only; the overview's table, the flow's boxes and check 5's rows keep
   the code beside the name, so a reader can find the section in ``profile.json``.
 - Prover beside plain is a per-run panel after check 5, so the run picker shows the chosen
@@ -489,9 +492,20 @@ def _overview(run: Run) -> str:
     dtype = run.profile.get("compute_dtype") or run.meta.get("compute_dtype")
     said = ", ".join(f"the {p.lower()} {fmt(sums[p])} s" for p in ("Prover", "Hand-off",
                                                                      "Verifier") if p in sums)
-    intro = (f"<p>One verified training step took <b>{fmt(v.get('step_s'))} s</b> on average over "
-             f"{fmt(v.get('n_steps'))} timed steps ({esc(v.get('device') or run.field('device'))}"
-             f"{', ' + esc(dtype) if dtype else ''}). Of that, {esc(said)}.</p>")
+    where = (f"{esc(v.get('device') or run.field('device'))}"
+             f"{', ' + esc(dtype) if dtype else ''}")
+    interval = v.get("step_source") == "step_interval"
+    if interval and v.get("pipelined"):
+        intro = (f"<p>Verified steps closed every <b>{fmt(v.get('step_s'))} s</b> on average over "
+                 f"{fmt(v.get('n_steps'))} timed steps ({where}): the prover trains the next "
+                 "step while the verifier checks this one. Each step's latency, from the "
+                 f"prover's first section to the verifier's last, was {fmt(v.get('latency_s'))} "
+                 f"s. Per step the prover worked {fmt(sums.get('Prover'))} s and the verifier "
+                 f"{fmt(sums.get('Verifier'))} s.</p>")
+    else:
+        intro = (f"<p>One verified training step took <b>{fmt(v.get('step_s'))} s</b> on average "
+                 f"{'(interval between verified steps) ' if interval else ''}over "
+                 f"{fmt(v.get('n_steps'))} timed steps ({where}). Of that, {esc(said)}.</p>")
 
     w, total = 1000.0, sum(run.mean(n) or 0.0 for n in top) or 1.0
     segs, x = [], 0.0
@@ -530,10 +544,16 @@ def _overview(run: Run) -> str:
     head = ('<tr><th class="l">Section</th><th class="l">What it does</th>'
             '<th>Mean time (s)</th><th class="l">Share of step time</th>'
             '<th class="l">Marks</th></tr>')
-    note = ('<p class="mute small">Share of step time: the section\'s mean time over the mean '
-            "time of one whole verified step (prover, hand-off and verifier). The training rows "
-            "are the prover's own training with the matmul capture on; plain training, without "
-            "the protocol, is compared in Prover beside plain.</p>")
+    if v.get("step_source") == "step_interval":
+        against = ("the mean interval between verified steps"
+                   + ("; the prover and the verifier run at the same time, so each side's "
+                      "shares sum to at most about 100%, not the two together"
+                      if v.get("pipelined") else ""))
+    else:
+        against = "the mean time of one whole verified step (prover, hand-off and verifier)"
+    note = (f'<p class="mute small">Share of step time: the section\'s mean time over {against}. '
+            "The training rows are the prover's own training with the matmul capture on; plain "
+            "training, without the protocol, is compared in Prover beside plain.</p>")
     return (intro + bar + f'<div class="scroll"><table>{head}{"".join(rows)}</table></div>' + note
             + _marks_legend(_distinct(marks), run.profile.get("thresholds")))
 
@@ -581,9 +601,11 @@ def _flow(run: Run) -> str:
             few = bool(u.get("few_samples"))
             ms = s.get("marks") or []
             g, c = u.get("g_util"), u.get("c_tree")
+            devs = [str(d) for d in s.get("util_devices") or []]
             tip = (f"{_name(n)} ({n})\n{_sec(n)[3]}\nmean {fmt(run.mean(n))} s · "
                    f"{pct(s.get('share'))} of step"
-                   + ("" if cpu else f"\nGPU busy {pct(None if few else g)}")
+                   + ("" if cpu else f"\nGPU busy {pct(None if few else g)}"
+                      + (f" (mean of {', '.join(devs)})" if len(devs) > 1 else ""))
                    + f"\nCPU {fmt(None if few else c)} cores\nmarks {_marks(ms)}")
             stroke = 'stroke="var(--mark)" stroke-width="2"' if ms else \
                 'stroke="var(--line)" stroke-width="1"'
@@ -852,13 +874,23 @@ def _plain(run: Run) -> str:
              fmt(c.get("ratio"))] for n, c in (cmp.get("sections") or {}).items()]
     st = cmp.get("step") or {}
     pr, pl = st.get("prover_s"), st.get("plain_s")
-    rows.append(["Whole step: verified (prover, hand-off, verifier) against plain", fmt(pr),
-                 fmt(pl), fmt(pr / pl if pr and pl else None)])
+    iv, ps, vs = st.get("interval_s"), st.get("prover_side_s"), st.get("verifier_side_s")
+    if iv is not None:
+        rows.append(["Whole step: interval between verified steps against plain", fmt(iv),
+                     fmt(pl), fmt(iv / pl if pl else None)])
+        rows.append(["Prover's work per step against plain", fmt(ps), fmt(pl),
+                     fmt(ps / pl if ps is not None and pl else None)])
+        rows.append(["Verifier's work per step against plain", fmt(vs), fmt(pl),
+                     fmt(vs / pl if vs is not None and pl else None)])
+    else:
+        rows.append(["Whole step: verified (prover, hand-off, verifier) against plain", fmt(pr),
+                     fmt(pl), fmt(pr / pl if pr and pl else None)])
     return (_table(["Training part", "Prover, with matmul capture (s)", "Plain training (s)",
                     "Prover ÷ plain"], rows)
             + '<p class="mute small">Plain training runs the same steps on the same model '
-              "without the protocol. The whole-step row puts the verified step, prover and "
-              "verifier together, beside one plain step.</p>")
+              "without the protocol. The whole-step row puts the verified step beside one plain "
+              "step: with an interval, the time between verified steps; else the prover and "
+              "the verifier together.</p>")
 
 
 # ---- the page ----------------------------------------------------------------------------

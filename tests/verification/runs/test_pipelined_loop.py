@@ -520,3 +520,22 @@ def test_a_memory_recorder_gets_both_sides_sections(mlp):
     comps = {(r["step"], r["component"]) for r in rec.rows if r["record"] == "memory"}
     assert (2, "P3.commit") in comps and (2, "6a") in comps and (0, "P4.tree") in comps
     assert len(comps) == len([r for r in rec.rows if r["record"] == "memory"])
+
+
+def test_merged_steps_carry_step_interval_beside_step_wall(mlp, tmp_path):
+    """FS42: on the CPU pipelined loop every step has a ``step_interval`` row equal to the
+    markers' ``t1_ns`` differences (step 1: from its ``t0_ns``); ``step_wall`` is still written."""
+    w = MetricsWriter(tmp_path / "t", "r")
+    rec = w.recorder("s")
+    r = go(mlp, pipelined=True, recorder=rec)
+    w.close()
+    assert r.loop.verdict.accepted
+    by = {x["step"]: x for x in _markers(tmp_path / "t") if x.get("kind") == "step"}
+    rows = [x for x in rec.rows if x["record"] == "time" and x.get("level") == "total"]
+    iv = {x["step"]: x for x in rows if x["component"] == "step_interval"}
+    wall = {x["step"]: x for x in rows if x["component"] == "step_wall"}
+    assert sorted(iv) == sorted(wall) == list(range(1, mlp.T + 1))
+    for t in range(1, mlp.T + 1):
+        start = by[t]["t0_ns"] if t == 1 else by[t - 1]["t1_ns"]
+        assert iv[t]["time_s"] == pytest.approx((by[t]["t1_ns"] - start) / 1e9, abs=1e-9)
+        assert iv[t]["side"] == "run" and wall[t]["time_s"] > 0

@@ -126,6 +126,9 @@ def test_three_devices_time_rows_are_as_before_plus_fields(run, baseline, tmp_pa
         else:
             assert g[6] == b[6]
     for r in time_rows:
+        if r["component"] == "step_interval":  # FS42: each device once, as ``step_wall`` lists them
+            assert r["devices"] == ["cpu"] and r["gpu_held_s"] == pytest.approx(r["time_s"])
+            continue
         assert r["devices"] == ["cpu", "cpu", "cpu"]  # the Mac's cpus are one device, the process
         assert r["gpu_held_s"] == pytest.approx(3 * r["time_s"])
     # the markers line names the devices and each section the ones it ran on

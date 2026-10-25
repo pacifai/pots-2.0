@@ -123,8 +123,11 @@ BLAKE3 sources and library (`commitment/native.py`), default `~/.cache/pots-2.0/
 some, `--gpu N` one). The header lists them in `gpus` (`index`, `name`, `uuid`, `pci_bus_id`),
 and each `g_*` field of a row is a list with one value per header GPU, `null` where a read
 failed; process and machine fields stay scalars. The profile analysis (`evaluation/results/
-profile/analyze.py`) reads versions 1 and 2, takes each section's utilization from the GPU of
-its device (matched by UUID) and its floors from that device's `probe.json` rates.
+profile/analyze.py`) reads versions 1 and 2 and matches each device to its GPU by UUID. It takes
+a section's headline utilization from the GPUs of the section's role (`gpu_roles`: the mean over
+the section's listed prover or verifier devices; `util_by_device` keeps each GPU), its floors
+from each device's `probe.json` rates, and its step time as the interval between verified steps
+when the run has one (the `step_interval` time row).
 
 Data artifacts (`D`, `DÌƒ`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch
@@ -2243,11 +2246,13 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     step, a second part for a step, a merge after `finish` and a name in both raise `ValueError` and
     change nothing. The counting pass and `trace_step` refuse (one process). `step` stays work (the
     sum); a merged step adds the `step_wall` total, its wall extent (its `gpu_held_s` is wall times
-    devices, idle gap included: not work). EQ14's numbers read wall time (`step_wall`) beside
-    accumulated GPU time per role, as F22 says. `gpu_held_s` is only an upper bound on held GPU
-    time (a section's time times every device its process lists); the measure is computed by the
-    four-H100 session's summary from the per-side `total` rows and `gpu_roles`
-    (`fs11_session._accumulated_gpu_s`).
+    devices, idle gap included: not work; it is the latency). Every step from 1, in both
+    loops, adds the `step_interval` total (FS42): the step's close (`t1_ns` of its markers line)
+    minus the step before's (step 1: minus its own `t0_ns`). EQ14 reads `step_interval` as the wall
+    time per step (amended 2026-10-25), beside accumulated GPU time per role, as F22 says.
+    `gpu_held_s` is only an upper bound on held GPU time (a section's time times every device its
+    process lists); the measure is computed by the four-H100 session's summary from the per-side
+    `total` rows and `gpu_roles` (`fs11_session._accumulated_gpu_s`).
   - **Prover rows (EQ1b).**
     - P0, original training: `P0.load`, `P0.forward`, `P0.backward`, `P0.update`, emitted only
       by `plain_step` (the plain baseline, B7).
@@ -3318,7 +3323,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     (`llama_step --steps 3 --metrics --no-count`, each in its own run directory; only `pipe_*`
     sets `VERIF_PIPELINED`). `four_h100(parts)` goes to `summary.json["four_h100"]` and
     `_four_lines` ends the job log (`FS35 ok:` or `FS35 FAIL:` per acceptance item; per model
-    and arm the wall time, a steady step (mean of steps 2-3), beside the accumulated GPU time
+    and arm the wall time, a steady step (the mean of steps 2-3 of the interval between verified
+    steps, `step_interval`; a pipelined arm also prints its latency, the `step_wall` mean, beside
+    it), beside the accumulated GPU time
     (steady, mean of steps 2-3) and four GPU peaks; the peer-rate range).
     `pass` fails closed: every part in `four_h100_parts()` ended `ok` or `skipped_done`, the
     peer copies right, the tests' junit with tests and no failure, error or skipped case (the
