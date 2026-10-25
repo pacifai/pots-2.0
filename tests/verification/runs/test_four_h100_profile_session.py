@@ -614,8 +614,6 @@ def test_the_readme_commands_use_only_flags_the_tools_have_and_all_they_require(
         flags = set(_flags(c[3:]))
         have = {f for f in set(help_text.replace("[", " ").replace("]", " ").split())
                 if f.startswith("--")}
-        if tool == "analyze":  # FS42 fix part 2 adds --steady-steps to the tool; this branch
-            have |= {"--steady-steps"}  # (part 3) may not list it yet, so it is allowed by hand
         assert flags <= have, (tool, flags)
         assert required[tool] <= flags, (tool, required[tool] - flags)
         assert len(flags) == len(_flags(c[3:])), "a flag twice"
