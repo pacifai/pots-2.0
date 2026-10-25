@@ -270,7 +270,7 @@ def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, kernel_calls
     """Run the loop with ``torch.cuda`` stubbed and the model's device taken for CUDA when
     ``cuda``, logging sections, cache releases and verifier calls in order; also whether each
     step's ``StepOutput`` was gone at its release. ``env`` sets ``VERIF_RELEASE_CACHE`` (unset
-    by default). ``kernel_calls``, when a list, collects ``(device, len(log))`` for every call of
+    by default). ``kernel_calls``, when a list, collects ``(device, len(log), k)`` for every call of
     ``measure_kernel.kernels``, so a test can place the call among the logged sections."""
     log, refs, gone = [], {}, []
     monkeypatch.delenv("VERIF_RELEASE_CACHE", raising=False)
@@ -296,7 +296,7 @@ def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, kernel_calls
 
     def kernels(device, k=None):  # FS37's kernel, faked
         if kernel_calls is not None:
-            kernel_calls.append((torch.device(device), len(log)))
+            kernel_calls.append((torch.device(device), len(log), k))
 
     monkeypatch.setattr(loop_mod.measure_kernel, "kernels", kernels)
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: not cuda)  # not what decides
@@ -356,7 +356,8 @@ def test_the_measuring_kernel_is_built_once_before_every_section_on_cuda(c, D, w
     res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, kernel_calls=calls)
     assert res.verdict.accepted
     first = next(i for i, x in enumerate(log) if not x.startswith("warm"))  # the first section
-    assert [d for d, _ in calls] == [torch.device("cpu")], calls  # the model's device, once
+    assert [d for d, _, _ in calls] == [torch.device("cpu")], calls  # the model's device, once
+    assert [k for _, _, k in calls] == [K], calls  # the run's k, one image per chunk size
     assert calls[0][1] <= first < len(log), (calls, first, log)  # before it; sections follow
 
 

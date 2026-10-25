@@ -64,7 +64,12 @@ from setup.machine import machine_facts
 from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import DeclaredComputation
 from verification.parameters import load_protocol_config
-from verification.runs.k_tunability import base_context, check5_pass, full_step
+from verification.runs.k_tunability import (
+    base_context,
+    check5_pass,
+    full_step,
+    prebuild_measure_kernels,
+)
 from verification.runs.llama_step import load_committed_dataset
 from verification.runs.metrics import normalize_devices
 from verification.runs.run_verified import (
@@ -313,6 +318,7 @@ def profile_step(c: DeclaredComputation, store: TranscriptStore, step: int,
     out(f"full step: accepted in {time.perf_counter() - t0:.2f} s; per slot "
         + ", ".join(f"{s} {v:.3f}" for s, v in slots.items()))
 
+    prebuild_measure_kernels(c, device, [k])  # outside every timed pass
     times: list[float] = []
     per_section: dict[str, list[float]] = {s: [] for s in SECTIONS}
     accepted, st = True, StepStats()

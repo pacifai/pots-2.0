@@ -711,9 +711,9 @@ interface.
     `W_0` there with the kernel, in the `run:0` section) and so before step 1, outside every
     section, and `kernel_check.new_run()` first of all (FS34), before the pipelined dispatch. The
     pipelined child calls `new_run()` at its start and loads its hash kernels; the pipelined
-    parent loads the hash kernel and check 5's measuring kernel (`measure_kernel.kernels(d)`,
-    FS37) on the CUDA devices of `c.placement.devices` before `start_run`, outside every
-    section. The child never measures, so it builds no measuring kernel. A CUDA run that
+    parent loads the hash kernel and check 5's measuring kernel (`measure_kernel.kernels(d, k)`,
+    FS37, with the run's `k`) on the CUDA devices of `c.placement.devices` before `start_run`,
+    outside every section. The child never measures, so it builds no measuring kernel. A CUDA run that
     doesn't go through `run_loop` (`card_identity`) is left as it was: call
     `GpuBlake3().kernels(device)` first there to keep the build out of a timed step. A build or
     load failure raises; nothing falls back to the CPU.
@@ -2026,10 +2026,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
     `final` is the agreed final weights for check 8.
   - Before `verifier.start_run` (so before step 1), `run_loop` builds
-    `measure_kernel.kernels(d)` beside `GpuBlake3().kernels(d)` on every CUDA device of the run
-    (FS37), so the first NVRTC build or cache load lands outside
-    every timed section, check 0's hash of `W_0` included. The pipelined loop's pre-build is
-    FS34's, at the same place.
+    `measure_kernel.kernels(d, k)` beside `GpuBlake3().kernels(d)` on every CUDA device of the run
+    (FS37; `k` is `verifier.k`, one image per chunk size), so the first NVRTC build or cache load
+    lands outside every timed section, check 0's hash of `W_0` included. The pipelined loop's
+    pre-build is FS34's, at the same place.
   - `release_device_cache(device, section=None, *, devices=None)`: only when the run's
     `device` or any of `devices` (the sharded run's verifier devices, `c.placement.devices`;
     FS32d) is CUDA (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in

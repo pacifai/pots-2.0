@@ -51,6 +51,15 @@ def test_cuda_counts_places_runtime_calls_in_the_innermost_section():
     assert r["total"] == {"kernels": 1, "kernel_us": 10}
 
 
+def test_profile_prebuilds_the_configured_k_before_its_timed_passes(env, stored, monkeypatch):  # noqa: F811
+    seen = []
+    monkeypatch.setattr(cp, "prebuild_measure_kernels", lambda c, d, ks: seen.append((d, list(ks))))
+    ks = rv.load_kept_step(env.c, stored, step=fs.SWEEP_STEP)
+    cp.profile(env.c, ks, env.bands, seed=SEED, h_D=env.h_D, n_records=len(env.D), k=K,
+               repeats=1, out=QUIET)
+    assert seen == [("cpu", [K])]
+
+
 def test_profile_of_the_stored_step(env, stored):  # noqa: F811
     """Accepted, equal to the archive, every product's ops counted and some host reads seen;
     two timed passes and no CUDA section on CPU."""

@@ -1,7 +1,8 @@
 """FS38b's check 5 on the Mac: the unit path measures each schedule step as one shared-read
 table (``measure_groups_rows(share=True)``), through the ``mac`` engine of ``test_kernel_step``
-(``pots_host_measure_levels``); the canonical path (``unit_schedule`` patched to ``None``)
-measures each group alone (``share=False``, ``pots_host_measure_phased``).
+(``pots_host_measure_sweep`` over ``mk.read_plan``); the canonical path (``unit_schedule``
+patched to ``None``) measures each group alone (``share=False``, the same function over
+``mk.plain_plan``).
 
 Compared: every row bit for bit, every check-5 number, the rejection and the record status.
 Also the calls (one ``share=True`` call per step and device on the unit path, none on the

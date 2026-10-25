@@ -73,6 +73,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 from setup import backdoorllm
 from setup.config import RunConfig, load_config, setup_determinism
@@ -86,6 +87,7 @@ from verification.runs.metrics import (
     MetricsWriter,
     counting,
     memory_probe,
+    normalize_devices,
     read_records,
     step_scores,
 )
@@ -102,6 +104,7 @@ from verification.verifier.bands import Bands
 from verification.verifier.calibration import band_context, load_bands
 from verification.verifier.checks import CHECKS, DEFAULT_ORDER
 from verification.verifier.context import Rejection, StepContext, StepState, StepStats
+from verification.verifier.matmul_check import measure_kernel
 from verification.verifier.matmul_check.challenges import encode_label
 from verification.verifier.matmul_check.sizing import (
     C_ANTI,
@@ -401,6 +404,19 @@ class KResult:
         return bool(self.summary["passed"])
 
 
+def prebuild_measure_kernels(c: DeclaredComputation, device: str | torch.device,
+                             ks: Sequence[int]) -> None:
+    """Build check 5's measuring kernel for every ``k`` of ``ks`` on every CUDA device the step
+    measures on (``device``, the run's, and the verifier devices of ``c.placement``), so no NVRTC
+    build lands in a timed pass: each chunk size ``min(k, 16)`` is its own image (FS37b). Nothing
+    on a CPU."""
+    placement = getattr(c, "placement", None)
+    for d in normalize_devices((device, *(getattr(placement, "devices", None) or ()))):
+        if d.type == "cuda":
+            for k in ks:
+                measure_kernel.kernels(d, k)
+
+
 def run_k(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, h_D: bytes,
           n_records: int, k_conf: int, T: int, top: int | None = None,
           repeats: int = DEFAULT_REPEATS, device: str = "cpu",
@@ -437,6 +453,7 @@ def run_k(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, h_
     keys: dict[int, tuple[Any, ...]] = {}
     repeatable: dict[int, bool] = dict.fromkeys(ks, True)
     slots: list[dict[str, float]] = []
+    prebuild_measure_kernels(c, device, ks)  # outside every timed pass
     for r in range(repeats):
         rej, slot_s, ready = full_step(store, c, base, bands)
         if rej is not None:

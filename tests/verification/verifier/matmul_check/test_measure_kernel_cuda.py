@@ -182,11 +182,12 @@ def test_run_loop_builds_the_measuring_kernel_before_step_1_opens_a_section(monk
     from verification.verifier.driver import Verifier
 
     c, D, tree, w0 = _setup("cuda", SWITCHES[0], "fp32")
-    log = []
+    log, ks = [], []
     real = mk.kernels
 
     def spy(device, k=None):
         log.append(f"kernels {torch.device(device)}")
+        ks.append(k)
         return real(device, k)
 
     monkeypatch.setattr(loop_mod.measure_kernel, "kernels", spy)
@@ -202,4 +203,5 @@ def test_run_loop_builds_the_measuring_kernel_before_step_1_opens_a_section(monk
     first_section = next(i for i, x in enumerate(log) if not x.startswith("kernels"))
     before = log[:first_section]
     assert before == [f"kernels {torch.device('cuda', 0)}"], log
+    assert ks == [v.k], ks  # the run's k: the build's chunk size is min(k, 16), one image per value
     assert len(log) > first_section  # the sections follow

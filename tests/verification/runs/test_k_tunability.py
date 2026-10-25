@@ -1,8 +1,10 @@
 """FS12's ``k`` run on the MLP's stored step 4, and the sizing arithmetic at both scales."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tests.verification.runs.test_cheats import K, QUIET, SEED, env, kept, stored  # noqa: F401
 from verification.runs import flipped_matmul_sweep as fs
@@ -36,6 +38,28 @@ def test_linear_fit_recovers_a_line():
     fit = kt.linear_fit([1, 2, 3, 4], [1.5, 2.0, 2.5, 3.0])
     assert math.isclose(fit["slope"], 0.5) and math.isclose(fit["intercept"], 1.0)
     assert math.isclose(fit["r2"], 1.0) and fit["max_rel_resid"] < 1e-12
+
+
+def test_prebuild_builds_every_k_on_every_cuda_device_and_nothing_on_cpu(monkeypatch):
+    """FS37b: each swept ``k`` is built on the run's CUDA device and the verifier devices of the
+    placement (no repeats), and a CPU run builds nothing."""
+    built = []
+    monkeypatch.setattr(kt.measure_kernel, "kernels", lambda d, k=None: built.append((str(d), k)))
+    plc = SimpleNamespace(devices=(torch.device("cuda", 1), torch.device("cuda", 0)))
+    kt.prebuild_measure_kernels(SimpleNamespace(placement=plc), "cuda:0", [1, 2])
+    assert built == [("cuda:0", 1), ("cuda:0", 2), ("cuda:1", 1), ("cuda:1", 2)]
+    built.clear()
+    kt.prebuild_measure_kernels(SimpleNamespace(), "cpu", [1, 2, 3])
+    assert built == []
+
+
+def test_run_k_prebuilds_every_swept_k_before_the_timed_rounds(env, stored, monkeypatch):  # noqa: F811
+    seen = []
+    monkeypatch.setattr(kt, "prebuild_measure_kernels", lambda c, d, ks: seen.append((d, list(ks))))
+    ks = rv.load_kept_step(env.c, stored, step=fs.SWEEP_STEP)
+    kt.run_k(env.c, ks, env.bands, seed=SEED, h_D=env.h_D, n_records=len(env.D), k_conf=K,
+             T=10, top=K + 1, repeats=1, out=QUIET)
+    assert seen == [("cpu", list(range(1, K + 2)))]
 
 
 def test_run_k_on_the_stored_step(env, stored, tmp_path):  # noqa: F811

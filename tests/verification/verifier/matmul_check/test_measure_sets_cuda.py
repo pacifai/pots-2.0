@@ -1,8 +1,9 @@
-"""FS37b round 2's sets on a GPU: the real kernel (``freivalds.measure_groups_rows`` then
+"""FS37b's shared-read sets on a GPU: the real kernel (``freivalds.measure_groups_rows`` then
 ``freivalds.drain``) against the host build's rows, bit for bit (NaN equal to NaN), with
-``share=True`` and ``share=False``, over read groups of 2, 3, 4, 5, 9 and 17 entries (the entries run one after another over a block's rows), phase-0 and phase-1 entries mixed over
-one view, ``k`` around ``K_CHUNK``, row counts off ``RB``, many-row views (many blocks per
-group), special values, a biased product beside a group, and several geometries. Skipped without
+``share=True`` and ``share=False``, over read groups of 2, 3, 4, 5, 9 and 17 entries (the
+entries run one after another over a block's rows), phase-0 and phase-1 entries mixed over one
+view, ``k`` around ``K_CHUNK``, row counts off ``RB``, many-row views (many blocks per group),
+special values, a biased product beside a group, and several geometries. Skipped without
 CUDA; the tables are ``sets_tables.shared_view``'s, each checked against ``mk.read_plan``."""
 
 import contextlib
@@ -67,7 +68,7 @@ def test_a_group_of_e_entries(host_measure, e, mode, dtype):
 @pytest.mark.parametrize("layout", ["row", "t"])
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_layouts_guard_and_many_rows(host_measure, dtype, layout, guard):
-    """Many blocks per group: 700 rows, the grid stride and the binary search over groups."""
+    """Many blocks per group: 700 rows, the grid stride and the per-block table (group and row block of each block)."""
     for e in (3, 5, 9):
         mis, _ = shared_view(e, "mix", n=700 + e, q=70, dtype=dtype, guard=guard, layout=layout,
                              seed=e)
@@ -131,9 +132,10 @@ def test_every_geometry_with_groups(host_measure, geometry):
         assert mk.set_geometry() == before
 
 
-def test_the_attributes_show_no_spill_and_the_registers_fit_two_blocks():
-    """Round 2's ``__launch_bounds__(256, 2)``: at most 128 registers per thread, and no local
-    (spilled) bytes. The key names are the coder's; they are found by substring."""
+def test_the_attributes_report_local_bytes_and_the_registers_fit_two_blocks():
+    """``__launch_bounds__(256, 2)``: at most 128 registers per thread, and ``local_bytes`` is
+    reported (an int, zero or not: a spill no longer fails a build, the measured time decides).
+    The key names are found by substring."""
     kernels = mk.kernels(torch.device("cuda"))
     if not hasattr(kernels, "attributes"):
         pytest.skip("no attributes() on this build")
@@ -142,4 +144,5 @@ def test_the_attributes_show_no_spill_and_the_registers_fit_two_blocks():
     local = [v for key, v in a.items() if "local" in key.lower() or "spill" in key.lower()]
     assert reg and local, a
     assert reg[0] <= 128, a
+    assert isinstance(a.get("local_bytes"), int) and a["local_bytes"] >= 0, a
     print("attributes:", a)

@@ -3,9 +3,10 @@
 The simulator compiles the CUDA source itself, with the CUDA keywords stubbed, one OS thread per
 CUDA thread and barriers for ``__syncthreads`` and ``__syncwarp``, and runs it one block at a
 time. So the CUDA file's own control flow (tile loads for every dtype and layout, the vector
-tiles, the row mapping of a block, the chunks, the bias item, phase-2 groups, the binary search
-on the row-block starts and the grid stride) is held to the host build bit for bit on the Mac,
-through the Python side's own plan, ``block_starts`` and ``level_launches``. What it cannot
+tiles, the row mapping of a block, the chunks, the bias item, phase-2 groups, the per-block
+table (``block_table``, ``pots_mblk_t {group, rbk}``, read with no search) and the grid stride)
+is held to the host build bit for bit on the Mac, through the Python side's own plan,
+``block_starts`` and ``level_launches``. What it cannot
 check: NVRTC's compile, the real shuffle and barrier hardware, shared-memory bank conflicts and
 speed. It takes about 12 minutes (a thread per CUDA thread), so it is marked slow. A divergent barrier or shuffle hangs the simulator; a watchdog turns that into a failure."""
 
