@@ -49,6 +49,16 @@ clock and :data:`US` turns µs into s; nothing else converts.
   same fields as a steady one). ``warmup_excluded`` is false, and ``warmup`` null, when only
   one untraced step exists (it is then the steady state). The plain comparison drops each run's
   own warm-up the same way and shows both warm-up times beside the steady ones.
+- Steady steps (FS42): ``--steady-steps A-B`` (or ``2,3``) names the steady set; each must be
+  an untraced step ≥ 1 with rows (else a warning and it is left out), the warm-up is the lowest
+  untraced step below the set, and every steady mean uses the set, the plain comparison too
+  (a plain run lacking one keeps its own rule, with a warning). The view's ``steady_steps``
+  lists the steps used. Not given, the rule above applies, with warnings when a pipelined
+  run's set includes its last step (verified with the prover idle) or a steady step follows a
+  traced one (its interval holds the trace's export).
+- A section's hashed leaves are its ``count`` row's ``hash_leaves`` when the row has one (the
+  CUDA commit hashes only the records, the weights and the dK leaves), else every leaf when it
+  hashes at least half the transcript's bytes, else none.
 - ``meta`` also holds ``n_s`` (the batch's sequences), ``M`` (products), ``n_leaves`` and
   ``us_per_leaf`` (``label`` for ``P1.label`` and ``commit`` for ``P3.commit``: steady mean
   seconds ÷ ``n_leaves`` × 10⁶). ``n_s`` and ``M`` come from the environment record, ``M``
@@ -681,6 +691,42 @@ def _warm_step(steps: Sequence[int]) -> int | None:
     return ordered[0] if len(ordered) >= 2 else None
 
 
+def parse_steps(text: str) -> list[int]:
+    """``--steady-steps``: a range ``A-B`` or a comma list of steps and ranges (``2-3,5``)."""
+    out: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, sep, b = part.partition("-")
+        lo, hi = int(a), int(b) if sep else int(a)
+        if hi < lo:
+            raise ValueError(f"steady steps: {part!r} runs backwards")
+        out += range(lo, hi + 1)
+    return sorted(set(out))
+
+
+def _pick_steady(known: Sequence[int], requested: Sequence[int] | None, warns: set[str],
+                 traced: Sequence[int] = ()) -> tuple[int | None, set[int] | None]:
+    """The warm-up step and the steady set. ``known`` are the untraced steps ≥ 1 with rows.
+    With ``requested`` steps: those present and untraced are the steady set (``None`` returned
+    for it when none is, with a warning, so the default rule applies); the others are warned
+    about and left out; the warm-up is the lowest known step below the set, when there is one.
+    Without: the warm-up is the lowest known step (when at least two) and the set is ``None``
+    (every known step but the warm-up)."""
+    if requested:
+        have = set(known)
+        good = sorted(t for t in set(requested) if t in have)
+        for t in sorted(set(requested) - have):
+            warns.add(f"steady step {t} is " + ("traced" if t in set(traced) else
+                      "missing from the markers and time rows") + ": left out")
+        if good:
+            below = [t for t in sorted(have) if t < good[0]]
+            return (below[0] if below else None), set(good)
+        warns.add("no requested steady step is usable: the default steady rule is used")
+    return _warm_step(known), None
+
+
 def _only(times: dict[str, dict[int, float]], keep) -> dict[str, dict[int, float]]:
     """``times`` restricted to the steps ``keep(step)`` accepts; a component left with none
     is dropped."""
@@ -1029,6 +1075,15 @@ def _hashes_transcript(count: dict[str, Any] | None, transcript_bytes: int) -> b
         and (count.get("hash_in_bytes") or 0) >= transcript_bytes / 2
 
 
+def _section_leaves(count: dict[str, Any] | None, leaves: int, transcript_bytes: int) -> int:
+    """The leaves a section hashes: its ``count`` row's ``hash_leaves`` when it has one (the
+    CUDA commit hashes only the records, the weights and the dK leaves; the rest arrive
+    hashed), else every leaf for a section that hashes the transcript, else none."""
+    if count and count.get("hash_leaves") is not None:
+        return int(count["hash_leaves"])
+    return leaves if _hashes_transcript(count, transcript_bytes) else 0
+
+
 def _hash_part(name: str) -> bool:
     return any(name.startswith(f"{o}.hash.") for o in HASH_OWNERS.values())
 
@@ -1081,7 +1136,7 @@ def _hash_breakdown(parts: dict[str, dict[int, float]], times: dict[str, dict[in
 def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampler,
               probe: dict[str, Any], trace: dict[str, Any] | None,
               layout: dict[str, Any] | None, compute_bf16: bool, gpu_memory: int | None,
-              warns: set[str]) -> dict[str, Any]:
+              warns: set[str], steady_steps: Sequence[int] | None = None) -> dict[str, Any]:
     dv = _Devices(sampler, probe, records, markers.header.get("device"), warns)
     all_times, sides, levels = _times(records)
     # the hash parts are added seconds, not sections: they feed "hash" below only
@@ -1097,11 +1152,30 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
     pipelined = "step_wall" in special or any(s.get("merged") for s in markers.steps)
     all_untraced = [s for s in markers.steps if not s["traced"] and s["step"] >= 1]
     # the warm-up step: from the time rows' untraced steps, else from the markers'
-    warm = _warm_step([t for v in all_times.values() for t in v]
-                      or [s["step"] for s in all_untraced])
-    times = _only(all_times, lambda t: t != warm)
-    parts = _only(all_parts, lambda t: t != warm)
-    steady_special = _only(special, lambda t: t != warm)
+    time_steps = sorted({t for v in all_times.values() for t in v})
+    marker_steps = [s["step"] for s in all_untraced]
+    traced = [s for s in markers.steps if s["traced"] and s["step"] >= 1]
+    traced_steps = {s["step"] for s in traced}
+    known = sorted(set(time_steps) | set(marker_steps)) if steady_steps \
+        else (time_steps or marker_steps)
+    warm, chosen = _pick_steady(known, steady_steps, warns, sorted(traced_steps))
+    used = sorted(chosen) if chosen is not None else [t for t in known if t != warm]
+    if chosen is None:  # the default rule: say what it can get wrong
+        last = max([*known, *traced_steps], default=None)
+        if pipelined and last in used:
+            warns.add(f"the steady steps include the last step ({last}), verified with the "
+                      "prover idle: pass --steady-steps")
+        for t in used:
+            if t - 1 in traced_steps:
+                warns.add(f"steady step {t} follows traced step {t - 1}: its interval holds "
+                          "the trace's export")
+
+    def keep(t: int) -> bool:
+        return t in chosen if chosen is not None else t != warm
+
+    times = _only(all_times, keep)
+    parts = _only(all_parts, keep)
+    steady_special = _only(special, keep)
     counts = _first_counts(records)
     leaves = _leaves(records)
     peaks: dict[str, int] = {}
@@ -1123,9 +1197,8 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                      default=0)
 
     # the time rows' step set: steps >= 1, untraced (the traced step only serves the trace join)
-    untraced = [s for s in all_untraced if s["step"] != warm]
+    untraced = [s for s in all_untraced if keep(s["step"])]
     warm_marks = [s for s in all_untraced if s["step"] == warm]
-    traced = [s for s in markers.steps if s["traced"] and s["step"] >= 1]
     depths: dict[str, int] = {}
     for s in all_untraced + traced:
         for sec in s["sections"]:
@@ -1197,7 +1270,7 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
             share = mean_t / step_s if step_s and mean_t is not None else None
             calls = [sec["calls"] for _, sec in occ if depth == 0 and sec.get("gpu_us") is not None]
             work = _work(name, _rate_key(name, sides, compute_bf16), counts.get(name),
-                         leaves if _hashes_transcript(counts.get(name), transcript) else 0, tr,
+                         _section_leaves(counts.get(name), leaves, transcript), tr,
                          c5_scale,
                          2 * round(_mean(calls) or 0))
             floors = _floors(work, probes, warns, devices=devs, gpu_hash=dv.gpu_hash,
@@ -1265,7 +1338,7 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
 
     return {
         "device": markers.header.get("device"), "n_steps": len(untraced),
-        "warmup_excluded": warm is not None, "warmup": warmup, **info,
+        "warmup_excluded": warm is not None, "warmup": warmup, "steady_steps": used, **info,
         "share_total": sum(s["share"] or 0.0 for s in sections.values()
                             if s["depth"] == 0 and not s.get("rollup")),
         "sections": sections, "hash": _hash_breakdown(parts, times, sections),
@@ -1287,11 +1360,20 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                    **({"gpu_memory_bytes_by_device": dev_memory} if dev_memory else {})}}
 
 
-def _plain_comparison(records: list[dict[str, Any]], plain_dir: Path) -> dict[str, Any]:
+def _plain_comparison(records: list[dict[str, Any]], plain_dir: Path, warns: set[str],
+                      steady_steps: Sequence[int] | None = None) -> dict[str, Any]:
     """The plain step's sections beside the prover's ``train.*``: the plain run names them
-    ``train.*`` or ``P0.*``."""
-    prover, prover_warm, prover_step = _steady_warm(records)
-    plain, plain_warm, plain_step = _steady_warm(io.read_records(plain_dir))
+    ``train.*`` or ``P0.*``. Both runs use the steady steps when they are given (a plain run
+    lacking one of them keeps its own steady rule, with a warning)."""
+    prover, prover_warm, prover_step = _steady_warm(records, steady_steps, warns)
+    plain_rows = io.read_records(plain_dir)
+    plain_steps = steady_steps
+    if steady_steps:
+        have = {t for v in _times(plain_rows)[0].values() for t in v}
+        if not set(steady_steps) <= have:
+            warns.add("the plain run lacks some of the steady steps: its own steady rule is used")
+            plain_steps = None
+    plain, plain_warm, plain_step = _steady_warm(plain_rows, plain_steps, warns)
     out: dict[str, Any] = {}
     for name, t in prover.items():
         if not name.startswith("train."):
@@ -1314,13 +1396,17 @@ def _plain_comparison(records: list[dict[str, Any]], plain_dir: Path) -> dict[st
             "warmup_step": {"prover": prover_step, "plain": plain_step}}
 
 
-def _steady_warm(rows: list[dict[str, Any]]
+def _steady_warm(rows: list[dict[str, Any]], steady_steps: Sequence[int] | None = None,
+                 warns: set[str] | None = None
                  ) -> tuple[dict[str, float], dict[str, float], int | None]:
-    """Mean seconds per component over the steady untraced steps, the warm-up step's seconds
-    per component, and the warm-up step (``None`` when only one step exists)."""
+    """Mean seconds per component over the steady untraced steps (``steady_steps`` when given,
+    else all but the warm-up), the warm-up step's seconds per component, and the warm-up step
+    (``None`` when only one step exists)."""
     times = _times(rows)[0]
-    warm = _warm_step([t for v in times.values() for t in v])
-    steady = {n: statistics.fmean(v.values()) for n, v in _only(times, lambda t: t != warm).items()}
+    warm, chosen = _pick_steady(sorted({t for v in times.values() for t in v}), steady_steps,
+                                set() if warns is None else warns)
+    steady = {n: statistics.fmean(v.values()) for n, v in _only(
+        times, lambda t: t in chosen if chosen is not None else t != warm).items()}
     first = {n: v[warm] for n, v in times.items() if warm in v}
     return steady, first, warm
 
@@ -1373,7 +1459,8 @@ def _read(label: str, path: Path | None, reader, warns: list[str], default: Any)
 def analyze(run_dir: Path, samples: Path | None = None, probe: Path | None = None,
             trace_summary: Path | None = None, plain: Path | None = None,
             compute_dtype: str = "float32", markers: Path | None = None,
-            session: str | None = None) -> dict[str, Any]:
+            session: str | None = None, steady_steps: Sequence[int] | None = None
+            ) -> dict[str, Any]:
     """The analysis. A missing or empty markers, samples or probe file, or a markers file
     with no steps, adds a warning instead of failing: the sections then come from the time
     rows alone, utilization is null and the probe-based floors are skipped."""
@@ -1396,7 +1483,8 @@ def analyze(run_dir: Path, samples: Path | None = None, probe: Path | None = Non
         warns.append("no machine block has gpu_memory_bytes: the memory mark is skipped")
     soft: set[str] = set()
     view = _run_view(mk, records, sampler, pr, trace, layout,
-                     dtype.removeprefix("torch.") in ("bfloat16", "bf16"), gpu_memory, soft)
+                     dtype.removeprefix("torch.") in ("bfloat16", "bf16"), gpu_memory, soft,
+                     steady_steps)
     run = mk.header.get("run") or next((r["run"] for r in records if "run" in r), "unknown")
     env = next((r for r in records if r.get("record") == "environment"), {})
     meta = {"model": env.get("model"), "attack": env.get("attack"), "scenario": run,
@@ -1409,13 +1497,15 @@ def analyze(run_dir: Path, samples: Path | None = None, probe: Path | None = Non
         warns.append("no --session was given: meta.session is null")
     machine = next((m for m in [pr.get("machine"), env.get("machine")]
                     if isinstance(m, dict) and m), None)
+    comparisons = None if plain is None \
+        else _plain_comparison(records, plain, soft, steady_steps)  # may add warnings
     return {"version": io.VERSION, "meta": meta,
             "probe": None if pr is no_probe else {k: v for k, v in pr.items() if k != "machine"},
             "machine": machine, "run": run, "compute_dtype": dtype,
             "thresholds": THRESHOLDS,
             "warnings": warns + sorted(soft) + list((trace or {}).get("warnings") or []),
             "runs": {run: view},
-            "comparisons": None if plain is None else _plain_comparison(records, plain)}
+            "comparisons": comparisons}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1427,6 +1517,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--probe", type=Path, default=None)
     p.add_argument("--trace-summary", type=Path, default=None)
     p.add_argument("--plain", type=Path, default=None, help="the plain run's directory")
+    p.add_argument("--steady-steps", type=parse_steps, default=None,
+                   help="the steady steps, e.g. 2-3 or 2,3 (default: every untraced step after "
+                        "the warm-up); give them when the last pipelined step or a step after "
+                        "a traced one would be in the default set")
     p.add_argument("--compute-dtype", default="float32",
                    help="used when no environment record names compute_dtype")
     p.add_argument("--session", required=True,
@@ -1434,7 +1528,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--out", type=Path, required=True)
     a = p.parse_args(argv)
     result = analyze(a.run_dir, a.samples, a.probe, a.trace_summary, a.plain, a.compute_dtype,
-                     a.markers, a.session)
+                     a.markers, a.session, a.steady_steps)
     a.out.write_text(json.dumps(result, indent=1) + "\n", encoding="utf-8")
     print(f"wrote {a.out}", file=sys.stderr)
     return 0
