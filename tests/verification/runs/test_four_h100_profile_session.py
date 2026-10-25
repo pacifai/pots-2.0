@@ -123,6 +123,7 @@ def test_each_part_has_its_environment_and_command(tmp_path):
     plan = {p.name: p for p in fs.four_h100_profile_plan(tmp_path / "up", tmp_path / "out")}
     for n, p in plan.items():
         assert (p.env.get("VERIF_TRACE_STEP") == "4") == n.startswith("seq_"), n
+        assert (p.env.get("VERIF_TRACE_C5") == "all") == n.startswith("seq_"), n
         assert bool(p.env.get("VERIF_PIPELINED")) == n.startswith("pipe_"), n
         assert "VERIF_TRACE_STEP" not in p.env or n.startswith(("seq_", "pipe_")), n
     dirs = []

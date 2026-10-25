@@ -195,8 +195,9 @@ sit on one axis. How to read a merged step ``t``:
   What runs after the recorder takes ``t1`` is in no section and in the **next** step's
   interval, not ``step`` (``step`` sums sections only): the rows, the markers line, the residual
   archive, a traced step's profiler stop, export and gzip, and whatever a caller's ``on_step``
-  does after the recorder's (the stored step's write, in the sequential loop); at a rejected
-  step the record pass. So an interval can exceed the step's work by more than the idle gap.
+  does after the recorder's (the stored step's write, in the sequential loop). So an interval
+  can exceed the step's work by more than the idle gap. The record pass at a rejected step runs
+  inside ``verify_step``, before the step closes: in that step's own interval, in no section.
   The paper's EQ14 numbers should read: wall time (``step_interval`` per step, the run's wall
   across steps) beside accumulated GPU time per role, since "one role at a time"
   no longer holds. ``gpu_held_s`` (a merged row's seconds times the devices its side held) is

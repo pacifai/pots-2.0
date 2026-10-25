@@ -1312,7 +1312,7 @@ FOUR_PROFILE_PINS: tuple[tuple[str, str], ...] = tuple(sorted(
 # (a step is about a quarter of those times, plus the memory pass and the start-up), so 4
 # minutes; the models part is FS35's estimate, 6, and limit, 720 s (it fetches the whole
 # manifest, and a slow download fails the part); the sequential arm adds the trace of one step (a full-scale
-# step's trace is a JSON of about 1-1.5 GB, gzipped at level 9: an estimate, adding 2-3 minutes
+# step's trace is a JSON of about 1-1.5 GB, gzipped at level 1: an estimate, adding 2-3 minutes
 # to a step of about 195 s), so 6 minutes and 720 s; the plain run (three steps and a memory pass on one GPU) is estimated, not measured,
 # at 3.
 FOUR_PROFILE_ESTIMATE_MIN = {"native_build": 1, "peer_check": 1, "models": 6, "four_tests": 6,
@@ -1401,8 +1401,9 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
         for arm, piped in (("seq", None), ("pipe", "1")):  # only the pipelined arm sets the mode
             d = _run_dir(out, upload, key, f"four_{key}_{arm}")
             env = {**base, **sharded, "VERIF_OUTPUT_DIR": str(d), "VERIF_PIPELINED": piped}
-            if profile:  # only the sequential arm is traced, at its last step
+            if profile:  # only the sequential arm is traced, at its last step, check 5 whole
                 env["VERIF_TRACE_STEP"] = str(FOUR_PROFILE_TRACE_STEP) if arm == "seq" else None
+                env["VERIF_TRACE_C5"] = "all" if arm == "seq" else None
             plan.append(Part(
                 f"{arm}_{k}", ["{python}", "-m", "verification.runs.llama_step", "--steps",
                                str(steps), "--metrics", "--no-count"],

@@ -1409,14 +1409,16 @@ its limit is FS35's 720 s), `four_tests` (6), `probe` (7), then per model `plain
 `card_<model>` (2), `seq_<model>` (6) and `pipe_<model>` (4). The estimates are FS35's
 measured times of 2026-10-25 scaled to four steps (FS35's card measured 37-62 s); the plain
 run's is a guess, and the sequential arm's 6 adds an estimated 2-3 minutes for the trace of
-one full-scale step (a JSON of about 1-1.5 GB, gzipped at level 9) to a step of about 195 s,
-so its limit is 720 s. In all, 21 + 3 x 15 = 66 min, plus packing 1 and the grace window 20,
+one full-scale step, all of check 5 included (`VERIF_TRACE_C5=all`: the measuring kernel runs
+outside the sampled serving stamps), a JSON of about 1-1.5 GB gzipped at level 1, to a step of
+about 195 s, so its limit is 720 s. In all, 21 + 3 x 15 = 66 min, plus packing 1 and the grace window 20,
 87 min; the job's default deadline is twice that, 10,440 s rounded up to 10,500 s (2 h
 55 min), set in `fs11_job.sh` and `four_profile_default_deadline_s()`, which a test holds
 equal. The pod's boot guard is (87 + 20) x 2 = 214 min = 12,840 s, rounded up to 12,900 s: 87
 is the job's estimated runtime with its packing and grace window (the job deadline's own
 basis), 20 is the pod's setup (image pull, set-up script, upload), and the 2 is the margin.
-Each part's time limit is about twice its estimate.
+The pod's start command is the four-H100 session's above with a `sleep` of 12,900 s in place of
+17,100. Each part's time limit is about twice its estimate.
 
 **Expected cost.** The parts' estimated runtime, 66 min, plus about 15 min of pod setup and
 fetch, is about 81 min, so a run costs about 81 / 60 x $P/h, at $P/h the pod's hourly price;
@@ -1427,7 +1429,8 @@ $47 at that price, and the boot guard caps the whole pod at 12,900 s, about $57.
   no verifier devices, no pipelining): the plain training step the verifier's cost is compared
   with.
 - `card_<model>`: `card_identity` on GPU 0, as in FS35.
-- `seq_<model>`: `llama_step --steps 4 --metrics --no-count` with `VERIF_TRACE_STEP=4`.
+- `seq_<model>`: `llama_step --steps 4 --metrics --no-count` with `VERIF_TRACE_STEP=4` and
+  `VERIF_TRACE_C5=all`.
 - `pipe_<model>`: the same with `VERIF_PIPELINED=1` and no `VERIF_TRACE_STEP`.
 
 Every part records its GPUs' peaks and a `samples.jsonl` with four GPUs in its header.

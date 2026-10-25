@@ -2253,7 +2253,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     The recorder takes `t1` in `on_step`; what runs after it falls in the next step's interval
     and in no section: the rows, the markers line, the residual archive, a traced step's
     profiler stop, export and gzip, a caller's `on_step` after the recorder's (the stored
-    step's write, sequential loop), and at a rejected step the record pass.
+    step's write, sequential loop). The record pass at a rejected step runs inside
+    `verify_step`, so it is in that step's own interval, in no section.
     `gpu_held_s` is only an upper bound on held GPU time (a section's time times every device its
     process lists); the measure is computed by the four-H100 session's summary from the per-side
     `total` rows and `gpu_roles` (`fs11_session._accumulated_gpu_s`).
@@ -3380,7 +3381,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `probe`, per model `plain_<k>` (`plain_baseline --steps 3 --metrics`, `FOUR_PROFILE_PLAIN_STEPS`,
     on `cuda:0` alone, kind
     `profile_plain`), `card_<k>`, `seq_<k>` (`llama_step --steps 4 --metrics --no-count`,
-    `VERIF_TRACE_STEP=4`) and `pipe_<k>` (the same, `VERIF_PIPELINED=1`, no trace), the arms of
+    `VERIF_TRACE_STEP=4`, `VERIF_TRACE_C5=all`) and `pipe_<k>` (the same, `VERIF_PIPELINED=1`, no trace), the arms of
     kind `profile_run`; every part has `gpu_peak` and a `samples.jsonl` header check
     (`info["samples_check"]`, `extras["samples"]`). Estimates in minutes (`FOUR_PROFILE_ESTIMATE_MIN`:
     1, 1, 6, 6, 7, then 3, 2, 6, 4 per model, 66 in all) come from FS35's 2026-10-25 times (the
