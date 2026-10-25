@@ -16,7 +16,8 @@ from verification.computation.instances import DecoderComputation
 from verification.computation.interface import snapshot_weights
 from verification.parameters import load_protocol_config
 from verification.runs import llama_step
-from verification.runs.metrics import MetricsWriter, read_residuals
+from verification.runs import prover_spec
+from verification.runs.metrics import MetricsWriter, read_records, read_residuals
 from verification.runs.loop import ProverFault
 from verification.runs.scenarios import (
     HONEST,
@@ -30,7 +31,13 @@ from verification.verifier.calibration import BandFileMismatch, band_context, lo
 from verification.verifier.residuals import class_summary, tensor_summary
 
 from tests.verification.decoder_helpers import make_records, tiny_config
-from tests.verification.runs.test_run_verified import K, _band_file
+from tests.verification.runs import pipelined_helpers as P  # noqa: F401
+from tests.verification.runs.test_fs33d_entry_points import tiny_spec  # noqa: F401 (fixture)
+from tests.verification.runs.test_run_verified import (  # noqa: F401 (tiny_main is a fixture)
+    K,
+    _band_file,
+    tiny_main,
+)
 
 SEED = 1  # π's seed (F8c), the default VERIF_SEED
 
@@ -242,6 +249,91 @@ def test_main_judges_with_a_band_file_of_this_run(monkeypatch, tmp_path, capsys)
     monkeypatch.setenv("VERIF_ETA", "2e-3")
     with pytest.raises(BandFileMismatch, match=r"\(eta: file 0.001, run 0.002\)"):
         llama_step.main(["--steps", "1", "--no-metrics", "--bands", str(path)])
+
+
+def _work_rows_of(rows, c):
+    steps = [r for r in rows if r.get("record") == "step"]
+    return steps, llama_step.work_rows(c, llama_step.RUN_NAME, "honest", steps)
+
+
+def _marker_traced(out):
+    lines = [json.loads(x) for x in (out / "markers.jsonl").read_text().splitlines()]
+    return {m["step"]: m["traced"] for m in lines if m["kind"] == "step"}
+
+
+def test_sequential_metrics_run_traces_the_step_and_writes_layout_and_work_rows(
+        monkeypatch, tmp_path, capsys):
+    """VERIF_TRACE_STEP=2 over 3 steps with --no-count: step 2's trace and marker, check 5's
+    layout, and the shape-derived count/storage rows equal to work_rows over the step records."""
+    _tiny_main_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VERIF_TRACE_STEP", "2")
+    assert llama_step.main(["--steps", "3", "--metrics", "--no-count"]) == 0
+    assert "trace:" not in capsys.readouterr().out
+    out = tmp_path / llama_step.RUN_NAME
+    assert (out / "trace" / "step_00002.json.gz").exists()
+    assert not (out / "trace" / "step_00001.json.gz").exists()
+    assert _marker_traced(out) == {1: False, 2: True, 3: False}
+    assert (out / "c5_layout.json").exists()
+    rows = read_records(out / "records.jsonl")
+    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
+    steps, want = _work_rows_of(rows, c)
+    assert [s["step"] for s in steps] == [1, 2, 3]
+    assert all(s["transcript_bytes"] and s["leaves"] for s in steps)
+    got = [r for r in rows if r["record"] in ("count", "storage")]
+    assert got == want and sum(r["record"] == "storage" for r in got) == 3
+
+
+def test_metrics_off_with_a_trace_step_says_it_needs_metrics(monkeypatch, tmp_path, capsys):
+    _tiny_main_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("VERIF_TRACE_STEP", "2")
+    assert llama_step.main(["--steps", "2", "--no-metrics"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("trace:") == 1 and "needs --metrics" in out
+    assert not (tmp_path / llama_step.RUN_NAME).exists()
+
+
+def test_pipelined_metrics_run_prints_no_trace_and_writes_layout_and_work_rows(
+        tiny_main, tiny_spec, monkeypatch, capsys):  # noqa: F811
+    c, _, root = tiny_main
+    monkeypatch.setattr(llama_step, "setup_determinism", prover_spec.setup_determinism)
+    monkeypatch.setenv("VERIF_PIPELINED", "1")
+    monkeypatch.setenv("VERIF_TRACE_STEP", "2")
+    assert llama_step.main(["--steps", "3", "--metrics", "--no-count", "--bands",
+                            str(root / "bands.json")]) == 0
+    text = capsys.readouterr().out.splitlines()
+    want = ("trace: VERIF_TRACE_STEP=2 is not traced in the pipelined loop "
+            "(the profiler records one process)")
+    assert text.count(want) == 1
+    assert text.index(want) < next(i for i, x in enumerate(text) if x.startswith("step "))
+    out = root / llama_step.RUN_NAME
+    assert not (out / "trace").exists()
+    assert not any(_marker_traced(out).values())
+    assert (out / "c5_layout.json").exists()
+    rows = read_records(out / "records.jsonl")
+    steps, want_rows = _work_rows_of(rows, c)
+    # the pipelined step records (written after the merge) hold the work counts
+    assert [s["step"] for s in steps] == [1, 2, 3]
+    assert all(s["transcript_bytes"] and s["leaves"] for s in steps)
+    assert [r for r in rows if r["record"] in ("count", "storage")] == want_rows
+
+
+def test_count_pass_writes_no_work_rows(monkeypatch, tmp_path):
+    _tiny_main_env(monkeypatch, tmp_path)
+    assert llama_step.main(["--steps", "2", "--metrics", "--count"]) == 0
+    rows = read_records(tmp_path / llama_step.RUN_NAME / "records.jsonl")
+    counts = [r for r in rows if r["record"] in ("count", "storage")]
+    assert counts
+    # two sources would collide: one count row per side, component and step, one storage row
+    # per step
+    keys = [(r["record"], r.get("side"), r.get("component"), r["step"]) for r in counts]
+    assert len(keys) == len(set(keys))
+
+
+def test_work_rows_still_importable_from_bring_up():
+    from verification.runs import bring_up
+
+    assert bring_up.work_rows is llama_step.work_rows
+    assert bring_up._step_records is llama_step._step_records
 
 
 @pytest.mark.slow

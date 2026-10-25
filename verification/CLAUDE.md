@@ -2373,7 +2373,17 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   (`StepRecord.root`, in `run_verified`'s format; nothing else in the output changes), so a
   session can compare roots across runs. `--no-count` skips the counting pass (the default
   `--count` runs it): counts do not depend on the GPU layout, and FS35's session skips them to
-  save pod time. Exits 1 unless
+  save pod time. With metrics the timed run also writes check 5's layout (`c5_layout.json`,
+  what the markers' check-5 stamps index) and traces `VERIF_TRACE_STEP` in the sequential loop
+  (`trace/`, as `bring_up` does); the pipelined loop prints `trace: VERIF_TRACE_STEP=N is not
+  traced in the pipelined loop (the profiler records one process)` and traces nothing, and
+  without `--metrics` a set `VERIF_TRACE_STEP` prints that it needs `--metrics`. The memory and
+  counting passes are never traced. With `--no-count` it writes the shape-derived work rows
+  after the timed run: `work_rows(c, run, scenario, step_rows)` (moved here from `bring_up`,
+  which imports it back) gives the `count` and `storage` rows from the declared products and
+  each `step` record's `transcript_bytes` and `leaves` (both loops write them), because the
+  counting pass is never run beside a timed run; with `--count` no work rows are written, so a
+  component and step has one `count` row. Exits 1 unless
   accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s
   and `memory_run`'s `release_cache`), not the counting pass. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
   every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
