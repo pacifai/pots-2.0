@@ -319,3 +319,16 @@ def test_notes_and_legend_names():
         st["strips"] = None
     tl = panel(page(nostrips), "r0-timeline")
     assert "No sampler data for this run." in tl and "Lines under each step" not in tl
+
+
+def test_check_5_floor_says_serving_measuring_reads_and_partial():
+    detail = {"hbm": {"serving_bytes": 1.0, "serving_s": 0.05, "measuring_reads_bytes": 2.0,
+                      "measuring_reads_s": 0.07}}
+    v = view(gpu=True)
+    v["sections"]["5"] |= {"floor_detail": detail, "ratio": 14.0}
+    c5 = panel(page(profile(runs={"honest": v})), "r0-check5")
+    assert "serving" in c5 and "measuring reads" in c5 and "Partial floor" not in c5
+    assert "14" in c5
+    v["sections"]["5"] |= {"floor_partial": {"missing": ["hbm serving", "pcie", "launch"]}}
+    c5 = panel(page(profile(runs={"honest": v})), "r0-check5")
+    assert "Partial floor" in c5 and "hbm serving, pcie, launch" in c5 and "no mark" in c5

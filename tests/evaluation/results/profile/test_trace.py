@@ -22,7 +22,7 @@ import json
 
 import pytest
 
-from evaluation.results.profile import trace
+from evaluation.results.profile import io, trace
 
 CPU = {"pid": 1, "tid": 1}
 GPU = {"pid": 0, "tid": 7}
@@ -125,8 +125,9 @@ def test_top_level(summary):
 def test_section_a(summary):
     a = summary["sections"]["A"]
     assert a["parent"] is None and summary["sections"]["A.inner"]["parent"] == "A"
-    assert a["wall_us"] == 1000 and a["kernel_us"] == 50 + 50 and a["kernel_span_us"] == 100
-    assert a["gpu_idle_us"] == 900 and a["kernels"] == 5 and a["launches"] == 5
+    assert a["wall_us"] == 1000 and a["kernel_us"] == 50 + 50
+    assert a["kernel_span_us"] == {"0": 100} and a["gpu_idle_us"] == {"0": 900}
+    assert a["kernels"] == 5 and a["launches"] == 5
     assert a["categories_us"] == {
         "gemm": 30, "attention": 50, "elementwise": 10, "reduction": 6, "memcpy_h2d": 20,
         "memcpy_d2h": 5 + 10, "memcpy_d2d": 4, "memset": 2, "other": 4}
@@ -151,13 +152,13 @@ def test_nested_section(summary):
     assert inner["categories_us"]["memcpy_d2h"] == 10
     assert inner["copy_bytes"] == {"h2d": 0, "d2h": 64, "d2d": 0}
     assert inner["sync_wait_us"] == 80 + 30
-    assert inner["gpu_idle_us"] == 150
+    assert inner["gpu_idle_us"] == {"0": 150}
     assert inner["gemm_flops"] == 0 and inner["gemm_bytes"] == 0
 
 
 def test_section_with_stamps(summary):
     s = summary["sections"]["5"]
-    assert s["parent"] is None and s["wall_us"] == 1000 and s["gpu_idle_us"] == 960
+    assert s["parent"] is None and s["wall_us"] == 1000 and s["gpu_idle_us"] == {"0": 960}
     assert s["categories_us"]["gemm"] == 40 and s["categories_us"]["memcpy_h2d"] == 60
     assert s["copy_bytes"]["h2d"] == 4096 and s["launches"] == 1
     assert s["top_cpu_ops"] == [{"name": "aten::copy_", "self_us": 20, "calls": 1},
@@ -308,7 +309,8 @@ def test_kernel_span_is_a_union(tmp_path):
     evs = [ann("S", 0, 100), launch(1, 1), launch(2, 2),
            kernel("gemm_a", 10, 20, 1), kernel("gemm_b", 20, 20, 2)]
     sec = trace.summarize(write(tmp_path / "t.json", evs))["sections"]["S"]
-    assert sec["kernel_us"] == 40 and sec["kernel_span_us"] == 30 and sec["gpu_idle_us"] == 70
+    assert sec["kernel_us"] == 40 and sec["kernel_span_us"] == {"0": 30}
+    assert sec["gpu_idle_us"] == {"0": 70}
 
 
 def test_cli(tmp_path):
@@ -317,3 +319,108 @@ def test_cli(tmp_path):
     assert trace.main(["--trace", str(t), "--layout", str(layout(tmp_path / "l.json")),
                        "--out", str(out)]) == 0
     assert json.loads(out.read_text())["version"] == 1
+
+
+def test_markers_added_seconds_rows_are_left_out(tmp_path):
+    """A row with no host span and a ``rest`` aggregate (``Seam.add``) is never in a trace."""
+    t = write(tmp_path / "t.json.gz", events())
+    m = tmp_path / "markers.jsonl"
+    added = {"name": "P3.commit.hash.read", "host_us": [], "rest": {"calls": 1, "host_s": 0.1}}
+    spanned = {"name": "A", "host_us": [[0, 1000]], "rest": None}
+    lines = [{"kind": "header"}, {"kind": "step", "traced": True, "sections": [
+        spanned, {"name": "A.inner", "host_us": [[400, 600]]}, {"name": "5", "host_us": [[1, 2]]},
+        added]}]
+    m.write_text("".join(json.dumps(r) + "\n" for r in lines))
+    assert trace.summarize(t, markers_path=m)["warnings"][0].startswith("30.0%")
+    warned = trace.summarize(t, markers_path=m)["warnings"]
+    assert not any("P3.commit.hash.read" in w for w in warned)
+    # a section that has a span is still cross-checked
+    lines[1]["sections"].append({"name": "6", "host_us": [[3, 4]], "rest": None})
+    m.write_text("".join(json.dumps(r) + "\n" for r in lines))
+    assert any("'6' is in the markers" in w
+               for w in trace.summarize(t, markers_path=m)["warnings"])
+
+
+def test_kernel_span_and_idle_are_per_device(tmp_path):
+    def dev_kernel(name, ts, dur, corr, pid):
+        return {**kernel(name, ts, dur, corr), "pid": pid, "args": {"correlation": corr,
+                                                                    "device": pid}}
+
+    evs = [ann("S", 0, 100), launch(1, 1), launch(2, 2), launch(3, 3),
+           dev_kernel("gemm_a", 10, 20, 1, 0), dev_kernel("gemm_b", 20, 20, 2, 0),
+           dev_kernel("gemm_c", 10, 20, 3, 1)]
+    sec = trace.summarize(write(tmp_path / "t.json", evs))["sections"]["S"]
+    assert sec["kernel_us"] == 60 and sec["kernels"] == 3
+    assert sec["kernel_span_us"] == {"0": 30, "1": 20}  # not the pooled union of 30
+    assert sec["gpu_idle_us"] == {"0": 70, "1": 80}
+
+
+def c5_events(stamps):
+    """A section ``5`` with the given ``(name, ts, dur)`` stamps, ids in the name."""
+    return [ann("5", 0, 10000), *[ann(n, ts, dur) for n, ts, dur in stamps]]
+
+
+def write_layout(path, ents):
+    path.write_text(json.dumps({"version": 1, "entries": [
+        {"window": 0, "members": 1, "operand_bytes": ob, "product_bytes": pb, **e}
+        for e, ob, pb in ents]}))
+    return path
+
+
+def test_two_class_run_is_spread_by_bytes(tmp_path):
+    """A run of an S group (100 B) and an O group (300 B): its ``run`` stamp splits 1:3, a
+    group's own stamps go to that group's class."""
+    lay = write_layout(tmp_path / "l.json", [({"run": 0, "group": 0, "class": "S"}, 60, 40),
+                                              ({"run": 0, "group": 1, "class": "O"}, 200, 100)])
+    evs = c5_events([("c5.run|run=0", 0, 400), ("c5.glue|run=0|group=0", 0, 40),
+                     ("c5.glue|run=0|group=1", 40, 20), ("c5.serve|run=0|group=1", 60, 10)])
+    s = trace.summarize(write(tmp_path / "t.json", evs), lay)
+    assert s["warnings"] == []
+    out = s["c5_slice"]
+    assert out["S"]["phases_us"]["run"] == pytest.approx(100)
+    assert out["O"]["phases_us"]["run"] == pytest.approx(300)
+    assert out["S"]["phases_us"]["glue"] == 40 and out["O"]["phases_us"]["glue"] == 20
+    assert out["S"]["phases_us"]["serve"] == 0 and out["O"]["phases_us"]["serve"] == 10
+    assert out["S"]["scale"] == 1 and out["O"]["runs_total"] == 1
+
+
+def test_batched_measure_is_spread_over_the_runs_it_covers(tmp_path):
+    """One measure stamp (run 0, group -1) after runs 0 and 1 covers both, split by their
+    bytes (100 B and 300 B); the next, after run 2, covers run 2 alone."""
+    lay = write_layout(tmp_path / "l.json", [({"run": 0, "group": 0, "class": "A"}, 60, 40),
+                                              ({"run": 1, "group": 1, "class": "B"}, 200, 100),
+                                              ({"run": 2, "group": 2, "class": "C"}, 50, 50)])
+    evs = c5_events([("c5.run|run=0", 0, 50), ("c5.run|run=1", 50, 50),
+                     ("c5.measure|run=0|group=-1", 100, 200),
+                     ("c5.run|run=2", 400, 50), ("c5.measure|run=2|group=-1", 450, 80)])
+    out = trace.summarize(write(tmp_path / "t.json", evs), lay)["c5_slice"]
+    assert out["A"]["phases_us"]["measure"] == pytest.approx(50)
+    assert out["B"]["phases_us"]["measure"] == pytest.approx(150)
+    assert out["C"]["phases_us"]["measure"] == pytest.approx(80)
+    assert sum(c["phases_us"]["run"] for c in out.values()) == 150
+
+
+def test_class_scale_uses_the_members_of_that_class(tmp_path):
+    """Run 0 holds 4 S members and 8 O members, run 1 the same; only run 0 is traced, so each
+    class's scale is 2 and the traced run's time is split, not counted twice."""
+    lay = write_layout(tmp_path / "l.json", [
+        ({"run": 0, "group": 0, "class": "S", "members": 4}, 10, 10),
+        ({"run": 0, "group": 1, "class": "O", "members": 8}, 10, 10),
+        ({"run": 1, "group": 2, "class": "S", "members": 4}, 10, 10),
+        ({"run": 1, "group": 3, "class": "O", "members": 8}, 10, 10)])
+    out = trace.summarize(write(tmp_path / "t.json", c5_events([("c5.run|run=0", 0, 100)])),
+                          lay)["c5_slice"]
+    assert out["S"]["scale"] == 2 and out["O"]["scale"] == 2
+    assert out["S"]["scaled"]["run"] + out["O"]["scaled"]["run"] == pytest.approx(200)
+
+
+def test_batch_cover_rules():
+    stamps = [(0, "run", 4, -1), (1, "run", 5, -1), (2, "measure", 4, -1),  # runs 4, 5
+              (3, "measure", 4, -1),            # the same step on a second device
+              (4, "run", 6, -1), (5, "measure", 6, 9),  # one group: ends the batch
+              (6, "run", 7, -1), (7, "measure", 7, -1),
+              (8, "measure", 9, -1)]            # nothing served before it
+    cover = io.batch_cover(stamps)
+    assert cover == {2: [4, 5], 3: [4, 5], 7: [7], 8: []}
+    shuffled = [stamps[i] for i in (8, 3, 0, 7, 1, 5, 2, 6, 4)]
+    assert sorted(io.batch_cover(shuffled).values()) == sorted(cover.values())

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import warnings
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,8 @@ from typing import Any
 from evaluation.records import read_jsonl
 
 __all__ = ["VERSION", "MARKERS_FILE", "C5_LAYOUT_FILE", "Markers", "Samples", "read_markers",
-           "read_samples", "read_probe", "read_c5_layout", "read_trace_summary", "read_records"]
+           "read_samples", "read_probe", "read_c5_layout", "read_trace_summary", "read_records",
+           "class_shares", "batch_cover", "entry_bytes"]
 
 VERSION = 1
 VERSIONS = {"samples": (1, 2), "probe": (1, 2)}  # the other files: (VERSION,)
@@ -130,3 +132,58 @@ def read_trace_summary(path: str | Path) -> dict[str, Any]:
 def read_records(run_dir: str | Path) -> list[dict[str, Any]]:
     """``records.jsonl`` of a run directory, as :func:`evaluation.records.read_jsonl` reads it."""
     return read_jsonl(Path(run_dir) / "records.jsonl")
+
+
+def entry_bytes(e: dict[str, Any]) -> int:
+    """A layout entry's measured bytes: ``operand_bytes`` plus ``product_bytes``."""
+    return e.get("operand_bytes", 0) + e.get("product_bytes", 0)
+
+
+def class_shares(entries: Iterable[dict[str, Any]]) -> dict[str, float]:
+    """Each class's share of the layout ``entries``' measured bytes (``operand_bytes`` plus
+    ``product_bytes``), summing to 1, in order of first appearance. A stamp that covers entries
+    of several classes (an attention run of scores and mixes, a batched measuring) is spread
+    over the classes by these shares; entries with no bytes share equally."""
+    tot: dict[str, float] = {}
+    for e in entries:
+        tot[e["class"]] = tot.get(e["class"], 0.0) + entry_bytes(e)
+    whole = sum(tot.values())
+    if not tot:
+        return {}
+    if whole <= 0:
+        return {c: 1.0 / len(tot) for c in tot}
+    return {c: v / whole for c, v in tot.items()}
+
+
+def batch_cover(stamps: Sequence[tuple[float, str, int, int]]) -> dict[int, list[int]]:
+    """The runs each batched measuring stamp (``measure``, group -1) covers.
+
+    ``stamps`` are ``(start, name without "c5.", run, group)``, in any order. On the GPU path
+    the unit pass serves every run of a schedule step (a ``run`` stamp each) and then measures
+    them all in one ``measure`` stamp, labelled with the step's first run and group -1
+    (``checks.py``, ``_measure_step_kernel``). So the runs a batched stamp covers are those whose
+    ``run`` stamps start after the previous batched stamp. A second batched stamp with the same
+    run id (a step on a second device) covers the same runs. A stamp for one group (group >= 0,
+    a run measured on its own) ends the batch collected so far. Returns the covered runs by
+    index in ``stamps``; a batched stamp with no run before it maps to ``[]``.
+
+    Two limits. With overlap on (FS39) a batched stamp's host time includes the wait for the
+    previous step's measuring on that device, so spreading it over this step's classes is an
+    approximation. A second device's stamp for the same step is spread over all of the step's
+    runs, not only that device's (the decoder uses one device per step)."""
+    out: dict[int, list[int]] = {}
+    pending: list[int] = []
+    last: tuple[int, list[int]] | None = None
+    for i in sorted(range(len(stamps)), key=lambda j: stamps[j][0]):
+        _, name, run, group = stamps[i]
+        if name == "run":
+            if run not in pending:
+                pending.append(run)
+        elif name == "measure" and group >= 0:
+            pending = []
+        elif name == "measure":
+            if pending:
+                last = (run, pending)
+                pending = []
+            out[i] = list(last[1]) if last is not None and last[0] == run else []
+    return out

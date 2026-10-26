@@ -31,10 +31,14 @@ clock and :data:`US` turns µs into s; nothing else converts.
   of ``c5_slice`` (estimated total run time over traced run time).
 - Copies (``memcpy_h2d``, ``memcpy_d2h``) cost at the pageable rates, and the PCIe floor is
   the larger of the two directions' times (the link is full duplex); ``hbm`` bytes are
-  ``gemm_bytes`` plus ``memcpy_d2d``; ``hash`` bytes are ``hash_in_bytes`` plus
-  ``hash_out_bytes`` of the ``count`` row; ``leaves`` come from the ``storage`` record, for
-  every section whose ``hash_in_bytes`` is at least half the step's ``transcript_bytes``
-  (the commit and check 2).
+  ``gemm_bytes`` plus ``memcpy_d2d`` (serving). Section ``5`` on a CUDA run adds the measuring
+  kernel's reads (``bytes.hbm_measure``, ``_measure_reads``): per layout entry A, B and P as
+  stored (``operand_bytes`` is fp32, so it is rescaled to the product dtype), times
+  once per step (no sweep factor) and not scaled by the trace slice; the section's
+  ``floor_detail.hbm`` gives ``serving_s`` and ``measuring_reads_s`` apart. ``hash`` bytes are
+  ``hash_in_bytes`` plus ``hash_out_bytes`` of the ``count`` row; ``leaves`` come from the
+  ``storage`` record, for every section whose ``hash_in_bytes`` is at least half the step's
+  ``transcript_bytes`` (the commit and check 2).
 - Syncs are 2 per top-level section call on CUDA. The hook bound's events are the ``gpu_us``
   spans that hold events (with the folded calls), none for a stamp or a host-timed span
   (``seam.host``, null ``gpu_us`` entries: no events); both are 0 off CUDA.
@@ -67,8 +71,8 @@ clock and :data:`US` turns µs into s; nothing else converts.
 - Clock times are sums of a section's marker spans over the untraced steps; the trace time is
   compared with the host time of the traced step. ``agree`` is false when either differs by
   more than the rule's tolerance, and ``null`` when no second clock exists.
-- Measured utilization on the bound's lane: ``gemm`` is ``g_tensor`` when the floor used the bf16 rate, else ``g_sm_active``
-  (both falling back to ``g_util``; a measured 0 is a reading),
+- Measured utilization on the bound's lane: ``gemm`` is ``g_tensor`` when the floor used the bf16
+  rate, else ``g_sm_active`` (both falling back to ``g_util``; a measured 0 is a reading),
   ``hbm`` is ``g_dram_bw`` (else ``g_mem_util``), ``pcie`` is ``g_pcie_tx + g_pcie_rx``
   over the datasheet's ``pcie_bytes``, ``hash`` is ``c_tree`` over the probe's hash threads;
   ``launch`` has no lane, so it never gets the mark.
@@ -543,18 +547,23 @@ def _direction(d: dict[str, Any] | None, key: str) -> float:
 
 
 def _work(name: str, rate_key: str, count: dict[str, Any] | None, leaves: int,
-          trace: dict[str, Any] | None, c5_scale: float, syncs: int) -> dict[str, Any]:
+          trace: dict[str, Any] | None, c5_scale: float, syncs: int,
+          measure_reads: float = 0.0) -> dict[str, Any]:
+    """``measure_reads`` is check 5's measuring-kernel read bytes per step (section ``5`` only,
+    not scaled by the trace slice); it is ``bytes.hbm_measure``, apart from the serving's
+    ``bytes.hbm``."""
     count, trace = count or {}, trace or {}
     flops = float(count.get("flops") or 0.0)
     hash_bytes = float(count.get("hash_in_bytes") or 0.0) \
         + float(count.get("hash_out_bytes") or 0.0)
     scale = c5_scale if _is_c5(name) else 1.0
     copy = trace.get("copy_bytes")
-    return {"flops": {rate_key: flops} if flops else {},
-            "bytes": {"hbm": scale * (float(trace.get("gemm_bytes") or 0.0)
-                                      + _direction(copy, "d2d")),
-                      "h2d": scale * _direction(copy, "h2d"),
-                      "d2h": scale * _direction(copy, "d2h"), "hash": hash_bytes},
+    nbytes = {"hbm": scale * (float(trace.get("gemm_bytes") or 0.0) + _direction(copy, "d2d")),
+              "h2d": scale * _direction(copy, "h2d"),
+              "d2h": scale * _direction(copy, "d2h"), "hash": hash_bytes}
+    if name == "5":
+        nbytes["hbm_measure"] = measure_reads
+    return {"flops": {rate_key: flops} if flops else {}, "bytes": nbytes,
             "leaves": leaves, "launches": scale * float(trace.get("launches") or 0.0),
             "syncs": syncs}
 
@@ -603,7 +612,8 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
     for key, fl in work["flops"].items():
         total("gemm", [(key, fl, rate_s(key))])
     b = work["bytes"]
-    total("hbm", [("hbm_copy_bytes", b["hbm"], rate_s("hbm_copy_bytes"))])
+    total("hbm", [("hbm_copy_bytes", b["hbm"] + b.get("hbm_measure", 0.0),
+                   rate_s("hbm_copy_bytes"))])
     total("pcie", [(key, b[d], rate_s(key))
                    for d, key in (("h2d", "h2d_pageable_bytes"), ("d2h", "d2h_pageable_bytes"))],
           combine=max)
@@ -831,45 +841,87 @@ def _timeline(untraced: list[dict[str, Any]], sampler: Sampler, dv: _Devices | N
 # ---- check 5 -----------------------------------------------------------------------------
 
 
-def _layout_maps(layout: dict[str, Any], warns: set[str]
-                 ) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
-    """The layout's entries by group and by run (the run's first entry). Members of one group
-    that carry different classes get the first one's, with a warning."""
-    by_group: dict[int, dict[str, Any]] = {}
-    by_run: dict[int, dict[str, Any]] = {}
+_ITEM_BYTES = {"float32": 4, "float64": 8, "bfloat16": 2, "float16": 2}
+
+
+def _measure_reads(layout: dict[str, Any] | None, device: str | None) -> float:
+    """HBM bytes the check-5 measuring needs to read in one step (GPU path only), else 0.
+
+    Every product's A, B and P are read once, as stored: the operands are served as views in
+    the replay's dtype, which for the decoder is the product's dtype (``operand_dtype ==
+    product_dtype``). The layout counts A and B as fp32 (``operand_bytes``), so they are
+    rescaled to the product dtype's item size. Counted once per step: the layout covers every
+    run, not the trace's slice.
+
+    This is a floor, so it leaves out what the kernel's design adds: the kernel sweeps each
+    operand once per chunk of 16 challenge columns (``K_CHUNK``), which is part of its ratio
+    over this floor. Products that share one stored view (``share=True``) read it once, so the
+    kernel can read up to about 13% less than this count (FS38b measured 0.8 of 6.3 GB per
+    layer saved); that overstatement is known, and the layout cannot remove it (it records no
+    addresses)."""
+    if not layout or not str(device or "").startswith("cuda"):
+        return 0.0
+    tot = 0.0
     for e in layout["entries"]:
-        first = by_group.setdefault(e["group"], e)
-        if first["class"] != e["class"]:
-            warns.add("c5_layout: members of one group carry different classes; the first "
-                      "member's class is used")
-        by_run.setdefault(e["run"], e)
+        item = _ITEM_BYTES.get(str(e.get("product_dtype", "float32")).removeprefix("torch."), 4)
+        tot += e.get("operand_bytes", 0) * item / 4 + e.get("product_bytes", 0)
+    return tot
+
+
+def _layout_maps(layout: dict[str, Any], warns: set[str]
+                 ) -> tuple[dict[int, list[dict[str, Any]]], dict[int, list[dict[str, Any]]]]:
+    """The layout's entries by group and by run. A group whose entries carry different classes
+    is spread over them by bytes, with a warning."""
+    by_group: dict[int, list[dict[str, Any]]] = {}
+    by_run: dict[int, list[dict[str, Any]]] = {}
+    for e in layout["entries"]:
+        g = by_group.setdefault(e["group"], [])
+        if g and g[0]["class"] != e["class"]:
+            warns.add("c5_layout: members of one group carry different classes; the group's "
+                      "time is spread over them by bytes")
+        g.append(e)
+        by_run.setdefault(e["run"], []).append(e)
     return by_group, by_run
 
 
-def _stamp_rows(step: dict[str, Any], maps: tuple[dict[int, dict[str, Any]],
-                                                  dict[int, dict[str, Any]]]
+def _stamp_rows(step: dict[str, Any], maps: tuple[dict[int, list[dict[str, Any]]],
+                                                  dict[int, list[dict[str, Any]]]]
                 ) -> list[dict[str, Any]]:
-    """The step's stamps as rows: name, class, window and host span in s from t0."""
+    """The step's stamps as rows: name, class, window and host span in s from t0, and
+    ``shares`` (class -> share of the row's time). A stamp covers the entries of its group;
+    a run stamp, those of its run (the two classes of an attention run share it by bytes); a
+    batched measure stamp (group -1), those of the runs it covers (:func:`io.batch_cover`)."""
     st, names = step["stamps"], step["stamp_names"]
     by_group, by_run = maps
+    n = len(st["name"])
+    parsed = [(st["h0"][i], names[st["name"][i]].removeprefix("c5."), st["run"][i],
+               st["group"][i]) for i in range(n)]
+    cover = io.batch_cover(parsed)
     rows = []
-    for i in range(len(st["name"])):
+    for i in range(n):
         run, group, window = st["run"][i], st["group"][i], st["window"][i]
-        entry = by_group.get(group) if group >= 0 else by_run.get(run) if run >= 0 else None
-        if window < 0 and entry is not None:
-            window = entry["window"]
+        own = by_group.get(group) if group >= 0 else by_run.get(run) if run >= 0 else None
+        ents = own
+        if i in cover:
+            ents = [e for r in cover[i] for e in by_run.get(r, [])] or own
+        if window < 0 and own:
+            window = own[0]["window"]
+        shares = io.class_shares(ents) if ents else {}
         rows.append({"name": names[st["name"][i]].removeprefix("c5."), "run": run,
-                     "class": entry["class"] if entry else None, "window": window,
+                     "class": next(iter(shares), None), "shares": shares, "window": window,
                      "h0": st["h0"][i] * US, "h1": st["h1"][i] * US})
     return rows
 
 
-def _phase_totals(rows: list[dict[str, Any]]) -> dict[str, float]:
-    """Seconds per phase; ``host_stack`` is ``c5.serve − c5.copy`` (§5.2)."""
+def _phase_totals(rows: list[dict[str, Any]], cls: str | None = None) -> dict[str, float]:
+    """Seconds per phase; ``host_stack`` is ``c5.serve - c5.copy`` (§5.2). With ``cls``, each
+    row counts its ``shares`` of that class."""
     tot = dict.fromkeys(PHASES, 0.0)
     serve = 0.0
     for r in rows:
         d = r["h1"] - r["h0"]
+        if cls is not None:
+            d *= r["shares"].get(cls, 0.0)
         if r["name"] == "serve":
             serve += d
         elif r["name"] in tot:
@@ -940,8 +992,8 @@ def _c5_view(steps: list[dict[str, Any]], layout: dict[str, Any], sampler: Sampl
             wm, _ = sampler.means(_extent_ns(wr, t0))
             windows.append({"step": s["step"], "window": w, "phases_s": _phase_totals(wr),
                             "sampler": {f: wm.get(f) for f in VAR_FIELDS}})
-        for c in sorted({r["class"] for r in rows if r["class"]}):
-            for ph, v in _phase_totals([r for r in rows if r["class"] == c]).items():
+        for c in sorted({c for r in rows for c in r["shares"]}):
+            for ph, v in _phase_totals(rows, c).items():
                 classes.setdefault(c, {}).setdefault(ph, []).append(v)
         runs = [r for r in rows if r["name"] == "run"]
         over_time[str(s["step"])] = {"run": [r["run"] for r in runs],
@@ -1193,6 +1245,7 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                   if (m := dv.memory_of(d, gpu_memory))}
     tsec = (trace or {}).get("sections", {})
     c5_scale = _c5_scale((trace or {}).get("c5_slice") or {}, warns)
+    measure_reads = _measure_reads(layout, markers.header.get("device"))
     transcript = max((r["transcript_bytes"] for r in records if r.get("record") == "storage"),
                      default=0)
 
@@ -1213,8 +1266,11 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
     rollups = {n for n in depths if n not in spanned and levels.get(n) == "component"
                and sides.get(n) in phase_sides}
     if trace is not None:
-        absent = sorted(n for n in depths
-                        if n not in rollups and n not in (trace.get("sections") or {}))
+        # added-seconds rows (no host span, a rest aggregate) never reach a trace
+        added = {sec["name"] for s in all_untraced + traced for sec in s["sections"]
+                 if not sec.get("host_us") and sec.get("rest")}
+        absent = sorted(n for n in depths if n not in rollups and n not in added
+                        and n not in (trace.get("sections") or {}))
         if absent:
             warns.add(f"the trace summary has no section {', '.join(absent)}")
 
@@ -1272,15 +1328,18 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
             work = _work(name, _rate_key(name, sides, compute_bf16), counts.get(name),
                          _section_leaves(counts.get(name), leaves, transcript), tr,
                          c5_scale,
-                         2 * round(_mean(calls) or 0))
+                         2 * round(_mean(calls) or 0), measure_reads=measure_reads)
             floors = _floors(work, probes, warns, devices=devs, gpu_hash=dv.gpu_hash,
                              holders=[dv.holds_transcript(d) for d in devs])
             floor_s = max(floors.values()) if floors else None
             bound = max(floors, key=floors.__getitem__) if floors else "unknown"
             ratio = mean_t / floor_s if floor_s and mean_t is not None else None
             marks = []
+            # no trace: check 5's floor holds the measuring reads alone, a partial floor
+            partial = ["hbm serving", "pcie", "launch"] \
+                if work["bytes"].get("hbm_measure") and not tr else []
             if share is not None and ratio is not None and share >= THRESHOLDS["share"] \
-                    and ratio >= THRESHOLDS["ratio"]:
+                    and ratio >= THRESHOLDS["ratio"] and not partial:
                 marks.append("bottleneck")
             rate_key = next(iter(work["flops"]), None)
             lanes = [m for i, ((dm, _), p) in enumerate(zip(per_dev, probes, strict=True))
@@ -1307,8 +1366,19 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                                                  "few_samples": k < THRESHOLDS["min_samples"],
                                                  "truncated": truncated}
                                              for d, (m, k) in zip(devs, per_dev, strict=True)}}
+            detail = {}
+            if work["bytes"].get("hbm_measure") and floors.get("hbm"):
+                rs = [(p.get("rates") or {}).get("hbm_copy_bytes") for p in probes]
+                sec_s = max(1.0 / r for r in rs)
+                detail = {"floor_detail": {"hbm": {
+                    "serving_bytes": work["bytes"]["hbm"],
+                    "serving_s": work["bytes"]["hbm"] * sec_s,
+                    "measuring_reads_bytes": work["bytes"]["hbm_measure"],
+                    "measuring_reads_s": work["bytes"]["hbm_measure"] * sec_s}}}
+            if partial:
+                detail["floor_partial"] = {"missing": partial}
             sections[name] = {
-                "depth": depth, "time": time_stats, "share": share,
+                **detail, "depth": depth, "time": time_stats, "share": share,
                 "clocks": {"host_s": host_m, "gpu_s": gpu_m, "trace_s": trace_s, "agree": agree},
                 "util": util, "util_devices": util_devices, **by_dev,
                 "work": work, "floors_s": floors, "floor_s": floor_s, "bound": bound,
