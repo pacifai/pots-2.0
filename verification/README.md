@@ -1355,24 +1355,23 @@ twice its estimate. The counting pass is skipped (`--no-count`): counts do not d
 layout and FS27 measured them on an H100.
 
 The result reports each model's cost two ways, as the cost decision asks. The wall time is the
-steady step (the interval between verified steps, the `step_interval` row; of the three steps
-the sequential arm's mean of steps 2 and 3, the pipelined arm's step 2 alone, since its step 3
-is the drain, verified with the prover idle and shorter: about 11% on the Mac rehearsal, 0-5% on
-the 2026-10-25 four-H100 run, where Qwen2.5-0.5B's drain step took 9.25 s against 9.27-9.66 s for
-steps 2-3, Llama-3.2-1B's 12.37 against 12.44-12.51 and Falcon3-1B's 4.98 against 5.22-5.27; the
-pipelined arm's latency, the merged step's wall extent, is reported beside it and is not
-the step time). The accumulated GPU time is
-each GPU's held time summed over the GPUs a part holds (three verifier GPUs for 1 s are 3 s):
-per step, the prover side's time times the prover GPUs plus the verifier side's time times the
-verifier GPUs, the counts from the environment record's `gpu_roles`. It counts held time per
-role: the prover side's time once per prover GPU and the verifier side's once per verifier GPU;
-the prover's arrival and commit hashing run on GPUs 1-3 but sit inside the prover side's
-sections, so they count under the prover side, once.
-The log prints both per model and arm. `metrics.py`'s `gpu_held_s` multiplies
-each section's time by every device its
-process lists (four on the sequential arm), so it only bounds that quantity from above; the
-summary keeps it as `gpu_held_upper_s`. The session fails if any of the step times, per-GPU peaks
-or 12 peer rates is missing, or if any test case was skipped.
+steady step (the interval between verified steps, the `step_interval` row; of the three steps the
+sequential arm's mean of steps 2 and 3, the pipelined arm's step 2 alone, since its step 3 is the
+drain, verified with the prover idle and shorter: about 11% on the Mac rehearsal, about 1-5% of
+the steady mean on the four-H100 profiling run of 2026-10-25 (FS42, four steps, the drain step 4,
+steady steps 2-3), where Qwen2.5-0.5B's drain step took 9.25 s against 9.27-9.66 s for steps 2-3,
+Llama-3.2-1B's 12.37 against 12.44-12.51 and Falcon3-1B's 4.98 against 5.22-5.27; the pipelined
+arm's latency, the merged step's wall extent, is reported beside it and is not the step time).
+The accumulated GPU time is each GPU's held time summed over the GPUs a part holds (three
+verifier GPUs for 1 s are 3 s): per step, the prover side's time times the prover GPUs plus the
+verifier side's time times the verifier GPUs, the counts from the environment record's
+`gpu_roles`. It counts held time per role: the prover side's time once per prover GPU and the
+verifier side's once per verifier GPU; the prover's arrival and commit hashing run on GPUs 1-3
+but sit inside the prover side's sections, so they count under the prover side, once. The log
+prints both per model and arm. `metrics.py`'s `gpu_held_s` multiplies each section's time by
+every device its process lists (four on the sequential arm), so it only bounds that quantity from
+above; the summary keeps it as `gpu_held_upper_s`. The session fails if any of the step times,
+per-GPU peaks or 12 peer rates is missing, or if any test case was skipped.
 
 **Reading the result.** `summary.json["four_h100"]["pass"]` fails closed. It is true only when
 every part ended `ok` (or was done in an earlier run); the peer copies landed the right bytes;
@@ -1388,13 +1387,12 @@ model and arm, each step's prover, verifier, hand-off and total time, the accumu
 for both arms (not only the pipelined merged step; the per-arm log line shows the wall time
 beside it), the pipelined latency (the merged step's wall extent), the peak per device and
 `gpu_peak.json`'s whole-card peaks, and once
-the probe's per-device rates, its 12 peer rates and the peer check's per-pair rates. The job
-log ends with one `FS35 ok:` or `FS35 FAIL:` line per acceptance item, then a line per model
-and arm with the steady step time (steps 2 and 3, the pipelined arm's step 2 alone; step 1 pays
-one-off costs) and the four GPUs' peaks, then the slowest and fastest peer pair. An acceptance
-failure does not change the job's exit code. If computing the summary raises,
-`four_h100_error` holds the error
-and the job runs on.
+the probe's per-device rates, its 12 peer rates and the peer check's per-pair rates. The job log
+ends with one `FS35 ok:` or `FS35 FAIL:` line per acceptance item, then a line per model and arm
+with the steady step time (steps 2 and 3, the pipelined arm's step 2 alone; step 1 pays one-off
+costs) and the four GPUs' peaks, then the slowest and fastest peer pair. An acceptance failure
+does not change the job's exit code. If computing the summary raises, `four_h100_error` holds the
+error and the job runs on.
 
 ### The four-H100 profiling session (FS42)
 
