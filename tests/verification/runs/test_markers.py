@@ -466,3 +466,60 @@ def test_work_after_a_step_closes_lands_in_the_next_steps_interval(tiny):
     assert sorted(iv) == [1, 2, 3]
     assert iv[3] - iv[2] > 0.7 * SLEEP and iv[3] > work[3] + 0.7 * SLEEP
     assert work[3] < work[2] + 0.5 * SLEEP and iv[2] < work[2] + 0.5 * SLEEP
+
+
+def test_the_record_pass_at_a_rejected_step_is_in_that_steps_own_interval(monkeypatch):
+    """FS42: the record pass runs inside ``verify_step``, before the step closes: the rejected
+    step's ``step_interval`` holds it, no section does, and no later step exists to hold it."""
+    import time
+
+    from verification.verifier.driver import Verifier
+
+    c = MLPComputation((16, 32, 32, 8), n_s=4, eta=1e-3)
+    D = synthetic_dataset(c.widths, 40, seed=0)
+    w0 = init_weights(c.widths, seed=0)
+    T, SLEEP = 2, 0.2
+    final = honest_final(c, D, w0, T, seed=SEED)
+    s = next(x for x in scenarios(c, D, SEED) if x.name == "flip")
+    real = Verifier._record_rest
+    monkeypatch.setattr(Verifier, "_record_rest",
+                        lambda self, *a, **kw: (time.sleep(SLEEP), real(self, *a, **kw))[1])
+    rec = TimeRecorder("r", "flip")
+    res = run_scenario(c, D, w0, s, T=T, k=K, final=final, recorder=rec, seed=SEED)
+    assert res.loop.rejection is not None and res.loop.rejection.step == 2
+    rows = [r for r in rec.rows if r["record"] == "time" and r["level"] == "total"]
+    iv = {r["step"]: r["time_s"] for r in rows if r["component"] == "step_interval"}
+    work = {r["step"]: r["time_s"] for r in rows if r["component"] == "step" and r["side"] == "run"}
+    assert sorted(iv) == [1, 2]
+    assert iv[2] > work[2] + 0.8 * SLEEP  # in the rejected step's own interval ...
+    assert work[2] < 0.5 * SLEEP and iv[1] < 0.5 * SLEEP  # ... in no section, not in step 1's
+    assert all(r["time_s"] < 0.5 * SLEEP for r in rec.rows
+               if r["record"] == "time" and r["component"] != "step_interval")
+
+
+def test_a_traced_middle_steps_profiler_stop_and_export_land_in_the_next_interval(
+        tiny, monkeypatch, tmp_path):
+    """FS42: the profiler stop, export and gzip run after the traced step's close, so the
+    sleep put in the export is in step 3's interval, not step 2's (the traced step)."""
+    import time
+
+    c, D, w0 = tiny
+    T, SLEEP = 3, 0.3
+    final = honest_final(c, D, w0, T, seed=SEED)
+    real = torch.profiler.profile.export_chrome_trace
+
+    def slow_export(self, path, *a, **kw):
+        time.sleep(SLEEP)
+        return real(self, path, *a, **kw)
+
+    monkeypatch.setattr(torch.profiler.profile, "export_chrome_trace", slow_export)
+    with MetricsWriter(tmp_path, "tiny", device="cpu", model="tiny", corpus="synthetic", seed=0,
+                       config={}) as mw:
+        rec = mw.recorder(HONEST.name, trace_step=2, trace_c5="all")
+        run_scenario(c, D, w0, HONEST, T=T, k=K, final=final, recorder=rec, seed=SEED)
+    assert (tmp_path / "trace" / "step_00002.json.gz").exists()
+    rows = [r for r in rec.rows if r["record"] == "time" and r["level"] == "total"]
+    iv = {r["step"]: r["time_s"] for r in rows if r["component"] == "step_interval"}
+    work = {r["step"]: r["time_s"] for r in rows if r["component"] == "step" and r["side"] == "run"}
+    assert iv[3] > work[3] + 0.8 * SLEEP
+    assert iv[2] < work[2] + 0.5 * SLEEP and work[3] < 0.5 * SLEEP

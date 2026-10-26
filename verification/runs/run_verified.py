@@ -29,7 +29,8 @@ judged step, and a run at any other seed stores none: the planted-error sweep an
 verifier reads every step from memory, as every run does, and the step is written after its
 verdict, outside every timed section (:class:`KeptStepHandoff`), so its cost rows are an
 in-memory step's; but it is inside a step interval: the next step's in the sequential loop (the
-caller's ``on_step``, after the recorder's), the step's own in the pipelined loop. The root recomputed from the written files must equal the step's ``h``; a
+caller's ``on_step``, after the recorder's), the step's own in the pipelined loop. The root
+recomputed from the written files must equal the step's ``h``; a
 ``kept_transcript`` record holds the path, the size and the root, and is written only when a
 step was stored.
 

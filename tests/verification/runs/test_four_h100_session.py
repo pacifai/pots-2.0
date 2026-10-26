@@ -533,7 +533,7 @@ def test_the_log_lines_all_good():
     assert per[0] == (f"FS35 {KEYS[0]} seq: steady step 2.5 s (step_wall, mean of steps 2-3); "
                       "accumulated GPU time 17.0 s (mean of steps 2-3); GPU peaks "
                       "0: 39.1 GiB, 1: 19.5 GiB, 2: 20.5 GiB, 3: 21.5 GiB")
-    assert per[1].startswith(f"FS35 {KEYS[0]} pipe: steady step 2.5 s")
+    assert per[1].startswith(f"FS35 {KEYS[0]} pipe: steady step 3.0 s (step_wall, mean of step 2)")
     assert lines[-1].startswith("FS35 peer rates (probe, 12 pairs): slowest cuda:0->cuda:1 ")
     assert "fastest cuda:3->cuda:2" in lines[-1]
 
@@ -783,6 +783,23 @@ def test_the_steady_time_prefers_the_step_interval_then_step_wall_then_the_total
         pytest.approx(5.0), "total")
 
 
+def test_the_steady_steps_leave_out_a_pipelined_arms_drain_and_a_traced_last_step():
+    three = [10.0, 2.0, 1.0]
+    assert fs._steady_mean(three, 3) == pytest.approx(1.5)  # sequential: steps 2-3
+    assert fs._steady_mean(three, 3, pipelined=True) == pytest.approx(2.0)  # step 2 alone
+    four = [10.0, 2.0, 4.0, 100.0]
+    assert fs._steady_mean(four, 4, pipelined=True) == pytest.approx(3.0)  # steps 2-3
+    assert fs._steady_mean(four, 4, traced_last=True) == pytest.approx(3.0)
+    assert fs._steady_mean(four, 4) == pytest.approx((2.0 + 4.0 + 100.0) / 3)  # untraced: 2-4
+    assert fs._steady_mean([1.0, 2.0], 3, pipelined=True) is None
+    ex = {"step_interval_s": three}
+    assert fs._steady_s(ex, 3, pipelined=True) == (pytest.approx(2.0), "step_interval")
+    assert fs._steady_s(ex, 3) == (pytest.approx(1.5), "step_interval")
+    assert [fs._steady_steps_text(*a) for a in
+            ((3, False), (3, True), (4, True), (4, False, True))] == [
+        "steps 2-3", "step 2", "steps 2-3", "steps 2-3"]
+
+
 def test_the_summary_keeps_the_latency_beside_the_interval_for_the_pipelined_arm_only():
     k = KEYS[0]
     res = _four(_parts(**{f"seq_{k}": _arm(k, "seq", interval=[3.0, 2.0, 1.0]),
@@ -790,7 +807,9 @@ def test_the_summary_keeps_the_latency_beside_the_interval_for_the_pipelined_arm
     seq, pipe = (res["models"][k]["arms"][a] for a in ("seq", "pipe"))
     assert seq["steady_s"] == pytest.approx(1.5) and seq["steady_source"] == "step_interval"
     assert seq["step_interval_s"] == [3.0, 2.0, 1.0] and seq["latency_steady_s"] is None
-    assert pipe["steady_s"] == pytest.approx(0.75) and pipe["latency_steady_s"] == pytest.approx(2.5)
+    # a pipelined 3-step arm: step 3 is the drain, so step 2 alone is the steady step
+    assert pipe["steady_s"] == pytest.approx(1.0) and pipe["latency_steady_s"] == pytest.approx(3.0)
+    assert pipe["steady_steps"] == "step 2" and seq["steady_steps"] == "steps 2-3"
     assert pipe["step_wall_s"] == [4.0, 3.0, 2.0]
     per = [x for x in fs._four_lines(res) if x.startswith(f"FS35 {k} ")]
     assert per[0].startswith(
@@ -798,8 +817,8 @@ def test_the_summary_keeps_the_latency_beside_the_interval_for_the_pipelined_arm
         "accumulated GPU time")
     assert "latency" not in per[0]
     assert per[1].startswith(
-        f"FS35 {k} pipe: steady step 0.8 s (interval between verified steps, mean of steps 2-3);"
-        " latency 2.5 s (step_wall); accumulated GPU time")
+        f"FS35 {k} pipe: steady step 1.0 s (interval between verified steps, mean of step 2);"
+        " latency 3.0 s (step_wall); accumulated GPU time")
 
 
 def test_interval_only_records_have_a_steady_step_and_pass():

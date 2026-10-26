@@ -1355,8 +1355,9 @@ twice its estimate. The counting pass is skipped (`--no-count`): counts do not d
 layout and FS27 measured them on an H100.
 
 The result reports each model's cost two ways, as the cost decision asks. The wall time is the
-steady step (the interval between verified steps, the `step_interval` row, mean of steps 2 and
-3; the pipelined arm's latency, the merged step's wall extent, is reported beside it and is not
+steady step (the interval between verified steps, the `step_interval` row; of the three steps
+the sequential arm's mean of steps 2 and 3, the pipelined arm's step 2 alone, since its step 3
+is the drain, verified with the prover idle and about 11% short; the pipelined arm's latency, the merged step's wall extent, is reported beside it and is not
 the step time). The accumulated GPU time is
 each GPU's held time summed over the GPUs a part holds (three verifier GPUs for 1 s are 3 s):
 per step, the prover side's time times the prover GPUs plus the verifier side's time times the
@@ -1386,7 +1387,7 @@ beside it), the pipelined latency (the merged step's wall extent), the peak per 
 `gpu_peak.json`'s whole-card peaks, and once
 the probe's per-device rates, its 12 peer rates and the peer check's per-pair rates. The job
 log ends with one `FS35 ok:` or `FS35 FAIL:` line per acceptance item, then a line per model
-and arm with the steady step time (the mean of steps 2 and 3; step 1 pays one-off costs) and
+and arm with the steady step time (steps 2 and 3, the pipelined arm's step 2 alone; step 1 pays one-off costs) and
 the four GPUs' peaks, then the slowest and fastest peer pair. An acceptance failure does not
 change the job's exit code. If computing the summary raises, `four_h100_error` holds the error
 and the job runs on.
@@ -1419,6 +1420,15 @@ is the job's estimated runtime with its packing and grace window (the job deadli
 basis), 20 is the pod's setup (image pull, set-up script, upload), and the 2 is the margin.
 The pod's start command is the four-H100 session's above with a `sleep` of 12,900 s in place of
 17,100. Each part's time limit is about twice its estimate.
+
+**Measured (2026-10-25, one four-H100 SXM pod, every part passed).** From `job.log`: the native
+build 18 s, the peer check 26 s, the models 47 s, the four-GPU tests 557 s, the probe 362 s;
+per model the plain run 67-88 s, the card 84-91 s, the sequential arm 216-440 s (Qwen2.5-0.5B
+337, Llama-3.2-1B 440, Falcon3-1B 216) and the pipelined arm 257-335 s (293, 335, 257). The
+whole job took 57 min, from the deadline line to the last part's end, against the 66-min
+estimate. The tests ran 9.3 min against an estimate of 6 and the sequential arm of Llama-3.2-1B
+7.3 against 6; the plain runs (a guess of 3 min) and the cards ran well under theirs. The
+estimates above stay what sets the limits.
 
 **Expected cost.** The parts' estimated runtime, 66 min, plus about 15 min of pod setup and
 fetch, is about 81 min, so a run costs about 81 / 60 x $P/h, at $P/h the pod's hourly price;
@@ -1512,7 +1522,8 @@ python -m evaluation.results.profile.report \
 ```
 
 A test (`test_four_h100_profile_session.py`) checks these commands against the three tools'
-`--help`; no run has executed them yet.
+`--help`. The session ran once, on 2026-10-25 on one four-H100 SXM pod, and every part passed;
+the commands above ran as written on the fetched outputs.
 
 ## Workflow: calibrating the tolerances
 

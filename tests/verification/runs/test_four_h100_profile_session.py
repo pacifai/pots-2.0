@@ -225,6 +225,9 @@ def test_a_complete_fake_output_passes():
     assert pipe["latency_steady_s"] == pytest.approx(21.0) and seq["latency_steady_s"] is None
     assert seq["accumulated_steady_s"] == pytest.approx(27.0)
     assert seq["gpu_peak_mib"] == base.CARD_MIB
+    # the 4-step arms keep steps 2-3: the sequential arm's step 4 is traced, the pipelined arm's
+    # is its drain
+    assert seq["steady_steps"] == pipe["steady_steps"] == "steps 2-3"
     assert res["probe"]["devices"] == [f"cuda:{i}" for i in range(4)]
     assert json.dumps(res)
 
@@ -425,9 +428,11 @@ def test_the_log_lines_hold_the_numbers_and_ratios():
     per = [x for x in lines if x.startswith(f"FS42 {K} ")]
     assert per == [
         f"FS42 {K} seq: step 20.0 s (interval between verified steps), verifier 13.0 s per "
-        "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), 5.6 (accumulated GPU time); step ÷ training 2.9",
+        "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), "
+        f"5.6 (accumulated GPU time); step ÷ training 2.9",
         f"FS42 {K} pipe: step 11.0 s (interval between verified steps), verifier 13.0 s per "
-        "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), 5.6 (accumulated GPU time); step ÷ training 1.6"]
+        "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), "
+        f"5.6 (accumulated GPU time); step ÷ training 1.6"]
     assert sum(" plain training " in x for x in lines) == 2 * len(PKEYS)
     assert lines[-1].startswith(f"FS42 {PKEYS[-1]} pipe:")
 
