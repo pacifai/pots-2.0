@@ -31,6 +31,12 @@ before its asynchronous kernels finish, so it's meaningful when the section ends
 ``top_cpu_ops`` self times include descendants. ``sync_wait_us`` sums the host calls to
 ``cudaDeviceSynchronize``, ``cudaStreamSynchronize``, ``cudaEventSynchronize`` and ``cudaMemcpy``
 and the ``cudaMemcpyAsync`` calls of device-to-host copies from pageable memory (these block).
+``copy_kinds`` keeps the copies' bytes by kind: ``h2d_pinned``, ``h2d_pageable``,
+``h2d_unknown`` and the ``d2h`` ones, ``d2d``, and ``peer`` per ``cuda:S->cuda:D`` pair, while
+``copy_bytes`` keeps the totals by direction with peer copies inside ``d2d``. ``copy_devices``
+keeps the host copies' bytes by kind (the six host kinds) per GPU, the trace's device id as
+``kernel_span_us`` has it (the event's ``args.device``, else its ``pid``), so each can be priced
+at its own GPU's rate.
 ``gemm_flops`` and ``gemm_bytes`` come from the input shapes of the outermost ``mm``, ``addmm``,
 ``bmm`` and ``matmul`` ops (torch's Chrome trace carries no ``flops`` argument; when one is
 present, it's checked against the shapes, with a warning past 1%). ``gemm_flops`` is null when
@@ -41,12 +47,13 @@ every copy in it lacks ``args.bytes``.
 stamps of its traced runs (``stack`` is ``serve − copy``), and ``scale`` is the class's products
 over its traced runs' products (``members`` summed over the layout's entries of that class), so
 unequal runs weigh by their products. A stamp that covers entries of several classes is spread
-over them by the entries' bytes (``operand_bytes + product_bytes``): a ``group=-1`` stamp of a
-run that holds two classes (an attention run's scores and mixes), and the batched
-``c5.measure|group=-1`` stamp, which measures every run of a schedule step at once and is spread
-over the runs served since the previous one (:func:`io.batch_cover`). The window stamps
-(``c5.judge``) have no class and aren't summarized. A section row of the markers that has no span
-(added seconds, ``metrics.py``) can never be in a trace and is left out of the cross-check.
+over them by the entries' bytes (``io.entry_bytes``: operands, at the product's dtype, plus
+products): a ``group=-1`` stamp of a run that holds two classes (an attention run's scores
+and mixes), and the batched ``c5.measure|group=-1`` stamp, which measures every run of a
+schedule step at once and is spread over the runs served since the previous one
+(:func:`io.batch_cover`). The window stamps (``c5.judge``) have no class and aren't
+summarized. A section row of the markers that has no span (added seconds, ``metrics.py``)
+can never be in a trace and is left out of the cross-check.
 
 Run as ``python -m evaluation.results.profile.trace --trace T [--layout L] [--markers M]
 --out trace_summary.json``.
@@ -342,6 +349,7 @@ class _Acc:
         self.copy_unknown: dict[str, int] = {}
         self.kinds: dict[str, int] = dict.fromkeys(COPY_KINDS, 0)
         self.peer: dict[str, int] = {}
+        self.devcopies: dict[str, dict[str, int]] = {}
         self.gemm_bytes = 0
         self.gemm_flops: int | None = None
         self.gemm_ops = 0
@@ -363,6 +371,7 @@ class _Acc:
             "kernels": sum(map(len, self.kernels.values())), "launches": self.launches,
             "categories_us": self.cats, "copy_bytes": copy,
             "copy_kinds": {**self.kinds, "peer": dict(sorted(self.peer.items()))},
+            "copy_devices": {dev: dict(kinds) for dev, kinds in sorted(self.devcopies.items())},
             "gemm_flops": self.gemm_flops if self.gemm_ops else 0, "gemm_bytes": self.gemm_bytes,
             "sync_wait_us": self.sync_us,
             "top_cpu_ops": [{"name": n, "self_us": v[0], "calls": v[1]} for n, v in top],
@@ -528,6 +537,9 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
                         a.peer[pair] = a.peer.get(pair, 0) + int(nbytes)
                     else:
                         a.kinds[kind] += int(nbytes)
+                        if kind != "d2d":
+                            own = a.devcopies.setdefault(_device_id(e), {})
+                            own[kind] = own.get(kind, 0) + int(nbytes)
                 if blocking:
                     a.sync_us += call.get("dur", 0.0)
     if no_launch:

@@ -348,7 +348,9 @@ def test_check_5_partial_floor_says_not_counted_and_the_profile_says_it_once():
     out = page(profile(runs={"honest": v}))
     c5 = panel(out, "r0-check5")
     assert "Partial floor</b>: this run has no trace of check 5" in c5
-    assert "hbm serving, pcie, nvlink, launch are not counted (no trace)" in c5
+    assert ("the memory traffic of serving, PCIe, the GPU-to-GPU link and kernel launches "
+            "are not counted (no trace)") in c5
+    assert "hbm serving" not in c5 and "nvlink" not in c5
     assert "Check 5's floor is 0.070 s, set by memory bandwidth; it took 31× that. " in c5
     assert "sets no mark" in c5
     assert "serving (copying the operands and products), not counted (no trace), and" in c5

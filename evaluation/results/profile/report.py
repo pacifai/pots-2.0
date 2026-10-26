@@ -453,6 +453,14 @@ def _by_part(names: Sequence[str]) -> dict[str, list[str]]:
 FLOOR_RESOURCES = {"gemm": "the matmul rate", "hbm": "memory bandwidth", "pcie": "PCIe",
                    "nvlink": "the GPU-to-GPU link", "hash": "hashing",
                    "launch": "kernel launches"}
+MISSING_TERMS = {**FLOOR_RESOURCES, "hbm serving": "the memory traffic of serving"}
+"""A partial floor's missing terms (``floor_partial.missing``) in words: the floor's resources,
+and check 5's serving apart from its measuring reads."""
+
+
+def _words(terms: Sequence[str]) -> str:
+    names = [MISSING_TERMS.get(t, t) for t in terms]
+    return ", ".join(names[:-1]) + f" and {names[-1]}" if len(names) > 1 else "".join(names)
 
 
 def _inputs(profiles: Sequence[dict[str, Any]], names: Sequence[str], runs: list[Run]) -> str:
@@ -804,7 +812,7 @@ def _c5(run: Run) -> str:
                     + (f"; it took {fmt(ratio)}× that" if ratio is not None else "") + ". ")
         if part:
             lead = (f"<b>Partial floor</b>: this run has no trace of check 5, so "
-                    f"{esc(', '.join(part))} are not counted (no trace). " + lead
+                    f"{esc(_words(part))} are not counted (no trace). " + lead
                     + ("The ratio is not comparable with a traced run's, and it sets no mark. "
                        if ratio is not None else ""))
         reads_s = detail["measuring_reads_s"]

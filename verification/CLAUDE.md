@@ -2134,16 +2134,15 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `emit(t, out)` (an A3 splice).
   - `LoopResult(verdict, steps, w_final)`, where `steps` holds `StepRecord(t, rejection, loss,
     prove_s, commit_s, verify_s, handoff_s, ...)`, whose last field `known` is the leaves the
-    commit took from arrival digests (the `step` record writes it as `known`, `null` where the loop
-    has none, in both loops; `llama_step.work_rows` checks it, see there). `w_final` is host
-    copies from the pipelined loop and
-    the prover's device tensors from the sequential one, so tests compare it by value on the
-    CPU. The step summary's `capture["host_buffers"]` is the process-wide pinned pool, so it
-    differs between a long-lived test process and a fresh child: the equality test leaves it
-    out. `prove_s` excludes `emit`; `handoff_s` is the
-    time between the roles (the cache release on CUDA), in neither `commit_s` nor `verify_s`. Per-check timings and stats stay on
-    the verifier. A test holds weakrefs to each step's products and checks they are dead by the
-    next step.
+    commit took from arrival digests (the `step` record writes it as `known`, `null` where the
+    loop has none, in both loops; `llama_step.work_rows` checks it, see there). `w_final` is host
+    copies from the pipelined loop and the prover's device tensors from the sequential one, so
+    tests compare it by value on the CPU. The step summary's `capture["host_buffers"]` is the
+    process-wide pinned pool, so it differs between a long-lived test process and a fresh child:
+    the equality test leaves it out. `prove_s` excludes `emit`; `handoff_s` is the time between
+    the roles (the cache release on CUDA), in neither `commit_s` nor `verify_s`. Per-check timings
+    and stats stay on the verifier. A test holds weakrefs to each step's products and checks they
+    are dead by the next step.
 - `scenarios.py`: the instance-agnostic scenario harness, shared by `mlp_smoke` and
   `llama_step`. `Scenario(name, description, fault, expected)`, `Expected` (the declared
   outcome), `ScenarioResult`, `HONEST` (no fault, accept), `honest_final(c, D, w0, T, *, seed)`
@@ -2433,18 +2432,19 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   and, on a CPU run, the commit's row hash every leaf; on a CUDA run `c.device` the commit's
   row counts only the batch records, `W_t`, `W_{t+1}` and the `dK` products, since the other
   products' digests come from arrival hashing on their owner GPUs inside `train.*`, whose rows
-  carry FLOPs only; every hashing row carries `hash_leaves`, the leaf count). A `step` record
-  that carries `known` (the leaves the commit took from arrival digests; both loops write it) is
-  checked against that rule: `leaves` minus `known` must equal the rule's commit leaf count, else
-  one `WARNING step <t>: the commit hashed N leaves (leaves L minus known K), the work-row rule
-  counts M; its hash floor is off` line goes to stderr; the commit's count row then carries the
-  measured `known` as its own field (a record without `known` gives no warning and no field).
-  `leaves` and `known` are measured, because the counting pass is never run beside a timed run;
-  with `--count` no work rows are written, so a component and step has one `count` row. Exits 1
-  unless accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s
-  and `memory_run`'s `release_cache`), not the counting pass. `main` takes `W_0` from one `ReusedModel`, which then serves `honest_final` and
-  every prover run (timed, memory and count passes), so a no-metrics run loads the checkpoint
-  twice (that model and the verifier's), not four times.
+  carry FLOPs only; every hashing row carries `hash_leaves`, the leaf count), because the
+  counting pass is never run beside a timed run; with `--count` no work rows are written, so a
+  component and step has one `count` row. A `step` record that carries `known` (the leaves the
+  commit took from arrival digests; both loops write it) is checked against that rule: `leaves`
+  minus `known` must equal the rule's commit leaf count, else one `WARNING step <t>: the commit
+  hashed N leaves (leaves L minus known K), the work-row rule counts M; its hash floor is off`
+  line goes to stderr; the commit's count row then carries the measured `known` as its own field
+  (a record without `known` gives no warning and no field). `leaves` and `known` are measured,
+  not counted. Exits 1 unless accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory
+  pass (`run_honest`'s and `memory_run`'s `release_cache`), not the counting pass. `main` takes
+  `W_0` from one `ReusedModel`, which then serves `honest_final` and every prover run (timed,
+  memory and count passes), so a no-metrics run loads the checkpoint twice (that model and the
+  verifier's), not four times.
   - The real step from `W_0` on `π(1)` (k 7, η 1e-3), 2026-10-04 on the dev Mac: accepted.
     Most classes have an RMS of 0.3–0.9 and a max ≤ 2.7, except `S` (max 3.8), `Λ` (RMS 3.8,
     max 5.43, the global max) and `dF` (RMS 1.6, max 2.1); max κ 28 (`dX_down`).
@@ -3373,15 +3373,14 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `step_wall_s`, per-device peaks, `gpu_peak_mib`, the probe's per-device rates and 12 peer
     rates (`probe.json` version 2), `peer_check`'s per-pair rate (`gbps`), and per arm the GPU
     time: `accumulated_gpu_s` per step and `accumulated_steady_s` (the arm's steady steps), as the
-    cost
-    decision defines it (each GPU's held time summed over the GPUs a part holds: three
-    verifier GPUs for 1 s are 3 s), `_accumulated_gpu_s`: the prover side's `total` row
-    `time_s` times the prover GPUs plus the verifier side's times the verifier GPUs, counts
-    from the environment record's `gpu_roles` (the `run` side and harness rows are in
-    neither). `gpu_held_upper_s` per step (`metrics.py`'s `gpu_held_s` on the `step` row: each
-    section's seconds times every device its process lists, so four on the sequential arm) is
-    an upper bound, not that quantity. `four_pins(pins)` puts `FOUR_ORDER`'s models first and
-    any other run model after them without raising.
+    cost decision defines it (each GPU's held time summed over the GPUs a part holds: three
+    verifier GPUs for 1 s are 3 s), `_accumulated_gpu_s`: the prover side's `total` row `time_s`
+    times the prover GPUs plus the verifier side's times the verifier GPUs, counts from the
+    environment record's `gpu_roles` (the `run` side and harness rows are in neither).
+    `gpu_held_upper_s` per step (`metrics.py`'s `gpu_held_s` on the `step` row: each section's
+    seconds times every device its process lists, so four on the sequential arm) is an upper
+    bound, not that quantity. `four_pins(pins)` puts `FOUR_ORDER`'s models first and any other run
+    model after them without raising.
     An acceptance failure leaves the exit code alone; an error in the summary is recorded as
     `four_h100_error` and the session runs on. `four_default_deadline_s()` is 14,700 s: the
     estimates (101 min) plus packing 1 and the grace window 20, twice, rounded up to 100 s.

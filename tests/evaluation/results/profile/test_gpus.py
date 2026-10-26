@@ -494,3 +494,48 @@ def test_the_flow_notes_that_prover_side_gpu_use_understates_with_several_role_g
     paths = build_run(tmp_path / "one", device="cuda:0")
     one = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
     assert "understates them" not in htmllib.unescape(report.build([one]))
+
+
+PINNED = {"cuda:0": 6e10, "cuda:1": 5.5e10, "cuda:2": 5.3e10, "cuda:3": 4.9e10}
+
+
+def _pcie_floor(tmp_path, copies, kinds, **extra):
+    """Section V's PCIe floor with host copies ``copies`` (device id -> kind -> bytes) and
+    the per-GPU pinned rates ``PINNED`` (d2h at a tenth of them)."""
+    pr = v2_probe()
+    for d, r in PINNED.items():
+        pr["per_device"][d]["rates"] |= {"h2d_pinned_bytes": r, "d2h_pinned_bytes": r / 10}
+    paths = build(tmp_path / "run", probe_obj=pr)
+    secs = {n: {"launches": 0, "wall_us": None} for n in SECS}
+    secs["V"] |= {"copy_kinds": kinds, "copy_devices": copies}
+    t = paths["run_dir"] / "trace_summary.json"
+    t.write_text(json.dumps({"version": 1, "c5_slice": {}, "sections": secs, **extra}))
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t)
+    return out, out["runs"]["honest"]["sections"]["V"]
+
+
+def test_each_host_copy_is_priced_at_its_own_gpus_rate_and_a_directions_times_add(tmp_path):
+    out, v = _pcie_floor(
+        tmp_path, {"1": {"h2d_pinned": 1e9}, "2": {"h2d_pinned": 1e9, "d2h_pinned": 1e8},
+                   "3": {"h2d_pinned": 1e9}},
+        {"h2d_pinned": 3e9, "d2h_pinned": 1e8})
+    # the three uploads run one GPU at a time: each at its own rate, not 3e9 at the slowest 4.9e10
+    assert v["floors_s"]["pcie"] == pytest.approx(1e9 / 5.5e10 + 1e9 / 5.3e10 + 1e9 / 4.9e10)
+    assert v["floors_s"]["pcie"] < 3e9 / 4.9e10
+    assert not any("names no GPU" in w for w in out["warnings"])  # no fallback was used
+
+
+def test_the_larger_direction_sets_the_pcie_floor_and_a_gpu_outside_the_list_has_its_rate(
+        tmp_path):
+    # d2h is a tenth of the rate: 2e9 B on cuda:0 (not among V's devices) = 2e9 / 6e9 s
+    _, v = _pcie_floor(tmp_path, {"1": {"h2d_pinned": 1e9}, "0": {"d2h_pinned": 2e9}},
+                       {"h2d_pinned": 1e9, "d2h_pinned": 2e9})
+    assert v["floors_s"]["pcie"] == pytest.approx(2e9 / 6e9)
+
+
+def test_a_host_copy_with_no_gpu_id_goes_at_the_slowest_devices_rate_with_a_warning(tmp_path):
+    out, v = _pcie_floor(tmp_path, {"1": {"h2d_pinned": 1e9}, "host": {"h2d_pinned": 1e9}},
+                         {"h2d_pinned": 2e9})
+    # the unnamed 1e9 B is priced at the slowest of V's devices (cuda:3, 4.9e10)
+    assert v["floors_s"]["pcie"] == pytest.approx(1e9 / 5.5e10 + 1e9 / 4.9e10)
+    assert sum("names no GPU for some host copies" in w for w in out["warnings"]) == 1
