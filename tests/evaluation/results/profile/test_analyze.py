@@ -1194,3 +1194,23 @@ def test_entry_bytes_are_the_bytes_as_stored():
     layout = {"entries": [_entry(0, 0, "Y", 400, 100), _entry(1, 1, "Z", 40, 10, dtype="float32")]}
     assert analyze._measure_reads(layout, "cuda") == 300 + 50
     assert io.class_shares(layout["entries"]) == pytest.approx({"Y": 300 / 350, "Z": 50 / 350})
+
+
+def test_an_added_seconds_row_absent_from_the_trace_does_not_warn(tmp_path):
+    """A section with no host span and a ``rest`` aggregate (added seconds, as the hash parts
+    are) never reaches a trace; a real section the trace lacks still warns."""
+    extra = [time_row(k, "X", 0.01, "prover", "component") for k in (1, 2, 3)]
+    paths = build_run(tmp_path / "run", records_extra=extra)
+    f = paths["run_dir"] / "markers.jsonl"
+    lines = [json.loads(ln) for ln in f.read_text().splitlines()]
+    for ln in lines:
+        if ln.get("kind") == "step":
+            ln["sections"].append({"name": "X", "depth": 0, "calls": 1, "host_us": [],
+                                   "gpu_us": None, "rest": {"calls": 1, "host_s": 0.01},
+                                   "alloc": None})
+    jl(f, lines)
+    t = tmp_path / "trace_summary.json"
+    t.write_text(json.dumps({"version": 1, "c5_slice": {}, "sections": {"A": {}}}))
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t)
+    absent = [w for w in out["warnings"] if w.startswith("the trace summary has no section")]
+    assert len(absent) == 1 and "B" in absent[0] and "X" not in absent[0]
