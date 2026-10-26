@@ -451,3 +451,34 @@ def test_copy_bytes_are_kept_by_kind(tmp_path):
 def test_a_section_without_copies_has_zero_kinds(tmp_path):
     s = trace.summarize(write(tmp_path / "t.json.gz", [ann("S", 0, 100)]))["sections"]["S"]
     assert s["copy_kinds"] == {**dict.fromkeys(trace.COPY_KINDS, 0), "peer": {}}
+
+
+def test_host_copies_are_kept_per_gpu_by_kind(tmp_path):
+    def copy(kind, ts, nbytes, corr, device=None):
+        args = {"correlation": corr, "bytes": nbytes}
+        if device is not None:
+            args["device"] = device
+        return x("gpu_memcpy", f"Memcpy {kind}", ts, 5, args)
+
+    evs = [ann("S", 0, 300),
+           launch(50, 1, "cudaMemcpyAsync"), copy("HtoD (Pinned -> Device)", 60, 100, 1, 2),
+           launch(51, 2, "cudaMemcpyAsync"), copy("HtoD (Pinned -> Device)", 70, 30, 2, 2),
+           launch(52, 3, "cudaMemcpyAsync"), copy("HtoD (Pageable -> Device)", 80, 10, 3, 3),
+           launch(53, 4, "cudaMemcpyAsync"), copy("DtoH (Device -> Pinned)", 90, 7, 4, 3),
+           launch(54, 5, "cudaMemcpyAsync"), copy("HtoD (Pinned -> Device)", 100, 5, 5),
+           launch(55, 6, "cudaMemcpyAsync"), copy("DtoH (Device -> ?)", 110, 9, 6, 2),
+           launch(56, 7, "cudaMemcpyAsync"), copy("DtoD (Device -> Device)", 120, 11, 7, 2),
+           launch(57, 8, "cudaMemcpyPeerAsync"),
+           copy("PtoP (Device -> Device)", 130, 13, 8, 2)]
+    s = trace.summarize(write(tmp_path / "t.json.gz", evs))["sections"]["S"]
+    # keyed by the trace's device id (args.device, else the pid, 0 here); device-to-device and
+    # peer copies are not host copies
+    assert s["copy_devices"] == {"0": {"h2d_pinned": 5},
+                                 "2": {"h2d_pinned": 130, "d2h_unknown": 9},
+                                 "3": {"h2d_pageable": 10, "d2h_pinned": 7}}
+    assert s["copy_kinds"]["h2d_pinned"] == 135
+
+
+def test_a_section_without_host_copies_has_no_copy_devices(tmp_path):
+    s = trace.summarize(write(tmp_path / "t.json.gz", [ann("S", 0, 100)]))["sections"]["S"]
+    assert s["copy_devices"] == {}

@@ -137,7 +137,9 @@ def test_trace_work_sets_the_pcie_floor(tmp_path):
     paths = build_run(tmp_path / "run")
     t = tmp_path / "trace_summary.json"
     t.write_text(json.dumps({"version": 1, "c5_slice": {}, "sections": {
-        "A": {"copy_bytes": {"h2d": 1e9, "d2h": 5e8}, "launches": 1000}}}))
+        "A": {"copy_kinds": {"h2d_pageable": 1e9, "d2h_pageable": 5e8},
+              "copy_devices": {"0": {"h2d_pageable": 1e9, "d2h_pageable": 5e8}},
+              "launches": 1000}}}))
     s = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t
                         )["runs"]["honest"]["sections"]["A"]
     assert s["floors_s"]["pcie"] == pytest.approx(1e9 / 1e10)  # max of the two directions
@@ -395,9 +397,12 @@ def test_the_hbm_floor(tmp_path):
 def test_a_null_rate_drops_only_its_own_resource(tmp_path):
     rates = probe()["rates"] | {"h2d_pageable_bytes": None}
     paths = build_run(tmp_path / "run", probe_over={"rates": rates})
-    t = trace_file(tmp_path, {"A": {"copy_bytes": {"d2h": 1e9}, "launches": 10},
-                              "B": {"copy_bytes": {"h2d": 1e9}, "launches": 10},
-                              "C": {"launches": 10}})
+    t = trace_file(tmp_path, {
+        "A": {"copy_kinds": {"d2h_pageable": 1e9}, "launches": 10,
+              "copy_devices": {"0": {"d2h_pageable": 1e9}}},
+        "B": {"copy_kinds": {"h2d_pageable": 1e9}, "launches": 10,
+              "copy_devices": {"0": {"h2d_pageable": 1e9}}},
+        "C": {"launches": 10}})
     out = with_trace(paths, t)
     s = out["runs"]["honest"]["sections"]
     assert s["A"]["floors_s"]["pcie"] == pytest.approx(1e9 / 1e10)  # h2d count is 0: no term
@@ -1069,10 +1074,16 @@ def kinds(**over):
     return {**k, "peer": {}, **over}
 
 
+def on_device(copy_kinds, dev="0"):
+    """``copy_devices`` with every host copy of ``copy_kinds`` on one GPU."""
+    return {dev: {k: v for k, v in copy_kinds.items() if k[:3] in ("h2d", "d2h") and v}}
+
+
 def kind_floors(tmp_path, copy_kinds, **probe_extra):
     rates = probe()["rates"] | RATES
     paths = build_run(tmp_path / "run", probe_over={"rates": rates, **probe_extra})
-    t = trace_file(tmp_path, {"A": {"copy_kinds": copy_kinds}})
+    t = trace_file(tmp_path, {"A": {"copy_kinds": copy_kinds,
+                                    "copy_devices": on_device(copy_kinds)}})
     out = with_trace(paths, t)
     return out, out["runs"]["honest"]["sections"]["A"]
 
@@ -1092,18 +1103,33 @@ def test_pinned_and_pageable_bytes_share_a_direction_at_their_own_rates(tmp_path
     assert a["work"]["bytes"]["h2d"] == 2e9
 
 
-def test_unknown_kind_is_priced_pageable_with_a_warning(tmp_path):
+def test_unknown_kind_is_priced_pinned_with_a_warning(tmp_path):
     out, a = kind_floors(tmp_path, kinds(h2d_unknown=1e9))
-    assert a["floors_s"]["pcie"] == pytest.approx(1e9 / 1e10)
+    assert a["floors_s"]["pcie"] == pytest.approx(1e9 / 5e10)  # the faster rate: a lower bound
     assert sum("unknown kind" in w for w in out["warnings"]) == 1
 
 
-def test_a_summary_without_copy_kinds_is_priced_pageable_with_a_warning(tmp_path):
+def test_a_summary_without_copy_kinds_is_priced_pinned_with_a_warning(tmp_path):
     paths = build_run(tmp_path / "run", probe_over={"rates": probe()["rates"] | RATES})
     out = with_trace(paths, trace_file(tmp_path, {"A": {"copy_bytes": {"h2d": 1e9}}}))
     a = out["runs"]["honest"]["sections"]["A"]
-    assert a["floors_s"]["pcie"] == pytest.approx(1e9 / 1e10)  # not the pinned 5e10
+    assert a["floors_s"]["pcie"] == pytest.approx(1e9 / 5e10)  # not the pageable 1e10
     assert sum("no copy kinds" in w for w in out["warnings"]) == 1
+
+
+def test_a_summary_without_copy_devices_prices_host_copies_at_the_slowest_device(tmp_path):
+    paths = build_run(tmp_path / "run", probe_over={"rates": probe()["rates"] | RATES})
+    t = trace_file(tmp_path, {"A": {"copy_kinds": kinds(h2d_pinned=1e9)}})
+    out = with_trace(paths, t)
+    a = out["runs"]["honest"]["sections"]["A"]
+    assert a["floors_s"]["pcie"] == pytest.approx(1e9 / 5e10)
+    assert a["work"]["host_copies"] == {} and a["work"]["host_copies_loose"]["h2d_pinned"] == 1e9
+    assert sum("names no GPU for some host copies" in w for w in out["warnings"]) == 1
+    # with the devices named, no such warning, and the bytes are attributed
+    _, b = kind_floors(tmp_path / "b", kinds(h2d_pinned=1e9))
+    assert b["work"]["host_copies"] == {"cuda:0": {
+        "h2d_pinned": 1e9, "h2d_pageable": 0.0, "d2h_pinned": 0.0, "d2h_pageable": 0.0}}
+    assert not any(b["work"]["host_copies_loose"].values())
 
 
 def test_peer_copies_cost_at_the_probes_pair_rate_and_the_busiest_link_sets_the_floor(tmp_path):
@@ -1114,15 +1140,16 @@ def test_peer_copies_cost_at_the_probes_pair_rate_and_the_busiest_link_sets_the_
     assert a["work"]["bytes"]["peer"] == 8e9 and a["work"]["peer_pairs"]["cuda:3->cuda:0"] == 4e9
     # device-to-device copies stay on the HBM term; the peer ones are not in it
     assert a["floors_s"]["hbm"] == pytest.approx(1e9 / 1e11)
-    assert a["bound"] == "nvlink" and "nvlink" not in a["util"]
+    assert a["bound"] == "nvlink" and "utilization" not in a["marks"]
     assert not any("peer" in w for w in out["warnings"])
 
 
-def test_a_peer_copy_without_both_devices_uses_the_slowest_pair(tmp_path):
+def test_a_peer_copy_without_a_measured_pair_uses_the_fastest_pair_with_a_warning(tmp_path):
     out, a = kind_floors(tmp_path, kinds(peer={"cuda:?->cuda:?": 2e9}), peer=PEER)
-    assert a["floors_s"]["nvlink"] == pytest.approx(2e9 / 2e11)
+    assert a["floors_s"]["nvlink"] == pytest.approx(2e9 / 4e11)  # a lower bound
+    assert sum("names no device pair" in w for w in out["warnings"]) == 1
     out, a = kind_floors(tmp_path / "b", kinds(peer={"cuda:2->cuda:3": 2e9}), peer=PEER)
-    assert a["floors_s"]["nvlink"] == pytest.approx(2e9 / 2e11)  # named, not measured: warned
+    assert a["floors_s"]["nvlink"] == pytest.approx(2e9 / 4e11)  # named, not measured: warned
     assert sum("no peer rate for cuda:2->cuda:3" in w for w in out["warnings"]) == 1
 
 
@@ -1214,3 +1241,20 @@ def test_an_added_seconds_row_absent_from_the_trace_does_not_warn(tmp_path):
     out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], t)
     absent = [w for w in out["warnings"] if w.startswith("the trace summary has no section")]
     assert len(absent) == 1 and "B" in absent[0] and "X" not in absent[0]
+
+
+def test_the_headline_mean_skips_nan_like_null():
+    got, n = analyze._mean_means([({"f": 0.1, "g": NAN}, 5), ({"f": NAN, "g": NAN}, 4),
+                                  ({"f": 0.3, "g": None}, 6)])
+    assert got["f"] == pytest.approx(0.2) and got["g"] is None and n == 4
+
+
+def test_an_empty_trace_entry_is_a_trace_not_a_missing_one(tmp_path):
+    paths = cuda_run(tmp_path, hash_bytes={"A": 20_000_000})
+    s = with_trace(paths, trace_file(tmp_path, {"A": {}}))["runs"]["honest"]["sections"]["A"]
+    assert "floor_partial" not in s and s["floors_s"]["hash"] > 0
+
+
+def test_peer_bytes_are_a_float_even_without_pairs(tmp_path):
+    _, a = kind_floors(tmp_path, kinds(h2d_pinned=1e9))
+    assert isinstance(a["work"]["bytes"]["peer"], float) and a["work"]["bytes"]["peer"] == 0.0

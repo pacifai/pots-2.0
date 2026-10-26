@@ -29,22 +29,26 @@ clock and :data:`US` turns µs into s; nothing else converts.
 - Trace work (launches, copy bytes, GEMM bytes) is the traced step's own values; check 5's
   sections (``5``, ``5.*``) scale by ``Σ scaled["run"] ÷ Σ phases_us["run"]`` over the classes
   of ``c5_slice`` (estimated total run time over traced run time).
-- Copies cost at their own kind's rate (FS42; the 2026-10-19 rule priced every copy at the
-  pageable rate, on the premise that the trace cannot tell pinned from pageable memory, but it
-  can: it names each copy "Memcpy HtoD (Pinned -> Device)", "(Pageable -> Device)", "DtoH
-  (Device -> Pinned)", "PtoP (Device -> Device)" for a GPU-to-GPU copy, "DtoD"). The trace
-  summary's ``copy_kinds`` keeps the bytes by kind; each is priced at the probe's rate for it:
-  ``h2d_pinned_bytes``, ``h2d_pageable_bytes``, ``d2h_pinned_bytes``, ``d2h_pageable_bytes``;
-  peer copies (``nvlink`` floor) at the probe's ``peer`` rate of their device pair (the slowest
-  pair's when the event names no pair), each pair on its own link, the busiest one setting the
-  floor; ``hbm`` bytes are ``gemm_bytes`` plus the device-to-device copies (serving, before
-  FS42 also the peer copies). A copy of unknown kind, or a trace summary without
-  ``copy_kinds``, is priced pageable, with a warning. The PCIe floor is the larger of the two
-  directions' times (the link is full duplex), each direction summing its pinned and pageable
-  bytes. Section ``5`` on a CUDA run adds the measuring
-  kernel's reads (``bytes.hbm_measure``, ``_measure_reads``): per layout entry A, B and P as
-  stored (``operand_bytes`` is fp32, so it is rescaled to the product dtype), times
-  once per step (no sweep factor) and not scaled by the trace slice; the section's
+- Copies cost at their own kind's rate, on their own GPU (FS42; the 2026-10-19 rule priced
+  every copy at the pageable rate, on the premise that the trace cannot tell pinned from
+  pageable memory, but it can: it names each copy "Memcpy HtoD (Pinned -> Device)",
+  "(Pageable -> Device)", "DtoH (Device -> Pinned)", "PtoP (Device -> Device)" for a GPU-to-GPU
+  copy, "DtoD"). The trace summary's ``copy_kinds`` keeps the bytes by kind and ``copy_devices``
+  the host copies' bytes by kind per GPU; each is priced at that GPU's probe rate for its kind:
+  ``h2d_pinned_bytes``, ``h2d_pageable_bytes``, ``d2h_pinned_bytes``, ``d2h_pageable_bytes``.
+  The PCIe floor is the larger of the two directions' times (the link is full duplex), each
+  direction summing its GPUs' times (the trace shows copies on different GPUs running one at a
+  time). Peer copies (``nvlink`` floor) go at the probe's ``peer`` rate of their device pair,
+  each pair on its own link, the busiest one setting the floor; ``hbm`` bytes are ``gemm_bytes``
+  plus the device-to-device copies (serving, before FS42 also the peer copies). Three fallbacks,
+  each with a warning, all choosing the faster rate so the floor stays a lower bound: a peer
+  copy with no named or measured pair costs at the fastest pair's rate, a copy of unknown kind
+  (or any copy of a trace summary without ``copy_kinds``) at the pinned rate. A host copy with
+  no GPU (a summary without ``copy_devices``) uses the slowest of the section's devices'
+  rates, which can overstate the time of copies on the faster ones. Section ``5`` on a CUDA
+  run adds the measuring kernel's reads (``bytes.hbm_measure``, ``_measure_reads``): per layout
+  entry A, B and P as stored (``operand_bytes`` is fp32, so it is rescaled to the product
+  dtype), once per step (no sweep factor) and not scaled by the trace slice; the section's
   ``floor_detail.hbm`` gives ``serving_s`` and ``measuring_reads_s`` apart. ``hash`` bytes are
   ``hash_in_bytes`` plus ``hash_out_bytes`` of the ``count`` row; ``leaves`` come from the
   ``storage`` record, for every section whose ``hash_in_bytes`` is at least half the step's
@@ -562,7 +566,7 @@ def _direction(d: dict[str, Any] | None, key: str) -> float:
     return float(d.get(key) or d.get("memcpy_" + key) or 0.0)
 
 
-def _missing_terms(name: str, work: dict[str, Any]) -> list[str]:
+def _missing_terms(work: dict[str, Any]) -> list[str]:
     """The floor terms that come from the trace and so are missing (not zero) without one:
     memory traffic (``hbm serving`` for check 5, whose floor holds the measuring reads
     besides, else ``hbm``), PCIe, the GPU-to-GPU link and launches."""
@@ -581,7 +585,11 @@ def _work(name: str, rate_key: str, count: dict[str, Any] | None, leaves: int,
     ``h2d_pageable``, ``d2h_pinned``, ``d2h_pageable`` (``h2d`` and ``d2h`` are the totals), the
     device-to-device ones in ``hbm`` with the GEMM bytes, and the GPU-to-GPU ones as ``peer``
     (their total) with ``work["peer_pairs"]`` (device pair -> bytes). A copy of unknown kind, or
-    every copy of a trace summary without ``copy_kinds``, counts as pageable, with a warning."""
+    every copy of a trace summary without ``copy_kinds``, counts as pinned (the faster rate, so
+    the floor stays a lower bound), with a warning. The host copies by GPU are
+    ``work["host_copies"]`` (device -> the four kinds' bytes, from ``copy_devices``); what
+    has no GPU is ``work["host_copies_loose"]`` (all of it for a summary without
+    ``copy_devices``)."""
     count, trace = count or {}, trace or {}
     flops = float(count.get("flops") or 0.0)
     hash_bytes = float(count.get("hash_in_bytes") or 0.0) \
@@ -593,29 +601,46 @@ def _work(name: str, rate_key: str, count: dict[str, Any] | None, leaves: int,
     if kinds is None:
         if copy and warns is not None:
             warns.add("the trace summary has no copy kinds: its copies are priced at the "
-                      "pageable rates")
+                      "pinned rates")
         d2d = _direction(copy, "d2d")
-        pinned = {"h2d": 0.0, "d2h": 0.0}
-        pageable = {d: _direction(copy, d) for d in ("h2d", "d2h")}
+        pinned = {d: _direction(copy, d) for d in ("h2d", "d2h")}
+        pageable = {"h2d": 0.0, "d2h": 0.0}
     else:
         d2d = float(kinds.get("d2d") or 0.0)
         pairs = {k: scale * float(v or 0.0) for k, v in (kinds.get("peer") or {}).items()}
-        pinned = {d: float(kinds.get(f"{d}_pinned") or 0.0) for d in ("h2d", "d2h")}
         unknown = {d: float(kinds.get(f"{d}_unknown") or 0.0) for d in ("h2d", "d2h")}
         if any(unknown.values()) and warns is not None:
             warns.add("the trace summary has copies of unknown kind (pinned or pageable): "
-                      "priced at the pageable rates")
-        pageable = {d: float(kinds.get(f"{d}_pageable") or 0.0) + unknown[d]
-                    for d in ("h2d", "d2h")}
+                      "priced at the pinned rates")
+        pinned = {d: float(kinds.get(f"{d}_pinned") or 0.0) + unknown[d] for d in ("h2d", "d2h")}
+        pageable = {d: float(kinds.get(f"{d}_pageable") or 0.0) for d in ("h2d", "d2h")}
+    host = {f"{d}_{k}": scale * v[d] for k, v in (("pinned", pinned), ("pageable", pageable))
+            for d in ("h2d", "d2h")}
+    by_dev: dict[str, dict[str, float]] = {}
+    loose = dict(host)
+    if kinds is not None and isinstance(trace.get("copy_devices"), dict):
+        loose = dict.fromkeys(host, 0.0)
+        for dev, own in trace["copy_devices"].items():
+            row = {k: 0.0 for k in host}
+            for kind, n in own.items():
+                key = kind.replace("_unknown", "_pinned")
+                if key in row:
+                    row[key] += scale * float(n or 0.0)
+            if str(dev).isdigit():
+                by_dev[f"cuda:{dev}"] = row
+            else:
+                loose = {k: loose[k] + row[k] for k in loose}
+    if any(loose.values()) and warns is not None:
+        warns.add("the trace summary names no GPU for some host copies: priced at the slowest "
+                  "device's rate")
     nbytes = {"hbm": scale * (float(trace.get("gemm_bytes") or 0.0) + d2d),
-              "h2d": scale * (pinned["h2d"] + pageable["h2d"]),
-              "d2h": scale * (pinned["d2h"] + pageable["d2h"]),
-              "h2d_pinned": scale * pinned["h2d"], "h2d_pageable": scale * pageable["h2d"],
-              "d2h_pinned": scale * pinned["d2h"], "d2h_pageable": scale * pageable["d2h"],
-              "peer": sum(pairs.values()), "hash": hash_bytes}
+              "h2d": host["h2d_pinned"] + host["h2d_pageable"],
+              "d2h": host["d2h_pinned"] + host["d2h_pageable"], **host,
+              "peer": sum(pairs.values(), 0.0), "hash": hash_bytes}
     if name == "5":
         nbytes["hbm_measure"] = measure_reads
     return {"flops": {rate_key: flops} if flops else {}, "bytes": nbytes, "peer_pairs": pairs,
+            "host_copies": by_dev, "host_copies_loose": loose,
             "leaves": leaves, "launches": scale * float(trace.get("launches") or 0.0),
             "syncs": syncs}
 
@@ -625,8 +650,8 @@ def _peer_floor(work: dict[str, Any], plist: Sequence[dict[str, Any]],
     """The GPU-to-GPU copies' floor: each device pair's bytes at the probe's ``peer`` rate for
     that pair, the slowest such time (the links are independent, so a lower bound is the busiest
     one). A pair the event did not name (``cuda:?``) or the probe did not measure runs at the
-    slowest measured pair's rate (the probe's peer rates are the top level's, shared by every
-    device)."""
+    fastest measured pair's rate, with a warning, so the floor stays a lower bound (the probe's
+    peer rates are the top level's, shared by every device)."""
     pairs = {k: v for k, v in (work.get("peer_pairs") or {}).items() if v}
     if not pairs:
         return None
@@ -634,23 +659,28 @@ def _peer_floor(work: dict[str, Any], plist: Sequence[dict[str, Any]],
     if not rates:
         warns.add("the probe has no peer rates: the nvlink floor is skipped")
         return None
-    slowest = min(rates.values())
+    fastest = max(rates.values())
     times = []
     for pair, n in pairs.items():
-        if pair not in rates and "?" not in pair:
-            warns.add(f"the probe has no peer rate for {pair}: the slowest pair's is used")
-        times.append(n / rates.get(pair, slowest))
+        if pair not in rates:
+            warns.add("a GPU-to-GPU copy names no device pair: the fastest pair's rate is used"
+                      if "?" in pair else
+                      f"the probe has no peer rate for {pair}: the fastest pair's is used")
+        times.append(n / rates.get(pair, fastest))
     return max(times)
 
 
 def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, Any]],
             warns: set[str], *, devices: Sequence[str | None] = (), gpu_hash: bool = False,
-            holders: Sequence[bool] = ()) -> dict[str, float]:
+            holders: Sequence[bool] = (),
+            copy_probes: dict[str, dict[str, Any]] | None = None) -> dict[str, float]:
     """§6 step 2: one floor per resource that has work. A term with a zero count adds 0
     whatever its rate; a non-zero count with a null rate drops the resource, with a warning.
     PCIe is the larger of the two directions' times (the link is full duplex), each direction
-    summing its pinned and pageable bytes at their own rates; ``nvlink`` is the GPU-to-GPU
-    copies (:func:`_peer_floor`).
+    summing, over the GPUs that copied (``work["host_copies"]``), their pinned and pageable
+    bytes at that GPU's own rates (``copy_probes``: the probe as each of them sees it); bytes
+    with no GPU go at the slowest section device's rate. ``nvlink`` is the GPU-to-GPU copies
+    (:func:`_peer_floor`).
 
     ``probes`` is the probe as each of the section's devices sees it (FS35; one dict is one
     device). The work does not divide over devices (the split replay runs its units one after
@@ -691,15 +721,23 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
     b = work["bytes"]
     total("hbm", [("hbm_copy_bytes", b["hbm"] + b.get("hbm_measure", 0.0),
                    rate_s("hbm_copy_bytes"))])
-    link = [(d, kind, f"{d}_{kind}_bytes") for d in ("h2d", "d2h")
-            for kind in ("pinned", "pageable")]
-    live = [(d, key, b[f"{d}_{kind}"], rate_s(key)) for d, kind, key in link
-            if b.get(f"{d}_{kind}")]
-    missing = [key for _, key, _, r in live if r is None]
+    own_probes = copy_probes or {}
+    legs: list[tuple[str, str, float, float | None]] = []  # direction, rate key, bytes, s/byte
+    for d in ("h2d", "d2h"):
+        for kind in ("pinned", "pageable"):
+            key = f"{d}_{kind}_bytes"
+            for dev, own in (work.get("host_copies") or {}).items():
+                rate = ((own_probes.get(dev) or {}).get("rates") or {}).get(key)
+                if own.get(f"{d}_{kind}"):
+                    legs.append((d, key, own[f"{d}_{kind}"], None if rate is None else 1 / rate))
+            loose = (work.get("host_copies_loose") or {}).get(f"{d}_{kind}")
+            if loose:
+                legs.append((d, key, loose, rate_s(key)))
+    missing = sorted({key for _, key, _, r in legs if r is None})
     if missing:
         warns.add(f"the probe has no {', '.join(missing)}: the pcie floor is skipped")
-    elif live:  # each direction's pinned and pageable bytes share the link; full duplex
-        out["pcie"] = max(sum(n * r for dd, _, n, r in live if dd == d) for d in ("h2d", "d2h"))
+    elif legs:  # each direction sums its GPUs' times (one copy at a time); full duplex
+        out["pcie"] = max(sum(n * r for dd, _, n, r in legs if dd == d) for d in ("h2d", "d2h"))
     peer = _peer_floor(work, plist, warns)
     if peer is not None:
         out["nvlink"] = peer
@@ -1046,13 +1084,13 @@ class _MeanView:
 
 def _mean_means(per_dev: Sequence[tuple[dict[str, float | None], int]]
                 ) -> tuple[dict[str, float | None], int]:
-    """The headline of several devices: each field's mean over the devices with a non-null
-    value, and the smallest sample count. One device is returned as it is."""
+    """The headline of several devices: each field's mean over the devices with a value (not
+    null, not NaN), and the smallest sample count. One device is returned as it is."""
     if len(per_dev) == 1:
         return per_dev[0]
     out: dict[str, float | None] = {}
     for f in per_dev[0][0]:
-        vals = [m[f] for m, _ in per_dev if m.get(f) is not None]
+        vals = [m[f] for m, _ in per_dev if m.get(f) is not None and not math.isnan(m[f])]
         out[f] = statistics.fmean(vals) if vals else None
     return out, min(n for _, n in per_dev)
 
@@ -1426,16 +1464,17 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                          c5_scale,
                          2 * round(_mean(calls) or 0), measure_reads=measure_reads, warns=warns)
             floors = _floors(work, probes, warns, devices=devs, gpu_hash=dv.gpu_hash,
-                             holders=[dv.holds_transcript(d) for d in devs])
+                             holders=[dv.holds_transcript(d) for d in devs],
+                             copy_probes={d: dv.probe_of(d, True) for d in work["host_copies"]})
             floor_s = max(floors.values()) if floors else None
             bound = max(floors, key=floors.__getitem__) if floors else "unknown"
             ratio = mean_t / floor_s if floor_s and mean_t is not None else None
             marks = []
             # on a CUDA run without the section's trace, the trace-derived terms (memory
             # traffic, PCIe, peer, launch) are missing, not zero: the floor is partial
-            partial = _missing_terms(name, work) \
+            partial = _missing_terms(work) \
                 if floor_s and str(markers.header.get("device") or "").startswith("cuda") \
-                and not tr else []
+                and tr is None else []
             if share is not None and ratio is not None and share >= THRESHOLDS["share"] \
                     and ratio >= THRESHOLDS["ratio"] and not partial:
                 marks.append("bottleneck")
