@@ -41,10 +41,10 @@ clock and :data:`US` turns µs into s; nothing else converts.
   time; downloads overlap a little in check 5, where the sum can overstate that direction, which
   stays below the uploads there). Peer copies (``nvlink`` floor) go at the probe's ``peer`` rate
   of their device pair, each pair on its own link, the busiest one setting the floor; ``hbm``
-  bytes are ``gemm_bytes``
-  plus the device-to-device copies (serving, before FS42 also the peer copies). Three fallbacks,
-  each with a warning, all choosing the faster rate so the floor stays a lower bound: a peer
-  copy with no named or measured pair costs at the fastest pair's rate, a copy of unknown kind
+  bytes are ``gemm_bytes`` plus the device-to-device copies (serving, before FS42 also the peer
+  copies). Three fallbacks, each with a warning, all choosing the faster rate so the floor
+  stays a lower bound: a peer copy with no named or measured pair costs at the fastest pair's
+  rate, a copy of unknown kind
   (or any copy of a trace summary without ``copy_kinds``) at the pinned rate. A host copy with
   no GPU (a summary without ``copy_devices``) uses the slowest of the section's devices'
   rates, which can overstate the time of copies on the faster ones. Section ``5`` on a CUDA
