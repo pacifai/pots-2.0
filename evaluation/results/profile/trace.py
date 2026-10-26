@@ -23,9 +23,10 @@ outside every section, are counted in ``warnings`` and left out. Each warning ap
 its count.
 
 **Per section.** ``wall_us`` is the length of the union of the section's own occurrences.
-``kernel_us`` sums kernel durations and ``kernel_span_us`` is the union of their intervals, so
-``gpu_idle_us = wall_us − kernel_span_us``. It is negative when a section ends before its
-asynchronous kernels finish, so it's meaningful when the section ends in a sync.
+``kernel_us`` sums kernel durations. ``kernel_span_us`` is the union of each GPU's kernel
+intervals, a mapping from the trace's device id (the event's ``args.device``, else its ``pid``)
+to µs, and ``gpu_idle_us`` is ``wall_us`` less that, per GPU. It is negative when a section ends
+before its asynchronous kernels finish, so it's meaningful when the section ends in a sync.
 ``top_cpu_ops`` self times include descendants. ``sync_wait_us`` sums the host calls to
 ``cudaDeviceSynchronize``, ``cudaStreamSynchronize``, ``cudaEventSynchronize`` and ``cudaMemcpy``
 and the ``cudaMemcpyAsync`` calls of device-to-host copies from pageable memory (these block).
@@ -37,8 +38,14 @@ every copy in it lacks ``args.bytes``.
 
 **Check 5.** A stamp's span is its annotation's duration. A class's ``phases_us`` sum the
 stamps of its traced runs (``stack`` is ``serve − copy``), and ``scale`` is the class's products
-over its traced runs' products (``members`` summed over the layout's entries), so unequal runs
-weigh by their products. The window stamps (``c5.judge``) have no class and aren't summarized.
+over its traced runs' products (``members`` summed over the layout's entries of that class), so
+unequal runs weigh by their products. A stamp that covers entries of several classes is spread
+over them by the entries' bytes (``operand_bytes + product_bytes``): a ``group=-1`` stamp of a
+run that holds two classes (an attention run's scores and mixes), and the batched
+``c5.measure|group=-1`` stamp, which measures every run of a schedule step at once and is spread
+over the runs served since the previous one (:func:`io.batch_cover`). The window stamps
+(``c5.judge``) have no class and aren't summarized. A section row of the markers that has no span
+(added seconds, ``metrics.py``) can never be in a trace and is left out of the cross-check.
 
 Run as ``python -m evaluation.results.profile.trace --trace T [--layout L] [--markers M]
 --out trace_summary.json``.
@@ -55,6 +62,8 @@ from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+from evaluation.results.profile import io
 
 __all__ = ["VERSION", "KERNEL_CATEGORIES", "CATEGORIES", "GEMM_OPS", "summarize", "main"]
 
@@ -100,6 +109,12 @@ def _read_events(path: Path) -> list[Event]:
         data = json.load(f)
     events = data["traceEvents"] if isinstance(data, dict) else data
     return [e for e in events if e.get("ph") == "X" and e.get("cat") in KEEP_CATS]
+
+
+def _device_id(e: Event) -> str:
+    """The GPU a device event ran on, as the trace names it: ``args.device``, else ``pid``."""
+    dev = e.get("args", {}).get("device")
+    return str(e.get("pid") if dev is None else dev)
 
 
 def _end(e: Event) -> float:
@@ -294,7 +309,7 @@ def _gemm_ops(ops: Sequence[Event], warn: _Warnings) -> dict[int, tuple[int, int
 class _Acc:
     def __init__(self) -> None:
         self.own: list[tuple[float, float]] = []
-        self.kernels: list[tuple[float, float]] = []
+        self.kernels: dict[str, list[tuple[float, float]]] = defaultdict(list)
         self.cats = dict.fromkeys(CATEGORIES, 0.0)
         self.launches = 0
         self.copy_bytes: dict[str, int] = {}
@@ -307,8 +322,8 @@ class _Acc:
 
     def result(self) -> dict[str, Any]:
         wall = _union(self.own)
-        kernel_us = sum(b - a for a, b in self.kernels)
-        span = _union(self.kernels)
+        kernel_us = sum(b - a for ks in self.kernels.values() for a, b in ks)
+        span = {dev: _union(ks) for dev, ks in sorted(self.kernels.items())}
         copy = {}
         for d in ("h2d", "d2h", "d2d"):
             lacking = self.copy_unknown.get(d, 0)
@@ -316,7 +331,8 @@ class _Acc:
         top = sorted(self.ops.items(), key=lambda kv: (-kv[1][0], kv[0]))[:TOP_OPS]
         return {
             "wall_us": wall, "kernel_us": kernel_us, "kernel_span_us": span,
-            "gpu_idle_us": wall - span, "kernels": len(self.kernels), "launches": self.launches,
+            "gpu_idle_us": {dev: wall - v for dev, v in span.items()},
+            "kernels": sum(map(len, self.kernels.values())), "launches": self.launches,
             "categories_us": self.cats, "copy_bytes": copy,
             "gemm_flops": self.gemm_flops if self.gemm_ops else 0, "gemm_bytes": self.gemm_bytes,
             "sync_wait_us": self.sync_us,
@@ -325,13 +341,17 @@ class _Acc:
 
 
 def _markers_sections(path: Path) -> set[str] | None:
-    """The section names of the traced step's marker line, or ``None`` without one."""
+    """The section names of the traced step's marker line that have a span, or ``None`` without
+    a line. A row with no host span and a ``rest`` aggregate is added seconds (``Seam.add``, the
+    hashing parts ``P3.commit.hash.<part>`` and ``2.hash.<part>``): no annotation wraps it, so
+    it is never in a trace and is left out."""
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         row = json.loads(line)
         if row.get("kind") == "step" and row.get("traced"):
-            return {s["name"] for s in row.get("sections", [])}
+            return {s["name"] for s in row.get("sections", [])
+                    if s.get("host_us") or not s.get("rest")}
     return None
 
 
@@ -449,8 +469,9 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
         dur = e.get("dur", 0.0)
         if e["cat"] == "kernel":
             cat = _kernel_category(e["name"])
+            dev = _device_id(e)
             for a in tg:
-                a.kernels.append((e["ts"], _end(e)))
+                a.kernels[dev].append((e["ts"], _end(e)))
                 a.cats[cat] += dur
         elif e["cat"] == "gpu_memset":
             for a in tg:
@@ -537,30 +558,57 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
 def _c5_slice(stamps: Sequence[tuple[Event, str, dict[str, int]]], layout_path: Path,
               trace_path: Path, warn: _Warnings) -> dict[str, Any]:
     layout = json.loads(layout_path.read_text(encoding="utf-8"))
-    cls: dict[int, str] = {}
-    members: dict[int, int] = defaultdict(int)
+    by_run: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    by_group: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for ent in layout["entries"]:
-        run = ent["run"]
-        if cls.setdefault(run, ent["class"]) != ent["class"]:
-            warn.add("a layout run has entries of two classes; the first is used")
-        members[run] += ent["members"]
-    total_runs: dict[str, set[int]] = defaultdict(set)
-    for run, c in cls.items():
-        total_runs[c].add(run)
+        by_run[ent["run"]].append(ent)
+        by_group[ent["group"]].append(ent)
+    cls: dict[int, str] = {run: ents[0]["class"] for run, ents in by_run.items()}
+    # members of each run per class: the scale's weights
+    members: dict[tuple[int, str], int] = defaultdict(int)
+    runs_of: dict[str, set[int]] = defaultdict(set)
+    for ent in layout["entries"]:
+        members[ent["run"], ent["class"]] += ent["members"]
+        runs_of[ent["class"]].add(ent["run"])
+
+    parsed = [(e["ts"], name.removeprefix(STAMP_PREFIX), ids.get("run", -1), ids.get("group", -1))
+              for e, name, ids in stamps]
+    cover = io.batch_cover(parsed)
+
+    def spread(i: int, run: int, group: int, phase: str) -> dict[tuple[int, str], float]:
+        """The stamp's seconds as shares of ``(run, class)``: an entry of one group, else the
+        runs a batched measuring covers, else the stamp's run, by the entries' bytes."""
+        if group >= 0 and group in by_group:
+            ents = by_group[group]
+        elif phase == "measure" and group < 0 and cover.get(i):
+            ents = [e for r in cover[i] for e in by_run.get(r, [])]
+        else:
+            ents = by_run.get(run, [])
+        tot: dict[tuple[int, str], float] = defaultdict(float)
+        for e in ents:
+            tot[e["run"], e["class"]] += io.entry_bytes(e)
+        whole = sum(tot.values())
+        if whole <= 0:
+            return {k: 1.0 / len(tot) for k in tot}
+        return {k: v / whole for k, v in tot.items()}
 
     traced: set[int] = set()
-    phases: dict[int, dict[str, float]] = defaultdict(lambda: dict.fromkeys(PHASES, 0.0))
-    for e, name, ids in stamps:
+    seen: set[int] = set()
+    phases: dict[tuple[int, str], dict[str, float]] = defaultdict(
+        lambda: dict.fromkeys(PHASES, 0.0))
+    for i, (e, name, ids) in enumerate(stamps):
         run = ids.get("run")
         phase = name.removeprefix(STAMP_PREFIX)
         if run is None or phase not in PHASES:
             continue
+        seen.add(run)
         if phase == "run":
             traced.add(run)
-        phases[run][phase] += e.get("dur", 0.0)
-    for run in phases:
-        phases[run]["stack"] = phases[run]["serve"] - phases[run]["copy"]
-    unknown = sorted(r for r in traced | set(phases) if r not in cls)
+        for key, share in spread(i, run, ids.get("group", -1), phase).items():
+            phases[key][phase] += e.get("dur", 0.0) * share
+    for acc in phases.values():
+        acc["stack"] = acc["serve"] - acc["copy"]
+    unknown = sorted(r for r in traced | seen if r not in cls)
     if unknown:
         warn.add(f"stamped runs {unknown} are not in the layout; left out")
     meta = trace_path.parent / "meta.json"
@@ -570,16 +618,16 @@ def _c5_slice(stamps: Sequence[tuple[Event, str, dict[str, int]]], layout_path: 
     want = layout.get("trace_slice")
     if want is not None and not all_traced and sorted(traced) != sorted(want):
         warn.add(f"traced runs {sorted(traced)} differ from the layout's "
-                        f"trace_slice {sorted(want)}")
+                 f"trace_slice {sorted(want)}")
 
     out: dict[str, Any] = {}
-    for c, runs in sorted(total_runs.items()):
+    for c, runs in sorted(runs_of.items()):
         got = sorted(r for r in runs if r in traced)
         if not got:
             continue
-        sums = {p: sum(phases[r][p] for r in got) for p in PHASES}
-        denom = sum(members[r] for r in got)
-        scale = sum(members[r] for r in runs) / denom if denom else None
+        sums = {p: sum(phases[r, c][p] for r in got if (r, c) in phases) for p in PHASES}
+        denom = sum(members[r, c] for r in got)
+        scale = sum(members[r, c] for r in runs) / denom if denom else None
         out[c] = {"runs_traced": len(got), "runs_total": len(runs), "scale": scale,
                   "phases_us": sums,
                   "scaled": None if scale is None else {p: v * scale for p, v in sums.items()}}

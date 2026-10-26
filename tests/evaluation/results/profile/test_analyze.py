@@ -965,3 +965,70 @@ def test_a_missing_or_traced_requested_step_is_warned_about_and_left_out(tmp_pat
 def test_parse_steps_reads_ranges_and_lists():
     assert analyze.parse_steps("2-4") == [2, 3, 4] and analyze.parse_steps("2,3,5-6") == \
         [2, 3, 5, 6]
+
+
+# ---- check 5: spread of two-class and batched stamps, and the measuring reads ------------
+
+
+def _entry(run, group, cls, op, prod, window=0, dtype="bfloat16"):
+    return {"run": run, "group": group, "window": window, "class": cls, "kind": "members",
+            "operand_bytes": op, "product_bytes": prod, "product_dtype": dtype,
+            "served_bytes": prod}
+
+
+def _step(stamps):
+    """``stamps`` are (name, run, group, h0_us, h1_us); the table the markers hold."""
+    names = ["c5.run", "c5.glue", "c5.serve", "c5.copy", "c5.measure", "c5.judge"]
+    idx = {n.removeprefix("c5."): i for i, n in enumerate(names)}
+    return {"stamps": {"name": [idx[s[0]] for s in stamps], "run": [s[1] for s in stamps],
+                       "group": [s[2] for s in stamps], "window": [-1] * len(stamps),
+                       "h0": [float(s[3]) for s in stamps], "h1": [float(s[4]) for s in stamps]},
+            "stamp_names": names}
+
+
+def test_two_class_run_stamp_is_spread_by_bytes():
+    layout = {"entries": [_entry(0, 0, "S", 300, 100), _entry(0, 1, "O", 100, 100)]}
+    rows = analyze._stamp_rows(_step([("run", 0, -1, 0, 100)]),
+                               analyze._layout_maps(layout, set()))
+    assert rows[0]["shares"] == pytest.approx({"S": 2 / 3, "O": 1 / 3})
+    tot = analyze._phase_totals(rows, "S")["run"], analyze._phase_totals(rows, "O")["run"]
+    assert tot == pytest.approx((200e-6 / 3, 100e-6 / 3))
+
+
+def test_batched_measure_stamp_is_spread_over_the_runs_it_covers():
+    layout = {"entries": [_entry(0, 0, "Y", 100, 100), _entry(1, 1, "Z", 100, 300),
+                          _entry(2, 2, "W", 100, 100)]}
+    step = _step([("run", 0, 0, 0, 10), ("run", 1, 1, 10, 20),
+                  ("measure", 0, -1, 20, 60),  # one step: runs 0 and 1
+                  ("run", 2, 2, 60, 70), ("measure", 2, -1, 70, 90)])
+    rows = analyze._stamp_rows(step, analyze._layout_maps(layout, set()))
+    assert rows[2]["shares"] == pytest.approx({"Y": 1 / 3, "Z": 2 / 3})
+    assert rows[4]["shares"] == {"W": 1.0}
+    assert analyze._phase_totals(rows, "Y")["measure"] == pytest.approx(40e-6 / 3)
+    assert analyze._phase_totals(rows, "Z")["measure"] == pytest.approx(80e-6 / 3)
+    assert analyze._phase_totals(rows, "W")["measure"] == pytest.approx(20e-6)
+    assert rows[2]["window"] == 0
+
+
+def test_measure_reads_rule():
+    layout = {"entries": [_entry(0, 0, "Y", 4000, 1000),
+                          _entry(1, 1, "Z", 400, 100, dtype="float32")]}
+    env = {"k": 21}  # two sweeps of at most 16 columns
+    # bf16: A and B are half their fp32 bytes; fp32 entries are as counted
+    assert analyze._measure_reads(layout, env, "cuda") == 2 * (2000 + 1000 + 400 + 100)
+    assert analyze._measure_reads(layout, {"k": 16}, "cuda:0") == 3500  # one sweep
+    assert analyze._measure_reads(layout, env, "cpu") == 0
+    assert analyze._measure_reads(layout, {}, "cuda") == 0
+    assert analyze._measure_reads(None, env, "cuda") == 0
+
+
+def test_check_5_floor_adds_measuring_reads_once_apart():
+    probe = {"rates": {"hbm_copy_bytes": 1e3, "skinny_bmm_fp32_flops": 1e9}}
+    trace = {"gemm_bytes": 1000.0, "launches": 0}
+    work = analyze._work("5", "skinny_bmm_fp32_flops", None, 0, trace, 4.0, 0,
+                         measure_reads=2000.0)
+    assert work["bytes"]["hbm"] == 4000.0 and work["bytes"]["hbm_measure"] == 2000.0
+    # serving 4000 B and measuring 2000 B at 1 kB/s: 6 s; the scale touches serving only
+    assert analyze._floors(work, probe, set())["hbm"] == pytest.approx(6.0)
+    other = analyze._work("6", "gemm_fp32_flops", None, 0, trace, 4.0, 0, measure_reads=2000.0)
+    assert other["bytes"]["hbm_measure"] == 0.0

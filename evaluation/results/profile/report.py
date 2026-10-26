@@ -174,7 +174,8 @@ padding:8px 16px;display:flex;flex-wrap:wrap;gap:4px 14px;align-items:center;fon
 nav a{color:var(--barfg);text-decoration:none;opacity:.85}nav a:hover{opacity:1;
 text-decoration:underline}
 section{margin:0 0 28px;scroll-margin-top:56px}
-h1{font-size:22px;margin:8px 0}h2{font-size:18px;margin:24px 0 8px;border-bottom:1px solid var(--line);
+h1{font-size:22px;margin:8px 0}
+h2{font-size:18px;margin:24px 0 8px;border-bottom:1px solid var(--line);
 padding-bottom:4px}h3{font-size:15px;margin:16px 0 6px}
 .run-head{font-size:19px;margin:28px 0 4px;font-weight:600}
 p{max-width:820px}
@@ -345,7 +346,8 @@ def _svg(w: float, h: float, body: str) -> str:
     return f'<svg viewBox="0 0 {w:.0f} {h:.0f}" width="{w:.0f}">{body}</svg>'
 
 
-def _rect(x: float, y: float, w: float, h: float, paint: str, tip: str = "", extra: str = "") -> str:
+def _rect(x: float, y: float, w: float, h: float, paint: str, tip: str = "",
+          extra: str = "") -> str:
     title = f"<title>{esc(tip)}</title>" if tip else ""
     cls = ' class="seg"' if tip else ""
     return (f'<rect{cls} x="{x:.2f}" y="{y:.2f}" width="{max(w, 0.0):.2f}" height="{h:.2f}" '
@@ -389,7 +391,8 @@ class Run:
 
     @property
     def label(self) -> str:
-        return " · ".join([self.model] + [self.field(k) for k in ("attack", "scenario", "session")])
+        return " · ".join([self.model]
+                          + [self.field(k) for k in ("attack", "scenario", "session")])
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -454,7 +457,8 @@ def _inputs(profiles: Sequence[dict[str, Any]], names: Sequence[str], runs: list
     files = (f"{', '.join(Path(n).name for n in names)} in {dirs[0]}"
              if len(dirs) == 1 and dirs[0] != "." else ", ".join(names))
     out = [f"<p>{len(runs)} run(s) from {len(profiles)} file(s). Models: "
-           f"{esc(', '.join(models) or '—')}. Session(s): {esc(', '.join(sessions) or '—')}.</p>",
+           f"{esc(', '.join(models) or '—')}. "
+           f"Session(s): {esc(', '.join(sessions) or '—')}.</p>",
            f'<p class="mute small">Files: {esc(files)}. The page is a summary; '
            "every measure behind it (clocks, work counts, floors, sampler fields, hashing parts, "
            "probe rates, machine facts, thresholds) stays in these files.</p>"]
@@ -635,12 +639,16 @@ def _flow(run: Run) -> str:
     if not cpu and any(len(s.get("util_by_device") or {}) > 1 for s in top.values()):
         gpu_words += ("With four GPUs, the commit's hashing of the weights and the dK leaves "
                       "and the copies of the next weights run on the verifier GPUs, so a "
-                      "prover-side section's GPU figure here understates them; "
-                      "the profile's util_by_device holds each GPU. ")
+                      "prover-side section's GPU figure here understates them. The largest "
+                      "prover-side work on GPUs 1 to 3 is the peer copies of the products to "
+                      "those GPUs and their hashing on arrival during training, beside the "
+                      "commit's hashing and the next weights' copies. The profile's "
+                      "per-GPU utilization holds each GPU. ")
     return (_svg(w + 2, y, "".join(out))
             + f'<p class="mute small">Each box is one section of the step, in the order it runs '
               f"(left to right, then down); its color strip is the one the overview and the "
-              f"timeline use, and a red outline means a mark (see the overview). {gpu_words}CPU: the cores "
+              f"timeline use, and a red outline means a mark (see the overview). "
+              f"{gpu_words}CPU: the cores "
               f"the run's processes kept busy on average, on a scale to the {fmt(cores)} cores "
               "this machine allowed. A dash means the section was too short for the sampler "
               "(under 3 samples).</p>")
@@ -765,6 +773,14 @@ def _c5(run: Run) -> str:
              + (f"It took <b>{fmt(whole)} s</b> per step ({pct(share)} of the step). "
                 if whole is not None else "")
              + f"Its five timed phases add up to {fmt(sum(phases.values()))} s per step:</p>")
+    detail = ((run.sections.get("5") or {}).get("floor_detail") or {}).get("hbm")
+    if detail:
+        intro += ("<p class=\"small\">Its memory-bandwidth floor is "
+                  f"{fmt(detail['serving_s'] + detail['measuring_reads_s'])} s: serving "
+                  f"(copying the operands and products), {fmt(detail['serving_s'])} s, and "
+                  "measuring reads (the measuring kernel reading each product's inputs and "
+                  f"the product, once per sweep of challenges), "
+                  f"{fmt(detail['measuring_reads_s'])} s.</p>")
     steps = "".join(f"<li><b>{esc(PHASES[p][0])}</b> <span class=\"code\">{esc(p)}</span> — "
                     f"{esc(PHASES[p][1])}: {fmt(phases[p])} s</li>" for p in C5_PHASES)
     out = [intro, f'<ul class="small">{steps}</ul>']
@@ -875,8 +891,9 @@ def _plain(run: Run) -> str:
     cmp = run.profile.get("comparisons")
     if not cmp:
         return ""
-    rows = [[PLAIN_ROWS.get(n, n) + " (prover, with matmul capture)", fmt(c.get("prover_s")), fmt(c.get("plain_s")),
-             fmt(c.get("ratio"))] for n, c in (cmp.get("sections") or {}).items()]
+    rows = [[PLAIN_ROWS.get(n, n) + " (prover, with matmul capture)", fmt(c.get("prover_s")),
+             fmt(c.get("plain_s")), fmt(c.get("ratio"))]
+            for n, c in (cmp.get("sections") or {}).items()]
     st = cmp.get("step") or {}
     pr, pl = st.get("prover_s"), st.get("plain_s")
     iv, ps, vs = st.get("interval_s"), st.get("prover_side_s"), st.get("verifier_side_s")
