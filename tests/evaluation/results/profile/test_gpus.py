@@ -99,9 +99,19 @@ def build(root: Path, *, order=DEVS, roles=True, probe_obj=None,
     return {"run_dir": root, "samples": root / "samples.jsonl", "probe": root / "probe.json"}
 
 
+def _trace(root: Path) -> Path:
+    """A trace summary that holds every section (no launches or copies): the run's floors are
+    full, not partial."""
+    t = root / "trace_summary.json"
+    t.write_text(json.dumps({"version": 1, "c5_slice": {}, "sections": {
+        n: {"launches": 0, "wall_us": None} for n in SECS}}), encoding="utf-8")
+    return t
+
+
 def run(tmp_path: Path, **kw):
     paths = build(tmp_path / "run", **kw)
-    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"],
+                          _trace(paths["run_dir"]))
     return out, out["runs"]["honest"]["sections"]
 
 
@@ -299,7 +309,8 @@ def _sequential(tmp_path: Path, **kw) -> dict:
     """Every section lists all four devices, as the sequential loop's one process does."""
     paths = build(tmp_path / "run", **kw)
     _rewrite(paths, devices={n: DEVS for n in SECS})
-    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"],
+                          _trace(paths["run_dir"]))
     return out["runs"]["honest"]
 
 

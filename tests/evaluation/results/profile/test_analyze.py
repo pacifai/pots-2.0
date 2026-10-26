@@ -1043,8 +1043,142 @@ def test_floor_without_trace_is_partial_and_sets_no_bottleneck(tmp_path):
     jl(paths["run_dir"] / "markers.jsonl", mk)
     s5 = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"]
                          )["runs"]["honest"]["sections"]["5"]
-    assert s5["floor_partial"]["missing"] == ["hbm serving", "pcie", "launch"]
+    assert s5["floor_partial"]["missing"] == ["hbm serving", "pcie", "nvlink", "launch"]
     assert s5["ratio"] is not None and s5["share"] >= analyze.THRESHOLDS["share"]
     assert s5["ratio"] >= analyze.THRESHOLDS["ratio"]  # it would be marked, were it not partial
     assert "bottleneck" not in s5["marks"]
-    assert s5["floor_detail"]["hbm"]["serving_s"] == 0.0
+    assert s5["floor_detail"]["hbm"]["serving_s"] is None  # unknown, not 0.0
+    assert s5["floor_detail"]["hbm"]["serving_bytes"] is None
+    assert s5["floor_detail"]["pcie"] is None and s5["floor_detail"]["launch"] is None
+    assert s5["floor_detail"]["nvlink"] is None
+    assert s5["floor_detail"]["hbm"]["measuring_reads_s"] > 0
+    assert "utilization" not in s5["marks"]
+
+
+# ---- copies at their own kind's rate, partial floors, NaN-aware lanes (FS42 round 2) ----------
+
+RATES = {"h2d_pinned_bytes": 5e10, "d2h_pinned_bytes": 4e10}
+PEER = {"cuda:0->cuda:1": 4e11, "cuda:3->cuda:0": 2e11, "cuda:1->cuda:0": 3e11}
+
+
+def kinds(**over):
+    k = dict.fromkeys(["h2d_pinned", "h2d_pageable", "h2d_unknown", "d2h_pinned", "d2h_pageable",
+                       "d2h_unknown", "d2d"], 0)
+    return {**k, "peer": {}, **over}
+
+
+def kind_floors(tmp_path, copy_kinds, **probe_extra):
+    rates = probe()["rates"] | RATES
+    paths = build_run(tmp_path / "run", probe_over={"rates": rates, **probe_extra})
+    t = trace_file(tmp_path, {"A": {"copy_kinds": copy_kinds}})
+    out = with_trace(paths, t)
+    return out, out["runs"]["honest"]["sections"]["A"]
+
+
+def test_all_pinned_copies_get_the_pinned_rate_floor(tmp_path):
+    out, a = kind_floors(tmp_path, kinds(h2d_pinned=1e9, d2h_pinned=2e9))
+    # h2d 1e9 B at 5e10 = 0.02 s, d2h 2e9 B at 4e10 = 0.05 s: the larger direction
+    assert a["floors_s"]["pcie"] == pytest.approx(0.05)
+    assert a["work"]["bytes"]["h2d_pinned"] == 1e9 and a["work"]["bytes"]["h2d_pageable"] == 0
+    assert not any("pageable" in w or "copy kinds" in w for w in out["warnings"])
+
+
+def test_pinned_and_pageable_bytes_share_a_direction_at_their_own_rates(tmp_path):
+    _, a = kind_floors(tmp_path, kinds(h2d_pinned=1e9, h2d_pageable=1e9, d2h_pageable=1e8))
+    # h2d: 1e9/5e10 + 1e9/1e10 = 0.12 s; d2h: 1e8/1e10 = 0.01 s
+    assert a["floors_s"]["pcie"] == pytest.approx(0.12)
+    assert a["work"]["bytes"]["h2d"] == 2e9
+
+
+def test_unknown_kind_is_priced_pageable_with_a_warning(tmp_path):
+    out, a = kind_floors(tmp_path, kinds(h2d_unknown=1e9))
+    assert a["floors_s"]["pcie"] == pytest.approx(1e9 / 1e10)
+    assert sum("unknown kind" in w for w in out["warnings"]) == 1
+
+
+def test_a_summary_without_copy_kinds_is_priced_pageable_with_a_warning(tmp_path):
+    paths = build_run(tmp_path / "run", probe_over={"rates": probe()["rates"] | RATES})
+    out = with_trace(paths, trace_file(tmp_path, {"A": {"copy_bytes": {"h2d": 1e9}}}))
+    a = out["runs"]["honest"]["sections"]["A"]
+    assert a["floors_s"]["pcie"] == pytest.approx(1e9 / 1e10)  # not the pinned 5e10
+    assert sum("no copy kinds" in w for w in out["warnings"]) == 1
+
+
+def test_peer_copies_cost_at_the_probes_pair_rate_and_the_busiest_link_sets_the_floor(tmp_path):
+    out, a = kind_floors(tmp_path, kinds(d2d=1e9, peer={"cuda:3->cuda:0": 4e9,
+                                                         "cuda:0->cuda:1": 4e9}), peer=PEER)
+    # 4e9 B at 2e11 = 0.02 s on 3->0; 4e9 at 4e11 = 0.01 s on 0->1: the links are independent
+    assert a["floors_s"]["nvlink"] == pytest.approx(0.02)
+    assert a["work"]["bytes"]["peer"] == 8e9 and a["work"]["peer_pairs"]["cuda:3->cuda:0"] == 4e9
+    # device-to-device copies stay on the HBM term; the peer ones are not in it
+    assert a["floors_s"]["hbm"] == pytest.approx(1e9 / 1e11)
+    assert a["bound"] == "nvlink" and "nvlink" not in a["util"]
+    assert not any("peer" in w for w in out["warnings"])
+
+
+def test_a_peer_copy_without_both_devices_uses_the_slowest_pair(tmp_path):
+    out, a = kind_floors(tmp_path, kinds(peer={"cuda:?->cuda:?": 2e9}), peer=PEER)
+    assert a["floors_s"]["nvlink"] == pytest.approx(2e9 / 2e11)
+    out, a = kind_floors(tmp_path / "b", kinds(peer={"cuda:2->cuda:3": 2e9}), peer=PEER)
+    assert a["floors_s"]["nvlink"] == pytest.approx(2e9 / 2e11)  # named, not measured: warned
+    assert sum("no peer rate for cuda:2->cuda:3" in w for w in out["warnings"]) == 1
+
+
+def test_peer_copies_without_probe_peer_rates_drop_only_that_floor(tmp_path):
+    out, a = kind_floors(tmp_path, kinds(h2d_pinned=1e9, peer={"cuda:0->cuda:1": 1e9}))
+    assert "nvlink" not in a["floors_s"] and "pcie" in a["floors_s"]
+    assert sum("no peer rates" in w for w in out["warnings"]) == 1
+
+
+def cuda_run(tmp_path, **kw):
+    paths = build_run(tmp_path / "run", device="cuda", **kw)
+    return paths
+
+
+def test_every_cuda_section_with_a_floor_but_no_trace_is_partial(tmp_path):
+    paths = cuda_run(tmp_path, hash_bytes={"A": 20_000_000, "B": 100_000_000})
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    s = out["runs"]["honest"]["sections"]
+    # A is a non-check-5 section: share 0.2 and ratio 10 would mark it a bottleneck
+    assert s["A"]["ratio"] == pytest.approx(10.0) and s["A"]["share"] >= 0.1
+    assert s["A"]["floor_partial"]["missing"] == ["hbm", "pcie", "nvlink", "launch"]
+    assert s["A"]["marks"] == [] and s["A"]["floor_detail"] == {
+        "hbm": None, "pcie": None, "nvlink": None, "launch": None}
+    assert s["D"]["floor_s"] is None and "floor_partial" not in s["D"]  # no floor, no flag
+    # a trace that holds the section makes the floor full again, and the mark returns
+    t = trace_file(tmp_path, {"A": {"launches": 0}, "B": {"launches": 0}})
+    full = with_trace(paths, t)["runs"]["honest"]["sections"]["A"]
+    assert "floor_partial" not in full and "bottleneck" in full["marks"]
+
+
+def test_a_cpu_run_has_no_partial_floors(tmp_path):
+    _, s = run(tmp_path, hash_bytes={"A": 20_000_000})
+    assert "floor_partial" not in s["A"] and "bottleneck" in s["A"]["marks"]
+
+
+def test_a_partial_floor_sets_no_utilization_mark(tmp_path):
+    rows = [{"t": int(i * 1e9), "c_tree": 4.0, "g_util": 0.5} for i in range(1, 61)]
+    paths = cuda_run(tmp_path, steps=4, hash_bytes={"A": 20_000_000}, sample_rows=rows)
+    t = trace_file(tmp_path, {"A": {"launches": 0}})
+    # with the trace: floor/time = 0.1 against a c_tree lane of 4/8 = 0.5: it differs by 5x
+    full = with_trace(paths, t)["runs"]["honest"]["sections"]["A"]
+    assert "utilization" in full["marks"]
+    part = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"]
+                           )["runs"]["honest"]["sections"]["A"]
+    assert "floor_partial" in part and "utilization" not in part["marks"]
+
+
+NAN = float("nan")
+
+
+@pytest.mark.parametrize("readings", [[NAN, 0.03, 0.1], [0.03, 0.1, NAN], [0.1, NAN, 0.03]])
+def test_the_lane_is_the_largest_finite_reading_whatever_the_order(readings):
+    means = [{"g_dram_bw": r, "g_mem_util": 0.5} for r in readings]
+    assert analyze._lane_max("hbm", means, [{}] * 3, None) == 0.1
+
+
+def test_the_lane_falls_back_when_no_reading_is_finite():
+    means = [{"g_dram_bw": NAN, "g_mem_util": 0.4}, {"g_dram_bw": NAN, "g_mem_util": 0.2}]
+    assert analyze._lane_max("hbm", means, [{}] * 2, None) == 0.4
+    assert analyze._lane_max("hbm", [{"g_dram_bw": NAN}], [{}], None) is None
+    assert analyze._lane_max("hbm", [{"g_dram_bw": None, "g_mem_util": 0.2}], [{}], None) == 0.2
