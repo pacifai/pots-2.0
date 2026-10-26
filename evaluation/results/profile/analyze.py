@@ -944,9 +944,6 @@ def _timeline(untraced: list[dict[str, Any]], sampler: Sampler, dv: _Devices | N
 # ---- check 5 -----------------------------------------------------------------------------
 
 
-_ITEM_BYTES = {"float32": 4, "float64": 8, "bfloat16": 2, "float16": 2}
-
-
 def _measure_reads(layout: dict[str, Any] | None, device: str | None) -> float:
     """HBM bytes the check-5 measuring needs to read in one step (GPU path only), else 0.
 
@@ -964,11 +961,7 @@ def _measure_reads(layout: dict[str, Any] | None, device: str | None) -> float:
     layout cannot remove it (it records no addresses)."""
     if not layout or not str(device or "").startswith("cuda"):
         return 0.0
-    tot = 0.0
-    for e in layout["entries"]:
-        item = _ITEM_BYTES.get(str(e.get("product_dtype", "float32")).removeprefix("torch."), 4)
-        tot += e.get("operand_bytes", 0) * item / 4 + e.get("product_bytes", 0)
-    return tot
+    return float(sum(io.entry_bytes(e) for e in layout["entries"]))
 
 
 def _layout_maps(layout: dict[str, Any], warns: set[str]

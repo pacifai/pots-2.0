@@ -990,9 +990,10 @@ def test_two_class_run_stamp_is_spread_by_bytes():
     layout = {"entries": [_entry(0, 0, "S", 300, 100), _entry(0, 1, "O", 100, 100)]}
     rows = analyze._stamp_rows(_step([("run", 0, -1, 0, 100)]),
                                analyze._layout_maps(layout, set()))
-    assert rows[0]["shares"] == pytest.approx({"S": 2 / 3, "O": 1 / 3})
+    # bf16 products: the fp32-counted operands halve (S 150 + 100, O 50 + 100 bytes as stored)
+    assert rows[0]["shares"] == pytest.approx({"S": 250 / 400, "O": 150 / 400})
     tot = analyze._phase_totals(rows, "S")["run"], analyze._phase_totals(rows, "O")["run"]
-    assert tot == pytest.approx((200e-6 / 3, 100e-6 / 3))
+    assert tot == pytest.approx((62.5e-6, 37.5e-6))
 
 
 def test_batched_measure_stamp_is_spread_over_the_runs_it_covers():
@@ -1002,10 +1003,11 @@ def test_batched_measure_stamp_is_spread_over_the_runs_it_covers():
                   ("measure", 0, -1, 20, 60),  # one step: runs 0 and 1
                   ("run", 2, 2, 60, 70), ("measure", 2, -1, 70, 90)])
     rows = analyze._stamp_rows(step, analyze._layout_maps(layout, set()))
-    assert rows[2]["shares"] == pytest.approx({"Y": 1 / 3, "Z": 2 / 3})
+    # as stored (bf16): Y 50 + 100, Z 50 + 300 bytes
+    assert rows[2]["shares"] == pytest.approx({"Y": 0.3, "Z": 0.7})
     assert rows[4]["shares"] == {"W": 1.0}
-    assert analyze._phase_totals(rows, "Y")["measure"] == pytest.approx(40e-6 / 3)
-    assert analyze._phase_totals(rows, "Z")["measure"] == pytest.approx(80e-6 / 3)
+    assert analyze._phase_totals(rows, "Y")["measure"] == pytest.approx(12e-6)
+    assert analyze._phase_totals(rows, "Z")["measure"] == pytest.approx(28e-6)
     assert analyze._phase_totals(rows, "W")["measure"] == pytest.approx(20e-6)
     assert rows[2]["window"] == 0
 
@@ -1182,3 +1184,13 @@ def test_the_lane_falls_back_when_no_reading_is_finite():
     assert analyze._lane_max("hbm", means, [{}] * 2, None) == 0.4
     assert analyze._lane_max("hbm", [{"g_dram_bw": NAN}], [{}], None) is None
     assert analyze._lane_max("hbm", [{"g_dram_bw": None, "g_mem_util": 0.2}], [{}], None) == 0.2
+
+
+def test_entry_bytes_are_the_bytes_as_stored():
+    assert io.entry_bytes(_entry(0, 0, "Y", 400, 100)) == 300  # bf16: operands halve
+    assert io.entry_bytes(_entry(0, 0, "Y", 400, 100, dtype="torch.float32")) == 500
+    assert io.entry_bytes(_entry(0, 0, "Y", 400, 100, dtype="float64")) == 900
+    # the spread and the floor weigh an entry alike
+    layout = {"entries": [_entry(0, 0, "Y", 400, 100), _entry(1, 1, "Z", 40, 10, dtype="float32")]}
+    assert analyze._measure_reads(layout, "cuda") == 300 + 50
+    assert io.class_shares(layout["entries"]) == pytest.approx({"Y": 300 / 350, "Z": 50 / 350})

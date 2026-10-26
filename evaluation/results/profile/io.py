@@ -134,14 +134,21 @@ def read_records(run_dir: str | Path) -> list[dict[str, Any]]:
     return read_jsonl(Path(run_dir) / "records.jsonl")
 
 
-def entry_bytes(e: dict[str, Any]) -> int:
-    """A layout entry's measured bytes: ``operand_bytes`` plus ``product_bytes``."""
-    return e.get("operand_bytes", 0) + e.get("product_bytes", 0)
+ITEM_BYTES = {"float32": 4, "float64": 8, "bfloat16": 2, "float16": 2}
+"""Bytes per element by dtype name (``torch.`` prefix removed)."""
+
+
+def entry_bytes(e: dict[str, Any]) -> float:
+    """A layout entry's bytes as stored: ``operand_bytes`` (the layout counts the operands as
+    fp32) rescaled to the product dtype's item size, which is what the kernel reads (the
+    operands are served as views in the product's dtype), plus ``product_bytes``."""
+    item = ITEM_BYTES.get(str(e.get("product_dtype", "float32")).removeprefix("torch."), 4)
+    return e.get("operand_bytes", 0) * item / 4 + e.get("product_bytes", 0)
 
 
 def class_shares(entries: Iterable[dict[str, Any]]) -> dict[str, float]:
-    """Each class's share of the layout ``entries``' measured bytes (``operand_bytes`` plus
-    ``product_bytes``), summing to 1, in order of first appearance. A stamp that covers entries
+    """Each class's share of the layout ``entries``' bytes as stored (:func:`entry_bytes`),
+    summing to 1, in order of first appearance. A stamp that covers entries
     of several classes (an attention run of scores and mixes, a batched measuring) is spread
     over the classes by these shares; entries with no bytes share equally."""
     tot: dict[str, float] = {}
