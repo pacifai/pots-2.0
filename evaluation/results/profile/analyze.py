@@ -37,9 +37,11 @@ clock and :data:`US` turns µs into s; nothing else converts.
   the host copies' bytes by kind per GPU; each is priced at that GPU's probe rate for its kind:
   ``h2d_pinned_bytes``, ``h2d_pageable_bytes``, ``d2h_pinned_bytes``, ``d2h_pageable_bytes``.
   The PCIe floor is the larger of the two directions' times (the link is full duplex), each
-  direction summing its GPUs' times (the trace shows copies on different GPUs running one at a
-  time). Peer copies (``nvlink`` floor) go at the probe's ``peer`` rate of their device pair,
-  each pair on its own link, the busiest one setting the floor; ``hbm`` bytes are ``gemm_bytes``
+  direction summing its GPUs' times (the trace shows uploads on different GPUs running one at a
+  time; downloads overlap a little in check 5, where the sum can overstate that direction, which
+  stays below the uploads there). Peer copies (``nvlink`` floor) go at the probe's ``peer`` rate
+  of their device pair, each pair on its own link, the busiest one setting the floor; ``hbm``
+  bytes are ``gemm_bytes``
   plus the device-to-device copies (serving, before FS42 also the peer copies). Three fallbacks,
   each with a warning, all choosing the faster rate so the floor stays a lower bound: a peer
   copy with no named or measured pair costs at the fastest pair's rate, a copy of unknown kind
@@ -141,8 +143,9 @@ clock and :data:`US` turns µs into s; nothing else converts.
 - With a version 2 probe a section's GPU rates and costs are its device's ``per_device``
   entry; the host-only rates are the top-level ones. A version 1 probe, or a device the probe
   didn't measure, uses the top level, with one warning naming the device.
-- A multi-device section's GEMM, HBM, PCIe and launch floors use the slowest device's rate
-  (the split replay runs its units one after another, so the work does not divide).
+- A multi-device section's GEMM, HBM and launch floors use the slowest device's rate (the split
+  replay runs its units one after another, so the work does not divide); its PCIe floor prices
+  each GPU's host copies at that GPU's own rate (above).
 - The hash floor of a run whose transcript sits on the GPUs (its environment record's
   ``gpu_roles`` has a verifier-only device) uses each device's ``hash_kernel`` rate on an even
   share of the bytes and leaves, the slowest time. An even split is an estimate: the placement
@@ -684,7 +687,8 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
 
     ``probes`` is the probe as each of the section's devices sees it (FS35; one dict is one
     device). The work does not divide over devices (the split replay runs its units one after
-    another), so the GEMM, HBM, PCIe and launch floors use the slowest device's rate or cost.
+    another), so the GEMM, HBM and launch floors use the slowest device's rate or cost; the PCIe
+    floor prices each GPU's host copies at that GPU's own rate.
     The hash floor, with ``gpu_hash`` (the transcript sits on the GPUs), is each device's
     ``hash_kernel`` rate on an even share of the bytes and leaves (each owner hashes its own
     leaves; an even split is an estimate), the slowest device's time; else the host ``hash``.
@@ -736,7 +740,7 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
     missing = sorted({key for _, key, _, r in legs if r is None})
     if missing:
         warns.add(f"the probe has no {', '.join(missing)}: the pcie floor is skipped")
-    elif legs:  # each direction sums its GPUs' times (one copy at a time); full duplex
+    elif legs:  # each direction sums its GPUs' times (uploads run one at a time); full duplex
         out["pcie"] = max(sum(n * r for dd, _, n, r in legs if dd == d) for d in ("h2d", "d2h"))
     peer = _peer_floor(work, plist, warns)
     if peer is not None:

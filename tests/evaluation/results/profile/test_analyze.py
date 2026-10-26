@@ -1107,6 +1107,12 @@ def test_unknown_kind_is_priced_pinned_with_a_warning(tmp_path):
     out, a = kind_floors(tmp_path, kinds(h2d_unknown=1e9))
     assert a["floors_s"]["pcie"] == pytest.approx(1e9 / 5e10)  # the faster rate: a lower bound
     assert sum("unknown kind" in w for w in out["warnings"]) == 1
+    # without copy_devices the per-kind split itself maps unknown to pinned
+    paths = build_run(tmp_path / "b" / "run", probe_over={"rates": probe()["rates"] | RATES})
+    t = trace_file(tmp_path / "b", {"A": {"copy_kinds": kinds(h2d_unknown=1e9)}})
+    b = with_trace(paths, t)["runs"]["honest"]["sections"]["A"]
+    assert b["work"]["host_copies_loose"]["h2d_pinned"] == 1e9
+    assert b["floors_s"]["pcie"] == pytest.approx(1e9 / 5e10)
 
 
 def test_a_summary_without_copy_kinds_is_priced_pinned_with_a_warning(tmp_path):
