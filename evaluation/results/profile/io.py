@@ -165,7 +165,12 @@ def batch_cover(stamps: Sequence[tuple[float, str, int, int]]) -> dict[int, list
     ``run`` stamps start after the previous batched stamp. A second batched stamp with the same
     run id (a step on a second device) covers the same runs. A stamp for one group (group >= 0,
     a run measured on its own) ends the batch collected so far. Returns the covered runs by
-    index in ``stamps``; a batched stamp with no run before it maps to ``[]``."""
+    index in ``stamps``; a batched stamp with no run before it maps to ``[]``.
+
+    Two limits. With overlap on (FS39) a batched stamp's host time includes the wait for the
+    previous step's measuring on that device, so spreading it over this step's classes is an
+    approximation. A second device's stamp for the same step is spread over all of the step's
+    runs, not only that device's (the decoder uses one device per step)."""
     out: dict[int, list[int]] = {}
     pending: list[int] = []
     last: tuple[int, list[int]] | None = None

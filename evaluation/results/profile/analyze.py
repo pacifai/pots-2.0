@@ -34,7 +34,7 @@ clock and :data:`US` turns µs into s; nothing else converts.
   ``gemm_bytes`` plus ``memcpy_d2d`` (serving). Section ``5`` on a CUDA run adds the measuring
   kernel's reads (``bytes.hbm_measure``, ``_measure_reads``): per layout entry A, B and P as
   stored (``operand_bytes`` is fp32, so it is rescaled to the product dtype), times
-  ``ceil(k / 16)`` sweeps, once per step and not scaled by the trace slice; the section's
+  once per step (no sweep factor) and not scaled by the trace slice; the section's
   ``floor_detail.hbm`` gives ``serving_s`` and ``measuring_reads_s`` apart. ``hash`` bytes are
   ``hash_in_bytes`` plus ``hash_out_bytes`` of the ``count`` row; ``leaves`` come from the
   ``storage`` record, for every section whose ``hash_in_bytes`` is at least half the step's
@@ -841,30 +841,31 @@ def _timeline(untraced: list[dict[str, Any]], sampler: Sampler, dv: _Devices | N
 # ---- check 5 -----------------------------------------------------------------------------
 
 
-MEASURE_K_CHUNK = 16  # the measuring kernel's default cap on challenge columns per sweep
 _ITEM_BYTES = {"float32": 4, "float64": 8, "bfloat16": 2, "float16": 2}
 
 
-def _measure_reads(layout: dict[str, Any] | None, env: dict[str, Any],
-                   device: str | None) -> float:
-    """HBM bytes the measuring kernel reads in one step (check 5, GPU path only), else 0.
+def _measure_reads(layout: dict[str, Any] | None, device: str | None) -> float:
+    """HBM bytes the check-5 measuring needs to read in one step (GPU path only), else 0.
 
-    The kernel reads A, B and P as stored: the operands are served as views in the replay's
-    dtype, which for the decoder is the product's dtype (``operand_dtype == product_dtype``),
-    and each of the three is swept once per chunk of at most ``MEASURE_K_CHUNK`` of the ``k``
-    challenge columns (``measure_kernel.cu``). The layout counts A and B as fp32
-    (``operand_bytes``), so they are rescaled to the product dtype's item size. Products that
-    share one stored view read it once (``share=True``), so this can overstate. Counted once
-    per step: the layout covers every run, not the trace's slice."""
-    k = env.get("k")
-    if not layout or not k or not str(device or "").startswith("cuda"):
+    Every product's A, B and P are read once, as stored: the operands are served as views in
+    the replay's dtype, which for the decoder is the product's dtype (``operand_dtype ==
+    product_dtype``). The layout counts A and B as fp32 (``operand_bytes``), so they are
+    rescaled to the product dtype's item size. Counted once per step: the layout covers every
+    run, not the trace's slice.
+
+    This is a floor, so it leaves out what the kernel's design adds: the kernel sweeps each
+    operand once per chunk of 16 challenge columns (``K_CHUNK``), which is part of its ratio
+    over this floor. Products that share one stored view (``share=True``) read it once, so the
+    kernel can read up to about 13% less than this count (FS38b measured 0.8 of 6.3 GB per
+    layer saved); that overstatement is known, and the layout cannot remove it (it records no
+    addresses)."""
+    if not layout or not str(device or "").startswith("cuda"):
         return 0.0
-    sweeps = -(-int(k) // MEASURE_K_CHUNK)
     tot = 0.0
     for e in layout["entries"]:
         item = _ITEM_BYTES.get(str(e.get("product_dtype", "float32")).removeprefix("torch."), 4)
         tot += e.get("operand_bytes", 0) * item / 4 + e.get("product_bytes", 0)
-    return sweeps * tot
+    return tot
 
 
 def _layout_maps(layout: dict[str, Any], warns: set[str]
@@ -1244,8 +1245,7 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                   if (m := dv.memory_of(d, gpu_memory))}
     tsec = (trace or {}).get("sections", {})
     c5_scale = _c5_scale((trace or {}).get("c5_slice") or {}, warns)
-    env = next((r for r in records if r.get("record") == "environment"), {})
-    measure_reads = _measure_reads(layout, env, markers.header.get("device"))
+    measure_reads = _measure_reads(layout, markers.header.get("device"))
     transcript = max((r["transcript_bytes"] for r in records if r.get("record") == "storage"),
                      default=0)
 
@@ -1335,8 +1335,11 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
             bound = max(floors, key=floors.__getitem__) if floors else "unknown"
             ratio = mean_t / floor_s if floor_s and mean_t is not None else None
             marks = []
+            # no trace: check 5's floor holds the measuring reads alone, a partial floor
+            partial = ["hbm serving", "pcie", "launch"] \
+                if work["bytes"].get("hbm_measure") and not tr else []
             if share is not None and ratio is not None and share >= THRESHOLDS["share"] \
-                    and ratio >= THRESHOLDS["ratio"]:
+                    and ratio >= THRESHOLDS["ratio"] and not partial:
                 marks.append("bottleneck")
             rate_key = next(iter(work["flops"]), None)
             lanes = [m for i, ((dm, _), p) in enumerate(zip(per_dev, probes, strict=True))
@@ -1372,6 +1375,8 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                     "serving_s": work["bytes"]["hbm"] * sec_s,
                     "measuring_reads_bytes": work["bytes"]["hbm_measure"],
                     "measuring_reads_s": work["bytes"]["hbm_measure"] * sec_s}}}
+            if partial:
+                detail["floor_partial"] = {"missing": partial}
             sections[name] = {
                 **detail, "depth": depth, "time": time_stats, "share": share,
                 "clocks": {"host_s": host_m, "gpu_s": gpu_m, "trace_s": trace_s, "agree": agree},

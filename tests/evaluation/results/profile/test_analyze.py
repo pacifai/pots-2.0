@@ -1013,13 +1013,11 @@ def test_batched_measure_stamp_is_spread_over_the_runs_it_covers():
 def test_measure_reads_rule():
     layout = {"entries": [_entry(0, 0, "Y", 4000, 1000),
                           _entry(1, 1, "Z", 400, 100, dtype="float32")]}
-    env = {"k": 21}  # two sweeps of at most 16 columns
-    # bf16: A and B are half their fp32 bytes; fp32 entries are as counted
-    assert analyze._measure_reads(layout, env, "cuda") == 2 * (2000 + 1000 + 400 + 100)
-    assert analyze._measure_reads(layout, {"k": 16}, "cuda:0") == 3500  # one sweep
-    assert analyze._measure_reads(layout, env, "cpu") == 0
-    assert analyze._measure_reads(layout, {}, "cuda") == 0
-    assert analyze._measure_reads(None, env, "cuda") == 0
+    # bf16: A and B are half their fp32 bytes; fp32 entries are as counted; one read each
+    assert analyze._measure_reads(layout, "cuda") == 2000 + 1000 + 400 + 100 - 0
+    assert analyze._measure_reads(layout, "cuda:0") == 3500
+    assert analyze._measure_reads(layout, "cpu") == 0
+    assert analyze._measure_reads(None, "cuda") == 0
 
 
 def test_check_5_floor_adds_measuring_reads_once_apart():
@@ -1032,3 +1030,21 @@ def test_check_5_floor_adds_measuring_reads_once_apart():
     assert analyze._floors(work, probe, set())["hbm"] == pytest.approx(6.0)
     other = analyze._work("6", "gemm_fp32_flops", None, 0, trace, 4.0, 0, measure_reads=2000.0)
     assert "hbm_measure" not in other["bytes"]
+
+
+def test_floor_without_trace_is_partial_and_sets_no_bottleneck(tmp_path):
+    names, st, layout = c5_inputs(tmp_path)
+    paths = build_run(tmp_path / "run", steps=4, secs={"5": (0.0, 0.0002)})
+    for e in layout["entries"]:
+        e.update(operand_bytes=4000, product_dtype="bfloat16")
+    (paths["run_dir"] / "c5_layout.json").write_text(json.dumps(layout))
+    mk = [json.loads(ln) for ln in (paths["run_dir"] / "markers.jsonl").read_text().splitlines()]
+    mk[0]["device"] = "cuda"
+    jl(paths["run_dir"] / "markers.jsonl", mk)
+    s5 = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"]
+                         )["runs"]["honest"]["sections"]["5"]
+    assert s5["floor_partial"]["missing"] == ["hbm serving", "pcie", "launch"]
+    assert s5["ratio"] is not None and s5["share"] >= analyze.THRESHOLDS["share"]
+    assert s5["ratio"] >= analyze.THRESHOLDS["ratio"]  # it would be marked, were it not partial
+    assert "bottleneck" not in s5["marks"]
+    assert s5["floor_detail"]["hbm"]["serving_s"] == 0.0

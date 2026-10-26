@@ -773,14 +773,22 @@ def _c5(run: Run) -> str:
              + (f"It took <b>{fmt(whole)} s</b> per step ({pct(share)} of the step). "
                 if whole is not None else "")
              + f"Its five timed phases add up to {fmt(sum(phases.values()))} s per step:</p>")
-    detail = ((run.sections.get("5") or {}).get("floor_detail") or {}).get("hbm")
+    sec5 = run.sections.get("5") or {}
+    detail = (sec5.get("floor_detail") or {}).get("hbm")
     if detail:
+        part = (sec5.get("floor_partial") or {}).get("missing")
+        ratio = sec5.get("ratio")
+        tail = (f" (check 5 took {fmt(ratio)}× its floor)" if ratio is not None else "")
+        if part:
+            tail = (f" <b>Partial floor</b>: the run has no trace, so only the measuring reads "
+                    f"are counted and the {', '.join(part)} terms are missing"
+                    + (f"; the ratio of {fmt(ratio)}× to it is not comparable with a full "
+                       "floor and sets no mark" if ratio is not None else "") + ".")
         intro += ("<p class=\"small\">Its memory-bandwidth floor is "
                   f"{fmt(detail['serving_s'] + detail['measuring_reads_s'])} s: serving "
                   f"(copying the operands and products), {fmt(detail['serving_s'])} s, and "
                   "measuring reads (the measuring kernel reading each product's inputs and "
-                  f"the product, once per sweep of challenges), "
-                  f"{fmt(detail['measuring_reads_s'])} s.</p>")
+                  f"the product once), {fmt(detail['measuring_reads_s'])} s.{tail}</p>")
     steps = "".join(f"<li><b>{esc(PHASES[p][0])}</b> <span class=\"code\">{esc(p)}</span> — "
                     f"{esc(PHASES[p][1])}: {fmt(phases[p])} s</li>" for p in C5_PHASES)
     out = [intro, f'<ul class="small">{steps}</ul>']
