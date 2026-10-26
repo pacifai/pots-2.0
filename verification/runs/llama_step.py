@@ -208,7 +208,11 @@ def work_rows(c: DecoderComputation, run: str, scenario: str,
     unused): ``hash_leaves`` and ``hash_calls`` are ``leaves`` minus the other products,
     ``hash_in_bytes`` their bytes (``transcript_bytes`` minus those products' bytes, each
     ``prod(p_shape)`` times the product dtype's size) plus the prefix byte per leaf,
-    ``hash_out_bytes`` 32 per leaf. A ``storage`` row carries ``transcript_bytes`` and
+    ``hash_out_bytes`` 32 per leaf. A step row that carries ``known`` (the leaves the commit
+    took from arrival digests, ``HashStats.known``; absent or ``None`` on records without it) is
+    checked against that rule: ``leaves`` minus ``known`` must equal the rule's commit leaf
+    count, else one ``WARNING step <t>: ...`` line goes to stderr; the commit row then carries
+    the measured ``known`` as its own field. A ``storage`` row carries ``transcript_bytes`` and
     ``leaves``. Nothing is read from the device."""
     fwd = bwd = 0
     for q in c.products:
@@ -228,6 +232,11 @@ def work_rows(c: DecoderComputation, run: str, scenario: str,
     for r in step_rows:
         t, leaves, nbytes = r["step"], r["leaves"], r["transcript_bytes"]
         c_leaves, c_bytes = leaves - skipped_n, nbytes - skipped_bytes
+        known = r.get("known")
+        if known is not None and leaves - known != c_leaves:
+            print(f"WARNING step {t}: the commit hashed {leaves - known} leaves (leaves {leaves} "
+                  f"minus known {known}), the work-row rule counts {c_leaves}; its hash floor "
+                  "is off", file=sys.stderr)
         base = {"record": "count", "run": run, "scenario": scenario, "step": t,
                 "calls": 1, "derived": False}
         for side, name, level, flops, h_in, h_out, h_calls, h_leaves in (
@@ -239,7 +248,9 @@ def work_rows(c: DecoderComputation, run: str, scenario: str,
                  leaves)):
             rows.append({**base, "side": side, "component": name, "level": level,
                          "flops": flops, "hash_in_bytes": h_in, "hash_out_bytes": h_out,
-                         "hash_calls": h_calls, "hash_leaves": h_leaves})
+                         "hash_calls": h_calls, "hash_leaves": h_leaves,
+                         **({"known": known} if name == "P3.commit" and known is not None
+                            else {})})
         rows.append({"record": "storage", "run": run, "scenario": scenario, "step": t,
                      "transcript_bytes": nbytes, "leaves": leaves})
     return rows

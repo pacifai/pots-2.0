@@ -707,7 +707,7 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
             finally:
                 h2 = time.perf_counter()
             wr = 0.0
-            if kept_from is not None:  # the stored step: outside every section, inside step t's interval
+            if kept_from is not None:  # the stored step: in no section, inside step t's interval
                 w0_ = time.perf_counter()
                 leaves = [store.leaf(i) for i in range(c.n_leaves)]
                 keep.write_from(c, leaves, *kept_from)

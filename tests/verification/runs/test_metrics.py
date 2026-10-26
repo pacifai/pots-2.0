@@ -209,6 +209,12 @@ def test_record_pass_field_without_a_verifier_entry():
     assert metrics.record_pass(v, 1, st, kappa_guard=False)["measured"]["rho_kappa"] == 0
 
 
+def test_step_record_carries_the_commits_known_digests_or_none():
+    v = type("V", (), {"timings": {1: {"4": 0.1}}})()
+    assert step_record("r", "s", 1, v, None, leaves=9, known=4)["known"] == 4
+    assert step_record("r", "s", 1, v, None)["known"] is None
+
+
 def test_step_record_uses_protocol_ids_at_step_1():
     v = type("V", (), {"timings": {1: {"4": 0.1, "7": 0.1}, 2: {"4": 0.1, "7": 0.1}}})()
     r = step_record("r", "s", 1, v, Rejection(step=1, check_id="0", detail="x", kind="failed"))

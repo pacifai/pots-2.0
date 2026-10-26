@@ -2134,7 +2134,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `emit(t, out)` (an A3 splice).
   - `LoopResult(verdict, steps, w_final)`, where `steps` holds `StepRecord(t, rejection, loss,
     prove_s, commit_s, verify_s, handoff_s, ...)`, whose last field `known` is the leaves the
-    commit took from arrival digests. `w_final` is host copies from the pipelined loop and
+    commit took from arrival digests (the `step` record writes it as `known`, `null` where the loop
+    has none, in both loops; `llama_step.work_rows` checks it, see there). `w_final` is host copies from the pipelined loop and
     the prover's device tensors from the sequential one, so tests compare it by value on the
     CPU. The step summary's `capture["host_buffers"]` is the process-wide pinned pool, so it
     differs between a long-lived test process and a fresh child: the equality test leaves it
@@ -2431,7 +2432,12 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   and, on a CPU run, the commit's row hash every leaf; on a CUDA run `c.device` the commit's
   row counts only the batch records, `W_t`, `W_{t+1}` and the `dK` products, since the other
   products' digests come from arrival hashing on their owner GPUs inside `train.*`, whose rows
-  carry FLOPs only; every hashing row carries `hash_leaves`, the leaf count), because the
+  carry FLOPs only; every hashing row carries `hash_leaves`, the leaf count). A `step` record
+  that carries `known` (the leaves the commit took from arrival digests; both loops write it) is
+  checked against that rule: `leaves` minus `known` must equal the rule's commit leaf count, else
+  one `WARNING step <t>: the commit hashed N leaves (leaves L minus known K), the work-row rule
+  counts M; its hash floor is off` line goes to stderr; the commit's count row then carries the
+  measured `known` as its own field (a record without `known` gives no warning and no field), because the
   counting pass is never run beside a timed run; with `--count` no work rows are written, so a
   component and step has one `count` row. Exits 1 unless
   accepted. `VERIF_RELEASE_CACHE` reaches the timed run and the memory pass (`run_honest`'s

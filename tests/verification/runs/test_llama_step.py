@@ -280,6 +280,7 @@ def test_sequential_metrics_run_traces_the_step_and_writes_layout_and_work_rows(
     steps, want = _work_rows_of(rows, c)
     assert [s["step"] for s in steps] == [1, 2, 3]
     assert all(s["transcript_bytes"] and s["leaves"] for s in steps)
+    assert [s["known"] for s in steps] == [0, 0, 0]  # a CPU commit takes no arrival digest
     got = [r for r in rows if r["record"] in ("count", "storage")]
     assert got == want and sum(r["record"] == "storage" for r in got) == 3
 
@@ -315,6 +316,7 @@ def test_pipelined_metrics_run_prints_no_trace_and_writes_layout_and_work_rows(
     # the pipelined step records (written after the merge) hold the work counts
     assert [s["step"] for s in steps] == [1, 2, 3]
     assert all(s["transcript_bytes"] and s["leaves"] for s in steps)
+    assert all(s["known"] is not None for s in steps)  # the pipelined loop records it too
     assert [r for r in rows if r["record"] in ("count", "storage")] == want_rows
 
 
@@ -393,6 +395,41 @@ def test_work_rows_on_cuda_commit_hashes_records_weights_and_dk_only(tiny, monke
     chk = by["2"]
     assert chk["hash_leaves"] == chk["hash_calls"] == leaves
     assert chk["hash_in_bytes"] == nbytes + leaves and chk["hash_out_bytes"] == 32 * leaves
+
+
+def _cuda_step(c, known, t=1):
+    n_w, dk, w_bytes, p_bytes = _tiny_leaf_counts(c)
+    leaves = c.n_s + 2 * n_w + len(c.products)
+    step = {"step": t, "leaves": leaves, "transcript_bytes": 1234 + 2 * w_bytes + sum(p_bytes)}
+    return {**step, "known": known}, c.n_s + 2 * n_w + len(dk)
+
+
+def test_work_rows_check_the_measured_known_digests_against_the_rule(tiny, monkeypatch, capsys):
+    c = tiny[0]
+    monkeypatch.setattr(c, "device", torch.device("cuda"))
+    good, want_n = _cuda_step(c, 0)
+    good["known"] = good["leaves"] - want_n  # the rule's count: every non-dK product known
+    bad, _ = _cuda_step(c, good["known"] - 1, t=2)  # one product lacks its arrival digest
+    rows = llama_step.work_rows(c, "r", "honest", [good, bad])
+    err = capsys.readouterr().err.splitlines()
+    assert err == [f"WARNING step 2: the commit hashed {want_n + 1} leaves (leaves "
+                   f"{bad['leaves']} minus known {bad['known']}), the work-row rule counts "
+                   f"{want_n}; its hash floor is off"]
+    commits = [r for r in rows if r.get("component") == "P3.commit"]
+    assert [r["known"] for r in commits] == [good["known"], bad["known"]]
+    assert all(r["hash_leaves"] == want_n for r in commits)  # the rule's count stays
+    assert all("known" not in r for r in rows if r.get("component") not in ("P3.commit",)
+               and r["record"] == "count")
+
+
+def test_work_rows_without_known_warn_nothing_and_add_no_field(tiny, monkeypatch, capsys):
+    c = tiny[0]
+    monkeypatch.setattr(c, "device", torch.device("cuda"))
+    step, _ = _cuda_step(c, None)
+    del step["known"]
+    rows = llama_step.work_rows(c, "r", "honest", [step, {**step, "step": 2, "known": None}])
+    assert capsys.readouterr().err == ""
+    assert not any("known" in r for r in rows)
 
 
 def test_work_rows_on_cpu_commit_keeps_the_whole_transcript(tiny):

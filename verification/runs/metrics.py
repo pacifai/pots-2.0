@@ -338,7 +338,8 @@ RECORD_TYPES = ("environment", "step", "verdict", "time", "memory", "count", "st
 RUN_PREFIX = "run:"
 STEP_WALL = "step_wall"  # the merged step's wall-extent row (FS33c)
 STEP_INTERVAL = "step_interval"  # every step's close minus the step before's close (EQ14, FS42);
-# work after a step's close (rows, markers, archive, trace export, a caller's on_step) lands in the next interval
+# work after a step's close (rows, markers, archive, trace export, a caller's on_step) lands in
+# the next interval
 TRACE_DIR = "trace"  # the traced step's files in a run directory (FS23)
 # Host spans kept per section per step in markers.jsonl; the calls past them fold into ``rest``.
 MAX_SPANS = 64
@@ -1621,7 +1622,8 @@ class TimeRecorder(_Recorder):
             rows.append({**step_record(self.run, self.scenario, t, self._verifier,
                                        getattr(rec, "rejection", None), self.step_fields,
                                        transcript_bytes=getattr(rec, "transcript_bytes", None),
-                                       leaves=getattr(rec, "leaves", None)),
+                                       leaves=getattr(rec, "leaves", None),
+                                       known=getattr(rec, "known", None)),
                          "traced": self._tracing_step})
             cap = getattr(rec, "capture", None)
             if cap is not None:
@@ -1661,8 +1663,8 @@ class TimeRecorder(_Recorder):
 
 def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
                 fields: Mapping[str, Any] | None = None, *,
-                transcript_bytes: int | None = None, leaves: int | None = None
-                ) -> dict[str, Any]:
+                transcript_bytes: int | None = None, leaves: int | None = None,
+                known: int | None = None) -> dict[str, Any]:
     """EQ13 record 1 for step ``t`` (EVALUATION_SPEC §4.1): the verdict, the first failing
     check, each check's ``pass``, ``fail`` or ``not_run``, whether the step is judged, and the
     step's three scores.
@@ -1679,8 +1681,10 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
     are :func:`step_scores` over the tests the verifier measured at this step, and
     ``f_achieved_max`` / ``f_achieved_at`` :func:`step_floor_fields`. ``transcript_bytes`` and
     ``leaves`` are the step's committed bytes and leaf count (``leaf_totals``), ``None`` when the
-    loop didn't take them; ``traced`` is ``False`` here, and the timed run sets it on the step
-    the profiler traced (FS23)."""
+    loop didn't take them; ``known`` is how many of those leaves the commit took from the
+    arrival digests instead of hashing (``HashStats.known``; FS42, so the work-row rule of
+    ``llama_step.work_rows`` can be checked), ``None`` when the loop has none; ``traced`` is
+    ``False`` here, and the timed run sets it on the step the profiler traced (FS23)."""
     def pid(cid: str) -> str:
         return "0" if t == 1 and cid == "7" else cid
 
@@ -1699,6 +1703,7 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
            "model": None, "corpus": None, "attack": None, "seed": None,
            "bpr_records": None, "bpr_actual": None, "cheat_step": None, **fields,
            "step": t, "traced": False, "transcript_bytes": transcript_bytes, "leaves": leaves,
+           "known": known,
            "judged": judged_step(verifier, t, fields.get("cheat_step")),
            "verdict": "reject" if failed else "accept",
            "first_failing_check": rejection.check_id if failed else None,
