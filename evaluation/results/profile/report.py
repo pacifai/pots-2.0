@@ -810,7 +810,7 @@ def _c5(run: Run) -> str:
         reads_s = detail["measuring_reads_s"]
         total = (f"{fmt(detail['serving_s'] + reads_s)} s" if detail["serving_s"] is not None
                  else f"at least {fmt(reads_s)} s")
-        intro += (f'<p class="small">{lead}Of it, the memory-bandwidth part is {total}: '
+        intro += (f'<p class="small">{lead}Its memory-bandwidth part is {total}: '
                   f"serving (copying the operands and products), {serving}, and "
                   "measuring reads (the measuring kernel reading each product's inputs and "
                   f"the product once), {fmt(reads_s)} s.</p>")

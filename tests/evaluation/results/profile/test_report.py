@@ -328,7 +328,7 @@ def test_check_5_sentence_names_the_overall_floor_its_resource_and_the_ratio():
     v["sections"]["5"] |= {"floor_detail": detail, "ratio": 14.0, "floor_s": 0.32,
                            "bound": "pcie"}
     c5 = panel(page(profile(runs={"honest": v})), "r0-check5")
-    assert "Check 5's floor is 0.32 s, set by PCIe; it took 14× that. Of it, the memory-" \
+    assert "Check 5's floor is 0.32 s, set by PCIe; it took 14× that. Its memory-" \
         "bandwidth part is 0.12 s: serving (copying the operands and products), 0.050 s, and " \
         "measuring reads (the measuring kernel reading each product's inputs and the product " \
         "once), 0.070 s.</p>" in c5
