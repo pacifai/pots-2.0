@@ -321,14 +321,59 @@ def test_notes_and_legend_names():
     assert "No sampler data for this run." in tl and "Lines under each step" not in tl
 
 
-def test_check_5_floor_says_serving_measuring_reads_and_partial():
+def test_check_5_sentence_names_the_overall_floor_its_resource_and_the_ratio():
     detail = {"hbm": {"serving_bytes": 1.0, "serving_s": 0.05, "measuring_reads_bytes": 2.0,
                       "measuring_reads_s": 0.07}}
     v = view(gpu=True)
-    v["sections"]["5"] |= {"floor_detail": detail, "ratio": 14.0}
+    v["sections"]["5"] |= {"floor_detail": detail, "ratio": 14.0, "floor_s": 0.32,
+                           "bound": "pcie"}
     c5 = panel(page(profile(runs={"honest": v})), "r0-check5")
-    assert "serving" in c5 and "measuring reads" in c5 and "Partial floor" not in c5
-    assert "14" in c5
-    v["sections"]["5"] |= {"floor_partial": {"missing": ["hbm serving", "pcie", "launch"]}}
-    c5 = panel(page(profile(runs={"honest": v})), "r0-check5")
-    assert "Partial floor" in c5 and "hbm serving, pcie, launch" in c5 and "no mark" in c5
+    assert "Check 5's floor is 0.32 s, set by PCIe; it took 14× that. Of it, the memory-" \
+        "bandwidth part is 0.12 s: serving (copying the operands and products), 0.050 s, and " \
+        "measuring reads (the measuring kernel reading each product's inputs and the product " \
+        "once), 0.070 s.</p>" in c5
+    assert "Partial floor" not in c5
+    ov = panel(page(profile(runs={"honest": v})), "r0-overview")
+    assert "Partial floors" not in ov
+
+
+def test_check_5_partial_floor_says_not_counted_and_the_profile_says_it_once():
+    detail = {"hbm": {"serving_bytes": None, "serving_s": None, "measuring_reads_bytes": 2.0,
+                      "measuring_reads_s": 0.07}, "pcie": None, "nvlink": None, "launch": None}
+    v = view(gpu=True)
+    v["sections"]["5"] |= {"floor_detail": detail, "ratio": 31.0, "floor_s": 0.07, "bound": "hbm",
+                           "floor_partial": {"missing": ["hbm serving", "pcie", "nvlink",
+                                                         "launch"]}}
+    v["sections"]["4"] |= {"floor_partial": {"missing": ["hbm", "pcie", "nvlink", "launch"]}}
+    out = page(profile(runs={"honest": v}))
+    c5 = panel(out, "r0-check5")
+    assert "Partial floor</b>: this run has no trace of check 5" in c5
+    assert "hbm serving, pcie, nvlink, launch are not counted (no trace)" in c5
+    assert "Check 5's floor is 0.070 s, set by memory bandwidth; it took 31× that. " in c5
+    assert "sets no mark" in c5
+    assert "serving (copying the operands and products), not counted (no trace), and" in c5
+    assert "at least 0.070 s" in c5 and " 0 s" not in c5
+    # the profile says once that its floors leave out the trace terms, however many sections
+    assert out.count("their floors leave out the terms that come from a trace") == 1
+    assert "not comparable with a traced run" in panel(out, "r0-overview")
+
+
+def test_the_four_gpu_note_is_drawn_only_with_several_gpus_on_a_section():
+    v = view(gpu=True)
+    flow = panel(page(profile(gpu=True, runs={"honest": v})), "r0-diagram")
+    assert "With four GPUs" not in flow
+    v["sections"]["train.forward"]["util_by_device"] = {"cuda:0": {}, "cuda:1": {}}
+    flow = panel(page(profile(gpu=True, runs={"honest": v})), "r0-diagram")
+    assert ("With four GPUs, the commit's hashing of the weights and the dK leaves and the "
+            "copies of the next weights run on the verifier GPUs, so a prover-side section's "
+            "GPU figure here understates them. The largest prover-side work on GPUs 1 to 3 is "
+            "the peer copies of the products to those GPUs and their hashing on arrival during "
+            "training, beside the commit's hashing and the next weights' copies. The "
+            "profile's per-GPU utilization holds each GPU.") in flow
+
+
+def test_the_phase_by_product_caption_says_how_measure_time_is_split():
+    out = panel(page(profile(runs={"honest": view(gpu=True)})), "r0-check5")
+    assert ("The measure time is split over the products by bytes, from one time stamp per "
+            "schedule step (a stamp covers many products), and each stamp's time includes the "
+            "wait for the previous step's measuring.") in out
