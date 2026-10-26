@@ -29,9 +29,19 @@ clock and :data:`US` turns µs into s; nothing else converts.
 - Trace work (launches, copy bytes, GEMM bytes) is the traced step's own values; check 5's
   sections (``5``, ``5.*``) scale by ``Σ scaled["run"] ÷ Σ phases_us["run"]`` over the classes
   of ``c5_slice`` (estimated total run time over traced run time).
-- Copies (``memcpy_h2d``, ``memcpy_d2h``) cost at the pageable rates, and the PCIe floor is
-  the larger of the two directions' times (the link is full duplex); ``hbm`` bytes are
-  ``gemm_bytes`` plus ``memcpy_d2d`` (serving). Section ``5`` on a CUDA run adds the measuring
+- Copies cost at their own kind's rate (FS42; the 2026-10-19 rule priced every copy at the
+  pageable rate, on the premise that the trace cannot tell pinned from pageable memory, but it
+  can: it names each copy "Memcpy HtoD (Pinned -> Device)", "(Pageable -> Device)", "DtoH
+  (Device -> Pinned)", "PtoP (Device -> Device)" for a GPU-to-GPU copy, "DtoD"). The trace
+  summary's ``copy_kinds`` keeps the bytes by kind; each is priced at the probe's rate for it:
+  ``h2d_pinned_bytes``, ``h2d_pageable_bytes``, ``d2h_pinned_bytes``, ``d2h_pageable_bytes``;
+  peer copies (``nvlink`` floor) at the probe's ``peer`` rate of their device pair (the slowest
+  pair's when the event names no pair), each pair on its own link, the busiest one setting the
+  floor; ``hbm`` bytes are ``gemm_bytes`` plus the device-to-device copies (serving, before
+  FS42 also the peer copies). A copy of unknown kind, or a trace summary without
+  ``copy_kinds``, is priced pageable, with a warning. The PCIe floor is the larger of the two
+  directions' times (the link is full duplex), each direction summing its pinned and pageable
+  bytes. Section ``5`` on a CUDA run adds the measuring
   kernel's reads (``bytes.hbm_measure``, ``_measure_reads``): per layout entry A, B and P as
   stored (``operand_bytes`` is fp32, so it is rescaled to the product dtype), times
   once per step (no sweep factor) and not scaled by the trace slice; the section's
@@ -39,6 +49,12 @@ clock and :data:`US` turns µs into s; nothing else converts.
   ``hash_in_bytes`` plus ``hash_out_bytes`` of the ``count`` row; ``leaves`` come from the
   ``storage`` record, for every section whose ``hash_in_bytes`` is at least half the step's
   ``transcript_bytes`` (the commit and check 2).
+- ``floor_partial`` (FS42): on a CUDA run, a section with a floor but no trace entry has no
+  trace-derived terms (memory traffic, PCIe, peer, launch): they are missing, not zero. Its
+  ``floor_partial`` lists them (``missing``: ``hbm`` or, for check 5, whose floor holds the
+  measuring reads, ``hbm serving``, then ``pcie``, ``nvlink``, ``launch``), ``floor_detail``
+  shows them as null, and no bottleneck or utilization mark is set from the floor: its ratio
+  and its predicted use are not comparable with a traced run's.
 - Syncs are 2 per top-level section call on CUDA. The hook bound's events are the ``gpu_us``
   spans that hold events (with the folded calls), none for a stamp or a host-timed span
   (``seam.host``, null ``gpu_us`` entries: no events); both are 0 off CUDA.
@@ -546,26 +562,85 @@ def _direction(d: dict[str, Any] | None, key: str) -> float:
     return float(d.get(key) or d.get("memcpy_" + key) or 0.0)
 
 
+def _missing_terms(name: str, work: dict[str, Any]) -> list[str]:
+    """The floor terms that come from the trace and so are missing (not zero) without one:
+    memory traffic (``hbm serving`` for check 5, whose floor holds the measuring reads
+    besides, else ``hbm``), PCIe, the GPU-to-GPU link and launches."""
+    return ["hbm serving" if work["bytes"].get("hbm_measure") else "hbm", "pcie", "nvlink",
+            "launch"]
+
+
 def _work(name: str, rate_key: str, count: dict[str, Any] | None, leaves: int,
           trace: dict[str, Any] | None, c5_scale: float, syncs: int,
-          measure_reads: float = 0.0) -> dict[str, Any]:
+          measure_reads: float = 0.0, warns: set[str] | None = None) -> dict[str, Any]:
     """``measure_reads`` is check 5's measuring-kernel read bytes per step (section ``5`` only,
     not scaled by the trace slice); it is ``bytes.hbm_measure``, apart from the serving's
-    ``bytes.hbm``."""
+    ``bytes.hbm``.
+
+    Copy bytes are kept by kind (the trace names each copy's host memory, FS42): ``h2d_pinned``,
+    ``h2d_pageable``, ``d2h_pinned``, ``d2h_pageable`` (``h2d`` and ``d2h`` are the totals), the
+    device-to-device ones in ``hbm`` with the GEMM bytes, and the GPU-to-GPU ones as ``peer``
+    (their total) with ``work["peer_pairs"]`` (device pair -> bytes). A copy of unknown kind, or
+    every copy of a trace summary without ``copy_kinds``, counts as pageable, with a warning."""
     count, trace = count or {}, trace or {}
     flops = float(count.get("flops") or 0.0)
     hash_bytes = float(count.get("hash_in_bytes") or 0.0) \
         + float(count.get("hash_out_bytes") or 0.0)
     scale = c5_scale if _is_c5(name) else 1.0
     copy = trace.get("copy_bytes")
-    nbytes = {"hbm": scale * (float(trace.get("gemm_bytes") or 0.0) + _direction(copy, "d2d")),
-              "h2d": scale * _direction(copy, "h2d"),
-              "d2h": scale * _direction(copy, "d2h"), "hash": hash_bytes}
+    kinds = trace.get("copy_kinds")
+    pairs: dict[str, float] = {}
+    if kinds is None:
+        if copy and warns is not None:
+            warns.add("the trace summary has no copy kinds: its copies are priced at the "
+                      "pageable rates")
+        d2d = _direction(copy, "d2d")
+        pinned = {"h2d": 0.0, "d2h": 0.0}
+        pageable = {d: _direction(copy, d) for d in ("h2d", "d2h")}
+    else:
+        d2d = float(kinds.get("d2d") or 0.0)
+        pairs = {k: scale * float(v or 0.0) for k, v in (kinds.get("peer") or {}).items()}
+        pinned = {d: float(kinds.get(f"{d}_pinned") or 0.0) for d in ("h2d", "d2h")}
+        unknown = {d: float(kinds.get(f"{d}_unknown") or 0.0) for d in ("h2d", "d2h")}
+        if any(unknown.values()) and warns is not None:
+            warns.add("the trace summary has copies of unknown kind (pinned or pageable): "
+                      "priced at the pageable rates")
+        pageable = {d: float(kinds.get(f"{d}_pageable") or 0.0) + unknown[d]
+                    for d in ("h2d", "d2h")}
+    nbytes = {"hbm": scale * (float(trace.get("gemm_bytes") or 0.0) + d2d),
+              "h2d": scale * (pinned["h2d"] + pageable["h2d"]),
+              "d2h": scale * (pinned["d2h"] + pageable["d2h"]),
+              "h2d_pinned": scale * pinned["h2d"], "h2d_pageable": scale * pageable["h2d"],
+              "d2h_pinned": scale * pinned["d2h"], "d2h_pageable": scale * pageable["d2h"],
+              "peer": sum(pairs.values()), "hash": hash_bytes}
     if name == "5":
         nbytes["hbm_measure"] = measure_reads
-    return {"flops": {rate_key: flops} if flops else {}, "bytes": nbytes,
+    return {"flops": {rate_key: flops} if flops else {}, "bytes": nbytes, "peer_pairs": pairs,
             "leaves": leaves, "launches": scale * float(trace.get("launches") or 0.0),
             "syncs": syncs}
+
+
+def _peer_floor(work: dict[str, Any], plist: Sequence[dict[str, Any]],
+                warns: set[str]) -> float | None:
+    """The GPU-to-GPU copies' floor: each device pair's bytes at the probe's ``peer`` rate for
+    that pair, the slowest such time (the links are independent, so a lower bound is the busiest
+    one). A pair the event did not name (``cuda:?``) or the probe did not measure runs at the
+    slowest measured pair's rate (the probe's peer rates are the top level's, shared by every
+    device)."""
+    pairs = {k: v for k, v in (work.get("peer_pairs") or {}).items() if v}
+    if not pairs:
+        return None
+    rates = {k: v for k, v in ((plist[0] if plist else {}).get("peer") or {}).items() if v}
+    if not rates:
+        warns.add("the probe has no peer rates: the nvlink floor is skipped")
+        return None
+    slowest = min(rates.values())
+    times = []
+    for pair, n in pairs.items():
+        if pair not in rates and "?" not in pair:
+            warns.add(f"the probe has no peer rate for {pair}: the slowest pair's is used")
+        times.append(n / rates.get(pair, slowest))
+    return max(times)
 
 
 def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, Any]],
@@ -573,7 +648,9 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
             holders: Sequence[bool] = ()) -> dict[str, float]:
     """§6 step 2: one floor per resource that has work. A term with a zero count adds 0
     whatever its rate; a non-zero count with a null rate drops the resource, with a warning.
-    PCIe is the larger of the two directions, since the link is full duplex.
+    PCIe is the larger of the two directions' times (the link is full duplex), each direction
+    summing its pinned and pageable bytes at their own rates; ``nvlink`` is the GPU-to-GPU
+    copies (:func:`_peer_floor`).
 
     ``probes`` is the probe as each of the section's devices sees it (FS35; one dict is one
     device). The work does not divide over devices (the split replay runs its units one after
@@ -614,9 +691,18 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
     b = work["bytes"]
     total("hbm", [("hbm_copy_bytes", b["hbm"] + b.get("hbm_measure", 0.0),
                    rate_s("hbm_copy_bytes"))])
-    total("pcie", [(key, b[d], rate_s(key))
-                   for d, key in (("h2d", "h2d_pageable_bytes"), ("d2h", "d2h_pageable_bytes"))],
-          combine=max)
+    link = [(d, kind, f"{d}_{kind}_bytes") for d in ("h2d", "d2h")
+            for kind in ("pinned", "pageable")]
+    live = [(d, key, b[f"{d}_{kind}"], rate_s(key)) for d, kind, key in link
+            if b.get(f"{d}_{kind}")]
+    missing = [key for _, key, _, r in live if r is None]
+    if missing:
+        warns.add(f"the probe has no {', '.join(missing)}: the pcie floor is skipped")
+    elif live:  # each direction's pinned and pageable bytes share the link; full duplex
+        out["pcie"] = max(sum(n * r for dd, _, n, r in live if dd == d) for d in ("h2d", "d2h"))
+    peer = _peer_floor(work, plist, warns)
+    if peer is not None:
+        out["nvlink"] = peer
     kernels = [((p.get("rates") or {}).get("hash_kernel") or {}) for p in plist]
     keep = [i for i, h in enumerate(list(holders)[:n_dev]) if h] or list(range(n_dev))
     kernels, hnames = [kernels[i] for i in keep], [names[i] for i in keep]
@@ -651,12 +737,15 @@ def _floors(work: dict[str, Any], probes: dict[str, Any] | Sequence[dict[str, An
 
 
 def _lane(bound: str | None, means: dict[str, float | None], probe: dict[str, Any],
-          rate_key: str | None = None) -> float | None:
+          rate_key: str | None = None, nan_missing: bool = False) -> float | None:
     """Measured utilization (a fraction) on the bound's lane, or ``None``. A measured 0 is a
-    reading. The GEMM lane is the tensor pipe for a bf16 rate and the SMs for an fp32 one."""
+    reading. The GEMM lane is the tensor pipe for a bf16 rate and the SMs for an fp32 one.
+    A NaN primary reading is returned as NaN, or with ``nan_missing`` read as absent (the
+    fallback field is used)."""
     def frac(primary: str, fallback: str) -> float | None:
-        if means.get(primary) is not None:
-            return means[primary]
+        v = means.get(primary)
+        if v is not None and not (nan_missing and math.isnan(v)):
+            return v
         return means.get(fallback)
 
     if bound == "gemm":
@@ -671,6 +760,20 @@ def _lane(bound: str | None, means: dict[str, float | None], probe: dict[str, An
         threads = ((probe.get("rates") or {}).get("hash") or {}).get("threads")
         c = means.get("c_tree")
         return None if not threads or c is None else c / threads
+    return None
+
+
+def _lane_max(bound: str | None, means: Sequence[dict[str, float | None]],
+              probes: Sequence[dict[str, Any]], rate_key: str | None) -> float | None:
+    """The largest lane utilization over the devices' readings, NaN-aware: a device reporting
+    NaN does not hide the others whatever the order. With no finite reading but a NaN one the
+    lane is read again with NaN as absent (the fallback field), as for a missing field."""
+    for nan_missing in (False, True):
+        lanes = [m for dm, p in zip(means, probes, strict=True)
+                 if (m := _lane(bound, dm, p, rate_key, nan_missing)) is not None
+                 and not math.isnan(m)]
+        if lanes:
+            return max(lanes)
     return None
 
 
@@ -841,9 +944,6 @@ def _timeline(untraced: list[dict[str, Any]], sampler: Sampler, dv: _Devices | N
 # ---- check 5 -----------------------------------------------------------------------------
 
 
-_ITEM_BYTES = {"float32": 4, "float64": 8, "bfloat16": 2, "float16": 2}
-
-
 def _measure_reads(layout: dict[str, Any] | None, device: str | None) -> float:
     """HBM bytes the check-5 measuring needs to read in one step (GPU path only), else 0.
 
@@ -856,16 +956,12 @@ def _measure_reads(layout: dict[str, Any] | None, device: str | None) -> float:
     This is a floor, so it leaves out what the kernel's design adds: the kernel sweeps each
     operand once per chunk of 16 challenge columns (``K_CHUNK``), which is part of its ratio
     over this floor. Products that share one stored view (``share=True``) read it once, so the
-    kernel can read up to about 13% less than this count (FS38b measured 0.8 of 6.3 GB per
-    layer saved); that overstatement is known, and the layout cannot remove it (it records no
-    addresses)."""
+    kernel can read less than this count: 0.8 of 6.3 GB per layer in the kernel plan's
+    arithmetic (FS38b; not a measurement), about 10-11% a step. That overstatement is known, and the
+    layout cannot remove it (it records no addresses)."""
     if not layout or not str(device or "").startswith("cuda"):
         return 0.0
-    tot = 0.0
-    for e in layout["entries"]:
-        item = _ITEM_BYTES.get(str(e.get("product_dtype", "float32")).removeprefix("torch."), 4)
-        tot += e.get("operand_bytes", 0) * item / 4 + e.get("product_bytes", 0)
-    return tot
+    return float(sum(io.entry_bytes(e) for e in layout["entries"]))
 
 
 def _layout_maps(layout: dict[str, Any], warns: set[str]
@@ -1328,25 +1424,26 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
             work = _work(name, _rate_key(name, sides, compute_bf16), counts.get(name),
                          _section_leaves(counts.get(name), leaves, transcript), tr,
                          c5_scale,
-                         2 * round(_mean(calls) or 0), measure_reads=measure_reads)
+                         2 * round(_mean(calls) or 0), measure_reads=measure_reads, warns=warns)
             floors = _floors(work, probes, warns, devices=devs, gpu_hash=dv.gpu_hash,
                              holders=[dv.holds_transcript(d) for d in devs])
             floor_s = max(floors.values()) if floors else None
             bound = max(floors, key=floors.__getitem__) if floors else "unknown"
             ratio = mean_t / floor_s if floor_s and mean_t is not None else None
             marks = []
-            # no trace: check 5's floor holds the measuring reads alone, a partial floor
-            partial = ["hbm serving", "pcie", "launch"] \
-                if work["bytes"].get("hbm_measure") and not tr else []
+            # on a CUDA run without the section's trace, the trace-derived terms (memory
+            # traffic, PCIe, peer, launch) are missing, not zero: the floor is partial
+            partial = _missing_terms(name, work) \
+                if floor_s and str(markers.header.get("device") or "").startswith("cuda") \
+                and not tr else []
             if share is not None and ratio is not None and share >= THRESHOLDS["share"] \
                     and ratio >= THRESHOLDS["ratio"] and not partial:
                 marks.append("bottleneck")
             rate_key = next(iter(work["flops"]), None)
-            lanes = [m for i, ((dm, _), p) in enumerate(zip(per_dev, probes, strict=True))
-                     if i in pick and (m := _lane(bound, dm, p, rate_key)) is not None]
-            measured = max(lanes) if lanes else None
+            measured = _lane_max(bound, [per_dev[i][0] for i in pick],
+                                 [probes[i] for i in pick], rate_key)
             if floor_s and mean_t and measured is not None and n >= THRESHOLDS["min_samples"] \
-                    and _differ(floor_s / mean_t, measured):
+                    and not partial and _differ(floor_s / mean_t, measured):
                 marks.append("utilization")
             if gpu_memory and peaks.get(name) is not None \
                     and peaks[name] >= THRESHOLDS["reserved"] * gpu_memory \
@@ -1371,11 +1468,14 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                 rs = [(p.get("rates") or {}).get("hbm_copy_bytes") for p in probes]
                 sec_s = max(1.0 / r for r in rs)
                 detail = {"floor_detail": {"hbm": {
-                    "serving_bytes": work["bytes"]["hbm"],
-                    "serving_s": work["bytes"]["hbm"] * sec_s,
+                    "serving_bytes": None if partial else work["bytes"]["hbm"],
+                    "serving_s": None if partial else work["bytes"]["hbm"] * sec_s,
                     "measuring_reads_bytes": work["bytes"]["hbm_measure"],
                     "measuring_reads_s": work["bytes"]["hbm_measure"] * sec_s}}}
-            if partial:
+            if partial:  # the missing terms are null: unknown, not 0.0
+                fd = detail.setdefault("floor_detail", {})
+                for term in ("hbm", "pcie", "nvlink", "launch"):
+                    fd.setdefault(term, None)
                 detail["floor_partial"] = {"missing": partial}
             sections[name] = {
                 **detail, "depth": depth, "time": time_stats, "share": share,

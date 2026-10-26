@@ -424,3 +424,30 @@ def test_batch_cover_rules():
     assert cover == {2: [4, 5], 3: [4, 5], 7: [7], 8: []}
     shuffled = [stamps[i] for i in (8, 3, 0, 7, 1, 5, 2, 6, 4)]
     assert sorted(io.batch_cover(shuffled).values()) == sorted(cover.values())
+
+
+def test_copy_bytes_are_kept_by_kind(tmp_path):
+    peer = x("gpu_memcpy", "Memcpy PtoP (Device -> Device)", 120, 5,
+             {"correlation": 4, "bytes": 800, "fromDevice": 3, "toDevice": 0})
+    peer_unnamed = memcpy("PtoP (Device -> Device)", 130, 5, 8, 5)
+    evs = [ann("S", 0, 300),
+           launch(50, 1, "cudaMemcpyAsync"), memcpy("HtoD (Pinned -> Device)", 60, 5, 100, 1),
+           launch(55, 2, "cudaMemcpyAsync"), memcpy("HtoD (Pageable -> Device)", 70, 5, 10, 2),
+           launch(56, 3, "cudaMemcpyAsync"), memcpy("DtoH (Device -> Pinned)", 80, 5, 1000, 3),
+           launch(57, 6, "cudaMemcpyAsync"), memcpy("DtoH (Device -> Pageable)", 85, 5, 20, 6),
+           launch(58, 7, "cudaMemcpyAsync"), memcpy("DtoH (Device -> ?)", 86, 5, 30, 7),
+           launch(59, 8, "cudaMemcpyAsync"), memcpy("DtoD (Device -> Device)", 90, 5, 7, 8),
+           launch(60, 4, "cudaMemcpyPeerAsync"), peer,
+           launch(61, 5, "cudaMemcpyPeerAsync"), peer_unnamed]
+    s = trace.summarize(write(tmp_path / "t.json.gz", evs))["sections"]["S"]
+    assert s["copy_kinds"] == {
+        "h2d_pinned": 100, "h2d_pageable": 10, "h2d_unknown": 0, "d2h_pinned": 1000,
+        "d2h_pageable": 20, "d2h_unknown": 30, "d2d": 7,
+        "peer": {"cuda:3->cuda:0": 800, "cuda:?->cuda:?": 8}}
+    # the totals by direction stay as before, a peer copy counted with the device-to-device ones
+    assert s["copy_bytes"] == {"h2d": 110, "d2h": 1050, "d2d": 7 + 808}
+
+
+def test_a_section_without_copies_has_zero_kinds(tmp_path):
+    s = trace.summarize(write(tmp_path / "t.json.gz", [ann("S", 0, 100)]))["sections"]["S"]
+    assert s["copy_kinds"] == {**dict.fromkeys(trace.COPY_KINDS, 0), "peer": {}}

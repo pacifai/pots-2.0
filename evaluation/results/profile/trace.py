@@ -86,6 +86,11 @@ KERNEL_CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 because flash kernels are built on cutlass. GEMM comes before reduction because cuBLAS's
 split-K reduce kernel belongs to its GEMM."""
 
+COPY_KINDS = ("h2d_pinned", "h2d_pageable", "h2d_unknown", "d2h_pinned", "d2h_pageable",
+              "d2h_unknown", "d2d")
+"""The ``copy_kinds`` keys (bytes of each kind of copy), beside ``peer`` (bytes per device
+pair, GPU to GPU). ``copy_bytes`` keeps the totals by direction, a peer copy counted in
+``d2d``."""
 COPY_DIRECTIONS = (("htod", "h2d"), ("dtoh", "d2h"), ("dtod", "d2d"), ("ptop", "d2d"))
 GEMM_OPS = frozenset({"aten::mm", "aten::addmm", "aten::bmm", "aten::matmul"})
 SYNC_CALLS = frozenset({"cudaDeviceSynchronize", "cudaStreamSynchronize",
@@ -212,6 +217,26 @@ def _copy_direction(name: str) -> str | None:
     return None
 
 
+def _copy_kind(e: Event) -> tuple[str, str | None]:
+    """The kind of a copy event whose direction is known: ``("h2d_pinned", None)``,
+    ``h2d_pageable``, ``h2d_unknown`` (and the ``d2h`` ones), ``("d2d", None)``, or
+    ``("peer", "cuda:S->cuda:D")`` (``"cuda:?->cuda:?"`` when the event names no two
+    devices). The trace names the host memory of a copy ("Memcpy HtoD (Pinned -> Device)",
+    "Memcpy DtoH (Device -> Pageable)") and a peer copy's two devices (``args.fromDevice`` and
+    ``toDevice``)."""
+    low = e["name"].lower()
+    if "ptop" in low:
+        args = e.get("args", {})
+        src, dst = args.get("fromDevice"), args.get("toDevice")
+        both = src is not None and dst is not None
+        return "peer", f"cuda:{src}->cuda:{dst}" if both else "cuda:?->cuda:?"
+    if "dtod" in low:
+        return "d2d", None
+    d = "h2d" if "htod" in low else "d2h"
+    host = "pinned" if "pinned" in low else "pageable" if "pageable" in low else "unknown"
+    return f"{d}_{host}", None
+
+
 class _Warnings:
     """Warning messages in first-seen order, each with its count."""
 
@@ -315,6 +340,8 @@ class _Acc:
         self.launches = 0
         self.copy_bytes: dict[str, int] = {}
         self.copy_unknown: dict[str, int] = {}
+        self.kinds: dict[str, int] = dict.fromkeys(COPY_KINDS, 0)
+        self.peer: dict[str, int] = {}
         self.gemm_bytes = 0
         self.gemm_flops: int | None = None
         self.gemm_ops = 0
@@ -335,6 +362,7 @@ class _Acc:
             "gpu_idle_us": {dev: wall - v for dev, v in span.items()},
             "kernels": sum(map(len, self.kernels.values())), "launches": self.launches,
             "categories_us": self.cats, "copy_bytes": copy,
+            "copy_kinds": {**self.kinds, "peer": dict(sorted(self.peer.items()))},
             "gemm_flops": self.gemm_flops if self.gemm_ops else 0, "gemm_bytes": self.gemm_bytes,
             "sync_wait_us": self.sync_us,
             "top_cpu_ops": [{"name": n, "self_us": v[0], "calls": v[1]} for n, v in top],
@@ -484,6 +512,7 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
                 for a in tg:
                     a.cats["other"] += dur
                 continue
+            kind, pair = _copy_kind(e)
             nbytes = e.get("args", {}).get("bytes")
             no_bytes += nbytes is None
             blocking = (d == "d2h" and "pageable" in e["name"].lower()
@@ -495,6 +524,10 @@ def summarize(trace_path: str | Path, layout_path: str | Path | None = None,
                     a.copy_unknown[d] = a.copy_unknown.get(d, 0) + 1
                 else:
                     a.copy_bytes[d] = a.copy_bytes.get(d, 0) + int(nbytes)
+                    if kind == "peer":
+                        a.peer[pair] = a.peer.get(pair, 0) + int(nbytes)
+                    else:
+                        a.kinds[kind] += int(nbytes)
                 if blocking:
                     a.sync_us += call.get("dur", 0.0)
     if no_launch:

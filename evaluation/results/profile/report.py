@@ -450,6 +450,11 @@ def _by_part(names: Sequence[str]) -> dict[str, list[str]]:
 # ---- panels ------------------------------------------------------------------------------
 
 
+FLOOR_RESOURCES = {"gemm": "the matmul rate", "hbm": "memory bandwidth", "pcie": "PCIe",
+                   "nvlink": "the GPU-to-GPU link", "hash": "hashing",
+                   "launch": "kernel launches"}
+
+
 def _inputs(profiles: Sequence[dict[str, Any]], names: Sequence[str], runs: list[Run]) -> str:
     models = _distinct([r.model for r in runs])
     sessions = _distinct([r.field("session") for r in runs])
@@ -467,6 +472,17 @@ def _inputs(profiles: Sequence[dict[str, Any]], names: Sequence[str], runs: list
             out.append(f"<h3>Warnings from {esc(n)}</h3><ul class=\"warn\">"
                        + "".join(f"<li>{esc(w)}</li>" for w in p["warnings"]) + "</ul>")
     return "".join(out)
+
+
+def _partial_note(run: Run) -> str:
+    """Once per run with a partial floor: what its floors leave out."""
+    if not any(s.get("floor_partial") for s in run.sections.values()):
+        return ""
+    return ('<p class="small"><b>Partial floors</b>: this run has no trace of some sections, so '
+            "their floors leave out the terms that come from a trace (memory traffic, PCIe, the "
+            "GPU-to-GPU link and kernel launches). Those terms are not counted (no trace), and "
+            "the ratios of those sections' times to their floors are not comparable with a "
+            "traced run's; no bottleneck or utilization mark is set from them.</p>")
 
 
 def _tip(run: Run, n: str) -> str:
@@ -558,7 +574,8 @@ def _overview(run: Run) -> str:
     note = (f'<p class="mute small">Share of step time: the section\'s mean time over {against}. '
             "The training rows are the prover's own training with the matmul capture on; plain "
             "training, without the protocol, is compared in Prover beside plain.</p>")
-    return (intro + bar + f'<div class="scroll"><table>{head}{"".join(rows)}</table></div>' + note
+    return (intro + _partial_note(run) + bar
+            + f'<div class="scroll"><table>{head}{"".join(rows)}</table></div>' + note
             + _marks_legend(_distinct(marks), run.profile.get("thresholds")))
 
 
@@ -777,18 +794,26 @@ def _c5(run: Run) -> str:
     detail = (sec5.get("floor_detail") or {}).get("hbm")
     if detail:
         part = (sec5.get("floor_partial") or {}).get("missing")
-        ratio = sec5.get("ratio")
-        tail = (f" (check 5 took {fmt(ratio)}× its floor)" if ratio is not None else "")
+        ratio, floor = sec5.get("ratio"), sec5.get("floor_s")
+        by = FLOOR_RESOURCES.get(sec5.get("bound"), str(sec5.get("bound")))
+        serving = ("not counted (no trace)" if detail["serving_s"] is None
+                   else f"{fmt(detail['serving_s'])} s")
+        lead = ""
+        if floor is not None:
+            lead = (f"Check 5's floor is {fmt(floor)} s, set by {esc(by)}"
+                    + (f"; it took {fmt(ratio)}× that" if ratio is not None else "") + ". ")
         if part:
-            tail = (f" <b>Partial floor</b>: the run has no trace, so only the measuring reads "
-                    f"are counted and the {', '.join(part)} terms are missing"
-                    + (f"; the ratio of {fmt(ratio)}× to it is not comparable with a full "
-                       "floor and sets no mark" if ratio is not None else "") + ".")
-        intro += ("<p class=\"small\">Its memory-bandwidth floor is "
-                  f"{fmt(detail['serving_s'] + detail['measuring_reads_s'])} s: serving "
-                  f"(copying the operands and products), {fmt(detail['serving_s'])} s, and "
+            lead = (f"<b>Partial floor</b>: this run has no trace of check 5, so "
+                    f"{esc(', '.join(part))} are not counted (no trace). " + lead
+                    + ("The ratio is not comparable with a traced run's, and it sets no mark. "
+                       if ratio is not None else ""))
+        reads_s = detail["measuring_reads_s"]
+        total = (f"{fmt(detail['serving_s'] + reads_s)} s" if detail["serving_s"] is not None
+                 else f"at least {fmt(reads_s)} s")
+        intro += (f'<p class="small">{lead}Its memory-bandwidth part is {total}: '
+                  f"serving (copying the operands and products), {serving}, and "
                   "measuring reads (the measuring kernel reading each product's inputs and "
-                  f"the product once), {fmt(detail['measuring_reads_s'])} s.{tail}</p>")
+                  f"the product once), {fmt(reads_s)} s.</p>")
     steps = "".join(f"<li><b>{esc(PHASES[p][0])}</b> <span class=\"code\">{esc(p)}</span> — "
                     f"{esc(PHASES[p][1])}: {fmt(phases[p])} s</li>" for p in C5_PHASES)
     out = [intro, f'<ul class="small">{steps}</ul>']
@@ -835,8 +860,10 @@ def _c5(run: Run) -> str:
     out.append("<h3>Phase time by product</h3>"
                '<p class="small">Each row is one kind of matmul product, grouped by the pass '
                "and the part of the model it belongs to; the bar splits its check-5 time into "
-               "the five phases.</p>" + _phase_legend() + _svg(x0 + pw + 60, y + 38,
-                                                               "".join(body)))
+               "the five phases. The measure time is split over the products by bytes, from one "
+               "time stamp per schedule step (a stamp covers many products), and each "
+               "stamp's time includes the wait for the previous step's measuring.</p>"
+               + _phase_legend() + _svg(x0 + pw + 60, y + 38, "".join(body)))
     return "".join(out)
 
 
