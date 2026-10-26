@@ -25,7 +25,8 @@ its count.
 **Per section.** ``wall_us`` is the length of the union of the section's own occurrences.
 ``kernel_us`` sums kernel durations. ``kernel_span_us`` is the union of each GPU's kernel
 intervals, a mapping from the trace's device id (the event's ``args.device``, else its ``pid``)
-to µs, and ``gpu_idle_us`` is ``wall_us`` less that, per GPU. It is negative when a section ends
+to µs (only the GPUs that ran a kernel in the section), and ``gpu_idle_us`` is ``wall_us`` less
+that, per GPU. It is negative when a section ends
 before its asynchronous kernels finish, so it's meaningful when the section ends in a sync.
 ``top_cpu_ops`` self times include descendants. ``sync_wait_us`` sums the host calls to
 ``cudaDeviceSynchronize``, ``cudaStreamSynchronize``, ``cudaEventSynchronize`` and ``cudaMemcpy``

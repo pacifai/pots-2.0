@@ -558,12 +558,12 @@ def _work(name: str, rate_key: str, count: dict[str, Any] | None, leaves: int,
         + float(count.get("hash_out_bytes") or 0.0)
     scale = c5_scale if _is_c5(name) else 1.0
     copy = trace.get("copy_bytes")
-    return {"flops": {rate_key: flops} if flops else {},
-            "bytes": {"hbm": scale * (float(trace.get("gemm_bytes") or 0.0)
-                                      + _direction(copy, "d2d")),
-                      "hbm_measure": measure_reads if name == "5" else 0.0,
-                      "h2d": scale * _direction(copy, "h2d"),
-                      "d2h": scale * _direction(copy, "d2h"), "hash": hash_bytes},
+    nbytes = {"hbm": scale * (float(trace.get("gemm_bytes") or 0.0) + _direction(copy, "d2d")),
+              "h2d": scale * _direction(copy, "h2d"),
+              "d2h": scale * _direction(copy, "d2h"), "hash": hash_bytes}
+    if name == "5":
+        nbytes["hbm_measure"] = measure_reads
+    return {"flops": {rate_key: flops} if flops else {}, "bytes": nbytes,
             "leaves": leaves, "launches": scale * float(trace.get("launches") or 0.0),
             "syncs": syncs}
 

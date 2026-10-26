@@ -1031,4 +1031,4 @@ def test_check_5_floor_adds_measuring_reads_once_apart():
     # serving 4000 B and measuring 2000 B at 1 kB/s: 6 s; the scale touches serving only
     assert analyze._floors(work, probe, set())["hbm"] == pytest.approx(6.0)
     other = analyze._work("6", "gemm_fp32_flops", None, 0, trace, 4.0, 0, measure_reads=2000.0)
-    assert other["bytes"]["hbm_measure"] == 0.0
+    assert "hbm_measure" not in other["bytes"]
