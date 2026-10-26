@@ -1296,8 +1296,9 @@ def four_default_deadline_s() -> int:
 # FS42 (d)'s profiling run (``four-h100-profile``): the same machine and head as ``four-h100``,
 # three models (F24, 2026-10-25, dropped Qwen2.5-1.5B from the full-scale runs: it runs out of
 # memory pipelined) and, per model, a plain training run (three steps), the card and the two
-# arms at four steps, the sequential arm tracing its step 4. Step 1 is the warm-up, steps 2-3 are the steady
-# steps (untraced in both arms), the traced step is the last.
+# arms at four steps, the sequential arm tracing its step 4. Step 1 is the warm-up, steps 2-3 are
+# the steady steps (untraced in both arms; the pipelined arm's step 4 is its drain), the traced
+# step is the last.
 FOUR_PROFILE_ORDER = ("Qwen2.5-0.5B", "Llama-3.2-1B", "Falcon3-1B")
 FOUR_PROFILE_STEPS = 4
 FOUR_PROFILE_TRACE_STEP = 4  # VERIF_TRACE_STEP of the sequential arms
@@ -1311,10 +1312,10 @@ FOUR_PROFILE_PINS: tuple[tuple[str, str], ...] = tuple(sorted(
 # 109-178 s (three steps each, the memory pass included). Here the pipelined arm runs four steps
 # (a step is about a quarter of those times, plus the memory pass and the start-up), so 4
 # minutes; the models part is FS35's estimate, 6, and limit, 720 s (it fetches the whole
-# manifest, and a slow download fails the part); the sequential arm adds the trace of one step (a full-scale
-# step's trace is a JSON of about 1-1.5 GB, gzipped at level 1: an estimate, adding 2-3 minutes
-# to a step of about 195 s), so 6 minutes and 720 s; the plain run (three steps and a memory pass on one GPU) is estimated, not measured,
-# at 3.
+# manifest, and a slow download fails the part); the sequential arm adds the trace of one
+# step (a full-scale step's trace is a JSON of about 1-1.5 GB, gzipped at level 1: an estimate,
+# adding 2-3 minutes to a step of about 195 s), so 6 minutes and 720 s; the plain run (three steps
+# and a memory pass on one GPU) is estimated, not measured, at 3.
 FOUR_PROFILE_ESTIMATE_MIN = {"native_build": 1, "peer_check": 1, "models": 6, "four_tests": 6,
                              "probe": 7, "plain": 3, "card": 2, "seq": 6, "pipe": 4}
 # Time limits, seconds, about twice the estimates (the native build's is the build part's own).
@@ -1343,9 +1344,10 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
                t: Mapping[str, int], steps: int, profile: bool) -> list[Part]:
     """The parts of the four-H100 sessions: ``pins``' models, ``steps`` verified steps per arm,
     time limits ``t``; with ``profile`` (``four-h100-profile``, :func:`four_h100_profile_plan`)
-    a ``plain_<key>`` run (``plain_baseline`` on GPU 0 alone, :data:`FOUR_PROFILE_PLAIN_STEPS` steps, metrics) before
-    each model's card, the sequential arm traced at :data:`FOUR_PROFILE_TRACE_STEP` and a
-    ``samples.jsonl`` check on every part. Otherwise :func:`four_h100_plan`'s.
+    a ``plain_<key>`` run (``plain_baseline`` on GPU 0 alone, :data:`FOUR_PROFILE_PLAIN_STEPS`
+    steps, metrics) before each model's card, the sequential arm traced at
+    :data:`FOUR_PROFILE_TRACE_STEP` and a ``samples.jsonl`` check on every part. Otherwise
+    :func:`four_h100_plan`'s.
     The F22 peer-copy byte check first (the native build runs ahead of it); the models part;
     ``four_tests``, one pytest part with a junit report running
     every two-GPU test, slow or not (:data:`PAIR_SLOW_SELECT`: the non-slow ones put the
@@ -2598,20 +2600,39 @@ def _four_tests_problems(part: Mapping[str, Any], expected: Sequence[str] | None
     return why
 
 
-def _steady_s(ex: Mapping[str, Any], steps: int = FOUR_STEPS) -> tuple[float | None, str | None]:
-    """An arm's steady step time, the mean of steps 2 and 3 of its ``steps`` steps, and what it
-    is: the interval between consecutive verified steps (``step_interval``, EQ14's wall time per
-    step, FS42) where the records hold it, else the merged step's wall extent (``step_wall``,
-    records written before FS42), else the times' total."""
+def _steady_slice(steps: int, pipelined: bool = False, traced_last: bool = False) -> slice:
+    """The steady steps of an arm of ``steps`` steps, as a slice of its per-step list: step 1 is
+    the warm-up and the last step is left out where it is not steady, steps 2..``steps`` for a
+    sequential arm, steps 2..``steps`` - 1 for a pipelined one (its last step is the drain, verified
+    with the prover idle, about 11% short on the rehearsal) and for an arm that traces its last
+    step. Three steps pipelined: step 2 alone; four steps: steps 2-3."""
+    return slice(1, steps - 1 if pipelined or traced_last else steps)
+
+
+def _steady_steps_text(steps: int, pipelined: bool = False, traced_last: bool = False) -> str:
+    """The steady steps of :func:`_steady_slice` as the logs name them: ``"steps 2-3"`` or
+    ``"step 2"``."""
+    first, last = 2, len(range(steps)[_steady_slice(steps, pipelined, traced_last)]) + 1
+    return f"step {first}" if last == first else f"steps {first}-{last}"
+
+
+def _steady_s(ex: Mapping[str, Any], steps: int = FOUR_STEPS, pipelined: bool = False,
+              traced_last: bool = False) -> tuple[float | None, str | None]:
+    """An arm's steady step time, the mean of its steady steps (:func:`_steady_slice`) of its
+    ``steps`` steps, and what it is: the interval between consecutive verified steps
+    (``step_interval``, EQ14's wall time per step, FS42) where the records hold it, else the
+    merged step's wall extent (``step_wall``, records written before FS42), else the times'
+    total."""
+    sl = _steady_slice(steps, pipelined, traced_last)
     ivs = ex.get("step_interval_s") or []
     if len(ivs) >= steps:
-        return statistics.fmean(ivs[1:3]), "step_interval"
+        return statistics.fmean(ivs[sl]), "step_interval"
     wall = ex.get("step_wall_s") or []
     if len(wall) >= steps:
-        return statistics.fmean(wall[1:3]), "step_wall"
+        return statistics.fmean(wall[sl]), "step_wall"
     times = ex.get("step_times") or []
     if len(times) >= steps and all(r.get("total_s") is not None for r in times):
-        return statistics.fmean(r["total_s"] for r in times[1:3]), "total"
+        return statistics.fmean(r["total_s"] for r in times[sl]), "total"
     return None, None
 
 
@@ -2620,10 +2641,13 @@ def _pos(x: Any) -> bool:
     return _number(x) and math.isfinite(x) and x > 0
 
 
-def _steady_mean(per_step: Sequence[float] | None, steps: int = FOUR_STEPS) -> float | None:
-    """The mean of steps 2 and 3 of a per-step list of ``steps`` values, else ``None``."""
+def _steady_mean(per_step: Sequence[float] | None, steps: int = FOUR_STEPS,
+                 pipelined: bool = False, traced_last: bool = False) -> float | None:
+    """The mean of the steady steps (:func:`_steady_slice`) of a per-step list of ``steps``
+    values, else ``None``."""
     vals = list(per_step or ())
-    return statistics.fmean(vals[1:3]) if len(vals) >= steps else None
+    return (statistics.fmean(vals[_steady_slice(steps, pipelined, traced_last)])
+            if len(vals) >= steps else None)
 
 
 def _four_missing_numbers(models: Mapping[str, Mapping[str, Any]],
@@ -2655,12 +2679,14 @@ def _four_missing_numbers(models: Mapping[str, Mapping[str, Any]],
 
 
 def _four_model_items(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any],
-                      steps: int) -> list[tuple[bool, str]]:
+                      steps: int, traced_last: bool = False) -> list[tuple[bool, str]]:
     """One model's acceptance items of the four-H100 sessions (``steps`` verified steps per
-    arm): both arms accepted at all ``steps`` steps in their loop mode, the arms' step roots
-    equal step for step, step 1's root the card's proved root, and the four GPUs named in each
-    arm's environment record. Fills ``row`` (the model's entry in the result) and returns the
-    items. The arms' parts are ``seq_<k>`` and ``pipe_<k>``, the card's ``card_<k>``."""
+    arm; ``traced_last``: the sequential arm traces its last step, :func:`_steady_slice` leaves
+    it out of the steady steps): both arms accepted at all ``steps`` steps in their loop mode, the
+    arms' step roots equal step for step, step 1's root the card's proved root, and the four
+    GPUs named in each arm's environment record. Fills ``row`` (the model's entry in the result)
+    and returns the items. The arms' parts are ``seq_<k>`` and ``pipe_<k>``, the card's
+    ``card_<k>``."""
     items: list[tuple[bool, str]] = []
     card = (_pair_part(parts, f"card_{k}").get("extras") or {})
     arm_ex = {a: (_pair_part(parts, f"{a}_{k}").get("extras") or {}) for a in FOUR_ARMS}
@@ -2672,19 +2698,24 @@ def _four_model_items(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str,
     card_ok = bool(card.get("root")) and bool(seq_roots) and seq_roots[0] == card["root"] \
         and bool(pipe_roots) and pipe_roots[0] == card["root"]
     gpu_why = {a: _four_gpu_problems(e) for a, e in arm_ex.items()}
-    steady = {a: _steady_s(e, steps) for a, e in arm_ex.items()}
+    pipe = {a: a == "pipe" for a in arm_ex}
+    last = {a: traced_last and a == "seq" for a in arm_ex}
+    steady = {a: _steady_s(e, steps, pipe[a], last[a]) for a, e in arm_ex.items()}
     row.update({
         "accepted": accepted, "roots_equal": equal, "step1_equals_card": card_ok,
         "card_root": card.get("root"), "gpu_problems": gpu_why,
         "arms": {a: {"step_roots": e.get("step_roots"), "step_times": e.get("step_times"),
                      "step_wall_s": e.get("step_wall_s"),
                      "step_interval_s": e.get("step_interval_s"),
-                     "latency_steady_s": _steady_mean(e.get("step_wall_s"), steps)
+                     "latency_steady_s": _steady_mean(e.get("step_wall_s"), steps, True)
                      if a == "pipe" else None,
+                     "steady_steps": _steady_steps_text(steps, pipe[a], last[a]),
                      "gpu_held_upper_s": e.get("gpu_held_upper_s"),
                      "accumulated_gpu_s": e.get("accumulated_gpu_s"),
-                     "verifier_steady_s": _steady_mean(e.get("verifier_s"), steps),
-                     "accumulated_steady_s": _steady_mean(e.get("accumulated_gpu_s"), steps),
+                     "verifier_steady_s": _steady_mean(e.get("verifier_s"), steps, pipe[a],
+                                                       last[a]),
+                     "accumulated_steady_s": _steady_mean(e.get("accumulated_gpu_s"), steps,
+                                                          pipe[a], last[a]),
                      "steady_s": steady[a][0], "steady_source": steady[a][1],
                      "device_peaks": e.get("device_peaks"), "loop_mode": e.get("loop_mode"),
                      "gpu_peak_mib": (_pair_part(parts, f"{a}_{k}").get("extras")
@@ -2719,9 +2750,12 @@ def four_h100(parts: Sequence[Mapping[str, Any]],
     once 12 peer rates). ``items`` lists each acceptance item as ``(ok, text)``, in the order
     the log prints them. Outside ``pass``: per model and arm each step's prover, verifier,
     hand-off and total time (``step_times``), ``step_wall_s``, ``step_interval_s`` and
-    ``gpu_held_upper_s`` (an upper bound) per step, ``accumulated_gpu_s`` per step and its steady mean
-    (``accumulated_steady_s``, steps 2 and 3; :func:`_accumulated_gpu_s`), ``steady_s`` (steps 2
-    and 3, :func:`_steady_s`: the step interval; ``latency_steady_s``, the pipelined arm's
+    ``gpu_held_upper_s`` (an upper bound) per step, ``accumulated_gpu_s`` per step and its steady
+    mean
+    (``accumulated_steady_s``, the arm's steady steps, ``steady_steps``: steps 2..n for a
+    sequential arm, 2..n-1 for a pipelined one, whose last step is the drain;
+    :func:`_steady_slice`, :func:`_accumulated_gpu_s`), ``steady_s`` (the same steps,
+    :func:`_steady_s`: the step interval; ``latency_steady_s``, the pipelined arm's
     ``step_wall`` mean), the memory pass's peak per device (``device_peaks``) and the whole
     card's peaks (``gpu_peak_mib``, per GPU); and once the probe's per-device headline rates, the
     12 peer rates and ``peer_check``'s per-pair rates."""
@@ -2800,16 +2834,17 @@ def _four_lines(res: Mapping[str, Any] | None) -> list[str]:
         for a, arm in row["arms"].items():
             s, src, acc = arm["steady_s"], arm["steady_source"], arm.get("accumulated_steady_s")
             lat = arm.get("latency_steady_s")
+            st = arm.get("steady_steps") or "steps 2-3"
             peaks = arm.get("gpu_peak_mib") or {}
             lines.append(
                 f"FS35 {k} {a}: steady step "
                 + ("unknown" if s is None else
-                   f"{s:.1f} s (interval between verified steps, mean of steps 2-3)"
-                   if src == "step_interval" else f"{s:.1f} s ({src}, mean of steps 2-3)")
+                   f"{s:.1f} s (interval between verified steps, mean of {st})"
+                   if src == "step_interval" else f"{s:.1f} s ({src}, mean of {st})")
                 + ("" if a != "pipe" else "; latency " + (
                     "unknown" if lat is None else f"{lat:.1f} s (step_wall)"))
                 + "; accumulated GPU time "
-                + ("unknown" if acc is None else f"{acc:.1f} s (mean of steps 2-3)")
+                + ("unknown" if acc is None else f"{acc:.1f} s (mean of {st})")
                 + "; GPU peaks "
                 + (", ".join(f"{i}: {peaks[i] / 1024:.1f} GiB" if i in peaks else f"{i}: ?"
                              for i in map(str, range(FOUR_CARDS))) if peaks else "unknown"))
@@ -2920,7 +2955,9 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
     ``items`` lists each acceptance item as ``(ok, text)``, in the order the log prints them.
     Outside ``pass``, per model: each arm's numbers as the FS35 result has them (the steady step
     from the step interval, the pipelined latency, the accumulated GPU time, the four GPUs'
-    peaks), ``verifier_steady_s`` (the verifier side's ``total`` row, mean of steps 2-3), the
+    peaks), ``verifier_steady_s`` (the verifier side's ``total`` row, mean of the arm's steady
+    steps; the sequential arm's traced step 4 and the pipelined arm's drain step 4 stay out,
+    so steps 2-3), the
     plain run's ``steady_s`` (mean of the ``step`` total over steps 2-3) and per arm
     ``verify_over_train`` (verifier over the plain step, in wall time: the verifier side's step
     time over the plain step's, whatever the number of verifier GPUs),
@@ -2950,7 +2987,7 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
          f"{tests_ex.get('errors')} errors, {tests_ex.get('skipped')} skipped; FS34's cases "
          "all passed" if not tests_problems else "the tests: " + "; ".join(tests_problems))]
     for k, row in models.items():
-        items += _four_model_items(parts, k, row, FOUR_PROFILE_STEPS)
+        items += _four_model_items(parts, k, row, FOUR_PROFILE_STEPS, traced_last=True)
         plain = _pair_part(parts, f"plain_{k}").get("extras") or {}
         why_plain = _profile_plain_problems(plain)
         steady_plain = plain.get("steady_s")

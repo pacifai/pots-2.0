@@ -3344,10 +3344,13 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     (`llama_step --steps 3 --metrics --no-count`, each in its own run directory; only `pipe_*`
     sets `VERIF_PIPELINED`). `four_h100(parts)` goes to `summary.json["four_h100"]` and
     `_four_lines` ends the job log (`FS35 ok:` or `FS35 FAIL:` per acceptance item; per model
-    and arm the wall time, a steady step (the mean of steps 2-3 of the interval between verified
-    steps, `step_interval`; a pipelined arm also prints its latency, the `step_wall` mean, beside
-    it), beside the accumulated GPU time
-    (steady, mean of steps 2-3) and four GPU peaks; the peer-rate range).
+    and arm the wall time, a steady step (the mean of the interval between verified steps,
+    `step_interval`, over the arm's steady steps, `_steady_slice`: steps 2..n for a sequential
+    arm, 2..n-1 for a pipelined one, whose last step is the drain, verified with the prover idle,
+    so step 2 alone at 3 steps; the profile's 4-step arms keep steps 2-3, the sequential arm's
+    step 4 being traced; the line names the steps; a pipelined arm also prints its latency, the
+    `step_wall` mean, beside it), beside the accumulated GPU time
+    (steady, the same steps) and four GPU peaks; the peer-rate range).
     `pass` fails closed: every part in `four_h100_parts()` ended `ok` or `skipped_done`, the
     peer copies right, the tests' junit with tests and no failure, error or skipped case (the
     log line names the first few skipped cases, then a count; a file of `FOUR_TEST_FILES` with
@@ -3362,7 +3365,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     probe's `peer` or else `peer_check`'s `gbps`). Recorded outside `pass`: step times,
     `step_wall_s`, per-device peaks, `gpu_peak_mib`, the probe's per-device rates and 12 peer
     rates (`probe.json` version 2), `peer_check`'s per-pair rate (`gbps`), and per arm the GPU
-    time: `accumulated_gpu_s` per step and `accumulated_steady_s` (steps 2-3), as the cost
+    time: `accumulated_gpu_s` per step and `accumulated_steady_s` (the arm's steady steps), as the cost
     decision defines it (each GPU's held time summed over the GPUs a part holds: three
     verifier GPUs for 1 s are 3 s), `_accumulated_gpu_s`: the prover side's `total` row
     `time_s` times the prover GPUs plus the verifier side's times the verifier GPUs, counts
