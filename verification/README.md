@@ -1357,7 +1357,10 @@ layout and FS27 measured them on an H100.
 The result reports each model's cost two ways, as the cost decision asks. The wall time is the
 steady step (the interval between verified steps, the `step_interval` row; of the three steps
 the sequential arm's mean of steps 2 and 3, the pipelined arm's step 2 alone, since its step 3
-is the drain, verified with the prover idle and about 11% short; the pipelined arm's latency, the merged step's wall extent, is reported beside it and is not
+is the drain, verified with the prover idle and shorter: about 11% on the Mac rehearsal, 0-5% on
+the 2026-10-25 four-H100 run, where Qwen2.5-0.5B's drain step took 9.25 s against 9.27-9.66 s for
+steps 2-3, Llama-3.2-1B's 12.37 against 12.44-12.51 and Falcon3-1B's 4.98 against 5.22-5.27; the
+pipelined arm's latency, the merged step's wall extent, is reported beside it and is not
 the step time). The accumulated GPU time is
 each GPU's held time summed over the GPUs a part holds (three verifier GPUs for 1 s are 3 s):
 per step, the prover side's time times the prover GPUs plus the verifier side's time times the
@@ -1387,9 +1390,10 @@ beside it), the pipelined latency (the merged step's wall extent), the peak per 
 `gpu_peak.json`'s whole-card peaks, and once
 the probe's per-device rates, its 12 peer rates and the peer check's per-pair rates. The job
 log ends with one `FS35 ok:` or `FS35 FAIL:` line per acceptance item, then a line per model
-and arm with the steady step time (steps 2 and 3, the pipelined arm's step 2 alone; step 1 pays one-off costs) and
-the four GPUs' peaks, then the slowest and fastest peer pair. An acceptance failure does not
-change the job's exit code. If computing the summary raises, `four_h100_error` holds the error
+and arm with the steady step time (steps 2 and 3, the pipelined arm's step 2 alone; step 1 pays
+one-off costs) and the four GPUs' peaks, then the slowest and fastest peer pair. An acceptance
+failure does not change the job's exit code. If computing the summary raises,
+`four_h100_error` holds the error
 and the job runs on.
 
 ### The four-H100 profiling session (FS42)
@@ -1426,8 +1430,9 @@ build 18 s, the peer check 26 s, the models 47 s, the four-GPU tests 557 s, the 
 per model the plain run 67-88 s, the card 84-91 s, the sequential arm 216-440 s (Qwen2.5-0.5B
 337, Llama-3.2-1B 440, Falcon3-1B 216) and the pipelined arm 257-335 s (293, 335, 257). The
 whole job took 57 min, from the deadline line to the last part's end, against the 66-min
-estimate. The tests ran 9.3 min against an estimate of 6 and the sequential arm of Llama-3.2-1B
-7.3 against 6; the plain runs (a guess of 3 min) and the cards ran well under theirs. The
+estimate. The tests ran 9.3 min against an estimate of 6, the sequential arm of Llama-3.2-1B
+7.3 against 6, and all three pipelined arms over their 4: 293, 335 and 257 s, i.e. 4.9, 5.6
+and 4.3 min; the plain runs (a guess of 3 min) and the cards ran well under theirs. The
 estimates above stay what sets the limits.
 
 **Expected cost.** The parts' estimated runtime, 66 min, plus about 15 min of pod setup and

@@ -1238,7 +1238,7 @@ def fs32_pair_plan(upload: Path, out: Path) -> list[Part]:
 FOUR_PROVER = "cuda:0"
 FOUR_VERIFIERS = "cuda:1,cuda:2,cuda:3"  # VERIF_VERIFIER_DEVICES of the sharded arms
 FOUR_CARDS = 4  # the session refuses a machine with fewer CUDA devices
-FOUR_STEPS = 3  # step 1 pays one-off costs; steps 2-3 give the steady step time
+FOUR_STEPS = 3  # step 1 pays one-off costs; steady: steps 2-3 (sequential), step 2 (pipelined)
 # Cheapest first (the order the models' parts run in), by the short name the parts carry.
 FOUR_ORDER = ("Qwen2.5-0.5B", "Llama-3.2-1B", "Falcon3-1B", "Qwen2.5-1.5B")
 # Test files the session runs beside FS34's: the per-device tools' CUDA- and NVML-only tests
@@ -2611,9 +2611,11 @@ def _steady_slice(steps: int, pipelined: bool = False, traced_last: bool = False
 
 def _steady_steps_text(steps: int, pipelined: bool = False, traced_last: bool = False) -> str:
     """The steady steps of :func:`_steady_slice` as the logs name them: ``"steps 2-3"`` or
-    ``"step 2"``."""
-    first, last = 2, len(range(steps)[_steady_slice(steps, pipelined, traced_last)]) + 1
-    return f"step {first}" if last == first else f"steps {first}-{last}"
+    ``"step 2"``, or ``"no steady step"`` where the set is empty (two pipelined steps)."""
+    n = len(range(steps)[_steady_slice(steps, pipelined, traced_last)])
+    if n == 0:
+        return "no steady step"
+    return "step 2" if n == 1 else f"steps 2-{n + 1}"
 
 
 def _steady_s(ex: Mapping[str, Any], steps: int = FOUR_STEPS, pipelined: bool = False,
@@ -2624,6 +2626,8 @@ def _steady_s(ex: Mapping[str, Any], steps: int = FOUR_STEPS, pipelined: bool = 
     merged step's wall extent (``step_wall``, records written before FS42), else the times'
     total."""
     sl = _steady_slice(steps, pipelined, traced_last)
+    if len(range(steps)[sl]) == 0:
+        return None, None
     ivs = ex.get("step_interval_s") or []
     if len(ivs) >= steps:
         return statistics.fmean(ivs[sl]), "step_interval"
@@ -2645,9 +2649,8 @@ def _steady_mean(per_step: Sequence[float] | None, steps: int = FOUR_STEPS,
                  pipelined: bool = False, traced_last: bool = False) -> float | None:
     """The mean of the steady steps (:func:`_steady_slice`) of a per-step list of ``steps``
     values, else ``None``."""
-    vals = list(per_step or ())
-    return (statistics.fmean(vals[_steady_slice(steps, pipelined, traced_last)])
-            if len(vals) >= steps else None)
+    vals = list(per_step or ())[_steady_slice(steps, pipelined, traced_last)]
+    return statistics.fmean(vals) if vals and len(per_step or ()) >= steps else None
 
 
 def _four_missing_numbers(models: Mapping[str, Mapping[str, Any]],
@@ -2826,7 +2829,8 @@ def _four_peer_range(res: Mapping[str, Any]) -> str:
 def _four_lines(res: Mapping[str, Any] | None) -> list[str]:
     """The session's last job-log lines: one ``FS35 ok`` or ``FS35 FAIL`` per acceptance item,
     one per model and arm with the wall time (the steady step) beside the accumulated GPU time
-    (steady, mean of steps 2-3) and the four GPUs' whole-card peaks, then the peer-rate range."""
+    (steady: the mean of steps 2-3 for a sequential arm, step 2 alone for a pipelined one) and
+    the four GPUs' whole-card peaks, then the peer-rate range."""
     if res is None:
         return []
     lines = [f"FS35 {'ok' if ok else 'FAIL'}: {text}" for ok, text in res["items"]]
