@@ -800,6 +800,14 @@ def test_the_steady_steps_leave_out_a_pipelined_arms_drain_and_a_traced_last_ste
         "steps 2-3", "step 2", "steps 2-3", "steps 2-3"]
 
 
+def test_two_pipelined_steps_have_no_steady_step():
+    assert fs._steady_steps_text(2, True) == "no steady step"
+    assert fs._steady_mean([1.0, 2.0], 2, pipelined=True) is None
+    ex = {"step_interval_s": [3.0, 2.0], "step_wall_s": [3.0, 2.0]}
+    assert fs._steady_s(ex, 2, pipelined=True) == (None, None)
+    assert fs._steady_s(ex, 2) == (pytest.approx(2.0), "step_interval")
+
+
 def test_the_summary_keeps_the_latency_beside_the_interval_for_the_pipelined_arm_only():
     k = KEYS[0]
     res = _four(_parts(**{f"seq_{k}": _arm(k, "seq", interval=[3.0, 2.0, 1.0]),
