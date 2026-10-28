@@ -333,3 +333,77 @@ def test_prepare_reports_missing_or_altered_native_sources(tmp_path, home):
     man = _prepare(tmp_path, home, native_src=src)
     assert any("blake3.c" in x for x in man["missing"])
     assert not any(a.startswith("native_cache/") for a in man["files"])
+
+
+# ---- the base arm's repo_base/ (O18, FS49s) ---------------------------------------------------
+
+BASE_SHA = "ba5e00" * 6 + "abcd"
+
+
+def _fake_base(src: Path):
+    def base(root, build, rev, name):
+        (src / "verification").mkdir(parents=True, exist_ok=True)
+        (src / "verification" / "y.py").write_text(f"rev = {rev!r}\n")
+        return prep._tree_members(src, name), {"commit": BASE_SHA, "dirty": False}
+    return base
+
+
+def test_prepare_without_base_commit_has_no_repo_base(tmp_path, home):
+    man = _prepare(tmp_path, home)
+    assert "base_commit" not in man
+    assert not any(k.startswith("repo_base/") for k in man["files"])
+
+
+def test_prepare_with_base_commit_packs_repo_base_and_records_it(tmp_path, home):
+    man = _prepare(tmp_path, home, base_commit="387b991",
+                   repo_base=_fake_base(tmp_path / "base_src"))
+    assert man["base_commit"] == BASE_SHA and man["repo"]["commit"] != BASE_SHA
+    assert "repo_base/verification/y.py" in man["files"]
+    assert "repo/verification/x.py" in man["files"]
+    with tarfile.open(man["tarball"]) as t:
+        t.extractall(tmp_path / "pod", filter="data")
+    up = tmp_path / "pod" / prep.TOP
+    assert "387b991" in (up / "repo_base/verification/y.py").read_text()
+    assert fs.fetch_models(up, tmp_path / "m", download=_download, say=lambda m: None) == 0
+    (up / "repo_base/verification/y.py").write_text("changed\n")
+    assert fs.fetch_models(up, tmp_path / "m", download=_download, say=lambda m: None) == 1
+    doc = json.loads((tmp_path / "m" / "models.json").read_text())
+    assert any("repo_base/verification/y.py" in p for p in doc["problems"])
+
+
+def _git_repo(root: Path) -> tuple[str, str]:
+    import subprocess
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c",
+                               "user.email=t@t", *a], capture_output=True, text=True,
+                              check=True).stdout.strip()
+    root.mkdir()
+    git("init", "-q")
+    (root / "a.txt").write_text("one\n")
+    git("add", "a.txt")
+    git("commit", "-qm", "one")
+    first = git("rev-parse", "HEAD")
+    (root / "a.txt").write_text("two\n")
+    git("commit", "-qam", "two")
+    return first, git("rev-parse", "HEAD")
+
+
+def test_repo_members_archives_a_revision_under_its_own_name(tmp_path):
+    first, head = _git_repo(tmp_path / "r")
+    members, info = prep._repo_members(tmp_path / "r", tmp_path / "b", first[:8], "repo_base")
+    assert info["commit"] == first and [m.arc for m in members] == ["repo_base/a.txt"]
+    assert (tmp_path / "b/repo_base/a.txt").read_text() == "one\n"
+    members, info = prep._repo_members(tmp_path / "r", tmp_path / "b")
+    assert info == {"commit": head, "dirty": False}
+    assert [m.arc for m in members] == ["repo/a.txt"]
+
+
+def test_a_bad_base_commit_is_refused_before_the_long_work(tmp_path, home, monkeypatch, capsys):
+    _git_repo(tmp_path / "r")
+    with pytest.raises(prep.PrepError, match="doesn't resolve"):
+        prep.prepare(tmp_path / "out", hub=home / "hub", bench_cache=tmp_path / "bench",
+                     repo_root=tmp_path / "r", base_commit="nosuchrev", say=lambda m: None)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert prep.main(["--out", str(tmp_path / "o2"), "--base-commit", "nosuchrev"]) == 1
+    assert "doesn't resolve" in capsys.readouterr().err
