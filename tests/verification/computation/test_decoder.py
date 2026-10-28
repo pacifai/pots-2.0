@@ -599,7 +599,6 @@ def test_run_labeling_fails_as_members_do(setup, tamper):
     model.zero_grad(set_to_none=True)
 
 
-
 def test_run_labeling_stacks_a_noncontiguous_batch_output(setup, monkeypatch):
     """A record whose members are each contiguous but whose batch tensor is not (a slice
     ``big[::2]``) is not taken whole: the per-member fill labels it, and the leaf is a
@@ -623,6 +622,7 @@ def test_run_labeling_stacks_a_noncontiguous_batch_output(setup, monkeypatch):
     k = c.product_leaf_index(g)
     assert leaves[k].is_contiguous() and torch.equal(leaves[k], want[k])
     model.zero_grad(set_to_none=True)
+
 
 def test_recorded_layout_contiguity_is_torchs():
     base = torch.zeros(3, 4, 5)
