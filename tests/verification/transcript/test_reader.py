@@ -100,9 +100,8 @@ def test_product_run_is_a_slice_of_the_group_leaf(setup, role, own):
         got = view.product_run(m0, pl.stride * mult, count, own=own)
         want = _loop(view, [m0 + pl.stride * mult * t for t in range(count)])
         assert got.shape == (count, *pl.shape[1:]) and torch.equal(got, want)
-        assert _shares(got, leaf) is (not own)
-        if not own:
-            assert got.untyped_storage().data_ptr() == leaf.untyped_storage().data_ptr()
+        assert _shares(got, leaf) is (not own and mult == 1 and got.data_ptr() % 64 == 0)
+        assert got.is_contiguous()
 
 
 def test_product_run_across_groups_or_lone_products_equals_the_loop(setup):
@@ -139,7 +138,8 @@ def test_product_block_progression_is_a_slice_other_orders_stack(setup, own):
     for idx in ([0, 1, 2], [1, 3, 5], [4], list(range(pl.n))):
         got = view.product_block([at(i) for i in idx], own=own)
         assert torch.equal(got, _loop(view, [at(i) for i in idx]))
-        assert _shares(got, leaf) is (not own)
+        spaced = len(idx) < 2 or idx[1] - idx[0] == 1  # O18: only consecutive members view
+        assert _shares(got, leaf) is (not own and spaced and got.data_ptr() % 64 == 0)
     for idx in ([2, 1, 0], [0, 2, 3], [1, 1], [0, 0, 0]):  # not an increasing progression
         got = view.product_block([at(i) for i in idx], own=own)
         assert torch.equal(got, _loop(view, [at(i) for i in idx]))
@@ -221,3 +221,47 @@ def test_a_write_to_a_lone_committed_leaf_is_caught(setup):
         view.product(m)
     with pytest.raises(StoreMutationError):
         view.product_block([m])
+
+
+def test_a_step_two_slice_comes_back_as_an_aligned_contiguous_copy(setup):
+    c, view, objs, _ = setup
+    pl = _group(c, "S")
+    leaf = _leaf(c, objs, pl.g)
+    got = view.product_run(pl.m0, pl.stride * 2, 3)
+    assert got.is_contiguous() and got.data_ptr() % 64 == 0 and not _shares(got, leaf)
+    assert torch.equal(got, torch.stack([leaf[0], leaf[2], leaf[4]]))
+
+
+def test_an_unaligned_start_comes_back_as_a_copy_at_an_aligned_address(setup):
+    c, view, objs, _ = setup
+    pl = _group(c, "S")
+    leaf = _leaf(c, objs, pl.g)
+    # a member run starting 4 bytes off a 64-byte boundary: shift the whole leaf by one float
+    raw = torch.empty(leaf.numel() + 16, dtype=leaf.dtype)
+    base = (-raw.data_ptr() // leaf.element_size()) % 16
+    shifted = raw[base + 1:base + 1 + leaf.numel()].view(leaf.shape)
+    shifted.copy_(leaf)
+    assert shifted.data_ptr() % 64 == leaf.element_size()
+    objs[c.product_leaf_index(pl.g)] = shifted
+    got = view.product_run(pl.m0, pl.stride, 3)
+    assert not _shares(got, shifted) and got.data_ptr() % 64 == 0 and got.is_contiguous()
+    assert torch.equal(got, torch.stack([leaf[0], leaf[1], leaf[2]]))
+    lone = c.m_of("L1.Y_o")  # a lone product's unsqueeze follows the same rule
+    lone_leaf = _leaf(c, objs, c.leaf_of(lone)[0])
+    objs[c.product_leaf_index(c.leaf_of(lone)[0])] = raw2 = torch.empty(
+        lone_leaf.numel() + 16, dtype=lone_leaf.dtype)
+    shifted2 = raw2[((-raw2.data_ptr() // raw2.element_size()) % 16) + 1:][:lone_leaf.numel()]
+    shifted2 = shifted2.view(lone_leaf.shape)
+    shifted2.copy_(lone_leaf)
+    objs[c.product_leaf_index(c.leaf_of(lone)[0])] = shifted2
+    one = view.product_block([lone])
+    assert one.data_ptr() % 64 == 0 and torch.equal(one[0], lone_leaf)
+
+
+def test_a_whole_leaf_comes_back_as_a_view_without_a_copy(setup):
+    c, view, objs, _ = setup
+    pl = _group(c, "S")
+    leaf = _leaf(c, objs, pl.g)
+    assert leaf.data_ptr() % 64 == 0
+    got = view.product_run(pl.m0, pl.stride, pl.n)
+    assert got.data_ptr() == leaf.data_ptr() and got.shape == leaf.shape

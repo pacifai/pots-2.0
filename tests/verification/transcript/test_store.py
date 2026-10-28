@@ -82,7 +82,7 @@ def test_commit_layout_and_count(c, data):
         encode_tensor_leaf(TAG_WEIGHT, step.w_t[name])
     assert b"".join(leaf_parts(c, c.w_next_index(name), step.w_next[name])) == \
         encode_tensor_leaf(TAG_WEIGHT, step.w_next[name])
-    assert b"".join(leaf_parts(c, c.product_index(1), step.products[0])) == \
+    assert b"".join(leaf_parts(c, c.product_leaf_index(c.leaf_of(1)[0]), step.products[0])) == \
         encode_tensor_leaf(TAG_PRODUCT, step.products[0])
     with pytest.raises(ValueError, match="leaves"):
         InMemoryStore.from_step(c, StepOutput(step.records[:3], step.w_t, step.products,
@@ -91,7 +91,7 @@ def test_commit_layout_and_count(c, data):
 
 def test_failed_perturb_leaves_store_unchanged(c, data):
     store = _store(c, data)
-    h, i = store.root, c.product_index(2)
+    h, i = store.root, c.product_leaf_index(c.leaf_of(2)[0])
     orig = store.leaf(i)
     for bad in (orig.t().contiguous(), orig.double(), orig.clone().fill_(float("nan"))):
         with pytest.raises(ValueError):
@@ -113,7 +113,7 @@ def test_leaf_order_matches_index_helpers(c, data):
         assert torch.equal(store.leaf(c.w_t_index(n)), step.w_t[n])
         assert torch.equal(store.leaf(c.w_next_index(n)), step.w_next[n])
     for m in range(1, c.M + 1):
-        assert torch.equal(store.leaf(c.product_index(m)), step.products[m - 1])
+        assert torch.equal(store.leaf(c.product_leaf_index(c.leaf_of(m)[0])), step.products[m - 1])
     with pytest.raises(IndexError):
         store.leaf(c.n_leaves)
 
@@ -133,7 +133,7 @@ def test_byte_flip_in_encoded_bytes_changes_root(c, data):
     store = _store(c, data)
     hashes = leaf_hashes(c, store)
     tree = MerkleTree(hashes)
-    for i in (0, c.w_t_index(c.weight_names[1]), c.product_index(3), c.n_leaves - 1):
+    for i in (0, c.w_t_index(c.weight_names[1]), c.product_leaf_index(c.leaf_of(3)[0]), c.n_leaves - 1):
         enc = bytearray(b"".join(leaf_parts(c, i, store.leaf(i))))
         for pos in (0, 1, 2, len(enc) - 1):
             enc[pos] ^= 0x80
@@ -152,7 +152,7 @@ def test_paths_verify_with_declared_count(c, data):
     kinds = {
         "record": c.record_index(1),
         "w_t": c.w_t_index(c.weight_names[2]),
-        "product": c.product_index(c.M),
+        "product": c.product_leaf_index(c.leaf_of(c.M)[0]),
         "w_next": c.w_next_index(c.weight_names[0]),
     }
     for kind, i in kinds.items():
@@ -184,7 +184,7 @@ def test_record_leaves_equal_dataset_leaves(c, data):
 
 def test_perturb_matches_full_rebuild(c, data):
     store = _store(c, data)
-    i = c.product_index(4)
+    i = c.product_leaf_index(c.leaf_of(4)[0])
     bad = store.leaf(i) * 1.001
     new_root = perturb_leaf(c, store, i, bad)
     assert new_root == store.root == transcript_root(c, store)
@@ -219,7 +219,7 @@ def test_store_guards_prover_mutation_zero_copy(c, data):
     step = _step(c, data)
     store = InMemoryStore.from_step(c, step)
     h = store.root
-    p = c.product_index(1)
+    p = c.product_leaf_index(c.leaf_of(1)[0])
     assert store.leaf(p).data_ptr() == step.products[0].data_ptr()  # handed over, not copied
     with torch.no_grad():
         step.products[0].add_(1.0)
@@ -340,7 +340,7 @@ def test_disk_store_round_trip(c, data, tmp_path):
 
 def test_disk_reads_are_fresh_and_share_nothing(c, data, tmp_path):
     mem, disk = _disk(c, data, tmp_path / "step")
-    i = c.product_index(1)
+    i = c.product_leaf_index(c.leaf_of(1)[0])
     a, b = disk.leaf(i), disk.leaf(i)
     assert a is not b and a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr()
     assert a.untyped_storage().data_ptr() != mem.leaf(i).untyped_storage().data_ptr()
@@ -466,7 +466,7 @@ def test_file_changed_between_check_4_and_check_2_rejects_at_2(c, data, tmp_path
 
 def test_corrupt_leaf_file_rejects_as_malformed(c, data, tmp_path):
     _, disk = _disk(c, data, tmp_path / "step")
-    (tmp_path / "step" / LEAF_FILE.format(c.product_index(2))).write_bytes(b"\0" * 10)
+    (tmp_path / "step" / LEAF_FILE.format(c.product_leaf_index(c.leaf_of(2)[0]))).write_bytes(b"\0" * 10)
     v = _verifier(c, data, init_weights(c.widths, seed=0))
     assert v.start_run(data) is None
     rej = v.verify_step(1, disk)

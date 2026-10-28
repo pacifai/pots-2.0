@@ -1475,9 +1475,13 @@ interface.
   `.records()`, `.w_t(name)`, `.product_leaf(g)` (a tensor of the declared shape, else
   `LeafShapeError`), `.product(m)` (a lone leaf, or `leaf[i]`, a view, for a member),
   `.product_run(m0, stride, n)`, `.product_block(ms)` and `.w_next(name)`. A run of members of
-  one group at evenly spaced member indices is a slice of the group's leaf, a view on any
-  device (`own` clones it); anything else is `torch.stack` of `.product(m)`. `stack_block` is
-  gone (O18): a member is a slice of one leaf, so nothing stacks leaves.
+  one group at evenly spaced member indices is a slice of the group's leaf. It is a view
+  (`own` clones it) only when the members are consecutive (member step 1) and the start is
+  64-byte aligned (`_ALIGN`, where `torch.stack`'s CPU output starts, so a BLAS kernel sees
+  the same alignment); otherwise it is `clone(memory_format=torch.contiguous_format)`, a fresh
+  aligned copy, bit for bit `torch.stack` (not `.contiguous()`, which returns an unaligned
+  contiguous view unchanged). A lone product's `unsqueeze(0)` follows the same rule; any other
+  block is `torch.stack` of `.product(m)`. `stack_block` is gone (O18).
 - `errors.py`: `TranscriptFormatError(ValueError)` and its subclasses `LeafShapeError`,
   `LeafDtypeError`, `StoreMutationError` and `LeafReadError` (a disk leaf or the store's
   metadata can't be read back).
