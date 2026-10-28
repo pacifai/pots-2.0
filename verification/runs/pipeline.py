@@ -113,7 +113,8 @@ writer): ``close_step`` per step, and the parent's ``merge_step``. Step 0's part
 is merged right after the handshake. The child's own hand-off work is named under ``handoff.``
 (``handoff.release``), which never collides with the parent's ``handoff.empty_cache``.
 
-**CUDA caches.** With ``release_cache`` on, the parent empties its allocator cache after each
+**CUDA caches.** With ``release_cache`` on (unset means auto: off when the prover's device is
+not a verifier device, FS53), the parent empties its allocator cache after each
 step's ``close`` (the verifier's blocks are cut to the verifier's sizes) and the child after each
 ``release`` (the prover's freed transcript blocks are cut to the prover's sizes), each in its own
 process, so the next step's allocations find the memory the other role left.

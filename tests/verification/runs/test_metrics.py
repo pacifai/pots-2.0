@@ -456,7 +456,7 @@ def test_environment_and_run_end(smoke):
     assert env["band_file_hash"] is None and env["h_D"] is None and env["attack"] is None
     assert env["git_commit"] is None or len(env["git_commit"]) == 40
     assert end["lifetime_maxrss_bytes"] > 0
-    assert set(metrics.ALLOC_VARS) | {"release_cache"} <= env.keys()
+    assert set(metrics.ALLOC_VARS) | {"release_cache", "release_cache_rule"} <= env.keys()
 
 
 def test_environment_records_the_allocator_settings(monkeypatch):

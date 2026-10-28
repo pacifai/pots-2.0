@@ -296,7 +296,6 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.flop_counter import flop_registry
 
-from setup.config import load_config
 from setup.machine import machine_facts, torch_gpu_uuid
 from verification.commitment import native
 from verification.computation.interface import ProductKind
@@ -2748,13 +2747,18 @@ _LIBRARIES = ("torch", "numpy", "blake3", "transformers", "datasets")
 ALLOC_VARS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
 
 
-def allocator_settings(release_cache: bool | None = None) -> dict[str, Any]:
+def allocator_settings(release_cache: bool | None = None, device: str | torch.device = "cpu",
+                       verifier_devices: Sequence[str | torch.device] | None = None
+                       ) -> dict[str, Any]:
     """What this process's CUDA allocator runs with: each of :data:`ALLOC_VARS` (``None`` when
-    unset) and the run's ``release_cache``, the cache release between prover and verifier
-    (``None`` reads ``VERIF_RELEASE_CACHE``)."""
+    unset), the run's ``release_cache``, the cache release between prover and verifier, as
+    resolved (``loop.resolve_release_cache``: ``release_cache`` given, else
+    ``VERIF_RELEASE_CACHE``, else auto from the prover's ``device`` and the
+    ``verifier_devices``), and ``release_cache_rule``, which of those three decided (FS53)."""
+    from verification.runs.loop import resolve_release_cache  # noqa: PLC0415 (import cycle)
+    on, rule = resolve_release_cache(release_cache, device, verifier_devices)
     return {**{v: os.environ.get(v) for v in ALLOC_VARS},
-            "release_cache": load_config().release_cache if release_cache is None
-            else release_cache}
+            "release_cache": on, "release_cache_rule": rule}
 
 
 def _dtype_name(dtype: Any) -> str | None:
@@ -2815,7 +2819,8 @@ def environment_record(run: str, *, device: str | torch.device, probe: MemoryPro
         "band_file_hash": band_file_hash,
         "h_D": None if h_D is None else h_D.hex(),
         "mem_source": probe.source, "MallocLargeCache": os.environ.get("MallocLargeCache"),
-        **allocator_settings(release_cache),
+        **allocator_settings(release_cache, dev,
+                             None if config is None else config.get("verifier_devices")),
         "machine": machine_facts(),
         "gpu_roles": gpu_roles(dev, None if config is None else config.get("verifier_devices")),
         "compute_dtype": _dtype_name(None if config is None else config.get("compute_dtype")),

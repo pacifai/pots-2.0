@@ -8,8 +8,9 @@
    :class:`~verification.transcript.store.StoreHandoff`, with each record's audit path into
    ``h_D``: an ``InMemoryStore`` by default, or a ``DiskStore`` (C3's cross-check);
 3. when the model is on CUDA, hands the caching allocator's free blocks back to the driver
-   (:func:`release_device_cache`, unless ``VERIF_RELEASE_CACHE=0`` turns it off), so the
-   verifier allocates in memory the prover has left;
+   (:func:`release_device_cache`, only where prover and verifier may share a card, or as
+   ``VERIF_RELEASE_CACHE`` says: :func:`resolve_release_cache`), so the verifier allocates in
+   memory the prover has left;
 4. hands the verifier the store, and only the store (invariant 1);
 5. drops the step's transcript (the handoff's ``release``) before the next step begins.
 
@@ -28,7 +29,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -53,7 +54,8 @@ from verification.verifier.matmul_check import measure_kernel
 
 __all__ = ["ProverFault", "StepRecord", "LoopResult", "run_loop", "PlainStepRecord", "PlainResult",
            "run_plain", "HANDOFF_SECTION", "TOTALS_SECTION", "release_device_cache",
-           "release_cache_setting", "pipelined_setting", "model_device", "run_devices"]
+           "release_cache_setting", "resolve_release_cache",
+           "pipelined_setting", "model_device", "run_devices"]
 
 # The metrics section around the hand-off's cache release. Its row is the harness's (side
 # "run") and in no role's total: deployed, the prover and the verifier run on separate machines.
@@ -146,10 +148,35 @@ class LoopResult:
         return self.verdict.rejection
 
 
-def release_cache_setting(release_cache: bool | None) -> bool:
-    """``release_cache`` as given, or ``RunConfig.release_cache`` (``VERIF_RELEASE_CACHE``)
-    when it is ``None``, so every entry point honours the setting without passing it."""
-    return load_config().release_cache if release_cache is None else release_cache
+def resolve_release_cache(release_cache: bool | None, prover_device: str | torch.device,
+                          devices: Sequence[str | torch.device] | None
+                          ) -> tuple[bool, Literal["argument", "env", "auto"]]:
+    """Whether the hand-off releases the CUDA cache, and where the answer came from (FS53).
+
+    Explicit argument, then ``VERIF_RELEASE_CACHE`` (``0`` or ``1``), then auto. Auto releases
+    iff the run uses CUDA and prover and verifier may share a card: unsharded, or the prover's
+    device is one of the verifier ``devices``. With the prover on a card of its own (the
+    four-GPU layout) the release has nothing to fix (F4b) and costs the next step's
+    ``cudaMalloc``s."""
+    if release_cache is not None:
+        return release_cache, "argument"
+    env = load_config().release_cache
+    if env is not None:
+        return env, "env"
+    from verification.runs.metrics import normalize_devices  # noqa: PLC0415 (import cycle)
+    if not any(_on_cuda(d) for d in (prover_device, *(devices or ()))):
+        return False, "auto"
+    if not devices:  # None or (): unsharded, as metrics.gpu_roles reads it
+        return True, "auto"
+    return normalize_devices([prover_device])[0] in normalize_devices(devices), "auto"
+
+
+def release_cache_setting(release_cache: bool | None, c: DeclaredComputation,
+                          prover_device: str | torch.device) -> bool:
+    """:func:`resolve_release_cache`'s answer for the run's computation ``c`` (its verifier
+    devices) and the prover's device, so every entry point honours the setting without
+    passing it."""
+    return resolve_release_cache(release_cache, prover_device, c.placement.devices)[0]
 
 
 def pipelined_setting(pipelined: bool | None) -> bool:
@@ -246,8 +273,8 @@ def run_loop(
     same either way. Between the hand-off and the verifier, when ``model`` is on CUDA,
     :func:`release_device_cache` runs in its own section, :data:`HANDOFF_SECTION`.
     ``release_cache=False`` skips it, section and all, so a run can measure what the release
-    costs and what it saves. ``None`` (the default) reads ``VERIF_RELEASE_CACHE``
-    (:func:`release_cache_setting`).
+    costs and what it saves. ``None`` (the default) reads ``VERIF_RELEASE_CACHE``, and unset
+    means auto (:func:`release_cache_setting`).
 
     ``pipelined`` (``None`` reads ``VERIF_PIPELINED``, :func:`pipelined_setting`) runs the
     prover in a spawned child process, one step ahead of the verifier
@@ -273,16 +300,18 @@ def run_loop(
         from verification.runs.pipeline import run_pipelined  # pipeline imports this module
         return run_pipelined(c, dataset, w0, verifier, final=final, fault=fault,
                              schedule=schedule, on_step=on_step, section=section,
-                             handoff=handoff, release_cache=release_cache_setting(release_cache),
+                             handoff=handoff,
+                             release_cache=release_cache_setting(release_cache, c,
+                                                                 c.placement.prover),
                              recorder=recorder, prover=prover)
     if model is None or w0 is None:
         raise ValueError("run_loop needs a model and w0 unless it is pipelined")
     sec = section or no_section
     handoff = handoff or IN_MEMORY
     fault = fault or HONEST
-    release_cache = release_cache_setting(release_cache)
     assert_no_dropout(model)  # invariant 3 (S4d)
     device = model_device(model)
+    release_cache = release_cache_setting(release_cache, c, device)  # FS53
     pi = schedule or _default_schedule(c, dataset, verifier.seed)
     result = LoopResult(verdict=RunVerdict(False, None, 0, None))
     # The first NVRTC build or cache load of the process would land inside a timed section:

@@ -454,7 +454,7 @@ def test_run_loop_passes_the_placement_devices_to_the_release(monkeypatch):
     monkeypatch.setattr(loop_mod, "release_device_cache", spy)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: empties.append(1))
     monkeypatch.delenv("VERIF_RELEASE_CACHE", raising=False)
-    res, _ = tl._run(c0, D, w0, final)
+    res, _ = tl._run(c0, D, w0, final, release_cache=True)  # auto would skip it on a CPU (FS53)
     assert res.verdict.accepted and seen == [c0.placement.devices] * tl.T and empties == []
 
 

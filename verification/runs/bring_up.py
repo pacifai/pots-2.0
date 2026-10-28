@@ -109,7 +109,12 @@ from verification.runs.llama_step import (  # noqa: F401 (work_rows: moved, stil
     report_costs,
     work_rows,
 )
-from verification.runs.loop import release_cache_setting, release_device_cache, run_devices
+from verification.runs.loop import (
+    release_cache_setting,
+    release_device_cache,
+    resolve_release_cache,
+    run_devices,
+)
 from verification.runs.metrics import (
     SCORE_FAMILIES,
     MetricsWriter,
@@ -255,7 +260,7 @@ def bias_tamper(c: DecoderComputation, D: Sequence[Any], w0: Mapping[str, torch.
     re-rooted before the step goes to ``handoff`` (default in memory), as the loop's does, and
     with the loop's cache release unless ``release_cache`` is off (``None`` reads
     ``VERIF_RELEASE_CACHE``)."""
-    release_cache = release_cache_setting(release_cache)
+    release_cache = release_cache_setting(release_cache, c, c.device)  # FS53
     b = c.bias(layer, x)
     if b is None:
         raise ValueError(f"layer {layer}'s {x} projection has no bias")
@@ -636,10 +641,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"run: n_s {c.n_s}, n {c.n}, η {c.eta:g}, k {k}, T {args.steps}, seed {cfg.seed}, "
           f"threads {cfg.threads}, |D| {len(D)}, h_D {h_D.hex()[:16]}…")
     disk = args.disk_transcripts
+    release, rule = resolve_release_cache(cfg.release_cache, cfg.device, c.placement.devices)
     print("hand-off: " + ("in memory" if disk is None else f"on disk under {disk}")
-          + ("; CUDA cache released before the verifier" if cfg.release_cache else
-             "; no cache release (VERIF_RELEASE_CACHE=0)"))
-    print("allocator: " + json.dumps(allocator_settings(cfg.release_cache)), flush=True)
+          + ("; CUDA cache released before the verifier" if release else
+             f"; no cache release (release_cache_rule {rule})"))
+    print("allocator: " + json.dumps(
+        allocator_settings(cfg.release_cache, cfg.device, c.placement.devices)), flush=True)
     run_dir = cfg.output_dir / RUN_NAME
     mw = None
     try:
