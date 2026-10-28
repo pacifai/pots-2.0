@@ -2031,7 +2031,7 @@ interface.
     with `read_plan`, replaces the entry and counts it; nodes kept apart that now share a view
     stay apart (a missed share costs speed, never bits; the group order inside a level follows the
     cached build's addresses and changes no row, FS38b). `table_cache_stats()` returns `hits`,
-    `misses` and `plan_rebuilds`; `table_cache(False)` turns the cache off for comparisons (it
+    `misses` and `plan_rebuilds` (`bring_up` and `llama_step` print them once at the end of a run and, with `--metrics`, write one `table_cache` record: FS55a); `table_cache(False)` turns the cache off for comparisons (it
     is on by default); `table_cache_clear()` empties it. The rows are the same bits with it on
     and off (`test_table_cache_host.py` through the host build, `test_table_cache_cuda.py` on a
     card). Measured on the Mac (2026-10-28, one Llama-3.2-1B layer step's synthetic groups, 24,585
@@ -2077,6 +2077,15 @@ interface.
     `Prefetch.covers` then compares the layout object, the slot's fill, `h` and `k`, not each
     member (a request that is not the cached one is looked up member by member, as before). The
     bytes drawn and their offsets are unchanged.
+    FS55a: the draw's tables list the products in served order (`_measure_groups` splits by
+    shape, `operand_blocks` by role), so on a layer step `find_layout` never returns the
+    prefetch's layout. The prefetch's `_Layout` therefore keeps the last draw request it covered
+    (its `ms` and `widths`, identity first, then equality) with that request's per-member
+    offsets. The first time a draw request meets a layout it is checked member by member and
+    stored; an identical later request reuses the stored offsets and skips that check
+    (`HostChallengeSource.fast_draws` counts them). The slot's fill, `h` and `k` are still
+    compared on every call. Both LRUs (`TABLE_CACHE_MAX`, `LAYOUT_CACHE_MAX`) also drop the
+    oldest entries of a last bucket that is over the cap.
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m(q, eps_in, eps_acc, u_ratio=1.0)` is F18's split, `√2·ε_in + √q·ε_acc·max(1,
@@ -2125,9 +2134,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     (`"handoff.empty_cache"`), once per step between the prover's role and the verifier's.
     One call empties every device's cache (`NativeCachingAllocator::emptyCache` loops over
     every device's allocator, torch 2.9.1). Elsewhere it does nothing and opens no section.
-    Prover and verifier share one process and one GPU in our runs, and the
-    prover's freed blocks stay cached at the prover's sizes, so a large verifier buffer may not
-    fit though the GPU has the room (the first H100 session's out-of-memory errors). Its row is
+    Where prover and verifier share a GPU (one H100, the pair layout: the only case auto
+    releases), the prover's freed blocks stay cached at the prover's sizes, so a large verifier
+    buffer may not fit though the GPU has the room (the first H100 session's out-of-memory
+    errors). On the four-GPU layout the prover has a card of its own and auto skips the release.
+    Its row is
     the harness's, side `run`, in no total. `run_loop` gives it the model's device
     (`model_device`: the first parameter's, host without one) and `c.placement.devices`;
     `bring_up.bias_tamper` calls it with `c.device` before each `verify_step` too.
@@ -2203,7 +2214,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   defaults to `D`'s root; `verifier(section) -> Verifier` replaces the default provisional
   verifier and must match the run's seam, `T`, `k` and `seed`; `memory_run` and `count_run`
   take it and `seed` too, and `handoff`, passed to `run_loop`; `run_scenario` and `memory_run`
-  also take `release_cache=True`, `run_loop`'s), `judge` (the
+  also take `release_cache=None`, `run_loop`'s: read from `VERIF_RELEASE_CACHE`, auto when unset), `judge` (the
   S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
   default `HONEST`, through `memory_pass` / `count_pass`).
   - **Model reuse (O4).** `honest_final`, `run_scenario`, `memory_run` and `count_run` take
@@ -2585,7 +2596,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     commit time. `test_disk_handoff_gives_the_same_decisions` checks that a tiny Qwen2 run
     decides number for number as in memory and leaves `DIR` empty.
   - `bias_tamper(c, D, w0, bands, *, k, seed, h_D, build_model, layer=1, x="q",
-    handoff=None, release_cache=True)`: two one-step judged runs (FS2's switch test on the real model). The last
+    handoff=None, release_cache=None)` (`None` reads `VERIF_RELEASE_CACHE`, auto when unset): two one-step judged runs (FS2's switch test on the real model). The last
     entry of `b_q` in layer 1 is raised by 1 in training with the `W_t` leaf restored
     (expected: check 5 naming `P_m (L1.Y_q)`), and in an honest step's `W_{t+1}` leaf
     (expected: 6b naming the bias). `Tamper.rejected_as_expected` checks the step, the check

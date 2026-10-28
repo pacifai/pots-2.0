@@ -93,6 +93,33 @@ class _Layout:
     offsets: dict[tuple[int, int], int]
     total: int
     member_offsets: np.ndarray  # int64, per member of ``ms``
+    # The last draw request this layout covered member by member (FS55a): its ``ms`` and
+    # ``widths`` and that request's per-member offsets. The draw's tables list the products in
+    # served order, not the prefetch's canonical order, so ``find_layout`` never matches them.
+    draw_ms: tuple[int, ...] | None = None
+    draw_widths: tuple[int, ...] | None = None
+    draw_offsets: np.ndarray | None = None
+
+    def drawn_offsets(self, ms: Sequence[int], widths: Sequence[int]) -> np.ndarray | None:
+        """The stored offsets when ``(ms, widths)`` is the remembered draw request (identity
+        first, then equality), else ``None``."""
+        if self.draw_offsets is None:
+            return None
+        if ms is not self.draw_ms:
+            tm = ms if isinstance(ms, tuple) else tuple(ms)
+            if tm != self.draw_ms:
+                return None
+        if widths is not self.draw_widths:
+            tw = widths if isinstance(widths, tuple) else tuple(widths)
+            if tw != self.draw_widths:
+                return None
+        return self.draw_offsets
+
+    def remember_draw(self, ms: Sequence[int], widths: Sequence[int],
+                      offsets: np.ndarray) -> None:
+        self.draw_ms = ms if isinstance(ms, tuple) else tuple(int(m) for m in ms)
+        self.draw_widths = widths if isinstance(widths, tuple) else tuple(int(w) for w in widths)
+        self.draw_offsets = offsets.copy()
 
 
 LAYOUT_CACHE_MAX = 64
@@ -122,6 +149,7 @@ class HostChallengeSource:
         self._executor: ThreadPoolExecutor | None = None
         self._layouts: OrderedDict[tuple, list[_Layout]] = OrderedDict()
         self._layouts_n = 0
+        self.fast_draws = 0  # draws that reused a layout's stored draw offsets (FS55a)
 
     def prefetch(self, h: bytes, ms: Sequence[int], k: int, widths: Sequence[int]) -> Prefetch:
         """Submit the draw of every ``(m, width)`` of ``ms`` and ``widths`` to the worker thread
@@ -187,6 +215,10 @@ class HostChallengeSource:
         while self._layouts_n > LAYOUT_CACHE_MAX and len(self._layouts) > 1:
             _, old = self._layouts.popitem(last=False)
             self._layouts_n -= len(old)
+        if self._layouts_n > LAYOUT_CACHE_MAX:  # one bucket left over the cap: oldest go
+            drop = self._layouts_n - LAYOUT_CACHE_MAX
+            del self._layouts[bucket][:drop]
+            self._layouts_n -= drop
         return lay
 
     @staticmethod
@@ -218,6 +250,11 @@ class HostChallengeSource:
             else torch.device(device)
         on_gpu = dev.type == "cuda"
         if prefetched is not None:
+            pl = prefetched.layout
+            known = pl.drawn_offsets(ms, widths) if pl is not None else None
+            if known is not None and prefetched.covers(h, ms, k, widths, pl):
+                self.fast_draws += 1  # FS55a: this request was checked member by member before
+                return self._draw_prefetched(prefetched, ms, widths, stream, dev, pl, known)
             lay = self.find_layout(k, ms, widths)
             if prefetched.covers(h, ms, k, widths, lay):
                 return self._draw_prefetched(prefetched, ms, widths, stream, dev, lay)
@@ -252,14 +289,19 @@ class HostChallengeSource:
 
     def _draw_prefetched(self, pf: Prefetch, ms: Sequence[int], widths: Sequence[int],
                          stream: Any, dev: torch.device,
-                         lay: _Layout | None = None) -> tuple[torch.Tensor, np.ndarray, Any]:
+                         lay: _Layout | None = None,
+                         known: np.ndarray | None = None) -> tuple[torch.Tensor, np.ndarray, Any]:
         pf.future.result()  # re-raises the worker's exception
         slot = pf.holder
-        if lay is not None and lay is pf.layout:  # the cached per-member offsets (FS51)
+        if known is not None:  # the stored offsets of this exact draw request (FS55a)
+            offsets = known.copy()
+        elif lay is not None and lay is pf.layout:  # the cached per-member offsets (FS51)
             offsets = lay.member_offsets.copy()
         else:
             offsets = np.asarray([pf.offsets[(int(m), int(w))] for m, w in zip(ms, widths)],
                                  dtype=np.int64)
+            if pf.layout is not None:
+                pf.layout.remember_draw(ms, widths, offsets)
         used = slot.buf[:pf.total]
         if dev.type != "cuda":
             return used.clone(), offsets, None  # the slot is refilled while this is in use

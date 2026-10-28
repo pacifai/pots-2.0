@@ -114,6 +114,7 @@ from verification.runs.loop import (
     release_device_cache,
     resolve_release_cache,
     run_devices,
+    table_cache_report,
 )
 from verification.runs.metrics import (
     SCORE_FAMILIES,
@@ -584,6 +585,18 @@ def check5_repeats(b: BringUp, c: DecoderComputation, *, h_D: bytes, n_records: 
     return True
 
 
+def handoff_lines(disk: Path | str | None, device: str,
+                  devices: Sequence[str] | None) -> list[str]:
+    """The ``hand-off:`` and ``allocator:`` lines of a run. The release setting is resolved
+    here from the environment and the layout (argument ``None``), so the rule names where the
+    answer came from: ``env`` when ``VERIF_RELEASE_CACHE`` is set (FS55a)."""
+    release, rule = resolve_release_cache(None, device, devices)
+    return ["hand-off: " + ("in memory" if disk is None else f"on disk under {disk}")
+            + ("; CUDA cache released before the verifier" if release else
+               f"; no cache release (release_cache_rule {rule})"),
+            "allocator: " + json.dumps(allocator_settings(None, device, devices))]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--steps", type=int, default=1, help="T, at least 1 (default 1)")
@@ -641,12 +654,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"run: n_s {c.n_s}, n {c.n}, η {c.eta:g}, k {k}, T {args.steps}, seed {cfg.seed}, "
           f"threads {cfg.threads}, |D| {len(D)}, h_D {h_D.hex()[:16]}…")
     disk = args.disk_transcripts
-    release, rule = resolve_release_cache(cfg.release_cache, cfg.device, c.placement.devices)
-    print("hand-off: " + ("in memory" if disk is None else f"on disk under {disk}")
-          + ("; CUDA cache released before the verifier" if release else
-             f"; no cache release (release_cache_rule {rule})"))
-    print("allocator: " + json.dumps(
-        allocator_settings(cfg.release_cache, cfg.device, c.placement.devices)), flush=True)
+    for line in handoff_lines(disk, cfg.device, c.placement.devices):
+        print(line, flush=True)
     run_dir = cfg.output_dir / RUN_NAME
     mw = None
     try:
@@ -669,8 +678,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                      release_cache=cfg.release_cache,
                      keep_last=args.check5_repeats > 0 or args.device_leaves,
                      recorder=rec)
+        cache_line, cache_row = table_cache_report(RUN_NAME)
+        print(cache_line, flush=True)
         if mw is not None:
             mw.write(work_rows(c, RUN_NAME, HONEST.name, _step_records(mw.dir)))
+            mw.write([cache_row])
     finally:
         if mw is not None:
             mw.close()
