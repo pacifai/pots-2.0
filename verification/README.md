@@ -1540,8 +1540,36 @@ python -m evaluation.results.profile.analyze \
     --steady-steps 2-3 --compute-dtype bfloat16 --out $PROFILES/${MODEL}_pipe.json
 ```
 
-That is three trace summaries and six profiles in all (the commands above, once per model).
-Last, one report over all six profiles:
+With the A/B arm (`repo_base/` in the upload), the base arms have the same commands, on
+`runs/four_${KEY}_seq_base` and `runs/four_${KEY}_pipe_base` and their parts, for the base
+model only (`KEY=Llama-3.2-1B-Instruct_refusal`, `MODEL=Llama-3.2-1B`). Each takes its own
+`--session` label, the O18 arm's plus `-base`, so that `report.py`, which labels a run by model,
+attack, scenario and session, tells the two apart:
+
+```bash
+python -m evaluation.results.profile.trace \
+    --trace $OUT/runs/four_${KEY}_seq_base/llama_step/trace/step_00004.json.gz \
+    --layout $OUT/runs/four_${KEY}_seq_base/llama_step/c5_layout.json \
+    --markers $OUT/runs/four_${KEY}_seq_base/llama_step/markers.jsonl \
+    --out $PROFILES/${MODEL}_seq_base_trace.json
+python -m evaluation.results.profile.analyze \
+    --run-dir $OUT/runs/four_${KEY}_seq_base/llama_step --session $LABEL-base \
+    --markers $OUT/runs/four_${KEY}_seq_base/llama_step/markers.jsonl \
+    --samples $OUT/parts/seq_${MODEL}_base/samples.jsonl --probe $OUT/probe/probe.json \
+    --trace-summary $PROFILES/${MODEL}_seq_base_trace.json \
+    --plain $OUT/runs/four_${KEY}_plain/plain_baseline \
+    --steady-steps 2-3 --compute-dtype bfloat16 --out $PROFILES/${MODEL}_seq_base.json
+python -m evaluation.results.profile.analyze \
+    --run-dir $OUT/runs/four_${KEY}_pipe_base/llama_step --session $LABEL-base \
+    --markers $OUT/runs/four_${KEY}_pipe_base/llama_step/markers.jsonl \
+    --samples $OUT/parts/pipe_${MODEL}_base/samples.jsonl --probe $OUT/probe/probe.json \
+    --plain $OUT/runs/four_${KEY}_plain/plain_baseline \
+    --steady-steps 2-3 --compute-dtype bfloat16 --out $PROFILES/${MODEL}_pipe_base.json
+```
+
+That is three trace summaries and six profiles in all for the O18 arms (the first commands,
+once per model), and with the A/B arm four trace summaries and eight profiles.
+Last, one report over the six O18 profiles (add the two base profiles to compare them):
 
 ```bash
 python -m evaluation.results.profile.report \
