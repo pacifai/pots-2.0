@@ -159,6 +159,7 @@ import statistics
 import subprocess
 import sys
 import time
+import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2603,7 +2604,7 @@ def _profile_run_extras(log: Path, records: Path, compare: bool = False) -> dict
         out["records_sha"] = _records_digest(rows) if rows else None
         try:
             out["archive_hashes"] = _archive_hashes(d)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, zipfile.BadZipFile) as e:
             out["archive_hashes"] = None
             out["archive_error"] = f"{type(e).__name__}: {e}"
     return out

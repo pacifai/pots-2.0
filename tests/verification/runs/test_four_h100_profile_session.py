@@ -1184,3 +1184,15 @@ def test_the_run_extras_compare_digest_and_archive_hashes(tmp_path):
     (d / "residuals" / "s1" / "step_00002.npz").write_bytes(b"not an archive")
     ex = fs._profile_run_extras(log, rec, compare=True)
     assert ex["archive_hashes"] is None and ex["archive_error"]
+
+
+def test_a_truncated_archive_reports_archive_error(tmp_path):
+    import numpy as np
+    log, rec = _arm_dir(tmp_path, "pipe", traced=())
+    (rec.parent / "residuals" / "s1").mkdir(parents=True)
+    good = rec.parent / "residuals" / "s1" / "step_00001.npz"
+    np.savez(good, r=np.arange(1000.0))
+    good.write_bytes(good.read_bytes()[:-40])  # cut off: the zip directory is gone
+    ex = fs._profile_run_extras(log, rec, compare=True)
+    assert ex["archive_hashes"] is None and "BadZipFile" in ex["archive_error"]
+    assert ex["profile"]["markers_file"] is True  # the arm's other inputs are still read
