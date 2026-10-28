@@ -574,6 +574,19 @@ class DecoderComputation(DeclaredComputation):
                 out[key] = (run[0][0], stride)
         return out
 
+    @cached_property
+    def product_groups(self) -> tuple[tuple[int, int, int], ...]:
+        """One ``(m₀, stride, n_s·n_h)`` per attention run of :attr:`member_runs`, sorted by
+        ``m₀`` (O18): the members of one role of one layer form one leaf. Raises if a member
+        product belongs to a run that :attr:`member_runs` left out (an unevenly spaced one)."""
+        runs = self.member_runs
+        for spec, role in zip(self.products, self._inventory[1]):
+            if spec.member is not None and (spec.layer, role) not in runs:
+                raise ValueError(f"member product {spec.name} (layer {spec.layer}, role "
+                                 f"{role}) is in no evenly spaced run, so it has no group")
+        n = self.n_s * self.n_h
+        return tuple(sorted((m0, stride, n) for m0, stride in runs.values()))
+
     def member_pieces(self, ms: Sequence[int]) -> list[tuple[int, int, int, int, int]] | None:
         """``ms`` cut into interleaved arithmetic progressions, from arithmetic on ``ms``
         and :attr:`member_runs`; ``None`` if ``ms`` has a product outside every run.

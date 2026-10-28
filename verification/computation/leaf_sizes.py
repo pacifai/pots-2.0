@@ -3,7 +3,8 @@
 For sizing the step (the hashing benchmark under ``benchmarks/hashing/``, and the memory and
 transcript-size estimates). Nothing here runs a model or allocates a leaf. The layout comes
 from the two places that define it: :class:`DecoderComputation` declares the weights and the
-products, and ``commitment.leaves`` maps each index to its slot. So the list matches the leaves
+product leaves (O18: a batched product's members are one leaf), and ``commitment.leaves`` maps
+each index to its slot. So the list matches the leaves
 the prover commits, in the order it commits them.
 """
 
@@ -32,8 +33,9 @@ class LeafSize:
     ``nbytes`` is the length of the leaf's canonical encoding (header and payload, what
     ``leaf_parts`` yields); ``H_leaf`` hashes one byte more, the ``0x00`` prefix. A record is
     sized at its longest, ``ℓ = n``: three int32 arrays of length ``n`` after a 6-byte header,
-    so its ``shape`` is ``(3, n)``. ``role`` is a product's κ class (``"Y_q"``, ``"S"``,
-    ``"Lambda"``, …; every head block's is its kind's) and ``None`` for records and weights.
+    so its ``shape`` is ``(3, n)``. ``role`` is a product leaf's κ class (``"Y_q"``, ``"S"``,
+    ``"Lambda"``, …; every head block's is its kind's; a group's is its first member's) and
+    ``None`` for records and weights.
     """
 
     index: int
@@ -59,17 +61,17 @@ def leaf_sizes(config: Any, *, n_s: int, n: int,
     out = [LeafSize(i, "record", f"record {i}", None, (3, n), torch.int32, record_bytes)
            for i in range(n_s)]
     header_bytes: dict[tuple[int, int], int] = {}
-    n_w, M = c.n_w, c.M
+    n_w, K = c.n_w, c.n_product_leaves
     for i in range(n_s, c.n_leaves):
         tag, shape, dtype, slot = _tensor_slot(c, i)
         role = None
         if i < n_s + n_w:
             section, name = "w_t", c.weight_names[i - n_s]
-        elif i < n_s + n_w + M:
-            spec = c.product(i - n_s - n_w + 1)
-            section, name, role = "product", spec.name, c.product_class(spec)
+        elif i < n_s + n_w + K:
+            pl = c.product_leaf(i - n_s - n_w)
+            section, name, role = "product", pl.name, c.product_class(c.product(pl.m0))
         else:
-            section, name = "w_next", c.weight_names[i - n_s - n_w - M]
+            section, name = "w_next", c.weight_names[i - n_s - n_w - K]
         if name not in slot:
             raise RuntimeError(f"leaf {i}: the layout's slot {slot!r} doesn't name {name!r}; "
                                "this list and commitment.leaves disagree on the leaf order")

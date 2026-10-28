@@ -40,10 +40,12 @@ class Placement:
     _product_slot: tuple[int, ...] = field(default=(), repr=False, compare=False)
     _leaf_device: tuple[torch.device, ...] = field(default=(), repr=False, compare=False)
     _loads: tuple[int, ...] = field(default=(), repr=False, compare=False)
+    _product_leaf_slot: tuple[int, ...] = field(default=(), repr=False, compare=False)
 
     _units: frozenset[int] = field(default=frozenset(), repr=False, compare=False)
     _weights: frozenset[str] = field(default=frozenset(), repr=False, compare=False)
     _n_products: int = field(default=0, repr=False, compare=False)
+    _n_product_leaves: int = field(default=0, repr=False, compare=False)
     _n_leaves: int = field(default=0, repr=False, compare=False)
 
     @property
@@ -81,6 +83,16 @@ class Placement:
         if self.devices is None:
             return HOST
         return self.devices[self._product_slot[m - 1]]
+
+    def product_leaf_device(self, g: int) -> torch.device:
+        """Where product leaf ``g`` (0-based among the product leaves) lives: the device of its
+        first product, since a group's members share a layer and so a unit (O18); ``HOST``
+        unsharded."""
+        if not 0 <= g < self._n_product_leaves:
+            raise IndexError(f"product leaf {g} outside 0..{self._n_product_leaves - 1}")
+        if self.devices is None:
+            return HOST
+        return self.devices[self._product_leaf_slot[g]]
 
     def leaf_device(self, i: int) -> torch.device:
         """Where leaf ``i`` (the transcript index) lives; records are always on ``HOST``."""
@@ -125,7 +137,8 @@ def placement_for(c: DeclaredComputation, prover: torch.device | str,
     """The placement of ``c``'s units and leaves over ``devices`` (``None``: unsharded)."""
     prover = torch.device(prover)
     bounds = dict(_units=frozenset(c.units), _weights=frozenset(c.weight_names),
-                  _n_products=c.M, _n_leaves=c.n_leaves)
+                  _n_products=c.M, _n_product_leaves=c.n_product_leaves,
+                  _n_leaves=c.n_leaves)
     if devices is None:
         return Placement(prover, None, **bounds)
     devs = tuple(torch.device(d) for d in devices)
@@ -153,11 +166,13 @@ def placement_for(c: DeclaredComputation, prover: torch.device | str,
 
     weight_slot = {name: slot[c.weight_unit(name)] for name in c.weight_names}
     product_slot = tuple(slot[j] for j in product_unit)
-    # Leaf order: records, W_t, products, W_{t+1} (ref block §6).
+    # Leaf order: records, W_t, product leaves, W_{t+1} (ref block §6, O18).
     w_slots = tuple(weight_slot[name] for name in c.weight_names)
-    leaf_slots = w_slots + product_slot + w_slots
+    product_leaf_slot = tuple(product_slot[pl.m0 - 1] for pl in c.product_leaves)
+    leaf_slots = w_slots + product_leaf_slot + w_slots
     loads = [0] * len(devs)
     for j, s in slot.items():
         loads[s] += size[j]
     return Placement(prover, devs, slot, weight_slot, product_slot,
-                     (HOST,) * c.n_s + tuple(devs[s] for s in leaf_slots), tuple(loads), **bounds)
+                     (HOST,) * c.n_s + tuple(devs[s] for s in leaf_slots), tuple(loads),
+                     _product_leaf_slot=product_leaf_slot, **bounds)

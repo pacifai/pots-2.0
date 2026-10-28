@@ -162,11 +162,11 @@ def test_error_injection(c, leaves, mode, seed):
 
 def test_nonfinite_message_matches_encoding(c, leaves):
     from verification.commitment.encoding import NonFiniteError, tensor_leaf_payload
-    t = leaves[c.product_index(1)].clone()
+    t = leaves[c.product_leaf_index(0)].clone()
     t.view(-1)[0] = float("nan")
     with pytest.raises(NonFiniteError) as ref:
         tensor_leaf_payload(t)
-    err = leaf_hashes_until_error(c, [(c.product_index(1), t)])[1]
+    err = leaf_hashes_until_error(c, [(c.product_leaf_index(0), t)])[1]
     assert str(err) == str(ref.value)
 
 
@@ -208,7 +208,7 @@ def test_counting_runs_the_python_path(c, leaves):
 class _Stub:
     """A computation of `n` weight leaves of one shape and no records or products."""
 
-    n_s, M = 0, 0
+    n_s, M, n_product_leaves = 0, 0, 0
 
     def __init__(self, n, shape):
         self.n_w = self.n_leaves = n
@@ -245,9 +245,9 @@ def test_speed(threads, capsys):
 
 
 def test_nonfinite_message_is_pinned(c, leaves):
-    t = leaves[c.product_index(1)].clone()
+    t = leaves[c.product_leaf_index(0)].clone()
     t.view(-1)[0] = float("nan")
-    assert str(leaf_hashes_until_error(c, [(c.product_index(1), t)])[1]) == \
+    assert str(leaf_hashes_until_error(c, [(c.product_leaf_index(0), t)])[1]) == \
         "float tensor contains NaN or Inf"
 
 
