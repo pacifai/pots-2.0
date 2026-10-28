@@ -50,8 +50,9 @@ Implementation pins (not fixed by the reference block):
   autocast cast different op sets, so a bit-for-bit result on one device says nothing about
   the other.
 
-Labeling (:meth:`DecoderComputation.label`) maps each captured matmul to its slot by operand
-identity (storage), never by call order alone. Under autocast a weight operand (and a bias) is
+Labeling (:meth:`DecoderComputation.label`) maps each captured matmul to its product leaf by
+operand identity (storage), never by call order alone (O18: a batched attention product's leaf
+holds all its members, so a bmm output is one whole leaf). Under autocast a weight operand (and a bias) is
 autocast's copy of the weight, which the capture traces back to the weight
 (``OperandInfo.param_copy``); nothing is matched by value:
 
@@ -963,16 +964,24 @@ class DecoderComputation(DeclaredComputation):
         return loss
 
     def label(self, capture: MatmulCapture, model: nn.Module) -> list[torch.Tensor]:
-        """Map the captured records onto ``P_1..P_M`` by operand identity (module docstring)."""
+        """Map the captured records onto the product leaves by operand identity (module docstring).
+
+        Returns the ``n_product_leaves`` leaves in leaf order (O18): a lone product's ``P``, or a
+        group's ``[n, *p_shape]`` tensor with member ``i`` at ``[i]``."""
         return _Labeler(self, capture, model).run()
 
 
 class _Labeler:
-    """One labeling pass. Every slot is filled exactly once, or :class:`LabelingError`."""
+    """One labeling pass. Every product is filled exactly once, or :class:`LabelingError`."""
 
     def __init__(self, c: DecoderComputation, capture: MatmulCapture, model: nn.Module) -> None:
         self.c, self.cap, self.model = c, capture, model
-        self.slots: list[torch.Tensor | None] = [None] * c.M
+        # O18: one tensor per product leaf, and a mask of the products filled so far (numpy, so
+        # Llama's members cost no Python object each). A grouped leaf filled member by member
+        # waits in ``parts`` until ``run`` stacks it.
+        self.leaves: list[torch.Tensor | None] = [None] * c.n_product_leaves
+        self.filled = np.zeros(c.M, dtype=bool)
+        self.parts: dict[int, dict[int, torch.Tensor]] = {}
         # weight name -> (ℓ or None, x) for every weight that has linear products.
         self.role = {c.w(l, x): (l, x) for l in range(1, c.L + 1) for x in LINEARS}
         self.role[c.w_out] = (None, "head")
@@ -994,16 +1003,19 @@ class _Labeler:
         bmm_ops = self._forward_bmms([r for r in fwd if r.batch is not None], y_rec)
         self._backward_linears([r for r in bwd if r.batch is None], y_rec)
         self._backward_bmms([r for r in bwd if r.batch is not None], bmm_ops)
-        missing = [c.products[i].name for i, t in enumerate(self.slots) if t is None]
+        missing = [c.products[i].name for i in np.flatnonzero(~self.filled)]
         if missing:
             raise LabelingError(f"{len(missing)} slots never filled, first {missing[:5]}")
-        return self.slots  # type: ignore[return-value]
+        for g, members in self.parts.items():
+            self.leaves[g] = torch.stack([members[i] for i in range(len(members))]).contiguous()
+        assert all(t is not None for t in self.leaves)
+        return self.leaves  # type: ignore[return-value]
 
     # ---- helpers -------------------------------------------------------------------------
 
     def _fill(self, name: str, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor,
               rec: MatmulRecord, leaf: torch.Tensor | None = None) -> None:
-        """Put the product in slot ``name`` after checking the operand shapes against its spec.
+        """Put the product named ``name`` in its leaf after checking the operand shapes against its spec.
 
         ``(a, b, out)`` are as captured. ``leaf`` is given when the record computed
         ``Pᵀ = Bᵀ·Aᵀ`` (the δK̃ case): it is the contiguous ``P``, and the captured shapes are
@@ -1011,7 +1023,7 @@ class _Labeler:
         """
         m = self.c.m_of(name)
         spec = self.c.product(m)
-        if self.slots[m - 1] is not None:
+        if self.filled[m - 1]:
             raise LabelingError(f"slot {name} filled twice (record #{rec.index})")
         got = (tuple(a.shape), tuple(b.shape), tuple(out.shape))
         want = (spec.a_shape, spec.b_shape, spec.p_shape)
@@ -1025,7 +1037,12 @@ class _Labeler:
                                 f"{self.c.product_dtype} {spec.p_shape}")
         if not (_contiguous(*_out_layout(rec)) if leaf is None else leaf.is_contiguous()):
             raise LabelingError(f"{name} (record #{rec.index}): output is not contiguous")
-        self.slots[m - 1] = p
+        g, i = self.c.leaf_of(m)
+        if i is None:
+            self.leaves[g] = p
+        else:
+            self.parts.setdefault(g, {})[i] = p
+        self.filled[m - 1] = True
 
     def _linear_name(self, weight: str, prefix: str, b: int = 0) -> str:
         """The product of ``weight`` named by ``prefix``; for the head, block ``b``'s."""
@@ -1164,7 +1181,10 @@ class _Labeler:
 
     def _fill_run(self, l: int, role: str, rec: MatmulRecord,
                   leaves: torch.Tensor | None) -> bool:
-        """Fill a whole member run at once, or return ``False`` and leave every slot alone.
+        """Fill a whole member run at once, or return ``False`` and leave every product alone.
+
+        The run's leaf is the whole tensor ``p``: the bmm output, or for ``δK̃`` the batched
+        transpose (O18).
 
         The shape, dtype and contiguity checks of ``_fill`` are the same for every member of a
         run, so they are made once on the batch tensors. Anything unusual (a run whose products
@@ -1192,9 +1212,10 @@ class _Labeler:
         if not (_contiguous(*_out_layout(rec)) if leaves is None else p[0].is_contiguous()):
             return False
         idx = slice(m0 - 1, m0 - 1 + stride * n, stride)
-        if any(t is not None for t in self.slots[idx]):
+        if self.filled[idx].any():
             return False
-        self.slots[idx] = p.unbind(0)
+        self.leaves[c.leaf_of(m0)[0]] = p
+        self.filled[idx] = True
         return True
 
     # ---- backward --------------------------------------------------------------------------
@@ -1257,7 +1278,7 @@ class _Labeler:
         the leaves' device (the host on a GPU run, FS9), which rounds as the device does."""
         c = self.c
         grad = self.model.get_parameter(c.w_out).grad
-        parts = [self.slots[m - 1] for m in c.head_gradients]
+        parts = [self.leaves[c.leaf_of(m)[0]] for m in c.head_gradients]
         if grad is None or any(p is None for p in parts) or not torch.equal(
                 grad.detach().to(parts[0].device),  # type: ignore[union-attr]
                 chain_gradient(parts, c.weight_dtype)):  # type: ignore[arg-type]
