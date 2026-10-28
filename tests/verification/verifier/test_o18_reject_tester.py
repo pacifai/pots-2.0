@@ -130,7 +130,8 @@ def test_corrupted_member_byte_is_rejected_at_check_2(S, honest, tmp_path, store
     bad = _tampered(S, leaves, name)  # the ORIGINAL tree: its root and paths
     for store in STORES[store_kind](S, bad, tree, tmp_path):
         assert store.root == tree.root
-        _expect(S.verifier().verify_step(1, store), "2")
+        rej = _expect(S.verifier().verify_step(1, store), "2")
+        assert rej.kind == "failed" and "recomputed root" in rej.detail, rej
 
 
 # ---- 4. a wrong member committed consistently --------------------------------------------

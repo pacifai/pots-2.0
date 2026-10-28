@@ -1179,9 +1179,9 @@ first captured CUDA matmul, so `run_loop` calls `GpuBlake3().kernels(device)` on
    on arrival (one per product leaf), the number of leaves the commit took from them (`commit known`, counted by the
    commit's own hash call), the number of product leaves `K` and the number of `δK̃` leaves. A second line, which nothing
    parses, reads
-   `device leaves missing: <kind> <count>, ...; first others: <names or none>`: the products
-   with no arrival digest by kind, and the first five that aren't operand gradients. On an
-   honest decoder step it reads `OPERAND_GRAD <the δK̃ count>; first others: none`.
+   `device leaves missing: <kind> <count>, ...; first others: <names or none>`: the product leaves
+   with no arrival digest, by their first product's kind, and the first five that aren't operand
+   gradients. On an honest decoder step it reads `OPERAND_GRAD <the δK̃ count>; first others: none`.
 4. **The gate.** `summary.json["device_leaves"]` and the last job-log line. It passes only if the
    tests part finished `ok` with no failure or error, none of FS30's CUDA tests was skipped,
    and for every model the step was accepted, the two roots are equal, both the arrival digests

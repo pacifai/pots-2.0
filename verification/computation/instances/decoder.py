@@ -1213,7 +1213,8 @@ class _Labeler:
         if not (_contiguous(*_out_layout(rec)) if leaves is None else p[0].is_contiguous()):
             return False
         if not p.is_contiguous():
-            return False  # the leaf is the whole tensor; the per-member path stacks a contiguous one
+            # the leaf is the whole tensor; the per-member path stacks a contiguous one
+            return False
         idx = slice(m0 - 1, m0 - 1 + stride * n, stride)
         if self.filled[idx].any():
             return False
