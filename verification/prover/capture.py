@@ -588,19 +588,19 @@ class MatmulCapture(TorchDispatchMode):
 
     def count_hint_misses(self, leaves: Sequence[torch.Tensor],
                           device_of: Callable[[int], torch.device]) -> int:
-        """Count the leaves (``P_1..P_M``, as labeling returned them) whose hinted device is not
-        ``device_of(m)``, and keep the count for :meth:`summary`. A leaf that is a record's
+        """Count the product leaves (as labeling returned them) whose hinted device is not
+        ``device_of(g)``, ``g`` being the leaf's position, and keep the count for :meth:`summary`. A leaf that is a record's
         output (or a view of it) is judged by that record's hint, so a CPU run checks the hint
         too; any other leaf (the δK̃ transpose, a new tensor) by the device it sits on, and not at
         all on the CPU."""
         hints = {StorageWeakRef(r.out.untyped_storage()): r.hint
                  for r in self.records + self.glue_outer if r.hint is not None}
         miss = 0
-        for m, p in enumerate(leaves, 1):
+        for g, p in enumerate(leaves):
             at = hints.get(StorageWeakRef(p.untyped_storage()))
             if at is None and p.device.type == "cpu":
                 continue  # a new CPU tensor was never sent anywhere: nothing to judge
-            miss += (p.device if at is None else at) != device_of(m)
+            miss += (p.device if at is None else at) != device_of(g)
         self.n_hint_misses = miss
         return miss
 
