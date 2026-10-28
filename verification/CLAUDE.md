@@ -3299,6 +3299,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `repo/`'s (so `check_upload` verifies it), and the manifest's `base_commit`, the full SHA
     `git rev-parse` gives; a REV that doesn't resolve stops the prep (exit 1) before the long
     work. Without it the manifest has no `base_commit` and nothing else changes.
+    `--o18-commit REV` (fs11 only; FS54; the same helper, name `"repo_o18"`) does the same for
+    `repo_o18/`, O18's merge without the host-side fixes, and records `o18_commit`; the profiling
+    session's host-side arms run it. A bad REV stops the prep (exit 1) naming its flag, and
+    kernel-speed refuses both flags (exit 2). FS49's runbook command is
+    `fs11_prep --out DIR --base-commit 387b991 --o18-commit 3dbf7aa`.
     Every cached file is checked against its blob name first. It never downloads and never
     packs the cache's token; a pinned model missing from the cache is reported (exit 1 for a run model). The
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights
@@ -3451,17 +3456,41 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     card's); per model `base` (the arms' numbers) and `ab` per loop (the O18 and base steady
     intervals, `diff_s` O18 minus base, `ratio` O18 over base), top-level `ab_skipped` when the
     plan has none; `pass` fails closed on them only when planned; the log has `FS49 A/B <k>
-    <loop>: O18 X s, base Y s (Î” Z s, ratio R)` lines.
+    <loop>: O18 (<basis>) X s, base Y s (Î” Z s, ratio R)` lines.
+    FS54's host-side arms: in this session's plan the main arms (`seq_<k>`, `pipe_<k>`, every
+    model) leave `VERIF_RELEASE_CACHE` unset (`None`; `RECHECK_ENV`, with `"1"`, still serves the
+    other sessions and the base, o18 and rel1 arms), so main's auto rule (FS53) decides. For
+    `FOUR_PROFILE_HOST_SIDE_MODELS` (`("Llama-3.2-1B",)`) the plan has, in order after the main
+    arms: the base arms, `seq_<k>_o18`/`pipe_<k>_o18` (only with `repo_o18/`: the main arm's
+    env and argv, own run directory, `PYTHONPATH` and `cwd` the upload's `repo_o18/`, release
+    `"1"`, `info` `o18: True`, `o18_commit`) and `seq_<k>_rel1`/`pipe_<k>_rel1` (main's code,
+    release `"1"`, `info` `release_pinned: True`; always there). Only the main and base
+    sequential arms trace. Their `info` has `compare: True` (main and rel1 and o18), which makes
+    `_profile_run_extras(compare=True)` add `records_sha` (`_records_digest`: the `step`,
+    `verdict`, `storage` and `count` rows, `traced` dropped) and `archive_hashes`
+    (`_archive_hash` per `residuals/*/step_*.npz`, array by array); every arm's extras get
+    `sections_s` (`_section_times`: `5.measure`, `5`, `handoff.empty_cache`, and the `prover`
+    and `verifier` totals per step). `_profile_base(..., o18_names=True)` then takes O18's side
+    of `ab` from the o18 arm (`ab_basis` `"o18 arm"`; else `"main arm"`). `_profile_host_side`
+    fills `row["host_side"][loop]` with `fixes_ab` (o18 against rel1) and `fix_c` (rel1 against
+    main), each `_host_side_cmp` of the steady `interval`, `5.measure`, `5`,
+    `handoff.empty_cache` and `between_steps` (interval minus the sections and the release;
+    pipelined the verifier side alone) as `without_s`, `with_s`, `diff_s`, `ratio`; its items:
+    the new arms accepted, four GPUs, profile inputs (untraced), and per loop equal roots,
+    step-record digests and archive hashes of the main, rel1 and o18 arms. `_memory_items`: one
+    item, every GPU's peak allocated and reserved under `HOST_SIDE_PEAK_LIMIT` (79 GiB), per
+    model and loop, in each row's `memory`. Top-level `host_side_skipped` when there are no o18
+    arms; lines `FS54 host-side <k> <loop>: ...` and `FS54 memory <k> <loop>: ...`.
     Every part has `gpu_peak` and a `samples.jsonl` header check
     (`info["samples_check"]`, `extras["samples"]`). Estimates in minutes (`FOUR_PROFILE_ESTIMATE_MIN`:
-    1, 1, 6, 6, 7, then 3, 2, 6, 4 per model, 66 in all, plus 10 for the base arms below, counted
-    always, 76) come from FS35's 2026-10-25 times (the
+    1, 1, 6, 6, 7, then 3, 2, 6, 4 per model, 66 in all, plus 10 for the base arms and 10 each for
+    the o18 and rel1 arms (FS54), counted always, 96) come from FS35's 2026-10-25 times (the
     card's 37-62 s), the plain run's a guess, the models part FS35's estimate and the sequential
     arm's 6 an estimate with the trace's 2-3 min; limits (`FOUR_PROFILE_TIMEOUT_S`) about twice
     them: models 720 s (FS35's), `seq` 720 s, `pipe` 480 s; `_models_part` still fetches the
     whole manifest (a list of repos for `fetch_models` was left: the tests and the data
-    tokenizers may need other models). `four_profile_default_deadline_s()` is 11,700 s
-    ((76 + 1 + 20) x 2 min, up to 100 s), equal to
+    tokenizers may need other models). `four_profile_default_deadline_s()` is 14,100 s
+    ((96 + 1 + 20) x 2 min, up to 100 s; 11,700 s before FS54), equal to
     `fs11_job.sh`'s. `four_h100_profile(parts)` goes to
     `summary.json["four_h100_profile"]` (an error: `four_h100_profile_error`) and the log ends
     with `FS42 ok:` / `FS42 FAIL:` lines. `pass` fails closed: every part `ok` or `skipped_done`,
@@ -3563,7 +3592,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     to the session's `--session`. Preflight (refuses without a way to end the pod; a refusal it
     can act on terminates), a deadline timer (`FS11_DEADLINE_S`, 12,600 s; 7,500 s for the re-check,
     19,800 s for the profile check, 5,400 s for the probe and for the kernel's speed,
-    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`, 14,700 s for `four-h100`, 11,700 s
+    16,100 s for `fs32-pair`, 8,800 s for `device-leaves`, 14,700 s for `four-h100`, 14,100 s
     for `four-h100-profile`;
     `FS31_CARDS` is passed on), the
     session, a kill of a session still running `FS11_HANG_MARGIN_S` after the work deadline,

@@ -407,3 +407,52 @@ def test_a_bad_base_commit_is_refused_before_the_long_work(tmp_path, home, monke
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     assert prep.main(["--out", str(tmp_path / "o2"), "--base-commit", "nosuchrev"]) == 1
     assert "doesn't resolve" in capsys.readouterr().err
+
+
+# ---- the host-side arms' repo_o18/ (FS54) -----------------------------------------------------
+
+O18_SHA = "0180180" * 5 + "abcde"
+
+
+def _fake_o18(src: Path):
+    calls = []
+
+    def got(root, build, rev, name):
+        calls.append((rev, name))
+        (src / "verification").mkdir(parents=True, exist_ok=True)
+        (src / "verification" / "z.py").write_text(f"rev = {rev!r}\n")
+        sha = O18_SHA if name == "repo_o18" else BASE_SHA
+        return prep._tree_members(src, name), {"commit": sha, "dirty": False}
+    got.calls = calls
+    return got
+
+
+def test_prepare_without_o18_commit_has_no_repo_o18(tmp_path, home):
+    man = _prepare(tmp_path, home, base_commit="387b991", repo_base=_fake_o18(tmp_path / "s"))
+    assert "o18_commit" not in man and man["base_commit"] == BASE_SHA
+    assert not any(k.startswith("repo_o18/") for k in man["files"])
+
+
+def test_prepare_with_o18_commit_packs_repo_o18_and_records_it(tmp_path, home):
+    fake = _fake_o18(tmp_path / "o18_src")
+    man = _prepare(tmp_path, home, base_commit="387b991", o18_commit="3dbf7aa", repo_base=fake)
+    assert fake.calls == [("387b991", "repo_base"), ("3dbf7aa", "repo_o18")]
+    assert man["o18_commit"] == O18_SHA and man["base_commit"] == BASE_SHA
+    assert "repo_o18/verification/z.py" in man["files"]
+    with tarfile.open(man["tarball"]) as t:
+        t.extractall(tmp_path / "pod", filter="data")
+    up = tmp_path / "pod" / prep.TOP
+    assert "3dbf7aa" in (up / "repo_o18/verification/z.py").read_text()
+    assert fs.fetch_models(up, tmp_path / "m", download=_download, say=lambda m: None) == 0
+    (up / "repo_o18/verification/z.py").write_text("changed\n")
+    assert fs.fetch_models(up, tmp_path / "m", download=_download, say=lambda m: None) == 1
+
+
+def test_a_bad_o18_commit_is_refused(tmp_path, home, monkeypatch, capsys):
+    _git_repo(tmp_path / "r")
+    with pytest.raises(prep.PrepError, match="--o18-commit 'nosuchrev' doesn't resolve"):
+        prep.prepare(tmp_path / "out", hub=home / "hub", bench_cache=tmp_path / "bench",
+                     repo_root=tmp_path / "r", o18_commit="nosuchrev", say=lambda m: None)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert prep.main(["--out", str(tmp_path / "o2"), "--session", "kernel-speed",
+                      "--o18-commit", "x"]) == 2

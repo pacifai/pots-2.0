@@ -13,6 +13,9 @@ Writes ``DIR/fs11_upload.tar`` (top directory ``fs11_upload/``), its SHA-256 to
 - ``repo_base/`` (only with ``--base-commit REV``): ``git archive REV``, packed the same way;
   the manifest gains ``base_commit``, the full SHA. The profiling session's A/B arm runs the
   code before O18 from it (FS49s).
+- ``repo_o18/`` (only with ``--o18-commit REV``): ``git archive REV``, packed the same way;
+  the manifest gains ``o18_commit``, the full SHA. O18's merge without the host-side fixes;
+  the profiling session's host-side arms run it (FS54).
 - ``data/<model>_<task>/``: ``materialize_data``'s five files for each full-scale model and
   task, at the full-scale config (:data:`~verification.runs.fs11_session.FULL_SCALE_ENV`:
   batch 128, seed 1, 10 steps, one poisoned record), built here on the CPU. A directory whose
@@ -431,6 +434,7 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
             base_commit: str | None = None,
             repo_base: Callable[[Path, Path, str, str], tuple[list[Member], dict[str, Any]]]
             = _repo_members,
+            o18_commit: str | None = None,
             native_src: Path | None = None,
             say: Callable[[str], None] = _say) -> dict[str, Any]:
     """Build the upload (module docstring) and return its manifest. ``build_data(repo,
@@ -438,7 +442,8 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
     config) and ``repo`` replace ``materialize_data`` and
     ``git archive`` in tests; ``base_commit`` (a revision) adds ``repo_base/``, ``git archive``
     of that revision (``repo_base(repo_root, build, rev, "repo_base")`` in tests), and the
-    manifest's ``base_commit`` (O18, FS49s); ``native_src``
+    manifest's ``base_commit`` (O18, FS49s); ``o18_commit`` does the same for ``repo_o18/``
+    (``repo_base`` is called with name ``"repo_o18"``) and ``o18_commit`` (FS54); ``native_src``
     is the native sources' directory (default
     ``native.source_dir()``)."""
     out = out.resolve()
@@ -454,14 +459,22 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
     # The base arm's code first: a revision that doesn't resolve stops before the long work.
     base_members: list[Member] = []
     base_sha: str | None = None
-    if base_commit is not None:
+    o18_sha: str | None = None
+    for flag, rev, name in (("--base-commit", base_commit, "repo_base"),
+                            ("--o18-commit", o18_commit, "repo_o18")):
+        if rev is None:
+            continue
         try:
-            base_members, base_info = repo_base(repo_root, build, base_commit, "repo_base")
+            got, info = repo_base(repo_root, build, rev, name)
         except subprocess.CalledProcessError as e:
-            raise PrepError(f"--base-commit {base_commit!r} doesn't resolve to a commit in "
+            raise PrepError(f"{flag} {rev!r} doesn't resolve to a commit in "
                             f"{repo_root}") from e
-        base_sha = base_info["commit"]
-        say(f"repo_base: commit {base_sha[:12]} ({len(base_members)} files)")
+        base_members += got
+        if name == "repo_base":
+            base_sha = info["commit"]
+        else:
+            o18_sha = info["commit"]
+        say(f"{name}: commit {info['commit'][:12]} ({len(got)} files)")
     # The models, each checked against its blob names.
     roles: dict[tuple[str, str], list[str]] = {}
     for pin in RUN_PINS:
@@ -547,6 +560,7 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
         "format": "fs11-upload/1", "python_version": platform.python_version(),
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "repo": repo_info, **({"base_commit": base_sha} if base_sha else {}),
+        **({"o18_commit": o18_sha} if o18_sha else {}),
         "versions": versions, "full_scale_env": FULL_SCALE_ENV,
         "files": dict(sorted(files.items())),
         "models": [{"repo": m.repo, "revision": m.revision, "gated": m.gated, "roles": m.roles,
@@ -641,11 +655,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--base-commit", metavar="REV", default=None,
                    help="fs11 only: also pack repo_base/, `git archive REV`, for the profiling "
                         "session's A/B arm (O18: 387b991, the code before it)")
+    p.add_argument("--o18-commit", metavar="REV", default=None,
+                   help="fs11 only: also pack repo_o18/, `git archive REV`, O18's merge without "
+                        "the host-side fixes, for the profiling session's host-side arms (FS54)")
     args = p.parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
     if args.session == "kernel-speed":
-        if args.base_commit is not None:
-            print("fs11_prep: --base-commit is for --session fs11", file=sys.stderr)
+        if args.base_commit is not None or args.o18_commit is not None:
+            print("fs11_prep: --base-commit and --o18-commit are for --session fs11",
+                  file=sys.stderr)
             return 2
         if args.sizes is None:
             print("fs11_prep: --session kernel-speed needs --sizes FILE", file=sys.stderr)
@@ -668,7 +686,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                      or Path.home() / ".cache" / "pots-benchmarks")
     try:
         man = prepare(args.out, hub=hub, bench_cache=bench, repo_root=repo_root,
-                      base_commit=args.base_commit)
+                      base_commit=args.base_commit, o18_commit=args.o18_commit)
     except PrepError as e:
         print(f"fs11_prep: {e}", file=sys.stderr)
         return 1
