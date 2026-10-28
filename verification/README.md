@@ -1175,9 +1175,9 @@ first captured CUDA matmul, so `run_loop` calls `GpuBlake3().kernels(device)` on
    files, `test_device_leaves_cuda.py` and the capture's GPU-memory test, junit report), then
    one `bring_up --no-tamper --device-leaves` per model, `Qwen/Qwen2.5-0.5B-Instruct` first.
    Each bring-up prints one `device leaves:` line with the prover's root, the CPU path's root
-   over the same leaves, the number of arrival digests in use, the number of products hashed
-   on arrival, the number of leaves the commit took from them (`commit known`, counted by the
-   commit's own hash call), `M` and the number of `δK̃` leaves. A second line, which nothing
+   over the same leaves, the number of arrival digests in use, the number of outputs hashed
+   on arrival (one per product leaf), the number of leaves the commit took from them (`commit known`, counted by the
+   commit's own hash call), the number of product leaves `K` and the number of `δK̃` leaves. A second line, which nothing
    parses, reads
    `device leaves missing: <kind> <count>, ...; first others: <names or none>`: the products
    with no arrival digest by kind, and the first five that aren't operand gradients. On an
@@ -1185,8 +1185,8 @@ first captured CUDA matmul, so `run_loop` calls `GpuBlake3().kernels(device)` on
 4. **The gate.** `summary.json["device_leaves"]` and the last job-log line. It passes only if the
    tests part finished `ok` with no failure or error, none of FS30's CUDA tests was skipped,
    and for every model the step was accepted, the two roots are equal, both the arrival digests
-   in use and the leaves the commit took from them number `M` less the `δK̃` leaves, and the
-   products hashed on arrival number `M` (the `δK̃` records are hashed too, their digests
+   in use and the leaves the commit took from them number `K` less the `δK̃` leaves, and the
+   outputs hashed on arrival number `K` (the `δK̃ᵀ` outputs are hashed too, their digests
    unused). A missing part, line or report fails it.
 
 ### The two-GPU session (FS32f)

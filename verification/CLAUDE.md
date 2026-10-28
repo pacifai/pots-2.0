@@ -688,7 +688,7 @@ interface.
     with `KernelMismatchError`, no verdict.
   - *The session.* `device-leaves` (`fs11_session.py`) runs the CUDA tests and, per model, a
     bring-up that prints `device leaves: step 1 accepted ..., prover root ..., cpu root ...,
-    arrival digests U, hashed H, commit known N, M M, dK leaves K`, then a second line nothing
+    arrival digests U, hashed H, commit known N, product leaves K, dK leaves D`, then a second line nothing
     parses, `device leaves missing: <kind> <count>, ...; first others: <names or none>`, from
     `missing` and `missing_first` (`U` is what the commit could use, `N` what it took:
     `StepRecord.known`, the `HashStats.known` of the commit's own hash call, which `run_loop`
@@ -716,7 +716,8 @@ interface.
     `PendingHash` holds every buffer and tensor the work reads until `result()`; `done()` asks
     the event; `result()` waits on the event only and returns `(digests, first_bad)`, the
     digests cut at `first_bad`. `enqueue_table(...)` is the array form under it: capture passes
-    one shared header and arithmetic member addresses rather than a view per member.
+    one entry per output (a whole matmul output is one leaf, O18; `tensor_leaf_header` of the
+    3-D output for a bmm) rather than a view per member.
   - **Where the first NVRTC build happens.** The kernel compiles lazily, on the first
     `enqueue_table` call of a process and device: in a captured run that is inside the first
     CUDA matmul's offload, in the first step's forward pass (the CUBIN then comes from the
@@ -2468,8 +2469,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   which imports it back) gives the `count` and `storage` rows from the declared products and
   each `step` record's `transcript_bytes` and `leaves` (both loops write them; check 2's row
   and, on a CPU run, the commit's row hash every leaf; on a CUDA run `c.device` the commit's
-  row counts only the batch records, `W_t`, `W_{t+1}` and the `dK` products, since the other
-  products' digests come from arrival hashing on their owner GPUs inside `train.*`, whose rows
+  row counts only the batch records, `W_t`, `W_{t+1}` and the `L` `δK̃` leaves, since the other
+  product leaves' digests come from arrival hashing on their owner GPUs inside `train.*`, whose rows
   carry FLOPs only; every hashing row carries `hash_leaves`, the leaf count), because the
   counting pass is never run beside a timed run; with `--count` no work rows are written, so a
   component and step has one `count` row. A `step` record that carries `known` (the leaves the
@@ -2892,7 +2893,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     (F18: `Held.e_m()`, from `q`, the honest `‖P‖_F` and `U`, `target_term_scale` on the held
     operands; a flip record without `U` falls back to ratio 1, a placeholder), and deep points
     (`DEEP_X` 300, 1000 and 3000 at `DEEP_TRIALS` 2,000, on `DEEP_SHAPES` `entry` and `row2`,
-    from their own generator). Re-rooted with `perturb_leaf`, measured by `measure_target` and
+    from their own generator). Re-rooted with `perturb_leaf` (a batched member sits in its group's
+    leaf, O18: each trial writes the planted product into a fresh clone of the honest group
+    leaf, `Held.member` is its index, and restoring puts the honest group leaf back), measured by `measure_target` and
     judged with check 5's own `_judge_product` (a biased target holds its committed `b` too).
     Then one check-6 trial (`check6_trial`): one `W_{t+1}` entry moved to
     `ρ ≈ CHECK6_FACTOR·τ_W` (2, a placeholder) must reject at 6a on that entry.
@@ -3204,7 +3207,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
   `CUDA_VISIBLE_DEVICES=k VERIF_MODEL=… .venv/bin/python -m verification.runs.card_identity
   --out card.json`. From `W_0` it runs one `plain_step` on `π(1)` and one `prove_step` committed
   with `InMemoryStore.commit_step`. The report holds the card, the proved step's root, both
-  steps' `W_{t+1}` section roots and losses, the leaf layout and the wall times; `card.digests`
+  steps' `W_{t+1}` section roots and losses, the leaf layout (`n_s`, `n_w`, `M`, the product-leaf count `K`, `product_leaf_names`;
+  the section root starts at leaf `n_s + n_w + K`) and the wall times; `card.digests`
   beside it holds every leaf hash. It exits 1 when capture changed the bits on the one card.
   The card's UUID is torch's own device's where torch exposes it (else `nvidia-smi`'s); both
   are recorded. `fs11_session.hw3_cards` compares the cards' reports: `same_bits` needs at
@@ -3325,7 +3329,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `�
     `summary.json["device_leaves"]` fails closed: tests part `ok`, no
     failure or error, no FS30 test skipped, and per model the step accepted, the two roots equal
     the arrival digests in use and the leaves the commit took from them (`commit known`) each
-    equal to `M` less the `dK` leaves, and the products hashed on arrival equal to `M`) or
+    equal to `K` less the `dK` leaves `D`, and the outputs hashed on arrival equal to `K`) or
     `fs32-pair` (FS32f);
     `fs32-pair` is F22's two-GPU acceptance: `refusal(env, True, PAIR_CARDS, need=...)` (2 CUDA
     devices of any type; the message names the pair session, not `FS31_CARDS`), then `models`,

@@ -43,7 +43,7 @@ def fake_known(monkeypatch, n):
     def wrapper(c, *a, **kw):
         out = real_prove(c, *a, **kw)
         want = hash_step_leaves(c, out.leaves())
-        idx = [c.product_index(m) for m in range(1, n + 1)]
+        idx = [c.product_leaf_index(g) for g in range(n)]
         return dataclasses.replace(out, arrival_digests={i: want[i] for i in idx})
 
     monkeypatch.setattr(loop_mod, "prove_step", wrapper)
@@ -107,7 +107,7 @@ def test_a_record_without_stats_makes_the_line_refuse(real):  # noqa: F811
     with pytest.raises(ValueError, match="known count"):
         bu.device_leaves_line(b, c_, T=1)
     step.known = 0  # an honest zero (a CPU run) is printed, not refused
-    assert "commit known 0, M" in bu.device_leaves_line(b, c_, T=1)
+    assert "commit known 0, product leaves" in bu.device_leaves_line(b, c_, T=1)
 
 
 # ---- the gate on the real line ---------------------------------------------------------------
@@ -116,13 +116,13 @@ def test_a_record_without_stats_makes_the_line_refuse(real):  # noqa: F811
 def test_the_real_line_has_commit_known_right_after_hashed(real):  # noqa: F811
     text = written_line(real)
     assert ", hashed " in text and text.index(", commit known ") > text.index(", hashed ")
-    assert text.index(", commit known ") < text.index(", M ")
+    assert text.index(", commit known ") < text.index(", product leaves ")
 
 
 @pytest.mark.parametrize("which,kw,own,others", [
     ("arrival", {"used": 0}, "arrival digests, expected", ("the commit took", "hashed on")),
     ("known", {"known": 0}, "the commit took", ("hashed on",)),
-    ("hashed", {"hashed": 1}, "products hashed on arrival", ("arrival digests, expected",
+    ("hashed", {"hashed": 1}, "outputs hashed on arrival", ("arrival digests, expected",
                                                              "the commit took")),
 ])
 def test_each_count_off_alone_fails_with_only_its_own_reason(real, tmp_path, which, kw, own,
@@ -142,7 +142,7 @@ def test_all_three_counts_right_passes_and_known_is_in_the_row(real, tmp_path): 
 def test_the_old_line_without_commit_known_fails_closed_and_is_not_misparsed(
         real, tmp_path):  # noqa: F811
     text = written_line(real)
-    old = text.replace(text[text.index(", commit known "):text.index(", M ")], "")
+    old = text.replace(text[text.index(", commit known "):text.index(", product leaves ")], "")
     assert "commit known" not in old
     part = bring_part(M0, old, tmp_path)
     assert part["extras"]["device_leaves"] is None

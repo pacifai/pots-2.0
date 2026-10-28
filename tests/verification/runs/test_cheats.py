@@ -345,7 +345,7 @@ def test_sweep_restores_the_root_and_matches_check_5(env, kept):
     with pytest.raises(AssertionError, match="did not restore"):
         fs.sweep_target(c, store, bad, ctx, env.bands, xs=(1.0,), shapes=("entry",), trials=1,
                         gen=torch.Generator().manual_seed(0))
-    perturb_leaf(c, store, c.product_index(held[0].spec.m), held[0].leaf)
+    perturb_leaf(c, store, c.product_leaf_index(c.leaf_of(held[0].spec.m)[0]), held[0].leaf)
     assert store.root == base
 
 
@@ -487,13 +487,48 @@ def test_sweep_targets_get_check_5s_numbers_on_a_decoder(tiny_decoder_step):
         assert fs.unmatched(mp, stats[h.spec.m]) == [] and mp.u == h.u
     base, gen = store.root, torch.Generator().manual_seed(0)
     for h in held[1:3] + held[-3:-1]:
-        idx = c.product_index(h.spec.m)
+        idx = c.product_leaf_index(c.leaf_of(h.spec.m)[0])
         p2, _ = fs.plant(h.p, "row2", 0.1, h.p_norm, gen)
-        root = perturb_leaf(c, store, idx, p2)
+        w = p2
+        if h.member is not None:  # O18: the planted member goes into a clone of its group leaf
+            w = h.leaf.clone()
+            w[h.member] = p2.to(w.dtype)
+        root = perturb_leaf(c, store, idx, w)
         mp = fs.measure_target(h, p2, h=root, ctx=ctx)
         planted, _ = _check_5_stats(c, store)
         assert fs.unmatched(mp, planted[h.spec.m]) == []
         assert perturb_leaf(c, store, idx, h.leaf) == base
+
+
+def test_a_member_trial_changes_only_its_member_of_the_leaf(tiny_decoder_step):
+    """O18: planting a member writes the product into a fresh clone of the group leaf, so one
+    trial changes only member ``i`` of the leaf, and the honest leaf and root come back."""
+    c, store = tiny_decoder_step
+    stats, ctx = _check_5_stats(c, store)
+    [h] = fs.hold_targets(c, store, [c.product(c.m_of("L1.S[0,1]"))])
+    g, i = c.leaf_of(h.spec.m)
+    assert i is not None and h.member == i and h.leaf.shape[0] > 1
+    honest, base = h.leaf.clone(), store.root
+    seen = []
+    real = fs.perturb_leaf
+
+    def spy(c_, st, idx, obj):
+        if obj is not h.leaf:
+            seen.append((idx, obj))
+        return real(c_, st, idx, obj)
+
+    fs.perturb_leaf = spy
+    try:
+        fs.sweep_target(c, store, h, ctx, Bands.provisional(), xs=(1.0,), shapes=("entry",),
+                        trials=2, gen=torch.Generator().manual_seed(0))
+    finally:
+        fs.perturb_leaf = real
+    assert len(seen) == 2 and seen[0][1] is not seen[1][1]  # a fresh clone per trial
+    for idx, w in seen:
+        assert idx == c.product_leaf_index(g)
+        others = [j for j in range(w.shape[0]) if j != i]
+        assert torch.equal(w[others], honest[others]) and not torch.equal(w[i], honest[i])
+    assert torch.equal(h.leaf, honest) and store.root == base
 
 
 def test_summary_fits_the_entry_constant():

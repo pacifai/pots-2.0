@@ -384,12 +384,12 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     prover's root (the tree the commit built, with the arrival digests and the device kernel),
     the root the CPU path gives over the same leaves (every leaf hashed by the C library through
     :func:`leaf_hashes_of` with ``kernel=False``, never the kernel), how many arrival digests the
-    commit could use (``used``), how many products the capture hashed on arrival (``hashed``;
-    the ``dK`` records too, whose digests go unused), how many leaves the commit actually took
-    from them (``commit known``, ``HashStats.known`` of the commit's own hash call,
-    ``StepRecord.known``), ``M``, and how many ``dK`` leaves there are
-    (the ones the prover hashes at the commit); and whether the step was accepted. Run on a
-    CPU, no leaf takes a digest and the roots agree trivially."""
+    commit could use (``used``), how many outputs the capture hashed on arrival (``hashed``, one
+    per product leaf; the ``δK̃ᵀ`` outputs too, whose digests go unused), how many leaves the
+    commit actually took from them (``commit known``, ``HashStats.known`` of the commit's own
+    hash call, ``StepRecord.known``), ``K`` (``c.n_product_leaves``, O18), and how many
+    ``dK`` product leaves there are (the ones the prover hashes at the commit); and whether the
+    step was accepted. Run on a CPU, no leaf takes a digest and the roots agree trivially."""
     if b.kept is None:
         raise ValueError("device_leaves_line needs the step's leaves: run with keep_last")
     step = next(s for s in b.result.loop.steps if s.t == T)
@@ -401,17 +401,17 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     cpu_root = MerkleTree(leaf_hashes_of(c, list(enumerate(leaves)), kernel=False)).root
     ah = (step.capture or {}).get("arrival_hash") or {}
     used, hashed = ah.get("used", 0), ah.get("leaves", 0)
-    dk = sum(1 for q in c.products if product_class(c, q) == "dK")
+    dk = sum(1 for pl in c.product_leaves if product_class(c, c.product(pl.m0)) == "dK")
     return (f"device leaves: step {T} accepted {step.rejection is None}, "
             f"prover root {step.root.hex() if step.root else 'none'}, cpu root {cpu_root.hex()}, "
             f"arrival digests {used}, hashed {hashed}, commit known {step.known}, "
-            f"M {c.M}, dK leaves {dk}")
+            f"product leaves {c.n_product_leaves}, dK leaves {dk}")
 
 
 def device_leaves_missing_line(b: BringUp, *, T: int) -> str:
-    """The line after :func:`device_leaves_line`, for a person: which products got no arrival
-    digest, by kind, and the first few that aren't operand gradients (the ``dK`` records'
-    digests are hashed but unused, so ``OPERAND_GRAD`` is expected). Nothing parses it."""
+    """The line after :func:`device_leaves_line`, for a person: which product leaves got no
+    arrival digest, by kind, and the first few that aren't operand gradients (the ``δK̃``
+    leaves' digests are hashed but unused, so ``OPERAND_GRAD`` is expected). Nothing parses it."""
     step = next(s for s in b.result.loop.steps if s.t == T)
     ah = (step.capture or {}).get("arrival_hash") or {}
     kinds = ", ".join(f"{k} {n}" for k, n in (ah.get("missing") or {}).items()) or "none"
