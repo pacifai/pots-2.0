@@ -26,11 +26,11 @@ def smollm2_config():
 
 
 def test_test_scale_step():
-    """SmolLM2-135M at 4 × 128 in fp32: 7,661 leaves and about 2.62 GB (ref block §6)."""
+    """SmolLM2-135M at 4 × 128 in fp32: 1,361 leaves (813 of them product leaves, O18) and about 2.62 GB (ref block §6)."""
     ls = leaf_sizes(smollm2_config(), n_s=4, n=128)
-    assert [l.index for l in ls] == list(range(7661))
+    assert [l.index for l in ls] == list(range(1361))
     sections = [l.section for l in ls]
-    assert sections == ["record"] * 4 + ["w_t"] * 272 + ["product"] * 7113 + ["w_next"] * 272
+    assert sections == ["record"] * 4 + ["w_t"] * 272 + ["product"] * 813 + ["w_next"] * 272
     params = sum(l.nbytes - 3 - 4 * len(l.shape) for l in ls if l.section == "w_t") // 4
     assert params == 134_515_008
     assert all(l.dtype == torch.float32 for l in ls if l.section != "record")
@@ -40,6 +40,11 @@ def test_test_scale_step():
     assert round(total / 1e9, 2) == 2.62
     products = [l for l in ls if l.section == "product"]
     assert products[0].name == "L1.Y_q" and products[0].role == "Y_q"
+    groups = [l for l in products if len(l.shape) == 3]
+    assert len(groups) == 180 and {l.shape for l in groups if l.name == "L1.S"} == {(36, 128, 128)}
+    assert {l.name for l in groups if l.name.startswith("L1.")} == {
+        "L1.S", "L1.O", "L1.dA", "L1.dV", "L1.dQ", "L1.dK"}
+    assert next(l for l in groups if l.name == "L1.S").role == "S"
     lam = next(l for l in products if l.name == "Lambda")
     assert lam.shape == (512, 49152) and lam.nbytes == 3 + 8 + 512 * 49152 * 4
 
@@ -93,8 +98,9 @@ def assert_agrees(c, records, biases=False):
             assert (tuple(obj.shape), obj.dtype) == (l.shape, l.dtype), l
     names = [l.name for l in ls]
     n_s, n_w = c.n_s, c.n_w
-    assert names[n_s:n_s + n_w] == list(c.weight_names) == names[n_s + n_w + c.M:]
-    assert names[n_s + n_w:n_s + n_w + c.M] == [p.name for p in c.products]
+    K = c.n_product_leaves
+    assert names[n_s:n_s + n_w] == list(c.weight_names) == names[n_s + n_w + K:]
+    assert names[n_s + n_w:n_s + n_w + K] == [pl.name for pl in c.product_leaves]
     return ls
 
 
@@ -115,11 +121,11 @@ def test_agrees_with_a_committed_step(switch, compute_dtype):
 @pytest.mark.slow
 def test_agrees_with_a_committed_smollm2_step():
     """The test-scale model, loaded at its pin, committed at 4 sequences of 16 tokens: the same
-    7,661 leaves as at 4 × 128 (the count depends on n_s, not n), each matching its entry."""
+    1,361 leaves as at 4 × 128 (the count depends on n_s, not n), each matching its entry."""
     pin = TEST_SCALE_TOKENIZER
     c = DecoderComputation.from_pretrained(pin.repo, pin.revision, n_s=4, n=16, eta=1e-3)
     ls = assert_agrees(c, make_records((16,) * 4))
-    assert len(ls) == 7661
+    assert len(ls) == 1361
 
 
 # Full scale (F1a): 128 × 128, fp32 weights, bf16 products. The largest leaf is the logits Λ,
@@ -138,8 +144,12 @@ def test_full_scale_step(repo, revision, logits_gb):
     config = load_model_config(repo, revision)
     ls = leaf_sizes(config, n_s=128, n=128, compute_dtype=torch.bfloat16)
     n_w = sum(l.section == "w_t" for l in ls)
-    assert len(ls) == 128 + 2 * n_w + matmul_count_decoder(
-        config.num_hidden_layers, 128, config.num_attention_heads)
+    B = sum(l.role == "Lambda" for l in ls)  # head blocks
+    L = config.num_hidden_layers
+    assert len(ls) == 128 + 2 * n_w + 27 * L + 3 * B  # O18: 6 attention leaves a layer
+    assert sum(l.section == "product" for l in ls) == 27 * L + 3 * B
+    assert 21 * L + 6 * 128 * config.num_attention_heads * L + 3 * B == matmul_count_decoder(
+        L, 128, config.num_attention_heads)
     largest: LeafSize = max(ls, key=lambda l: l.nbytes)
     assert largest.name == "Lambda" and largest.shape == (16384, config.vocab_size)
     assert round(largest.nbytes / 1e9, 2) == logits_gb
