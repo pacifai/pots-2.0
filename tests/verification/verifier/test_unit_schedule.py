@@ -513,7 +513,7 @@ def _malformed(leaf):
 def test_a_malformed_leaf_is_rejected_alike(name, monkeypatch):
     setup = proved(CHEAP, 2)
     m = _m(setup.c, name)
-    g, i = setup.c.leaf_of(m)
+    g = setup.c.leaf_of(m)[0]
     # a whole leaf (every attention member too: one leaf, O18) loses its last entry
     leaves = list(setup.leaves)
     j = setup.c.product_leaf_index(g)
