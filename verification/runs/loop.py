@@ -200,7 +200,8 @@ def release_device_cache(device: str | torch.device, section: Section | None = N
     """Hand the CUDA caching allocator's free blocks back to the driver, inside the metrics
     section :data:`HANDOFF_SECTION`.
 
-    Prover and verifier share one process and one GPU here. The prover's freed blocks stay in
+    Where prover and verifier share a GPU (one H100, the pair layout: the only case auto
+    releases), the prover's freed blocks stay in
     the allocator's cache, cut to the prover's sizes, and a large verifier buffer may then not
     fit in any of them though the GPU has the room (the first H100 session's out-of-memory
     errors reported GiBs "reserved but unallocated"). Called once per verified step, after the

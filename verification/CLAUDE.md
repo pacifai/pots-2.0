@@ -2134,9 +2134,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     (`"handoff.empty_cache"`), once per step between the prover's role and the verifier's.
     One call empties every device's cache (`NativeCachingAllocator::emptyCache` loops over
     every device's allocator, torch 2.9.1). Elsewhere it does nothing and opens no section.
-    Prover and verifier share one process and one GPU in our runs, and the
-    prover's freed blocks stay cached at the prover's sizes, so a large verifier buffer may not
-    fit though the GPU has the room (the first H100 session's out-of-memory errors). Its row is
+    Where prover and verifier share a GPU (one H100, the pair layout: the only case auto
+    releases), the prover's freed blocks stay cached at the prover's sizes, so a large verifier
+    buffer may not fit though the GPU has the room (the first H100 session's out-of-memory
+    errors). On the four-GPU layout the prover has a card of its own and auto skips the release.
+    Its row is
     the harness's, side `run`, in no total. `run_loop` gives it the model's device
     (`model_device`: the first parameter's, host without one) and `c.placement.devices`;
     `bring_up.bias_tamper` calls it with `c.device` before each `verify_step` too.
@@ -2212,7 +2214,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
   defaults to `D`'s root; `verifier(section) -> Verifier` replaces the default provisional
   verifier and must match the run's seam, `T`, `k` and `seed`; `memory_run` and `count_run`
   take it and `seed` too, and `handoff`, passed to `run_loop`; `run_scenario` and `memory_run`
-  also take `release_cache=True`, `run_loop`'s), `judge` (the
+  also take `release_cache=None`, `run_loop`'s: read from `VERIF_RELEASE_CACHE`, auto when unset), `judge` (the
   S6b oracle), `report`, and the generic passes `memory_run` and `count_run` (one scenario,
   default `HONEST`, through `memory_pass` / `count_pass`).
   - **Model reuse (O4).** `honest_final`, `run_scenario`, `memory_run` and `count_run` take
@@ -2594,7 +2596,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     commit time. `test_disk_handoff_gives_the_same_decisions` checks that a tiny Qwen2 run
     decides number for number as in memory and leaves `DIR` empty.
   - `bias_tamper(c, D, w0, bands, *, k, seed, h_D, build_model, layer=1, x="q",
-    handoff=None, release_cache=True)`: two one-step judged runs (FS2's switch test on the real model). The last
+    handoff=None, release_cache=None)` (`None` reads `VERIF_RELEASE_CACHE`, auto when unset): two one-step judged runs (FS2's switch test on the real model). The last
     entry of `b_q` in layer 1 is raised by 1 in training with the `W_t` leaf restored
     (expected: check 5 naming `P_m (L1.Y_q)`), and in an honest step's `W_{t+1}` leaf
     (expected: 6b naming the bias). `Tamper.rejected_as_expected` checks the step, the check
