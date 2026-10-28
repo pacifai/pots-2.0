@@ -257,7 +257,7 @@ def test_dk_owned_moved_to_another_device_is_the_copy():
 
 
 def test_zero_copy_leaves_really_are_in_play():
-    """The aliasing tests bite: this prover's leaves give ``stack_block`` a zero-copy view of a
+    """The aliasing tests bite: this prover's leaves give ``product_run`` a zero-copy view of a
     committed storage when ``own`` is off (so a served alias would be caught)."""
     c, leaves = _alias_replay(("llama", True), "fp32", 2, None)
     spans = _spans(leaves)

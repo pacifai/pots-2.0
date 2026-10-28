@@ -200,9 +200,6 @@ def SpyLeaf(t, log):
     spy.to = to
     return spy
 
-    def __getattr__(self, name):
-        return getattr(self.t, name)
-
 
 def _trial(env, store, name):
     return fsw.check6_trial(env.c, store, env.bands, _ctx(env), name,
