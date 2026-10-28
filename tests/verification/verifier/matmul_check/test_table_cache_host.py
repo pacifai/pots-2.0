@@ -284,6 +284,19 @@ def test_the_cache_is_bounded(monkeypatch):
     assert mk.table_cache_stats()["misses"] == 6
 
 
+def test_one_bucket_over_the_cap_drops_its_oldest_entries(monkeypatch):
+    """FS55a: dtype is not in the bucket key, so these entries share one bucket."""
+    monkeypatch.setattr(mk, "TABLE_CACHE_MAX", 1)
+    table_of(groups_of(1, torch.float32), 3)
+    table_of(groups_of(1, torch.bfloat16), 3)
+    assert len(mk._cache) == 1 and mk._cache_n == 1
+    assert sum(len(v) for v in mk._cache.values()) == 1
+    table_of(groups_of(1, torch.bfloat16), 3)  # the newest stays
+    assert mk.table_cache_stats()["hits"] == 1
+    table_of(groups_of(1, torch.float32), 3)  # the oldest went
+    assert mk.table_cache_stats()["misses"] == 3
+
+
 def test_an_invalid_group_fails_as_before_and_is_not_cached():
     groups = groups_of(1, torch.float32)
     bad = [groups[0], groups[1]._replace(ms=[1, 2])]  # two labels for three members
@@ -387,6 +400,86 @@ def test_the_layout_cache_is_bounded(monkeypatch):
     assert src._layouts_n <= 2
     assert src.find_layout(K, [31, 32], [6, 6]) is not None
     assert src.find_layout(K, [1, 2], [6, 6]) is None
+
+
+def test_one_layout_bucket_over_the_cap_drops_its_oldest(monkeypatch):
+    """FS55a: equal first and last ``ms`` and widths share a bucket."""
+    monkeypatch.setattr(cs, "LAYOUT_CACHE_MAX", 2)
+    src = cs.HostChallengeSource()
+    for mid in (2, 3, 4, 5):
+        src.prefetch(H, [1, mid, 9], K, [6, 6, 6])
+    assert src._layouts_n == 2 and len(src._layouts) == 1
+    assert sum(len(v) for v in src._layouts.values()) == 2
+    assert src.find_layout(K, [1, 5, 9], [6, 6, 6]) is not None
+    assert src.find_layout(K, [1, 4, 9], [6, 6, 6]) is not None
+    assert src.find_layout(K, [1, 2, 9], [6, 6, 6]) is None
+
+
+def served_order(ms, widths, seed=0):
+    perm = np.random.default_rng(seed).permutation(len(ms))
+    return [ms[i] for i in perm], [widths[i] for i in perm]
+
+
+def test_a_permuted_draw_takes_the_fast_path_the_second_time_with_the_same_offsets_and_bytes():
+    """FS55a: the draw's tables are in served order, the prefetch's request in canonical order."""
+    dms, dw = served_order(MS, WIDTHS)
+    dms_t, dw_t = tuple(dms), tuple(dw)
+    src, ref_src = cs.HostChallengeSource(), cs.HostChallengeSource()
+    results = []
+    for round_ in range(2):
+        pf = src.prefetch(H, MS, K, WIDTHS)
+        pf.future.result()
+        results.append(src.draw(H, dms_t, K, dw_t, stream=None, prefetched=pf))
+        assert src.fast_draws == round_  # the first draw checks member by member
+    # the per-member path: a source that never remembers
+    pf = ref_src.prefetch(H, MS, K, WIDTHS)
+    pf.layout.remember_draw = lambda *a: None
+    pf.future.result()
+    ref_buf, ref_offs, _ = ref_src.draw(H, dms, K, dw, stream=None, prefetched=pf)
+    assert ref_src.fast_draws == 0
+    for buf, offs, ev in results:
+        assert ev is None and offs.dtype == np.int64
+        assert np.array_equal(offs, ref_offs)
+        assert torch.equal(buf.view(torch.int32), ref_buf.view(torch.int32))
+        for m, w, o in zip(dms, dw, offs):
+            got = buf[o // 4:o // 4 + w * K].view(w, K)
+            assert torch.equal(got.view(torch.int32),
+                               challenge_matrix(H, m, K, w).view(torch.int32))
+    # equal but not identical sequences (lists) also reuse; the returned offsets are a copy
+    pf = src.prefetch(H, MS, K, WIDTHS)
+    pf.future.result()
+    _, offs, _ = src.draw(H, list(dms), K, list(dw), stream=None, prefetched=pf)
+    assert src.fast_draws == 2 and np.array_equal(offs, ref_offs)
+    offs[:] = -1
+    assert np.array_equal(pf.layout.draw_offsets, ref_offs)
+
+
+def test_a_different_draw_request_or_h_or_k_falls_back():
+    dms, dw = served_order(MS, WIDTHS)
+    src = cs.HostChallengeSource()
+    pf = src.prefetch(H, MS, K, WIDTHS)
+    pf.future.result()
+    src.draw(H, dms, K, dw, stream=None, prefetched=pf)
+    n = src.fast_draws
+    # another served order: checked member by member, replaces the stored request
+    ems, ew = served_order(MS, WIDTHS, seed=5)
+    _, offs, _ = src.draw(H, ems, K, ew, stream=None, prefetched=pf)
+    assert src.fast_draws == n
+    assert [pf.offsets[(m, w)] for m, w in zip(ems, ew)] == list(offs)
+    src.draw(H, ems, K, ew, stream=None, prefetched=pf)
+    assert src.fast_draws == n + 1
+    # a subset of the products is covered, member by member
+    src.draw(H, MS[:3], K, WIDTHS[:3], stream=None, prefetched=pf)
+    assert src.fast_draws == n + 1
+    # the slot fill, h and k are compared on every call, as the draw runs inline instead
+    other_h = bytes(range(32))
+    buf, offs, _ = src.draw(other_h, ems, K, ew, stream=None, prefetched=pf)
+    assert src.fast_draws == n + 1
+    for m, w, o in zip(ems, ew, offs):
+        assert torch.equal(buf[o // 4:o // 4 + w * K].view(w, K).view(torch.int32),
+                           challenge_matrix(other_h, m, K, w).view(torch.int32))
+    src.draw(H, ems, K + 1, ew, stream=None, prefetched=pf)
+    assert src.fast_draws == n + 1
 
 
 def test_prefetch_errors_are_unchanged():

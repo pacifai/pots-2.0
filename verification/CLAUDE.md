@@ -2077,6 +2077,15 @@ interface.
     `Prefetch.covers` then compares the layout object, the slot's fill, `h` and `k`, not each
     member (a request that is not the cached one is looked up member by member, as before). The
     bytes drawn and their offsets are unchanged.
+    FS55a: the draw's tables list the products in served order (`_measure_groups` splits by
+    shape, `operand_blocks` by role), so on a layer step `find_layout` never returns the
+    prefetch's layout. The prefetch's `_Layout` therefore keeps the last draw request it covered
+    (its `ms` and `widths`, identity first, then equality) with that request's per-member
+    offsets. The first time a draw request meets a layout it is checked member by member and
+    stored; an identical later request reuses the stored offsets and skips that check
+    (`HostChallengeSource.fast_draws` counts them). The slot's fill, `h` and `k` are still
+    compared on every call. Both LRUs (`TABLE_CACHE_MAX`, `LAYOUT_CACHE_MAX`) also drop the
+    oldest entries of a last bucket that is over the cap.
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m(q, eps_in, eps_acc, u_ratio=1.0)` is F18's split, `√2·ε_in + √q·ε_acc·max(1,

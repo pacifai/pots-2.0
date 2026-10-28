@@ -749,6 +749,10 @@ def table_structure(groups: Sequence["MeasureGroup"], k: int, guard: bool = True
         while _cache_n > TABLE_CACHE_MAX and len(_cache) > 1:
             _, old = _cache.popitem(last=False)
             _cache_n -= len(old)
+        if _cache_n > TABLE_CACHE_MAX:  # one bucket left over the cap: its oldest entries go
+            drop = _cache_n - TABLE_CACHE_MAX
+            del _cache[bucket][:drop]
+            _cache_n -= drop
     return entry
 
 
