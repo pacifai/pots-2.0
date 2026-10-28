@@ -1780,7 +1780,9 @@ interface.
     wherever it sits. `step_floor(stats, *, tau, k, N, eps_in, eps_acc) -> StepFloor |
     None`: one step's realized floor, its largest `f_achieved` and the product; it skips
     unrecorded or non-finite products rather than raising, since a rejected step may hold
-    them.
+    them. FS52: float64 array operations in the scalar formula's order (`2^(N/k)` once),
+    the first maximum winning, bit for bit the per-product loop it replaced (kept as
+    `_step_floor_loop`, the tests' reference).
   - `band_file_bytes(cal, stats=None)` (no timestamps, so a rerun gives the same hash),
     `write_band_file(path, data)` (temporary file then rename),
     `load_bands(path, *, k, context)` (the read-only loader every judged run uses: a missing
@@ -2290,10 +2292,21 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     `verifier.bands`; the band file is hashed at load, outside every section.
   - `MetricsWriter(dir, run, *, device, model, corpus, attack, seed, config, band_file_hash,
     h_D, extra)` (`.recorder(scenario, *, bpr_records, bpr_actual, cheat_step)`,
-    `.write(rows)`, `.write_residuals(scenario, t, stats, c, *, bands, k, kappa_guard)`,
-    `.close(completed=None)`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
+    `.write(rows)`, `.write_residuals(scenario, t, stats, c, *, bands, k, kappa_guard, rho)`,
+    `.flush()`, `.close(completed=None)`), `read_records(path, record=None)`, `read_residuals(dir)` (gives `StepStats`
     equal to `verifier.stats`), `memory_probe(device)`, `reserved_peak(probe)`,
     `step_record`, `config_hash`.
+    FS52 (the records between steps, `HOST_SIDE_PLAN_DRAFT.md` ยง3): `rho_arrays` runs once a
+    step (`TimeRecorder._emit`) and goes to `step_record`, `step_scores` and
+    `write_residuals` (the optional `rho`); `p_layer` and `p_spec_class` come from per-computation
+    columns (`_static_columns`, a weak-keyed cache) gathered by the step's `m`, with the dtype
+    the per-product lists gave. `write_residuals` builds the arrays on the calling thread and
+    hands `np.savez` to one writer thread, at most one archive in flight; its error is raised
+    by the next `write_residuals`, by `flush()` or by `close`, and `close` joins before it
+    writes `run_end`, so a failed archive leaves none. The file exists only after `flush()` or
+    `close`; every reader in the repo (`load_kept_step`, `evaluation.records`) reads a finished
+    run's directory. The name and class strings stay per-step lists (`np.array` of them is
+    about 20 ms at 393k products; a gather needs a verifying pass that costs as much).
     `model`, `corpus`, `attack` (`VERIF_ATTACK`, `None` for a run on other data) and `seed`
     go into the `environment` record and every `step` record. The `environment` record
     (`environment_record`) also holds the allocator's settings (`allocator_settings`): both
