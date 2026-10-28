@@ -659,7 +659,7 @@ interface.
     bytes and non-finite outputs, present only when something was hashed; `prove_step` adds
     `used`, the digests left in `arrival_digests` after the perturbations, and a diagnostic
     from the arrival loop it already runs: `missing` (`{ProductKind name: count}` of the
-    products with no digest) and `missing_first` (the names, in canonical order, of the first 5
+    product leaves with no digest, by their first product's kind) and `missing_first` (the names, in canonical order, of the first 5
     whose kind is not `OPERAND_GRAD`). The capture hashes
     the `dK` records too and their digests go unused (the `δK̃` leaf is the batched transpose
     made in labeling, a new tensor), so `leaves` (outputs hashed, one per record) is the record
@@ -1207,7 +1207,7 @@ interface.
       must be that weight's `δY` (storage recorded by a hook on the substituted forward
       output). Any other mm is `G_x`/`g_head`: `a` is some weight's `δY` and `b` the saved
       input of that `Y`. A bmm is named by which saved `S`/`O` operand it reads and in which
-      slot. `dK` is served as the transpose of the stacked leaves, as in `label`.
+      slot. `dK` is served as a transposed slice of the group's `δK̃` leaf, as in `label`.
     - Each operand's `_version` is recorded when it is supplied and checked when served; a
       mutated operand raises `ReplayError`. An undeclared, duplicate or missing backward
       product raises `ReplayError`.
