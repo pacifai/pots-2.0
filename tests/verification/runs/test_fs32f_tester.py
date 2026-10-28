@@ -188,15 +188,17 @@ from verification.runs import cheats  # noqa: E402
 from verification.runs import flipped_matmul_sweep as fsw  # noqa: E402
 
 
-class SpyLeaf:
-    """Stands for a stored product leaf: ``to`` notes its arguments, then converts."""
+def SpyLeaf(t, log):
+    """Stands for a stored product leaf: a tensor (the reader checks the type) whose ``to``
+    notes its arguments, then converts."""
+    spy = t.detach()
+    real = spy.to
 
-    def __init__(self, t, log):
-        self.t, self.log = t, log
-
-    def to(self, *a, **k):
-        self.log.append((a, k))
-        return self.t.to(*a, **k)
+    def to(*a, **k):
+        log.append((a, k))
+        return real(*a, **k)
+    spy.to = to
+    return spy
 
     def __getattr__(self, name):
         return getattr(self.t, name)
