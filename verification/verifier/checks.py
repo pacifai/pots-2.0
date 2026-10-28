@@ -54,8 +54,9 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
@@ -657,11 +658,19 @@ def check_5_matmuls(store: TranscriptStore, c: DeclaredComputation, ctx: StepCon
         schedule = replay.unit_schedule()
         if schedule is None:
             return _check_5_canonical(c, ctx, bands, replay, view, root)
-        runs = list(_member_runs(c.products))
-        steps = _schedule_runs(runs, schedule)  # a RuntimeError (a verifier bug) propagates
+        static = _c5_static(c)  # FS50: what C and the schedule fix, built once per run
+        if static is not None:
+            runs: Sequence[Sequence[ProductSpec]] = static.runs
+            sched: _ScheduleStatic | None = static.for_schedule(schedule)
+            steps: Sequence[Sequence[int]] = sched.steps
+        else:
+            runs = list(_member_runs(c.products))
+            sched = None
+            steps = _schedule_runs(runs, schedule)  # a RuntimeError (a verifier bug) propagates
         failed: tuple[str, int | None] | None = None
         try:
-            return _check_5_units(c, ctx, bands, replay, view, root, runs, steps)
+            return _check_5_units(c, ctx, bands, replay, view, root, runs, steps,
+                                  static=static, sched=sched)
         except _UnitPassError as e:
             failed = (type(e.__cause__).__name__, e.run)
         # Outside the handler, so no traceback keeps the old replay alive: a fresh replay (the
@@ -685,11 +694,12 @@ def _check_5_canonical(c: DeclaredComputation, ctx: StepContext, bands: Bands,
     first rejection. The path of a replay with no unit schedule (the MLP), and the one
     :func:`check_5_matmuls` reruns when the unit pass raises."""
     scratch = MeasureScratch()
+    static = _c5_static(c)
     window: list[_Rows] = []
     pending = 0
     w = 0  # the window being filled
     group0 = 0  # the first group id of the run: ids run across the step's runs
-    for i, run in enumerate(_member_runs(c.products)):
+    for i, run in enumerate(static.runs if static is not None else _member_runs(c.products)):
         try:
             with ctx.stamp("c5.run", i):
                 rows, error = _measure_served(c, run, ctx, replay, view, h=root, k=ctx.k,
@@ -711,17 +721,17 @@ def _check_5_canonical(c: DeclaredComputation, ctx: StepContext, bands: Bands,
                 raise error
             ctx.state.run_rest_error = error
             return rej
-        group0 += len(_measure_groups(run))
+        group0 += len(static.groups[i]) if static is not None else len(_measure_groups(run))
         window.append(rows)
         pending += len(rows.specs)
         if pending >= _JUDGE_WINDOW:
             with ctx.stamp("c5.judge", -1, -1, w):
-                rej = _judge_window(c, window, ctx, bands)
+                rej = _judge_window(c, window, ctx, bands, None, static, w)
             if rej is not None:
                 return rej
             window, pending, w = [], 0, w + 1
     with ctx.stamp("c5.judge", -1, -1, w):
-        return _judge_window(c, window, ctx, bands)
+        return _judge_window(c, window, ctx, bands, None, static, w)
 
 
 class _UnitPassError(Exception):
@@ -779,6 +789,200 @@ def _schedule_runs(runs: Sequence[Sequence[ProductSpec]],
     return out
 
 
+_STATIC_ON = True
+
+
+@contextmanager
+def check5_static_cache(enabled: bool) -> Iterator[None]:
+    """Turn check 5's per-computation cache (:class:`_Check5Static`, FS50) off or on inside the
+    block, for tests and comparisons: off, every function derives what it needs afresh, as
+    before the cache. On by default."""
+    global _STATIC_ON
+    previous, _STATIC_ON = _STATIC_ON, enabled
+    try:
+        yield
+    finally:
+        _STATIC_ON = previous
+
+
+class _WindowStatic:
+    """What judging one window (:func:`_judge_windows`) takes from the declared computation:
+    the window's specs in canonical order, their ``m``, names, κ classes and ``q`` as lists
+    (``extend_columns``' sequences), ``q``, ``n = a_shape[0]`` and ``biased`` as the arrays
+    ``finish_rows`` takes, each product's class code, and the canonical permutation of the
+    window's rows. The runs' row orders come from the replay's blocks (``order``), which the
+    run's grouping fixes, but the permutation is checked against them every window and rebuilt
+    if one differs, so a surprise costs speed, not bits."""
+
+    def __init__(self, runs: Sequence[Sequence[ProductSpec]], idx: Sequence[int],
+                 classes: Sequence[str], codes: Mapping[str, int]):
+        self.idx = tuple(idx)
+        self.runs = tuple(runs[i] for i in idx)
+        self.specs = [s for run in self.runs for s in run]
+        self.m = [s.m for s in self.specs]
+        self.name = [s.name for s in self.specs]
+        self.cls = list(classes)
+        self.q = [s.q for s in self.specs]
+        self.q_arr = _frozen(np.array(self.q))
+        self.n_arr = _frozen(np.array([s.a_shape[0] for s in self.specs]))
+        self.biased = _frozen(np.array([s.bias is not None for s in self.specs]))
+        self.codes = _frozen(np.array([codes[k] for k in self.cls], dtype=np.intp))
+        self._orders: list[list[int]] | None = None
+        self._perm: np.ndarray | None = None
+
+    def matches(self, batch: Sequence[_Rows]) -> bool:
+        """Whether ``batch`` is exactly this window: its runs, each with rows."""
+        return len(batch) == len(self.runs) and all(
+            r.rows is not None and r.specs is run for r, run in zip(batch, self.runs))
+
+    def perm(self, batch: Sequence[_Rows]) -> np.ndarray:
+        """``_finish_columns``' canonical permutation of the window's rows."""
+        orders = [r.order for r in batch]
+        if self._perm is None or self._orders != orders:
+            parts, base = [], 0
+            for r in batch:
+                parts.append(base + np.argsort(r.order))
+                base += len(r.order)
+            self._perm = _frozen(np.concatenate(parts))
+            self._orders = [list(o) for o in orders]
+        return self._perm
+
+
+def _frozen(a: np.ndarray) -> np.ndarray:
+    a.setflags(write=False)
+    return a
+
+
+class _ScheduleStatic:
+    """What check 5's unit pass takes from the declared computation and one unit schedule:
+    the schedule, :func:`_schedule_runs`' ``steps`` (tuples), and per step the prefetch's
+    ``(ms, widths)`` as tuples (``None`` for a step past the last)."""
+
+    def __init__(self, runs: Sequence[Sequence[ProductSpec]],
+                 schedule: Sequence[Sequence[int]]):
+        self.schedule = schedule
+        self.steps = tuple(tuple(s) for s in _schedule_runs(runs, schedule))
+        self.prefetch: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+        for step in self.steps:
+            specs = [spec for i in step for spec in runs[i]]
+            self.prefetch.append((tuple(s.m for s in specs), tuple(s.width for s in specs)))
+
+
+class _Check5Static:
+    """Check 5's per-computation cache (FS50, ``HOST_SIDE_PLAN_DRAFT.md`` §2.1): everything its
+    per-step functions derive from the declared computation ``C`` and the replay's unit
+    schedule alone, built once and read every step.
+
+    - from ``C``: ``runs`` (:func:`_member_runs`, as tuples), each run's groups
+      (:func:`_measure_groups`) and ``group0`` (a run's first group id), the judging windows
+      (:func:`_judge_windows`) and a :class:`_WindowStatic` for each;
+    - from the schedule (:meth:`for_schedule`): :class:`_ScheduleStatic`, rebuilt when the
+      schedule differs from the one it was built for;
+    - κ's per-class ceiling array (:meth:`kappa_ceiling`), kept for one bands' values.
+
+    It holds no prover data, no leaf, no operand and no ``h``: a function of ``C`` and the
+    schedule only, like :func:`_measure_groups`. It keeps ``products`` alive and checks it is
+    ``C``'s every time (identity, then equality), and rebuilds when :data:`_JUDGE_WINDOW` or
+    :data:`_GROUP_BYTES` (the window and group sizes, which tests change) differ from the
+    build's. :func:`check5_static_cache` bypasses it.
+    """
+
+    def __init__(self, c: DeclaredComputation):
+        self.products = c.products
+        self.knobs = (_JUDGE_WINDOW, _GROUP_BYTES)  # the two constants the structure follows
+        self.runs = tuple(tuple(r) for r in _member_runs(self.products))
+        self.groups = tuple(tuple(tuple(g) for g in _measure_groups(run)) for run in self.runs)
+        group0, g = [], 0
+        for groups in self.groups:
+            group0.append(g)
+            g += len(groups)
+        self.group0 = tuple(group0)
+        self.windows = tuple(tuple(w) for w in _judge_windows(self.runs))
+        table = product_classes(c)  # the specs are the inventory's own, so [m-1] is their class
+        codes: dict[str, int] = {}
+        built = []
+        for idx in self.windows:
+            specs = [s for i in idx for s in self.runs[i]]
+            classes = ([table[s.m - 1] for s in specs] if table is not None
+                       else [product_class(c, s) for s in specs])
+            for k in classes:
+                codes.setdefault(k, len(codes))
+            built.append((idx, classes))
+        self.classes = tuple(codes)
+        self.judge = [_WindowStatic(self.runs, idx, classes, codes) for idx, classes in built]
+        self.schedule: _ScheduleStatic | None = None
+        self.schedule_builds = 0  # how often for_schedule rebuilt (a test's and a report's)
+        self._kappa: tuple[float, dict[str, float], np.ndarray] | None = None
+
+    def holds(self, products: Sequence[ProductSpec]) -> bool:
+        if self.knobs != (_JUDGE_WINDOW, _GROUP_BYTES):
+            return False
+        if self.products is products:
+            return True
+        if self.products == products:
+            self.products = products
+            return True
+        return False
+
+    def for_schedule(self, schedule: Sequence[Sequence[int]]) -> _ScheduleStatic:
+        """The schedule's part: the cached one when ``schedule`` is the object it was built
+        for or equals it, else rebuilt (a verifier bug in the schedule raises
+        ``RuntimeError`` and caches nothing)."""
+        held = self.schedule
+        if held is not None and (held.schedule is schedule or held.schedule == schedule):
+            held.schedule = schedule
+            return held
+        self.schedule = _ScheduleStatic(self.runs, schedule)
+        self.schedule_builds += 1
+        return self.schedule
+
+    def window(self, w: int, batch: Sequence[_Rows]) -> _WindowStatic | None:
+        """Window ``w``'s judging inputs when ``batch`` is exactly that window, else ``None``
+        (a window cut short by an error is judged from its specs)."""
+        win = self.judge[w] if w < len(self.judge) else None
+        return win if win is not None and win.matches(batch) else None
+
+    def kappa_ceiling(self, bands: Bands) -> np.ndarray:
+        """``bands.kappa_for`` of every class in :attr:`classes`, float64: built once for the
+        bands' values (compared every call, so an edited bands object rebuilds it)."""
+        held = self._kappa
+        if held is None or held[0] != bands.kappa_max or held[1] != bands.kappa_classes:
+            held = (bands.kappa_max, dict(bands.kappa_classes),
+                    _frozen(np.array([bands.kappa_for(k) for k in self.classes],
+                                     dtype=np.float64)))
+            self._kappa = held
+        return held[2]
+
+
+_STATIC: weakref.WeakKeyDictionary[DeclaredComputation, _Check5Static] = \
+    weakref.WeakKeyDictionary()
+_STATIC_ATTR = "_check5_static"
+
+
+def _c5_static(c: DeclaredComputation) -> _Check5Static | None:
+    """``c``'s :class:`_Check5Static`, built on first use; ``None`` while
+    :func:`check5_static_cache` is off. Held weakly by the computation object; one that can't
+    be (unhashable or not weak-referenceable) keeps it in a private attribute, and one that
+    can't do that either gets a fresh build each time."""
+    if not _STATIC_ON:
+        return None
+    try:
+        entry = _STATIC.get(c)
+    except TypeError:
+        entry = getattr(c, _STATIC_ATTR, None)
+    if entry is not None and entry.holds(c.products):
+        return entry
+    entry = _Check5Static(c)
+    try:
+        _STATIC[c] = entry
+    except TypeError:
+        try:
+            setattr(c, _STATIC_ATTR, entry)
+        except AttributeError:
+            pass
+    return entry
+
+
 class _ReadOnce:
     """The rows of the unit pass's runs, read to the host once, when first asked for: one
     drain and one read per device over every run (:func:`_read_rows`). A failing read raises
@@ -802,7 +1006,8 @@ class _ReadOnce:
 
 def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, replay: Replay,
                    view: TranscriptView, root: bytes, runs: Sequence[Sequence[ProductSpec]],
-                   steps: Sequence[Sequence[int]]) -> Rejection | None:
+                   steps: Sequence[Sequence[int]], *, static: _Check5Static | None = None,
+                   sched: _ScheduleStatic | None = None) -> Rejection | None:
     """Check 5 in the replay's unit order (``Replay.unit_schedule``): every run measured in its
     step's turn, every run's rows kept on the device, read once at the first non-empty window,
     and the windows judged in canonical order from the host rows, so the first failing
@@ -816,24 +1021,35 @@ def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, repla
     kernel's work in flight is waited for (:func:`check_5_matmuls` then reruns in canonical
     order). Nothing is recorded in ``ctx.stats`` before the read. On a rejection,
     ``StepState.run_rest`` holds the failing window's tail and ``run_rest_rows`` the host rows
-    of every later window's runs."""
-    group0, g = [], 0
-    for run in runs:
-        group0.append(g)
-        g += len(_measure_groups(run))
+    of every later window's runs.
+
+    ``static`` and ``sched`` (:func:`_c5_static`) hold what the declared computation and the
+    schedule fix: the group ids, the groups, the prefetch's labels and widths, the windows and
+    their judging inputs. Without them each is derived here, as before the cache (FS50)."""
+    groups_of = static.groups if static is not None else None
+    if static is not None:
+        group0 = static.group0
+    else:
+        group0, g = [], 0
+        for run in runs:
+            group0.append(g)
+            g += len(_measure_groups(run))
+    plans = sched.prefetch if sched is not None else None
     scratch = MeasureScratch()
     rows: list[_Rows | None] = [None] * len(runs)
     try:
-        ahead = _prefetch_step(replay, runs, steps, 0, root, ctx.k)
+        ahead = _prefetch_step(replay, runs, steps, 0, root, ctx.k, plans)
         for s, step in enumerate(steps):
             # the next step's challenges are drawn on the worker thread while this one is served
-            prefetched, ahead = ahead, _prefetch_step(replay, runs, steps, s + 1, root, ctx.k)
+            prefetched, ahead = ahead, _prefetch_step(replay, runs, steps, s + 1, root, ctx.k,
+                                                      plans)
             if all(_kernel_run(replay, runs[i]) for i in step):
                 for i, r in zip(step, _measure_step_kernel(c, [runs[i] for i in step], step, ctx,
                                                            replay, view, h=root, k=ctx.k,
                                                            guard=ctx.kappa_guard,
                                                            group0=group0,
-                                                           prefetched=prefetched)):
+                                                           prefetched=prefetched,
+                                                           groups=groups_of)):
                     rows[i] = r
                 continue
             for i in step:
@@ -850,10 +1066,11 @@ def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, repla
                 rows[i] = r
         done: list[_Rows] = rows  # type: ignore[assignment]
         once = _ReadOnce(done)
-        windows = _judge_windows(runs)
+        windows = static.windows if static is not None else _judge_windows(runs)
         for w, idx in enumerate(windows):
             with ctx.stamp("c5.judge", -1, -1, w):
-                rej = _judge_window(c, [done[i] for i in idx], ctx, bands, once)
+                rej = _judge_window(c, [done[i] for i in idx], ctx, bands, once,
+                                    static, w)
             if rej is not None:
                 ctx.state.run_rest_rows = [
                     (done[i]._replace(rows=None), once.host(done[i]))
@@ -869,17 +1086,21 @@ def _check_5_units(c: DeclaredComputation, ctx: StepContext, bands: Bands, repla
 
 
 def _prefetch_step(replay: Replay, runs: Sequence[Sequence[ProductSpec]],
-                   steps: Sequence[Sequence[int]], s: int, h: bytes, k: int) -> Any:
+                   steps: Sequence[Sequence[int]], s: int, h: bytes, k: int,
+                   plans: Sequence[tuple[Sequence[int], Sequence[int]]] | None = None) -> Any:
     """The challenge prefetch (``measure_kernel.prefetch``, FS39) of step ``s``'s products,
     each at its ``P``'s column count, which is the width :func:`measure_kernel.enqueue` draws
     its challenges at; ``None`` for a step past the last, one with a run off the kernel, or
     while overlap is off. A failure to decide (a replay that can't tell its device yet) is
-    ``None``: the step then draws inline, and the serving raises what it raises."""
+    ``None``: the step then draws inline, and the serving raises what it raises. ``plans`` is
+    the schedule's cached ``(ms, widths)`` per step (:class:`_ScheduleStatic`), tuples."""
     if s >= len(steps) or not measure_kernel.overlap_on():
         return None
     try:
         if not all(_kernel_run(replay, runs[i]) for i in steps[s]):
             return None
+        if plans is not None:
+            return measure_kernel.prefetch(h, plans[s][0], k, plans[s][1])
         specs = [spec for i in steps[s] for spec in runs[i]]
         return measure_kernel.prefetch(h, [spec.m for spec in specs], k,
                                        [spec.width for spec in specs])
@@ -890,7 +1111,9 @@ def _prefetch_step(replay: Replay, runs: Sequence[Sequence[ProductSpec]],
 def _measure_step_kernel(c: DeclaredComputation, runs: Sequence[Sequence[ProductSpec]],
                          step: Sequence[int], ctx: StepContext, replay: Replay,
                          view: TranscriptView, *, h: bytes, k: int, guard: bool,
-                         group0: Sequence[int], prefetched: Any = None) -> list[_Rows]:
+                         group0: Sequence[int], prefetched: Any = None,
+                         groups: Sequence[Sequence[Sequence[int]]] | None = None
+                         ) -> list[_Rows]:
     """One schedule step on the kernel path (FS38b): every run of ``runs`` (the step's runs, at
     canonical indices ``step``, ``group0`` indexed by those) served as FS37's views, in order
     (a run of one by :func:`_served_view`, a member run group by group by
@@ -905,41 +1128,43 @@ def _measure_step_kernel(c: DeclaredComputation, runs: Sequence[Sequence[Product
     ``5.measure``, whose row on the kernel path is host time), so step ``s - 1`` measures on the
     device's measure stream while step ``s`` is served; a held input that moved raises
     ``ReplayError`` there, a measuring error. ``prefetched`` is the step's challenge prefetch,
-    shared by every device's call."""
+    shared by every device's call. ``groups`` is each canonical run's :func:`_measure_groups`,
+    indexed like ``group0`` (the cache's); ``None`` computes them."""
     served: list[tuple[list[MeasureGroup], list[int]]] = []
     for i, specs in zip(step, runs):
-        groups: list[MeasureGroup] = []
+        made: list[MeasureGroup] = []
         order: list[int] = []
         try:
             with ctx.stamp("c5.run", i):
                 if len(specs) == 1:
-                    groups.append(_served_view(c, specs[0], ctx, replay, view, run=i,
-                                               group=group0[i], st=ctx.stamper()))
+                    made.append(_served_view(c, specs[0], ctx, replay, view, run=i,
+                                             group=group0[i], st=ctx.stamper()))
                     order.append(0)
                 else:
-                    for g, idx in enumerate(_measure_groups(specs)):
+                    for g, idx in enumerate(groups[i] if groups is not None
+                                            else _measure_groups(specs)):
                         o, gs = _served_blocks(c, specs, idx, ctx, replay, view, run=i,
                                                group=group0[i] + g, st=ctx.stamper())
-                        groups.extend(gs)
+                        made.extend(gs)
                         order.extend(o)
             # The row split below hands each run its rows per device in device order, which is
             # serving order only for a run on one device; a run on two takes the canonical rerun.
-            where = {mg.a.device for mg in groups}
+            where = {mg.a.device for mg in made}
             if len(where) > 1:
                 raise RuntimeError(f"run {i} is served on several devices: "
                                    f"{sorted(map(str, where))}")
         except Exception as e:
             raise _UnitPassError(i) from e
-        served.append((groups, order))
+        served.append((made, order))
     devices: list[torch.device] = []
-    for groups, _ in served:
-        for mg in groups:
+    for made, _ in served:
+        for mg in made:
             if mg.a.device not in devices:
                 devices.append(mg.a.device)
     tables: dict[torch.device, torch.Tensor] = {}
     try:
         for dev in devices:
-            table = [mg for groups, _ in served for mg in groups if mg.a.device == dev]
+            table = [mg for made, _ in served for mg in made if mg.a.device == dev]
             with ctx.timed("5.measure", host=True), ctx.stamp("c5.measure", step[0], -1):
                 freivalds.drain(dev)
                 tables[dev] = freivalds.measure_groups_rows(table, h=h, k=k, guard=guard,
@@ -949,10 +1174,10 @@ def _measure_step_kernel(c: DeclaredComputation, runs: Sequence[Sequence[Product
         raise _UnitPassError(step[0]) from e
     taken = {dev: 0 for dev in devices}  # rows of each device's table already given to a run
     out: list[_Rows] = []
-    for specs, (groups, order) in zip(runs, served):
+    for specs, (made, order) in zip(runs, served):
         parts = []
         for dev in devices:
-            n = sum(mg.a.shape[0] for mg in groups if mg.a.device == dev)
+            n = sum(mg.a.shape[0] for mg in made if mg.a.device == dev)
             if n:
                 parts.append(tables[dev][taken[dev]:taken[dev] + n])
                 taken[dev] += n
@@ -1435,14 +1660,27 @@ def _finish(batch: Sequence[_Rows], ctx: StepContext) -> list[tuple[ProductSpec,
     return out
 
 
-def _finish_columns(batch: Sequence[_Rows], ctx: StepContext, once: _ReadOnce | None = None
+def _finish_columns(batch: Sequence[_Rows], ctx: StepContext, once: _ReadOnce | None = None,
+                    window: _WindowStatic | None = None
                     ) -> tuple[list[ProductSpec], MeasureColumns | None]:
     """:func:`_finish`'s products, as their specs and a :class:`MeasureColumns` in canonical
     order, finished in one vectorized step (``freivalds.finish_rows``). The unit pass hands
-    its rows' one read in as ``once``; the first window asking for it makes the read."""
+    its rows' one read in as ``once``; the first window asking for it makes the read.
+    ``window`` (:meth:`_Check5Static.window`, FS50) is the batch's cached judging inputs: its
+    specs, ``q``, ``n``, ``biased`` and canonical permutation, the same values built from
+    ``batch``; the returned specs list is the cache's, never to be changed."""
     present = [r for r in batch if r.rows is not None]
     if not present:
         return [], None
+    if window is not None:
+        with ctx.timed("5.measure", host=_from_kernel(present)):
+            read = ([once.host(r) for r in present] if once is not None
+                    else _read_rows([r.rows for r in present]))  # type: ignore[misc]
+            host = read[0] if len(read) == 1 else np.concatenate(read)
+            cols = finish_rows(host[window.perm(present)], q=window.q_arr, n=window.n_arr,
+                               eps_in=ctx.eps_in, eps_acc=ctx.eps_acc, guard=ctx.kappa_guard,
+                               biased=window.biased)
+        return window.specs, cols
     with ctx.timed("5.measure", host=_from_kernel(present)):
         read = ([once.host(r) for r in present] if once is not None
                 else _read_rows([r.rows for r in present]))  # type: ignore[misc]
@@ -1461,10 +1699,11 @@ def _finish_columns(batch: Sequence[_Rows], ctx: StepContext, once: _ReadOnce | 
 
 
 def _first_failing(specs: Sequence[ProductSpec], classes: Sequence[str], cols: MeasureColumns,
-                   ctx: StepContext, bands: Bands) -> int:
+                   ctx: StepContext, bands: Bands, ceiling: np.ndarray | None = None) -> int:
     """The index of the first product :func:`_judge_product` would reject, ``len(specs)`` if
     none: the same three tests as masks (finiteness, test 1, test 2), a product failing if any
-    does."""
+    does. ``ceiling`` is each product's ``κ_max`` (float64 ``[len(specs)]``) when the cache
+    has it (:meth:`_Check5Static.kappa_ceiling`); ``None`` builds it from ``classes``."""
     finite = (np.isfinite(cols.p_norm) & np.isfinite(cols.u) & np.isfinite(cols.unit)
               & np.isfinite(cols.residuals).all(axis=1))
     if ctx.kappa_guard:
@@ -1472,15 +1711,18 @@ def _first_failing(specs: Sequence[ProductSpec], classes: Sequence[str], cols: M
     bad = ~finite
     if ctx.judge:
         if ctx.kappa_guard:
-            kappa_max = {key: bands.kappa_for(key) for key in set(classes)}
-            ceiling = np.array([kappa_max[key] for key in classes]) * cols.p_abs1
-            bad |= ~(cols.nu <= ceiling)
+            if ceiling is None:
+                kappa_max = {key: bands.kappa_for(key) for key in set(classes)}
+                ceiling = np.array([kappa_max[key] for key in classes])
+            bad |= ~(cols.nu <= ceiling * cols.p_abs1)
         bad |= ~(cols.residuals <= bands.tau * cols.unit[:, None]).all(axis=1)
     return int(np.argmax(bad)) if bad.any() else len(specs)
 
 
 def _judge_window(c: DeclaredComputation, batch: Sequence[_Rows], ctx: StepContext,
-                  bands: Bands, once: _ReadOnce | None = None) -> Rejection | None:
+                  bands: Bands, once: _ReadOnce | None = None,
+                  static: _Check5Static | None = None, w: int | None = None
+                  ) -> Rejection | None:
     """Read the batch's numbers, then record and judge its products in canonical order. At a
     rejection the products after the failing one go to ``StepState.run_rest``, measured and
     never judged, for the record pass.
@@ -1488,19 +1730,32 @@ def _judge_window(c: DeclaredComputation, batch: Sequence[_Rows], ctx: StepConte
     The products before the first failing one are recorded in bulk, judged by masks. From the
     failing one on, :func:`_judge_product` runs product by product, so the rejection, and
     ``run_rest``, are the one-at-a-time path's.
+
+    ``static`` and ``w`` (the window's index) take the window's judging inputs from the cache
+    (FS50) when ``batch`` is exactly that window; a batch cut short by an error, or no cache,
+    derives them from the specs as before.
     """
-    specs, cols = _finish_columns(batch, ctx, once)
+    win = static.window(w, batch) if static is not None and w is not None else None
+    specs, cols = _finish_columns(batch, ctx, once, win)
     if cols is None:
         return None
-    table = product_classes(c)  # the specs are the inventory's own, so [m-1] is their class
-    classes = ([table[spec.m - 1] for spec in specs] if table is not None
-               else [product_class(c, spec) for spec in specs])
-    first = _first_failing(specs, classes, cols, ctx, bands)
+    if win is not None:
+        assert static is not None
+        classes = win.cls
+        ceiling = (static.kappa_ceiling(bands)[win.codes]
+                   if ctx.judge and ctx.kappa_guard else None)
+        first = _first_failing(specs, classes, cols, ctx, bands, ceiling)
+        m, name, q = win.m, win.name, win.q
+    else:
+        table = product_classes(c)  # the specs are the inventory's own, so [m-1] is their class
+        classes = ([table[spec.m - 1] for spec in specs] if table is not None
+                   else [product_class(c, spec) for spec in specs])
+        first = _first_failing(specs, classes, cols, ctx, bands)
+        m, name, q = ([s.m for s in specs], [s.name for s in specs], [s.q for s in specs])
     ctx.stats.products.extend_columns(
-        m=[s.m for s in specs[:first]], name=[s.name for s in specs[:first]],
-        cls=classes[:first], kappa=cols.kappa[:first], normalized=cols.normalized[:first],
-        q=[s.q for s in specs[:first]], p_norm=cols.p_norm[:first], nu=cols.nu[:first],
-        p_abs1=cols.p_abs1[:first], u=cols.u[:first])
+        m=m[:first], name=name[:first], cls=classes[:first], kappa=cols.kappa[:first],
+        normalized=cols.normalized[:first], q=q[:first], p_norm=cols.p_norm[:first],
+        nu=cols.nu[:first], p_abs1=cols.p_abs1[:first], u=cols.u[:first])
     for i in range(first, len(specs)):
         rej = _judge_product(c, specs[i], cols.measure(i), ctx, bands)
         if rej is not None:
