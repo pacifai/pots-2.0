@@ -92,9 +92,10 @@ def test_consumer_leaves_hash_to_the_producers_digests(remote):
 
     idx = list(_default_schedule(c, D, SEED)(1))
     assert [store.dataset_path(j) for j in range(c.n_s)] == [dtree.path(i) for i in idx]
-    # a tiny step shares storages: fewer distinct storages than tensor leaves
+    # storages are never more than tensor leaves (O18: a batched product is one leaf, so the
+    # per-member views that used to share storages are gone and a tiny step may share none)
     n_tensors = sum(isinstance(x, torch.Tensor) for x in leaves)
-    assert 0 < pkg.n_storages < n_tensors
+    assert 0 < pkg.n_storages <= n_tensors
     store.close()
     assert r.ask("release", 1) == "ok"
 
