@@ -2918,7 +2918,8 @@ def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any
     """The base arms' (``seq_<k>_base``, ``pipe_<k>_base``) acceptance items and numbers, filled
     into ``row["base"]`` and ``row["ab"]`` (O18, FS49s). Judged like the O18 arms: every step
     accepted in the loop's mode, the four GPUs named, the profile inputs there; the two base arms'
-    step roots equal to each other. A base root is not compared with the O18 arms' or the
+    step roots equal to each other, and each base root different from the O18 arm's at the same
+    step (equal roots mean the base arm ran the O18 code). A base root is not compared with the
     card's (the leaf layout differs). ``ab[<arm>]``: the O18 arm's steady step interval, the base
     arm's, their difference (O18 minus base: negative when O18 is faster) and ratio (O18 over
     base)."""

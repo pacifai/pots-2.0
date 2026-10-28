@@ -3447,8 +3447,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     directories `four_<key>_seq_base`/`four_<key>_pipe_base`, `cwd` the upload's `repo_base/`,
     `info` `base: True`, `arm`, `base_commit`; without `repo_base/` the plan logs that the A/B arm
     is skipped. `four_h100_profile` judges them in `_profile_base` like the O18 arms and
-    requires their two arms' roots equal to each other only (not to the O18 arms' or the
-    card's); per model `base` (the arms' numbers) and `ab` per loop (the O18 and base steady
+    requires their two arms' roots equal to each other and each different from the O18 arm's at
+    the same step (equal roots mean the base arm ran the O18 code), not compared with the
+    card's; per model `base` (the arms' numbers) and `ab` per loop (the O18 and base steady
     intervals, `diff_s` O18 minus base, `ratio` O18 over base), top-level `ab_skipped` when the
     plan has none; `pass` fails closed on them only when planned; the log has `FS49 A/B <k>
     <loop>: O18 X s, base Y s (Î” Z s, ratio R)` lines.

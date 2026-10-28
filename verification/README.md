@@ -1491,7 +1491,8 @@ accumulated GPU time ratio, the one EQ14 puts beside PoTS's verify over train) a
 `FS42 <model> <arm>: step X s (interval between verified steps), verifier Y s per step, plain training Z s per step; verifier ÷ training A (wall time), B (accumulated GPU time); step ÷ training C`.
 With the A/B arm, the base arms are judged like the O18 arms (every step accepted in the loop's
 mode, the profile's inputs, the samples, the peaks) and their two arms' step roots must be equal
-to each other; a base root is not compared with the O18 arms' or the card's, since the leaf
+to each other and each base root must differ from the O18 arm's at the same step (equal roots
+mean the base arm ran the O18 code); a base root is not compared with the card's, since the leaf
 layout differs. `pass` fails closed on them only when they are in the plan. Each model's `base`
 holds the same numbers as its O18 arms, and `ab` per loop the O18 and the base steady step
 interval, their difference (O18 minus base) and ratio (O18 over base); the log gets one
