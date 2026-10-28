@@ -1116,11 +1116,13 @@ interface.
       EOS target is always masked in), so only a faulted batch can reach it.
   - `label` fills every product leaf once and returns the `K` leaves in leaf order (O18): a lone
     product's `P`, or a group's `[n, *p_shape]` tensor, which is the bmm's whole output (a bmm
-    run) or, per-member fallback, the stacked members. It maps records by operand storage. The forward `S` and `O` have no storage link to a
+    run) or, per-member fallback, the stacked members. It maps records by operand storage. The
+    forward `S` and `O` have no storage link to a
     weight, so they're taken as the two bmms between a layer's `Y_v` and `Y_o`, `S` first.
     `O`'s `A` must be row-stochastic, `O`'s `B` must equal the layer's `Y_v` output head by
     head, and `S`'s `B` must be equal across the query heads that share a kv head. The `δK̃`
-    leaf is the batched contiguous transpose of the captured `Q̃ᵀ·δS` output. Any unmatched, duplicate or
+    leaf is the batched contiguous transpose of the captured `Q̃ᵀ·δS` output. Any unmatched,
+    duplicate or
     missing record raises `LabelingError`. A biased `Y_x` must be an `addmm` adding the
     declared `b_x` once (`α = β = 1`), and its leaf is the op's output, bias included (F14);
     a bias on any other record, or a missing or wrong one, raises `LabelingError`.
@@ -1438,10 +1440,12 @@ interface.
     dtype and shape, sits on its weight's device (`placement.weight_device`: `HOST` unsharded, FS9; its GPU
     sharded, FS32d), and shares no storage with the
     model's parameters (which the step updates in place). Any other input is copied, with
-    the same leaf bytes, to that device. The labeled product leaves go to `placement.product_leaf_device(g)`
+    the same leaf bytes, to that device. The labeled product leaves go to
+    `placement.product_leaf_device(g)`
     (a no-op when the hint was right), and `W_{t+1}` is `snapshot_weights`, on each
-    weight's device. The `perturb` hook acts on the owner-resident product; on a member of a batched product it
-    writes into a copy of the member's leaf, once per group per step. The caller must not write to `w_t` until the store is dropped; the
+    weight's device. The `perturb` hook acts on the owner-resident product; on a member of a
+    batched product it writes into a copy of the member's leaf, once per group per step. The
+    caller must not write to `w_t` until the store is dropped; the
     `_version` guard catches a write (invariant 6). In the loop, `w_t` is `W_0`, the previous
     step's `W_{t+1}` copy, or a fault's entry weights, and a test checks none of them is
     written during a run.
