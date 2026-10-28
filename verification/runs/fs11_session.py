@@ -3120,14 +3120,18 @@ def fix2_ab(parts: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
 
 
 def _leaf_label(layout: Mapping[str, Any], index: int) -> tuple[str, str]:
-    """The section and name of leaf ``index`` under a card report's ``layout``."""
-    n_s, n_w, m = layout["n_s"], layout["n_w"], layout["M"]
+    """The section and name of leaf ``index`` under a card report's ``layout``: product leaves
+    by ``K`` and ``product_leaf_names`` (O18); an old report's ``M`` and ``product_names`` still
+    read."""
+    n_s, n_w = layout["n_s"], layout["n_w"]
+    m = layout["K"] if "K" in layout else layout["M"]
+    names = layout["product_leaf_names"] if "K" in layout else layout["product_names"]
     if index < n_s:
         return "record", f"record {index}"
     if index < n_s + n_w:
         return "w_t", layout["weight_names"][index - n_s]
     if index < n_s + n_w + m:
-        return "product", layout["product_names"][index - n_s - n_w]
+        return "product", names[index - n_s - n_w]
     return "w_next", layout["weight_names"][index - n_s - n_w - m]
 
 
