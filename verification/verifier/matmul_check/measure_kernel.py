@@ -43,6 +43,7 @@ import ctypes
 import functools
 import hashlib
 from collections.abc import Iterator, Sequence
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -624,6 +625,267 @@ def level_launches(prods_addr: int, works_addr: int, rows_addr: int, reads_addr:
     return out
 
 
+# ---- the table's structure, built once per run (FS51, HOST_SIDE_PLAN_DRAFT §2.2) ----
+
+TABLE_CACHE_MAX = 64
+"""Cached structures at most (the least recently used goes first). One per schedule step and
+device: Llama's 24 steps a device are well under it."""
+
+_cache_on = True
+_cache: "OrderedDict[tuple, list[TableStructure]]" = OrderedDict()
+_cache_n = 0
+_stats = {"hits": 0, "misses": 0, "plan_rebuilds": 0}
+
+
+@contextmanager
+def table_cache(enabled: bool = True) -> Iterator[None]:
+    """Inside, the structure cache of :func:`table_structure` is on (``True``) or off (``False``:
+    every call builds its table from scratch and stores nothing), for the comparison tests.
+    Nests; outside any ``table_cache`` it is on. The rows are the same bits either way."""
+    global _cache_on
+    before, _cache_on = _cache_on, bool(enabled)
+    try:
+        yield
+    finally:
+        _cache_on = before
+
+
+def table_cache_on() -> bool:
+    return _cache_on
+
+
+def table_cache_stats(reset: bool = False) -> dict[str, int]:
+    """``{"hits", "misses", "plan_rebuilds"}`` since the last reset: calls that found their
+    structure, calls that built one, and hits whose cached read plan no longer held (a shared
+    view moved) and was rebuilt. Counted only while the cache is on."""
+    out = dict(_stats)
+    if reset:
+        for key in _stats:
+            _stats[key] = 0
+    return out
+
+
+def table_cache_clear() -> None:
+    """Forget every cached structure (the counters stay)."""
+    global _cache_n
+    _cache.clear()
+    _cache_n = 0
+
+
+@dataclass
+class _Built:
+    """What a table has that its call's addresses do not change: one build of the pieces below
+    from a first call's products."""
+
+    plan: ReadPlan
+    starts: np.ndarray
+    scratch_n: int
+    works: np.ndarray       # WORK_DTYPE, scratch offsets relative to a base of 0
+    at_works: int
+    end_works: int
+    at_reads: int
+    at_entries: int
+    at_blocks: int
+    total: int
+    tail: np.ndarray        # uint8, the table's bytes from ``at_reads`` on (reads, entries, blocks)
+    launches: list[tuple[int, int, int, int, int]]
+    # (reads byte offset, blocks byte offset, groups, blocks, grid) per level
+    shared_nodes: np.ndarray  # int64: the nodes 3t + p of every read group with 2+ entries
+    shared_first: np.ndarray  # int64: the first node of each such node's group
+
+
+@dataclass
+class TableStructure:
+    """One cache entry: the key (each group's ``ms``, view shapes, strides and dtypes), the
+    flat ``ms`` and widths in table order (tuples, so the challenge source can key on them), and
+    the :class:`_Built` pieces, filled by the first :func:`build_host_table`."""
+
+    key: tuple
+    counts: np.ndarray
+    ms: tuple[int, ...]
+    widths: tuple[int, ...]
+    built: _Built | None = None
+
+
+def _view_key(t: torch.Tensor) -> tuple:
+    return (tuple(t.shape), t.stride(), t.dtype)
+
+
+def _group_key(grp: "MeasureGroup") -> tuple:
+    return (tuple(grp.ms), _view_key(grp.a), _view_key(grp.b), _view_key(grp.p),
+            None if grp.bias is None else _view_key(grp.bias))
+
+
+def table_structure(groups: Sequence["MeasureGroup"], k: int, guard: bool = True,
+                    share: bool = False, *,
+                    _validated: tuple[torch.device, np.ndarray] | None = None) -> TableStructure:
+    """The cache entry of this call's structure: found (a hit) when an earlier call had the same
+    device, ``k``, ``guard``, ``share``, row-block size and, group by group, the same ``ms``
+    (compared as tuples) and a/b/p/bias shapes, strides and dtypes; else a new entry (a miss),
+    stored while the cache is on. :func:`validate` runs on every call, so an invalid call fails
+    as before and nothing invalid is cached."""
+    global _cache_n
+    device, counts = _validated if _validated is not None else validate(groups, k)
+    keys = tuple(_group_key(g) for g in groups) if _cache_on else ()
+    if _cache_on:
+        bucket = (device, k, guard, share, ROWS_PER_BLOCK, len(groups), int(keys[0][0][0]),
+                  int(keys[-1][0][-1]))
+        for e in _cache.get(bucket, ()):
+            if e.key == keys:
+                _stats["hits"] += 1
+                _cache.move_to_end(bucket)
+                return e
+        _stats["misses"] += 1
+    ms = tuple(int(m) for grp in groups for m in grp.ms)
+    widths = tuple(np.repeat([grp.b.shape[2] for grp in groups], counts).tolist())
+    entry = TableStructure(keys, counts, ms, widths)
+    if _cache_on:
+        _cache.setdefault(bucket, []).append(entry)
+        _cache.move_to_end(bucket)
+        _cache_n += 1
+        while _cache_n > TABLE_CACHE_MAX and len(_cache) > 1:
+            _, old = _cache.popitem(last=False)
+            _cache_n -= len(old)
+    return entry
+
+
+def _shared_nodes(plan: ReadPlan) -> tuple[np.ndarray, np.ndarray]:
+    """The nodes of every read group with two or more entries and, per node, its group's first
+    node (the validity check of :func:`_plan_holds`)."""
+    n_ent = plan.reads["n_entries"].astype(np.int64)
+    sel = np.flatnonzero(n_ent >= 2)
+    if len(sel) == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    cnt = n_ent[sel]
+    e0 = plan.reads["entry0"].astype(np.int64)[sel]
+    before = np.cumsum(cnt) - cnt
+    at = np.repeat(e0, cnt) + np.arange(int(cnt.sum()), dtype=np.int64) - np.repeat(before, cnt)
+    nodes = (plan.entries["prod"].astype(np.int64)[at] * 3 + plan.entries["phase"][at])
+    return nodes, np.repeat(nodes[before], cnt)
+
+
+def _build(prods: np.ndarray, share: bool) -> _Built:
+    """The call-independent pieces for products ``prods``, as :func:`enqueue` laid them out
+    before the cache: the plan, ``block_starts``, the buffer layout, the work array with scratch
+    offsets from 0, and the plan's reads, entries and blocks as one byte tail."""
+    n = len(prods)
+    at_works = -(-prods.nbytes // 16) * 16
+    end_works = at_works + WORK_DTYPE.itemsize * (n + 1)
+    plan = read_plan(prods) if share else plain_plan(prods)
+    at_reads = -(-end_works // 16) * 16
+    at_entries = -(-(at_reads + plan.reads.nbytes) // 16) * 16
+    at_blocks = -(-(at_entries + plan.entries.nbytes) // 16) * 16
+    starts = block_starts(plan)
+    blocks = block_table(plan)
+    total = at_blocks + blocks.nbytes
+    tail = np.zeros(total - at_reads, dtype=np.uint8)
+    tail[:plan.reads.nbytes] = plan.reads.view(np.uint8).reshape(-1)
+    tail[at_entries - at_reads:at_entries - at_reads + plan.entries.nbytes] = \
+        plan.entries.view(np.uint8).reshape(-1)
+    tail[at_blocks - at_reads:] = blocks.view(np.uint8).reshape(-1)
+    launches = []
+    off = plan.level_off.astype(np.int64)
+    done = 0
+    for lv in range(plan.n_levels):
+        lo, hi = int(off[lv]), int(off[lv + 1])
+        n_blocks = int(starts[hi - 1])
+        launches.append((lo * READ_DTYPE.itemsize, done * BLK_DTYPE.itemsize, hi - lo - 1,
+                         n_blocks, min(n_blocks, MAX_BLOCKS)))
+        done += n_blocks
+    nodes, first = _shared_nodes(plan)
+    return _Built(plan, starts, scratch_bytes(prods), works_array(prods, 0), at_works, end_works,
+                  at_reads, at_entries, at_blocks, total, tail, launches, nodes, first)
+
+
+def _plan_holds(built: _Built, prods: np.ndarray) -> bool:
+    """Whether every node of a shared read group of the cached plan still reads the same stored
+    view as its group's first node, by the keys of :func:`_plan` (address, rows, columns, both
+    strides, dtype) taken from ``prods``: one gather and compare per field, no sort. Nodes the
+    plan keeps apart that now share a view are not looked for: a missed share costs speed, never
+    bits (FS38b)."""
+    nodes = built.shared_nodes
+    if len(nodes) == 0:
+        return True
+    first = built.shared_first
+    for f in ("addr", "rows", "cols", "row_stride", "col_stride", "dtype"):
+        flat = np.stack((prods["b"][f], prods["a"][f], prods["p"][f]), 1).reshape(-1)
+        if not np.array_equal(flat[nodes], flat[first]):
+            return False
+    return True
+
+
+@dataclass
+class HostTable:
+    """One call's table on the host: its products (this call's addresses), the structure's
+    :class:`_Built` pieces, and what :func:`enqueue` does with them."""
+
+    prods: np.ndarray
+    built: _Built
+
+    @property
+    def plan(self) -> ReadPlan:
+        return self.built.plan
+
+    @property
+    def total(self) -> int:
+        return self.built.total
+
+    @property
+    def scratch_n(self) -> int:
+        return self.built.scratch_n
+
+    def works(self, scratch_base: int) -> np.ndarray:
+        """:func:`works_array` for scratch from ``scratch_base``: the cached offsets plus it."""
+        works = self.built.works.copy()
+        n = len(self.prods)
+        works["scratch"][:n] += np.uint64(scratch_base)
+        return works
+
+    def fill(self, hb: np.ndarray, scratch_base: int) -> np.ndarray:
+        """Write the table's bytes into ``hb`` (uint8, ``total`` long, zeroed); returns the work
+        array."""
+        b = self.built
+        works = self.works(scratch_base)
+        hb[:self.prods.nbytes] = self.prods.view(np.uint8).reshape(-1)
+        hb[b.at_works:b.end_works] = works.view(np.uint8).reshape(-1)
+        hb[b.at_reads:b.total] = b.tail
+        return works
+
+    def to_bytes(self, scratch_base: int) -> np.ndarray:
+        out = np.zeros(self.total, dtype=np.uint8)
+        self.fill(out, scratch_base)
+        return out
+
+    def launches(self, table_addr: int, rows_addr: int, k: int) -> list[tuple[LevelArgs, int]]:
+        """What :func:`level_launches` returns for this table copied to ``table_addr``."""
+        b = self.built
+        reads, blocks = table_addr + b.at_reads, table_addr + b.at_blocks
+        return [(LevelArgs(table_addr, table_addr + b.at_works, rows_addr, reads + ro,
+                           table_addr + b.at_entries, blocks + bo, ng, nb, k, 0), grid)
+                for ro, bo, ng, nb, grid in b.launches]
+
+
+def build_host_table(groups: Sequence["MeasureGroup"], r_addrs: np.ndarray, k: int,
+                     guard: bool = True, share: bool = False,
+                     structure: TableStructure | None = None) -> HostTable:
+    """The host side of one :func:`enqueue` call, testable on CPU tensors: the products of
+    ``groups`` (:func:`prods_array`, this call's addresses and challenge addresses ``r_addrs``)
+    over the structure of :func:`table_structure`. A structure's first call builds the read
+    plan, ``block_starts``, the block table and the work offsets; later calls reuse them after
+    :func:`_plan_holds` has checked the shared reads; a plan that no longer holds is rebuilt, it
+    replaces the entry's and the rebuild is counted."""
+    if structure is None:
+        structure = table_structure(groups, k, guard, share)
+    prods = prods_array(groups, r_addrs, k, guard)
+    built = structure.built
+    if built is None:
+        built = structure.built = _build(prods, share)
+    elif share and not _plan_holds(built, prods):
+        built = structure.built = _build(prods, share)
+        _stats["plan_rebuilds"] += 1
+    return HostTable(prods, built)
+
+
 # ---- in flight ----
 
 @dataclass
@@ -800,42 +1062,24 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
         side.wait_event(produced)
         stream = side
     source = challenges if challenges is not None else _DEFAULT_SOURCE
-    ms = [int(m) for grp in groups for m in grp.ms]
-    widths = np.repeat([grp.b.shape[2] for grp in groups], counts)
+    structure = table_structure(groups, k, guard, share, _validated=(device, counts))
     extra = {}
     if prefetched is not None and isinstance(source, HostChallengeSource):
         extra["prefetched"] = prefetched
-    buf, offsets, ev = source.draw(h, ms, k, widths.tolist(), stream=stream, **extra)
+    buf, offsets, ev = source.draw(h, structure.ms, k, structure.widths, stream=stream, **extra)
     if ev is not None:
         stream.wait_event(ev)
-    prods = prods_array(groups, np.uint64(buf.data_ptr()) + offsets.astype(np.uint64), k, guard)
+    ht = build_host_table(groups, np.uint64(buf.data_ptr()) + offsets.astype(np.uint64), k,
+                          guard, share, structure)
+    prods, plan = ht.prods, ht.plan
     n = len(prods)
-    scratch_n = scratch_bytes(prods)
-    at_works = -(-prods.nbytes // 16) * 16
-    end_works = at_works + WORK_DTYPE.itemsize * (n + 1)
-    total = end_works
-    plan = read_plan(prods) if share else plain_plan(prods)
-    at_reads = -(-end_works // 16) * 16
-    at_entries = -(-(at_reads + plan.reads.nbytes) // 16) * 16
-    at_blocks = -(-(at_entries + plan.entries.nbytes) // 16) * 16
-    starts = block_starts(plan)
-    blocks = block_table(plan)
-    total = at_blocks + blocks.nbytes
     with torch.cuda.stream(stream):
         rows = torch.empty(n, row_width(k), dtype=torch.float64, device=device)
-        scratch = torch.empty(max(scratch_n, 8), dtype=torch.uint8, device=device)
-        table = torch.empty(total, dtype=torch.uint8, device=device)
-    works = works_array(prods, scratch.data_ptr())
-    host = torch.zeros(total, dtype=torch.uint8, pin_memory=True)
-    hb = host.numpy()
-    hb[:prods.nbytes] = prods.view(np.uint8).reshape(-1)
-    hb[at_works:end_works] = works.view(np.uint8).reshape(-1)
-    hb[at_reads:at_reads + plan.reads.nbytes] = plan.reads.view(np.uint8).reshape(-1)
-    hb[at_entries:at_entries + plan.entries.nbytes] = plan.entries.view(np.uint8).reshape(-1)
-    hb[at_blocks:] = blocks.view(np.uint8).reshape(-1)
-    work = level_launches(table.data_ptr(), table.data_ptr() + at_works, rows.data_ptr(),
-                          table.data_ptr() + at_reads, table.data_ptr() + at_entries,
-                          table.data_ptr() + at_blocks, plan, k, starts)
+        scratch = torch.empty(max(ht.scratch_n, 8), dtype=torch.uint8, device=device)
+        table = torch.empty(ht.total, dtype=torch.uint8, device=device)
+    host = torch.zeros(ht.total, dtype=torch.uint8, pin_memory=True)
+    works = ht.fill(host.numpy(), scratch.data_ptr())
+    work = ht.launches(table.data_ptr(), rows.data_ptr(), k)
     if share and plan_out is not None:
         plan_out.append(plan)
     with torch.cuda.stream(stream):
