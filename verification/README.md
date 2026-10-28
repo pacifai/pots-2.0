@@ -1462,9 +1462,9 @@ upload check verifies `repo_base/` like `repo/`. Then, right after Llama-3.2-1B'
 `pipe_Llama-3.2-1B_base`: the same environment and command as the O18 arms (the sequential one
 traced at step 4 too), each in its own run directory (`runs/four_<key>_seq_base`,
 `runs/four_<key>_pipe_base`), run with the session's own python but with `repo_base/` as the
-working directory and as `PYTHONPATH`, so they import the base code. They add 6 + 4 = 10 min to the estimate. A
-prep without `--base-commit` has no `repo_base/`, the plan has no base arms and says so in the
-job log, and `summary.json` carries `ab_skipped`.
+working directory and as `PYTHONPATH`, so they import the base code. They add 6 + 4 = 10 min to the
+estimate. A prep without `--base-commit` has no `repo_base/`, the plan has no base arms and says so
+in the job log, and `summary.json` carries `ab_skipped`.
 
 **Reading the result.** `summary.json["four_h100_profile"]["pass"]` fails closed. It is true
 only when: every part ended `ok` (or was done earlier); the peer copies landed the right bytes;
