@@ -599,6 +599,31 @@ def test_run_labeling_fails_as_members_do(setup, tamper):
     model.zero_grad(set_to_none=True)
 
 
+
+def test_run_labeling_stacks_a_noncontiguous_batch_output(setup, monkeypatch):
+    """A record whose members are each contiguous but whose batch tensor is not (a slice
+    ``big[::2]``) is not taken whole: the per-member fill labels it, and the leaf is a
+    contiguous stack of the members (O18)."""
+    c, model, records = setup
+    cap = run_capture(c, model, records)
+    rec = _bmm_records(cap, "forward")[0]
+    big = torch.zeros(2 * rec.out.shape[0], *rec.out.shape[1:], dtype=rec.out.dtype)
+    big[::2] = rec.out
+    out = big[::2]
+    assert not out.is_contiguous() and all(o.is_contiguous() for o in out)
+    cap.records[cap.records.index(rec)] = dataclasses.replace(rec, out=out)
+    filled = []
+    orig = _Labeler._fill_run
+    monkeypatch.setattr(_Labeler, "_fill_run",
+                        lambda self, *a: filled.append(orig(self, *a)) or filled[-1])
+    leaves = c.label(cap, model)
+    assert filled.count(False) == 1 and filled.count(True) == 6 * c.L - 1
+    want = _label_by(c, run_capture(c, model, records), model, c.member_runs)
+    g, _ = c.leaf_of(c.member_runs[(1, "S")][0])
+    k = c.product_leaf_index(g)
+    assert leaves[k].is_contiguous() and torch.equal(leaves[k], want[k])
+    model.zero_grad(set_to_none=True)
+
 def test_recorded_layout_contiguity_is_torchs():
     base = torch.zeros(3, 4, 5)
     views = [base, base[0], base[:, 1], base.transpose(1, 2), base[:, :, :1], base[:, :1],
