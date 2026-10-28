@@ -654,7 +654,7 @@ interface.
     contiguity, an unchanged `_version` and the storage offset), and only for the whole output:
     a batched product's bmm output is one leaf (O18), so a member view `out[i]` gets `None`.
     `StepOutput.arrival_digests` (product leaf index to digest; default empty, not part of
-    equality) is filled in `prove_step` through `computation.product_index(m)`; `perturb` drops
+    equality) is filled in `prove_step` through `computation.product_leaf_index(g)`; `perturb` drops
     its entry and `with_w_next` keeps them. `summary()["arrival_hash"]` counts records, leaves,
     bytes and non-finite outputs, present only when something was hashed; `prove_step` adds
     `used`, the digests left in `arrival_digests` after the perturbations, and a diagnostic
@@ -1114,11 +1114,13 @@ interface.
       `VERIF_BATCH` records (`--eval-batch` overrides). A batch with `Σ μ = 0` raises `ValueError`
       in `loss` instead of giving a 0/0 NaN. `build_record` never builds such a record (its
       EOS target is always masked in), so only a faulted batch can reach it.
-  - `label` maps records by operand storage. The forward `S` and `O` have no storage link to a
+  - `label` fills every product leaf once and returns the `K` leaves in leaf order (O18): a lone
+    product's `P`, or a group's `[n, *p_shape]` tensor, which is the bmm's whole output (a bmm
+    run) or, per-member fallback, the stacked members. It maps records by operand storage. The forward `S` and `O` have no storage link to a
     weight, so they're taken as the two bmms between a layer's `Y_v` and `Y_o`, `S` first.
     `O`'s `A` must be row-stochastic, `O`'s `B` must equal the layer's `Y_v` output head by
     head, and `S`'s `B` must be equal across the query heads that share a kv head. The `δK̃`
-    leaf is the contiguous transpose of the captured `Q̃ᵀ·δS`. Any unmatched, duplicate or
+    leaf is the batched contiguous transpose of the captured `Q̃ᵀ·δS` output. Any unmatched, duplicate or
     missing record raises `LabelingError`. A biased `Y_x` must be an `addmm` adding the
     declared `b_x` once (`α = β = 1`), and its leaf is the op's output, bias included (F14);
     a bias on any other record, or a missing or wrong one, raises `LabelingError`.
@@ -1395,8 +1397,9 @@ interface.
       `copy_` makes wait for the copy, so there's no `record_stream`. The source is held until
       the event completes and a moved `_version` raises `MutatedCaptureError`, as for the
       host copy. An output already on its hinted device is kept; a hinted `cpu` takes the host
-      buffer path. After labeling, `count_hint_misses(labeled, placement.product_device)`
-      counts the leaves hinted elsewhere than their owner (`summary()["hint_misses"]`,
+      buffer path. After labeling, `count_hint_misses(labeled, placement.product_leaf_device)`
+      counts the product leaves hinted elsewhere than their owner (`device_of` takes the leaf's
+      position `g`) (`summary()["hint_misses"]`,
       sharded only; a leaf that isn't a record's output, the δK̃ transpose, is judged by the
       device it sits on, and on the CPU not at all), and `prove_step` moves each leaf to its
       owner; a cheat hook's result goes to its product's device first, wherever the hook built
@@ -1435,20 +1438,24 @@ interface.
     dtype and shape, sits on its weight's device (`placement.weight_device`: `HOST` unsharded, FS9; its GPU
     sharded, FS32d), and shares no storage with the
     model's parameters (which the step updates in place). Any other input is copied, with
-    the same leaf bytes, to that device. The labeled products go to `placement.product_device(m)`
+    the same leaf bytes, to that device. The labeled product leaves go to `placement.product_leaf_device(g)`
     (a no-op when the hint was right), and `W_{t+1}` is `snapshot_weights`, on each
-    weight's device. The `perturb` hook acts on the owner-resident product. The caller must not write to `w_t` until the store is dropped; the
+    weight's device. The `perturb` hook acts on the owner-resident product; on a member of a batched product it
+    writes into a copy of the member's leaf, once per group per step. The caller must not write to `w_t` until the store is dropped; the
     `_version` guard catches a write (invariant 6). In the loop, `w_t` is `W_0`, the previous
     step's `W_{t+1}` copy, or a fault's entry weights, and a test checks none of them is
     written during a run.
   - `StepOutput` has the fields `records`, `w_t`, `products`, `w_next`, `loss`,
     `versions`, `capture` and `hint_misses` (the sharded routing's miss count, 0 unsharded;
-    FS32d). `.leaves()` returns them in transcript order, and
+    FS32d). `products` are the `K` product leaves in leaf order (O18), with one version each, and
+    `arrival_digests` is keyed by `product_leaf_index(g)`; `missing` counts leaves by their first
+    product's kind. `.leaves()` returns them in transcript order, and
     `.assert_unmodified()` checks the versions.
   - `commit(c, step) -> MerkleTree` runs `commit_leaves`, then `step.assert_unmodified()`.
   - Faults:
     - `train_records` covers A1 and A2.
-    - `perturb` replaces a committed product only; training stays honest.
+    - `perturb` replaces a committed product only (a member of a batched product is written into
+      a copy of its leaf); training stays honest.
     - A3 is a caller-side splice of `w_next`: `out.with_w_next(w)` (A6) stores contiguous clones
       of `w` on each weight's device, keeps every other leaf, and re-takes the versions, so the splice passes
       `assert_unmodified`.
