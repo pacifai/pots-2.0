@@ -554,14 +554,19 @@ def test_run_labeling_equals_member_labeling(setup, monkeypatch):
     assert not any(filled)
     mixed = _label_by(c, cap, model, {k: v for k, v in c.member_runs.items() if k[1] != "dQ"})
     assert filled.count(True) == 5 * c.L
-    for other in (slow, mixed):
-        other = _per_product(c, other)
-        _same_slots(fast, other)
+    for label, leaves in (("slow", slow), ("mixed", mixed)):
+        _same_slots(fast, _per_product(c, leaves))
+        other = _per_product(c, leaves)
         for p, f, o in zip(c.products, fast, other):
-            # A member-by-member leaf is a stack, a new tensor (O18); a whole-run leaf is the
-            # capture's own output.
-            if other is mixed and c.product_class(p) not in ("dK", "dQ"):
-                assert f.untyped_storage().data_ptr() == o.untyped_storage().data_ptr(), p.name
+            lone = p.member is None
+            role = c.product_class(p)
+            # A lone product and a member of a whole-run leaf (not dK, a fresh transpose) are
+            # the capture's own output; a member filled one by one is a stack (O18).
+            if lone or (label == "mixed" and role not in ("dQ", "dK")):
+                assert (o.untyped_storage().data_ptr(), o.storage_offset(), o.stride()) == \
+                    (f.untyped_storage().data_ptr(), f.storage_offset(), f.stride()), p.name
+            else:
+                assert o.untyped_storage().data_ptr() != f.untyped_storage().data_ptr(), p.name
     model.zero_grad(set_to_none=True)
 
 
