@@ -166,7 +166,7 @@ def resolve_release_cache(release_cache: bool | None, prover_device: str | torch
     from verification.runs.metrics import normalize_devices  # noqa: PLC0415 (import cycle)
     if not any(_on_cuda(d) for d in (prover_device, *(devices or ()))):
         return False, "auto"
-    if devices is None:
+    if not devices:  # None or (): unsharded, as metrics.gpu_roles reads it
         return True, "auto"
     return normalize_devices([prover_device])[0] in normalize_devices(devices), "auto"
 

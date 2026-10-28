@@ -28,6 +28,8 @@ def _no_env(monkeypatch):
 TABLE = [
     ("cuda:0", ONE, True),  # one card, unsharded
     ("cuda", ONE, True),
+    ("cuda:0", (), True),  # an empty list is unsharded too
+    ("cpu", (), False),
     ("cuda:0", PAIR, True),  # the pair layout
     ("cuda", PAIR, True),  # "cuda" is cuda:0 (no CUDA here: index 0)
     ("cuda:0", ("cuda:0",), True),
