@@ -103,7 +103,9 @@ def test_the_honest_step_is_the_same_cold_warm_and_with_both_caches_off(switch, 
         mk.table_cache_clear()
         mk.table_cache_stats(reset=True)
         v1, r1 = _verify(c, D, tree, w0)  # cold: both caches built
+        fast = mk._DEFAULT_SOURCE.fast_draws
         v2, r2 = _verify(c, D, tree, w0)  # warm: both caches hit
+        fast = mk._DEFAULT_SOURCE.fast_draws - fast  # draws that reused a checked request
         s2 = mk.table_cache_stats(reset=True)
         with checks.check5_static_cache(False), mk.table_cache(False):
             v3, r3 = _verify(c, D, tree, w0)  # off: everything built fresh
@@ -111,6 +113,7 @@ def test_the_honest_step_is_the_same_cold_warm_and_with_both_caches_off(switch, 
         a, b, cc = _cols(v1), _cols(v2), _cols(v3)
         assert a == cc and b == cc
         assert s2["hits"] > 0 and s2["plan_rebuilds"] == 0
+        assert fast >= 1  # the challenge layout's fast path (FS55a) fires on the warm step
 
 
 def _alone(c, out):
