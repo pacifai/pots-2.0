@@ -80,7 +80,8 @@ and `TAU_W0` in `verifier/bands.py`.
 Model shapes, from ref block §1: `L=30`, `d=576`, `d_f=1536`, `n_h=9`, `n_kv=3`, `d_h=64`,
 `n_v=49152`, 272 weight tensors, 134,515,008 parameters, tied `W_E`.
 At 4×128 tokens: `M = L·(21 + 6·n_s·n_h) + 3B = 7,113` at `B = 1` (the output layer in one
-block), and there are 7,661 leaves; each further head block adds three products.
+block), and there are 1,361 leaves, 813 of them product leaves (O18); each further head block
+adds three products and three product leaves.
 
 ## Environment variables, with test-scale defaults
 
@@ -207,8 +208,10 @@ Leaf indices are 0-based:
 ```
 [0, n_s)                      batch records, in batch order (encoded exactly as in h_D, P9b)
 [n_s, n_s+n_w)                W_t: W_E; per layer γ_attn, W_q, W_k, W_v, W_o, γ_mlp, W_gate, W_up, W_down; γ_final
-[n_s+n_w, n_s+n_w+M)          products P_1..P_M in canonical order (ref block §6 items 3–4)
-[n_s+n_w+M, n_s+2n_w+M)       W_{t+1}, same order as W_t
+[n_s+n_w, n_s+n_w+K)          product leaves, K = n_product_leaves, in canonical order of the
+                              products P_1..P_M (ref block §6 items 3–4); a batched attention
+                              product's members are one leaf at the position of its first
+[n_s+n_w+K, n_s+2n_w+K)       W_{t+1}, same order as W_t
 ```
 
 Weight tensors are committed as the model holds them. Linear weights are `[o, i]`, as in
@@ -222,11 +225,15 @@ last, after `γ_final`.
 
 With the output layer in `B` row blocks (`VERIF_HEAD_BLOCKS`), the product section holds
 `Λ_0 … Λ_{B−1}` where it held `Λ`, then `δF_0, G_0, δF_1, G_1, …` where it held `δF, G`,
-each of `N/B` rows; `M` grows by `3(B − 1)`. At `B = 1` the order and every leaf are as
+each of `N/B` rows; `M` and `K` grow by `3(B − 1)`. At `B = 1` the order and every leaf are as
 above.
 
-Each product leaf is the product exactly as the spec's `P = A·B` defines it. Each `(s, h)`
-member of a batched attention product is its own leaf, an `n×n` or `n×d_h` matrix. The
+Each lone product leaf is the product exactly as the spec's `P = A·B` defines it. The
+`n_s·n_h` members of each batched attention product (`S`, `O`, `δA`, `δV`, `δQ̃`, `δK̃` of one
+layer) form one leaf `[n_s·n_h, a, b]`, member `s·n_h + h` at `[s·n_h + h]`, at the position of
+its first member (O18); each member is still its own matmul with its own label and challenges.
+Per layer that gives, forward, `Y_q, Y_k, Y_v, [S], [O], Y_o, …`, and backward,
+`…, G_o, [δA], [δV], [δQ̃], [δK̃], δX_q, …`, so `K = 27L + 3B` for a decoder. The
 weight-gradient `G_x` is `[o, i]`, the same shape as `W_x`.
 
 ## Per-step check order (S6c revised at stage 4; F15a, task C7)
@@ -276,7 +283,8 @@ it with the declared expected point (S6b).
 7. **The verifier knows every leaf count; the prover never supplies it.** An RFC 6962 root and
    audit path don't bind the tree size: a leaf can have the same path in trees of different
    sizes, for example leaf 0 at n = 40 and n = 41. So `verify_path` takes `n_leaves` from the
-   declared computation (`n_s + 2n_w + M` for `h`) or from the data manifest (`|D|` for `h_D`),
+   declared computation (`n_s + 2n_w + K` for `h`, `K` the number of product leaves) or from
+   the data manifest (`|D|` for `h_D`),
    never from the transcript.
 
 ## Module map
@@ -544,11 +552,13 @@ interface.
     counting pass. The digests are identical.
   - `verify_path(leaf_hash, index, n_leaves, path, root)`, following RFC 9162 §2.1.3.2. See
     invariant 7.
-  - About 9 GB/s on a 113 MB fp32 tensor, hashed alone. A step's 7,661 leaves (2.6 GB) hash
+  - About 9 GB/s on a 113 MB fp32 tensor, hashed alone. A step's 7,661 leaves (2.6 GB; before O18) hash
     in about 0.24 s through `hash_leaves` at 8 threads, encoding and finiteness included.
 - `leaves.py` (A4, merged): leaf hashing against `C`, the same code on both sides.
   - `leaf_parts(c, i, obj)` and `leaf_hash(c, i, obj)` check each leaf's shape and dtype
-    against `C`.
+    against `C`. A product leaf's slot is `P_m (name)` for a lone product and
+    `P_m0..P_mlast (name)` for a group, whose shape is `[n, a, b]` (O18; a 3-D tensor leaf
+    encodes with `ndim = 3`, no new tag).
   - `leaf_hashes_of(c, items)` hashes `(index, obj)` pairs: it validates on the calling thread
     in order and hashes in parallel. `leaf_hashes`, `commit_leaves`, check 2 and check 0's
     anchor use it. `leaf_hashes_until_error(c, items)` is the form that returns
@@ -740,9 +750,16 @@ interface.
       and `linear_weights` (a weight name mapped to the tuple of `m`s of its `G`s, whose
       widened sum `chain_gradient` forms is its gradient; these go to 6a). A layer's linear
       maps to one `m`; an untied output layer in `B` head blocks maps to `B`.
-    - Derived: `M`, `n_w`, `n_leaves = n_s + 2n_w + M`, `glue_gradient_weights` (these go to
-      6b), `product(m)`, `record_index`, `w_t_index`, `product_index`, `w_next_index` and
-      `validate()`. `validate()` rejects `q < 2`, because of P7.
+    - Derived: `M`, `n_w`, `n_leaves = n_s + 2n_w + K`, `glue_gradient_weights` (these go to
+      6b), `product(m)`, `record_index`, `w_t_index`, `w_next_index` and `validate()`. The
+      product-leaf map (O18): `product_groups` (the `(m0, stride, n)` of each batched product,
+      declared by the instance; none by default), `product_leaves` (a `ProductLeaf` of `g`,
+      `m0`, `stride`, `n`, `grouped`, `shape`, `name` per leaf, in leaf order), `product_leaf(g)`,
+      `leaf_of(m) -> (g, i)` (`i` the member index, `None` for a lone product),
+      `n_product_leaves` (`K`) and `product_leaf_index(g) = n_s + n_w + g`. The `m -> (g, i)`
+      table is two int64 arrays, not an object per product. `validate()` rejects `q < 2`,
+      because of P7, and a product group that is empty, overlaps another, mixes shapes, kinds
+      or layers, or leaves a member outside every group.
     - Shared: `encode_record` and `build_model`, and `weight_dtype`, `product_dtype`,
       `operand_dtype` and `accumulator_dtype` (all `float32` by default, under P6). A leaf of
       the wrong dtype is rejected. Check 5 takes `ε_in` and `ε_acc` from the last two.
@@ -805,8 +822,10 @@ interface.
     one of `δX_1`, each `N × d`. The MLP has one unit.
 - `placement.py` (F22, FS32a): `Placement`, built by `placement_for(c, prover, devices)`
   (`c.placement` for the instance's own). `unit_slot(j)`, `unit_device(j)`,
-  `weight_device(name)`, `product_device(m)`, `leaf_device(i)` (by transcript index; records
-  always `HOST`) and `loads()` (leaf bytes per slot). Unsharded (`devices is None`): units on
+  `weight_device(name)`, `product_device(m)`, `product_leaf_device(g)` (the device of the
+  leaf's first product; a group's members share a layer, so a unit; O18), `leaf_device(i)` (by
+  transcript index, in the layout records, `W_t`, product leaves, `W_{t+1}`; records always
+  `HOST`) and `loads()` (leaf bytes per slot, unchanged by O18). Unsharded (`devices is None`): units on
   the prover's device, every leaf on `HOST`. Sharded: a unit's bytes are its leaves' (each
   weight twice at `weight_dtype`, each product once at `product_dtype`); the pinned units go to
   the last slot; the others are cut in order into contiguous ranges, one per slot, minimizing
@@ -814,8 +833,8 @@ interface.
   the lexicographically smallest cut, so later slots fill first. A slot may hold no layer. A
   weight's and a product's device are their unit's, so a product's leaf and the unit that
   consumes it share a device. Every lookup refuses an out-of-range argument, sharded or
-  not: `IndexError` for a unit outside `units`, `m` outside `1..M` or a leaf outside
-  `0..n_leaves-1` (no negative wrap), `KeyError` for an undeclared weight. Imports `interface`
+  not: `IndexError` for a unit outside `units`, `m` outside `1..M`, a product leaf outside
+  `0..K-1` or a leaf outside `0..n_leaves-1` (no negative wrap), `KeyError` for an undeclared weight. Imports `interface`
   only.
 - `matmul_ops.py`: `HANDLED_OPS` (`mm`, `bmm`, `addmm`, `baddbmm`), `REJECTED_OPS` (every
   other matmul-like aten op, tested against the aten registry), `TRUSTED_NAMESPACES`
@@ -1137,7 +1156,8 @@ interface.
     skips because MPS runs `nn.Linear` as one `aten.linear` the substitution can't see).
   - `replay(leaves) -> DecoderReplay` (A8, forward products). Its own model, from the committed
     `W_t`, runs under `ProductSubstitution`, which hands back the committed leaf for each
-    product (an `S` or `O` bmm gets its `n_s·n_h` member leaves stacked at `s·n_h + h`).
+    product (an `S` or `O` bmm gets its group leaf, `[n_s·n_h, a, b]`, member `s·n_h + h` at
+    `[s·n_h + h]`).
     The replay does what training does: one forward pass and one backward pass, no reruns.
     The first request runs `logits` and `loss_from_logits` once on the committed batch with
     grad on. Pre-hooks on each decoder layer and on the final norm cut the graph into units:
@@ -1285,7 +1305,9 @@ interface.
     flows into (`W_E`'s and layer 1's `γ_attn`) and not `γ_final`'s.
 - `leaf_sizes.py` (FS10): `leaf_sizes(config, *, n_s, n, compute_dtype=torch.float32)`
   returns the step's `LeafSize(index, section, name, role, shape, dtype, nbytes)` list in
-  commit order, without running a model. `compute_dtype` goes to `DecoderComputation`, so
+  commit order, without running a model: one entry per leaf, so a batched attention product is
+  one entry named `L3.S` with shape `[n_s·n_h, a, b]` (O18), its `role` its first member's κ
+  class. `compute_dtype` goes to `DecoderComputation`, so
   weights are fp32 and products `compute_dtype`, as a real step commits them; a slot name that
   disagrees with the leaf order raises `RuntimeError`. The test checks it leaf for leaf against
   a real `prove_step` at fp32 and bf16, with the q/k/v biases drawn non-zero. `benchmarks/`
@@ -1436,11 +1458,13 @@ interface.
 
 - `reader.py`: `LeafReader`, a Protocol with a single method `leaf(index)`. A record leaf
   returns the instance's record object, and any other leaf returns a tensor. It has no leaf
-  count (invariant 7). `stack_block` serves a run of equal-shape leaves at consecutive offsets of
-  one 64-byte-aligned storage as one strided view, on any device (FS32b): one device is a
-  condition of the proof like shape and dtype, and a mix falls back to `torch.stack`, which
-  raises its own error. `TranscriptView(computation, reader)` gives named access: `.record(i)`,
-  `.records()`, `.w_t(name)`, `.product(m)` and `.w_next(name)`.
+  count (invariant 7). `TranscriptView(computation, reader)` gives named access: `.record(i)`,
+  `.records()`, `.w_t(name)`, `.product_leaf(g)` (a tensor of the declared shape, else
+  `LeafShapeError`), `.product(m)` (a lone leaf, or `leaf[i]`, a view, for a member),
+  `.product_run(m0, stride, n)`, `.product_block(ms)` and `.w_next(name)`. A run of members of
+  one group at evenly spaced member indices is a slice of the group's leaf, a view on any
+  device (`own` clones it); anything else is `torch.stack` of `.product(m)`. `stack_block` is
+  gone (O18): a member is a slice of one leaf, so nothing stacks leaves.
 - `errors.py`: `TranscriptFormatError(ValueError)` and its subclasses `LeafShapeError`,
   `LeafDtypeError`, `StoreMutationError` and `LeafReadError` (a disk leaf or the store's
   metadata can't be read back).
@@ -1528,12 +1552,9 @@ interface.
     chain_check_id=, k=, judge=)`. `ctx.state` (`StepState`) carries what check 2's read
     produced to later checks: `claimed_root` (the prover's `h`, validated as a digest; check 5
     keys on it), the leaf hashes and `CommittedLeaves` (`ctx.state.committed()`). It carries
-    check 5's replay to 6b. `CommittedLeaves` holds device leaves as they are (FS32b). Its
-    `tensor_run` and `stack_block` serve a range of equal-shape views at consecutive offsets of
-    one storage as one strided view on whatever device the storage is on: the proof drops the
-    old CPU-only condition and keeps shape, dtype, offsets, contiguity, the 64-byte alignment,
-    one storage, one device and the recorded `_version`s. A bmm's members that stay views of
-    one storage on the owner device are served with no stack copy. The root comparison writes
+    check 5's replay to 6b. `CommittedLeaves` holds device leaves as they are (FS32b). A
+    batched product's member is a slice of one leaf, whose recorded `_version` `leaf()` checks
+    on every read (O18); `tensor_run` and `tensor_block` are gone. The root comparison writes
     `recomputed_root`. `ctx.stats` (`StepStats` of `ProductStat`/`TensorStat`) records every
     normalized residual, κ and ρ, which is P10b's calibration feed. `ProductStat` also
     carries each product's scale for C1's realized floor: `q`, `p_norm` (`‖P‖_F`), `nu`,
