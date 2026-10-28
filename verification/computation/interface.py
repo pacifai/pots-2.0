@@ -3,8 +3,10 @@
 Prover and verifier share one :class:`DeclaredComputation` instance per model. It fixes:
 
 - the transcript layout (spec §4.1, ref block §6): ``n_s`` batch records, the ``n_w`` weights
-  of ``W_t`` in :attr:`~DeclaredComputation.weight_names` order, the products ``P_1..P_M`` in
-  canonical order, then ``W_{t+1}``. That gives ``n_leaves = n_s + 2·n_w + M``, the count that
+  of ``W_t`` in :attr:`~DeclaredComputation.weight_names` order, the product leaves in
+  canonical order (a lone product is a leaf; the members of one batched product share one
+  leaf, at the position of the first member, O18), then ``W_{t+1}``. That gives
+  ``n_leaves = n_s + 2·n_w + K`` with ``K`` the number of product leaves, the count that
   ``verify_path`` takes from here and never from the transcript (invariant 7);
 - the product inventory, one :class:`ProductSpec` per product. For ``P = A·B`` with ``A`` of
   shape ``p×q`` and ``B`` of shape ``q×c``, the challenge width is ``c``, the column count of
@@ -39,6 +41,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -49,6 +52,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ProductKind",
     "ProductSpec",
+    "ProductLeaf",
     "LabelingError",
     "ReplayError",
     "OperandBlock",
@@ -118,6 +122,29 @@ class ProductSpec:
     def width(self) -> int:
         """Challenge length ``c_m``: the column count of ``P``, since ``r`` multiplies ``P``."""
         return self.b_shape[1]
+
+
+@dataclass(frozen=True)
+class ProductLeaf:
+    """One product leaf of the transcript (O18): a lone product's ``P``, or the members of one
+    batched product as one tensor ``[n, *p_shape]``, member ``i`` (product ``m0 + stride·i``)
+    at ``[i]``.
+
+    ``g`` is the 0-based position among the product leaves. ``name`` is the spec's name for a
+    lone product; for a group it is the first member's name without its ``[s,h]`` suffix.
+    """
+
+    g: int
+    m0: int
+    stride: int
+    n: int  # members; 1 for a lone product
+    grouped: bool
+    shape: tuple[int, ...]
+    name: str
+
+    @property
+    def ms(self) -> range:
+        return range(self.m0, self.m0 + self.stride * self.n, self.stride)
 
 
 class LabelingError(RuntimeError):
@@ -332,8 +359,71 @@ class DeclaredComputation(ABC):
         return len(self.weight_names)
 
     @property
+    def product_groups(self) -> tuple[tuple[int, int, int], ...]:
+        """The ``(m0, stride, n)`` of each batched product, declared by the instance: its ``n``
+        members are products ``m0 + stride·i`` and form one leaf (O18). The default is none."""
+        return ()
+
+    @cached_property
+    def _leaf_map(self) -> tuple[np.ndarray, np.ndarray, tuple[ProductLeaf, ...]]:
+        """``(leaf of m, member index of m, leaves)`` over ``m = 1..M`` (index ``m - 1``); the
+        member index is -1 for a lone product. Two int64 arrays, so a large inventory costs no
+        Python object per product."""
+        M = self.M
+        gid = np.full(M, -1, dtype=np.int64)
+        idx = np.full(M, -1, dtype=np.int64)
+        groups = self.product_groups
+        for k, (m0, stride, n) in enumerate(groups):
+            if n < 1 or stride < 1 or m0 < 1 or m0 + stride * (n - 1) > M:
+                raise ValueError(f"product group {(m0, stride, n)} doesn't fit 1..{M}")
+            sl = slice(m0 - 1, m0 - 1 + stride * (n - 1) + 1, stride)
+            gid[sl] = k
+            idx[sl] = np.arange(n, dtype=np.int64)
+        starts = (gid < 0) | (idx == 0)
+        leaf_g = np.cumsum(starts, dtype=np.int64) - 1
+        for k, (m0, stride, n) in enumerate(groups):
+            leaf_g[m0 - 1:m0 - 1 + stride * (n - 1) + 1:stride] = leaf_g[m0 - 1]
+        by_m0 = {g[0]: g for g in groups}
+        leaves = []
+        for pos in np.flatnonzero(starts).tolist():
+            m0 = pos + 1
+            spec = self.products[pos]
+            if m0 in by_m0 and gid[pos] >= 0:
+                _, stride, n = by_m0[m0]
+                leaves.append(ProductLeaf(len(leaves), m0, stride, n, True,
+                                          (n, *spec.p_shape), spec.name.split("[")[0]))
+            else:
+                leaves.append(ProductLeaf(len(leaves), m0, 1, 1, False, spec.p_shape,
+                                          spec.name))
+        return leaf_g, idx, tuple(leaves)
+
+    @property
+    def product_leaves(self) -> tuple[ProductLeaf, ...]:
+        """The product leaves in leaf order (O18): walking ``m = 1..M``, a product in no group
+        is a leaf, a group is one leaf at its first member, and later members add none."""
+        return self._leaf_map[2]
+
+    @property
+    def n_product_leaves(self) -> int:
+        return len(self._leaf_map[2])
+
+    def product_leaf(self, g: int) -> ProductLeaf:
+        if not 0 <= g < self.n_product_leaves:
+            raise IndexError(f"product leaf {g} outside 0..{self.n_product_leaves - 1}")
+        return self._leaf_map[2][g]
+
+    def leaf_of(self, m: int) -> tuple[int, int | None]:
+        """``(g, i)``: product ``m`` is in product leaf ``g``, as member ``i`` of a group or
+        (``i`` is ``None``) as a lone product. ``IndexError`` outside ``1..M``."""
+        if not 1 <= m <= self.M:
+            raise IndexError(f"product m={m} outside 1..{self.M}")
+        leaf_g, idx, _ = self._leaf_map
+        i = int(idx[m - 1])
+        return int(leaf_g[m - 1]), (None if i < 0 else i)
+
+    @property
     def n_leaves(self) -> int:
-        return self.n_s + 2 * self.n_w + self.M
+        return self.n_s + 2 * self.n_w + self.n_product_leaves
 
     @property
     def glue_gradient_weights(self) -> tuple[str, ...]:
@@ -397,12 +487,13 @@ class DeclaredComputation(ABC):
     def w_t_index(self, name: str) -> int:
         return self.n_s + self._weight_pos[name]
 
-    def product_index(self, m: int) -> int:
-        self.product(m)
-        return self.n_s + self.n_w + m - 1
+    def product_leaf_index(self, g: int) -> int:
+        if not 0 <= g < self.n_product_leaves:
+            raise IndexError(f"product leaf {g} outside 0..{self.n_product_leaves - 1}")
+        return self.n_s + self.n_w + g
 
     def w_next_index(self, name: str) -> int:
-        return self.n_s + self.n_w + self.M + self._weight_pos[name]
+        return self.n_s + self.n_w + self.n_product_leaves + self._weight_pos[name]
 
     def validate(self) -> None:
         """Raise ``ValueError`` if the declaration is internally inconsistent."""
@@ -448,6 +539,36 @@ class DeclaredComputation(ABC):
                 if p.p_shape != tuple(self.weight_shapes[w]):
                     raise ValueError(f"{p.name} shape {p.p_shape} != {w} "
                                      f"{self.weight_shapes[w]}")
+        self._validate_groups()
+
+    def _validate_groups(self) -> None:
+        """O18: each product group is a well-formed run of like members, groups don't overlap,
+        and every member product is in a group."""
+        M = self.M
+        covered = np.zeros(M, dtype=bool)
+        for m0, stride, n in self.product_groups:
+            g = (m0, stride, n)
+            if n < 1:
+                raise ValueError(f"product group {g}: n must be at least 1")
+            if stride < 1:
+                raise ValueError(f"product group {g}: stride must be at least 1")
+            if m0 < 1 or m0 + stride * (n - 1) > M:
+                raise ValueError(f"product group {g}: members outside 1..{M}")
+            sl = slice(m0 - 1, m0 - 1 + stride * (n - 1) + 1, stride)
+            if covered[sl].any():
+                raise ValueError(f"product group {g} overlaps another group")
+            covered[sl] = True
+            first = self.products[m0 - 1]
+            for m in range(m0, m0 + stride * n, stride):
+                p = self.products[m - 1]
+                if p.member is None:
+                    raise ValueError(f"product group {g}: {p.name} has no member index")
+                if (p.p_shape, p.kind, p.layer) != (first.p_shape, first.kind, first.layer):
+                    raise ValueError(f"product group {g}: {p.name} differs from {first.name} "
+                                     f"in shape, kind or layer")
+        for p in self.products:
+            if p.member is not None and not covered[p.m - 1]:
+                raise ValueError(f"product {p.name} is a member but is in no product group")
 
     # ---- shared ---------------------------------------------------------------------------
 
@@ -496,9 +617,11 @@ class DeclaredComputation(ABC):
 
     @abstractmethod
     def label(self, capture: MatmulCapture, model: torch.nn.Module) -> list[torch.Tensor]:
-        """Map captured records to canonical slots; return ``P_1..P_M`` in order.
+        """Map captured records to canonical slots; return the product leaves in leaf order
+        (``n_product_leaves`` of them, O18). A lone product's leaf is its ``P``; a group's is
+        ``[n, *p_shape]``, contiguous, member ``i`` (product ``m0 + stride·i``) at ``[i]``.
 
         Called after :meth:`forward_backward` while the capture still holds its operands. Must
         map by operand identity, not call order, and raise :class:`LabelingError` unless every
-        slot is filled exactly once with the declared shape.
+        leaf is filled exactly once with its declared shape and dtype.
         """

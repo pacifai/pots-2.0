@@ -65,7 +65,7 @@ def _step(c, data) -> StepOutput:
 def test_wrong_shape_rejected(c, data):
     step = _step(c, data)
     with pytest.raises(LeafShapeError):
-        leaf_hash(c, c.product_index(1), step.products[0].t().contiguous())
+        leaf_hash(c, c.product_leaf_index(0), step.products[0].t().contiguous())
 
 
 def test_wrong_dtype_rejected(c, data):
@@ -88,7 +88,7 @@ def test_same_payload_other_declaration(c, data):
     # One payload, read under a different shape or dtype: it raises against C, and where a
     # declaration admits it, the header makes the hash differ.
     step = _step(c, data)
-    i = c.product_index(1)
+    i = c.product_leaf_index(0)
     p = step.products[0]
     with pytest.raises(LeafShapeError):
         leaf_hash(c, i, p.reshape(p.shape[1], p.shape[0]))
@@ -128,7 +128,7 @@ def test_bulk_hashing_raises_the_first_bad_leaf(c, data, parallel):
     """A non-finite leaf raises as `leaf_hash` does, and with two bad leaves the one first in
     leaf order is reported, whichever kind of error it is."""
     leaves = list(_step(c, data).leaves())
-    p1, p2 = c.product_index(1), c.product_index(3)
+    p1, p2 = c.product_leaf_index(0), c.product_leaf_index(2)
     nan = leaves[p1].clone()
     nan.view(-1)[5] = float("nan")
     with pytest.raises(NonFiniteError) as one:
@@ -162,7 +162,7 @@ def test_bulk_hashing_non_finite_before_a_read_error(c, data, parallel):
     error at an earlier leaf wins over it. `leaf_hashes_until_error` returns the first bad
     leaf's error with the digests before it only."""
     leaves = list(_step(c, data).leaves())
-    p1, p2 = c.product_index(1), c.product_index(3)
+    p1, p2 = c.product_leaf_index(0), c.product_leaf_index(2)
     bad = list(leaves)
     bad[p1] = leaves[p1].clone()
     bad[p1].view(-1)[0] = float("inf")
@@ -178,7 +178,7 @@ def test_bulk_hashing_non_finite_before_a_read_error(c, data, parallel):
 def test_single_leaf_paths_still_reject_non_finite(c, data):
     """`leaf_parts` and `leaf_hash`, off the parallel path, reject a non-finite leaf too."""
     step = _step(c, data)
-    i = c.product_index(1)
+    i = c.product_leaf_index(0)
     nan = step.products[0].clone()
     nan.view(-1)[2] = float("nan")
     with pytest.raises(NonFiniteError):
@@ -245,10 +245,10 @@ def test_stats_cover_the_wall_time(c, data, path):
 def test_stats_on_an_error_still_count(c, data, path):
     leaves = list(_step(c, data).leaves())
     bad = list(leaves)
-    bad[c.product_index(1)] = leaves[c.product_index(1)].t().contiguous()
+    bad[c.product_leaf_index(0)] = leaves[c.product_leaf_index(0)].t().contiguous()
     stats = HashStats()
     got, err = leaf_hashes_until_error(c, enumerate(bad), stats)
-    assert err is not None and len(got) == c.product_index(1)
+    assert err is not None and len(got) == c.product_leaf_index(0)
     assert stats.leaves >= len(got)
 
 
@@ -264,3 +264,47 @@ def test_stats_emit_skips_a_missing_seam_and_zero_parts():
     s.read_s, s.native_s = 0.5, 0.25
     s.emit(Seam(), "P3.commit.hash")
     assert rows == [("P3.commit.hash.read", 0.5), ("P3.commit.hash.native", 0.25)]
+
+
+# ---- O18: product leaves of a batched product -------------------------------------------
+
+
+def _tiny_decoder():
+    from tests.verification.decoder_helpers import tiny_config
+    from verification.computation.instances import DecoderComputation
+
+    config = tiny_config()
+    config.num_hidden_layers = 2
+    return DecoderComputation(config, n_s=2, n=8, eta=ETA)
+
+
+def test_tensor_slot_names_lone_and_grouped_product_leaves():
+    from verification.commitment.leaves import _tensor_slot
+
+    c = _tiny_decoder()
+    lone = c.product_leaf(0)
+    assert not lone.grouped
+    assert _tensor_slot(c, c.product_leaf_index(0)) == (
+        TAG_PRODUCT, lone.shape, c.product_dtype, f"P_{lone.m0} ({lone.name})")
+    grouped = next(pl for pl in c.product_leaves if pl.grouped)
+    tag, shape, dtype, slot = _tensor_slot(c, c.product_leaf_index(grouped.g))
+    assert (tag, shape, dtype) == (TAG_PRODUCT, grouped.shape, c.product_dtype)
+    assert len(shape) == 3 and shape[0] == c.n_s * c.n_h
+    assert slot == f"P_{grouped.m0}..P_{grouped.ms[-1]} ({grouped.name})"
+    assert _tensor_slot(c, c.n_s + c.n_w)[3].startswith("P_")
+    assert _tensor_slot(c, c.w_next_index(c.weight_names[0]))[3].startswith("W_t+1[")
+    with pytest.raises(IndexError):
+        _tensor_slot(c, c.n_leaves)
+
+
+def test_a_grouped_leaf_hashes_as_a_three_dimensional_tensor_leaf():
+    c = _tiny_decoder()
+    pl = next(pl for pl in c.product_leaves if pl.grouped)
+    t = torch.randn(pl.shape, dtype=c.product_dtype)
+    i = c.product_leaf_index(pl.g)
+    assert leaf_hash(c, i, t) == hash_leaf(encode_tensor_leaf(TAG_PRODUCT, t))
+    assert b"".join(leaf_parts(c, i, t))[2] == 3  # ndim, after the tag and dtype bytes
+    with pytest.raises(LeafShapeError):
+        leaf_hash(c, i, t[0])  # one member alone is not the group's leaf
+    with pytest.raises(LeafShapeError):
+        leaf_hash(c, i, t.reshape(-1, pl.shape[-1]))

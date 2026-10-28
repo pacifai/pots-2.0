@@ -170,16 +170,18 @@ def _python_timed(stats: HashStats, run: Any) -> Any:
 
 def _tensor_slot(c: DeclaredComputation,
                  index: int) -> tuple[int, tuple[int, ...], torch.dtype, str]:
-    """``(tag, shape, dtype, slot name)`` of a non-record leaf, from the ref block §6 layout."""
-    n_s, n_w, M = c.n_s, c.n_w, c.M
+    """``(tag, shape, dtype, slot name)`` of a non-record leaf, from the ref block §6 layout
+    (records, ``W_t``, product leaves, ``W_{t+1}``; O18)."""
+    n_s, n_w, K = c.n_s, c.n_w, c.n_product_leaves
     if n_s <= index < n_s + n_w:
         name = c.weight_names[index - n_s]
         return TAG_WEIGHT, tuple(c.weight_shapes[name]), c.weight_dtype, f"W_t[{name}]"
-    if n_s + n_w <= index < n_s + n_w + M:
-        spec = c.product(index - n_s - n_w + 1)
-        return TAG_PRODUCT, spec.p_shape, c.product_dtype, f"P_{spec.m} ({spec.name})"
-    if n_s + n_w + M <= index < c.n_leaves:
-        name = c.weight_names[index - n_s - n_w - M]
+    if n_s + n_w <= index < n_s + n_w + K:
+        pl = c.product_leaf(index - n_s - n_w)
+        label = f"P_{pl.m0}..P_{pl.ms[-1]}" if pl.grouped else f"P_{pl.m0}"
+        return TAG_PRODUCT, pl.shape, c.product_dtype, f"{label} ({pl.name})"
+    if n_s + n_w + K <= index < c.n_leaves:
+        name = c.weight_names[index - n_s - n_w - K]
         return TAG_WEIGHT, tuple(c.weight_shapes[name]), c.weight_dtype, f"W_t+1[{name}]"
     raise IndexError(f"leaf index {index} outside 0..{c.n_leaves - 1}")
 
@@ -460,8 +462,7 @@ def _native_until_error(c: DeclaredComputation, items: Iterable[tuple[int, Any]]
         items = _observed(items, stats)
         t_start, w0, r0 = perf_counter(), stats.wait_s, stats.read_s
     threads = torch.get_num_threads()
-    n_s, n_w, M, n_leaves = c.n_s, c.n_w, c.M, c.n_leaves
-    wt_end, prod_end = n_s + n_w, n_s + n_w + M
+    n_s = c.n_s
     big_at = merkle._MT_THRESHOLD
     batch_bytes, batch_entries = _BATCH_BYTES, _BATCH_ENTRIES
     finite_kind = native.FINITE_KIND

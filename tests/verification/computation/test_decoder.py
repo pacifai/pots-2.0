@@ -107,7 +107,9 @@ def test_inventory_order_names_and_count(setup):
         for x in "qkv":
             want += [f"L{l}.dX_{x}", f"L{l}.G_{x}"]
     assert [p.name for p in c.products] == want
-    assert c.n_leaves == n_s + 2 * c.n_w + c.M
+    K = 27 * L + 3  # O18: one leaf per attention product (6 per layer), the rest lone
+    assert c.n_product_leaves == K == c.M - 6 * L * (n_s * n_h - 1)
+    assert c.n_leaves == n_s + 2 * c.n_w + K
 
 
 def test_shapes_q_width_and_kinds(setup):
@@ -177,7 +179,8 @@ def test_matmul_count():
 
 def test_smollm2_declaration_numbers():
     c = DecoderComputation(smollm2_config(), n_s=4, n=128, eta=1e-3)
-    assert (c.M, c.n_w, c.n_leaves) == (7113, 272, 7661)
+    assert (c.M, c.n_w, c.n_leaves) == (7113, 272, 1361)
+    assert c.n_product_leaves == 813 and c.n_leaves == 4 + 272 + 813 + 272
     assert sum(map(lambda s: torch.Size(s).numel(), c.weight_shapes.values())) == 134_515_008
     assert Counter(p.kind for p in c.products) == {FWD: 2371, IG: 211, WG: 211, OG: 4320}
     q = {c.product_class(p): p.q for p in c.products}
@@ -1300,7 +1303,7 @@ def test_switches_declaration(switched):
     want += [c.gamma_final, *([] if tied else ["lm_head.weight"])]
     assert list(c.weight_names) == want and c.n_w == len(want)
     assert {n: tuple(p.shape) for n, p in model.named_parameters()} == dict(c.weight_shapes)
-    assert c.n_leaves == c.n_s + 2 * c.n_w + c.M
+    assert c.n_leaves == c.n_s + 2 * c.n_w + c.n_product_leaves
 
     g_head = "G_E_head" if tied else "G_head"
     base = DecoderComputation(tiny_config(), n_s=c.n_s, n=c.n, eta=c.eta)
@@ -1642,7 +1645,7 @@ def test_smollm2_real_step_m2():
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
     c = DecoderComputation.from_config(cfg)
-    assert (c.M, c.n_leaves) == (7113, 7661)
+    assert (c.M, c.n_leaves) == (7113, 1361)
     t0 = time.perf_counter()
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
