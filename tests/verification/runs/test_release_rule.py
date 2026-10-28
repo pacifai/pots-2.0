@@ -4,6 +4,8 @@
 may share a card (unsharded, or the prover's device is a verifier device). ``0`` and ``1``
 force it. The rule is pure device arithmetic, so the table runs with fake devices."""
 
+import json
+
 import pytest
 import torch
 
@@ -163,3 +165,27 @@ def test_the_environment_record_holds_the_resolved_value_and_its_rule(monkeypatc
 def test_allocator_settings_resolve_like_the_loop(prover, devices, auto):
     s = metrics.allocator_settings(None, prover, devices)
     assert (s["release_cache"], s["release_cache_rule"]) == (auto, "auto")
+
+
+# ---- bring_up's hand-off lines (FS55a) ------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw, released", [("1", True), ("0", False)])
+def test_bring_up_labels_the_envs_value_as_env(monkeypatch, raw, released):
+    from verification.runs.bring_up import handoff_lines
+
+    monkeypatch.setenv("VERIF_RELEASE_CACHE", raw)
+    hand_off, allocator = handoff_lines(None, "cpu", None)
+    s = json.loads(allocator.removeprefix("allocator: "))
+    assert (s["release_cache"], s["release_cache_rule"]) == (released, "env")
+    assert ("CUDA cache released" in hand_off) is released
+    assert ("release_cache_rule env" in hand_off) is not released
+    assert "argument" not in hand_off + allocator
+
+
+def test_bring_up_names_auto_when_the_env_is_unset():
+    from verification.runs.bring_up import handoff_lines
+
+    hand_off, allocator = handoff_lines("/tmp/x", "cpu", None)
+    assert "on disk under /tmp/x" in hand_off and "release_cache_rule auto" in hand_off
+    assert json.loads(allocator.removeprefix("allocator: "))["release_cache_rule"] == "auto"
