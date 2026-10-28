@@ -1439,7 +1439,8 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
             plan.append(Part(
                 f"{arm}_{k}{tag}", ["{python}", "-m", "verification.runs.llama_step", "--steps",
                                     str(steps), "--metrics", "--no-count"],
-                env=env, timeout_s=t[arm], kind="profile_run" if profile else "four_run",
+                env={**env, "PYTHONPATH": str(upload / "repo_base")} if is_base else env,
+                timeout_s=t[arm], kind="profile_run" if profile else "four_run",
                 info={**info, "arm": arm, "model_key": k, "run_dir": str(d),
                       "records": str(d / FOUR_RUN_NAME / "records.jsonl"),
                       **({"base": True, "base_commit": base_commit} if is_base else {})},
@@ -2947,6 +2948,9 @@ def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any
                    "base_commit": (_pair_part(parts, f"seq_{k}_base").get("info")
                                    or {}).get("base_commit")}
     row["ab"] = {}
+    same = {a: [t for t, (x, y) in enumerate(zip(row["arms"][a].get("step_roots") or [],
+                                                 arms[a].get("step_roots") or []), 1) if x == y]
+            for a in FOUR_ARMS}
     for a in FOUR_ARMS:
         o18, base = row["arms"][a].get("steady_s"), arms[a].get("steady_s")
         ok = (row["arms"][a].get("steady_source") == "step_interval"
@@ -2965,6 +2969,10 @@ def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any
         (not any(gpu_why.values()), f"{k} base: the environment records name the four GPUs"
          if not any(gpu_why.values()) else f"{k} base: " + "; ".join(
              f"{a} arm: " + ", ".join(w) for a, w in gpu_why.items() if w))]
+    items += [(not same[a], f"{k} base {a}: the base step roots differ from the O18 arm's"
+               if not same[a] else f"{k} base {a}: the base arm appears to have run the O18 "
+               f"code (its step roots equal the O18 arm's at step {', '.join(map(str, same[a]))})")
+              for a in FOUR_ARMS]
     items += [(not w, f"{k} base {a}: the profile's inputs are there" if not w
                else f"{k} base {a}: " + "; ".join(w)) for a, w in inputs.items()]
     return items

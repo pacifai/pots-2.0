@@ -438,7 +438,8 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
     config) and ``repo`` replace ``materialize_data`` and
     ``git archive`` in tests; ``base_commit`` (a revision) adds ``repo_base/``, ``git archive``
     of that revision (``repo_base(repo_root, build, rev, "repo_base")`` in tests), and the
-    manifest's ``base_commit`` (O18, FS49s); ``native_src`` is the native sources' directory (default
+    manifest's ``base_commit`` (O18, FS49s); ``native_src``
+    is the native sources' directory (default
     ``native.source_dir()``)."""
     out = out.resolve()
     build = out / "build"

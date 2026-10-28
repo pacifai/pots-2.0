@@ -3461,7 +3461,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     them: models 720 s (FS35's), `seq` 720 s, `pipe` 480 s; `_models_part` still fetches the
     whole manifest (a list of repos for `fetch_models` was left: the tests and the data
     tokenizers may need other models). `four_profile_default_deadline_s()` is 11,700 s
-    ((76 + 1 + 20) x 2 min, up to 100 s), equal to `fs11_job.sh`'s. `four_h100_profile(parts)` goes to
+    ((76 + 1 + 20) x 2 min, up to 100 s), equal to
+    `fs11_job.sh`'s. `four_h100_profile(parts)` goes to
     `summary.json["four_h100_profile"]` (an error: `four_h100_profile_error`) and the log ends
     with `FS42 ok:` / `FS42 FAIL:` lines. `pass` fails closed: every part `ok` or `skipped_done`,
     the peer check and the tests as FS35's, per model `_four_model_items` at 4 steps, the plain

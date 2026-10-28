@@ -712,8 +712,10 @@ def test_the_plan_gets_the_base_arms_after_llamas_o18_arms(tmp_path):
     for arm in ("seq", "pipe"):
         o18, base = by[f"{arm}_{K}"], by[f"{arm}_{K}_base"]
         assert base.argv == o18.argv and base.kind == o18.kind == "profile_run"
-        assert {k: v for k, v in base.env.items() if k != "VERIF_OUTPUT_DIR"} == \
-            {k: v for k, v in o18.env.items() if k != "VERIF_OUTPUT_DIR"}
+        skip = ("VERIF_OUTPUT_DIR", "PYTHONPATH")  # the run dir and the import root differ
+        assert {k: v for k, v in base.env.items() if k not in skip} == \
+            {k: v for k, v in o18.env.items() if k not in skip}
+        assert base.env["PYTHONPATH"] == str(up / "repo_base") and "PYTHONPATH" not in o18.env
         assert base.env["VERIF_OUTPUT_DIR"].endswith(f"_{arm}_base")
         assert base.env["VERIF_OUTPUT_DIR"] != o18.env["VERIF_OUTPUT_DIR"]
         assert base.cwd == up / "repo_base" and o18.cwd is None
@@ -789,6 +791,22 @@ def test_the_base_arms_report_the_same_numbers_and_the_ab_block():
     assert row["ab"]["pipe"]["diff_s"] == pytest.approx(-8.0)
     assert row["ab"]["pipe"]["ratio"] == pytest.approx(11.0 / 19.0)
     assert json.dumps(row)
+
+
+def test_a_base_arm_with_the_o18_roots_did_not_run_the_base_code():
+    res = _prof(_base_parts(**{f"{a}_{K}_base": _base_arm(K, a, roots=ROOTS4)
+                               for a in ("seq", "pipe")}))
+    bad = _fails(res)
+    assert not res["pass"] and len(bad) == 2, bad
+    for a in ("seq", "pipe"):
+        assert any(f"{K} base {a}" in b and "appears to have run the O18 code" in b
+                   and "step 1, 2, 3, 4" in b for b in bad), bad
+    # one equal step is enough (the pipelined base arm's other steps follow the seq arm's)
+    one = [ROOTS4[0], *ROOTS_BASE[1:]]
+    res = _prof(_base_parts(**{f"{a}_{K}_base": _base_arm(K, a, roots=one)
+                               for a in ("seq", "pipe")}))
+    assert any("base pipe" in b and "run the O18 code" in b and "step 1)" in b
+               for b in _fails(res))
 
 
 def test_unequal_base_roots_fail():
