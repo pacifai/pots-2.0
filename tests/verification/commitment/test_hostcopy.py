@@ -19,10 +19,9 @@ from verification.commitment.leaves import (
     leaf_hashes_until_error,
 )
 from verification.commitment.merkle import MerkleTree
+from verification.computation.interface import ProductLeaf
 from verification.transcript.errors import StoreMutationError
-from verification.transcript.reader import stack_block
 from verification.transcript.store import DiskStore, InMemoryStore, perturb_leaf
-from verification.verifier.context import CommittedLeaves
 
 _HAS = {"fake": True, "mps": torch.backends.mps.is_available(),
         "cuda": torch.cuda.is_available()}
@@ -59,6 +58,13 @@ class _Stub:
 
     def product(self, m):
         return _Spec(m, self._pshapes[m - 1])
+
+    @property
+    def n_product_leaves(self):
+        return self.M
+
+    def product_leaf(self, g):  # no groups: one lone product per leaf (O18)
+        return ProductLeaf(g, g + 1, 1, 1, False, self._pshapes[g], f"p{g + 1}")
 
     def encode_record(self, obj):
         return bytes(obj.ids.numpy())
@@ -376,31 +382,6 @@ def test_python_path_bounds_the_live_host_copies(monkeypatch, fail_at):
     assert _Buf.live == 0
 
 
-# ---- zero-copy runs -------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("kind", _kinds("mps", "cuda"))
-def test_runs_of_device_members_are_views(kind):
-    d = _Dev(kind)
-    big = d.place(torch.randn(6, 3, 5))
-    assert big.data_ptr() % 64 == 0
-    ts = [big[i] for i in range(6)]
-    out = stack_block(ts)
-    assert out.data_ptr() == big.data_ptr() and out._base is not None
-    assert torch.equal(out.cpu(), torch.stack(ts).cpu())
-    assert stack_block(ts, own=True).data_ptr() != big.data_ptr()
-    cl = CommittedLeaves()
-    for t in ts:
-        cl.add(t)
-    run = cl.tensor_run(0, 1, 6)
-    assert run.data_ptr() == big.data_ptr() and torch.equal(run.cpu(), big.cpu())
-    sub = cl.tensor_run(1, 2, 3)
-    assert torch.equal(sub.cpu(), big[1:6:2].cpu())
-    big.add_(1.0)  # every member's version moves: served by tensor_block, which raises
-    with pytest.raises(StoreMutationError):
-        cl.tensor_run(0, 1, 6)
-
-
 # ---- the stores -----------------------------------------------------------------------------
 
 
@@ -488,7 +469,7 @@ def test_cuda_check_5_measure_on_a_stacked_view_equals_torch_stack():
     b = torch.randn(B, q, w, device="cuda")
     p = torch.bmm(a, b)
     members = [p[i] for i in range(B)]
-    view = stack_block(members)
+    view = p[:B]
     assert view.data_ptr() == p.data_ptr()  # a view of the bmm block
     copy = torch.stack(members)
     kw = dict(h=b"\x01" * 32, ms=list(range(1, B + 1)), k=4)

@@ -217,8 +217,8 @@ def test_tiny_decoder_step_on_cuda(dtype, head_blocks):
         assert all(p.device.type == "cpu" for p in out.products)
         # Each leaf is its pinned host buffer, except δK̃: labeling commits the contiguous
         # transpose of the captured output, a new host tensor.
-        unpinned = {c.product_class(s) for s, p in zip(c.products, out.products)
-                    if not p.is_pinned()}
+        unpinned = {c.product_class(c.products[c.product_leaf(g).m0 - 1])
+                    for g, p in enumerate(out.products) if not p.is_pinned()}
         assert unpinned == {"dK"}
         w_plain, loss = plain_step(c, model, w0, records)
         assert loss == out.loss

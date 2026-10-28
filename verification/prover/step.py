@@ -12,7 +12,8 @@ Fault hooks are prover-side only (S6a, invariant 5) and off by default:
   supplies A2 (commit the clean ``b`` with the poisoned activations) and A1 (the caller commits
   ``b̃`` itself, which is an honest ``prove_step`` on ``b̃``);
 - ``perturb``: ``{m: fn}`` replaces committed product ``P_m`` with ``fn(copy of P_m)`` after
-  capture. Training still uses the true gradients, so only the committed leaf changes.
+  capture (a member of a batched product is written into a copy of its leaf, O18). Training
+  still uses the true gradients, so only the committed leaf changes.
 
 Other cheats are assembled by the caller from honest outputs, not by hooks here (S6e):
 
@@ -69,7 +70,7 @@ class StepOutput:
 
     records: tuple[Any, ...]
     w_t: dict[str, torch.Tensor]  # in weight_names order
-    products: tuple[torch.Tensor, ...]  # P_1..P_M
+    products: tuple[torch.Tensor, ...]  # the product leaves, in leaf order (O18)
     w_next: dict[str, torch.Tensor]  # in weight_names order
     loss: float
     versions: tuple[int, ...] = field(repr=False)
@@ -241,43 +242,55 @@ def prove_step(
             model, records if train_records is None else train_records, stage)
     with sec("P1.label"):
         labeled = computation.label(cap, model)
-        if len(labeled) != computation.M:
-            raise RuntimeError(f"label returned {len(labeled)} products, M = {computation.M}")
+        if len(labeled) != computation.n_product_leaves:
+            raise RuntimeError(f"label returned {len(labeled)} product leaves, "
+                               f"K = {computation.n_product_leaves}")
         place = computation.placement
-        hint_misses = (cap.count_hint_misses(labeled, place.product_device)
+        hint_misses = (cap.count_hint_misses(labeled, place.product_leaf_device)
                        if place.sharded else 0)
         # Each leaf goes to its owner (F22); a right hint left nothing to move, a wrong one
         # costs this copy.
-        products = [p.detach().to(place.product_device(m)) for m, p in enumerate(labeled, 1)]
+        products = [p.detach().to(place.product_leaf_device(g)) for g, p in enumerate(labeled)]
         # Invariant 6: the products are fixed and nothing has touched the captured tensors.
         cap.assert_unmodified()
         product_versions = list(_versions(products))
         cap.release_operands()
         arrival = {}
-        missing: dict[str, int] = {}  # products with no digest, by kind (a diagnostic)
+        missing: dict[str, int] = {}  # leaves with no digest, by their first product's kind
         missing_first: list[str] = []  # the first few that are not operand gradients
-        for m, p in enumerate(products, 1):
+        for g, p in enumerate(products):
             d = cap.arrival_digest(p)
             if d is not None:
-                arrival[computation.product_index(m)] = d
+                arrival[computation.product_leaf_index(g)] = d
             else:
-                spec = computation.product(m)
-                missing[spec.kind.name] = missing.get(spec.kind.name, 0) + 1
-                if spec.kind is not ProductKind.OPERAND_GRAD and len(missing_first) < 5:
-                    missing_first.append(spec.name)
+                pl = computation.product_leaf(g)
+                kind = computation.product(pl.m0).kind
+                missing[kind.name] = missing.get(kind.name, 0) + 1
+                if kind is not ProductKind.OPERAND_GRAD and len(missing_first) < 5:
+                    missing_first.append(pl.name)
     summary = cap.summary()
     summary["host_buffers"] = ({"n_buffers": cap.buffers.n_buffers, "nbytes": cap.buffers.nbytes}
                                if cap.buffers is not None else None)
 
+    cloned: set[int] = set()  # grouped leaves already copied for a perturbed member (O18)
     for m, fn in (perturb or {}).items():
         spec = computation.product(m)
-        new = fn(products[m - 1].clone())
-        if tuple(new.shape) != spec.p_shape or new.dtype != products[m - 1].dtype:
+        g, i = computation.leaf_of(m)
+        leaf = products[g]
+        new = fn((leaf if i is None else leaf[i]).clone())
+        if tuple(new.shape) != spec.p_shape or new.dtype != leaf.dtype:
             raise ValueError(f"perturbation of {spec.name} changed its shape or dtype")
         # The leaf stays on its owner, whatever device the fault built its tensor on.
-        products[m - 1] = new.detach().to(products[m - 1].device).contiguous()
-        product_versions[m - 1] = products[m - 1]._version
-        arrival.pop(computation.product_index(m), None)  # the digest was of the old bytes
+        new = new.detach().to(leaf.device).contiguous()
+        if i is None:
+            products[g] = new
+        else:
+            if g not in cloned:  # one copy of the group's leaf per step, shared by its members
+                products[g] = leaf.clone()
+                cloned.add(g)
+            products[g][i] = new
+        product_versions[g] = products[g]._version
+        arrival.pop(computation.product_leaf_index(g), None)  # the digest was of the old bytes
 
     if "arrival_hash" in summary:  # the digests in use, after the perturbations
         summary["arrival_hash"].update(used=len(arrival), missing=missing,

@@ -32,7 +32,9 @@ sweep and no check-6 trial.
    as its first product in canonical order (a batched product's first member), plus the
    binding product, the one with the largest ``q`` (``dF`` on the decoder). Per trial it plants
    an error ``Δ`` of relative size ``f = ‖Δ‖_F/‖P‖_F`` in the target, re-roots by re-hashing
-   only that leaf and its path (``store.perturb_leaf``), draws the challenges from the new root,
+   only that leaf and its path (``store.perturb_leaf``; a batched member sits in its group's
+   leaf (O18), so the planted product goes into a fresh clone of that leaf), draws the
+   challenges from the new root,
    and measures and judges the one product with check 5's own code (:func:`measure_target`,
    ``checks._judge_product``); a batched member is measured in its batch as check 5 stacks
    it, beside the other members' committed products. The other products are honest and are
@@ -161,6 +163,7 @@ from verification.runs.scenarios import (
     Scenario,
     ScenarioResult,
 )
+from verification.transcript.reader import TranscriptView
 from verification.transcript.store import InMemoryStore, perturb_leaf
 from verification.verifier.bands import Bands, product_class
 
@@ -322,7 +325,8 @@ class Held:
     cls: str  # its matmul class (bands.product_class)
     a: torch.Tensor
     b: torch.Tensor
-    leaf: torch.Tensor  # the committed leaf object, put back after the trials
+    leaf: torch.Tensor  # the committed leaf object, put back after the trials: a lone product's
+    # own leaf, or a member's whole group leaf (O18)
     p: torch.Tensor  # its fp32 view, as check 5 reads it
     p_norm: float  # ‖P‖_F in float64
     bias: torch.Tensor | None = None  # a biased product's committed bias, as check 5 reads it
@@ -330,6 +334,7 @@ class Held:
     binding: bool = False  # the binding product
     u: float = math.nan  # its term scale U (F18) as check 5 computes it (target_term_scale)
     batch: Batch | None = None  # a member's batch in check 5; None for a run of one
+    member: int | None = None  # O18: the target's index in its group leaf; None for a lone leaf
 
     def e_m(self, eps_in: float, eps_acc: float) -> float:
         """The target's own ``e_m`` (F18), the sweep's unit for ``x``."""
@@ -365,20 +370,22 @@ def hold_targets(c: DeclaredComputation, store: InMemoryStore,
     del replay
     bind = binding_product(c).m
     held = []
+    view = TranscriptView(c, store)
     for s in specs:
-        leaf = store.leaf(c.product_index(s.m))
-        p = leaf.detach().to(torch.float32)
+        g, i = c.leaf_of(s.m)
+        leaf = store.leaf(c.product_leaf_index(g))
+        p = view.product(s.m).detach().to(torch.float32)
         bias = None if s.bias is None else store.leaf(c.w_t_index(s.bias)).detach().to(
             c.operand_dtype).to(torch.float32)
         a, b = ops[s.m]
         bt = None
         if (members := batches[s.m]) is not None:
             ms = [x.m for x in members]
-            bt = Batch.of(s.m, ms, ops, {m: store.leaf(c.product_index(m)).detach().to(
+            bt = Batch.of(s.m, ms, ops, {m: view.product(m).detach().to(
                 torch.float32) for m in ms})
         h = Held(s, product_class(c, s), a, b, leaf, p,
                  float(torch.linalg.vector_norm(p, dtype=torch.float64)), bias,
-                 spec_class(c, s), s.m == bind, batch=bt)
+                 spec_class(c, s), s.m == bind, batch=bt, member=i)
         h.u = target_term_scale(h)
         held.append(h)
     return held
@@ -480,7 +487,8 @@ def sweep_target(c: DeclaredComputation, store: InMemoryStore, held: Held, ctx: 
                  phase: str = "grid") -> list[Trials]:
     """Every trial of one target, then the honest leaf back; raises if the root doesn't
     return. ``ctx`` gives ``k`` and the unit roundoffs, and holds no stats afterwards."""
-    s, idx = held.spec, c.product_index(held.spec.m)
+    s = held.spec
+    idx = c.product_leaf_index(c.leaf_of(s.m)[0])
     base = store.root
     e = held.e_m(ctx.eps_in, ctx.eps_acc)
     if not math.isfinite(e):
@@ -494,7 +502,12 @@ def sweep_target(c: DeclaredComputation, store: InMemoryStore, held: Held, ctx: 
                 f = x * bands.tau * e
                 for _ in range(trials):
                     p2, f_real = plant(held.p, shape, f, held.p_norm, gen)
-                    root = perturb_leaf(c, store, idx, p2)
+                    if held.member is None:
+                        w = p2
+                    else:  # O18: a fresh clone of the group leaf each trial (the store keeps it)
+                        w = held.leaf.clone()
+                        w[held.member] = p2.to(w.dtype)
+                    root = perturb_leaf(c, store, idx, w)
                     mp = measure_target(held, p2, h=root, ctx=ctx, scratch=scratch)
                     rej = _judge_product(c, s, mp, ctx, bands)
                     ctx.stats.products.clear()
@@ -560,7 +573,8 @@ def check6_trial(c: DeclaredComputation, store: InMemoryStore, bands: Bands, ctx
     idx, base = c.w_next_index(name), store.root
     w_t, w_next = store.leaf(c.w_t_index(name)), store.leaf(idx)
     (g_m,) = c.linear_weights[name]  # a layer's linear: one product (check6_weight)
-    g = store.leaf(c.product_index(g_m)).to(w_t.device, c.weight_dtype)  # sharded: its own device
+    # sharded: the weight's own device
+    g = TranscriptView(c, store).product(g_m).to(w_t.device, c.weight_dtype)
     tau_w = bands.tau_w_for(name)
     with torch.no_grad():  # check 6a's reference, term by term (_update_identity_reference)
         eta_g = c.eta * g
@@ -794,7 +808,7 @@ def run_sweep(env: CheatEnv, *, xs: Sequence[float] = DEFAULT_X,
         assert kept is not None
         store, stats = kept.store, kept.honest or StepStats()
     floor = floor_context(env.bands, c, k=env.k, T=t)
-    pf = store.leaf(c.product_index(m_flip)).detach().to(torch.float64)
+    pf = TranscriptView(c, store).product(m_flip).detach().to(torch.float64)
     e_flip, e_src = _flip_e_m(c, stats, m_flip)
     x_flip = (2 * float(pf.abs().max()) / float(torch.linalg.vector_norm(pf))
               / (env.bands.tau * e_flip))

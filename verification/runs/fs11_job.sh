@@ -24,7 +24,7 @@
 # 2. A deadline timer starts: FS11_DEADLINE_S (default 12600, 3.5 h; 7500, 2 h 5 min, for the
 #    re-check; 19800, 5.5 h, for the profile check; 5400, 1.5 h, for the hardware probe; 16100,
 #    4 h 28 min, for the two-GPU session; 8800, 2 h 27 min, for the device-leaves session;
-#    14700, 4 h 5 min, for the four-H100 session; 10500, 2 h 55 min, for its profiling run)
+#    14700, 4 h 5 min, for the four-H100 session; 11700, 3 h 15 min, for its profiling run)
 #    after the start it terminates the pod, whatever the job is doing.
 # 3. The session (verification.runs.fs11_session run) prints the environment, refuses a
 #    machine without an H100 (FS11_ALLOW_ANY_GPU=1 overrides; the hardware probe also refuses
@@ -100,7 +100,7 @@ DEFAULT_DEADLINE_S=12600
 [ "$SESSION" = kernel-speed ] && DEFAULT_DEADLINE_S=5400
 [ "$SESSION" = device-leaves ] && DEFAULT_DEADLINE_S=8800
 [ "$SESSION" = four-h100 ] && DEFAULT_DEADLINE_S=14700
-[ "$SESSION" = four-h100-profile ] && DEFAULT_DEADLINE_S=10500
+[ "$SESSION" = four-h100-profile ] && DEFAULT_DEADLINE_S=11700
 if [ -n "${FS31_CARDS:-}" ]; then export FS31_CARDS; fi
 if [ "$SELFTEST" = 1 ]; then
   DEADLINE_S=${FS11_DEADLINE_S:-360}; GRACE_S=${FS11_GRACE_S:-120}

@@ -203,11 +203,12 @@ def work_rows(c: DecoderComputation, run: str, scenario: str,
     what the commit itself hashes. On a CPU run that is the whole transcript, as for check 2.
     On a CUDA run (``c.device``) the products are hashed on arrival, on their owner GPUs inside
     ``train.*`` (those rows carry FLOPs only), and the commit takes those digests as ``known``,
-    so it hashes the batch records, ``W_t``, ``W_{t+1}`` and the ``dK`` products (the committed
-    ``δK̃`` leaf is the contiguous transpose made in labeling, so its arrival digest goes
-    unused): ``hash_leaves`` and ``hash_calls`` are ``leaves`` minus the other products,
-    ``hash_in_bytes`` their bytes (``transcript_bytes`` minus those products' bytes, each
-    ``prod(p_shape)`` times the product dtype's size) plus the prefix byte per leaf,
+    so it hashes the batch records, ``W_t``, ``W_{t+1}`` and the ``δK̃`` leaves (a ``dK`` product
+    leaf is the contiguous transpose made in labeling, so its arrival digest goes unused):
+    ``hash_leaves`` and ``hash_calls`` are ``leaves`` minus the other product leaves (O18: one
+    per lone product or group),
+    ``hash_in_bytes`` their bytes (``transcript_bytes`` minus those leaves' bytes, each
+    ``prod(leaf shape)`` times the product dtype's size) plus the prefix byte per leaf,
     ``hash_out_bytes`` 32 per leaf. A step row that carries ``known`` (the leaves the commit
     took from arrival digests, ``HashStats.known``; absent or ``None`` on records without it) is
     checked against that rule: ``leaves`` minus ``known`` must equal the rule's commit leaf
@@ -221,13 +222,13 @@ def work_rows(c: DecoderComputation, run: str, scenario: str,
             fwd += f
         else:
             bwd += f
-    skipped_n = skipped_bytes = 0  # the products the commit takes from arrival digests
+    skipped_n = skipped_bytes = 0  # the product leaves the commit takes from arrival digests
     if c.device.type == "cuda":
         psize = torch.empty((), dtype=c.product_dtype).element_size()
-        for q in c.products:
-            if c.product_class(q) != "dK":
+        for pl in c.product_leaves:  # O18: a leaf is one lone product or a whole group
+            if c.product_class(c.product(pl.m0)) != "dK":
                 skipped_n += 1
-                skipped_bytes += psize * math.prod(q.p_shape)
+                skipped_bytes += psize * math.prod(pl.shape)
     rows: list[dict[str, Any]] = []
     for r in step_rows:
         t, leaves, nbytes = r["step"], r["leaves"], r["transcript_bytes"]

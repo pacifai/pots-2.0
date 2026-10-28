@@ -51,8 +51,8 @@ def test_digest_file_has_every_leaf_hash(tiny, tmp_path):
     raw = digests.read_bytes()
     assert len(raw) == c.n_leaves * 32 == rep["n_leaves"] * 32
     lay = rep["layout"]
-    assert lay["n_leaves"] == lay["n_s"] + 2 * lay["n_w"] + lay["M"]
-    assert len(lay["weight_names"]) == lay["n_w"] and len(lay["product_names"]) == lay["M"]
+    assert lay["n_leaves"] == lay["n_s"] + 2 * lay["n_w"] + lay["K"]
+    assert len(lay["weight_names"]) == lay["n_w"] and len(lay["product_leaf_names"]) == lay["K"]
 
 
 def test_two_runs_give_the_same_root(tiny, tmp_path):

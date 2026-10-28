@@ -94,8 +94,8 @@ def card_facts(device: str, run: Callable[..., Any] = subprocess.run) -> dict[st
 def section_root(c: DeclaredComputation, w_next: dict[str, torch.Tensor]
                  ) -> tuple[bytes, list[bytes]]:
     """The Merkle root over the ``W_{t+1}`` leaves' hashes alone, and those hashes, hashed as
-    leaves ``n_s + n_w + M …`` of the layout."""
-    first = c.n_s + c.n_w + c.M
+    leaves ``n_s + n_w + K …`` of the layout (O18: ``K`` product leaves)."""
+    first = c.n_s + c.n_w + c.n_product_leaves
     hashes = leaf_hashes_of(c, ((first + i, w_next[n]) for i, n in enumerate(c.weight_names)))
     return merkle_root(hashes), hashes
 
@@ -123,15 +123,15 @@ def run_card(c: DeclaredComputation, dataset: Sequence[Any], build_model: Callab
     _, tree = InMemoryStore.commit_step(c, step)
     commit_s = time.perf_counter() - t0
     hashes = [tree.node(i, i + 1) for i in range(c.n_leaves)]
-    first = c.n_s + c.n_w + c.M
+    first = c.n_s + c.n_w + c.n_product_leaves
     proved_root = merkle_root(hashes[first:first + c.n_w])
 
     report = {
         "version": VERSION, "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "card": card, "model": model,
-        "layout": {"n_s": c.n_s, "n_w": c.n_w, "M": c.M, "n_leaves": c.n_leaves,
-                   "weight_names": list(c.weight_names),
-                   "product_names": [c.product(m).name for m in range(1, c.M + 1)]},
+        "layout": {"n_s": c.n_s, "n_w": c.n_w, "M": c.M, "K": c.n_product_leaves,
+                   "n_leaves": c.n_leaves, "weight_names": list(c.weight_names),
+                   "product_leaf_names": [pl.name for pl in c.product_leaves]},
         "plain": {"w_next_root": plain_root.hex(), "loss": loss_plain},
         "proved": {"root": tree.root.hex(), "w_next_root": proved_root.hex(),
                    "loss": step.loss},

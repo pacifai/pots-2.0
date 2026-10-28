@@ -61,9 +61,14 @@ def _sharded_step(devices, device):
     return c, prove_step(c, model, w0, records)
 
 
+def _n_dk(c):
+    """The δK̃ product leaves (O18: a leaf is a lone product or a group)."""
+    return sum(1 for pl in c.product_leaves if c.product_class(c.product(pl.m0)) == "dK")
+
+
 def _digests_body(devices, device, *, cuda):
     """The kernel's digests equal the C library's (``kernel=False``), and so do the root and
-    (on CUDA) the arrival digests, which hold ``M`` less the δK̃ leaves."""
+    (on CUDA) the arrival digests, which hold ``K`` (the product leaves) less the δK̃ leaves."""
     from verification.commitment.leaves import (
         HashStats, commit_leaves, leaf_hashes_of, leaf_hashes_until_error)
 
@@ -81,16 +86,16 @@ def _digests_body(devices, device, *, cuda):
     digests, err = leaf_hashes_until_error(c, items)
     assert err is None and digests == want
     if cuda:
-        n_dk = sum(1 for s in c.products if c.product_class(s) == "dK")
+        n_dk = _n_dk(c)
         assert out.capture["hint_misses"] == 0, "a hint miss lowers the arrival count"
-        assert len(out.arrival_digests) == c.M - n_dk
+        assert len(out.arrival_digests) == c.n_product_leaves - n_dk
         assert all(want[i] == d for i, d in out.arrival_digests.items())
         cap = out.capture
         assert cap["arrival_hash"]["nonfinite"] == 0
         known = out.arrival_digests
     else:  # no arrival digests on the host: hand the commit the kernel's own, as the capture does
-        known = {c.product_index(m): want[c.product_index(m)] for m in range(1, c.M + 1)
-                 if c.product_class(c.product(m)) != "dK"}
+        known = {c.product_leaf_index(pl.g): want[c.product_leaf_index(pl.g)]
+                 for pl in c.product_leaves if c.product_class(c.product(pl.m0)) != "dK"}
     root = commit_leaves(c, leaves, known).root
     assert root == commit_leaves(c, leaves, kernel=False).root
     assert root == commit_leaves(c, leaves).root
@@ -100,9 +105,9 @@ def _routed_and_kept_body(devices, device):
     """Products copied to their hinted owner and products already there both take an arrival
     digest: with both devices owning layers, some outputs move and some stay."""
     c, out = _sharded_step(devices, device)
-    n_dk = sum(1 for s in c.products if c.product_class(s) == "dK")
+    n_dk = _n_dk(c)
     assert out.capture["hint_misses"] == 0, "a hint miss lowers the arrival count"
-    assert len(out.arrival_digests) == c.M - n_dk
+    assert len(out.arrival_digests) == c.n_product_leaves - n_dk
     owners = {out.leaves()[i].device for i in out.arrival_digests}
     assert len(owners) == 2
 

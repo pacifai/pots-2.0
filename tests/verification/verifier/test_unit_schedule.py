@@ -209,8 +209,14 @@ def assert_same(unit, canon):
 def _flipped(setup, *ms):
     leaves = list(setup.leaves)
     for m in ms:
-        i = setup.c.product_index(m)
-        leaves[i] = _flip(leaves[i])
+        g, i = setup.c.leaf_of(m)  # O18: a group's members are one 3-D leaf; flip member i
+        k = setup.c.product_leaf_index(g)
+        if i is None:
+            leaves[k] = _flip(leaves[k])
+        else:
+            leaf = leaves[k].clone()
+            leaf[i] = _flip(leaf[i])
+            leaves[k] = leaf
     return leaves
 
 
@@ -500,9 +506,11 @@ def _malformed(leaf):
 def test_a_malformed_leaf_is_rejected_alike(name, monkeypatch):
     setup = proved(CHEAP, 2)
     m = _m(setup.c, name)
+    g = setup.c.leaf_of(m)[0]
+    # a whole leaf (every attention member too: one leaf, O18) loses its last entry
     leaves = list(setup.leaves)
-    i = setup.c.product_index(m)
-    leaves[i] = _malformed(leaves[i])
+    j = setup.c.product_leaf_index(g)
+    leaves[j] = _malformed(leaves[j])
     unit, canon = both(setup, monkeypatch, leaves=leaves)
     assert canon.rejection is not None or canon.error is not None
     assert_same(unit, canon)
@@ -511,7 +519,7 @@ def test_a_malformed_leaf_is_rejected_alike(name, monkeypatch):
 @pytest.mark.parametrize("name", ["L1.Y_q", "L2.O[0,1]", "L2.G_down", "Lambda[0]", "L1.G_v"])
 def test_a_leaf_whose_version_is_bumped_after_check_2_is_rejected_alike(name, monkeypatch):
     setup = proved(CHEAP, 2)
-    i = setup.c.product_index(_m(setup.c, name))
+    i = setup.c.product_leaf_index(setup.c.leaf_of(_m(setup.c, name))[0])
     unit, canon = both(setup, monkeypatch, bump=(i,))
     assert canon.rejection is not None and canon.rejection[3] == "malformed"
     assert "StoreMutationError" in canon.rejection[2]

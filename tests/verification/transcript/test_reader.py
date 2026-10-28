@@ -1,278 +1,267 @@
-"""``stack_block``: ``torch.stack`` bit for bit, zero-copy when the leaves are one run."""
+"""``TranscriptView``'s product reads under O18: a member is a view of its group's leaf, a run of
+members is a slice of it, and every read equals ``torch.stack`` of ``product(m)`` bit for bit."""
 
 import pytest
 import torch
 
-from verification.transcript.errors import StoreMutationError
-from verification.transcript.reader import stack_block
+from tests.verification.decoder_helpers import tiny_config
+from verification.computation.instances import DecoderComputation
+from verification.transcript.errors import LeafShapeError, StoreMutationError
+from verification.transcript.reader import TranscriptView
 from verification.verifier.context import CommittedLeaves
 
 
-def _run(n=6, shape=(3, 5), dtype=torch.float32):
-    """n member leaves as views of one 64-byte-aligned bmm-like output."""
+class CountingReader:
+    def __init__(self, leaves):
+        self.leaves = leaves
+        self.reads = 0
+
+    def leaf(self, index):
+        self.reads += 1
+        return self.leaves[index]
+
+
+def _decoder(n_s=2, n=12):
+    return DecoderComputation(tiny_config(), n_s=n_s, n=n, eta=1e-3)
+
+
+def _leaves(c, dtype=torch.float32):
+    """Random leaves of the declared shapes; the non-product ones are stand-ins."""
     torch.manual_seed(0)
-    big = torch.randn(n, *shape).to(dtype)
-    assert big.data_ptr() % 64 == 0
-    return big, [big[i] for i in range(n)]
+    objs = [torch.zeros(1) for _ in range(c.n_leaves)]
+    for pl in c.product_leaves:
+        objs[c.product_leaf_index(pl.g)] = torch.randn(pl.shape).to(dtype)
+    return objs
 
 
-def test_consecutive_views_come_back_as_one_view_of_the_storage():
-    big, ts = _run()
-    out = stack_block(ts)
-    assert torch.equal(out, torch.stack(ts))
-    assert out._base is not None and out.data_ptr() == big.data_ptr()
+@pytest.fixture
+def setup():
+    c = _decoder()
+    objs = _leaves(c)
+    reader = CountingReader(objs)
+    return c, TranscriptView(c, reader), objs, reader
+
+
+def _leaf(c, objs, g):
+    return objs[c.product_leaf_index(g)]
+
+
+def _group(c, role, layer=1):
+    return next(pl for pl in c.product_leaves
+                if pl.grouped and pl.name == f"L{layer}.{role}")
+
+
+def _loop(view, ms):
+    return torch.stack([view.product(m) for m in ms])
+
+
+def _same_as_loop(got, ms, view):
+    """``got()`` equals the loop over ``ms``, or raises what the loop raises."""
+    try:
+        want = _loop(view, ms)
+    except Exception as e:  # noqa: BLE001
+        with pytest.raises(type(e)) as raised:
+            got()
+        assert str(raised.value) == str(e)
+        return
+    assert torch.equal(got(), want)
+
+
+def _shares(a, b):
+    return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_sub_run_and_size_one_dims_equal_stack(dtype):
-    big, ts = _run(8, (1, 4), dtype)
-    out = stack_block(ts[2:5])
-    assert torch.equal(out, torch.stack(ts[2:5])) and out.dtype == dtype
-
-
-def test_fallbacks_equal_stack_and_own_their_memory():
-    big, ts = _run()
-    cases = {
-        "gap": [ts[0], ts[2], ts[3]],
-        "reversed": ts[::-1],
-        "mixed storage": [ts[0], ts[1].clone()],
-        "non-contiguous": [big.transpose(1, 2)[i] for i in range(3)],
-        "empty tensors": [torch.zeros(0, 3)] * 3,
-    }
-    for name, c in cases.items():
-        out = stack_block(c)
-        assert torch.equal(out, torch.stack(c)), name
-        assert out._base is None, name
-
-
-def test_misaligned_base_takes_the_stack_path():
-    buf = torch.randn(2 * 15 + 16)
-    off = next(o for o in range(16) if buf[o:].data_ptr() % 64)
-    ts = [buf[off + 15 * i:off + 15 * (i + 1)].view(3, 5) for i in range(2)]
-    out = stack_block(ts)
-    assert torch.equal(out, torch.stack(ts)) and out._base is None
-
-
-def test_empty_sequence_raises_as_stack_does():
-    with pytest.raises(RuntimeError):
-        stack_block([])
-
-
-def test_committed_leaves_block_checks_every_version():
-    big, ts = _run()
-    leaves = CommittedLeaves()
-    for t in ts:
-        leaves.add(t)
-    assert torch.equal(leaves.tensor_block(range(6)), torch.stack(ts))
-    for bad in (-1, 6):
-        with pytest.raises(RuntimeError, match="outside"):
-            leaves.tensor_block([0, bad])
-    ts[3].add_(1)  # a write through any alias moves the shared counter
-    with pytest.raises(StoreMutationError, match="changed in place"):
-        leaves.tensor_block(range(6))
-
-
-def test_own_copies_the_run_even_for_detached_leaves():
-    """``detach()`` leaves have no ``_base``, so ownership is asked for, not inferred."""
-    big, ts = _run()
-    ts = [t.detach() for t in ts]
-    assert all(t._base is None for t in ts)
-    out = stack_block(ts, own=True)
-    assert torch.equal(out, torch.stack(ts)) and out.data_ptr() != big.data_ptr()
-    assert stack_block(ts).data_ptr() == big.data_ptr()
-    leaves = CommittedLeaves()
-    for t in ts:
-        leaves.add(t)
-    assert leaves.tensor_block(range(6), own=True).data_ptr() != big.data_ptr()
-
-
-def test_product_block_through_a_committed_view_checks_a_middle_leaf():
-    from verification.computation.instances.decoder import DecoderComputation
-    from verification.transcript.reader import TranscriptView
-    from tests.verification.computation.test_decoder import tiny_config
-
-    c = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3)
-    ms = [c.m_of(f"L1.S[{s},{h}]") for s, h in c._members()]
-    leaves = CommittedLeaves()
-    idx = {c.product_index(m) for m in ms}
-    big = torch.randn(len(ms), 12, 12)
-    for i in range(c.product_index(max(ms)) + 1):  # leaves before the run: stand-ins
-        leaves.add(big[ms.index(next(m for m in ms if c.product_index(m) == i))]
-                   if i in idx else torch.zeros(1))
-    view = TranscriptView(c, leaves)
-    want = torch.stack([view.product(m) for m in ms])
-    assert torch.equal(view.product_block(ms), want)
-    assert torch.equal(view.product_block(ms, own=True), want)
-    mid = view.product(ms[len(ms) // 2])
-    mid.add_(1)
-    with pytest.raises(StoreMutationError, match="changed in place"):
-        view.product_block(ms)
-
-
-# ---- product_run: the range read -------------------------------------------------------------
-
-
-def _decoder_view(roles, n_s=2, n=12):
-    """A committed view over a tiny decoder whose products ``roles`` (a list of
-    ``(first_m, stride)``, one tensor storage each) hold member leaves ``m0 + stride·i``;
-    every other leaf is a one-element stand-in. Returns ``(c, view, leaves, storages)``."""
-    from verification.computation.instances.decoder import DecoderComputation
-    from verification.transcript.reader import TranscriptView
-    from tests.verification.computation.test_decoder import tiny_config
-
-    c = DecoderComputation(tiny_config(), n_s=n_s, n=n, eta=1e-3)
-    n_mem = c.n_s * c.n_h
-    total = c.n_s + len(c.weight_names) + c.M + len(c.weight_names)
-    objs, storages = [torch.zeros(1) for _ in range(total)], []
-    for m0, stride in roles:
-        big = torch.randn(n_mem, *c.product(m0).p_shape)
-        assert big.data_ptr() % 64 == 0
-        storages.append(big)
-        for i in range(n_mem):
-            objs[c.product_index(m0 + stride * i)] = big[i]
-    leaves = CommittedLeaves()
-    for o in objs:
-        leaves.add(o)
-    return c, TranscriptView(c, leaves), leaves, storages
-
-
-def _member_run(role, layer=1):
-    """The decoder's own ``(m₀, stride)`` of one attention run."""
-    from verification.computation.instances.decoder import DecoderComputation
-    from tests.verification.computation.test_decoder import tiny_config
-
-    return DecoderComputation(tiny_config(), n_s=2, n=12, eta=1e-3).member_runs[layer, role]
-
-
-def _loop(view, m0, stride, n):
-    return torch.stack([view.product(m0 + stride * i) for i in range(n)])
+def test_product_is_the_leaf_or_a_view_of_it(dtype):
+    c = _decoder()
+    objs = _leaves(c, dtype)
+    view = TranscriptView(c, CountingReader(objs))
+    for m in range(1, c.M + 1):
+        g, i = c.leaf_of(m)
+        leaf = _leaf(c, objs, g)
+        got = view.product(m)
+        if i is None:
+            assert got is leaf
+        else:
+            assert torch.equal(got, leaf[i]) and _shares(got, leaf)
+            assert got.shape == c.product(m).p_shape
 
 
 @pytest.mark.parametrize("own", [False, True])
-def test_product_run_equals_the_loop_for_a_contiguous_run(own):
-    m0, st = _member_run("S")
-    c, view, _, (big,) = _decoder_view([(m0, st)])
-    n = c.n_s * c.n_h
-    out = view.product_run(m0, st, n, own=own)
-    assert out.dtype == big.dtype and torch.equal(out, _loop(view, m0, st, n))
-    assert (out.data_ptr() != big.data_ptr()) == own  # zero-copy unless asked for its own
-    sub = view.product_run(m0 + 2, st, n - 4, own=own)  # a window, read off the first proof
-    assert torch.equal(sub, _loop(view, m0 + 2, st, n - 4)) and sub.is_contiguous()
+@pytest.mark.parametrize("role", ["S", "O", "dA", "dV", "dQ", "dK"])
+def test_product_run_is_a_slice_of_the_group_leaf(setup, role, own):
+    c, view, objs, _ = setup
+    pl = _group(c, role)
+    leaf = _leaf(c, objs, pl.g)
+    for first, count, mult in ((0, pl.n, 1), (2, 3, 1), (1, 3, 2), (pl.n - 1, 1, 1)):
+        m0 = pl.m0 + pl.stride * first
+        if first + mult * (count - 1) >= pl.n:
+            continue
+        got = view.product_run(m0, pl.stride * mult, count, own=own)
+        want = _loop(view, [m0 + pl.stride * mult * t for t in range(count)])
+        assert got.shape == (count, *pl.shape[1:]) and torch.equal(got, want)
+        assert _shares(got, leaf) is (not own and mult == 1 and got.data_ptr() % 64 == 0)
+        assert got.is_contiguous()
 
 
-def test_product_run_stride_two_interleaved_roles():
-    """Two roles alternate per member (δQ̃, δK̃): each is a stride-2 run of its own storage."""
-    (q0, st), (k0, _) = _member_run("dQ"), _member_run("dK")
-    assert st == 2 and k0 == q0 + 1
-    c, view, _, (bq, bk) = _decoder_view([(q0, st), (k0, st)])
-    n = c.n_s * c.n_h
-    for m0, big in ((q0, bq), (k0, bk)):
-        out = view.product_run(m0, 2, n)
-        assert torch.equal(out, _loop(view, m0, 2, n)) and out.data_ptr() == big.data_ptr()
-        assert torch.equal(view.product_run(m0 + 2, 2, 3, own=True), _loop(view, m0 + 2, 2, 3))
-    # Across the two roles the leaves are not one run: the loop's bits through the fallback.
-    assert torch.equal(view.product_run(q0, 1, 2 * n), _loop(view, q0, 1, 2 * n))
+def test_product_run_across_groups_or_lone_products_equals_the_loop(setup):
+    c, view, objs, _ = setup
+    s = _group(c, "S")
+    for m0, stride, n in ((s.m0 + s.stride * (s.n - 2), 1, 5),  # runs out of the group
+                          (s.m0, s.stride * 2 + 1, 3),  # a stride the group doesn't divide
+                          (c.m_of("L1.Y_gate"), 1, 2),  # lone products
+                          (c.m_of("L1.Y_gate"), 1, 1)):
+        _same_as_loop(lambda: view.product_run(m0, stride, n),
+                      [m0 + stride * t for t in range(n)], view)
+    with pytest.raises(RuntimeError):  # n = 0: stack of nothing, as the loop
+        view.product_run(s.m0, 1, 0)
 
 
-def test_product_run_fallbacks_match_the_loop():
-    m0, st = _member_run("S")
-    c, view, _, _ = _decoder_view([(m0, st)])
-    assert torch.equal(view.product_run(m0 + 1, st, 1), _loop(view, m0 + 1, st, 1))
-    # Leaves of another shape (a member next to a stand-in) take torch.stack, and its error.
-    with pytest.raises(RuntimeError) as want:
-        _loop(view, m0, c.M - m0, 2)
-    with pytest.raises(RuntimeError) as got:
-        view.product_run(m0, c.M - m0, 2)
-    assert str(got.value) == str(want.value)
-    with pytest.raises(RuntimeError):  # n = 0: stack of nothing
-        view.product_run(m0, 1, 0)
-
-
-def test_product_run_bad_index_raises_what_the_loop_raises():
-    c, view, _, _ = _decoder_view([_member_run("S")])
+def test_product_run_bad_index_raises_what_the_loop_raises(setup):
+    c, view, _, reader = setup
     for m0, stride, n in ((0, 1, 3), (c.M - 1, 1, 4), (c.M + 1, 1, 1), (1, 7, c.M)):
         with pytest.raises(IndexError) as want:
-            _loop(view, m0, stride, n)
+            _loop(view, [m0 + stride * t for t in range(n)])
+        reader.reads = 0
         with pytest.raises(IndexError) as got:
             view.product_run(m0, stride, n)
         assert str(got.value) == str(want.value), (m0, stride, n)
+        assert reader.reads == 0  # raised before any read
 
 
-def test_product_run_tampered_middle_leaf_raises_the_per_leaf_message():
-    m0, st = _member_run("dQ")
-    c, view, leaves, (big,) = _decoder_view([(m0, st)])
-    n = c.n_s * c.n_h
-    assert torch.equal(view.product_run(m0, st, n), _loop(view, m0, st, n))  # proof made
-    big[n // 2].add_(1)
-    with pytest.raises(StoreMutationError) as want:
-        _loop(view, m0, st, n)
-    with pytest.raises(StoreMutationError) as got:
-        view.product_run(m0, st, n)
-    assert str(got.value) == str(want.value)
-    assert f"leaf {c.product_index(m0)} changed" in str(got.value)  # first changed in order
+@pytest.mark.parametrize("own", [False, True])
+def test_product_block_progression_is_a_slice_other_orders_stack(setup, own):
+    c, view, objs, _ = setup
+    pl = _group(c, "dV")
+    leaf = _leaf(c, objs, pl.g)
+    at = lambda i: pl.m0 + pl.stride * i  # noqa: E731
+    for idx in ([0, 1, 2], [1, 3, 5], [4], list(range(pl.n))):
+        got = view.product_block([at(i) for i in idx], own=own)
+        assert torch.equal(got, _loop(view, [at(i) for i in idx]))
+        spaced = len(idx) < 2 or idx[1] - idx[0] == 1  # O18: only consecutive members view
+        assert _shares(got, leaf) is (not own and spaced and got.data_ptr() % 64 == 0)
+    for idx in ([2, 1, 0], [0, 2, 3], [1, 1], [0, 0, 0]):  # not an increasing progression
+        got = view.product_block([at(i) for i in idx], own=own)
+        assert torch.equal(got, _loop(view, [at(i) for i in idx]))
+        assert not _shares(got, leaf)
+    mixed = [at(0), c.m_of("L1.Y_gate"), at(1)]
+    _same_as_loop(lambda: view.product_block(mixed), mixed, view)
+    two = [at(0), _group(c, "dA").m0]  # two groups
+    _same_as_loop(lambda: view.product_block(two), two, view)
 
 
-def test_product_run_proof_is_not_stale_after_a_write():
-    """A write after a successful read must raise on the next one, for the whole range and
-    for a window of it, and the cache of a fresh ``CommittedLeaves`` starts empty."""
-    m0, st = _member_run("O")
-    c, view, leaves, (big,) = _decoder_view([(m0, st)])
-    n = c.n_s * c.n_h
-    view.product_run(m0, st, n)
-    view.product_run(m0 + 3, st, 3)
-    assert leaves._runs
-    big[0].mul_(2)
-    for args in ((m0, st, n), (m0 + 3, st, 3), (m0 + 4, st, 2)):
-        with pytest.raises(StoreMutationError, match="changed in place"):
-            view.product_run(*args)
-    assert not CommittedLeaves()._runs
+@pytest.mark.parametrize("own", [False, True])
+def test_a_lone_single_product_block_is_a_view(setup, own):
+    c, view, objs, _ = setup
+    m = c.m_of("L1.Y_o")
+    got = view.product_block([m], own=own)
+    leaf = _leaf(c, objs, c.leaf_of(m)[0])
+    assert got.shape == (1, *leaf.shape) and torch.equal(got[0], leaf)
+    assert _shares(got, leaf) is (not own)
+    pair = [c.m_of("L1.Y_gate"), c.m_of("L1.Y_up")]
+    assert torch.equal(view.product_block(pair), _loop(view, pair))
 
 
-def test_product_run_through_a_reader_without_tensor_run():
-    m0, st = _member_run("dV")
-    c, view, leaves, _ = _decoder_view([(m0, st)])
-    n = c.n_s * c.n_h
-
-    class Plain:
-        def leaf(self, i):
-            return leaves.leaf(i)
-
-    from verification.transcript.reader import TranscriptView
-    plain = TranscriptView(c, Plain())
-    assert torch.equal(plain.product_run(m0, st, n), _loop(view, m0, st, n))
-    assert torch.equal(plain.product_run(m0, st, n, own=True), _loop(view, m0, st, n))
+def test_product_block_bad_m_raises_before_any_read(setup):
+    c, view, _, reader = setup
+    for ms in ([1, 0], [c.M + 1], [1, 2, c.M + 1]):
+        reader.reads = 0
+        with pytest.raises(IndexError):
+            view.product_block(ms)
+        assert reader.reads == 0
+    with pytest.raises(RuntimeError):
+        view.product_block([])
 
 
-def test_product_run_catches_a_write_when_leaves_have_their_own_version_counters():
-    """``torch.load`` rebuilds tensors over one shared storage, each with its own ``_version``:
-    a write into a middle leaf moves only that leaf's counter, and the range read must see it."""
-    import io
+def test_a_group_leaf_of_the_wrong_shape_or_type_is_rejected(setup):
+    c, view, objs, reader = setup
+    pl = _group(c, "S")
+    i = c.product_leaf_index(pl.g)
+    good = objs[i]
+    objs[i] = good[0]  # one member, not the group
+    for read in (lambda: view.product_leaf(pl.g), lambda: view.product(pl.m0),
+                 lambda: view.product_run(pl.m0, 1, 2), lambda: view.product_block([pl.m0])):
+        with pytest.raises(LeafShapeError, match="declared"):
+            read()
+    objs[i] = "not a tensor"
+    with pytest.raises(LeafShapeError, match="expected a tensor"):
+        view.product(pl.m0)
+    objs[i] = good
+    assert view.product_leaf(pl.g) is good
 
-    m0, st = _member_run("dQ")
-    c, view, _, (big,) = _decoder_view([(m0, st)])
-    n = c.n_s * c.n_h
-    buf = io.BytesIO()
-    torch.save(list(big.unbind(0)), buf)
-    buf.seek(0)
-    loaded = torch.load(buf)
-    assert len({t.untyped_storage().data_ptr() for t in loaded}) == 1
-    leaves = CommittedLeaves()
-    for i in range(c.product_index(m0)):
-        leaves.add(torch.zeros(1))
-    for i in range(n):
-        leaves.add(loaded[i])
-        if i < n - 1:
-            for _ in range(st - 1):
-                leaves.add(torch.zeros(1))
-    from verification.transcript.reader import TranscriptView
-    v = TranscriptView(c, leaves)
-    assert torch.equal(v.product_run(m0, st, n), torch.stack(loaded))
-    before = [t._version for t in loaded]
-    loaded[n // 2].add_(1)
-    after = [t._version for t in loaded]
-    assert [i for i in range(n) if after[i] != before[i]] == [n // 2]  # only its own counter
-    with pytest.raises(StoreMutationError) as want:
-        torch.stack([v.product(m0 + st * i) for i in range(n)])
-    with pytest.raises(StoreMutationError) as got:
-        v.product_run(m0, st, n)
-    assert str(got.value) == str(want.value)
+
+def test_a_write_to_a_committed_group_leaf_is_caught_through_committed_leaves(setup):
+    c, _, objs, _ = setup
+    committed = CommittedLeaves()
+    for o in objs:
+        committed.add(o)
+    view = TranscriptView(c, committed)
+    pl = _group(c, "dA")
+    run = view.product_run(pl.m0, pl.stride, pl.n)
+    block = view.product_block([pl.m0, pl.m0 + pl.stride])
+    member = view.product(pl.m0 + pl.stride)
+    assert torch.equal(run[1], member) and torch.equal(block[1], member)
+    member.add_(1.0)  # an in-place write through a member view moves the leaf's version
+    i = c.product_leaf_index(pl.g)
+    for read in (lambda: view.product(pl.m0), lambda: view.product_run(pl.m0, pl.stride, 2),
+                 lambda: view.product_block([pl.m0]), lambda: view.product_leaf(pl.g)):
+        with pytest.raises(StoreMutationError, match=f"leaf {i} changed"):
+            read()
+
+
+def test_a_write_to_a_lone_committed_leaf_is_caught(setup):
+    c, _, objs, _ = setup
+    committed = CommittedLeaves()
+    for o in objs:
+        committed.add(o)
+    view = TranscriptView(c, committed)
+    m = c.m_of("L1.Y_o")
+    view.product(m).mul_(2.0)
+    with pytest.raises(StoreMutationError):
+        view.product(m)
+    with pytest.raises(StoreMutationError):
+        view.product_block([m])
+
+
+def test_a_step_two_slice_comes_back_as_an_aligned_contiguous_copy(setup):
+    c, view, objs, _ = setup
+    pl = _group(c, "S")
+    leaf = _leaf(c, objs, pl.g)
+    got = view.product_run(pl.m0, pl.stride * 2, 3)
+    assert got.is_contiguous() and got.data_ptr() % 64 == 0 and not _shares(got, leaf)
+    assert torch.equal(got, torch.stack([leaf[0], leaf[2], leaf[4]]))
+
+
+def test_an_unaligned_start_comes_back_as_a_copy_at_an_aligned_address(setup):
+    c, view, objs, _ = setup
+    pl = _group(c, "S")
+    leaf = _leaf(c, objs, pl.g)
+    # a member run starting 4 bytes off a 64-byte boundary: shift the whole leaf by one float
+    raw = torch.empty(leaf.numel() + 16, dtype=leaf.dtype)
+    base = (-raw.data_ptr() // leaf.element_size()) % 16
+    shifted = raw[base + 1:base + 1 + leaf.numel()].view(leaf.shape)
+    shifted.copy_(leaf)
+    assert shifted.data_ptr() % 64 == leaf.element_size()
+    objs[c.product_leaf_index(pl.g)] = shifted
+    got = view.product_run(pl.m0, pl.stride, 3)
+    assert not _shares(got, shifted) and got.data_ptr() % 64 == 0 and got.is_contiguous()
+    assert torch.equal(got, torch.stack([leaf[0], leaf[1], leaf[2]]))
+    lone = c.m_of("L1.Y_o")  # a lone product's unsqueeze follows the same rule
+    lone_leaf = _leaf(c, objs, c.leaf_of(lone)[0])
+    objs[c.product_leaf_index(c.leaf_of(lone)[0])] = raw2 = torch.empty(
+        lone_leaf.numel() + 16, dtype=lone_leaf.dtype)
+    shifted2 = raw2[((-raw2.data_ptr() // raw2.element_size()) % 16) + 1:][:lone_leaf.numel()]
+    shifted2 = shifted2.view(lone_leaf.shape)
+    shifted2.copy_(lone_leaf)
+    objs[c.product_leaf_index(c.leaf_of(lone)[0])] = shifted2
+    one = view.product_block([lone])
+    assert one.data_ptr() % 64 == 0 and torch.equal(one[0], lone_leaf)
+
+
+def test_a_whole_leaf_comes_back_as_a_view_without_a_copy(setup):
+    c, view, objs, _ = setup
+    pl = _group(c, "S")
+    leaf = _leaf(c, objs, pl.g)
+    assert leaf.data_ptr() % 64 == 0
+    got = view.product_run(pl.m0, pl.stride, pl.n)
+    assert got.data_ptr() == leaf.data_ptr() and got.shape == leaf.shape

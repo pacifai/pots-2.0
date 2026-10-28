@@ -84,7 +84,7 @@ def test_hint_matches_every_product_owner(switch, dtype):
     record's output was hinted to its product's owner, over a model with units on all three."""
     fake = ("cuda:0", "cuda:1", "cuda:2")
     c = tiny(switch, B=2, dtype=dtype, devices=fake, layers=4)
-    assert len({c.placement.product_device(m) for m in range(1, c.M + 1)}) == 3
+    assert len({c.placement.product_leaf_device(g) for g in range(c.n_product_leaves)}) == 3
     w0, records = start(c), make_records((12, 7))
     model = c.build_model()
     model.zero_grad(set_to_none=True)
@@ -97,7 +97,7 @@ def test_hint_matches_every_product_owner(switch, dtype):
     with cap:
         c.forward_backward(model, records, stage)
     labeled = c.label(cap, model)
-    assert cap.count_hint_misses(labeled, c.placement.product_device) == 0
+    assert cap.count_hint_misses(labeled, c.placement.product_leaf_device) == 0
     assert cap.summary()["hint_misses"] == 0
     hinted = {r.hint for r in cap.records}
     assert hinted == {torch.device(d) for d in fake}
@@ -120,9 +120,50 @@ def test_a_perturbed_product_lands_at_its_declared_check():
     m = on.m_of("L1.G_q")
     bump = lambda t: t + 1.0
     a, b = run(off, w0, records), run(on, w0, records, perturb={m: bump})
-    assert b.products[m - 1].device == on.placement.product_device(m)
-    assert same(b.products[m - 1], bump(a.products[m - 1]))
-    assert all(same(x, y) for i, (x, y) in enumerate(zip(a.products, b.products)) if i != m - 1)
+    g = on.leaf_of(m)[0]
+    assert b.products[g].device == on.placement.product_leaf_device(g)
+    assert same(b.products[g], bump(a.products[g]))
+    assert all(same(x, y) for i, (x, y) in enumerate(zip(a.products, b.products)) if i != g)
+    b.assert_unmodified()
+
+
+def test_a_perturbed_member_is_written_into_a_copy_of_its_leaf(monkeypatch):
+    """O18: perturbing members of one batched product changes only those members of the leaf
+    (one clone per group, shared by both), and the other leaves are untouched."""
+    c = tiny(("llama", True), devices=THREE)
+    w0, records = start(c), make_records((12, 7))
+    m1, m2, m3 = c.m_of("L1.S[0,1]"), c.m_of("L1.S[1,0]"), c.m_of("L1.dK[1,1]")
+    bump = lambda t: t + 1.0
+    a = run(c, w0, records)
+    labeled, before = [], []
+    real_label = type(c).label
+
+    def spy(self, cap, model):
+        out = real_label(self, cap, model)
+        labeled.extend(out)
+        before.extend(t.clone() for t in out)  # the honest leaves, as labeling returned them
+        return out
+
+    monkeypatch.setattr(type(c), "label", spy)
+    b = run(c, w0, records, perturb={m1: bump, m2: bump, m3: bump})
+    g, i1 = c.leaf_of(m1)
+    # The honest captured tensors are untouched: the perturbation wrote into copies.
+    assert all(torch.equal(x, y) for x, y in zip(labeled, before))
+    # No digest survives for a perturbed leaf (on the CPU none exist at all, so this is empty).
+    assert not {c.product_leaf_index(g), c.product_leaf_index(c.leaf_of(m3)[0])} \
+        & set(b.arrival_digests)
+    assert c.leaf_of(m2)[0] == g and c.leaf_of(m2)[1] != i1
+    changed = {g, c.leaf_of(m3)[0]}
+    for k, (x, y) in enumerate(zip(a.products, b.products)):
+        if k not in changed:
+            assert same(x, y), k
+    assert b.products[g].device == c.placement.product_leaf_device(g)
+    assert b.products[g].is_contiguous()
+    for i in range(c.product_leaf(g).n):
+        want = bump(a.products[g][i]) if i in (i1, c.leaf_of(m2)[1]) else a.products[g][i]
+        assert same(b.products[g][i], want), i
+    g3, i3 = c.leaf_of(m3)
+    assert same(b.products[g3][i3], bump(a.products[g3][i3]))
     b.assert_unmodified()
 
 
@@ -140,14 +181,14 @@ def test_with_w_next_and_w_t_sharing_stay_on_the_weight_device():
 
 def test_a_perturbation_built_on_another_device_stays_on_the_owner():
     """A fault function may return a tensor from ``torch.zeros(shape)``, on the host; the leaf
-    still sits on ``product_device(m)``. The placement's devices are ``meta`` here, which the
+    still sits on its leaf's device. The placement's devices are ``meta`` here, which the
     Mac has and the host is not."""
     c = tiny(("llama", True), devices=("meta", "meta", "meta"))
     w0, records = start(c), make_records((12, 7))
     m = c.m_of("L1.G_q")
     out = run(c, w0, records,
               perturb={m: lambda t: torch.zeros(t.shape, dtype=t.dtype)})
-    assert out.products[m - 1].device.type == "meta"
+    assert out.products[c.leaf_of(m)[0]].device.type == "meta"
     assert all(p.device.type == "meta" for p in out.products)
 
 
@@ -172,8 +213,8 @@ def test_two_gpus_every_leaf_on_its_owner_and_digests_equal(B, dtype, monkeypatc
     out = run(on, {n: t.to(on.placement.weight_device(n)) for n, t in w0.items()}, records)
     assert out.hint_misses == 0 and out.capture["hint_misses"] == 0
     assert takes == []  # no host buffer was taken during the sharded capture
-    for m, p in enumerate(out.products, 1):
-        assert p.device == on.placement.product_device(m), m
+    for g, p in enumerate(out.products):
+        assert p.device == on.placement.product_leaf_device(g), g
     for n in on.weight_names:
         assert out.w_t[n].device == out.w_next[n].device == on.placement.weight_device(n)
     # Same bytes as the host-buffer run, leaf by leaf (leaf_hash of a device leaf is FS32b's).

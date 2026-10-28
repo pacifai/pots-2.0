@@ -3,13 +3,17 @@ import dataclasses
 import pytest
 import torch
 
+from tests.verification.decoder_helpers import tiny_config
+from verification.computation.instances import DecoderComputation
 from verification.computation.instances.mlp import MLPComputation
 from verification.computation.interface import (
     DeclaredComputation,
     ProductKind,
+    ProductLeaf,
     ProductSpec,
     chain_gradient,
 )
+from verification.transcript.errors import LeafShapeError
 from verification.transcript.reader import LeafReader, TranscriptView
 
 
@@ -87,12 +91,15 @@ def test_layout_partitions_leaf_range():
     c = MLPComputation((5, 7, 6, 3), n_s=3, eta=0.1)
     idx = [c.record_index(i) for i in range(c.n_s)]
     idx += [c.w_t_index(n) for n in c.weight_names]
-    idx += [c.product_index(m) for m in range(1, c.M + 1)]
+    idx += [c.product_leaf_index(g) for g in range(c.n_product_leaves)]
     idx += [c.w_next_index(n) for n in c.weight_names]
     assert idx == list(range(c.n_leaves))
-    assert c.n_leaves == c.n_s + 2 * c.n_w + c.M
+    assert c.n_leaves == c.n_s + 2 * c.n_w + c.M  # no groups: K = M
+    assert c.n_product_leaves == c.M
     with pytest.raises(IndexError):
-        c.product_index(c.M + 1)
+        c.product_leaf_index(c.n_product_leaves)
+    with pytest.raises(IndexError):
+        c.product_leaf_index(-1)
     with pytest.raises(IndexError):
         c.record_index(c.n_s)
 
@@ -100,13 +107,161 @@ def test_layout_partitions_leaf_range():
 def test_transcript_view_names_leaves():
     c = MLPComputation((5, 7, 3), n_s=2, eta=0.1)
     leaves = [f"leaf{i}" for i in range(c.n_leaves)]
+    for p in c.products:
+        leaves[c.product_leaf_index(p.m - 1)] = torch.zeros(p.p_shape)
     r = ListReader(leaves)
     assert isinstance(r, LeafReader)
     v = TranscriptView(c, r)
     assert v.records() == ["leaf0", "leaf1"]
     assert v.w_t(c.weight_names[1]) == "leaf3"
-    assert v.product(1) == "leaf4"
+    assert v.product(1) is leaves[c.n_s + c.n_w]
     assert v.w_next(c.weight_names[0]) == leaves[c.n_s + c.n_w + c.M]
+
+
+# ---- O18: product leaves -----------------------------------------------------------------
+
+
+def _tiny_decoder(layers=3, B=1, n_s=2, cls=DecoderComputation):
+    config = tiny_config()
+    config.num_hidden_layers = layers
+    return cls(config, n_s=n_s, n=8, eta=1e-3, head_blocks=B)
+
+
+def _expected_leaves(c):
+    """The product leaves by a plain walk over the inventory."""
+    group_at = {g[0]: g for g in c.product_groups}
+    out, skip = [], set()
+    for p in c.products:
+        if p.m in skip:
+            continue
+        if p.m in group_at:
+            _, stride, n = group_at[p.m]
+            skip.update(p.m + stride * i for i in range(n))
+            out.append((p.m, stride, n, True, (n, *p.p_shape), p.name.split("[")[0]))
+        else:
+            out.append((p.m, 1, 1, False, p.p_shape, p.name))
+    return out
+
+
+@pytest.mark.parametrize("B", [1, 2])
+def test_product_leaves_order_and_shapes(B):
+    c = _tiny_decoder(layers=3, B=B)
+    got = [(pl.m0, pl.stride, pl.n, pl.grouped, pl.shape, pl.name) for pl in c.product_leaves]
+    assert got == _expected_leaves(c)
+    assert all(isinstance(pl, ProductLeaf) and pl.g == g for g, pl in enumerate(c.product_leaves))
+    assert [pl.m0 for pl in c.product_leaves] == sorted(pl.m0 for pl in c.product_leaves)
+    n_mem = c.n_s * c.n_h
+    grouped = [pl for pl in c.product_leaves if pl.grouped]
+    assert len(grouped) == 6 * 3 and all(pl.n == n_mem for pl in grouped)
+    assert {pl.name.split(".")[-1] for pl in grouped} == {"S", "O", "dA", "dV", "dQ", "dK"}
+    assert all("[" not in pl.name for pl in grouped)
+    assert c.n_product_leaves == 27 * 3 + 3 * B  # 27 L + 3 B
+    assert c.n_leaves == c.n_s + 2 * c.n_w + c.n_product_leaves
+    assert c.w_next_index(c.weight_names[0]) == c.n_s + c.n_w + c.n_product_leaves
+    assert c.w_t_index(c.weight_names[0]) == c.n_s
+    assert c.product_leaf_index(0) == c.n_s + c.n_w
+    assert c.product_leaf_index(c.n_product_leaves - 1) == c.w_next_index(c.weight_names[0]) - 1
+
+
+@pytest.mark.parametrize("B", [1, 2])
+def test_leaf_of_round_trips_and_each_m_is_in_one_leaf(B):
+    c = _tiny_decoder(layers=3, B=B)
+    seen = []
+    for m in range(1, c.M + 1):
+        g, i = c.leaf_of(m)
+        pl = c.product_leaf(g)
+        assert type(g) is int and (i is None or type(i) is int)
+        assert (i is not None) == pl.grouped
+        assert pl.ms[0 if i is None else i] == m
+        seen.append(m)
+    assert sum(pl.n for pl in c.product_leaves) == c.M
+    assert sorted(m for pl in c.product_leaves for m in pl.ms) == list(range(1, c.M + 1))
+    for bad in (0, c.M + 1, -1):
+        with pytest.raises(IndexError, match="outside"):
+            c.leaf_of(bad)
+    for bad in (-1, c.n_product_leaves):
+        with pytest.raises(IndexError):
+            c.product_leaf(bad)
+
+
+def test_one_member_group_is_still_a_group():
+    config = tiny_config()
+    config.num_hidden_layers = 1
+    config.num_attention_heads = config.num_key_value_heads = 1
+    c = DecoderComputation(config, n_s=1, n=8, eta=1e-3)
+    grouped = [pl for pl in c.product_leaves if pl.grouped]
+    assert len(grouped) == 6 and all(pl.n == 1 and len(pl.shape) == 3 for pl in grouped)
+
+
+def test_decoder_product_groups_are_the_member_runs_sorted():
+    c = _tiny_decoder(layers=2)
+    n = c.n_s * c.n_h
+    assert c.product_groups == tuple(sorted((m0, st, n) for m0, st in c.member_runs.values()))
+    assert len(c.product_groups) == 12
+
+
+def test_decoder_product_groups_raise_for_a_member_outside_every_run():
+    class Uneven(DecoderComputation):
+        @property
+        def member_runs(self):
+            runs = dict(super().member_runs)
+            runs.pop((1, "S"))
+            return runs
+
+    with pytest.raises(ValueError, match="no evenly spaced run"):
+        _tiny_decoder(cls=Uneven)
+
+
+def _with_groups(groups):
+    class Bad(DecoderComputation):
+        @property
+        def product_groups(self):
+            return groups(super().product_groups)
+
+    return Bad
+
+
+@pytest.mark.parametrize("name,edit,match", [
+    ("mixed shapes", lambda gs: ((gs[0][0], gs[0][1] + 1, gs[0][2]), *gs[1:]), "differs|overlaps"),
+    ("overlap", lambda gs: (*gs, gs[0]), "overlaps"),
+    ("ungrouped member", lambda gs: gs[1:], "in no product group"),
+    ("empty group", lambda gs: ((gs[0][0], gs[0][1], 0), *gs[1:]), "at least 1"),
+    ("zero stride", lambda gs: ((gs[0][0], 0, gs[0][2]), *gs[1:]), "stride"),
+    ("out of range", lambda gs: ((10**6, 1, 2), *gs[1:]), "outside|fit"),
+    ("a lone product", lambda gs: ((1, 1, 2), *gs[1:]), "no member|differs|overlaps"),
+])
+def test_validate_rejects_bad_product_groups(name, edit, match):
+    with pytest.raises(ValueError, match=match):
+        _tiny_decoder(cls=_with_groups(edit))
+
+
+def test_validate_rejects_a_group_across_layers():
+    class Cross(DecoderComputation):
+        @property
+        def product_groups(self):
+            s1, s2 = self.m_of("L1.S[0,0]"), self.m_of("L2.S[0,0]")
+            rest = [g for g in super().product_groups if g[0] not in (s1, s2)]
+            return (s1, s2 - s1, 2), *rest
+
+    with pytest.raises(ValueError, match="differs"):
+        _tiny_decoder(layers=2, cls=Cross)
+
+
+def test_transcript_view_over_a_decoder():
+    c = _tiny_decoder(layers=2)
+    leaves = [None] * c.n_leaves
+    for pl in c.product_leaves:
+        leaves[c.product_leaf_index(pl.g)] = torch.randn(pl.shape)
+    v = TranscriptView(c, ListReader(leaves))
+    for m in range(1, c.M + 1):
+        g, i = c.leaf_of(m)
+        leaf = leaves[c.product_leaf_index(g)]
+        assert torch.equal(v.product(m), leaf if i is None else leaf[i])
+    bad = list(leaves)
+    pl = next(pl for pl in c.product_leaves if pl.grouped)
+    bad[c.product_leaf_index(pl.g)] = torch.randn(pl.shape[1:])
+    with pytest.raises(LeafShapeError):
+        TranscriptView(c, ListReader(bad)).product_leaf(pl.g)
 
 
 def test_validate_rejects_bad_linear_map():
