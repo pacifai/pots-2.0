@@ -25,7 +25,9 @@ log ends with :func:`_four_lines`'s ``FS35 ok`` / ``FS35 FAIL`` lines), or
 per model a plain run, the card and the two arms at four steps, the sequential arm tracing
 step 4; ``summary.json["four_h100_profile"]`` is :func:`four_h100_profile`'s result and the log
 ends with :func:`_profile_lines`'s ``FS42 ok`` / ``FS42 FAIL`` lines; with ``repo_base/`` in the
-upload, Llama-3.2-1B's two arms run again on the code before O18, ``FS49 A/B`` lines).
+upload, Llama-3.2-1B's two arms run again on the code before O18, ``FS49 A/B`` lines; with
+``repo_o18/`` too, and always for the release pin, on O18's merge without the host-side fixes
+and on the main code with the cache release pinned, ``FS54 host-side`` lines).
 The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
@@ -61,7 +63,7 @@ row blocks (``VERIF_HEAD_BLOCKS``), and the allocator fix ("fix 2"), which is tw
 CUDA allocator's expandable segments (``PYTORCH_ALLOC_CONF``, which the allocator reads at
 CUDA's first use, so it is set in the part's environment, with the deprecated
 ``PYTORCH_CUDA_ALLOC_CONF`` unset) and the cache release between prover and verifier
-(``VERIF_RELEASE_CACHE=1``, the default, pinned). :data:`FIX_AB_MODEL`, the cheapest model,
+(``VERIF_RELEASE_CACHE=1``, pinned; unset is "auto" since FS53). :data:`FIX_AB_MODEL`, the cheapest model,
 is brought up first, so a failure of the 8 row blocks on CUDA shows within minutes. Right after
 its bring-up comes the same bring-up with the whole fix off
 (:data:`FIX_OFF_ENV`), its own part and run directory: ``summary.json``'s ``fix2_ab``
@@ -157,6 +159,7 @@ import statistics
 import subprocess
 import sys
 import time
+import zipfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1324,7 +1327,12 @@ FOUR_PROFILE_PINS: tuple[tuple[str, str], ...] = tuple(sorted(
 # The base arms (O18, FS49s) run the O18 arms' loops again on the code before O18, so the same
 # 6 and 4 minutes; they are counted always, a pod without ``repo_base/`` just ends early, so
 # the deadline stays one figure (``fs11_job.sh``'s ``DEFAULT_DEADLINE_S``).
+# The host-side arms (FS54) add two more pairs per model of FOUR_PROFILE_HOST_SIDE_MODELS: O18's
+# merge without the host-side fixes (``_o18``, needs ``repo_o18/``) and the main code with the
+# cache release pinned (``_rel1``). Counted like the base arms, at the same 6 and 4 minutes each
+# (they do not trace, so the estimate is a little high), always.
 FOUR_PROFILE_BASE_MODELS = ("Llama-3.2-1B",)  # the models that get base arms
+FOUR_PROFILE_HOST_SIDE_MODELS = ("Llama-3.2-1B",)  # the models that get o18 and rel1 arms (FS54)
 FOUR_PROFILE_ESTIMATE_MIN = {"native_build": 1, "peer_check": 1, "models": 6, "four_tests": 6,
                              "probe": 7, "plain": 3, "card": 2, "seq": 6, "pipe": 4}
 # Time limits, seconds, about twice the estimates (the native build's is the build part's own).
@@ -1335,12 +1343,15 @@ FOUR_PROFILE_TIMEOUT_S = {"models": 720, "four_tests": 720, "probe": 840, "plain
 def four_profile_estimated_min() -> int:
     """``four-h100-profile``'s estimated runtime, minutes: every part's estimate, the models'
     parts once per model, and the base arms (``seq`` and ``pipe`` again) of each model of
-    :data:`FOUR_PROFILE_BASE_MODELS`, counted whether or not the upload has ``repo_base/``."""
+    :data:`FOUR_PROFILE_BASE_MODELS`, counted whether or not the upload has ``repo_base/``, and
+    the host-side arms (``seq`` and ``pipe``, twice: the O18 pair and the release-pinned pair)
+    of each model of :data:`FOUR_PROFILE_HOST_SIDE_MODELS` (FS54)."""
     e = FOUR_PROFILE_ESTIMATE_MIN
     base = sum(four_model_key(r) in FOUR_PROFILE_BASE_MODELS for r, _ in FOUR_PROFILE_PINS)
+    host = sum(four_model_key(r) in FOUR_PROFILE_HOST_SIDE_MODELS for r, _ in FOUR_PROFILE_PINS)
     return (e["native_build"] + e["peer_check"] + e["models"] + e["four_tests"] + e["probe"]
             + len(FOUR_PROFILE_PINS) * (e["plain"] + e["card"] + e["seq"] + e["pipe"])
-            + base * (e["seq"] + e["pipe"]))
+            + (base + 2 * host) * (e["seq"] + e["pipe"]))
 
 
 def four_profile_default_deadline_s() -> int:
@@ -1376,8 +1387,17 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
     ``pipe_<key>``: ``seq_<key>_base`` and ``pipe_<key>_base``, the same environment and argv
     but ``PYTHONPATH`` (the upload's ``repo_base/``), the
     run directories ``four_<key>_seq_base``/``four_<key>_pipe_base``, ``cwd`` the upload's
-    ``repo_base/``, ``info`` ``base`` true and the manifest's ``base_commit``. Every part
-    records its GPUs' peak memory."""
+    ``repo_base/``, ``info`` ``base`` true and the manifest's ``base_commit``. The main arms of
+    ``profile`` leave ``VERIF_RELEASE_CACHE`` unset (the main code's auto rule, FS53); the base
+    arms and the two kinds below pin it to 1. The host-side arms (FS54), per model of
+    :data:`FOUR_PROFILE_HOST_SIDE_MODELS` after the base arms: with ``repo_o18/`` in the upload
+    ``seq_<key>_o18`` and ``pipe_<key>_o18`` (the main arm's environment and argv, run
+    directories ``..._o18``, ``PYTHONPATH`` and ``cwd`` the upload's ``repo_o18/``, ``info``
+    ``o18`` true and the manifest's ``o18_commit``, release pinned to 1), then always
+    ``seq_<key>_rel1`` and ``pipe_<key>_rel1`` (the main code, release pinned to 1, ``info``
+    ``release_pinned`` true). They trace nothing. The main arms of those models and these four
+    have ``info["compare"]``: their step records and residual archives are hashed for the
+    summary. Every part records its GPUs' peak memory."""
     from setup.data import TEST_SCALE_TOKENIZER as pin  # the tests' model: SmolLM2
     small = data_key(pin.repo, SMOLLM2_TASK)
     sharded = {"VERIF_DEVICE": FOUR_PROVER, "VERIF_VERIFIER_DEVICES": FOUR_VERIFIERS}
@@ -1390,6 +1410,16 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
             pass
     if profile and not has_base:
         _say("FS49 A/B arm skipped: the upload has no repo_base/ (prepared without --base-commit)")
+    has_o18 = profile and (upload / "repo_o18").is_dir()
+    o18_commit = None
+    if has_o18:
+        try:
+            o18_commit = json.loads((upload / "manifest.json").read_text()).get("o18_commit")
+        except (OSError, ValueError, AttributeError):
+            pass
+    if profile and not has_o18:
+        _say("FS54 host-side A+B arm skipped: the upload has no repo_o18/ (prepared without "
+             "--o18-commit)")
     junit = out / "parts" / "four_tests" / "junit.xml"
     expr = " or ".join([f"({PAIR_SLOW_SELECT})",
                         *(Path(f).stem for f in (FS34_TESTS_FILE, *FOUR_TEST_FILES))])
@@ -1428,25 +1458,41 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
                          info={**info, "run_dir": str(d), "report": str(d / "card.json")}))
         # After the O18 arms of a model of FOUR_PROFILE_BASE_MODELS: the same two arms on the
         # code before O18 (the upload's repo_base/), one host, one session (O18, FS49s).
-        arms = [(arm, piped, False) for arm, piped in (("seq", None), ("pipe", "1"))]
+        # Then the host-side arms (FS54): O18's merge without the host-side fixes, and the main
+        # code with the cache release pinned (the main arms leave it to the auto rule).
+        pairs = (("seq", None), ("pipe", "1"))
+        arms = [(arm, piped, "") for arm, piped in pairs]
         if profile and k in FOUR_PROFILE_BASE_MODELS and has_base:
-            arms += [(arm, piped, True) for arm, piped, _ in arms]
-        for arm, piped, is_base in arms:  # only the pipelined arm sets the mode
-            tag = "_base" if is_base else ""
+            arms += [(arm, piped, "_base") for arm, piped in pairs]
+        host_side = profile and k in FOUR_PROFILE_HOST_SIDE_MODELS
+        if host_side and has_o18:
+            arms += [(arm, piped, "_o18") for arm, piped in pairs]
+        if host_side:
+            arms += [(arm, piped, "_rel1") for arm, piped in pairs]
+        for arm, piped, tag in arms:  # only the pipelined arm sets the mode
             d = _run_dir(out, upload, key, f"four_{key}_{arm}{tag}")
             env = {**base, **sharded, "VERIF_OUTPUT_DIR": str(d), "VERIF_PIPELINED": piped}
-            if profile:  # only the sequential arm is traced, at its last step, check 5 whole
-                env["VERIF_TRACE_STEP"] = str(FOUR_PROFILE_TRACE_STEP) if arm == "seq" else None
-                env["VERIF_TRACE_C5"] = "all" if arm == "seq" else None
+            if profile:  # only the sequential main and base arms are traced, at the last step
+                traced = arm == "seq" and tag in ("", "_base")
+                env["VERIF_TRACE_STEP"] = str(FOUR_PROFILE_TRACE_STEP) if traced else None
+                env["VERIF_TRACE_C5"] = "all" if traced else None
+                if tag == "":  # the main arms: the main code's auto rule decides (FS53)
+                    env["VERIF_RELEASE_CACHE"] = None
+            root = upload / "repo_base" if tag == "_base" else (
+                upload / "repo_o18" if tag == "_o18" else None)
+            if root is not None:
+                env["PYTHONPATH"] = str(root)
             plan.append(Part(
                 f"{arm}_{k}{tag}", ["{python}", "-m", "verification.runs.llama_step", "--steps",
                                     str(steps), "--metrics", "--no-count"],
-                env={**env, "PYTHONPATH": str(upload / "repo_base")} if is_base else env,
-                timeout_s=t[arm], kind="profile_run" if profile else "four_run",
+                env=env, timeout_s=t[arm], kind="profile_run" if profile else "four_run",
                 info={**info, "arm": arm, "model_key": k, "run_dir": str(d),
                       "records": str(d / FOUR_RUN_NAME / "records.jsonl"),
-                      **({"base": True, "base_commit": base_commit} if is_base else {})},
-                cwd=upload / "repo_base" if is_base else None))
+                      **({"base": True, "base_commit": base_commit} if tag == "_base" else {}),
+                      **({"o18": True, "o18_commit": o18_commit} if tag == "_o18" else {}),
+                      **({"release_pinned": True} if tag == "_rel1" else {}),
+                      **({"compare": True} if host_side and tag != "_base" else {})},
+                cwd=root))
     for p in plan:
         p.info["gpu_peak"] = True
         if profile:
@@ -1926,7 +1972,8 @@ def part_extras(part: Part, log: Path) -> dict[str, Any]:
         if part.kind == "four_run":
             return _four_run_extras(log, Path(part.info["records"]))
         if part.kind == "profile_run":
-            return _profile_run_extras(log, Path(part.info["records"]))
+            return _profile_run_extras(log, Path(part.info["records"]),
+                                       compare=bool(part.info.get("compare")))
         if part.kind == "profile_plain":
             return _profile_plain_extras(Path(part.info["records"]))
         if part.kind == "pytest":
@@ -2468,12 +2515,69 @@ def _profile_markers(path: Path) -> dict[str, Any]:
             "traced_steps": sorted(t for t, v in steps.items() if v)}
 
 
-def _profile_run_extras(log: Path, records: Path) -> dict[str, Any]:
+# FS54: the sections the host-side comparison reads, per step, from the arm's time rows.
+HOST_SIDE_SECTIONS = ("5.measure", "5", "handoff.empty_cache")
+# The record types the host-side fixes must leave bit for bit: everything the step records hold
+# but the time, memory and capture rows, the environment record and the run's end (``traced`` is
+# left out of each row).
+COMPARED_RECORDS = ("step", "verdict", "storage", "count")
+
+
+def _section_times(rows: Sequence[Mapping[str, Any]], steps: int) -> dict[str, list[float | None]]:
+    """Per step 1..``steps`` the seconds of each of :data:`HOST_SIDE_SECTIONS` (the ``time``
+    row of that component, level ``component`` or ``sub``) and of the two sides' ``total`` rows
+    (``prover`` and ``verifier``); ``None`` for a step without the row."""
+    got: dict[str, dict[int, float]] = {}
+    for r in rows:
+        t, c = r.get("step"), r.get("component")
+        if r.get("record") != "time" or not isinstance(t, int) or not _number(r.get("time_s")):
+            continue
+        if c in HOST_SIDE_SECTIONS and r.get("level") in ("component", "sub"):
+            got.setdefault(c, {})[t] = r["time_s"]
+        elif r.get("level") == "total" and c in ("prover", "verifier"):
+            got.setdefault(c, {})[t] = r["time_s"]
+    return {n: [got.get(n, {}).get(t) for t in range(1, steps + 1)]
+            for n in (*HOST_SIDE_SECTIONS, "prover", "verifier")}
+
+
+def _records_digest(rows: Sequence[Mapping[str, Any]]) -> str:
+    """SHA-256 of the step records of ``rows`` (:data:`COMPARED_RECORDS`, ``traced`` dropped
+    from each), canonical JSON in file order."""
+    keep = [{k: v for k, v in r.items() if k != "traced"} for r in rows
+            if r.get("record") in COMPARED_RECORDS]
+    return hashlib.sha256(json.dumps(keep, sort_keys=True).encode()).hexdigest()
+
+
+def _archive_hash(path: Path) -> str:
+    """SHA-256 of a residual archive's arrays: per array, in name order, its name, dtype, shape
+    and bytes. One array in memory at a time (an archive is about 217 MB at full scale)."""
+    import numpy as np
+    h = hashlib.sha256()
+    with np.load(path, allow_pickle=False) as z:
+        for name in sorted(z.files):
+            a = np.ascontiguousarray(z[name])
+            h.update(f"{name}\0{a.dtype.str}\0{a.shape}\0".encode())
+            h.update(a.tobytes())
+            del a
+    return h.hexdigest()
+
+
+def _archive_hashes(run_dir: Path) -> dict[str, str]:
+    """:func:`_archive_hash` of every ``residuals/<scenario>/step_<t>.npz`` of a run directory,
+    keyed by its path under ``residuals/``, one archive at a time."""
+    root = run_dir / "residuals"
+    return {str(f.relative_to(root)): _archive_hash(f) for f in sorted(root.glob("*/step_*.npz"))}
+
+
+def _profile_run_extras(log: Path, records: Path, compare: bool = False) -> dict[str, Any]:
     """:func:`_four_run_extras` and, under ``profile``, what the profile reads from the arm's
     run directory (``records``' directory): the markers' steps and the traced ones, the steps
     with a ``step_interval`` time row, the work sections with a ``count`` row and the number of
     ``storage`` rows, whether the layout file exists and is not empty, and the non-empty trace
-    files (``trace_files``) with the trace's own ``error`` from ``trace/meta.json``."""
+    files (``trace_files``) with the trace's own ``error`` from ``trace/meta.json``. Always
+    ``sections_s`` (:func:`_section_times`); with ``compare`` (FS54's host-side arms) the step
+    records' digest (``records_sha``) and the residual archives' hashes (``archive_hashes``;
+    ``archive_error`` if one could not be read)."""
     out = _four_run_extras(log, records)
     d = records.parent
     rows = _four_records(records)
@@ -2497,6 +2601,14 @@ def _profile_run_extras(log: Path, records: Path) -> dict[str, Any]:
         "trace_files": sorted(p.name for p in trace.glob("step_*.json.gz")
                               if p.stat().st_size > 0) if trace.is_dir() else [],
         "trace_error": meta.get("error") if isinstance(meta, dict) else None}
+    out["sections_s"] = _section_times(rows, FOUR_PROFILE_STEPS)
+    if compare:
+        out["records_sha"] = _records_digest(rows) if rows else None
+        try:
+            out["archive_hashes"] = _archive_hashes(d)
+        except (OSError, ValueError, zipfile.BadZipFile) as e:
+            out["archive_hashes"] = None
+            out["archive_error"] = f"{type(e).__name__}: {e}"
     return out
 
 
@@ -2685,6 +2797,8 @@ def _steady_mean(per_step: Sequence[float] | None, steps: int = FOUR_STEPS,
     """The mean of the steady steps (:func:`_steady_slice`) of a per-step list of ``steps``
     values, else ``None``."""
     vals = list(per_step or ())[_steady_slice(steps, pipelined, traced_last)]
+    if any(v is None for v in vals):  # a step without the row (FS54's section lists)
+        return None
     return statistics.fmean(vals) if vals and len(per_step or ()) >= steps else None
 
 
@@ -2916,7 +3030,7 @@ def _base_models(parts: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any],
-                  plain_steady: float | None) -> list[tuple[bool, str]]:
+                  plain_steady: float | None, o18_names: bool = False) -> list[tuple[bool, str]]:
     """The base arms' (``seq_<k>_base``, ``pipe_<k>_base``) acceptance items and numbers, filled
     into ``row["base"]`` and ``row["ab"]`` (O18, FS49s). Judged like the O18 arms: every step
     accepted in the loop's mode, the four GPUs named, the profile inputs there; the two base arms'
@@ -2924,7 +3038,10 @@ def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any
     step (equal roots mean the base arm ran the O18 code). A base root is not compared with the
     card's (the leaf layout differs). ``ab[<arm>]``: the O18 arm's steady step interval, the base
     arm's, their difference (O18 minus base: negative when O18 is faster) and ratio (O18 over
-    base)."""
+    base). With the host-side arms in the plan (``o18_names``, FS54) the O18 side is the
+    ``<arm>_<k>_o18`` arm, O18's merge alone; the main arm also holds the host-side fixes, so
+    without o18 arms the old meaning stays (``ab_basis`` says which: ``"o18 arm"`` or
+    ``"main arm"``)."""
     steps = FOUR_PROFILE_STEPS
     mode = {"seq": "sequential", "pipe": "pipelined"}
     ex = {a: (_pair_part(parts, f"{a}_{k}_base").get("extras") or {}) for a in FOUR_ARMS}
@@ -2950,13 +3067,19 @@ def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any
                    "arms": arms, "inputs": inputs,
                    "base_commit": (_pair_part(parts, f"seq_{k}_base").get("info")
                                    or {}).get("base_commit")}
-    row["ab"] = {}
+    row["ab"], row["ab_basis"] = {}, "o18 arm" if o18_names else "main arm"
+    o18_arms = row["arms"]
+    if o18_names:
+        o18_ex = {a: _pair_part(parts, f"{a}_{k}_o18").get("extras") or {} for a in FOUR_ARMS}
+        o18_arms = {a: _four_arm_numbers(e, a, steps, True,
+                                         _steady_s(e, steps, a == "pipe", a == "seq"))
+                    for a, e in o18_ex.items()}
     same = {a: [t for t, (x, y) in enumerate(zip(row["arms"][a].get("step_roots") or [],
                                                  arms[a].get("step_roots") or []), 1) if x == y]
             for a in FOUR_ARMS}
     for a in FOUR_ARMS:
-        o18, base = row["arms"][a].get("steady_s"), arms[a].get("steady_s")
-        ok = (row["arms"][a].get("steady_source") == "step_interval"
+        o18, base = o18_arms[a].get("steady_s"), arms[a].get("steady_s")
+        ok = (o18_arms[a].get("steady_source") == "step_interval"
               and arms[a].get("steady_source") == "step_interval")
         row["ab"][a] = {"o18_steady_s": o18, "base_steady_s": base,
                         "diff_s": o18 - base if ok and o18 is not None and base is not None
@@ -2980,6 +3103,164 @@ def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any
                else f"{k} base {a}: " + "; ".join(w)) for a, w in inputs.items()]
     return items
 
+# FS54: the host-side arms' summary. The release-on arms (``_o18``, ``_rel1``) and the main arms
+# are compared per loop; GiB are 2^30 bytes.
+HOST_SIDE_PEAK_LIMIT = 79 * 2 ** 30  # the memory line: every GPU's peaks stay under it (FS53)
+HOST_SIDE_FIELDS = (*HOST_SIDE_SECTIONS, "between_steps")
+_HS_LABEL = {"interval": "step", "5.measure": "5.measure", "5": "check 5",
+             "handoff.empty_cache": "handoff.empty_cache", "between_steps": "between steps"}
+
+
+def _host_side_models(parts: Sequence[Mapping[str, Any]]) -> dict[str, bool]:
+    """The model keys whose host-side arms are in the plan (``release_pinned`` arms), in plan
+    order, each with whether its ``_o18`` arms are too."""
+    out: dict[str, bool] = {}
+    for p in parts:
+        info = p.get("info") or {}
+        if p.get("kind") == "profile_run" and info.get("model_key"):
+            k = info["model_key"]
+            if info.get("release_pinned"):
+                out.setdefault(k, False)
+            if info.get("o18"):
+                out[k] = True
+    return out
+
+
+def _between_steps(e: Mapping[str, Any], arm: str) -> list[float | None]:
+    """Per step the part of the step interval outside every section: the interval minus the
+    sections' time and the cache release (``handoff.empty_cache``, taken as 0 s when the arm has
+    no such row: the release is off). Sequential, the sections are the prover's and the
+    verifier's ``total`` rows; pipelined the prover side overlaps, so the verifier's alone (the
+    parent's critical path; an assumption: the prover side is the shorter). ``None`` for a step
+    without a row it needs."""
+    sec, iv = e.get("sections_s") or {}, e.get("step_interval_s") or []
+    out: list[float | None] = []
+    for t in range(FOUR_PROFILE_STEPS):
+        got = [(sec.get(n) or [None] * FOUR_PROFILE_STEPS)[t]
+               for n in (("verifier",) if arm == "pipe" else ("prover", "verifier"))]
+        h = (sec.get("handoff.empty_cache") or [None] * FOUR_PROFILE_STEPS)[t]
+        out.append(None if t >= len(iv) or None in got else iv[t] - sum(got) - (h or 0.0))
+    return out
+
+
+def _host_side_arm(e: Mapping[str, Any], arm: str) -> dict[str, float | None]:
+    """One arm's steady-step means (the steps :func:`_steady_s` uses): the step interval, the
+    sections of :data:`HOST_SIDE_SECTIONS` (a missing ``handoff.empty_cache`` row counts 0 s
+    when the others are there) and ``between_steps`` (:func:`_between_steps`)."""
+    st, pipe, last = FOUR_PROFILE_STEPS, arm == "pipe", arm == "seq"
+    sec = dict(e.get("sections_s") or {})
+    if sec.get("5.measure") and not any(v is not None for v in sec.get("handoff.empty_cache") or ()):
+        sec["handoff.empty_cache"] = [0.0] * st
+    out = {"interval": _steady_s(e, st, pipe, last)[0]}
+    out.update({n: _steady_mean(sec.get(n), st, pipe, last) for n in HOST_SIDE_SECTIONS})
+    out["between_steps"] = _steady_mean(_between_steps(e, arm), st, pipe, last)
+    return out
+
+
+def _host_side_cmp(without: Mapping[str, float | None],
+                   with_: Mapping[str, float | None]) -> dict[str, Any]:
+    """Per field of ``interval`` and :data:`HOST_SIDE_FIELDS`: the arm without the fix, the arm
+    with it, their difference (with minus without: negative when the fix is faster) and ratio
+    (with over without)."""
+    out = {}
+    for n in ("interval", *HOST_SIDE_FIELDS):
+        a, b = without.get(n), with_.get(n)
+        out[n] = {"without_s": a, "with_s": b,
+                  "diff_s": b - a if a is not None and b is not None else None,
+                  "ratio": b / a if a is not None and b is not None and a > 0 else None}
+    return out
+
+
+def _profile_host_side(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any],
+                       has_o18: bool) -> list[tuple[bool, str]]:
+    """The host-side arms' (FS54) items and numbers for model ``k``, filled into
+    ``row["host_side"]``, per loop: ``fixes_ab`` (fixes A and B: the ``_o18`` arm, O18's merge
+    without them, against the ``_rel1`` arm, the main code, both releasing the cache; only with
+    o18 arms) and ``fix_c`` (the ``_rel1`` arm against the main arm: the same code, release on
+    against auto), each :func:`_host_side_cmp`. Items: the o18 and rel1 arms accepted at every
+    step in their loop mode, the four GPUs named, their profile inputs there (they trace
+    nothing); per loop the step roots of the main, rel1 and o18 arms equal step by step, their
+    step records (:func:`_records_digest`) equal, their residual archives (:func:`_archive_hash`
+    per archive) equal; the numbers are the rel1 arm's and the main arm's against the
+    ``_o18`` arm's."""
+    steps = FOUR_PROFILE_STEPS
+    mode = {"seq": "sequential", "pipe": "pipelined"}
+    tags = ("", "_rel1", "_o18") if has_o18 else ("", "_rel1")
+    ex = {t: {a: _pair_part(parts, f"{a}_{k}{t}").get("extras") or {} for a in FOUR_ARMS}
+          for t in tags}
+    new = [(t, a) for t in tags[1:] for a in FOUR_ARMS]
+    bad_acc = [f"{a}_{k}{t}" for t, a in new if not (
+        ex[t][a].get("accepted") and len(ex[t][a].get("step_roots") or ()) == steps
+        and ex[t][a].get("loop_mode") == mode[a])]
+    bad_gpu = {f"{a}_{k}{t}": w for t, a in new if (w := _four_gpu_problems(ex[t][a]))}
+    bad_in = {f"{a}_{k}{t}": w for t, a in new
+              if (w := _profile_arm_problems(ex[t][a], a, traced_arm=False))}
+    hs: dict[str, Any] = {}
+    for a in FOUR_ARMS:
+        nums = {t: _host_side_arm(ex[t][a], a) for t in tags}
+        hs[a] = {"fix_c": _host_side_cmp(nums["_rel1"], nums[""]),
+                 "fixes_ab": _host_side_cmp(nums["_o18"], nums["_rel1"]) if has_o18 else None}
+    row["host_side"] = hs
+    items = [
+        (not bad_acc, f"{k} host-side: the {', '.join(f'{a}{t}' for t, a in new)} arms accepted at "
+         f"all {steps} steps in their loop modes" if not bad_acc else
+         f"{k} host-side: not accepted at all {steps} steps in their loop mode: "
+         + ", ".join(bad_acc)),
+        (not bad_gpu, f"{k} host-side: the environment records name the four GPUs"
+         if not bad_gpu else f"{k} host-side: " + "; ".join(
+             f"{n}: " + ", ".join(w) for n, w in bad_gpu.items())),
+        (not bad_in, f"{k} host-side: the profile's inputs are there" if not bad_in
+         else f"{k} host-side: " + "; ".join(f"{n}: " + "; ".join(w) for n, w in bad_in.items()))]
+    for a in FOUR_ARMS:
+        arms = {t: ex[t][a] for t in tags}
+        label = ", ".join(f"{a}_{k}{t}" for t in tags)
+        roots = [e.get("step_roots") or [] for e in arms.values()]
+        same = len(roots[0]) == steps and all(r == roots[0] for r in roots)
+        items.append((same, f"{k} host-side {a}: the step roots of {label} are equal" if same
+                      else f"{k} host-side {a}: the step roots of {label} differ"))
+        recs = [e.get("records_sha") for e in arms.values()]
+        same = recs[0] is not None and all(r == recs[0] for r in recs)
+        items.append((same, f"{k} host-side {a}: the step records of {label} are equal" if same
+                      else f"{k} host-side {a}: the step records of {label} differ"
+                      + ("" if None not in recs else " (a digest is missing)")))
+        hashes = [e.get("archive_hashes") for e in arms.values()]
+        same = bool(hashes[0]) and all(h == hashes[0] for h in hashes)
+        why = [n for n in dict.fromkeys(n for h in hashes for n in (h or {}))
+               if len({(h or {}).get(n) for h in hashes}) > 1]
+        items.append((same, f"{k} host-side {a}: the residual archives of {label} are equal "
+                      f"({len(hashes[0] or {})} archives, hash of every array)" if same else
+                      f"{k} host-side {a}: the residual archives of {label} differ"
+                      + (f" ({', '.join(why[:4])})" if why else " (no hashes)")))
+    return items
+
+
+def _memory_items(models: Mapping[str, Mapping[str, Any]]) -> list[tuple[bool, str]]:
+    """FS53's memory line: per model and main loop each GPU's peak allocated and peak reserved
+    bytes (the ``memory`` rows' ``device_peak_bytes`` and ``device_peak_reserved_bytes``,
+    ``arms[<loop>]["device_peaks"]``) under :data:`HOST_SIDE_PEAK_LIMIT`, 79 GiB. One item;
+    names every GPU over the line or without a number, and the four GPUs must all be there."""
+    over: list[str] = []
+    for k, row in models.items():
+        for a, arm in row["arms"].items():
+            peaks = arm.get("device_peaks") or {}
+            row.setdefault("memory", {})[a] = {
+                d: {"peak_gib": None if not _number(v.get("peak_bytes")) else
+                    v["peak_bytes"] / 2 ** 30,
+                    "reserved_gib": None if not _number(v.get("peak_reserved_bytes")) else
+                    v["peak_reserved_bytes"] / 2 ** 30} for d, v in peaks.items()}
+            if len(peaks) != FOUR_CARDS:
+                over.append(f"{k} {a}: {len(peaks)} GPUs in the memory rows, not {FOUR_CARDS}")
+            for d, v in peaks.items():
+                for field in ("peak_bytes", "peak_reserved_bytes"):
+                    x = v.get(field)
+                    if not _number(x):
+                        over.append(f"{k} {a} {d}: no {field.replace('_bytes', '')}")
+                    elif x >= HOST_SIDE_PEAK_LIMIT:
+                        over.append(f"{k} {a} {d}: {field.replace('_bytes', '')} "
+                                    f"{x / 2 ** 30:.1f} GiB")
+    return [(not over, "every GPU's peak allocated and reserved memory is under 79 GiB, both loops, "
+             "every model" if not over else "memory over 79 GiB or missing: " + "; ".join(over))]
+
 
 def _missing_steps(have: Sequence[int], steps: int = FOUR_PROFILE_STEPS) -> str:
     """``"steps 2, 4"``: the steps of 1..``steps`` not in ``have``."""
@@ -2987,13 +3268,15 @@ def _missing_steps(have: Sequence[int], steps: int = FOUR_PROFILE_STEPS) -> str:
     return "step" + ("s " if len(gone) > 1 else " ") + ", ".join(map(str, gone))
 
 
-def _profile_arm_problems(ex: Mapping[str, Any], arm: str) -> list[str]:
+def _profile_arm_problems(ex: Mapping[str, Any], arm: str,
+                          traced_arm: bool | None = None) -> list[str]:
     """What an arm's output lacks of the profile's inputs (empty when none): a markers line, a
     ``step_interval`` time row for every step; a ``count`` row for each of
     :data:`PROFILE_WORK_SECTIONS` and a ``storage`` row; the layout file; the sequential arm's
     trace of step :data:`FOUR_PROFILE_TRACE_STEP` (its markers line ``traced`` and no other
     step's, the trace file there and not empty, the trace's own error empty); and for the
-    pipelined arm no traced step."""
+    pipelined arm no traced step. ``traced_arm`` (default: the sequential arm) says whether the
+    arm traces; the host-side arms (FS54) trace nothing."""
     pr = ex.get("profile")
     if not isinstance(pr, dict):
         return ["no profile inputs read (the arm left no output)"]
@@ -3016,7 +3299,9 @@ def _profile_arm_problems(ex: Mapping[str, Any], arm: str) -> list[str]:
         why.append(f"no {PROFILE_LAYOUT} (or it is empty)")
     traced = list(pr.get("traced_steps") or ())
     name = f"step_{FOUR_PROFILE_TRACE_STEP:05d}.json.gz"
-    if arm == "seq":
+    if traced_arm is None:
+        traced_arm = arm == "seq"
+    if traced_arm:
         if traced != [FOUR_PROFILE_TRACE_STEP]:
             why.append(f"the markers trace {traced or 'no step'}, not step "
                        f"{FOUR_PROFILE_TRACE_STEP} alone")
@@ -3026,7 +3311,7 @@ def _profile_arm_problems(ex: Mapping[str, Any], arm: str) -> list[str]:
             why.append(f"the trace reports an error: {pr['trace_error']}")
     elif traced:
         why.append(f"the markers show a traced step ({', '.join(map(str, traced))}), "
-                   "a pipelined run is never traced")
+                   "this arm is never traced")
     return why
 
 
@@ -3087,13 +3372,22 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
     that EQ14 puts beside PoTS's verify over train) and ``wall_over_train`` (the arm's step
     interval over the plain step). With base arms in the plan (FS49s, :func:`_profile_base`):
     their items and numbers under each model's ``base`` and ``ab`` (the O18 and base steady
-    step intervals, their difference and ratio, per loop); ``ab_skipped`` says why not otherwise."""
+    step intervals, their difference and ratio, per loop; the O18 side is the o18 arms when the
+    plan has them); ``ab_skipped`` says why not otherwise. With the host-side arms (FS54,
+    :func:`_profile_host_side`): their items and each model's ``host_side``;
+    ``host_side_skipped`` says why not (no o18 arms). Always the memory line
+    (:func:`_memory_items`: every GPU's peaks under 79 GiB, per model and loop, in each row's
+    ``memory``)."""
     if not any(p.get("kind") == "profile_run" for p in parts):
         return None
     names = {p["name"] for p in parts}
     models = {four_model_key(r): {} for r, _ in FOUR_PROFILE_PINS}
     base_keys = _base_models(parts)  # only when the plan has them (FS49s)
-    want = (*four_profile_parts(), *(f"{a}_{k}_base" for k in base_keys for a in FOUR_ARMS))
+    host_keys = _host_side_models(parts)  # likewise (FS54): {model: has o18 arms}
+    want = (*four_profile_parts(), *(f"{a}_{k}_base" for k in base_keys for a in FOUR_ARMS),
+            *(f"{a}_{k}{t}" for k, o in host_keys.items() for t in (("_o18", "_rel1") if o
+                                                                    else ("_rel1",))
+              for a in FOUR_ARMS))
     problems = {n: _pair_part(parts, n).get("status", "not_started") for n in want
                 if n not in names or _pair_part(parts, n).get("status") not in _PAIR_OK}
     peer = (_pair_part(parts, PEER_CHECK_NAME).get("extras") or {}).get("peer_check")
@@ -3135,7 +3429,10 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
             items.append((not why, f"{k} {a}: the profile's inputs are there" if not why
                           else f"{k} {a}: " + "; ".join(why)))
         if k in base_keys:
-            items += _profile_base(parts, k, row, steady_plain)
+            items += _profile_base(parts, k, row, steady_plain, host_keys.get(k, False))
+        if k in host_keys:
+            items += _profile_host_side(parts, k, row, host_keys[k])
+    items += _memory_items(models)
     sample_why = {n: w for n in want if n != NATIVE_BUILD_NAME
                   and (w := _samples_problem(_pair_part(parts, n).get("extras") or {}))}
     items += [(False, f"{n}: {w}") for n, w in sample_why.items()]
@@ -3155,9 +3452,14 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
                   if not missing else "numbers missing: " + "; ".join(missing)))
     ab_skipped = (None if base_keys else "FS49 A/B arm skipped: the plan has no base arms "
                   "(the upload has no repo_base/, prepared without --base-commit)")
+    host_skipped = (None if host_keys and all(host_keys.values()) else
+                    "FS54 host-side A+B arm skipped: the plan has no o18 arms (the upload has no "
+                    "repo_o18/, prepared without --o18-commit)" if host_keys else
+                    "FS54 host-side arms skipped: the plan has none")
     return {"pass": all(ok for ok, _ in items), "items": [[ok, text] for ok, text in items],
             "missing_numbers": missing, "models": models, "part_problems": problems,
             "peer_bytes_ok": peer_ok, "ab_skipped": ab_skipped,
+            "host_side_skipped": host_skipped,
             "tests": {k: tests_ex.get(k) for k in ("tests", "failures", "errors", "skipped",
                                                    "files", "missing_files")},
             "tests_problems": tests_problems, "samples_problems": sample_why,
@@ -3181,6 +3483,12 @@ def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
     def rat(x: float | None) -> str:
         return "unknown" if x is None else f"{x:.2g}"
 
+    def sec3(x: float | None) -> str:
+        return "unknown" if x is None else f"{x:.3g} s"
+
+    def gib(x: float | None) -> str:
+        return "?" if x is None else f"{x:.1f}"
+
     lines = [f"FS42 {'ok' if ok else 'FAIL'}: {text}" for ok, text in res["items"]]
     for k, row in res["models"].items():
         plain = (row.get("plain") or {}).get("steady_s")
@@ -3196,9 +3504,25 @@ def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
                 f"÷ training {rat(arm.get('wall_over_train'))}")
         for a, ab in (row.get("ab") or {}).items():
             lines.append(
-                f"FS49 A/B {k} {a}: O18 {sec(ab.get('o18_steady_s'))}, base "
+                f"FS49 A/B {k} {a}: O18 ({row.get('ab_basis', 'main arm')}) "
+                f"{sec(ab.get('o18_steady_s'))}, base "
                 f"{sec(ab.get('base_steady_s'))} (Δ {sec(ab.get('diff_s'))}, ratio "
                 f"{rat(ab.get('ratio'))})")
+        for a, hs in (row.get("host_side") or {}).items():
+            for fix, (no, yes) in (("fixes_ab", ("o18", "rel1")), ("fix_c", ("rel1", "main"))):
+                cmp = hs.get(fix)
+                if cmp is None:
+                    continue
+                label = "fixes A+B" if fix == "fixes_ab" else "fix C"
+                parts_ = "; ".join(f"{_HS_LABEL[n]} {sec3(c['without_s'])} -> "
+                                   f"{sec3(c['with_s'])} (Δ {sec3(c['diff_s'])}, ratio "
+                                   f"{rat(c['ratio'])})" for n, c in cmp.items())
+                lines.append(f"FS54 host-side {k} {a}: {label} ({no} -> {yes}), steady "
+                             f"{parts_}")
+        for a, mem in (row.get("memory") or {}).items():
+            gpus = ", ".join(f"{d} {gib(v['peak_gib'])}/{gib(v['reserved_gib'])}"
+                             for d, v in mem.items())
+            lines.append(f"FS54 memory {k} {a}: peak allocated/reserved GiB per GPU: {gpus}")
     return lines
 
 

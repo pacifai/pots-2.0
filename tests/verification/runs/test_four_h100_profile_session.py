@@ -45,7 +45,8 @@ def _arm(k, arm, roots=None, profile=None, samples=None, **over):
           "accumulated_gpu_s": [30.0, 28.0, 26.0, 29.0],
           "step_wall_s": [31.0, 22.0, 20.0, 26.0] if arm == "pipe" else [],
           "step_interval_s": ARM_INTERVAL[arm],
-          "device_peaks": {"cuda:0": {"peak_bytes": 5, "peak_reserved_bytes": 6}},
+          "device_peaks": {f"cuda:{i}": {"peak_bytes": 5, "peak_reserved_bytes": 6}
+                           for i in range(4)},
           "gpu_peak_mib": base.CARD_MIB, "profile": profile or _profile(arm),
           "samples": samples or {"version": 2, "gpus": 4}}
     return base._part(f"{arm}_{k}", "profile_run", {**ex, **over}, arm=arm)
@@ -112,8 +113,12 @@ def test_the_plan_has_the_parts_in_order_and_no_qwen_1_5b(tmp_path):
     plan = fs.with_native_build(fs.four_h100_profile_plan(tmp_path / "up", tmp_path / "out"))
     names = [p.name for p in plan]
     assert names[:5] == ["native_build", "peer_check", "models", "four_tests", "probe"]
-    assert names[5:] == [f"{a}_{k}" for k in PKEYS for a in ("plain", "card", "seq", "pipe")]
-    assert names == list(fs.four_profile_parts())
+    core = [f"{a}_{k}" for k in PKEYS for a in ("plain", "card", "seq", "pipe")]
+    assert names[5:] == [n for k in PKEYS for n in (
+        [f"{a}_{k}" for a in ("plain", "card", "seq", "pipe")]
+        + ([f"{a}_{k}_rel1" for a in ("seq", "pipe")] if k == K else []))]  # FS54: always there
+    assert [n for n in names if not n.endswith("_rel1")] == list(fs.four_profile_parts())
+    assert [n for n in names[5:] if not n.endswith("_rel1")] == core
     assert not any("Qwen2.5-1.5B" in n for n in names)
     assert all(p.info.get("gpu_peak") for p in plan[1:])
     assert all(p.info.get("samples_check") for p in plan[1:])
@@ -122,8 +127,9 @@ def test_the_plan_has_the_parts_in_order_and_no_qwen_1_5b(tmp_path):
 def test_each_part_has_its_environment_and_command(tmp_path):
     plan = {p.name: p for p in fs.four_h100_profile_plan(tmp_path / "up", tmp_path / "out")}
     for n, p in plan.items():
-        assert (p.env.get("VERIF_TRACE_STEP") == "4") == n.startswith("seq_"), n
-        assert (p.env.get("VERIF_TRACE_C5") == "all") == n.startswith("seq_"), n
+        traced = n.startswith("seq_") and not n.endswith("_rel1")  # FS54's arms trace nothing
+        assert (p.env.get("VERIF_TRACE_STEP") == "4") == traced, n
+        assert (p.env.get("VERIF_TRACE_C5") == "all") == traced, n
         assert bool(p.env.get("VERIF_PIPELINED")) == n.startswith("pipe_"), n
         assert "VERIF_TRACE_STEP" not in p.env or n.startswith(("seq_", "pipe_")), n
     dirs = []
@@ -145,7 +151,22 @@ def test_each_part_has_its_environment_and_command(tmp_path):
             assert p.info["records"].endswith("llama_step/records.jsonl")
         assert seq.env["VERIF_PIPELINED"] is None and pipe.env["VERIF_TRACE_STEP"] is None
         assert pipe.env["VERIF_PIPELINED"] == "1"
+        # FS54: the main arms leave the cache release unset (main's auto rule decides), only here
+        assert "VERIF_RELEASE_CACHE" in seq.env and seq.env["VERIF_RELEASE_CACHE"] is None
+        assert "VERIF_RELEASE_CACHE" in pipe.env and pipe.env["VERIF_RELEASE_CACHE"] is None
         dirs += [p.env["VERIF_OUTPUT_DIR"] for p in (plain, card, seq, pipe)]
+        if k in fs.FOUR_PROFILE_HOST_SIDE_MODELS:
+            for a, main in (("seq", seq), ("pipe", pipe)):
+                r1 = plan[f"{a}_{k}_rel1"]
+                assert r1.argv == main.argv and r1.kind == "profile_run" and r1.cwd is None
+                assert r1.env["VERIF_RELEASE_CACHE"] == "1" and "PYTHONPATH" not in r1.env
+                assert "VERIF_TRACE_STEP" not in r1.env or r1.env["VERIF_TRACE_STEP"] is None
+                assert r1.info["release_pinned"] is True and r1.info["compare"] is True
+                assert r1.env["VERIF_OUTPUT_DIR"].endswith(f"_{a}_rel1")
+                assert "release_pinned" not in main.info and main.info["compare"] is True
+                dirs.append(r1.env["VERIF_OUTPUT_DIR"])
+        else:
+            assert fs.FOUR_PROFILE_HOST_SIDE_MODELS == (K,) and "compare" not in seq.info
         assert plain.timeout_s == fs.FOUR_PROFILE_TIMEOUT_S["plain"]
     assert len(set(dirs)) == len(dirs)
     assert plan["probe"].env.get("VERIF_TRACE_STEP") is None
@@ -155,7 +176,8 @@ def test_the_estimates_are_the_briefs_and_the_limits_about_twice_them():
     e = fs.FOUR_PROFILE_ESTIMATE_MIN
     assert e == {"native_build": 1, "peer_check": 1, "models": 6, "four_tests": 6, "probe": 7,
                  "plain": 3, "card": 2, "seq": 6, "pipe": 4}
-    assert fs.four_profile_estimated_min() == 21 + 3 * 15 + 10 == 76
+    # FS49s's base pair (10 min) and FS54's o18 and rel1 pairs (10 min each), at Llama's arm times
+    assert fs.four_profile_estimated_min() == 21 + 3 * 15 + 10 + 20 == 96
     for part, limit in fs.FOUR_PROFILE_TIMEOUT_S.items():
         assert limit == 2 * 60 * e[part], part
 
@@ -188,12 +210,13 @@ def test_the_refusal_is_the_same_as_four_h100s():
 
 
 def test_the_deadline_is_twice_the_estimate_and_the_job_holds_it():
-    assert fs.four_profile_default_deadline_s() == 11700  # (76 + 1 + 20) * 2 * 60 = 11640, up 100
+    assert fs.four_profile_default_deadline_s() == 14100  # (96 + 1 + 20) * 2 * 60 = 14040, up 100
     text = JOB.read_text()
     want = f"[ \"$SESSION\" = four-h100-profile ] && DEFAULT_DEADLINE_S=" \
            f"{fs.four_profile_default_deadline_s()}"
     assert want in text
     assert fs.four_default_deadline_s() == 14700
+    assert "14100, 3 h 55 min" in text
     assert subprocess.run(["bash", "-n", str(JOB)]).returncode == 0
 
 
@@ -435,7 +458,7 @@ def test_the_log_lines_hold_the_numbers_and_ratios():
         "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), "
         f"5.6 (accumulated GPU time); step ÷ training 1.6"]
     assert sum(" plain training " in x for x in lines) == 2 * len(PKEYS)
-    assert lines[-1].startswith(f"FS42 {PKEYS[-1]} pipe:")
+    assert [x for x in lines if x.startswith("FS42")][-1].startswith(f"FS42 {PKEYS[-1]} pipe:")
 
 
 def test_a_failed_item_prints_as_fs42_fail_and_unknown_numbers_say_so():
@@ -616,12 +639,12 @@ def test_the_readme_has_the_runbook_commands_with_placeholders():
     assert mods == ["evaluation.results.profile.trace", "evaluation.results.profile.analyze",
                     "evaluation.results.profile.analyze", "evaluation.results.profile.report"]
     text = README.read_text()
-    assert "FS11_SESSION=four-h100-profile" in text and "11,700 s" in text
+    assert "FS11_SESSION=four-h100-profile" in text and "14,100 s" in text
     assert "summary.json[\"four_h100_profile\"]" in text
     for c in cmds:
         assert any("$PROFILES" in a for a in c) and any("--out" == a for a in c)
         assert c[2].endswith("report") or any("$OUT" in a for a in c)
-    assert str(fs.four_profile_default_deadline_s()) == "11700"
+    assert str(fs.four_profile_default_deadline_s()) == "14100"
 
 
 def test_the_readme_commands_use_only_flags_the_tools_have_and_all_they_require():
@@ -653,10 +676,13 @@ def test_the_readme_gives_the_cost_line_the_ratios_and_the_interval():
     sec = " ".join(sec[:sec.index("\n## ")].split())  # the README's line breaks do not count
     est = fs.four_profile_estimated_min()
     assert f"{est} min" in sec and "about 15 min of pod setup and fetch" in sec
-    assert "$P/h" in sec and "$15.96/h" in sec and "11,700 s" in sec and "14,100 s" in sec
-    assert "(97 + 20) x 2" in sec and "20 is the pod's setup" in sec
-    assert est + fs.FOUR_PACK_MIN + fs.FOUR_GRACE_MIN == 97
-    assert -(-(97 + 20) * 2 * 60 // 100) * 100 == 14100
+    assert "$P/h" in sec and "$15.96/h" in sec and "14,100 s" in sec and "16,500 s" in sec
+    assert "(117 + 20) x 2" in sec and "20 is the pod's setup" in sec
+    assert est + fs.FOUR_PACK_MIN + fs.FOUR_GRACE_MIN == 117
+    assert -(-(117 + 20) * 2 * 60 // 100) * 100 == 16500
+    assert "sleep` of 16,500 s" in sec and "21 + 3 x 15 + 10 + 20 = 96 min" in sec
+    assert "--o18-commit 3dbf7aa" in sec and "--base-commit 387b991" in sec
+    assert "about 111 min" in sec and "`VERIF_RELEASE_CACHE` unset" in sec
     assert "wall time" in sec and "verify_over_train_accumulated" in sec
     assert "(accumulated GPU time)" in sec
     assert "`plain_baseline --steps 3 --metrics`" in sec
@@ -706,12 +732,19 @@ def _base_parts(**over):
     return [over.get(p["name"], p) for p in parts]
 
 
-def _upload(tmp_path, base_dir=True, commit=BASE_SHA):
+O18_SHA = "3dbf7aa" + "0" * 33
+
+
+def _upload(tmp_path, base_dir=True, commit=BASE_SHA, o18_dir=False, o18_commit=O18_SHA):
     up = tmp_path / "up"
     up.mkdir()
-    (up / "manifest.json").write_text(json.dumps({"base_commit": commit} if commit else {}))
+    man = {**({"base_commit": commit} if commit else {}),
+           **({"o18_commit": o18_commit} if o18_dir and o18_commit else {})}
+    (up / "manifest.json").write_text(json.dumps(man))
     if base_dir:
         (up / "repo_base").mkdir()
+    if o18_dir:
+        (up / "repo_o18").mkdir()
     return up
 
 
@@ -721,12 +754,16 @@ def test_the_plan_gets_the_base_arms_after_llamas_o18_arms(tmp_path):
     names = [p.name for p in plan]
     i = names.index(f"pipe_{K}")
     assert names[i + 1:i + 3] == BASE_NAMES and fs.FOUR_PROFILE_BASE_MODELS == (K,)
+    assert names[i + 3:i + 5] == [f"{a}_{K}_rel1" for a in ("seq", "pipe")]  # FS54, no o18 tree
     assert sum(n.endswith("_base") for n in names) == 2
     by = {p.name: p for p in plan}
     for arm in ("seq", "pipe"):
         o18, base = by[f"{arm}_{K}"], by[f"{arm}_{K}_base"]
         assert base.argv == o18.argv and base.kind == o18.kind == "profile_run"
-        skip = ("VERIF_OUTPUT_DIR", "PYTHONPATH")  # the run dir and the import root differ
+        # the run dir, the import root and (FS54) the release setting differ: main's is unset
+        # (auto), the base arm's release is on as FS42's was
+        skip = ("VERIF_OUTPUT_DIR", "PYTHONPATH", "VERIF_RELEASE_CACHE")
+        assert base.env["VERIF_RELEASE_CACHE"] == "1" and o18.env["VERIF_RELEASE_CACHE"] is None
         assert {k: v for k, v in base.env.items() if k not in skip} == \
             {k: v for k, v in o18.env.items() if k not in skip}
         assert base.env["PYTHONPATH"] == str(up / "repo_base") and "PYTHONPATH" not in o18.env
@@ -746,9 +783,12 @@ def test_the_plan_gets_the_base_arms_after_llamas_o18_arms(tmp_path):
 
 def test_without_repo_base_there_are_no_base_arms_and_the_log_says_why(tmp_path, capsys):
     plan = fs.four_h100_profile_plan(_upload(tmp_path, base_dir=False), tmp_path / "out")
-    assert [p.name for p in plan] == [n for n in fs.four_profile_parts()
-                                      if n != fs.NATIVE_BUILD_NAME]
-    assert not any(p.name.endswith("_base") or p.cwd is not None for p in plan)
+    # FS54's rel1 arms need no extra tree: they are there without repo_base/ and repo_o18/
+    rel1 = [f"{a}_{K}_rel1" for a in ("seq", "pipe")]
+    assert [p.name for p in plan if not p.name.endswith("_rel1")] == [
+        n for n in fs.four_profile_parts() if n != fs.NATIVE_BUILD_NAME]
+    assert [p.name for p in plan if p.name.endswith("_rel1")] == rel1
+    assert not any(p.name.endswith(("_base", "_o18")) or p.cwd is not None for p in plan)
     assert "FS49 A/B arm skipped" in capsys.readouterr().out
     # the plain four-H100 session never has them, repo_base or not
     (tmp_path / "up" / "repo_base").mkdir(parents=True)
@@ -758,8 +798,8 @@ def test_without_repo_base_there_are_no_base_arms_and_the_log_says_why(tmp_path,
 
 def test_the_estimate_counts_the_base_arms_always():
     e = fs.FOUR_PROFILE_ESTIMATE_MIN
-    assert fs.four_profile_estimated_min() == 21 + 3 * (e["plain"] + e["card"] + e["seq"]
-                                                        + e["pipe"]) + e["seq"] + e["pipe"]
+    pair = e["seq"] + e["pipe"]  # the base arms (FS49s), the o18 and the rel1 arms (FS54)
+    assert fs.four_profile_estimated_min() == 21 + 3 * (e["plain"] + e["card"] + pair) + 3 * pair
 
 
 def test_run_part_runs_in_its_own_cwd_and_the_default_is_the_sessions(tmp_path):
@@ -854,8 +894,9 @@ def test_a_missing_base_part_fails_only_when_planned():
 def test_the_ab_lines_hold_the_numbers():
     lines = fs._profile_lines(_prof(_base_parts()))
     ab = [x for x in lines if x.startswith("FS49 A/B")]
-    assert ab == [f"FS49 A/B {K} seq: O18 20.0 s, base 30.0 s (Δ -10.0 s, ratio 0.67)",
-                  f"FS49 A/B {K} pipe: O18 11.0 s, base 19.0 s (Δ -8.0 s, ratio 0.58)"]
+    assert ab == [f"FS49 A/B {K} seq: O18 (main arm) 20.0 s, base 30.0 s (Δ -10.0 s, ratio 0.67)",
+                  f"FS49 A/B {K} pipe: O18 (main arm) 11.0 s, base 19.0 s (Δ -8.0 s, ratio 0.58)"]
+    assert _prof(_base_parts())["models"][K]["ab_basis"] == "main arm"
     assert not any(x.startswith("FS49") for x in fs._profile_lines(_prof()))
 
 
@@ -875,3 +916,315 @@ def test_the_readme_base_commands_mirror_the_o18_ones_with_distinct_sessions():
     assert "pipe_${MODEL}_base" in val(bpipe, "--samples")
     assert val(bseq, "--session") == val(bpipe, "--session") == val(seq, "--session") + "-base"
     assert val(seq, "--session") == val(pipe, "--session")
+
+
+# ---- the host-side arms (FS54, plan section 5.3) ----------------------------------------------
+
+HS_TAGS = ("", "_rel1", "_o18")
+HS_ADD = {"": 0.0, "_rel1": 2.0, "_o18": 5.0}  # added to the main arm's step interval
+HS_GAP = {"": 1.0, "_rel1": 2.0, "_o18": 2.5}  # the time between steps outside every section
+HS_SEC = {"": (2.0, 4.0, None), "_rel1": (3.0, 5.0, 0.5), "_o18": (4.0, 7.0, 0.5)}
+HS_HASHES = {"s1/step_00001.npz": "a" * 64, "s1/step_00002.npz": "b" * 64}
+GIB = 2 ** 30
+
+
+def _hs_sections(arm, tag):
+    """Sections that make the steady between-steps time exactly ``HS_GAP`` (interval minus the
+    prover and verifier sides, or the verifier alone pipelined, minus the cache release)."""
+    iv = [x + HS_ADD[tag] for x in ARM_INTERVAL[arm]]
+    meas, five, rel = HS_SEC[tag]
+    prover = [5.0] * 4 if arm == "seq" else [4.0] * 4  # pipelined: overlapped, not subtracted
+    ver = [i - (5.0 if arm == "seq" else 0.0) - (rel or 0.0) - HS_GAP[tag] for i in iv]
+    return {"5.measure": [meas] * 4, "5": [five] * 4,
+            "handoff.empty_cache": [rel] * 4, "prover": prover, "verifier": ver}
+
+
+def _hs_arm(arm, tag, roots=None, hashes=None, sha="r" * 64, profile=None, **over):
+    """A host-side part: the main arm (``tag`` ""), the ``_rel1`` or the ``_o18`` arm; only the
+    main sequential arm traces."""
+    traces = arm == "seq" and tag == ""
+    part = _arm(K, arm, roots=roots, step_interval_s=[x + HS_ADD[tag] for x in ARM_INTERVAL[arm]],
+                sections_s=_hs_sections(arm, tag), records_sha=sha,
+                archive_hashes=dict(HS_HASHES if hashes is None else hashes),
+                profile=profile or _profile(
+                    arm, traced_steps=[4] if traces else [],
+                    trace_files=["step_00004.json.gz"] if traces else []), **over)
+    info = {**part["info"], "model_key": K}
+    if tag:
+        info.update({"_rel1": {"release_pinned": True},
+                     "_o18": {"o18": True, "o18_commit": O18_SHA, "release_pinned": True}}[tag])
+    return {**part, "name": f"{arm}_{K}{tag}", "info": info}
+
+
+def _hs_parts(o18=True, **over):
+    """The plan's parts with Llama's main arms replaced by host-side ones, the base arms after
+    them (the plan's order), then the ``_o18`` and ``_rel1`` arms."""
+    parts = _base_parts()
+    parts = [_hs_arm(p["name"].split("_")[0], "") if p["name"] in (f"seq_{K}", f"pipe_{K}") else p
+             for p in parts]
+    at = next(i for i, p in enumerate(parts) if p["name"] == f"pipe_{K}_base") + 1
+    tags = ("_o18", "_rel1") if o18 else ("_rel1",)
+    parts[at:at] = [_hs_arm(a, t) for t in tags for a in ("seq", "pipe")]
+    return [over.get(p["name"], p) for p in parts]
+
+
+def test_the_plan_has_the_o18_arms_after_the_base_arms_in_the_o18_tree(tmp_path):
+    up = _upload(tmp_path, o18_dir=True)
+    plan = fs.four_h100_profile_plan(up, tmp_path / "out")
+    names = [p.name for p in plan]
+    i = names.index(f"pipe_{K}")
+    want = [f"{a}_{K}{t}" for t in ("", "_base", "_o18", "_rel1") for a in ("seq", "pipe")]
+    assert names[i - 1:i + 7] == want  # main seq, main pipe, base, o18, rel1 (seq before pipe)
+    by = {p.name: p for p in plan}
+    for a in ("seq", "pipe"):
+        main, o18, r1 = by[f"{a}_{K}"], by[f"{a}_{K}_o18"], by[f"{a}_{K}_rel1"]
+        assert o18.argv == main.argv and o18.kind == "profile_run"
+        skip = ("VERIF_OUTPUT_DIR", "PYTHONPATH", "VERIF_RELEASE_CACHE", "VERIF_TRACE_STEP",
+                "VERIF_TRACE_C5")  # the o18 arms trace nothing, the main sequential one traces
+        assert {k: v for k, v in o18.env.items() if k not in skip} == \
+            {k: v for k, v in main.env.items() if k not in skip}
+        assert o18.env["PYTHONPATH"] == str(up / "repo_o18") and o18.cwd == up / "repo_o18"
+        assert o18.env["VERIF_RELEASE_CACHE"] == "1" and main.env["VERIF_RELEASE_CACHE"] is None
+        assert o18.env["VERIF_OUTPUT_DIR"].endswith(f"_{a}_o18")
+        assert o18.info["o18"] is True and o18.info["o18_commit"] == O18_SHA
+        assert o18.info["arm"] == a and o18.info["gpu_peak"] and o18.info["samples_check"]
+        assert o18.info["records"] != main.info["records"]
+        assert o18.env.get("VERIF_TRACE_STEP") is None and o18.env.get("VERIF_TRACE_C5") is None
+        assert r1.env["VERIF_RELEASE_CACHE"] == "1" and r1.cwd is None
+        assert "PYTHONPATH" not in r1.env and r1.info["release_pinned"] is True
+        assert "o18" not in r1.info and "o18" not in main.info
+        assert r1.env.get("VERIF_TRACE_STEP") is None
+    base_seq = by[f"seq_{K}_base"]
+    assert base_seq.env["VERIF_TRACE_STEP"] == "4" and base_seq.cwd == up / "repo_base"
+    assert len({p.env.get("VERIF_OUTPUT_DIR") for p in plan if p.kind == "profile_run"}) == \
+        sum(p.kind == "profile_run" for p in plan)
+
+
+def test_without_repo_o18_there_are_no_o18_arms_and_the_log_says_why(tmp_path, capsys):
+    plan = fs.four_h100_profile_plan(_upload(tmp_path, o18_dir=False), tmp_path / "out")
+    assert not any(p.name.endswith("_o18") for p in plan)
+    assert f"seq_{K}_rel1" in [p.name for p in plan]  # fix C's comparison needs no tree
+    assert "FS54 host-side A+B arm skipped" in capsys.readouterr().out
+
+
+def test_the_summary_gives_the_ab_against_the_o18_arms_and_the_host_side_numbers():
+    res = _prof(_hs_parts())
+    assert res["pass"], _fails(res)
+    row = res["models"][K]
+    assert res["host_side_skipped"] is None and row["ab_basis"] == "o18 arm"
+    # O18's A/B: the o18 arm (main + 5 s) against the base arm (steady 30.0 and 19.0 s)
+    assert row["ab"]["seq"]["o18_steady_s"] == pytest.approx(25.0)
+    assert row["ab"]["seq"]["diff_s"] == pytest.approx(-5.0)
+    assert row["ab"]["pipe"]["o18_steady_s"] == pytest.approx(16.0)
+    assert row["ab"]["pipe"]["ratio"] == pytest.approx(16.0 / 19.0)
+    hs = row["host_side"]
+    assert set(hs) == {"seq", "pipe"} and json.dumps(row)
+    ab, c = hs["seq"]["fixes_ab"], hs["seq"]["fix_c"]
+    # fixes A+B: o18 (without) against rel1 (with); fix C: rel1 (without) against main (with)
+    assert ab["interval"] == {"without_s": pytest.approx(25.0), "with_s": pytest.approx(22.0),
+                              "diff_s": pytest.approx(-3.0), "ratio": pytest.approx(22.0 / 25.0)}
+    assert c["interval"]["without_s"] == pytest.approx(22.0)
+    assert c["interval"]["with_s"] == pytest.approx(20.0)
+    assert c["interval"]["diff_s"] == pytest.approx(-2.0)
+    assert ab["5.measure"]["without_s"] == pytest.approx(4.0)
+    assert ab["5.measure"]["with_s"] == pytest.approx(3.0)
+    assert ab["5"]["diff_s"] == pytest.approx(-2.0) and c["5"]["ratio"] == pytest.approx(4.0 / 5.0)
+    assert ab["handoff.empty_cache"]["ratio"] == pytest.approx(1.0)
+    assert c["handoff.empty_cache"]["with_s"] == pytest.approx(0.0)  # main: no row, release off
+    assert c["handoff.empty_cache"]["diff_s"] == pytest.approx(-0.5)
+    assert ab["between_steps"]["without_s"] == pytest.approx(2.5)
+    assert ab["between_steps"]["with_s"] == pytest.approx(2.0)
+    assert c["between_steps"]["with_s"] == pytest.approx(1.0)
+    assert c["between_steps"]["ratio"] == pytest.approx(0.5)
+    pipe_ab = hs["pipe"]["fixes_ab"]  # pipelined: the verifier side alone is subtracted
+    assert pipe_ab["interval"]["without_s"] == pytest.approx(16.0)
+    assert pipe_ab["between_steps"]["without_s"] == pytest.approx(2.5)
+    assert pipe_ab["between_steps"]["with_s"] == pytest.approx(2.0)
+    items = [t for _, t in res["items"] if "host-side" in t]
+    assert any(t == f"{K} host-side seq: the step roots of seq_{K}, seq_{K}_rel1, seq_{K}_o18 "
+                    "are equal" for t in items)
+    assert any("residual archives" in t and "2 archives" in t for t in items)
+    assert any("step records" in t and "are equal" in t for t in items)
+    assert any("accepted at all 4 steps" in t for t in items)
+
+
+def test_the_host_side_lines_hold_the_numbers():
+    lines = fs._profile_lines(_prof(_hs_parts()))
+    hs = [x for x in lines if x.startswith(f"FS54 host-side {K} seq:")]
+    assert len(hs) == 2 and hs[0].startswith(
+        f"FS54 host-side {K} seq: fixes A+B (o18 -> rel1), steady step 25 s -> 22 s (Δ -3 s, "
+        "ratio 0.88); 5.measure 4 s -> 3 s (Δ -1 s, ratio 0.75); check 5 7 s -> 5 s")
+    assert "between steps 2.5 s -> 2 s" in hs[0]
+    assert hs[1].startswith(f"FS54 host-side {K} seq: fix C (rel1 -> main), steady step 22 s "
+                            "-> 20 s (Δ -2 s, ratio 0.91)")
+    assert "handoff.empty_cache 0.5 s -> 0 s (Δ -0.5 s, ratio 0)" in hs[1]
+    assert sum(x.startswith("FS54 host-side") for x in lines) == 4
+    ab = [x for x in lines if x.startswith("FS49 A/B")]
+    assert ab == [f"FS49 A/B {K} seq: O18 (o18 arm) 25.0 s, base 30.0 s (Δ -5.0 s, ratio 0.83)",
+                  f"FS49 A/B {K} pipe: O18 (o18 arm) 16.0 s, base 19.0 s (Δ -3.0 s, ratio 0.84)"]
+    assert lines.index(ab[1]) < lines.index(hs[0])  # after FS49's lines
+    assert not any(x.startswith("FS54 host-side") for x in fs._profile_lines(_prof()))
+
+
+def test_without_o18_arms_the_summary_skips_fixes_ab_and_says_so():
+    res = _prof(_hs_parts(o18=False))
+    assert res["pass"], _fails(res)
+    row = res["models"][K]
+    assert row["ab_basis"] == "main arm" and "repo_o18" in res["host_side_skipped"]
+    assert row["host_side"]["seq"]["fixes_ab"] is None
+    assert row["host_side"]["seq"]["fix_c"]["interval"]["diff_s"] == pytest.approx(-2.0)
+    assert "ab_skipped" in res and _prof(_parts())["host_side_skipped"] is not None
+    lines = fs._profile_lines(res)
+    assert sum(x.startswith("FS54 host-side") and "fix C" in x for x in lines) == 2
+    assert not any("fixes A+B" in x for x in lines)
+
+
+def test_an_o18_archive_with_another_hash_fails_one_item():
+    other = {**HS_HASHES, "s1/step_00002.npz": "c" * 64}
+    res = _prof(_hs_parts(**{f"pipe_{K}_o18": _hs_arm("pipe", "_o18", hashes=other)}))
+    _one_fail(res, f"{K} host-side pipe", "residual archives", "differ", "s1/step_00002.npz")
+    res = _prof(_hs_parts(**{f"seq_{K}_o18": _hs_arm("seq", "_o18", hashes={})}))
+    assert any("host-side seq" in t and "residual archives" in t for t in _fails(res))
+    res = _prof(_hs_parts(**{f"seq_{K}_rel1": _hs_arm("seq", "_rel1", archive_error="boom",
+                                                       hashes={"s1/step_00001.npz": "a" * 64})}))
+    _one_fail(res, "host-side seq", "residual archives", "step_00002")
+
+
+def test_unequal_host_side_roots_or_step_records_fail():
+    bad = [*ROOTS4[:3], "%064x" % 99]
+    res = _prof(_hs_parts(**{f"pipe_{K}_rel1": _hs_arm("pipe", "_rel1", roots=bad)}))
+    _one_fail(res, f"{K} host-side pipe", "step roots", "differ")
+    res = _prof(_hs_parts(**{f"seq_{K}_o18": _hs_arm("seq", "_o18", sha="x" * 64)}))
+    _one_fail(res, f"{K} host-side seq", "step records", "differ")
+    res = _prof(_hs_parts(**{f"seq_{K}_o18": _hs_arm("seq", "_o18", sha=None)}))
+    _one_fail(res, "step records", "a digest is missing")
+
+
+def test_a_host_side_arm_not_accepted_or_without_its_inputs_fails():
+    res = _prof(_hs_parts(**{f"seq_{K}_o18": _hs_arm("seq", "_o18", accepted=False)}))
+    assert any("host-side: not accepted" in t and f"seq_{K}_o18" in t for t in _fails(res))
+    res = _prof(_hs_parts(**{f"pipe_{K}_rel1": _hs_arm(
+        "pipe", "_rel1", profile=_profile("pipe", layout=False))}))
+    assert any("host-side" in t and f"pipe_{K}_rel1" in t and "layout" in t for t in _fails(res))
+    gone = [{**p, "status": "not_started", "extras": None} if p["name"] == f"seq_{K}_rel1" else p
+            for p in _hs_parts()]
+    assert any(f"seq_{K}_rel1 did not run" in t for t in _fails(_prof(gone)))
+    # a planned o18 arm that is missing fails; an unplanned one (no repo_o18) does not
+    gone = [{**p, "status": "not_started", "extras": None} if p["name"] == f"pipe_{K}_o18" else p
+            for p in _hs_parts()]
+    assert any(f"pipe_{K}_o18 did not run" in t for t in _fails(_prof(gone)))
+
+
+def _peaks(allocated, reserved=6, n=4):
+    return {f"cuda:{i}": {"peak_bytes": allocated, "peak_reserved_bytes": reserved}
+            for i in range(n)}
+
+
+def test_the_memory_line_holds_every_gpu_under_79_gib():
+    res = _prof()
+    assert res["pass"] and any("under 79 GiB" in t for _, t in res["items"])
+    mem = res["models"][K]["memory"]["seq"]
+    assert set(mem) == {f"cuda:{i}" for i in range(4)} and mem["cuda:0"]["peak_gib"] < 1
+    ok = {f"pipe_{K}": _arm(K, "pipe", device_peaks=_peaks(78 * GIB, 78 * GIB))}
+    assert _prof(_parts(**ok))["pass"]
+    over = _peaks(70 * GIB, 70 * GIB)
+    over["cuda:2"] = {"peak_bytes": 70 * GIB, "peak_reserved_bytes": 79 * GIB}  # reserved at 79
+    res = _prof(_parts(**{f"seq_{K}": _arm(K, "seq", device_peaks=over)}))
+    _one_fail(res, "79 GiB", f"{K} seq cuda:2", "peak_reserved 79.0 GiB")
+    over["cuda:2"] = {"peak_bytes": 80 * GIB, "peak_reserved_bytes": 80 * GIB}
+    res = _prof(_parts(**{f"pipe_{K}": _arm(K, "pipe", device_peaks=over)}))
+    _one_fail(res, f"{K} pipe cuda:2", "peak 80.0 GiB")
+    assert res["models"][K]["memory"]["pipe"]["cuda:2"]["peak_gib"] == pytest.approx(80.0)
+    res = _prof(_parts(**{f"pipe_{K}": _arm(K, "pipe", device_peaks=_peaks(5, n=3))}))
+    _one_fail(res, f"{K} pipe: 3 GPUs in the memory rows")
+    res = _prof(_parts(**{f"pipe_{K}": _arm(K, "pipe", device_peaks=_peaks(None))}))
+    _one_fail(res, f"{K} pipe cuda:0", "no peak")
+    lines = fs._profile_lines(_prof(_parts(**{f"seq_{K}": _arm(K, "seq", device_peaks=_peaks(
+        int(70.25 * GIB), int(72.5 * GIB)))})))
+    assert f"FS54 memory {K} seq: peak allocated/reserved GiB per GPU: cuda:0 70.2/72.5, " \
+        "cuda:1 70.2/72.5, cuda:2 70.2/72.5, cuda:3 70.2/72.5" in lines
+    assert any(x.startswith("FS42 FAIL") and "79 GiB" in x for x in fs._profile_lines(
+        _prof(_parts(**{f"seq_{K}": _arm(K, "seq", device_peaks=over)}))))
+
+
+# ---- the host-side extras on real files (FS54) ------------------------------------------------
+
+
+def _time(step, component, level, t, side=None):
+    return {"record": "time", "step": step, "component": component, "level": level, "time_s": t,
+            **({"side": side} if side else {})}
+
+
+def test_the_section_times_read_the_rows_per_step():
+    rows = [_time(1, "5.measure", "sub", 1.5), _time(2, "5.measure", "sub", 2.5),
+            _time(1, "5", "component", 4.0), _time(1, "handoff.empty_cache", "sub", 0.25),
+            _time(1, "prover", "total", 9.0), _time(2, "verifier", "total", 8.0),
+            _time(1, "5", "phase", 99.0), _time(1, "5.measure", "sub", "x"),
+            {"record": "count", "step": 1, "component": "5"}]
+    got = fs._section_times(rows, 3)
+    assert got["5.measure"] == [1.5, 2.5, None] and got["5"] == [4.0, None, None]
+    assert got["handoff.empty_cache"] == [0.25, None, None]
+    assert got["prover"] == [9.0, None, None] and got["verifier"] == [None, 8.0, None]
+
+
+def test_the_records_digest_ignores_times_traced_and_the_environment():
+    a = [{"record": "step", "step": 1, "root": "r", "traced": True}, {"record": "storage", "n": 2},
+         {"record": "time", "step": 1, "time_s": 1.0}, {"record": "environment", "pid": 1}]
+    b = [{"record": "step", "step": 1, "root": "r", "traced": False}, {"record": "storage", "n": 2},
+         {"record": "time", "step": 1, "time_s": 7.0}, {"record": "environment", "pid": 2}]
+    assert fs._records_digest(a) == fs._records_digest(b)
+    b[0]["root"] = "q"
+    assert fs._records_digest(a) != fs._records_digest(b)
+    c = [{**a[0]}, {"record": "storage", "n": 3}]
+    assert fs._records_digest(a[:2]) != fs._records_digest(c)
+
+
+def test_the_archive_hash_sees_names_dtypes_shapes_and_bytes(tmp_path):
+    import numpy as np
+    x = np.arange(6, dtype=np.float32)
+    np.savez(tmp_path / "a.npz", w=x, v=np.ones(2))
+    np.savez(tmp_path / "same.npz", v=np.ones(2), w=x.copy())  # the order of the arrays is no matter
+    np.savez(tmp_path / "name.npz", w2=x, v=np.ones(2))
+    np.savez(tmp_path / "dtype.npz", w=x.astype(np.float64), v=np.ones(2))
+    np.savez(tmp_path / "shape.npz", w=x.reshape(2, 3), v=np.ones(2))
+    y = x.copy()
+    y[3] += 1
+    np.savez(tmp_path / "bytes.npz", w=y, v=np.ones(2))
+    h = {n: fs._archive_hash(tmp_path / f"{n}.npz") for n in
+         ("a", "same", "name", "dtype", "shape", "bytes")}
+    assert h["a"] == h["same"] and len(set(h.values())) == 5
+
+
+def test_the_run_extras_compare_digest_and_archive_hashes(tmp_path):
+    import numpy as np
+    log, rec = _arm_dir(tmp_path, "pipe", traced=())
+    d = rec.parent
+    rec.write_text(rec.read_text().replace(
+        "{cut", json.dumps(_time(2, "5.measure", "sub", 1.25)) + "\n"
+        + json.dumps(_time(2, "handoff.empty_cache", "sub", 0.5)) + "\n{cut"))
+    ex = fs._profile_run_extras(log, rec)
+    assert ex["sections_s"]["5.measure"] == [None, 1.25, None, None]
+    assert ex["sections_s"]["handoff.empty_cache"] == [None, 0.5, None, None]
+    assert "records_sha" not in ex and "archive_hashes" not in ex
+    (d / "residuals" / "s1").mkdir(parents=True)
+    np.savez(d / "residuals" / "s1" / "step_00001.npz", r=np.arange(4.0))
+    np.savez(d / "residuals" / "s1" / "step_00002.npz", r=np.arange(4.0) + 1)
+    ex = fs._profile_run_extras(log, rec, compare=True)
+    assert set(ex["archive_hashes"]) == {"s1/step_00001.npz", "s1/step_00002.npz"}
+    assert len(set(ex["archive_hashes"].values())) == 2 and len(ex["records_sha"]) == 64
+    assert ex["records_sha"] == fs._profile_run_extras(log, rec, compare=True)["records_sha"]
+    (d / "residuals" / "s1" / "step_00002.npz").write_bytes(b"not an archive")
+    ex = fs._profile_run_extras(log, rec, compare=True)
+    assert ex["archive_hashes"] is None and ex["archive_error"]
+
+
+def test_a_truncated_archive_reports_archive_error(tmp_path):
+    import numpy as np
+    log, rec = _arm_dir(tmp_path, "pipe", traced=())
+    (rec.parent / "residuals" / "s1").mkdir(parents=True)
+    good = rec.parent / "residuals" / "s1" / "step_00001.npz"
+    np.savez(good, r=np.arange(1000.0))
+    good.write_bytes(good.read_bytes()[:-40])  # cut off: the zip directory is gone
+    ex = fs._profile_run_extras(log, rec, compare=True)
+    assert ex["archive_hashes"] is None and "BadZipFile" in ex["archive_error"]
+    assert ex["profile"]["markers_file"] is True  # the arm's other inputs are still read

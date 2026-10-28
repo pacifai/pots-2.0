@@ -1415,20 +1415,23 @@ sequential arm traces step 4.
 Its parts, in order: `native_build` (1 min), `peer_check` (1), `models` (6, FS35's estimate; it
 fetches the whole manifest, not only these three models, and a slow download fails the part, so
 its limit is FS35's 720 s), `four_tests` (6), `probe` (7), then per model `plain_<model>` (3),
-`card_<model>` (2), `seq_<model>` (6) and `pipe_<model>` (4). The estimates are FS35's
+`card_<model>` (2), `seq_<model>` (6) and `pipe_<model>` (4), then for Llama-3.2-1B the
+base, o18 and rel1 arms (below). The estimates are FS35's
 measured times of 2026-10-25 scaled to four steps (FS35's card measured 37-62 s); the plain
 run's is a guess, and the sequential arm's 6 adds an estimated 2-3 minutes for the trace of
 one full-scale step, all of check 5 included (`VERIF_TRACE_C5=all`: the measuring kernel runs
 outside the sampled serving stamps), a JSON of about 1-1.5 GB gzipped at level 1, to a step of
-about 195 s, so its limit is 720 s. In all, 21 + 3 x 15 + 10 = 76 min (the last 10 are the A/B
-arm's, below, counted whether or not the upload has it), plus packing 1 and the grace window 20,
-97 min; the job's default deadline is twice that, 11,640 s rounded up to 11,700 s (3 h
-15 min), set in `fs11_job.sh` and `four_profile_default_deadline_s()`, which a test holds
-equal. The pod's boot guard is (97 + 20) x 2 = 234 min = 14,040 s, rounded up to 14,100 s: 97
-is the job's estimated runtime with its packing and grace window (the job deadline's own
-basis), 20 is the pod's setup (image pull, set-up script, upload), and the 2 is the margin.
-The pod's start command is the four-H100 session's above with a `sleep` of 14,100 s in place of
-17,100. Each part's time limit is about twice its estimate.
+about 195 s, so its limit is 720 s. In all, 21 + 3 x 15 + 10 + 20 = 96 min (the last 30 are
+Llama-3.2-1B's base, o18 and rel1 arms, below, 10 each; the base and o18 arms are counted whether
+or not the upload has them), plus packing 1 and the grace window 20, 117 min; the job's default
+deadline is twice that, 14,040 s rounded up to 14,100 s (3 h 55 min), set in `fs11_job.sh` and
+`four_profile_default_deadline_s()`, which a test holds equal. The pod's boot guard is
+(117 + 20) x 2 = 274 min = 16,440 s, rounded up to 16,500 s: 117 is the job's estimated runtime
+with its packing and grace window (the job deadline's own basis), 20 is the pod's setup (image
+pull, set-up script, upload), and the 2 is the margin. The pod's start command is the four-H100
+session's above with a `sleep` of 16,500 s in place of 17,100. Each part's time limit is about
+twice its estimate. (Before FS54 the estimate was 76 min, the job deadline 11,700 s and the boot
+guard 14,100 s.)
 
 **Measured (2026-10-25, one four-H100 SXM pod, every part passed).** From `job.log`: the native
 build 18 s, the peer check 26 s, the models 47 s, the four-GPU tests 557 s, the probe 362 s;
@@ -1440,17 +1443,19 @@ estimate. The tests ran 9.3 min against an estimate of 6, the sequential arm of 
 and 4.3 min; the plain runs (a guess of 3 min) and the cards ran well under theirs. The
 estimates above stay what sets the limits.
 
-**Expected cost.** The parts' estimated runtime, 76 min, plus about 15 min of pod setup and
-fetch, is about 91 min, so a run costs about 91 / 60 x $P/h, at $P/h the pod's hourly price;
-at FS35's $15.96/h that is about $24. The job deadline caps the job at 11,700 s, about
-$52 at that price, and the boot guard caps the whole pod at 14,100 s, about $63.
+**Expected cost.** The parts' estimated runtime, 96 min, plus about 15 min of pod setup and
+fetch, is about 111 min, so a run costs about 111 / 60 x $P/h, at $P/h the pod's hourly price;
+at FS35's $15.96/h that is about $30. The job deadline caps the job at 14,100 s, about
+$63 at that price, and the boot guard caps the whole pod at 16,500 s, about $73.
 
 - `plain_<model>`: `plain_baseline --steps 3 --metrics` on GPU 0 alone (`VERIF_DEVICE=cuda:0`,
   no verifier devices, no pipelining): the plain training step the verifier's cost is compared
   with.
 - `card_<model>`: `card_identity` on GPU 0, as in FS35.
 - `seq_<model>`: `llama_step --steps 4 --metrics --no-count` with `VERIF_TRACE_STEP=4` and
-  `VERIF_TRACE_C5=all`.
+  `VERIF_TRACE_C5=all`, and `VERIF_RELEASE_CACHE` unset in this session's main arms (FS54): the
+  code under test decides (with the host-side fixes, FS53's "auto": no CUDA cache release when the
+  verifier devices exclude the prover's, as on four GPUs).
 - `pipe_<model>`: the same with `VERIF_PIPELINED=1` and no `VERIF_TRACE_STEP`.
 
 Every part records its GPUs' peaks and a `samples.jsonl` with four GPUs in its header.
@@ -1460,7 +1465,9 @@ Merkle leaf per attention product instead of one per member) is host-side, so th
 with the code before O18 is made on one pod, in one session. Prepare the upload with
 `--base-commit 387b991` (the commit before O18, "the base") and the upload also carries
 `repo_base/`, `git archive` of that commit; the manifest records `base_commit`, and the pod's
-upload check verifies `repo_base/` like `repo/`. Then, right after Llama-3.2-1B's `pipe_<model>`
+upload check verifies `repo_base/` like `repo/`. The base arms release the CUDA cache
+(`VERIF_RELEASE_CACHE=1`, the base code's only behaviour, as FS42 ran). Then, right after
+Llama-3.2-1B's `pipe_<model>`
 (`FOUR_PROFILE_BASE_MODELS`), the plan adds `seq_Llama-3.2-1B_base` and
 `pipe_Llama-3.2-1B_base`: the same environment and command as the O18 arms (the sequential one
 traced at step 4 too), each in its own run directory (`runs/four_<key>_seq_base`,
@@ -1468,6 +1475,29 @@ traced at step 4 too), each in its own run directory (`runs/four_<key>_seq_base`
 working directory and as `PYTHONPATH`, so they import the base code. They add 6 + 4 = 10 min to the
 estimate. A prep without `--base-commit` has no `repo_base/`, the plan has no base arms and says so
 in the job log, and `summary.json` carries `ab_skipped`.
+
+**The host-side arms (FS54).** The host-side fixes (A: check 5's per-step bookkeeping built once
+per run, B: the evaluation records off the critical path, C: no CUDA cache release when the
+verifier devices exclude the prover's) change no bit, and this session measures what they gain on
+one pod. The full prep command is
+
+    HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --out DIR \
+        --base-commit 387b991 --o18-commit 3dbf7aa
+
+where `387b991` is the code before O18 and `3dbf7aa` the O18 merge without the host-side fixes
+(`fs11_prep.py --o18-commit REV`, the fs11 session only, packs `repo_o18/` the way `repo_base/` is
+packed and records `o18_commit` in the manifest; the pod's upload check verifies it too). The
+code under test, "main", is the checkout's own (`repo/`). For Llama-3.2-1B
+(`FOUR_PROFILE_HOST_SIDE_MODELS`) the plan runs, in this order after the main `seq_<model>` and
+`pipe_<model>`: the base arms, then `seq_<model>_o18` and `pipe_<model>_o18` (with `repo_o18/`:
+the main arm's environment and command, its own run directory, `PYTHONPATH` and working
+directory `repo_o18/`, and `VERIF_RELEASE_CACHE=1`), then `seq_<model>_rel1` and
+`pipe_<model>_rel1` (main's code with `VERIF_RELEASE_CACHE=1`, which needs no extra tree). The
+o18 and rel1 arms trace nothing (the base arms trace, as FS49s built them). Each pair adds
+6 + 4 = 10 min to the estimate, the base pair's included in the 30 above; the arms that trace
+nothing will run a little under that. Without `repo_o18/` there are no o18 arms,
+the plan says so in the job log, and `summary.json` carries `host_side_skipped`; the rel1 arms
+stay, and fix C is still measured.
 
 **Reading the result.** `summary.json["four_h100_profile"]["pass"]` fails closed. It is true
 only when: every part ended `ok` (or was done earlier); the peer copies landed the right bytes;
@@ -1499,8 +1529,29 @@ mean the base arm ran the O18 code); a base root is not compared with the card's
 layout differs. `pass` fails closed on them only when they are in the plan. Each model's `base`
 holds the same numbers as its O18 arms, and `ab` per loop the O18 and the base steady step
 interval, their difference (O18 minus base) and ratio (O18 over base); the log gets one
-`FS49 A/B <model> <loop>: O18 X s, base Y s (Δ Z s, ratio R)` line per loop, after the
-`FS42` lines of that model.
+`FS49 A/B <model> <loop>: O18 (<basis>) X s, base Y s (Δ Z s, ratio R)` line per loop, after the
+`FS42` lines of that model. With the o18 arms in the plan, O18's own effect is the o18 arm against
+the base arm (`ab_basis` is `o18 arm`, the main arm also holds the host-side fixes); without them
+the O18 side is the main arm and the line says `main arm`.
+
+With the host-side arms (FS54) each model has `host_side[<loop>]`, in two blocks: `fixes_ab`
+(fixes A and B: the o18 arm against the rel1 arm, both releasing the cache; only with o18 arms)
+and `fix_c` (the rel1 arm against the main arm: the same code, release on against auto). Each
+holds, for the steady step interval (the steps the A/B uses) and for `5.measure`, check 5's total
+(`5`), `handoff.empty_cache` (taken as 0 s where the arm has no such row) and `between_steps`
+(the interval minus the sections' time and the cache release: the prover and verifier `total`
+rows sequentially, the verifier's alone pipelined, where the prover side overlaps; an assumption
+that the verifier is the longer), the arm without the fix, the arm with it, their difference
+(with minus without) and ratio (with over without). The log gets `FS54 host-side <model>
+<loop>: fixes A+B (o18 -> rel1), steady step ...` and `... fix C (rel1 -> main) ...` lines after
+FS49's. The items add, for the o18 and rel1 arms, the same acceptance as the others (judged
+untraced), and per loop that the step roots of the main, rel1 and o18 arms are equal step by step,
+that their step records (every `step`, `verdict`, `storage` and `count` row but `traced`) are
+equal, and that their residual archives are equal (a SHA-256 over each archive's arrays' names,
+dtypes, shapes and bytes, one archive at a time, about 217 MB each at full scale). A last item
+holds every GPU's peak allocated and peak reserved memory under 79 GiB (79 x 2^30 bytes), for
+every model and both main loops; each row's `memory` and the `FS54 memory <model> <loop>` lines
+give the per-GPU figures in GiB.
 An acceptance failure does not change the job's exit code; if computing it raises,
 `four_h100_profile_error` holds the error and the job runs on.
 
