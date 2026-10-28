@@ -1,7 +1,7 @@
 """FS30 tester: the device-leaves gate fed by what the real code writes. The bring-up lines come
-from ``bring_up.device_leaves_line`` over a real step's leaves and a real computation's product-leaf
-count ``K`` and ``dK`` leaves, and the tests part's cases from a real ``pytest --junitxml`` run, so a change of
-either format shows here and not on the card."""
+from ``bring_up.device_leaves_line`` over a real step's leaves and a real computation's
+product-leaf count ``K`` and ``dK`` leaves, and the tests part's cases from a real
+``pytest --junitxml`` run, so a change of either format shows here and not on the card."""
 
 import subprocess
 import sys

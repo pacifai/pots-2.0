@@ -33,7 +33,8 @@ sweep and no check-6 trial.
    binding product, the one with the largest ``q`` (``dF`` on the decoder). Per trial it plants
    an error ``Δ`` of relative size ``f = ‖Δ‖_F/‖P‖_F`` in the target, re-roots by re-hashing
    only that leaf and its path (``store.perturb_leaf``; a batched member sits in its group's
-   leaf (O18), so the planted product goes into a fresh clone of that leaf), draws the challenges from the new root,
+   leaf (O18), so the planted product goes into a fresh clone of that leaf), draws the
+   challenges from the new root,
    and measures and judges the one product with check 5's own code (:func:`measure_target`,
    ``checks._judge_product``); a batched member is measured in its batch as check 5 stacks
    it, beside the other members' committed products. The other products are honest and are

@@ -388,8 +388,8 @@ def device_leaves_line(b: BringUp, c: DecoderComputation, *, T: int) -> str:
     per product leaf; the ``δK̃ᵀ`` outputs too, whose digests go unused), how many leaves the
     commit actually took from them (``commit known``, ``HashStats.known`` of the commit's own
     hash call, ``StepRecord.known``), ``K`` (``c.n_product_leaves``, O18), and how many
-    ``dK`` product leaves there are (the ones the prover hashes at the commit); and whether the step was accepted. Run on a
-    CPU, no leaf takes a digest and the roots agree trivially."""
+    ``dK`` product leaves there are (the ones the prover hashes at the commit); and whether the
+    step was accepted. Run on a CPU, no leaf takes a digest and the roots agree trivially."""
     if b.kept is None:
         raise ValueError("device_leaves_line needs the step's leaves: run with keep_last")
     step = next(s for s in b.result.loop.steps if s.t == T)

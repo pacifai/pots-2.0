@@ -43,7 +43,7 @@ def fake_known(monkeypatch, n):
     def wrapper(c, *a, **kw):
         out = real_prove(c, *a, **kw)
         want = hash_step_leaves(c, out.leaves())
-        idx = [c.product_index(m) for m in range(1, n + 1)]
+        idx = [c.product_leaf_index(g) for g in range(n)]
         return dataclasses.replace(out, arrival_digests={i: want[i] for i in idx})
 
     monkeypatch.setattr(loop_mod, "prove_step", wrapper)

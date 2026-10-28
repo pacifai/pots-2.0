@@ -3124,15 +3124,15 @@ def _leaf_label(layout: Mapping[str, Any], index: int) -> tuple[str, str]:
     by ``K`` and ``product_leaf_names`` (O18); an old report's ``M`` and ``product_names`` still
     read."""
     n_s, n_w = layout["n_s"], layout["n_w"]
-    m = layout["K"] if "K" in layout else layout["M"]
+    k = layout["K"] if "K" in layout else layout["M"]
     names = layout["product_leaf_names"] if "K" in layout else layout["product_names"]
     if index < n_s:
         return "record", f"record {index}"
     if index < n_s + n_w:
         return "w_t", layout["weight_names"][index - n_s]
-    if index < n_s + n_w + m:
+    if index < n_s + n_w + k:
         return "product", names[index - n_s - n_w]
-    return "w_next", layout["weight_names"][index - n_s - n_w - m]
+    return "w_next", layout["weight_names"][index - n_s - n_w - k]
 
 
 def _first_difference(ref: Mapping[str, Any], other: Mapping[str, Any]) -> dict[str, Any]:

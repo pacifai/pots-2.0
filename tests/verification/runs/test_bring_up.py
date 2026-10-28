@@ -333,8 +333,8 @@ class _Spy(StoreHandoff):
     def hold(self, c, t, leaves, tree, dataset_paths=None):
         gc.collect()
         self.dead_at[t] = {u: all(r() is None for r in refs) for u, refs in self.refs.items()}
-        lo = c.product_index(1)
-        self.refs[t] = [weakref.ref(x) for x in leaves[lo:lo + c.M]]
+        lo = c.product_leaf_index(0)  # O18: the K product leaves
+        self.refs[t] = [weakref.ref(x) for x in leaves[lo:lo + c.n_product_leaves]]
         self.roots[t] = tree.root
         return InMemoryStore.hold(c, leaves, tree, dataset_paths)
 
