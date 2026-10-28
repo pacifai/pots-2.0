@@ -209,8 +209,14 @@ def assert_same(unit, canon):
 def _flipped(setup, *ms):
     leaves = list(setup.leaves)
     for m in ms:
-        i = setup.c.product_index(m)
-        leaves[i] = _flip(leaves[i])
+        g, i = setup.c.leaf_of(m)  # O18: a group's members are one 3-D leaf; flip member i
+        k = setup.c.product_leaf_index(g)
+        if i is None:
+            leaves[k] = _flip(leaves[k])
+        else:
+            leaf = leaves[k].clone()
+            leaf[i] = _flip(leaf[i])
+            leaves[k] = leaf
     return leaves
 
 
