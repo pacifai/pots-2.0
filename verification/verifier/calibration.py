@@ -298,11 +298,11 @@ def step_floor(stats: StepStats, *, tau: float, k: int, N: float, eps_in: float,
     # ``f_achieved``), so every ``f`` equals the loop's bit for bit (:func:`_step_floor_loop`).
     # ``keep`` holds only ``q > 0``, finite non-zero ``‖P‖_F`` and a non-NaN ``U``, so
     # ``term_ratio`` is ``U/‖P‖_F`` (``inf`` when ``U`` is) and never NaN.
-    ratio = cols.u[keep] / cols.p_norm[keep]
-    e = (math.sqrt(2.0) * eps_in
-         + np.sqrt(cols.q[keep].astype(np.float64)) * eps_acc * np.maximum(1.0, ratio))
     scale = 2.0 ** (N / k)  # once, as ``f_achieved`` computes it per call
     with np.errstate(all="ignore"):
+        ratio = cols.u[keep] / cols.p_norm[keep]
+        e = (math.sqrt(2.0) * eps_in
+             + np.sqrt(cols.q[keep].astype(np.float64)) * eps_acc * np.maximum(1.0, ratio))
         f = c * tau * e * scale
     # The loop's strict ``>``: the first maximum wins, and a NaN never beats a value (it only
     # stands when it is the first product, which the loop takes unconditionally).
