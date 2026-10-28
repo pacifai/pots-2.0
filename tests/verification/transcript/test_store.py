@@ -133,7 +133,8 @@ def test_byte_flip_in_encoded_bytes_changes_root(c, data):
     store = _store(c, data)
     hashes = leaf_hashes(c, store)
     tree = MerkleTree(hashes)
-    for i in (0, c.w_t_index(c.weight_names[1]), c.product_leaf_index(c.leaf_of(3)[0]), c.n_leaves - 1):
+    for i in (0, c.w_t_index(c.weight_names[1]), c.product_leaf_index(c.leaf_of(3)[0]),
+              c.n_leaves - 1):
         enc = bytearray(b"".join(leaf_parts(c, i, store.leaf(i))))
         for pos in (0, 1, 2, len(enc) - 1):
             enc[pos] ^= 0x80
@@ -466,7 +467,8 @@ def test_file_changed_between_check_4_and_check_2_rejects_at_2(c, data, tmp_path
 
 def test_corrupt_leaf_file_rejects_as_malformed(c, data, tmp_path):
     _, disk = _disk(c, data, tmp_path / "step")
-    (tmp_path / "step" / LEAF_FILE.format(c.product_leaf_index(c.leaf_of(2)[0]))).write_bytes(b"\0" * 10)
+    leaf = c.product_leaf_index(c.leaf_of(2)[0])
+    (tmp_path / "step" / LEAF_FILE.format(leaf)).write_bytes(b"\0" * 10)
     v = _verifier(c, data, init_weights(c.widths, seed=0))
     assert v.start_run(data) is None
     rej = v.verify_step(1, disk)

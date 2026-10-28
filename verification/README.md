@@ -1462,9 +1462,9 @@ upload check verifies `repo_base/` like `repo/`. Then, right after Llama-3.2-1B'
 `pipe_Llama-3.2-1B_base`: the same environment and command as the O18 arms (the sequential one
 traced at step 4 too), each in its own run directory (`runs/four_<key>_seq_base`,
 `runs/four_<key>_pipe_base`), run with the session's own python but with `repo_base/` as the
-working directory, so they import the base code. They add 6 + 4 = 10 min to the estimate. A
-prep without `--base-commit` has no `repo_base/`, the plan has no base arms and says so in the
-job log, and `summary.json` carries `ab_skipped`.
+working directory and as `PYTHONPATH`, so they import the base code. They add 6 + 4 = 10 min to the
+estimate. A prep without `--base-commit` has no `repo_base/`, the plan has no base arms and says so
+in the job log, and `summary.json` carries `ab_skipped`.
 
 **Reading the result.** `summary.json["four_h100_profile"]["pass"]` fails closed. It is true
 only when: every part ended `ok` (or was done earlier); the peer copies landed the right bytes;
@@ -1491,7 +1491,8 @@ accumulated GPU time ratio, the one EQ14 puts beside PoTS's verify over train) a
 `FS42 <model> <arm>: step X s (interval between verified steps), verifier Y s per step, plain training Z s per step; verifier ÷ training A (wall time), B (accumulated GPU time); step ÷ training C`.
 With the A/B arm, the base arms are judged like the O18 arms (every step accepted in the loop's
 mode, the profile's inputs, the samples, the peaks) and their two arms' step roots must be equal
-to each other; a base root is not compared with the O18 arms' or the card's, since the leaf
+to each other and each base root must differ from the O18 arm's at the same step (equal roots
+mean the base arm ran the O18 code); a base root is not compared with the card's, since the leaf
 layout differs. `pass` fails closed on them only when they are in the plan. Each model's `base`
 holds the same numbers as its O18 arms, and `ab` per loop the O18 and the base steady step
 interval, their difference (O18 minus base) and ratio (O18 over base); the log gets one
@@ -1539,8 +1540,36 @@ python -m evaluation.results.profile.analyze \
     --steady-steps 2-3 --compute-dtype bfloat16 --out $PROFILES/${MODEL}_pipe.json
 ```
 
-That is three trace summaries and six profiles in all (the commands above, once per model).
-Last, one report over all six profiles:
+With the A/B arm (`repo_base/` in the upload), the base arms have the same commands, on
+`runs/four_${KEY}_seq_base` and `runs/four_${KEY}_pipe_base` and their parts, for the base
+model only (`KEY=Llama-3.2-1B-Instruct_refusal`, `MODEL=Llama-3.2-1B`). Each takes its own
+`--session` label, the O18 arm's plus `-base`, so that `report.py`, which labels a run by model,
+attack, scenario and session, tells the two apart:
+
+```bash
+python -m evaluation.results.profile.trace \
+    --trace $OUT/runs/four_${KEY}_seq_base/llama_step/trace/step_00004.json.gz \
+    --layout $OUT/runs/four_${KEY}_seq_base/llama_step/c5_layout.json \
+    --markers $OUT/runs/four_${KEY}_seq_base/llama_step/markers.jsonl \
+    --out $PROFILES/${MODEL}_seq_base_trace.json
+python -m evaluation.results.profile.analyze \
+    --run-dir $OUT/runs/four_${KEY}_seq_base/llama_step --session $LABEL-base \
+    --markers $OUT/runs/four_${KEY}_seq_base/llama_step/markers.jsonl \
+    --samples $OUT/parts/seq_${MODEL}_base/samples.jsonl --probe $OUT/probe/probe.json \
+    --trace-summary $PROFILES/${MODEL}_seq_base_trace.json \
+    --plain $OUT/runs/four_${KEY}_plain/plain_baseline \
+    --steady-steps 2-3 --compute-dtype bfloat16 --out $PROFILES/${MODEL}_seq_base.json
+python -m evaluation.results.profile.analyze \
+    --run-dir $OUT/runs/four_${KEY}_pipe_base/llama_step --session $LABEL-base \
+    --markers $OUT/runs/four_${KEY}_pipe_base/llama_step/markers.jsonl \
+    --samples $OUT/parts/pipe_${MODEL}_base/samples.jsonl --probe $OUT/probe/probe.json \
+    --plain $OUT/runs/four_${KEY}_plain/plain_baseline \
+    --steady-steps 2-3 --compute-dtype bfloat16 --out $PROFILES/${MODEL}_pipe_base.json
+```
+
+That is three trace summaries and six profiles in all for the O18 arms (the first commands,
+once per model), and with the A/B arm four trace summaries and eight profiles.
+Last, one report over the six O18 profiles (add the two base profiles to compare them):
 
 ```bash
 python -m evaluation.results.profile.report \

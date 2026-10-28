@@ -579,7 +579,7 @@ def test_an_error_in_the_acceptance_is_recorded_and_the_session_runs_on(tmp_path
 PY = "/Users/amitainevo/Projects/pots-2.0/.venv/bin/python"
 
 
-def _readme_commands():
+def _readme_all_commands():
     """The profiling section's fenced commands, each joined into one line, split into the
     ``python -m`` commands it holds."""
     text = README.read_text()
@@ -590,6 +590,20 @@ def _readme_commands():
         body = block.split("```")[0].replace("\\\n", " ")
         cmds += [ln.split() for ln in body.splitlines() if ln.startswith("python -m ")]
     return cmds
+
+
+def _is_base(c):
+    return any("seq_base" in a or "pipe_base" in a for a in c)
+
+
+def _readme_commands():
+    """The O18 arms' commands (trace, two analyzes, report); the base arms' are
+    :func:`_readme_base_commands`."""
+    return [c for c in _readme_all_commands() if not _is_base(c)]
+
+
+def _readme_base_commands():
+    return [c for c in _readme_all_commands() if _is_base(c)]
 
 
 def _flags(argv):
@@ -613,7 +627,7 @@ def test_the_readme_has_the_runbook_commands_with_placeholders():
 def test_the_readme_commands_use_only_flags_the_tools_have_and_all_they_require():
     required = {"trace": {"--trace", "--out"}, "analyze": {"--run-dir", "--session", "--out"},
                 "report": {"--out"}}
-    for c in _readme_commands():
+    for c in _readme_all_commands():
         tool = c[2].rsplit(".", 1)[1]
         help_text = subprocess.run([PY, "-m", c[2], "--help"], capture_output=True, text=True,
                                    cwd=Path(fs.__file__).parents[2]).stdout
@@ -843,3 +857,21 @@ def test_the_ab_lines_hold_the_numbers():
     assert ab == [f"FS49 A/B {K} seq: O18 20.0 s, base 30.0 s (Δ -10.0 s, ratio 0.67)",
                   f"FS49 A/B {K} pipe: O18 11.0 s, base 19.0 s (Δ -8.0 s, ratio 0.58)"]
     assert not any(x.startswith("FS49") for x in fs._profile_lines(_prof()))
+
+
+def test_the_readme_base_commands_mirror_the_o18_ones_with_distinct_sessions():
+    trace, seq, pipe, _ = _readme_commands()
+    btrace, bseq, bpipe = _readme_base_commands()
+
+    def val(c, flag):
+        return c[c.index(flag) + 1]
+
+    for o, b in ((trace, btrace), (seq, bseq), (pipe, bpipe)):
+        assert _flags(o) == _flags(b)
+    assert val(btrace, "--out") == val(bseq, "--trace-summary")
+    assert "four_${KEY}_seq_base" in val(bseq, "--run-dir")
+    assert "four_${KEY}_pipe_base" in val(bpipe, "--run-dir")
+    assert "seq_${MODEL}_base" in val(bseq, "--samples")
+    assert "pipe_${MODEL}_base" in val(bpipe, "--samples")
+    assert val(bseq, "--session") == val(bpipe, "--session") == val(seq, "--session") + "-base"
+    assert val(seq, "--session") == val(pipe, "--session")

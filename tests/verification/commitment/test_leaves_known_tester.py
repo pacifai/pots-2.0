@@ -194,7 +194,8 @@ def stepped(c, monkeypatch):  # noqa: F811
 
 
 def test_arrival_digests_are_keyed_by_product_leaf_index(c, stepped):  # noqa: F811
-    assert set(stepped.arrival_digests) == {c.product_leaf_index(c.leaf_of(m)[0]) for m in range(1, c.M + 1)}
+    assert set(stepped.arrival_digests) == {
+        c.product_leaf_index(c.leaf_of(m)[0]) for m in range(1, c.M + 1)}
     leaves = stepped.leaves()
     plain_digests = hash_step_leaves(c, leaves)
     assert all(plain_digests[i] == d for i, d in stepped.arrival_digests.items())
@@ -219,9 +220,11 @@ def test_a_perturbed_product_loses_only_its_entry(c, monkeypatch):  # noqa: F811
     out = prove_step(c, c.build_model(), init_weights(c.widths, seed=0), data[4:8],
                      perturb={2: lambda t: t + 1, 5: lambda t: t * 2})
     gone = {c.product_leaf_index(c.leaf_of(2)[0]), c.product_leaf_index(c.leaf_of(5)[0])}
-    assert set(out.arrival_digests) == {c.product_leaf_index(c.leaf_of(m)[0]) for m in range(1, c.M + 1)} - gone
+    assert set(out.arrival_digests) == {
+        c.product_leaf_index(c.leaf_of(m)[0]) for m in range(1, c.M + 1)} - gone
     assert out.capture["arrival_hash"]["used"] == c.n_product_leaves - 2
-    assert out.capture["arrival_hash"]["leaves"] == c.n_product_leaves  # the capture hashed them all
+    # the capture hashed them all
+    assert out.capture["arrival_hash"]["leaves"] == c.n_product_leaves
     # the digests left are right; the perturbed leaves hash from their bytes
     assert commit(c, out).root == commit_leaves(c, out.leaves()).root
 
