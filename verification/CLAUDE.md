@@ -641,7 +641,8 @@ interface.
     contiguous output in `records` (not `glue_outer`) whose dtype is in `native.FINITE_KIND`,
     on the same side stream right after the host copy. `MatmulCapture.arrival_digest(p)` returns
     the digest for product `p` or `None` (matched by storage identity, dtype, shape,
-    contiguity, an unchanged `_version` and the member's place in its batch).
+    contiguity, an unchanged `_version` and the storage offset), and only for the whole output:
+    a batched product's bmm output is one leaf (O18), so a member view `out[i]` gets `None`.
     `StepOutput.arrival_digests` (product leaf index to digest; default empty, not part of
     equality) is filled in `prove_step` through `computation.product_index(m)`; `perturb` drops
     its entry and `with_w_next` keeps them. `summary()["arrival_hash"]` counts records, leaves,
@@ -650,8 +651,9 @@ interface.
     from the arrival loop it already runs: `missing` (`{ProductKind name: count}` of the
     products with no digest) and `missing_first` (the names, in canonical order, of the first 5
     whose kind is not `OPERAND_GRAD`). The capture hashes
-    the `dK` records too and their digests go unused (the `δK̃` leaf is a new tensor), so
-    `leaves` (hashed) is `M` and `used` is `M − dK`. A non-finite product
+    the `dK` records too and their digests go unused (the `δK̃` leaf is the batched transpose
+    made in labeling, a new tensor), so `leaves` (outputs hashed, one per record) is the record
+    count `K` and `used` is `K − L` (`L` the `δK̃` leaves). A non-finite product
     gets no digest (the host path raises on it as before). The sharded path (FS34) hashes on
     arrival too: `_route` hashes a product after its peer copy lands, on the owner's side
     stream, and a product already on its owner is hashed where it sits (`_hash_in_place`),
