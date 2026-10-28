@@ -148,11 +148,11 @@ A wrong hint costs a copy, never a bit. The copy:
   :class:`MutatedCaptureError`, as above;
 - the owner hashes the copy on arrival (FS34): the kernel's table for the product is queued on
   the destination's side stream behind the copy's event, as the host path queues it behind its
-  host copy, and its digests are keyed by the copy's storage, so :meth:`arrival_digest` serves
-  them as on the one-GPU path. The training GPU hashes nothing when it owns no layers (the
+  host copy, and its digest is keyed by the copy's storage, so :meth:`arrival_digest` serves
+  it as on the one-GPU path. The training GPU hashes nothing when it owns no layers (the
   four-GPU machine); on the two-GPU pod GPU 0 also owns layers and hashes the products it keeps;
 - an output already on its hinted device is kept as it is, and hashed where it sits, on that
-  device's side stream after the producing stream; the digests are paired with the ``_version``
+  device's side stream after the producing stream; the digest is paired with the ``_version``
   read when the hash was queued, since the kept tensor is autograd's own (a later write is
   :class:`MutatedCaptureError`, and never a digest of a later version); a hint that is the host
   takes the host-buffer path above.
@@ -422,8 +422,8 @@ class MatmulCapture(TorchDispatchMode):
         # ``hasher`` is the kernel's host for tests.
         self.hash_arrivals = hash_arrivals
         self._hasher = hasher
-        # host storage -> (members, shape, dtype, the host tensor's offset, digests, version):
-        # the digests are those below the first non-finite member.
+        # host storage -> (shape, dtype, the host tensor's offset, digest, version): the whole
+        # output's one digest (O18), ``None`` for a non-finite output.
         self._arrived: dict[StorageWeakRef, tuple] = {}
         self._arrival_stats = {"records": 0, "leaves": 0, "bytes": 0, "nonfinite": 0}
         # Only a sharded placement routes (FS32d); unsharded, the capture is as before.
@@ -683,21 +683,17 @@ class MatmulCapture(TorchDispatchMode):
 
     def _hash_arrival(self, rec: MatmulRecord, out: torch.Tensor,
                       side: torch.cuda.Stream) -> PendingHash:
-        """Enqueue the product leaves' hashes on ``side`` (behind the host copy): the whole
-        output, or each member ``out[i]``, with header ``tensor_leaf_header(TAG_PRODUCT, leaf)``.
-        Members are contiguous and equal in size, so their addresses are arithmetic and one
-        header serves them all. Nothing here waits."""
-        members = rec.n_members
-        leaf = out if rec.batch is None else out[0]
-        hdr = tensor_leaf_header(TAG_PRODUCT, leaf)
-        size = leaf.nbytes
+        """Enqueue the product leaf's hash on ``side`` (behind the host copy): the whole output
+        as one table entry, with header ``tensor_leaf_header(TAG_PRODUCT, out)`` (O18: 3-D for a
+        batched bmm, whose members are one leaf). Nothing here waits."""
+        hdr = tensor_leaf_header(TAG_PRODUCT, out)
         hasher = self._hasher if self._hasher is not None else _hasher()
         return hasher.enqueue_table(
             hdr, np.zeros(1, np.uint64), np.array([len(hdr)], np.uint32),
-            np.zeros(members, np.int64),
-            out.data_ptr() + size * np.arange(members, dtype=np.uint64),
-            np.full(members, size, np.uint64),
-            np.full(members, native.FINITE_KIND[out.dtype], np.uint8),
+            np.zeros(1, np.int64),
+            np.array([out.data_ptr()], np.uint64),
+            np.array([out.nbytes], np.uint64),
+            np.full(1, native.FINITE_KIND[out.dtype], np.uint8),
             device=out.device, stream=side, keep=[out])
 
     def _arrived_from(self, rec: MatmulRecord, pend: PendingHash,
@@ -707,34 +703,30 @@ class MatmulCapture(TorchDispatchMode):
         digests, bad = pend.result()
         host = rec.out
         self._arrived[StorageWeakRef(host.untyped_storage())] = (
-            rec.n_members, tuple(host.shape[(rec.batch is not None):]), host.dtype,
-            host.storage_offset(), digests, host._version if version is None else version)
+            tuple(host.shape), host.dtype, host.storage_offset(),
+            digests[0] if digests else None, host._version if version is None else version)
         st = self._arrival_stats
         st["records"] += 1
-        st["leaves"] += len(digests)
-        st["bytes"] += len(digests) * (host.nbytes // rec.n_members)
+        st["leaves"] += 1
+        st["bytes"] += host.nbytes
         st["nonfinite"] += pend.n - bad
 
     def arrival_digest(self, p: torch.Tensor) -> bytes | None:
-        """The digest of ``p`` hashed on arrival, if ``p`` is exactly a leaf that was: the
-        whole output of an unbatched record, or member ``i`` of a batched one, found by storage
-        identity, then offset, shape, dtype and contiguity. ``None`` for any other tensor (the
-        ``δK̃`` transpose, a new tensor, a member with a NaN or Inf, or a buffer written since).
+        """The digest of ``p`` hashed on arrival, if ``p`` is exactly the whole output that was
+        hashed (O18: a batched bmm's output is one leaf), found by storage identity, then
+        offset, shape, dtype and contiguity. ``None`` for any other tensor (a member view
+        ``out[i]``, a slice, the ``δK̃`` transpose, a new tensor, an output with a NaN or Inf,
+        or a buffer written since).
         """
         self.wait_copies()
         hit = self._arrived.get(StorageWeakRef(p.untyped_storage()))
         if hit is None:
             return None
-        members, shape, dtype, base, digests, version = hit
-        if p.dtype != dtype or tuple(p.shape) != shape or not p.is_contiguous() \
-                or p._version != version:
+        shape, dtype, base, digest, version = hit
+        if p.dtype != dtype or tuple(p.shape) != shape or p.storage_offset() != base \
+                or not p.is_contiguous() or p._version != version:
             return None
-        step = p.numel()
-        rel = p.storage_offset() - base
-        if step == 0 or rel < 0 or rel % step or rel // step >= members:
-            return None
-        i = rel // step
-        return digests[i] if i < len(digests) else None
+        return digest
 
     def _drain(self, *, block: bool, check: bool = True) -> None:
         """Drop the GPU outputs whose copy is done (all of them when ``block``)."""

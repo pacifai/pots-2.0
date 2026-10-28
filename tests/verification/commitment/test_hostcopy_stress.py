@@ -25,9 +25,7 @@ from verification.commitment.leaves import (
 )
 from verification.transcript import store as store_mod
 from verification.transcript.errors import StoreMutationError
-from verification.transcript.reader import stack_block
 from verification.transcript.store import DiskStore, InMemoryStore, perturb_leaf
-from verification.verifier.context import CommittedLeaves
 
 from tests.verification.commitment.test_hostcopy import _Stub, _same_error
 
@@ -400,80 +398,6 @@ def test_python_path_mutation_during_the_copy_raises(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "to", to)
     with native.disabled(), pytest.raises(StoreMutationError):
         leaf_hashes_of(c, enumerate(placed))
-
-
-# ---- zero-copy runs on the CPU, as before ----------------------------------------------------
-
-
-def test_cpu_runs_are_views_and_fall_back_as_before():
-    big = torch.randn(6, 3, 5)
-    assert big.data_ptr() % 64 == 0
-    ts = [big[i] for i in range(6)]
-    out = stack_block(ts)
-    assert out.data_ptr() == big.data_ptr() and out._base is not None
-    assert torch.equal(out, torch.stack(ts))
-    assert stack_block(ts, own=True).data_ptr() != big.data_ptr()
-    # fallbacks are torch.stack, bit for bit
-    for bad in (
-        [big[0], big[2], big[1]],                        # offsets out of order
-        [big[0], big[1].clone()],                        # another storage
-        [big[0], big[1][:2]],                            # another shape
-        [big[0], big[1].to(torch.float64)],              # another dtype
-        [torch.randn(3, 5).t(), torch.randn(3, 5).t()],  # non-contiguous
-        [torch.empty(0), torch.empty(0)],                # empty
-    ):
-        try:
-            want = torch.stack(bad)
-        except RuntimeError as e:
-            with pytest.raises(RuntimeError):
-                stack_block(bad)
-            assert str(e)
-            continue
-        got = stack_block(bad)
-        assert got.dtype == want.dtype and torch.equal(got, want)
-        assert got.numel() == 0 or got.data_ptr() not in {t.data_ptr() for t in bad}
-    g = big.clone().requires_grad_()
-    assert stack_block([g[0], g[1]]).requires_grad
-    base = torch.randn(200)
-    m = base[1:31].reshape(6, 5)  # starts 4 bytes into an aligned storage: torch.stack aligns, a view cannot
-    out = stack_block([m[i] for i in range(6)])
-    assert out.data_ptr() != m.data_ptr() and torch.equal(out, m)
-    with pytest.raises(RuntimeError):
-        stack_block([])
-
-
-def test_cpu_tensor_run_is_a_view_and_checks_versions():
-    big = torch.randn(6, 3, 5)
-    ts = [big[i] for i in range(6)]
-    cl = CommittedLeaves()
-    for t in ts:
-        cl.add(t)
-    run = cl.tensor_run(0, 1, 6)
-    assert run.data_ptr() == big.data_ptr() and torch.equal(run, big)
-    sub = cl.tensor_run(1, 2, 3)
-    assert torch.equal(sub, big[1:6:2])
-    big.add_(1.0)
-    with pytest.raises(StoreMutationError):
-        cl.tensor_run(0, 1, 6)
-
-
-def test_cpu_runs_of_mixed_storage_are_not_a_run():
-    a, b = torch.randn(2, 4), torch.randn(2, 4)
-    cl = CommittedLeaves()
-    for t in (a[0], a[1], b[0], b[1]):
-        cl.add(t)
-    out = cl.tensor_run(0, 1, 4)
-    assert torch.equal(out, torch.stack([a[0], a[1], b[0], b[1]]))
-
-
-@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="no mps")
-def test_mixed_device_members_are_no_run():
-    a = torch.randn(4, 8)
-    ts = [a[0], a[1], a[2].to("mps"), a[3]]
-    with pytest.raises(RuntimeError):
-        torch.stack(ts)
-    with pytest.raises(RuntimeError):
-        stack_block(ts)
 
 
 # ---- real MPS leaves mixed with CPU leaves ---------------------------------------------------

@@ -310,10 +310,13 @@ unchanged bit for bit. One code path serves both: `VERIF_DEVICE` picks the devic
 A step's transcript is an ordered list of leaves:
 
 ```
-[ batch records (n_s) | W_t (n_w tensors) | P_1 … P_M | W_{t+1} (n_w tensors) ]
+[ batch records (n_s) | W_t (n_w tensors) | product leaves (K) | W_{t+1} (n_w tensors) ]
 ```
 
-For SmolLM2 that's 4 + 272 + 7,113 + 272 = 7,661 leaves.
+A lone product is one leaf. The `n_s·n_h` members of each batched attention product (`S`,
+`O`, `δA`, `δV`, `δQ̃`, `δK̃` of a layer) are one leaf `[n_s·n_h, a, b]`, at the position of
+the first member. Every member is still its own matmul with its own label and challenges.
+For SmolLM2 that's 4 + 272 + 813 + 272 = 1,361 leaves (`K = 27L + 3B = 813`).
 
 `TranscriptStore` in `store.py` is the verifier's entire view of a step. It has four
 methods: read leaf `i`, read the claimed root, read a leaf's authentication path, and read a

@@ -40,7 +40,6 @@ from verification.transcript.errors import (
     StoreMutationError,
     TranscriptFormatError,
 )
-from verification.transcript.reader import _ALIGN, stack_block
 
 if TYPE_CHECKING:
     from verification.computation.interface import DeclaredComputation, ProductSpec, Replay
@@ -485,13 +484,13 @@ class CommittedLeaves:
     Each object is the one whose bytes entered the recomputed root. Its tensors' ``_version``
     is recorded before hashing and compared on every read, so an in-place write through any
     alias after hashing raises :class:`StoreMutationError` instead of serving changed bytes.
+    A batched product's member is read as a slice of its one leaf (O18), whose ``_version``
+    :meth:`leaf` checks on every read.
     """
 
     def __init__(self) -> None:
         self._objs: list[Any] = []
         self._versions: list[tuple[int, ...]] = []
-        # (first, stride, n) -> proof of a range read, or None (tensor_run)
-        self._runs: dict[tuple[int, int, int], Any] = {}
 
     def add(self, obj: Any) -> None:
         self._versions.append(tuple(t._version for t in _leaf_tensors(obj)))
@@ -510,93 +509,6 @@ class CommittedLeaves:
         if self.changed(index):
             raise StoreMutationError(f"leaf {index} changed in place after check 2 hashed it")
         return self._objs[index]
-
-    def tensor_block(self, indices: Sequence[int], own: bool = False) -> torch.Tensor:
-        """:func:`stack_block` of the tensor leaves at ``indices``, each read as :meth:`leaf`
-        reads it: the index and ``_version`` checked per leaf, in order, so the first bad one
-        raises as in a loop. (Views of one storage share a version counter, so a write
-        through any alias moves every member's; the per-leaf check still compares each
-        against its own recorded value.) A leaf that is not a tensor takes the plain path."""
-        objs, versions = self._objs, self._versions
-        n, ts = len(objs), []
-        for i in indices:
-            if not (isinstance(i, int) and 0 <= i < n):
-                self.leaf(i)  # raises the verifier-bug error
-            t = objs[i]
-            if not isinstance(t, torch.Tensor):
-                return stack_block([self.leaf(j) for j in indices], own)
-            if t._version != versions[i][0]:
-                raise StoreMutationError(f"leaf {i} changed in place after check 2 hashed it")
-            ts.append(t)
-        return stack_block(ts, own)
-
-    def tensor_run(self, first: int, stride: int, n: int, own: bool = False) -> torch.Tensor:
-        """:meth:`tensor_block` of the leaves ``first + stride·k``, ``k < n``, without its
-        per-leaf checks of shape, offset and storage when they are one bmm's members.
-
-        The first read of a range proves, once, that the leaves are equal-shape contiguous
-        tensors at storage offsets ``off + k·numel`` of one storage, 64-byte aligned (the
-        conditions of :func:`stack_block`), and that every recorded ``_version`` is the same
-        number. That structure can't change, so the proof is kept. Every read still compares
-        each leaf's own ``_version`` to the recorded one: sharing a storage does not mean
-        sharing a version counter (``torch.load`` and ``set_`` give each tensor its own
-        counter over one storage, so a write through one leaf would leave the others' unmoved).
-        Any mismatch, and any range the proof fails on, takes :meth:`tensor_block`, which
-        raises for the first changed leaf, with its index, exactly as a loop of :meth:`leaf`
-        does. The proofs are kept on this object, so none outlives the step's leaves.
-        """
-        key = (first, stride, n)
-        last = first + stride * (n - 1)
-        runs = self._runs
-        if key not in runs:
-            runs[key] = self._prove_run(first, stride, n)
-        desc = runs[key]
-        if desc is not None:
-            t0, version, shape, strides, off = desc
-            if all(t._version == version for t in self._objs[first:last + 1:stride]):
-                out = t0.as_strided((n, *shape), strides, off)
-                return out.clone() if own else out
-        return self.tensor_block([first + stride * k for k in range(n)], own)
-
-    def _prove_run(self, first: int, stride: int, n: int
-                   ) -> tuple[torch.Tensor, int, Any, tuple[int, ...], int] | None:
-        """The proof :meth:`tensor_run` keeps for a range, or ``None`` if it can't be made.
-        A range inside a proved one is read off that proof, without visiting its leaves."""
-        objs, versions = self._objs, self._versions
-        last = first + stride * (n - 1)
-        if n < 1 or stride < 1 or not (isinstance(first, int) and 0 <= first and last < len(objs)):
-            return None
-        for (f0, s0, n0), d0 in self._runs.items():
-            if (d0 is not None and s0 == stride and first >= f0 and last <= f0 + s0 * (n0 - 1)
-                    and (first - f0) % stride == 0):
-                t0, version, shape, strides, off = d0
-                k = (first - f0) // stride
-                t = objs[first]
-                numel = strides[0]
-                if t.storage_offset() == off + k * numel and t.data_ptr() % _ALIGN == 0:
-                    return t, version, shape, strides, t.storage_offset()
-        t0 = objs[first]
-        if (not isinstance(t0, torch.Tensor) or t0.numel() == 0
-                or not t0.is_contiguous() or t0.requires_grad or t0.data_ptr() % _ALIGN):
-            return None
-        shape, dtype, numel, off = t0.shape, t0.dtype, t0.numel(), t0.storage_offset()
-        device, ptr, version = t0.device, t0.untyped_storage().data_ptr(), versions[first]
-        if len(version) != 1:
-            return None
-        for k in range(n):
-            i = first + stride * k
-            t = objs[i]
-            if (not isinstance(t, torch.Tensor) or t.shape != shape or t.dtype != dtype
-                    or t.device != device  # members of one storage share a device; a mix is no run
-                    or t.storage_offset() != off + k * numel or not t.is_contiguous()
-                    or t.untyped_storage().data_ptr() != ptr or t.requires_grad
-                    or versions[i] != version or t._version != version[0]):
-                return None
-        strides, run = [], numel
-        for d in shape:
-            run //= d
-            strides.append(run)
-        return t0, version[0], shape, (numel, *strides), off
 
 
 @dataclass
