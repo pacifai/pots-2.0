@@ -10,6 +10,9 @@ Writes ``DIR/fs11_upload.tar`` (top directory ``fs11_upload/``), its SHA-256 to
 
 - ``repo/``: ``git archive HEAD`` of this repository. Uncommitted changes are not in it; the
   manifest records the commit and whether the tree was dirty.
+- ``repo_base/`` (only with ``--base-commit REV``): ``git archive REV``, packed the same way;
+  the manifest gains ``base_commit``, the full SHA. The profiling session's A/B arm runs the
+  code before O18 from it (FS49s).
 - ``data/<model>_<task>/``: ``materialize_data``'s five files for each full-scale model and
   task, at the full-scale config (:data:`~verification.runs.fs11_session.FULL_SCALE_ENV`:
   batch 128, seed 1, 10 steps, one poisoned record), built here on the CPU. A directory whose
@@ -300,23 +303,25 @@ class Member:
     data: bytes | None = None  # bytes made here (an empty .no_exist entry, the manifest)
 
 
-def _repo_members(repo_root: Path, build: Path) -> tuple[list[Member], dict[str, Any]]:
-    """``git archive HEAD``, extracted under ``build/repo``."""
+def _repo_members(repo_root: Path, build: Path, rev: str = "HEAD",
+                  name: str = "repo") -> tuple[list[Member], dict[str, Any]]:
+    """``git archive REV`` (default ``HEAD``), extracted under ``build/NAME``. ``dirty`` is
+    only meaningful for ``HEAD``'s ``repo``; the base arm's ``repo_base`` (O18, FS49s) has none."""
     def git(*args: str) -> str:
         return subprocess.run(["git", "-C", str(repo_root), *args], capture_output=True,
                               text=True, check=True).stdout.strip()
 
-    commit = git("rev-parse", "HEAD")
-    dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
-    dest = build / "repo"
+    commit = git("rev-parse", "--verify", "--end-of-options", f"{rev}^{{commit}}")
+    dirty = bool(git("status", "--porcelain", "--untracked-files=no")) if rev == "HEAD" else False
+    dest = build / name
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
-    archive = subprocess.run(["git", "-C", str(repo_root), "archive", "--format=tar", "HEAD"],
+    archive = subprocess.run(["git", "-C", str(repo_root), "archive", "--format=tar", commit],
                              capture_output=True, check=True).stdout
     with tarfile.open(fileobj=io.BytesIO(archive)) as t:
         t.extractall(dest, filter="data")
-    return _tree_members(dest, "repo"), {"commit": commit, "dirty": dirty}
+    return _tree_members(dest, name), {"commit": commit, "dirty": dirty}
 
 
 def _tree_members(root: Path, prefix: str) -> list[Member]:
@@ -423,12 +428,18 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
             build_data: Callable[[str, str, str, Path], Path] | None = None,
             build_test_data: Callable[[str, str, str, Path], Path] | None = None,
             repo: Callable[[Path, Path], tuple[list[Member], dict[str, Any]]] = _repo_members,
+            base_commit: str | None = None,
+            repo_base: Callable[[Path, Path, str, str], tuple[list[Member], dict[str, Any]]]
+            = _repo_members,
             native_src: Path | None = None,
             say: Callable[[str], None] = _say) -> dict[str, Any]:
     """Build the upload (module docstring) and return its manifest. ``build_data(repo,
     revision, task, build_dir) -> data dir`` (``build_test_data``, the same at test scale's
     config) and ``repo`` replace ``materialize_data`` and
-    ``git archive`` in tests; ``native_src`` is the native sources' directory (default
+    ``git archive`` in tests; ``base_commit`` (a revision) adds ``repo_base/``, ``git archive``
+    of that revision (``repo_base(repo_root, build, rev, "repo_base")`` in tests), and the
+    manifest's ``base_commit`` (O18, FS49s); ``native_src``
+    is the native sources' directory (default
     ``native.source_dir()``)."""
     out = out.resolve()
     build = out / "build"
@@ -440,6 +451,17 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
         def build_test_data(r: str, rev: str, task: str, d: Path) -> Path:
             return materialize(r, rev, task, d, cwd=repo_root, python=python, test_scale=True)
 
+    # The base arm's code first: a revision that doesn't resolve stops before the long work.
+    base_members: list[Member] = []
+    base_sha: str | None = None
+    if base_commit is not None:
+        try:
+            base_members, base_info = repo_base(repo_root, build, base_commit, "repo_base")
+        except subprocess.CalledProcessError as e:
+            raise PrepError(f"--base-commit {base_commit!r} doesn't resolve to a commit in "
+                            f"{repo_root}") from e
+        base_sha = base_info["commit"]
+        say(f"repo_base: commit {base_sha[:12]} ({len(base_members)} files)")
     # The models, each checked against its blob names.
     roles: dict[tuple[str, str], list[str]] = {}
     for pin in RUN_PINS:
@@ -502,7 +524,7 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
     native_members, native_missing = _native_members(native_src or native.source_dir())
     versions = _versions()
     extra = [Member("requirements-fs11.txt", data=_requirements(versions))]
-    members = repo_members + data_members + bench_members + native_members + extra
+    members = repo_members + base_members + data_members + bench_members + native_members + extra
     for m in models:
         members += _model_members(hub, m)
     bad = [m.arc for m in members if _forbidden(m.arc)]
@@ -524,7 +546,8 @@ def prepare(out: Path, *, hub: Path, bench_cache: Path, repo_root: Path,
     manifest = {
         "format": "fs11-upload/1", "python_version": platform.python_version(),
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "repo": repo_info, "versions": versions, "full_scale_env": FULL_SCALE_ENV,
+        "repo": repo_info, **({"base_commit": base_sha} if base_sha else {}),
+        "versions": versions, "full_scale_env": FULL_SCALE_ENV,
         "files": dict(sorted(files.items())),
         "models": [{"repo": m.repo, "revision": m.revision, "gated": m.gated, "roles": m.roles,
                     "files": [vars(f) for f in m.files], "no_exist": m.no_exist,
@@ -615,9 +638,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--bench-cache", type=Path, default=None,
                    help="the benchmark's cache (default: $POTS_BENCH_CACHE, else "
                         "~/.cache/pots-benchmarks)")
+    p.add_argument("--base-commit", metavar="REV", default=None,
+                   help="fs11 only: also pack repo_base/, `git archive REV`, for the profiling "
+                        "session's A/B arm (O18: 387b991, the code before it)")
     args = p.parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
     if args.session == "kernel-speed":
+        if args.base_commit is not None:
+            print("fs11_prep: --base-commit is for --session fs11", file=sys.stderr)
+            return 2
         if args.sizes is None:
             print("fs11_prep: --session kernel-speed needs --sizes FILE", file=sys.stderr)
             return 2
@@ -638,7 +667,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     bench = args.bench_cache or Path(os.environ.get("POTS_BENCH_CACHE")
                                      or Path.home() / ".cache" / "pots-benchmarks")
     try:
-        man = prepare(args.out, hub=hub, bench_cache=bench, repo_root=repo_root)
+        man = prepare(args.out, hub=hub, bench_cache=bench, repo_root=repo_root,
+                      base_commit=args.base_commit)
     except PrepError as e:
         print(f"fs11_prep: {e}", file=sys.stderr)
         return 1
