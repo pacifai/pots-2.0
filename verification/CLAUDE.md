@@ -210,7 +210,7 @@ Leaf indices are 0-based:
 [n_s, n_s+n_w)                W_t: W_E; per layer γ_attn, W_q, W_k, W_v, W_o, γ_mlp, W_gate, W_up, W_down; γ_final
 [n_s+n_w, n_s+n_w+K)          product leaves, K = n_product_leaves, in canonical order of the
                               products P_1..P_M (ref block §6 items 3–4); a batched attention
-                              product's members are one leaf at the position of its first
+                              product's members are one leaf at the position of its first member
 [n_s+n_w+K, n_s+2n_w+K)       W_{t+1}, same order as W_t
 ```
 
@@ -1514,7 +1514,7 @@ interface.
     `path`) and `meta.json` (`format`, the root and the `h_D` paths as hex), written last; a
     failed write deletes `dir`. `DiskStore(dir)` opens one. Not part of any commitment.
     - A device leaf is saved as its host copy (`host_tensor`), so its file and `leaf(i)` are
-      its host twin's. A tensor that doesn't own its whole storage (a `bmm` member, a slice of
+      its host twin's. A tensor that doesn't own its whole storage (a slice of
       `D`) is cloned before saving, because `torch.save` writes the whole storage. A `Record`
       is saved as a dict of its three tensors and rebuilt (and so revalidated) on load.
     - `leaf(i)` loads the file on every call (`weights_only=True`, CPU, no `mmap`, no cache),
@@ -1656,8 +1656,8 @@ interface.
     order, cut into consecutive chunks of at most `_GROUP_BYTES` = 4 GiB of fp32 `A`, `B`
     and `P`; a function of the declared computation only). `_measure_served` takes a run one
     group at a time: the group is served at once (`Replay.operand_group(ms, float32)`,
-    inside `5.glue`, converted to fp32 as it is copied), its `P` leaves stacked on the host
-    and moved to the device in one copy, and measured right away with
+    inside `5.glue`, converted to fp32 as it is copied), the members' `P` is a slice of the group's
+    leaf (a view when they are consecutive and aligned, else one aligned copy), moved to the device in one copy, and measured right away with
     `measure_products_rows` (inside `5.measure`). Only its rows are kept, so the device
     holds one group's operands at a time, at most `_GROUP_BYTES` plus about as much in
     measuring temporaries. If a group's serving raises, `_measure_to_failure` serves the
