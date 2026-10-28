@@ -110,7 +110,7 @@ All start with `VERIF_`. Scale is config only, never a code fork (ยง8.A.5).
 | `VERIF_SEED` | `1`: `ฯ€`'s seed (F8c) and F8g's draw, a public input. It also seeds torch, numpy and `random` (S4c) and the MLP's synthetic data and init |
 | `VERIF_OUTPUT_DIR` | `trainer_output/verification` (gitignored) |
 | `VERIF_METRICS` | `1`: runs write B6's metrics to `$VERIF_OUTPUT_DIR/<run>/`; `0` turns them off. Only `0` or `1` |
-| `VERIF_RELEASE_CACHE` | `1`: on CUDA, the loop hands the allocator's cached blocks back between prover and verifier (`loop.release_device_cache`); `0` skips it, so the re-check session can time the verified step without it. Only `0` or `1`. Read by every verified run: `bring_up` and `llama_step` pass it, and `run_loop`, `run_scenario`, `memory_run`, `bias_tamper` and `run_honest` read it themselves when their `release_cache` is `None` (the default, `loop.release_cache_setting`). It changes no number, so no config hash holds it |
+| `VERIF_RELEASE_CACHE` | unset = auto (FS53): on CUDA, the loop hands the allocator's cached blocks back between prover and verifier (`loop.release_device_cache`) iff prover and verifier may share a card, that is the run is unsharded or the prover's device is one of `VERIF_VERIFIER_DEVICES`; with the prover on a card of its own (the four-H100 layout) it does not, and never on a CPU run. `1` always releases and `0` never does, so the re-check session can time the verified step without it. Only `0`, `1` or unset (`RunConfig.release_cache` is `bool \| None`). The environment record's `release_cache` holds the resolved value and `release_cache_rule` (`auto`, `env`, `argument`) says which decided. Read by every verified run: `bring_up` and `llama_step` pass it, and `run_loop`, `run_scenario`, `memory_run`, `bias_tamper` and `run_honest` read it themselves when their `release_cache` is `None` (the default, `loop.release_cache_setting`). It changes no number, so no config hash holds it |
 | `VERIF_PIPELINED` | `0`: the loop runs the prover and verifier in one process, step by step. `1`: the prover runs in a spawned child process (`runs/pipeline.py`) and the verifier in the parent, so step `t+1` is proved while step `t` is verified. Only `0` or `1`. `run_loop`, `run_scenario` and `memory_run` read it when their `pipelined` is `None` (`loop.pipelined_setting`). It changes no number, so no config hash holds it |
 
 `VERIF_DATASET` and `VERIF_DATASET_REVISION` are retired: F8d pins the data in
@@ -2057,8 +2057,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     `InMemoryStore.commit_step` (`P3.commit`) and `handoff.hold` with the `h_D` paths
     (`P5.write`; default `IN_MEMORY`, or a `DiskHandoff`), drops the prover's references,
     `release_device_cache(model_device(model), section)` (skipped, section and all, with
-    `release_cache=False`; `None` reads `VERIF_RELEASE_CACHE` through
-    `release_cache_setting`),
+    `release_cache=False`; `None` reads `VERIF_RELEASE_CACHE`, and unset means auto, through
+    `release_cache_setting(release_cache, c, model_device(model))`, which
+    `resolve_release_cache(release_cache, prover_device, devices)` backs (FS53: argument,
+    then env, then auto; auto releases iff a CUDA run is unsharded or the prover's device is
+    in `c.placement.devices`)),
     `verifier.verify_step(t, store)`,
     `handoff.release(store)` (also on error), and drops the step. `StepRecord.commit_s`
     includes `P5.write`, so a disk write lands there. It stops at the first rejection and ends with `verifier.end_run(final)`, where
@@ -2083,7 +2086,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     `bring_up.bias_tamper` calls it with `c.device` before each `verify_step` too.
     `run_scenario`, `memory_run`, `bring_up`,
     `bias_tamper` and `llama_step.run_honest` pass on `release_cache` (default `None`, read
-    from `VERIF_RELEASE_CACHE`); `bring_up` and `llama_step` set it from `cfg.release_cache`.
+    from `VERIF_RELEASE_CACHE`, auto when unset); `bring_up` and `llama_step` set it from
+    `cfg.release_cache` (`None` = auto). The pipelined parent resolves it with
+    `c.placement.prover` as the prover's device and hands the answer to the child too.
     Set `PYTORCH_ALLOC_CONF=expandable_segments:True` in the run's environment, not in
     Python: the allocator reads it at CUDA's first use. torch 2.9 prefers that name over the
     deprecated `PYTORCH_CUDA_ALLOC_CONF`, so leave the old one unset.
@@ -2298,8 +2303,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
     go into the `environment` record and every `step` record. The `environment` record
     (`environment_record`) also holds the allocator's settings (`allocator_settings`): both
     variables of `ALLOC_VARS`, `PYTORCH_ALLOC_CONF` and `PYTORCH_CUDA_ALLOC_CONF` (null when
-    unset), and the run's `release_cache` (`VERIF_RELEASE_CACHE` unless the caller passes
-    it). It also holds `gpu_roles` (FS35, I2): `None` on a CPU run, else one entry per distinct
+    unset), the run's `release_cache` as resolved (the caller's argument, else
+    `VERIF_RELEASE_CACHE`, else auto from the record's `device` and `verifier_devices`) and
+    `release_cache_rule` (`"argument"`, `"env"` or `"auto"`: FS53). It also holds `gpu_roles` (FS35, I2): `None` on a CPU run, else one entry per distinct
     CUDA device, the prover first then the verifiers (`VERIF_VERIFIER_DEVICES`), with `index`,
     `name`, `uuid` (`GPU-โ€ฆ`, as in the machine record's `gpus`) and `roles` (`["prover"]`,
     `["verifier"]`, or both: an unsharded run, or `cuda:0` in the pair layout). The machine
@@ -3457,8 +3463,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `ฯ
   - The re-check (`recheck_plan`, 22 parts, no benchmark): the models part; `bring_up
     --no-tamper` per model and `smooth_check` per model and task, at `FULL_SCALE_ENV` plus
     `RECHECK_ENV`: `VERIF_HEAD_BLOCKS=8` and the allocator fix ("fix 2"),
-    `PYTORCH_ALLOC_CONF=expandable_segments:True` and `VERIF_RELEASE_CACHE=1` (the
-    default, pinned). `alloc_env(conf)` writes the allocator setting: `PYTORCH_ALLOC_CONF`
+    `PYTORCH_ALLOC_CONF=expandable_segments:True` and `VERIF_RELEASE_CACHE=1`
+    (pinned: unset would be auto). `alloc_env(conf)` writes the allocator setting: `PYTORCH_ALLOC_CONF`
     at `conf` and the deprecated `PYTORCH_CUDA_ALLOC_CONF` unset, both unset for `None`.
     `FIX_AB_MODEL` (Qwen2.5-0.5B, which fit in FS11 without the fix, and the cheapest model)
     is brought up first, so a failure of the 8 row blocks on CUDA shows within minutes; the

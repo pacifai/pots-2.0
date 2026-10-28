@@ -700,15 +700,18 @@ verifier buffer may not fit in any of them though the GPU has the room. On CUDA 
 therefore empties that cache once per step, after the prover's step is released and before
 the verifier starts (`release_device_cache`). Its time is a metrics row of its own,
 `handoff.empty_cache`, counted in neither role's total, since deployed the two roles run on
-separate machines. Whether the step runs on CUDA goes by the model's device.
-`VERIF_RELEASE_CACHE=0` skips the release in every verified run, so a run can time the
-verified step without it. The re-check session also sets the allocator variable,
+separate machines. Whether the step runs on CUDA goes by the model's device. The release
+only helps where the two roles share a card, so with `VERIF_RELEASE_CACHE` unset (auto) it
+runs on an unsharded CUDA run and when the prover's device is one of the verifier devices, and
+not on the four-GPU layout, where the prover has a card of its own (the release cost about
+0.18 s and 0.29 s of re-allocation a step there; FS53). `VERIF_RELEASE_CACHE=0` skips it in
+every verified run, so a run can time the verified step without it, and `=1` forces it. The re-check session also sets the allocator variable,
 `PYTORCH_ALLOC_CONF=expandable_segments:True`, in its parts' environment, which lets the
 allocator grow a block in place rather than leave gaps. That setting is on trial: it stays only
 if the allocator-fix speed test (FS17) measures no speed cost. Every run's `environment` record
 holds both allocator variables, `PYTORCH_ALLOC_CONF` and its deprecated older name
-`PYTORCH_CUDA_ALLOC_CONF`, with the run's `release_cache`, so a run's records say which setting
-it had. On CUDA the memory pass records the allocator's reserved peak
+`PYTORCH_CUDA_ALLOC_CONF`, with the run's `release_cache` as resolved and `release_cache_rule` (`auto`, `env` or
+`argument`), so a run's records say which setting it had and why. On CUDA the memory pass records the allocator's reserved peak
 (`torch.cuda.max_memory_reserved`) beside the allocated one, so the gap between them, the
 memory held but not in use, shows how much fragmentation is left.
 
@@ -1009,8 +1012,8 @@ recheck`); `summary.json` names it `recheck`. Its 22 parts, in order:
 It has no benchmark part. `VERIF_HEAD_BLOCKS=8` checks the output layer's product in 8 row
 blocks. Qwen2.5-0.5B, the cheapest model, is brought up first, so if the 8 row blocks fail on
 CUDA, the failure shows within minutes. The allocator fix is two settings together: expandable segments, and the CUDA cache
-released between prover and verifier (`VERIF_RELEASE_CACHE=1`, the default, pinned so that the
-arm without it names its setting). Expandable segments let the CUDA allocator grow a segment
+released between prover and verifier (`VERIF_RELEASE_CACHE=1`, pinned so that both arms name their
+setting). Expandable segments let the CUDA allocator grow a segment
 in place rather than reserve a new fixed-size one, which cuts fragmentation. Four of the first
 session's seven
 out-of-memory errors left 6–12 GiB "reserved but unallocated" (Llama-3.2-1B's and Falcon3-1B's

@@ -25,8 +25,9 @@ def test_defaults_match_claude_md_table():
     assert cfg.data_dir == Path("trainer_output/verification/data")
     assert cfg.metrics is True
     assert cfg.head_blocks == 1
-    assert cfg.release_cache is True
+    assert cfg.release_cache is None  # unset = auto (FS53)
     assert load_config({"VERIF_RELEASE_CACHE": "0"}).release_cache is False
+    assert load_config({"VERIF_RELEASE_CACHE": "1"}).release_cache is True
     assert (cfg.trace_step, cfg.trace_c5) == (0, "slice")
     on = load_config({"VERIF_TRACE_STEP": "3", "VERIF_TRACE_C5": "all"})
     assert (on.trace_step, on.trace_c5) == (3, "all")

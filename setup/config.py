@@ -45,7 +45,6 @@ _DEFAULTS: dict[str, str] = {
     "VERIF_OUTPUT_DIR": "trainer_output/verification",
     "VERIF_METRICS": "1",
     "VERIF_HEAD_BLOCKS": "1",
-    "VERIF_RELEASE_CACHE": "1",
     "VERIF_PIPELINED": "0",
     "VERIF_TRACE_STEP": "0",
     "VERIF_TRACE_C5": "slice",
@@ -73,8 +72,9 @@ class RunConfig:
     metrics: bool  # B6: write the cost, count and residual tables (runs/metrics.py)
     head_blocks: int  # B: the output layer runs in B blocks of n_s/B records each
     # Hand the CUDA allocator's cached blocks back between prover and verifier
-    # (runs/loop.py's release_device_cache). 0 only for the re-check's fix-off arm.
-    release_cache: bool
+    # (runs/loop.py's release_device_cache). None (unset) = auto: release where prover and
+    # verifier share a card (FS53); 0 and 1 force it.
+    release_cache: bool | None
     # The traced step (runs/metrics.py): the step to profile with torch.profiler (0 = none) and
     # whether the trace holds check 5's sliced runs ("slice") or every run ("all").
     trace_step: int
@@ -194,11 +194,18 @@ def _attack(env: Mapping[str, str]) -> str:
     return raw
 
 
-def _bool(env: Mapping[str, str], name: str) -> bool:
-    raw = _str(env, name)
+def _bool(env: Mapping[str, str], name: str, default: str | None = None) -> bool:
+    raw = _str(env, name, default)
     if raw not in ("0", "1"):
         raise ValueError(f"{name} must be 0 or 1, got {raw!r}")
     return raw == "1"
+
+
+def _release_cache(env: Mapping[str, str]) -> bool | None:
+    """``VERIF_RELEASE_CACHE``: ``0`` or ``1``, or ``None`` when unset (auto, FS53)."""
+    if "VERIF_RELEASE_CACHE" not in env:
+        return None
+    return _bool(env, "VERIF_RELEASE_CACHE", "1")
 
 
 def _trace_c5(env: Mapping[str, str]) -> str:
@@ -242,7 +249,7 @@ def load_config(env: Mapping[str, str] | None = None) -> RunConfig:
         output_dir=Path(_str(env, "VERIF_OUTPUT_DIR")),
         metrics=_bool(env, "VERIF_METRICS"),
         head_blocks=head_blocks,
-        release_cache=_bool(env, "VERIF_RELEASE_CACHE"),
+        release_cache=_release_cache(env),
         trace_step=_int(env, "VERIF_TRACE_STEP", 0),
         trace_c5=_trace_c5(env),
         verifier_devices=_verifier_devices(env, _device(env)),
