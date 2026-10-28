@@ -49,9 +49,9 @@ def test_no_known_and_no_device_leaf_is_leaf_hashes_of(c, leaves, known):  # noq
 @pytest.mark.parametrize("known", [None, {}])
 def test_no_known_gives_leaf_hashes_ofs_errors_at_the_same_leaf(c, leaves, known):  # noqa: F811
     bad = list(leaves)
-    bad[c.product_index(2)] = bad[c.product_index(2)].clone()
-    bad[c.product_index(2)].view(-1)[0] = float("nan")
-    bad[c.product_index(5)] = bad[c.product_index(5)][:-1]
+    bad[c.product_leaf_index(c.leaf_of(2)[0])] = bad[c.product_leaf_index(c.leaf_of(2)[0])].clone()
+    bad[c.product_leaf_index(c.leaf_of(2)[0])].view(-1)[0] = float("nan")
+    bad[c.product_leaf_index(c.leaf_of(5)[0])] = bad[c.product_leaf_index(c.leaf_of(5)[0])][:-1]
     want = of_leaf_hashes_of(c, bad)
     try:
         got = (hash_step_leaves(c, bad, known=known), None)
@@ -68,7 +68,7 @@ def test_no_known_pins_the_nans_leaf_on_both_sides(c, leaves, known):  # noqa: F
     cut at product 2 the shape error, with ``leaf_hashes_of`` and with ``hash_step_leaves``."""
     from verification.transcript.errors import LeafShapeError
 
-    i = c.product_index(3)
+    i = c.product_leaf_index(c.leaf_of(3)[0])
     for j, kind in ((i + 1, NonFiniteError), (i - 1, LeafShapeError)):
         bad = list(leaves)
         bad[i] = bad[i].clone()
@@ -85,7 +85,7 @@ def test_no_known_pins_the_nans_leaf_on_both_sides(c, leaves, known):  # noqa: F
 
 def test_a_leaf_count_mismatch_is_refused_with_known_too(c, leaves):  # noqa: F811
     with pytest.raises(ValueError, match="transcript has"):
-        hash_step_leaves(c, leaves[:-1], known={c.product_index(1): b"x" * 32})
+        hash_step_leaves(c, leaves[:-1], known={c.product_leaf_index(c.leaf_of(1)[0]): b"x" * 32})
 
 
 # ---- known digests: where they apply ----------------------------------------------------------
@@ -102,7 +102,7 @@ def test_known_digests_in_layout_order_are_the_plain_digests(c, leaves):  # noqa
 
 def test_known_digests_are_taken_by_index_not_by_order(c, leaves):  # noqa: F811
     want = hash_step_leaves(c, leaves)
-    a, b = c.product_index(1), c.product_index(2)
+    a, b = c.product_leaf_index(c.leaf_of(1)[0]), c.product_leaf_index(c.leaf_of(2)[0])
     got = hash_step_leaves(c, leaves, known={a: want[b], b: want[a]})
     assert got[a] == want[b] and got[b] == want[a]
     assert [got[i] for i in range(len(got)) if i not in (a, b)] == \
@@ -131,7 +131,7 @@ def test_a_known_digest_outside_the_tensor_slots_is_ignored(c, leaves, which):  
 
 def test_a_known_digest_beside_an_ignored_one_still_counts_once(c, leaves):  # noqa: F811
     want = hash_step_leaves(c, leaves)
-    i = c.product_index(1)
+    i = c.product_leaf_index(c.leaf_of(1)[0])
     s = HashStats()
     got = hash_step_leaves(c, leaves, s, known={i: want[i], 0: b"\x00" * 32, c.n_leaves: b""})
     assert got == want and s.known == 1
@@ -140,7 +140,7 @@ def test_a_known_digest_beside_an_ignored_one_still_counts_once(c, leaves):  # n
 @pytest.mark.parametrize("break_it", ["shape", "dtype", "stride"])
 def test_a_known_leaf_failing_a_structural_check_raises_the_plain_error(
         c, leaves, break_it):  # noqa: F811
-    i = c.product_index(3)
+    i = c.product_leaf_index(c.leaf_of(3)[0])
     bad = list(leaves)
     t = bad[i]
     bad[i] = {"shape": t[:-1], "dtype": t.to(torch.float64),
@@ -159,7 +159,7 @@ def test_a_known_leaf_failing_a_structural_check_raises_the_plain_error(
 def test_a_known_digest_does_not_hide_a_non_finite_leaf_at_another_index(c, leaves):  # noqa: F811
     want_digests = hash_step_leaves(c, leaves)
     bad = list(leaves)
-    j = c.product_index(4)
+    j = c.product_leaf_index(c.leaf_of(4)[0])
     bad[j] = bad[j].clone()
     bad[j].view(-1)[3] = float("inf")
     known = {i: want_digests[i] for i in range(c.n_s, c.n_leaves) if i != j}
@@ -194,7 +194,7 @@ def stepped(c, monkeypatch):  # noqa: F811
 
 
 def test_arrival_digests_are_keyed_by_product_leaf_index(c, stepped):  # noqa: F811
-    assert set(stepped.arrival_digests) == {c.product_index(m) for m in range(1, c.M + 1)}
+    assert set(stepped.arrival_digests) == {c.product_leaf_index(c.leaf_of(m)[0]) for m in range(1, c.M + 1)}
     leaves = stepped.leaves()
     plain_digests = hash_step_leaves(c, leaves)
     assert all(plain_digests[i] == d for i, d in stepped.arrival_digests.items())
@@ -214,14 +214,14 @@ def test_a_perturbed_product_loses_only_its_entry(c, monkeypatch):  # noqa: F811
                         lambda self, p: hash_tensor_leaf(TAG_PRODUCT, p))
     real = MatmulCapture.summary
     monkeypatch.setattr(MatmulCapture, "summary", lambda self: real(self) | {
-        "arrival_hash": {"records": 1, "leaves": c.M, "bytes": 0, "nonfinite": 0}})
+        "arrival_hash": {"records": 1, "leaves": c.n_product_leaves, "bytes": 0, "nonfinite": 0}})
     data = synthetic_dataset(c.widths, 12, seed=0)
     out = prove_step(c, c.build_model(), init_weights(c.widths, seed=0), data[4:8],
                      perturb={2: lambda t: t + 1, 5: lambda t: t * 2})
-    gone = {c.product_index(2), c.product_index(5)}
-    assert set(out.arrival_digests) == {c.product_index(m) for m in range(1, c.M + 1)} - gone
-    assert out.capture["arrival_hash"]["used"] == c.M - 2
-    assert out.capture["arrival_hash"]["leaves"] == c.M  # the capture hashed them all
+    gone = {c.product_leaf_index(c.leaf_of(2)[0]), c.product_leaf_index(c.leaf_of(5)[0])}
+    assert set(out.arrival_digests) == {c.product_leaf_index(c.leaf_of(m)[0]) for m in range(1, c.M + 1)} - gone
+    assert out.capture["arrival_hash"]["used"] == c.n_product_leaves - 2
+    assert out.capture["arrival_hash"]["leaves"] == c.n_product_leaves  # the capture hashed them all
     # the digests left are right; the perturbed leaves hash from their bytes
     assert commit(c, out).root == commit_leaves(c, out.leaves()).root
 
@@ -241,7 +241,7 @@ def test_a_wrong_arrival_digest_moves_the_committed_root(c, stepped, how):  # no
     """The digests are used, not recomputed: a wrong one shows in the root, which check 2's
     CPU recompute (K4) then rejects."""
     want = commit_leaves(c, stepped.leaves()).root
-    i = c.product_index(1)
+    i = c.product_leaf_index(c.leaf_of(1)[0])
     bad = dataclasses.replace(stepped, arrival_digests={**stepped.arrival_digests,
                                                         i: b"\x5a" * 32})
     if how == "commit":
@@ -258,7 +258,7 @@ def test_the_store_copy_holds_leaves_the_known_digests_still_describe(c, stepped
     assert tree.root == commit_leaves(c, leaves_).root
     with pytest.raises(LeafShapeError):
         bad = list(leaves_)
-        bad[c.product_index(1)] = bad[c.product_index(1)][:-1]
+        bad[c.product_leaf_index(c.leaf_of(1)[0])] = bad[c.product_leaf_index(c.leaf_of(1)[0])][:-1]
         hash_step_leaves(c, bad, known=stepped.arrival_digests)
 
 
