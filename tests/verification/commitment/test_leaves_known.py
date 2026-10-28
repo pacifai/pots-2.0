@@ -45,7 +45,7 @@ def same_outcome(got, want):
 
 
 def first_product(c):
-    return c.product_index(1)
+    return c.product_leaf_index(c.leaf_of(1)[0])
 
 
 def nan_bracket(c, leaves, i, run):
@@ -272,12 +272,12 @@ def test_prove_step_counts_the_digests_in_use_after_a_perturbation(c, monkeypatc
     real = MatmulCapture.summary
     monkeypatch.setattr(MatmulCapture, "arrival_digest", lambda self, p: bytes(32))
     monkeypatch.setattr(MatmulCapture, "summary", lambda self: {
-        **real(self), "arrival_hash": {"records": 1, "leaves": c.M, "bytes": 0, "nonfinite": 0}})
+        **real(self), "arrival_hash": {"records": 1, "leaves": c.n_product_leaves, "bytes": 0, "nonfinite": 0}})
     data = synthetic_dataset(c.widths, 12, seed=0)
     w0 = init_weights(c.widths, seed=0)
     out = prove_step(c, c.build_model(), w0, data[4:8], perturb={1: lambda t: t + 1})
-    assert len(out.arrival_digests) == c.M - 1
-    assert out.capture["arrival_hash"]["used"] == c.M - 1
+    assert len(out.arrival_digests) == c.n_product_leaves - 1
+    assert out.capture["arrival_hash"]["used"] == c.n_product_leaves - 1
     assert out.capture["arrival_hash"]["leaves"] == c.M
 
 
