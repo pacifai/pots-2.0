@@ -659,8 +659,8 @@ interface.
     bytes and non-finite outputs, present only when something was hashed; `prove_step` adds
     `used`, the digests left in `arrival_digests` after the perturbations, and a diagnostic
     from the arrival loop it already runs: `missing` (`{ProductKind name: count}` of the
-    product leaves with no digest, by their first product's kind) and `missing_first` (the names, in canonical order, of the first 5
-    whose kind is not `OPERAND_GRAD`). The capture hashes
+    product leaves with no digest, by their first product's kind) and `missing_first` (the names, in
+    canonical order, of the first 5 whose kind is not `OPERAND_GRAD`). The capture hashes
     the `dK` records too and their digests go unused (the `δK̃` leaf is the batched transpose
     made in labeling, a new tensor), so `leaves` (outputs hashed, one per record) is the record
     count `K` and `used` is `K − L` (`L` the `δK̃` leaves). A non-finite product
