@@ -26,7 +26,8 @@ def smollm2_config():
 
 
 def test_test_scale_step():
-    """SmolLM2-135M at 4 × 128 in fp32: 1,361 leaves (813 of them product leaves, O18) and about 2.62 GB (ref block §6)."""
+    """SmolLM2-135M at 4 × 128 in fp32: 1,361 leaves (813 of them product leaves, O18) and about
+    2.62 GB (ref block §6)."""
     ls = leaf_sizes(smollm2_config(), n_s=4, n=128)
     assert [l.index for l in ls] == list(range(1361))
     sections = [l.section for l in ls]

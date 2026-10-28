@@ -155,7 +155,8 @@ def _forged(c, leaves, which):
     ``"product"`` moves a forward product's entry."""
     leaves = list(leaves)
     if which == "product":
-        i = c.product_leaf_index(c.leaf_of(next(s.m for s in c.products if s.kind.name == "FORWARD"))[0])
+        m = next(s.m for s in c.products if s.kind.name == "FORWARD")
+        i = c.product_leaf_index(c.leaf_of(m)[0])
     else:
         name = (next(iter(c.linear_weights)) if which == "linear"
                 else next(iter(c.glue_gradient_weights)))
