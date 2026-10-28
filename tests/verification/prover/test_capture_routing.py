@@ -127,7 +127,7 @@ def test_a_perturbed_product_lands_at_its_declared_check():
     b.assert_unmodified()
 
 
-def test_a_perturbed_member_is_written_into_a_copy_of_its_leaf():
+def test_a_perturbed_member_is_written_into_a_copy_of_its_leaf(monkeypatch):
     """O18: perturbing members of one batched product changes only those members of the leaf
     (one clone per group, shared by both), and the other leaves are untouched."""
     c = tiny(("llama", True), devices=THREE)
@@ -135,8 +135,23 @@ def test_a_perturbed_member_is_written_into_a_copy_of_its_leaf():
     m1, m2, m3 = c.m_of("L1.S[0,1]"), c.m_of("L1.S[1,0]"), c.m_of("L1.dK[1,1]")
     bump = lambda t: t + 1.0
     a = run(c, w0, records)
+    labeled, before = [], []
+    real_label = type(c).label
+
+    def spy(self, cap, model):
+        out = real_label(self, cap, model)
+        labeled.extend(out)
+        before.extend(t.clone() for t in out)  # the honest leaves, as labeling returned them
+        return out
+
+    monkeypatch.setattr(type(c), "label", spy)
     b = run(c, w0, records, perturb={m1: bump, m2: bump, m3: bump})
     g, i1 = c.leaf_of(m1)
+    # The honest captured tensors are untouched: the perturbation wrote into copies.
+    assert all(torch.equal(x, y) for x, y in zip(labeled, before))
+    # No digest survives for a perturbed leaf (on the CPU none exist at all, so this is empty).
+    assert not {c.product_leaf_index(g), c.product_leaf_index(c.leaf_of(m3)[0])} \
+        & set(b.arrival_digests)
     assert c.leaf_of(m2)[0] == g and c.leaf_of(m2)[1] != i1
     changed = {g, c.leaf_of(m3)[0]}
     for k, (x, y) in enumerate(zip(a.products, b.products)):

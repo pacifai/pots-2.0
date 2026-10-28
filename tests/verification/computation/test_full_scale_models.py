@@ -124,8 +124,8 @@ def test_digest_comparison_on_a_tiny_model(family, tied):
 
     bad, bad_glue, _ = replay_mismatches(c, altered(c.w_t_index(c.w(2, "q"))), seen, glue)
     assert (bad, bad_glue) == (["L2.Y_q", "L2.dX_q"], [])
-    bad, bad_glue, _ = replay_mismatches(c, altered(c.product_leaf_index(c.leaf_of(c.m_of("L1.dX_q"))[0])), seen,
-                                         glue)
+    i = c.product_leaf_index(c.leaf_of(c.m_of("L1.dX_q"))[0])
+    bad, bad_glue, _ = replay_mismatches(c, altered(i), seen, glue)
     assert bad == [] and {c.w_e, c.gamma_attn(1)} <= set(bad_glue)
     assert c.gamma_final not in bad_glue
 
