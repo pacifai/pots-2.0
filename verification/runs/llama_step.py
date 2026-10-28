@@ -54,7 +54,7 @@ from verification.computation.interface import (
 )
 from verification.computation.instances.decoder import DecoderComputation
 from verification.parameters import load_protocol_config
-from verification.runs.loop import run_devices
+from verification.runs.loop import run_devices, table_cache_report
 from verification.runs.metrics import (
     CountRecorder,
     MemoryRecorder,
@@ -350,7 +350,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.count:
                 mw.write(count_run(c, D, w0, run=RUN_NAME, pipelined=False,
                                    **run_args))  # sequential
+            cache_line, cache_row = table_cache_report(RUN_NAME)
+            mw.write([cache_row])
         print(f"metrics: {mw.dir}")
+    if not use_metrics:
+        cache_line, _ = table_cache_report(RUN_NAME)
+    print(cache_line, flush=True)
     report(r)
     report_residuals(r)
     report_costs(r, mem_rows)

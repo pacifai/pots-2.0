@@ -471,3 +471,22 @@ def test_work_rows_count_flops_and_leaf_hashing_from_shapes():
     s1, s2 = (r for r in rows if r["record"] == "storage")
     assert (s1["step"], s1["leaves"], s1["transcript_bytes"]) == (1, 100, 5000)
     assert s2["step"] == 2
+
+
+def test_the_table_cache_counters_are_reported_as_a_line_and_a_record(tmp_path):
+    """FS55a (plan §2.2): hits, misses and plan rebuilds as one printed line and one
+    ``table_cache`` record, which the evaluation reader keeps as a table of its own."""
+    from evaluation import records
+    from verification.runs.loop import table_cache_report
+    from verification.verifier.matmul_check import measure_kernel as mk
+
+    mk.table_cache_stats(reset=True)
+    line, row = table_cache_report("bring_up")
+    assert row == {"record": "table_cache", "run": "bring_up", "enabled": mk.table_cache_on(),
+                   "hits": 0, "misses": 0, "plan_rebuilds": 0}
+    assert line == "table cache: on, hits 0, misses 0, plan rebuilds 0"
+    out = tmp_path / "bring_up"
+    with MetricsWriter(out, "bring_up", device="cpu", model="tiny", seed=SEED, config={},
+                       h_D=b"\0" * 32) as mw:
+        mw.write([row])
+    assert len(records.read(tmp_path).tables["table_cache"]) == 1

@@ -195,6 +195,17 @@ def _on_cuda(device: str | torch.device) -> bool:
     return torch.device(device).type == "cuda"
 
 
+def table_cache_report(run: str) -> tuple[str, dict[str, Any]]:
+    """The measuring-table cache's counters (hits, misses, plan rebuilds) as the run's one
+    printed line and one ``table_cache`` record (FS55a, plan §2.2). The counters are the
+    process's since it started; the pipelined loop's verifier runs in this process."""
+    stats = measure_kernel.table_cache_stats()
+    on = measure_kernel.table_cache_on()
+    line = (f"table cache: {'on' if on else 'off'}, hits {stats['hits']}, misses "
+            f"{stats['misses']}, plan rebuilds {stats['plan_rebuilds']}")
+    return line, {"record": "table_cache", "run": run, "enabled": on, **stats}
+
+
 def release_device_cache(device: str | torch.device, section: Section | None = None, *,
                          devices: Sequence[str | torch.device] | None = None) -> None:
     """Hand the CUDA caching allocator's free blocks back to the driver, inside the metrics

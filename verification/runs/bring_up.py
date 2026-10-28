@@ -114,6 +114,7 @@ from verification.runs.loop import (
     release_device_cache,
     resolve_release_cache,
     run_devices,
+    table_cache_report,
 )
 from verification.runs.metrics import (
     SCORE_FAMILIES,
@@ -677,8 +678,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                      release_cache=cfg.release_cache,
                      keep_last=args.check5_repeats > 0 or args.device_leaves,
                      recorder=rec)
+        cache_line, cache_row = table_cache_report(RUN_NAME)
+        print(cache_line, flush=True)
         if mw is not None:
             mw.write(work_rows(c, RUN_NAME, HONEST.name, _step_records(mw.dir)))
+            mw.write([cache_row])
     finally:
         if mw is not None:
             mw.close()
