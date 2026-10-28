@@ -313,7 +313,7 @@ def test_leaf_changed_under_the_root(c, D, tree, w0):
     """A leaf swapped under an unchanged root. A change check 5 sees rejects there, before the
     root comparison; a one-ulp change passes 6a, 5 and 6b and is caught by the root comparison."""
     store, out = _store(c, D, tree, w0, 1)
-    i = c.product_index(2)
+    i = _pidx(c, 2)
     rej = _verifier(c, D, tree, w0).verify_step(1, Wrapped(store, leaves={i: out.products[1] * 2}))
     _expect(rej, 1, "5")
     ulp = out.products[1].clone()
@@ -329,7 +329,7 @@ def test_leaf_changed_under_the_root(c, D, tree, w0):
 
 
 def _malformed_cases(c, out):
-    p = c.product_index(1)
+    p = _pidx(c, 1)
     w_t = c.w_t_index(c.weight_names[0])
     nan_product = out.products[0].clone()
     nan_product.view(-1)[0] = float("nan")
@@ -550,7 +550,7 @@ def test_record_pass_after_6a_at_bf16_scores_as_the_live_checks():
     idx = schedule(1, c.n_s, len(D), SEED)
     out = prove_step(c, c.build_model(), w0, [D[i] for i in idx])
     name = next(iter(c.linear_weights))
-    assert out.products[c.linear_weights[name][0] - 1].dtype == torch.bfloat16
+    assert out.products[c.leaf_of(c.linear_weights[name][0])[0]].dtype == torch.bfloat16
     assert c.weight_dtype == torch.float32 and c.glue_gradient_weights
 
     def verify(edit=None):
@@ -651,7 +651,7 @@ def test_record_pass_only_after_a_failed_test(c, D, tree, w0, monkeypatch):
     store, _ = _store(c, D, tree, w0, 1)
     nan = torch.full(c.product(1).p_shape, math.nan)
     v = _verifier(c, D, tree, w0)
-    _expect(v.verify_step(1, Wrapped(store, leaves={c.product_index(1): nan})), 1, "2",
+    _expect(v.verify_step(1, Wrapped(store, leaves={_pidx(c, 1): nan})), 1, "2",
             "malformed")
     assert calls == ["4"] and v.record_pass[1] == checks.RECORD_NOT_RUN
 
@@ -901,7 +901,7 @@ def test_overflowing_weight_gradient_rejected_at_5(c, D, tree, w0):
     g = out.products[m - 1] + 0.5 * torch.randn(out.products[m - 1].shape,
                                                 generator=torch.Generator().manual_seed(0))
     g.view(-1)[0] = 3e19
-    perturb_leaf(c, store, c.product_index(m), g)
+    perturb_leaf(c, store, _pidx(c, m), g)
     perturb_leaf(c, store, c.w_next_index(name), (out.w_t[name] - ETA * g).contiguous())
     rej = _verifier(c, D, tree, w0).verify_step(1, store)
     _expect(rej, 1, "5")
@@ -913,7 +913,7 @@ def test_overflowing_forward_product_rejected_at_5(c, D, tree, w0):
     store, out = _store(c, D, tree, w0, 1)
     y = out.products[0] + 1.0
     y.view(-1)[0] = 3e19
-    perturb_leaf(c, store, c.product_index(1), y)
+    perturb_leaf(c, store, _pidx(c, 1), y)
     rej = _verifier(c, D, tree, w0).verify_step(1, store)
     _expect(rej, 1, "5")
     assert "P_1 (Y_1), challenge j=1: normalized residual" in rej.detail
@@ -952,7 +952,7 @@ def test_overflowing_update_bound_rejected_at_6a():
     (m,) = c.linear_weights[c.weight(1)]
     g = out.products[m - 1].clone()
     g.view(-1)[3] = 1e36
-    perturb_leaf(c, store, c.product_index(m), g)
+    perturb_leaf(c, store, _pidx(c, m), g)
     for calibrate in (False, True):
         rej = _verifier(c, D, tree, w0, calibrate=calibrate).verify_step(1, store)
         _expect(rej, 1, "6a")
@@ -1013,7 +1013,7 @@ def test_mutation_during_check_2_rejected_at_2(c, D, tree, w0):
     """An in-place write to a hashed leaf while check 2 runs (here in the root getter, which
     check 2 reads after hashing every leaf): check 2 itself rejects, as malformed."""
     store, _ = _store(c, D, tree, w0, 1)
-    y1 = store.leaf(c.product_index(1))
+    y1 = store.leaf(_pidx(c, 1))
 
     class Mutating(Wrapped):
         @property
@@ -1023,7 +1023,7 @@ def test_mutation_during_check_2_rejected_at_2(c, D, tree, w0):
 
     rej = _verifier(c, D, tree, w0).verify_step(1, Mutating(store))
     _expect(rej, 1, "2", "malformed")
-    assert f"leaf {c.product_index(1)} changed in place during check 2" in rej.detail
+    assert f"leaf {_pidx(c, 1)} changed in place during check 2" in rej.detail
 
 
 @pytest.fixture
@@ -1060,7 +1060,7 @@ def test_check_2_reports_the_first_bad_leaf_in_order(c, D, tree, w0, parallel):
     """Leaves are hashed in parallel, but the rejection is the one a leaf-by-leaf loop gives:
     the first malformed leaf in leaf order, whether it fails to read, validate or encode."""
     store, out = _store(c, D, tree, w0, 1)
-    p1, p2 = c.product_index(1), c.product_index(3)
+    p1, p2 = _pidx(c, 1), _pidx(c, 3)
     nan1 = out.products[0].clone()
     nan1.view(-1)[3] = float("nan")
     inf2 = out.products[2].clone().fill_(float("inf"))
@@ -1094,24 +1094,24 @@ def test_mutation_by_a_later_read_rejected_at_2(c, D, tree, w0, parallel):
     """A store whose read of a later leaf writes in place into a leaf it already served: the
     earlier leaf may be hashed after the write, so check 2 rejects it as malformed."""
     store, _ = _store(c, D, tree, w0, 1)
-    y1 = store.leaf(c.product_index(1))
+    y1 = store.leaf(_pidx(c, 1))
 
     class MutatingRead(Wrapped):
         def leaf(self, index):
-            if index == c.product_index(4):
+            if index == _pidx(c, 4):
                 y1.mul_(2.0)
             return super().leaf(index)
 
     rej = _verifier(c, D, tree, w0).verify_step(1, MutatingRead(store))
     _expect(rej, 1, "2", "malformed")
-    assert rej.detail == f"leaf {c.product_index(1)} changed in place during check 2"
+    assert rej.detail == f"leaf {_pidx(c, 1)} changed in place during check 2"
 
 
 class MutatingReplayMLP(MLPComputation):
     """Writes a committed product in place after check 2, when check 5 builds its replay."""
 
     def replay(self, leaves):
-        leaves.leaf(self.product_index(1)).mul_(2.0)
+        leaves.leaf(self.product_leaf_index(0)).mul_(2.0)
         return super().replay(leaves)
 
 
@@ -1553,7 +1553,7 @@ def _llama_ctx(c, out, *, judge=True, perturb=None):
     store = InMemoryStore.from_step(c, out, copy=True)
     for name, fn in (perturb or {}).items():
         m = c.m_of(name)
-        perturb_leaf(c, store, c.product_index(m), fn(out.products[m - 1]))
+        _perturb_product(c, store, out, m, fn)
     ctx = StepContext.for_computation(
         c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
         prev_w_hashes=(), chain_check_id="0", k=K, judge=judge)
@@ -1570,6 +1570,23 @@ def _llama_check_5(c, out, monkeypatch, *, batched, judge=True, perturb=None):
             mp.setattr(checks, "_member_runs", lambda products: ((p,) for p in products))
         rej = check_5_matmuls(store, c, ctx, Bands.provisional())
     return rej, ctx.stats.products
+
+
+def _pidx(c, m):
+    """The leaf index of the leaf holding product ``m`` (a member's group leaf)."""
+    return c.product_leaf_index(c.leaf_of(m)[0])
+
+
+def _perturb_product(c, store, out, m, fn):
+    """Replace product ``m`` in ``store`` by ``fn(product)``; a member is written into a copy of
+    its group's leaf (O18)."""
+    g, i = c.leaf_of(m)
+    leaf = out.products[g].clone()
+    if i is None:
+        leaf = fn(leaf)
+    else:
+        leaf[i] = fn(leaf[i])
+    perturb_leaf(c, store, c.product_leaf_index(g), leaf)
 
 
 def _bumped(t):
@@ -1763,7 +1780,7 @@ def test_record_pass_keeps_check_5s_measures_of_the_failing_run(llama_out, monke
     forged, later = run[len(run) // 2], run[len(run) // 2 + 1:]
     assert forged.name.startswith("L1.") and later
     store = InMemoryStore.from_step(c, out, copy=True)
-    perturb_leaf(c, store, c.product_index(forged.m), _bumped(out.products[forged.m - 1]))
+    _perturb_product(c, store, out, forged.m, _bumped)
 
     def ctx_for(judge):
         ctx = StepContext.for_computation(
@@ -1813,7 +1830,7 @@ def test_record_pass_raises_a_stashed_serving_error(llama_out, monkeypatch):
     monkeypatch.setattr(_DecoderWith, "operands_hook", fail)
     store = InMemoryStore.from_step(c, out, copy=True)
     m = c.m_of(forged)
-    perturb_leaf(c, store, c.product_index(m), _bumped(out.products[m - 1]))
+    _perturb_product(c, store, out, m, _bumped)
     ctx = StepContext.for_computation(
         c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
         prev_w_hashes=(), chain_check_id="0", k=K)
@@ -1843,7 +1860,7 @@ def test_record_pass_ends_on_a_later_runs_serving_error(llama_out, monkeypatch):
     monkeypatch.setattr(_DecoderWith, "operands_hook", fail)
     store = InMemoryStore.from_step(c, out, copy=True)
     m = c.m_of(forged)
-    perturb_leaf(c, store, c.product_index(m), _bumped(out.products[m - 1]))
+    _perturb_product(c, store, out, m, _bumped)
     ctx = StepContext.for_computation(
         c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
         prev_w_hashes=(), chain_check_id="0", k=K)
