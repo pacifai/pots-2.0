@@ -292,6 +292,36 @@ def step_floor(stats: StepStats, *, tau: float, k: int, N: float, eps_in: float,
     cols = stats.products.columns()
     keep = np.flatnonzero((cols.q > 0) & np.isfinite(cols.p_norm) & (cols.p_norm != 0)
                           & ~np.isnan(cols.u))
+    if not keep.size:
+        return None
+    # FS52: float64 array operations in the scalar formula's order (``product_e_m``, then
+    # ``f_achieved``), so every ``f`` equals the loop's bit for bit (:func:`_step_floor_loop`).
+    # ``keep`` holds only ``q > 0``, finite non-zero ``‖P‖_F`` and a non-NaN ``U``, so
+    # ``term_ratio`` is ``U/‖P‖_F`` (``inf`` when ``U`` is) and never NaN.
+    scale = 2.0 ** (N / k)  # once, as ``f_achieved`` computes it per call
+    with np.errstate(all="ignore"):
+        ratio = cols.u[keep] / cols.p_norm[keep]
+        e = (math.sqrt(2.0) * eps_in
+             + np.sqrt(cols.q[keep].astype(np.float64)) * eps_acc * np.maximum(1.0, ratio))
+        f = c * tau * e * scale
+    # The loop's strict ``>``: the first maximum wins, and a NaN never beats a value (it only
+    # stands when it is the first product, which the loop takes unconditionally).
+    if np.isnan(f[0]):
+        i = 0
+    else:
+        i = int(np.argmax(np.where(np.isnan(f), -np.inf, f)))
+    return StepFloor(float(f[i]), cols.name[int(keep[i])])
+
+
+def _step_floor_loop(stats: StepStats, *, tau: float, k: int, N: float, eps_in: float,
+                     eps_acc: float, c: float = C_ANTI) -> StepFloor | None:
+    """:func:`step_floor` as the per-product loop it was before FS52, the reference the tests
+    compare the vectorized version against."""
+    if not stats.products:
+        return None
+    cols = stats.products.columns()
+    keep = np.flatnonzero((cols.q > 0) & np.isfinite(cols.p_norm) & (cols.p_norm != 0)
+                          & ~np.isnan(cols.u))
     best: StepFloor | None = None
     for i, q, p_norm, u in zip(keep.tolist(), cols.q[keep].tolist(), cols.p_norm[keep].tolist(),
                                cols.u[keep].tolist()):

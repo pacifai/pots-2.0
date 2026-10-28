@@ -282,7 +282,9 @@ import resource
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -1618,12 +1620,16 @@ class TimeRecorder(_Recorder):
     def _emit(self, t: int, table: dict[str, _Acc], rec: Any) -> None:
         self._devfields = self._multi or t in self._merged
         rows = self._rows(t, table)
+        rho = None
         if rec is not None and self._verifier is not None:
+            bands, k, guard = _scoring(self._verifier)
+            stats = getattr(self._verifier, "stats", {}).get(t) or StepStats()
+            rho = rho_arrays(stats, bands, k=k, kappa_guard=guard)  # FS52: once per step
             rows.append({**step_record(self.run, self.scenario, t, self._verifier,
                                        getattr(rec, "rejection", None), self.step_fields,
                                        transcript_bytes=getattr(rec, "transcript_bytes", None),
                                        leaves=getattr(rec, "leaves", None),
-                                       known=getattr(rec, "known", None)),
+                                       known=getattr(rec, "known", None), rho=rho),
                          "traced": self._tracing_step})
             cap = getattr(rec, "capture", None)
             if cap is not None:
@@ -1638,9 +1644,9 @@ class TimeRecorder(_Recorder):
         if rec is not None and self._verifier is not None:
             stats = self._verifier.stats.get(t)
             if stats is not None:  # zero rows when the step stopped before checks 5 and 6
-                bands, k, guard = _scoring(self._verifier)
                 self.writer.write_residuals(self.scenario, t, stats, self._verifier.c,
-                                            bands=bands, k=k, kappa_guard=guard)
+                                            bands=bands, k=k, kappa_guard=guard,
+                                            rho=rho)
 
     def finish(self, verdict: Any = None) -> None:
         super().finish()
@@ -1664,7 +1670,8 @@ class TimeRecorder(_Recorder):
 def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
                 fields: Mapping[str, Any] | None = None, *,
                 transcript_bytes: int | None = None, leaves: int | None = None,
-                known: int | None = None) -> dict[str, Any]:
+                known: int | None = None,
+                rho: Mapping[str, np.ndarray] | None = None) -> dict[str, Any]:
     """EQ13 record 1 for step ``t`` (EVALUATION_SPEC §4.1): the verdict, the first failing
     check, each check's ``pass``, ``fail`` or ``not_run``, whether the step is judged, and the
     step's three scores.
@@ -1684,7 +1691,8 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
     loop didn't take them; ``known`` is how many of those leaves the commit took from the
     arrival digests instead of hashing (``HashStats.known``; FS42, so the work-row rule of
     ``llama_step.work_rows`` can be checked), ``None`` when the loop has none; ``traced`` is
-    ``False`` here, and the timed run sets it on the step the profiler traced (FS23)."""
+    ``False`` here, and the timed run sets it on the step the profiler traced (FS23). ``rho`` is
+    the step's :func:`rho_arrays` when the caller has them already (FS52: once per step)."""
     def pid(cid: str) -> str:
         return "0" if t == 1 and cid == "7" else cid
 
@@ -1708,7 +1716,7 @@ def step_record(run: str, scenario: str, t: int, verifier: Any, rejection: Any,
            "verdict": "reject" if failed else "accept",
            "first_failing_check": rejection.check_id if failed else None,
            "rejection_kind": rejection.kind if failed else None, "checks": checks,
-           **step_scores(stats, bands, k=k, kappa_guard=guard),
+           **step_scores(stats, bands, k=k, kappa_guard=guard, rho=rho),
            **step_floor_fields(verifier, stats),
            "record_pass": record_pass(verifier, t, stats, kappa_guard=guard) if failed else None}
     return out
@@ -1860,7 +1868,8 @@ SCORE_FAMILIES = ("rho_5", "rho_kappa", "rho_6")
 
 
 def step_scores(stats: StepStats, bands: Any, *, k: int | None,
-                kappa_guard: bool = True) -> dict[str, Any]:
+                kappa_guard: bool = True,
+                rho: Mapping[str, np.ndarray] | None = None) -> dict[str, Any]:
     """The step record's scores (EVALUATION_SPEC §2.2, §4.1): per family the largest component
     score (``rho_5``, ``rho_kappa``, ``rho_6``) and ``n_failing``, a dict of the number of
     component tests above 1, both over what the verifier measured at the step.
@@ -1872,8 +1881,11 @@ def step_scores(stats: StepStats, bands: Any, *, k: int | None,
     of it was scored: no bands (calibration), the κ guard off (``rho_kappa``), no product
     measured (``rho_5``, ``rho_kappa``: the step stopped before check 5) or no tensor
     (``rho_6``). A non-finite score counts as failing, as the live checks reject it, and a NaN
-    score counts as ``+inf`` in the maximum (:func:`nan_as_inf`), so it can't hide the rest."""
-    rho = rho_arrays(stats, bands, k=k, kappa_guard=kappa_guard)
+    score counts as ``+inf`` in the maximum (:func:`nan_as_inf`), so it can't hide the rest.
+
+    ``rho`` is the step's :func:`rho_arrays` when the caller has them (FS52: once per step)."""
+    if rho is None:
+        rho = rho_arrays(stats, bands, k=k, kappa_guard=kappa_guard)
     scored = {"rho_5": bands is not None and bool(stats.products),
               "rho_kappa": bands is not None and kappa_guard and bool(stats.products),
               "rho_6": bands is not None and bool(stats.tensors)}
@@ -2562,34 +2574,94 @@ def c5_layout_file(c: Any, run: str) -> dict[str, Any]:
             "entries": entries, "trace_slice": sorted(trace)}
 
 
+class _StaticColumns:
+    """FS52: ``p_layer`` and ``p_spec_class`` of every canonical ``m`` of a computation, built
+    once from its declared inventory (they depend on nothing else) and gathered per step by the
+    step's ``m`` column. ``layer`` is int32 ``[M]``; ``spec`` indexes ``table`` (``-1``: the
+    product has no §5.7 class, :func:`spec_class` raises for it)."""
+
+    __slots__ = ("layer", "spec", "table", "table_len")
+
+    def __init__(self, c: Any) -> None:
+        n_layers = layer_count(c)
+        specs = c.products
+        classes = product_classes(c) or [product_class(c, s) for s in specs]
+        layer = np.empty(len(specs), dtype=np.int32)
+        code = np.empty(len(specs), dtype=np.int8)
+        table: dict[str, int] = {}
+        for i, spec in enumerate(specs):
+            layer[i] = layer_index(spec, n_layers)
+            try:
+                code[i] = table.setdefault(spec_class(c, spec, classes[i]), len(table))
+            except ValueError:
+                code[i] = -1
+        self.layer, self.spec = layer, code
+        self.table = tuple(table)
+        self.table_len = np.array([len(s) for s in self.table], dtype=np.int64)
+
+
+_STATIC_COLUMNS: weakref.WeakKeyDictionary[Any, _StaticColumns] = weakref.WeakKeyDictionary()
+
+
+def _static_columns(c: Any) -> _StaticColumns:
+    """The computation's :class:`_StaticColumns`, cached per computation object (weakly: the
+    entry dies with it). A computation that can't be weakly referenced or hashed is built
+    afresh each call."""
+    try:
+        got = _STATIC_COLUMNS.get(c)
+    except TypeError:
+        return _StaticColumns(c)
+    if got is None:
+        got = _StaticColumns(c)
+        _STATIC_COLUMNS[c] = got
+    return got
+
+
+def _layers_and_classes(c: Any, ms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``p_layer`` (int32) and ``p_spec_class`` (``<U{longest}``) of canonical ``m`` column
+    ``ms``, equal to what :func:`layer_index` and :func:`spec_class` give each product (FS52:
+    gathered from the cached per-``m`` columns)."""
+    st = _static_columns(c)
+    if len(ms) and not 1 <= int(ms.min()) <= int(ms.max()) <= c.M:
+        c.product(int(ms.min()) if ms.min() < 1 else int(ms.max()))  # raises as the lookup always did
+    if len(ms) and int(ms.max()) > len(st.layer):
+        raise IndexError(int(ms.max()))  # as ``specs[m - 1]`` did
+    idx = ms - 1
+    codes = st.spec[idx]
+    if len(codes) and int(codes.min()) < 0:
+        specs = c.products
+        table = product_classes(c) or [product_class(c, s) for s in specs]
+        for m in ms.tolist():  # raises for the product with no class, as it always did
+            spec_class(c, specs[m - 1], table[m - 1])
+    width = int(st.table_len[np.unique(codes)].max()) if len(codes) else 1
+    classes = np.array(st.table, dtype=f"<U{max(width, 1)}")[codes] if st.table else np.array(
+        [], dtype=str)
+    return st.layer[idx], classes
+
+
 def _residual_arrays(run: str, scenario: str, step: int, stats: StepStats, c: Any, *,
                      bands: Any = None, k: int | None = None,
-                     kappa_guard: bool = True) -> dict[str, np.ndarray]:
+                     kappa_guard: bool = True,
+                     rho: Mapping[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
+    """The archive's arrays (:class:`MetricsWriter.write_residuals`). ``rho`` is the step's
+    :func:`rho_arrays` when the caller has them already (FS52: computed once per step)."""
     ps = stats.products
     cols = ps.columns() if ps else ProductStats().columns()
     width = cols.normalized.shape[1] if ps else (k or 0)
-    layers, classes = [], []
     if c is not None:
-        n_layers = layer_count(c)
-        specs = c.products
-        table = product_classes(c) or [product_class(c, s) for s in specs]
-        ms = cols.m.tolist()
-        if ms and not 1 <= min(ms) <= max(ms) <= c.M:
-            c.product(min(ms) if min(ms) < 1 else max(ms))  # raises as the lookup always did
-        for m in ms:
-            spec = specs[m - 1]
-            layers.append(layer_index(spec, n_layers))
-            classes.append(spec_class(c, spec, table[m - 1]))
+        layers, classes = _layers_and_classes(c, cols.m)
     else:
-        layers, classes = [-1] * len(cols), [""] * len(cols)
-    rho = rho_arrays(stats, bands, k=k, kappa_guard=kappa_guard)
+        layers, classes = np.full(len(cols), -1, dtype=np.int32), np.array([""] * len(cols),
+                                                                           dtype=str)
+    if rho is None:
+        rho = rho_arrays(stats, bands, k=k, kappa_guard=kappa_guard)
     return {
         "run": np.array(run), "scenario": np.array(scenario), "step": np.array(step),
         "p_m": cols.m.astype(np.int32),
         "p_name": np.array(cols.name, dtype=str),
         "p_cls": np.array(cols.cls, dtype=str),
-        "p_spec_class": np.array(classes, dtype=str),
-        "p_layer": np.array(layers, dtype=np.int32),
+        "p_spec_class": classes,
+        "p_layer": layers,
         "p_kappa": cols.kappa.copy(), "p_q": cols.q.copy(), "p_norm": cols.p_norm.copy(),
         "p_nu": cols.nu.copy(), "p_abs1": cols.p_abs1.copy(), "p_u": cols.u.copy(),
         "p_normalized": cols.normalized.copy().reshape(len(cols), width),
@@ -2844,6 +2916,8 @@ class MetricsWriter:
         self._f: IO[str] = open(self.dir / "records.jsonl", "w")  # noqa: SIM115
         self._m: IO[str] | None = None  # markers.jsonl, opened by the first write_markers
         self._layout_written = False
+        self._writer_thread: threading.Thread | None = None  # FS52: the archive in flight
+        self._writer_error: BaseException | None = None
         self._traces: list[_Trace] = []
         self.write([environment_record(run, device=self.device, probe=self.probe, config=config,
                                        band_file_hash=band_file_hash, h_D=h_D,
@@ -2907,15 +2981,41 @@ class MetricsWriter:
 
     def write_residuals(self, scenario: str, step: int, stats: StepStats, c: Any, *,
                         bands: Any = None, k: int | None = None,
-                        kappa_guard: bool = True) -> Path:
+                        kappa_guard: bool = True,
+                        rho: Mapping[str, np.ndarray] | None = None) -> Path:
         """The step's residual arrays, with its scores under ``bands`` (:func:`rho_arrays`;
-        NaN without bands)."""
+        NaN without bands; ``rho`` when the caller has them already).
+
+        The arrays are built here, on the calling thread; ``np.savez`` runs on one writer thread
+        (FS52), at most one archive in flight: a call first waits for the previous one. The
+        returned file exists only once :meth:`flush` (or :meth:`close`) has returned, and an
+        error in the thread is raised by the next ``write_residuals``, ``flush`` or ``close``."""
         d = self.dir / "residuals" / _SAFE_NAME.sub("_", scenario)
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"step_{step:05d}.npz"
-        np.savez(path, **_residual_arrays(self.run, scenario, step, stats, c, bands=bands, k=k,
-                                          kappa_guard=kappa_guard))
+        self.flush()
+        arrays = _residual_arrays(self.run, scenario, step, stats, c, bands=bands, k=k,
+                                  kappa_guard=kappa_guard, rho=rho)
+        self._writer_thread = threading.Thread(target=self._save, args=(path, arrays),
+                                               name="residual-archive")
+        self._writer_thread.start()
         return path
+
+    def _save(self, path: Path, arrays: dict[str, np.ndarray]) -> None:
+        try:
+            np.savez(path, **arrays)
+        except BaseException as e:  # noqa: BLE001 - re-raised on the calling thread by flush
+            self._writer_error = e
+
+    def flush(self) -> None:
+        """Wait for the archive in flight, then raise its error if it had one (once). Call it
+        before reading an archive of a run that is still open."""
+        thread, self._writer_thread = self._writer_thread, None
+        if thread is not None:
+            thread.join()
+        err, self._writer_error = self._writer_error, None
+        if err is not None:
+            raise err
 
     def close(self, completed: bool | None = None) -> None:
         """Close the file, writing ``run_end`` only if the run completed.
@@ -2934,6 +3034,11 @@ class MetricsWriter:
             trace.close()
         if self._m is not None:
             self._m.close()
+        try:
+            self.flush()  # FS52: before ``run_end``; a failed archive leaves none
+        except BaseException:
+            self._f.close()
+            raise
         if completed is None:
             completed = sys.exception() is None
         if completed:
