@@ -153,3 +153,25 @@ def test_full_scale_step(repo, revision, logits_gb):
     largest: LeafSize = max(ls, key=lambda l: l.nbytes)
     assert largest.name == "Lambda" and largest.shape == (16384, config.vocab_size)
     assert round(largest.nbytes / 1e9, 2) == logits_gb
+
+
+# O18 (plan 2.4): the full-scale leaf counts, no weights and no model build.
+FULL_SCALE_COUNTS = {
+    "unsloth/Llama-3.2-1B-Instruct": (456, 876),
+    "Qwen/Qwen2.5-0.5B-Instruct": (672, 1380),
+    "tiiuae/Falcon3-1B-Instruct": (510, 968),
+    "Qwen/Qwen2.5-1.5B-Instruct": None,  # no row in the plan's table
+}
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("repo,revision,logits_gb", FULL_SCALE, ids=[r for r, _, _ in FULL_SCALE])
+def test_full_scale_leaf_counts(repo, revision, logits_gb):
+    config = load_model_config(repo, revision)
+    c = DecoderComputation(config, n_s=128, n=128, eta=1e-3, compute_dtype=torch.bfloat16,
+                           head_blocks=8)
+    L = config.num_hidden_layers
+    assert c.n_product_leaves == 27 * L + 3 * 8
+    assert c.n_leaves == 128 + 2 * c.n_w + c.n_product_leaves
+    if FULL_SCALE_COUNTS[repo] is not None:
+        assert (c.n_product_leaves, c.n_leaves) == FULL_SCALE_COUNTS[repo]
