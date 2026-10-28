@@ -2031,7 +2031,7 @@ interface.
     with `read_plan`, replaces the entry and counts it; nodes kept apart that now share a view
     stay apart (a missed share costs speed, never bits; the group order inside a level follows the
     cached build's addresses and changes no row, FS38b). `table_cache_stats()` returns `hits`,
-    `misses` and `plan_rebuilds`; `table_cache(False)` turns the cache off for comparisons (it
+    `misses` and `plan_rebuilds` (`bring_up` and `llama_step` print them once at the end of a run and, with `--metrics`, write one `table_cache` record: FS55a); `table_cache(False)` turns the cache off for comparisons (it
     is on by default); `table_cache_clear()` empties it. The rows are the same bits with it on
     and off (`test_table_cache_host.py` through the host build, `test_table_cache_cuda.py` on a
     card). Measured on the Mac (2026-10-28, one Llama-3.2-1B layer step's synthetic groups, 24,585
