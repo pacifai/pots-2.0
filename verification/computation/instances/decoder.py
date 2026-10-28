@@ -52,8 +52,8 @@ Implementation pins (not fixed by the reference block):
 
 Labeling (:meth:`DecoderComputation.label`) maps each captured matmul to its product leaf by
 operand identity (storage), never by call order alone (O18: a batched attention product's leaf
-holds all its members, so a bmm output is one whole leaf). Under autocast a weight operand (and a bias) is
-autocast's copy of the weight, which the capture traces back to the weight
+holds all its members, so a bmm output is one whole leaf). Under autocast a weight operand (and
+a bias) is autocast's copy of the weight, which the capture traces back to the weight
 (``OperandInfo.param_copy``); nothing is matched by value:
 
 - forward ``Y_x`` and ``Λ``: ``B`` is a view of the weight's storage; backward ``δX_x`` and
@@ -1015,7 +1015,8 @@ class _Labeler:
 
     def _fill(self, name: str, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor,
               rec: MatmulRecord, leaf: torch.Tensor | None = None) -> None:
-        """Put the product named ``name`` in its leaf after checking the operand shapes against its spec.
+        """Put the product named ``name`` in its leaf after checking the operand shapes against
+        its spec.
 
         ``(a, b, out)`` are as captured. ``leaf`` is given when the record computed
         ``Pᵀ = Bᵀ·Aᵀ`` (the δK̃ case): it is the contiguous ``P``, and the captured shapes are

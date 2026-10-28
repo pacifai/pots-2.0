@@ -206,24 +206,17 @@ def assert_same(unit, canon):
     assert unit.record_stats == canon.record_stats
 
 
-def _apply_to_member(c, leaves, m, fn):
-    """``leaves`` with ``fn`` applied to product ``m`` only: a member of an attention leaf (O18) is
-    ``leaf[i]``, written into a copy of its leaf."""
-    g, i = c.leaf_of(m)
-    j = c.product_leaf_index(g)
-    if i is None:
-        leaves[j] = fn(leaves[j])
-    else:
-        leaf = leaves[j].clone()
-        leaf[i] = fn(leaf[i])
-        leaves[j] = leaf
-    return leaves
-
-
 def _flipped(setup, *ms):
     leaves = list(setup.leaves)
     for m in ms:
-        _apply_to_member(setup.c, leaves, m, _flip)
+        g, i = setup.c.leaf_of(m)  # O18: a group's members are one 3-D leaf; flip member i
+        k = setup.c.product_leaf_index(g)
+        if i is None:
+            leaves[k] = _flip(leaves[k])
+        else:
+            leaf = leaves[k].clone()
+            leaf[i] = _flip(leaf[i])
+            leaves[k] = leaf
     return leaves
 
 
