@@ -573,7 +573,8 @@ def check6_trial(c: DeclaredComputation, store: InMemoryStore, bands: Bands, ctx
     idx, base = c.w_next_index(name), store.root
     w_t, w_next = store.leaf(c.w_t_index(name)), store.leaf(idx)
     (g_m,) = c.linear_weights[name]  # a layer's linear: one product (check6_weight)
-    g = TranscriptView(c, store).product(g_m).to(w_t.device, c.weight_dtype)  # sharded: its own device
+    # sharded: the weight's own device
+    g = TranscriptView(c, store).product(g_m).to(w_t.device, c.weight_dtype)
     tau_w = bands.tau_w_for(name)
     with torch.no_grad():  # check 6a's reference, term by term (_update_identity_reference)
         eta_g = c.eta * g
