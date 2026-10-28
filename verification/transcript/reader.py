@@ -4,7 +4,8 @@
 in-memory store, a store on disk, and the verifier's own cache of the leaves it hashed.
 :class:`TranscriptView` names the leaves under a computation's layout. A product leaf is a lone
 product or, for a batched attention product, all its members as ``[n, *p_shape]`` (O18), so a
-member is a view of one leaf and a run of members is a slice of it: no copy and no stacking.
+member is a view of one leaf and a run of consecutive, 64-byte aligned members is a slice of
+it (a view, no copy); any other run is one aligned copy, as ``torch.stack`` makes.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
     from verification.computation.interface import DeclaredComputation
 
 __all__ = ["LeafReader", "TranscriptView"]
+
+_ALIGN = 64  # torch.stack's CPU output is 64-byte aligned; a zero-copy block must be too
 
 
 @runtime_checkable
@@ -76,14 +79,28 @@ class TranscriptView:
 
     def _slice(self, g: int, i0: int, step: int, n: int, own: bool) -> torch.Tensor:
         out = self.product_leaf(g)[i0:i0 + step * (n - 1) + 1:step]
-        return out.clone() if own else out
+        return self._aligned(out, step == 1, own)
+
+    @staticmethod
+    def _aligned(out: torch.Tensor, consecutive: bool, own: bool) -> torch.Tensor:
+        """``out`` as a view only when it is what ``torch.stack`` would give a BLAS kernel: the
+        members consecutive in the leaf (member step 1) and the start 64-byte aligned (where
+        ``torch.stack``'s CPU output starts). Else a fresh contiguous copy at a new aligned
+        allocation (``clone``, not ``.contiguous()``, which returns a contiguous view as is).
+        ``own`` clones the view too."""
+        if consecutive and out.data_ptr() % _ALIGN == 0:
+            return out.clone(memory_format=torch.contiguous_format) if own else out
+        return out.clone(memory_format=torch.contiguous_format)
 
     def product_block(self, ms: Sequence[int], own: bool = False) -> torch.Tensor:
         """The products ``ms`` stacked, ``[len(ms), *p_shape]``, equal bit for bit to
         ``torch.stack([self.product(m) for m in ms])``. Members of one group at member indices
-        in an increasing arithmetic progression come back as a slice of the group's leaf, a
-        view, read-only and aliasing the committed leaf, unless ``own`` asks for a copy; so does
-        a lone product (``unsqueeze``). Anything else is ``torch.stack``."""
+        in an increasing arithmetic progression come back as a slice of the group's leaf; so
+        does a lone product (``unsqueeze``). The slice is a view, read-only and aliasing the
+        committed leaf, only when the members are consecutive (step 1) and it starts 64-byte
+        aligned, as ``torch.stack``'s output does, so a BLAS kernel sees the same alignment;
+        otherwise (and with ``own``) it is a fresh contiguous aligned copy. Anything else is
+        ``torch.stack``."""
         # Every index is looked up before any leaf is read, so only an invalid ``m`` (which
         # comes from the computation, never the prover) fails in another order than a loop.
         pos = [self.c.leaf_of(m) for m in ms]
@@ -92,8 +109,7 @@ class TranscriptView:
             if all(p[0] == g for p in pos):
                 if i0 is None:
                     if len(pos) == 1:
-                        leaf = self.product_leaf(g).unsqueeze(0)
-                        return leaf.clone() if own else leaf
+                        return self._aligned(self.product_leaf(g).unsqueeze(0), True, own)
                 else:
                     step = pos[1][1] - i0 if len(pos) > 1 else 1
                     if step >= 1 and all(p[1] == i0 + step * k for k, p in enumerate(pos)):
