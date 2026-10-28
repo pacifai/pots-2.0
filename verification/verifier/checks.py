@@ -1324,7 +1324,8 @@ def _measure_served_kernel(c: DeclaredComputation, specs: Sequence[ProductSpec],
             return _Rows(specs[:0], [], None), e
         with ctx.timed("5.measure", host=True), \
                 (st("c5.measure", run, group0) if st else _NO_STAMP):
-            rows = freivalds.measure_groups_rows([group], h=h, k=k, guard=guard)
+            with measure_kernel.table_cache(False):  # a one-off structure (FS51b)
+                rows = freivalds.measure_groups_rows([group], h=h, k=k, guard=guard)
         return _Rows(specs, [0], rows), None
     groups, rows, orders = _measure_groups(specs), [], []
     for g, idx in enumerate(groups):
@@ -1337,7 +1338,8 @@ def _measure_served_kernel(c: DeclaredComputation, specs: Sequence[ProductSpec],
                                        orders=orders)
         with ctx.timed("5.measure", host=True), \
                 (st("c5.measure", run, group0 + g) if st else _NO_STAMP):
-            rows.append(freivalds.measure_groups_rows(served, h=h, k=k, guard=guard))
+            with measure_kernel.table_cache(False):  # a one-off structure (FS51b)
+                rows.append(freivalds.measure_groups_rows(served, h=h, k=k, guard=guard))
         orders.append(order)
         del served  # the views; the kernel holds what it still reads
     return _Rows(specs, [i for o in orders for i in o], _join_rows(rows)), None
