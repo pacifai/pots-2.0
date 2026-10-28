@@ -2016,6 +2016,26 @@ interface.
     `[Σ n_t, row_width(k)]` on the device and reads nothing back. `validate` applies FS36's
     rules per group first (`ValueError` naming the group and its products). `run` replaces the
     loaded kernel and `challenges` the challenge source, for tests.
+  - **The table's structure, once per run (FS51).** What a table holds besides addresses is a
+    function of the declared computation, so `enqueue` builds it once per structure
+    (`table_structure`, `build_host_table`): the key is the device, `k`, `guard`, `share`,
+    `ROWS_PER_BLOCK` and, group by group, `ms` (as a tuple) and the a/b/p/bias shapes, strides
+    and dtypes, compared per group in C (`TABLE_CACHE_MAX` entries, least recently used out).
+    A hit reuses the `ms` and widths tuples, the `ReadPlan`, `block_starts`, the block table,
+    the work array's item starts and scratch offsets (from 0), the buffer layout and the plan's
+    bytes as one tail; each call rebuilds `prods_array` (its addresses and the challenge
+    addresses), the work array's scratch addresses (base plus offsets), the pinned buffer and the
+    launches' `LevelArgs`. **Every hit checks the plan** (`_plan_holds`): each node of a shared
+    read group must still have the key (address, rows, columns, both strides, dtype) of its
+    group's first node, one gather and compare per field, no sort. A mismatch rebuilds the plan
+    with `read_plan`, replaces the entry and counts it; nodes kept apart that now share a view
+    stay apart (a missed share costs speed, never bits; the group order inside a level follows the
+    cached build's addresses and changes no row, FS38b). `table_cache_stats()` returns `hits`,
+    `misses` and `plan_rebuilds`; `table_cache(False)` turns the cache off for comparisons (it
+    is on by default); `table_cache_clear()` empties it. The rows are the same bits with it on
+    and off (`test_table_cache_host.py` through the host build, `test_table_cache_cuda.py` on a
+    card). Measured on the Mac (2026-10-28, one Llama-3.2-1B layer step's synthetic groups, 24,585
+    members): the host build 14 ms before, 1.5 ms on a hit.
   - **Holds.** Each call is a `Pending`: its event, every input (`a`, `b`, `p`, `bias`) with
     its `_version` as enqueued, and the buffers the stream reads. `retire(device)` releases
     the entries whose event has completed, as each `enqueue` does first. `drain(device=None)`
@@ -2051,6 +2071,12 @@ interface.
     prefetch doesn't cover the request or a later prefetch has refilled its slot
     (`Prefetch.fill`). A slot's copy events are waited for before it is refilled. A worker error
     is raised at the draw.
+    FS51: the layout of a request (the distinct `(m, width)` products, their offsets and each
+    member's offset) is cached per source for `(k, ms, widths)` compared as tuples
+    (`find_layout`, `LAYOUT_CACHE_MAX`); `prefetch` and `draw(prefetched=)` reuse it, and
+    `Prefetch.covers` then compares the layout object, the slot's fill, `h` and `k`, not each
+    member (a request that is not the cached one is looked up member by member, as before). The
+    bytes drawn and their offsets are unchanged.
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m(q, eps_in, eps_acc, u_ratio=1.0)` is F18's split, `√2·ε_in + √q·ε_acc·max(1,
