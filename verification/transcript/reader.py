@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 
+from verification.commitment.leaves import _tensor_slot
 from verification.transcript.errors import LeafShapeError
 
 if TYPE_CHECKING:
@@ -59,12 +60,13 @@ class TranscriptView:
         declared shape."""
         pl = self.c.product_leaf(g)
         index = self.c.product_leaf_index(g)
+        slot = _tensor_slot(self.c, index)[3]
         obj = self.reader.leaf(index)
         if not isinstance(obj, torch.Tensor):
-            raise LeafShapeError(f"leaf {index} {pl.name}: expected a tensor, got "
+            raise LeafShapeError(f"leaf {index} {slot}: expected a tensor, got "
                                  f"{type(obj).__name__}")
         if tuple(obj.shape) != pl.shape:
-            raise LeafShapeError(f"leaf {index} {pl.name}: shape {tuple(obj.shape)}, "
+            raise LeafShapeError(f"leaf {index} {slot}: shape {tuple(obj.shape)}, "
                                  f"declared {pl.shape}")
         return obj
 
