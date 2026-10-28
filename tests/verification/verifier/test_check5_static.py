@@ -313,6 +313,7 @@ def test_a_second_computation_gets_its_own_entry():
 
 
 def test_the_entry_goes_with_its_computation():
+    gc.collect()  # earlier tests' dead computations leave first, so ``before`` is stable
     before = len(checks._STATIC)
     c = _tiny(("qwen2", False), 1)
     checks._c5_static(c)
