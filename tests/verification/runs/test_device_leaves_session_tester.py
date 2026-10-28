@@ -1,6 +1,6 @@
 """FS30 tester: the device-leaves gate fed by what the real code writes. The bring-up lines come
-from ``bring_up.device_leaves_line`` over a real step's leaves and a real computation's ``M`` and
-``dK`` count, and the tests part's cases from a real ``pytest --junitxml`` run, so a change of
+from ``bring_up.device_leaves_line`` over a real step's leaves and a real computation's product-leaf
+count ``K`` and ``dK`` leaves, and the tests part's cases from a real ``pytest --junitxml`` run, so a change of
 either format shows here and not on the card."""
 
 import subprocess
@@ -43,13 +43,13 @@ def real():
 def written_line(real, *, used=None, hashed=None, known=None, accepted=True, root="same",
                  capture=True):
     c, leaves, root_ = real
-    dk = sum(1 for cl in c.product_classes if cl == "dK")
-    ah = {"used": c.M - dk if used is None else used,
-          "leaves": c.M if hashed is None else hashed}
+    dk = sum(1 for pl in c.product_leaves if c.product_classes[pl.m0 - 1] == "dK")
+    ah = {"used": c.n_product_leaves - dk if used is None else used,
+          "leaves": c.n_product_leaves if hashed is None else hashed}
     step = SimpleNamespace(
         t=1, rejection=None if accepted else object(),
         root=None if root is None else (root_ if root == "same" else bytes(32)),
-        known=c.M - dk if known is None else known,
+        known=c.n_product_leaves - dk if known is None else known,
         capture={"arrival_hash": ah} if capture else {"n_calls": 1})
     b = SimpleNamespace(kept=SimpleNamespace(leaf=lambda i: leaves[i]),
                         result=SimpleNamespace(loop=SimpleNamespace(steps=[step])))
@@ -74,7 +74,7 @@ def parts_with(real, tmp_path, tests=None, **bad_for_first):
 
 def test_the_computation_has_dK_leaves_so_the_two_counts_differ(real):
     c, _, _ = real
-    assert sum(1 for cl in c.product_classes if cl == "dK") > 0
+    assert sum(1 for pl in c.product_leaves if c.product_classes[pl.m0 - 1] == "dK") > 0
 
 
 def test_an_honest_run_written_by_the_real_line_passes(real, tmp_path):
@@ -82,8 +82,9 @@ def test_an_honest_run_written_by_the_real_line_passes(real, tmp_path):
     assert g["pass"] is True, g
     c, _, _ = real
     row = g["models"][M0]
-    assert row["M"] == c.M and row["hashed"] == c.M and row["arrival"] == c.M - row["dK"]
-    assert row["known"] == c.M - row["dK"]
+    K = c.n_product_leaves
+    assert row["K"] == K and row["hashed"] == K and row["arrival"] == K - row["dK"]
+    assert row["known"] == K - row["dK"]
     assert row["prover_root"] == row["cpu_root"] and row["accepted"] is True
 
 
@@ -91,17 +92,18 @@ def test_an_honest_run_written_by_the_real_line_passes(real, tmp_path):
     ({"accepted": False}, "the step was not accepted"),
     ({"root": "other"}, "the roots differ"),
     ({"root": None}, "the roots differ"),
-    ({"used": "M"}, "arrival digests, expected"),  # the count before the fix round
+    ({"used": "K"}, "arrival digests, expected"),  # the count before the fix round
     ({"used": 0}, "arrival digests, expected"),
-    ({"known": "M"}, "the commit took"),  # the commit hashed everything itself
+    ({"known": "K"}, "the commit took"),  # the commit hashed everything itself
     ({"known": 0}, "the commit took"),  # the commit stopped passing ``known``
-    ({"hashed": "dk"}, "products hashed on arrival, expected"),
+    ({"hashed": "dk"}, "outputs hashed on arrival, expected"),
     ({"capture": False}, "arrival digests, expected"),
 ])
 def test_each_failure_of_a_real_line_fails_the_gate_with_its_reason(real, tmp_path, kw, needle):
     c, _, _ = real
-    dk = sum(1 for cl in c.product_classes if cl == "dK")
-    kw = {k: ({"M": c.M, "dk": c.M - dk}[v] if v in ("M", "dk") else v) for k, v in kw.items()}
+    dk = sum(1 for pl in c.product_leaves if c.product_classes[pl.m0 - 1] == "dK")
+    K = c.n_product_leaves
+    kw = {k: ({"K": K, "dk": K - dk}[v] if v in ("K", "dk") else v) for k, v in kw.items()}
     g = fs.device_leaves_gate(parts_with(real, tmp_path, **kw))
     assert g["pass"] is False and needle in " | ".join(g["reasons"]), g
     assert g["models"][M0]["ok"] is False

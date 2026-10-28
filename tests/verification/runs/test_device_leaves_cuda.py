@@ -54,13 +54,15 @@ def test_capture_hashes_every_product_but_dK_on_arrival(dtype, head_blocks, dete
 
     c, out = _step(dtype, head_blocks)
     leaves = out.leaves()
-    want = {c.product_index(s.m) for s in c.products if c.product_class(s) != "dK"}
+    K = c.n_product_leaves  # O18: one digest per product leaf, not per matmul
+    want = {c.product_leaf_index(pl.g) for pl in c.product_leaves
+            if c.product_class(c.product(pl.m0)) != "dK"}
     assert set(out.arrival_digests) == want
     assert out.capture["arrival_hash"]["nonfinite"] == 0
-    assert out.capture["arrival_hash"]["leaves"] == c.M  # the dK records are hashed too
+    assert out.capture["arrival_hash"]["leaves"] == K  # the raw δK̃ᵀ outputs are hashed too
     assert out.capture["arrival_hash"]["used"] == len(want)
-    n_dk = sum(1 for s in c.products if c.product_class(s) == "dK")
-    assert n_dk == c.M - len(want) > 0
+    n_dk = sum(1 for pl in c.product_leaves if c.product_class(c.product(pl.m0)) == "dK")
+    assert n_dk == K - len(want) > 0
     assert out.capture["arrival_hash"]["missing"] == {"OPERAND_GRAD": n_dk}
     assert out.capture["arrival_hash"]["missing_first"] == []
     plain = leaf_hashes_of(c, list(enumerate(leaves)))
@@ -126,7 +128,7 @@ def test_a_nan_in_a_device_leaf_is_the_host_paths_leaf_and_error(deterministic):
 
     c, out = _step()
     leaves = out.leaves()
-    i = c.product_index(3)  # i - 1 and i + 1 are products 2 and 4, device leaves on the kernel
+    i = c.product_leaf_index(1)  # i - 1 and i + 1 are product leaves 0 and 2, on the kernel
     host = list(leaves)
     host[i] = host[i].clone()
     host[i][(0,) * host[i].dim()] = float("nan")
@@ -157,7 +159,7 @@ def test_a_planted_nan_product_is_rejected_at_its_leaf_through_prove_step_and_th
     arrival hashing and the commit's routing run together. ``InMemoryStore.commit_step``
     raises the plain path's error at the planted leaf: a cut product after it (its digest
     still given) leaves the NaN's error, a cut one before it gives the shape error. The product
-    is the first with a non-``dK`` product on each side, so both neighbours carry digests.
+    leaf is the first with a non-``dK`` product leaf on each side, so both neighbours carry digests.
     A NaN made inside a matmul is a different path, covered by
     ``test_a_nan_inside_a_matmul_output_has_no_digest_and_the_cpu_paths_leaf``."""
     import dataclasses
@@ -168,15 +170,19 @@ def test_a_planted_nan_product_is_rejected_at_its_leaf_through_prove_step_and_th
     from verification.transcript.store import InMemoryStore
 
     c, plain_out = _step()
-    m = next(m for m in range(2, c.M)
-             if all(c.product_class(c.product(k)) != "dK" for k in (m - 1, m, m + 1)))
+    # O18: the planted leaf is a product leaf (the first member of a group, or a lone product)
+    # with a non-dK product leaf on each side
+    g = next(g for g in range(1, c.n_product_leaves - 1)
+             if all(c.product_class(c.product(c.product_leaf(k).m0)) != "dK"
+                    for k in (g - 1, g, g + 1)))
+    m = c.product_leaf(g).m0
 
     def plant(p):
         p[(0,) * p.dim()] = float("nan")
         return p
 
     c, out = _step(perturb={m: plant})
-    i = c.product_index(m)
+    i = c.product_leaf_index(g)
     assert i not in out.arrival_digests
     assert {i - 1, i + 1} <= set(out.arrival_digests)
     host = [x.cpu() if isinstance(x, torch.Tensor) else x for x in out.leaves()]
@@ -186,7 +192,7 @@ def test_a_planted_nan_product_is_rejected_at_its_leaf_through_prove_step_and_th
         InMemoryStore.commit_step(c, out)
     assert str(got.value) == str(want.value)
     for j, kind in ((i + 1, NonFiniteError), (i - 1, LeafShapeError)):
-        k = j - c.product_index(1)  # the product's place in ``products``
+        k = j - c.product_leaf_index(0)  # the leaf's place in ``products``
         products = list(out.products)
         products[k] = products[k][:-1]
         cut = dataclasses.replace(out, products=tuple(products))
@@ -206,7 +212,7 @@ def test_a_device_leaf_mutated_before_its_table_is_read_raises(deterministic):
 
     c, out = _step()
     dev = [x if j < c.n_s else x.to(DEV) for j, x in enumerate(out.leaves())]
-    i = c.product_index(1)
+    i = c.product_leaf_index(0)
     real = L._enqueue_table
 
     def mutate_after(idx, tensors, tags):
