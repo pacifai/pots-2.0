@@ -88,15 +88,16 @@ def captured(c, w0, records, *, rule2=True, hint=None):
 
 
 def leaf_hints(cap, labeled):
-    """Per product ``m`` (1-based): the hint of the record whose storage the leaf shares, or
-    None for a leaf that is no record's output."""
+    """Per product leaf ``g`` (0-based): the hint of the record whose storage the leaf shares,
+    or None for a leaf that is no record's output."""
     by = {StorageWeakRef(r.out.untyped_storage()): r.hint
           for r in cap.records + cap.glue_outer if r.hint is not None}
-    return {m: by.get(StorageWeakRef(p.untyped_storage())) for m, p in enumerate(labeled, 1)}
+    return {g: by.get(StorageWeakRef(p.untyped_storage())) for g, p in enumerate(labeled)}
 
 
-def role(c, m):
-    return c.product_class(c.products[m - 1])
+def role(c, g):
+    """The class of the leaf's first product (a group's members share one)."""
+    return c.product_class(c.products[c.product_leaf(g).m0 - 1])
 
 
 def fake(n):
@@ -117,12 +118,12 @@ def test_every_product_but_dK_is_hinted_to_its_owner(n_dev, layers, switch, B, d
     c = tiny(switch, B=B, dtype=dtype, devices=fake(n_dev), layers=layers)
     cap, labeled = captured(c, start(c), make_records((12, 7)))
     hints = leaf_hints(cap, labeled)
-    for m, h in hints.items():
-        if role(c, m) == "dK":
-            assert h is None, m  # a fresh contiguous transpose: no record shares its storage
+    for g, h in hints.items():
+        if role(c, g) == "dK":
+            assert h is None, g  # a fresh contiguous transpose: no record shares its storage
         else:
-            assert h == c.placement.product_device(m), (m, c.products[m - 1].name)
-    assert cap.count_hint_misses(labeled, c.placement.product_device) == 0
+            assert h == c.placement.product_leaf_device(g), (g, c.product_leaf(g).name)
+    assert cap.count_hint_misses(labeled, c.placement.product_leaf_device) == 0
     assert cap.summary()["hint_misses"] == 0
     if n_dev > 1:
         assert len({h for h in hints.values() if h}) > 1 or layers == 1
@@ -131,10 +132,10 @@ def test_every_product_but_dK_is_hinted_to_its_owner(n_dev, layers, switch, B, d
 @pytest.mark.parametrize("switch", SWITCHES, ids=switch_id)
 def test_more_devices_than_layers_leave_a_device_unused_and_still_hit(switch):
     c = tiny(switch, devices=fake(5), layers=2)
-    used = {c.placement.product_device(m) for m in range(1, c.M + 1)}
+    used = {c.placement.product_leaf_device(g) for g in range(c.n_product_leaves)}
     assert len(used) < 5
     cap, labeled = captured(c, start(c), make_records((12, 7)))
-    assert cap.count_hint_misses(labeled, c.placement.product_device) == 0
+    assert cap.count_hint_misses(labeled, c.placement.product_leaf_device) == 0
 
 
 @pytest.mark.parametrize("switch", SWITCHES, ids=switch_id)
@@ -144,11 +145,11 @@ def test_cpu_count_skips_exactly_the_dK_leaves(switch):
     c = tiny(switch, B=2, devices=fake(3), layers=3)
     cap, labeled = captured(c, start(c), make_records((12, 7)))
     hints = leaf_hints(cap, labeled)
-    skipped = {m for m, h in hints.items() if h is None}
-    assert skipped == {m for m in hints if role(c, m) == "dK"} and skipped
+    skipped = {g for g, h in hints.items() if h is None}
+    assert skipped == {g for g in hints if role(c, g) == "dK"} and skipped
     # Wrong for everyone: every judged leaf counts, the skipped ones do not.
-    miss = cap.count_hint_misses(labeled, lambda m: torch.device("cuda:9"))
-    assert miss == c.M - len(skipped)
+    miss = cap.count_hint_misses(labeled, lambda g: torch.device("cuda:9"))
+    assert miss == c.n_product_leaves - len(skipped)
 
 
 def test_second_rule_decides_the_weight_gradient_and_removing_it_misses():
@@ -162,12 +163,12 @@ def test_second_rule_decides_the_weight_gradient_and_removing_it_misses():
             w0, records = start(c), make_records((12, 7))
             cap, labeled = captured(c, w0, records, rule2=False)
             hints = leaf_hints(cap, labeled)
-            missed = [m for m, h in hints.items()
-                      if h is not None and h != c.placement.product_device(m)]
+            missed = [g for g, h in hints.items()
+                      if h is not None and h != c.placement.product_leaf_device(g)]
             assert missed, (switch, B)
-            for m in missed:
-                seen.setdefault(role(c, m), 0)
-                seen[role(c, m)] += 1
+            for g in missed:
+                seen.setdefault(role(c, g), 0)
+                seen[role(c, g)] += 1
     print("rule 2 decides:", seen)
     assert seen
 
@@ -193,8 +194,8 @@ def _random(devs, seed):
 
 def _expected_misses(c, cap, labeled):
     """Per judged leaf (a record's output) whether its hint differs from the owner."""
-    return sum(h != c.placement.product_device(m)
-               for m, h in leaf_hints(cap, labeled).items() if h is not None)
+    return sum(h != c.placement.product_leaf_device(g)
+               for g, h in leaf_hints(cap, labeled).items() if h is not None)
 
 
 WRONG = {
@@ -212,7 +213,7 @@ def test_a_wrong_hint_counts_and_changes_no_bit_on_the_capture(kind, switch):
     cap, labeled = captured(c, start(c), make_records((12, 7)), hint=WRONG[kind](devs))
     want = _expected_misses(c, cap, labeled)
     assert want > 0
-    assert cap.count_hint_misses(labeled, c.placement.product_device) == want
+    assert cap.count_hint_misses(labeled, c.placement.product_leaf_device) == want
     ref, ref_labeled = captured(c, start(c), make_records((12, 7)))
     assert all(same(x, y) for x, y in zip(labeled, ref_labeled))
 
@@ -252,7 +253,7 @@ def test_a_wrong_hint_in_a_step_changes_no_leaf_root_loss_or_weight(
     assert want > 0
     assert_same_step(a, b)
     assert commit(off, a).root == commit(on, b).root
-    assert all(p.device == on.placement.product_device(m) for m, p in enumerate(b.products, 1))
+    assert all(p.device == on.placement.product_leaf_device(g) for g, p in enumerate(b.products))
     w_next, loss = plain_step(on, on.build_model(), w0, records)
     assert loss == b.loss and all(same(w_next[n], b.w_next[n]) for n in on.weight_names)
     b.assert_unmodified()
@@ -370,10 +371,11 @@ def test_a_perturbed_product_lands_at_m_and_the_verifier_rejects_it(devices, nam
     clean = prove_step(c, c.build_model(), w0, batch)
     m = c.m_of(name)
     out = prove_step(c, c.build_model(), w0, batch, perturb={m: lambda p: p * 1.5 + 1})
-    assert out.products[m - 1].device == c.placement.product_device(m)
+    g = c.leaf_of(m)[0]
+    assert out.products[g].device == c.placement.product_leaf_device(g)
     assert all(same(x, y) for i, (x, y) in enumerate(zip(clean.products, out.products))
-               if i != m - 1)
-    assert not same(clean.products[m - 1], out.products[m - 1])
+               if i != g)
+    assert not same(clean.products[g], out.products[g])
 
     def verify(step):
         store = InMemoryStore.from_step(c, step, copy=True,
@@ -529,18 +531,18 @@ def test_smollm2_hint_under_a_fake_placement_matches_every_owner(monkeypatch):
     # The config insists a CUDA setting go with a CUDA VERIF_DEVICE; set the devices directly.
     c.verifier_devices = tuple(torch.device(d) for d in fake(3))
     c.__dict__.pop("placement", None)
-    assert c.placement.sharded and len({c.placement.product_device(m)
-                                        for m in range(1, c.M + 1)}) == 3
+    assert c.placement.sharded and len({c.placement.product_leaf_device(g)
+                                        for g in range(c.n_product_leaves)}) == 3
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
     records = [D[i] for i in schedule(1, c.n_s, len(D), 1)]
     cap, labeled = captured(c, None, records)
     hints = leaf_hints(cap, labeled)
     n_dk = 0
-    for m, h in hints.items():
-        if role(c, m) == "dK":
+    for g, h in hints.items():
+        if role(c, g) == "dK":
             n_dk += 1
-            assert h is None, m
+            assert h is None, g
         else:
-            assert h == c.placement.product_device(m), (m, c.products[m - 1].name)
+            assert h == c.placement.product_leaf_device(g), (g, c.product_leaf(g).name)
     assert n_dk > 0
-    assert cap.count_hint_misses(labeled, c.placement.product_device) == 0
+    assert cap.count_hint_misses(labeled, c.placement.product_leaf_device) == 0

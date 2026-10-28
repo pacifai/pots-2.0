@@ -568,6 +568,9 @@ def _old_decoder():
         exec(compile(src, "decoder_before_fs32c.py", "exec"), mod.__dict__)
     finally:
         sys.modules.pop(mod.__name__, None)
+    # The old decoder declares attention members but no product groups (O18); this test only
+    # builds models and batches, so it skips the layout check.
+    mod.DecoderComputation.validate = lambda self: None
     return mod
 
 
