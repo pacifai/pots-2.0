@@ -64,9 +64,10 @@ def _ctx(c, out, *, flips=(), judge=True, seam=None):
     store = InMemoryStore.from_step(c, out, copy=True)
     for name in flips:
         m = c.m_of(name)
-        t = out.products[m - 1].clone()
-        t.view(-1)[-1] += 1.0
-        perturb_leaf(c, store, c.product_index(m), t)
+        g, i = c.leaf_of(m)  # O18: a group's members are one leaf
+        t = out.products[g].clone()
+        (t if i is None else t[i]).view(-1)[-1] += 1.0
+        perturb_leaf(c, store, c.product_leaf_index(g), t)
     ctx = StepContext.for_computation(
         c, step=1, indices=tuple(range(c.n_s)), h_D=bytes(32), n_records=c.n_s,
         prev_w_hashes=(), chain_check_id="0", k=K, judge=judge, section=seam)
