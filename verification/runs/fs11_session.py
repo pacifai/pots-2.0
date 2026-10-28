@@ -438,7 +438,8 @@ class Part:
     kind: str = "other"
     info: dict[str, Any] = field(default_factory=dict)  # model, task, run_dir, report
     # The part's working directory (and its sampler's); None: the session's own, the repository
-    # root. The base arm (O18, FS49s) runs in the upload's ``repo_base/`` with the same python.
+    # root. The base arm (O18, FS49s) runs in the upload's ``repo_base/`` with the same python, and
+    # its env sets ``PYTHONPATH`` to it too.
     cwd: Path | None = None
 
 
@@ -1372,7 +1373,8 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
     over GPUs 1-3) and ``pipe_<key>`` (the same with ``VERIF_PIPELINED=1``), each in its own run
     directory. Only the ``pipe_*`` parts set ``VERIF_PIPELINED``. With ``profile`` and an upload
     with ``repo_base/`` (O18, FS49s), right after each model of :data:`FOUR_PROFILE_BASE_MODELS`'s
-    ``pipe_<key>``: ``seq_<key>_base`` and ``pipe_<key>_base``, the same environment and argv,
+    ``pipe_<key>``: ``seq_<key>_base`` and ``pipe_<key>_base``, the same environment and argv
+    but ``PYTHONPATH`` (the upload's ``repo_base/``), the
     run directories ``four_<key>_seq_base``/``four_<key>_pipe_base``, ``cwd`` the upload's
     ``repo_base/``, ``info`` ``base`` true and the manifest's ``base_commit``. Every part
     records its GPUs' peak memory."""

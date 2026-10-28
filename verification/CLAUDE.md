@@ -3444,8 +3444,8 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     the session's `{python}`. With `repo_base/` in the upload (`--base-commit`), the plan adds,
     right after each `FOUR_PROFILE_BASE_MODELS` model's (`("Llama-3.2-1B",)`) `pipe_<k>`, the
     base arms `seq_<k>_base` and `pipe_<k>_base` (O18, FS49s): the same env and argv, run
-    directories `four_<key>_seq_base`/`four_<key>_pipe_base`, `cwd` the upload's `repo_base/`,
-    `info` `base: True`, `arm`, `base_commit`; without `repo_base/` the plan logs that the A/B arm
+    directories `four_<key>_seq_base`/`four_<key>_pipe_base`, `cwd` and `PYTHONPATH` the upload's
+    `repo_base/`, `info` `base: True`, `arm`, `base_commit`; without `repo_base/` the plan logs that the A/B arm
     is skipped. `four_h100_profile` judges them in `_profile_base` like the O18 arms and
     requires their two arms' roots equal to each other and each different from the O18 arm's at
     the same step (equal roots mean the base arm ran the O18 code), not compared with the
