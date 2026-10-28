@@ -343,11 +343,12 @@ def _fill_view(dst: np.ndarray, at: int, t: torch.Tensor, nt: int) -> None:
 
 
 def prods_array(groups: Sequence["MeasureGroup"], r_addrs: np.ndarray, k: int,
-                guard: bool = True) -> np.ndarray:
+                guard: bool = True, *,
+                _validated: tuple[torch.device, np.ndarray] | None = None) -> np.ndarray:
     """The ``pots_mprod_t`` array of every member of ``groups`` in order, built by arithmetic
     on each group's views (no loop over members). ``r_addrs`` is each product's challenge
     matrix address. The bytes equal :func:`measure_table.pack`'s for the same members."""
-    _, counts = validate(groups, k)
+    _, counts = _validated if _validated is not None else validate(groups, k)
     n = int(counts.sum())
     r_addrs = np.asarray(r_addrs, dtype=np.uint64)
     if r_addrs.shape != (n,):
@@ -640,7 +641,9 @@ _stats = {"hits": 0, "misses": 0, "plan_rebuilds": 0}
 @contextmanager
 def table_cache(enabled: bool = True) -> Iterator[None]:
     """Inside, the structure cache of :func:`table_structure` is on (``True``) or off (``False``:
-    every call builds its table from scratch and stores nothing), for the comparison tests.
+    every call builds its table from scratch, looks nothing up and stores nothing). Off is for
+    the comparison tests and for calls whose structure never comes again, such as the canonical
+    path's single runs: they would push the unit pass's entries out of the bounded cache.
     Nests; outside any ``table_cache`` it is on. The rows are the same bits either way."""
     global _cache_on
     before, _cache_on = _cache_on, bool(enabled)
@@ -867,7 +870,8 @@ class HostTable:
 
 def build_host_table(groups: Sequence["MeasureGroup"], r_addrs: np.ndarray, k: int,
                      guard: bool = True, share: bool = False,
-                     structure: TableStructure | None = None) -> HostTable:
+                     structure: TableStructure | None = None, *,
+                     _validated: tuple[torch.device, np.ndarray] | None = None) -> HostTable:
     """The host side of one :func:`enqueue` call, testable on CPU tensors: the products of
     ``groups`` (:func:`prods_array`, this call's addresses and challenge addresses ``r_addrs``)
     over the structure of :func:`table_structure`. A structure's first call builds the read
@@ -875,8 +879,8 @@ def build_host_table(groups: Sequence["MeasureGroup"], r_addrs: np.ndarray, k: i
     :func:`_plan_holds` has checked the shared reads; a plan that no longer holds is rebuilt, it
     replaces the entry's and the rebuild is counted."""
     if structure is None:
-        structure = table_structure(groups, k, guard, share)
-    prods = prods_array(groups, r_addrs, k, guard)
+        structure = table_structure(groups, k, guard, share, _validated=_validated)
+    prods = prods_array(groups, r_addrs, k, guard, _validated=_validated)
     built = structure.built
     if built is None:
         built = structure.built = _build(prods, share)
@@ -1070,7 +1074,7 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
     if ev is not None:
         stream.wait_event(ev)
     ht = build_host_table(groups, np.uint64(buf.data_ptr()) + offsets.astype(np.uint64), k,
-                          guard, share, structure)
+                          guard, share, structure, _validated=(device, counts))
     prods, plan = ht.prods, ht.plan
     n = len(prods)
     with torch.cuda.stream(stream):

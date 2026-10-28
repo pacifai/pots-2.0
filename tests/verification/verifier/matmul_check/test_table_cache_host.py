@@ -398,3 +398,49 @@ def test_prefetch_errors_are_unchanged():
     with pytest.raises(ValueError, match="width is below 1"):
         src.prefetch(H, [1], K, [0])
     assert src._layouts_n == 0
+
+
+# ---- the canonical path's single runs stay out of the cache (FS51b) ----
+
+def test_served_kernel_calls_bypass_the_table_cache(monkeypatch):
+    """``_measure_served_kernel`` measures a run's groups with the table cache off, so the
+    unit pass's entries are never pushed out. Its step-table call is not touched."""
+    from contextlib import nullcontext
+    from verification.verifier import checks
+    seen = []
+
+    def fake_measure(groups, **kw):
+        seen.append(mk.table_cache_on())
+        return torch.zeros(len(groups), 1)
+
+    class Ctx:
+        def timed(self, *a, **k):
+            return nullcontext()
+
+    monkeypatch.setattr(checks.freivalds, "measure_groups_rows", fake_measure)
+    monkeypatch.setattr(checks, "_served_view", lambda *a, **k: "group")
+    monkeypatch.setattr(checks, "_served_blocks", lambda *a, **k: ([0], ["g"]))
+    monkeypatch.setattr(checks, "_measure_groups", lambda specs: [[0], [1]])
+    monkeypatch.setattr(checks, "_join_rows", lambda rows: rows[0])
+    one, two = ["s0"], ["s0", "s1"]
+    for specs in (one, two):
+        checks._measure_served_kernel(None, specs, Ctx(), None, None, h=b"", k=3, scratch=None,
+                                      guard=True, run=0, group0=0, st=None)
+    assert seen == [False, False, False] and mk.table_cache_on()
+
+
+def test_single_run_calls_leave_the_unit_pass_entries_cached():
+    """Many one-off structures measured with the cache off do not evict or count; the unit
+    pass's structure is a hit, not a miss, on the next step."""
+    mk.table_cache_clear()
+    unit = groups_of(1, torch.float32, members=5, label0=1)
+    with mk.table_cache(True):
+        mk.table_structure(unit, 9, True, True)
+        mk.table_cache_stats(reset=True)
+        for i in range(mk.TABLE_CACHE_MAX + 5):
+            with mk.table_cache(False):
+                mk.table_structure(groups_of(2, torch.float32, members=3, label0=100 + 10 * i), 9,
+                                   True, True)
+        mk.table_structure(unit, 9, True, True)
+        stats = mk.table_cache_stats()
+    assert stats == {"hits": 1, "misses": 0, "plan_rebuilds": 0}
