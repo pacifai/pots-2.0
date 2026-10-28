@@ -83,8 +83,12 @@ def test_plan_is_check_5s_call_list(switch, n_s, n):
     config = tiny_config(family=family, tied=tied)
     c = DecoderComputation(config, n_s=n_s, n=n, eta=1.0)
     ps = bench.products(_step(config, n_s, n))
+    # O18: a member's name is its leaf's name plus ``[i]``, ``i`` = ``s * n_h + h``
+    n_h = config.num_attention_heads
+    def member_name(s):
+        return f"{s.name.split('[')[0]}[{s.member[0] * n_h + s.member[1]}]" if s.member else s.name
     assert [(p.m, p.name, p.layer, p.member) for p in ps] == \
-        [(s.m, s.name, s.layer, s.member is not None) for s in c.products]
+        [(s.m, member_name(s), s.layer, s.member is not None) for s in c.products]
     assert [p.width for p in ps] == [s.b_shape[1] for s in c.products]
     calls = bench.plan(ps)
     assert [(c_.ms, c_.width, c_.layer, c_.batched) for c_ in calls] == _check5_calls(c)
@@ -105,7 +109,8 @@ def test_e5a_on_a_tiny_step():
     rows = bench.run_e5a(s, k=3, layers=1)
     assert [r["name"] for r in rows] == ["python_path", "python_path_per_step"]
     assert [r["status"] for r in rows] == ["measured", "estimated"]
-    m = len([l for l in s.leaves if l.section == "product"])
+    # O18: the XOF is called once per product (member), not per product leaf
+    m = DecoderComputation(tiny_config(), n_s=2, n=12, eta=1.0).M
     assert rows[1]["values"]["xof_calls_per_step"] == 3 * m
     full = bench.run_e5a(s, k=3, layers=None)
     assert full[1]["status"] == "measured"

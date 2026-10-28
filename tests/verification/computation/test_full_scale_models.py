@@ -59,6 +59,7 @@ def prover_digests(c, model, records):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(_Labeler, "_fill", fill)
         # The whole-run fill never calls _fill; no runs makes every member go through it.
+        c.product_groups  # the leaf layout is fixed before the runs go (O18)
         mp.setitem(c.__dict__, "member_runs", {})
         with cap:
             with cap.phase("forward"):
@@ -111,7 +112,7 @@ def test_digest_comparison_on_a_tiny_model(family, tied):
     randomize_biases(dict(model.named_parameters()))
     records = make_records((c.n, c.n - 5), seed=2)
     products, fills, leaves, seen, glue = check_step(c, model, records)
-    assert len(products) == c.M and fills == Counter(p.name for p in c.products)
+    assert len(products) == c.n_product_leaves and fills == Counter(p.name for p in c.products)
     assert len(seen) == c.M
     assert replay_mismatches(c, leaves, seen, glue)[:2] == ([], [])
 
@@ -123,8 +124,8 @@ def test_digest_comparison_on_a_tiny_model(family, tied):
 
     bad, bad_glue, _ = replay_mismatches(c, altered(c.w_t_index(c.w(2, "q"))), seen, glue)
     assert (bad, bad_glue) == (["L2.Y_q", "L2.dX_q"], [])
-    bad, bad_glue, _ = replay_mismatches(c, altered(c.product_index(c.m_of("L1.dX_q"))), seen,
-                                         glue)
+    i = c.product_leaf_index(c.leaf_of(c.m_of("L1.dX_q"))[0])
+    bad, bad_glue, _ = replay_mismatches(c, altered(i), seen, glue)
     assert bad == [] and {c.w_e, c.gamma_attn(1)} <= set(bad_glue)
     assert c.gamma_final not in bad_glue
 
@@ -148,10 +149,11 @@ def test_real_step_labels_and_replays(repo, revision):
     t1 = time.perf_counter()
     products, fills, leaves, seen, glue = check_step(c, model, records)
     t2 = time.perf_counter()
-    assert len(products) == c.M and fills == Counter(p.name for p in c.products)
-    for spec, p in zip(c.products, products):
-        assert tuple(p.shape) == spec.p_shape and p.dtype == c.product_dtype, spec.name
-        assert torch.isfinite(p).all(), spec.name
+    assert len(products) == c.n_product_leaves and fills == Counter(p.name for p in c.products)
+    for g, p in enumerate(products):
+        name = c.product_leaf(g).name
+        assert tuple(p.shape) == c.product_leaf(g).shape and p.dtype == c.product_dtype, name
+        assert torch.isfinite(p).all(), name
     del model, products
     gc.collect()
     bad, bad_glue, (t_fwd, t_bwd) = replay_mismatches(c, leaves, seen, glue)

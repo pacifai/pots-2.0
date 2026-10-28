@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from verification.computation.instances import DecoderComputation
+from verification.transcript.errors import LeafShapeError
 from verification.transcript.reader import TranscriptView
 from verification.verifier import checks
 from verification.verifier.checks import _measure_groups, _member_runs
@@ -79,26 +80,31 @@ def test_served_group_interleaved_backward_group_reads_ranges_not_members(monkey
     idx = next(g for g in _measure_groups(run) if c.product_class(run[g[-1]]) == "dK")
     ms = [run[i].m for i in idx]
     calls = []
-    real = CommittedLeaves.tensor_block
+    real = TranscriptView.product
 
-    def counting(self, ix, own=False):
-        calls.append(len(ix))
-        return real(self, ix, own)
+    def counting(self, m):
+        calls.append(m)
+        return real(self, m)
 
-    monkeypatch.setattr(CommittedLeaves, "tensor_block", counting)
+    # O18: the per-member path is ``TranscriptView.product`` (what ``product_block`` falls back
+    # on through ``torch.stack``); a range is one ``product_run``/``product_block`` slice.
+    monkeypatch.setattr(TranscriptView, "product", counting)
     got = checks._served_group(c, run, idx, ctx, _fake_replay(run, idx), view)
     assert not calls  # every range was proved once and read as a view: no per-leaf path
     assert torch.equal(got.p, _reference(view, ms, got.p.device))
     # A write after the read is caught on the next one, as a per-leaf read would.
     view.product(ms[len(ms) // 2]).add_(1)
+    calls.clear()
     with pytest.raises(Exception, match="changed in place"):
         checks._served_group(c, run, idx, ctx, _fake_replay(run, idx), view)
-    assert calls  # and that error came from the per-leaf path
+    assert not calls  # O18: the leaf's version is checked on the range read itself
 
 
 def test_served_group_broadcastable_wrong_shape_raises_what_stack_raises():
-    """Every δK̃ leaf cut to one row: a strided ``copy_`` would broadcast it, ``torch.stack``
-    raises, and so must the group."""
+    """Every δK̃ leaf cut to one row: a strided ``copy_`` would broadcast it. O18: the group's
+    leaf is one tensor whose declared shape the reader checks on every read, so the loop and
+    the group both raise that ``LeafShapeError`` (before, ``torch.stack`` raised a
+    ``RuntimeError``); the group must raise what the loop raises."""
     c, leaves = _step(False)
     run = next(r for r in _member_runs(c.products)
                if len(r) > 1 and c.product_class(r[0]) == "dA" and r[0].layer == c.L)
@@ -106,11 +112,12 @@ def test_served_group_broadcastable_wrong_shape_raises_what_stack_raises():
     ms = [run[i].m for i in idx]
     for i in idx:
         if c.product_class(run[i]) == "dK":
-            j = c.product_index(run[i].m)
-            leaves[j] = leaves[j][:1].clone()
+            g, k = c.leaf_of(run[i].m)  # O18: a member of its group's leaf
+            j = c.product_leaf_index(g)
+            leaves[j] = leaves[j][:, :1].clone() if k is not None else leaves[j][:1].clone()
     view, ctx = _view_and_ctx(c, leaves)
-    with pytest.raises(RuntimeError) as want:
+    with pytest.raises(LeafShapeError) as want:
         torch.stack([view.product(m) for m in ms])
-    with pytest.raises(RuntimeError) as got:
+    with pytest.raises(LeafShapeError) as got:
         checks._served_group(c, run, idx, ctx, _fake_replay(run, idx), view)
     assert type(got.value) is type(want.value) and str(got.value) == str(want.value)

@@ -2,7 +2,10 @@
 
 :class:`LeafReader` is the one method every transcript source implements: the prover's
 in-memory store, a store on disk, and the verifier's own cache of the leaves it hashed.
-:class:`TranscriptView` names the leaves under a computation's layout.
+:class:`TranscriptView` names the leaves under a computation's layout. A product leaf is a lone
+product or, for a batched attention product, all its members as ``[n, *p_shape]`` (O18), so a
+member is a view of one leaf and a run of consecutive, 64-byte aligned members is a slice of
+it (a view, no copy); any other run is one aligned copy, as ``torch.stack`` makes.
 """
 
 from __future__ import annotations
@@ -12,46 +15,15 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 
+from verification.commitment.leaves import _tensor_slot
+from verification.transcript.errors import LeafShapeError
+
 if TYPE_CHECKING:
     from verification.computation.interface import DeclaredComputation
 
-__all__ = ["LeafReader", "TranscriptView", "stack_block"]
+__all__ = ["LeafReader", "TranscriptView"]
 
 _ALIGN = 64  # torch.stack's CPU output is 64-byte aligned; a zero-copy block must be too
-
-
-def stack_block(ts: Sequence[torch.Tensor], own: bool = False) -> torch.Tensor:
-    """``torch.stack(ts)``, bit for bit; zero-copy when ``ts`` are consecutive in one storage.
-
-    The fast path needs every tensor on one device (a device leaf is served in place, FS32b)
-    with one shape and dtype, contiguous, non-empty, and the ``k``-th at storage offset
-    ``off + k·numel`` in the storage of the first, which starts 64-byte aligned (where
-    ``torch.stack``'s output does, so a BLAS kernel sees the same alignment). The result is
-    then a view of that storage, which a caller must not write to, and which aliases the
-    leaves; with ``own`` the view is cloned (one copy, as ``torch.stack`` makes), so the result
-    never aliases a leaf. Anything else is ``torch.stack``, errors included.
-    """
-    n = len(ts)
-    t0 = ts[0] if n else None
-    if (t0 is None or not isinstance(t0, torch.Tensor) or t0.numel() == 0
-            or not t0.is_contiguous() or t0.requires_grad):
-        return torch.stack(list(ts))
-    shape, dtype, numel, off = t0.shape, t0.dtype, t0.numel(), t0.storage_offset()
-    device, ptr = t0.device, t0.untyped_storage().data_ptr()
-    if t0.data_ptr() % _ALIGN:
-        return torch.stack(list(ts))
-    for k, t in enumerate(ts):
-        if (not isinstance(t, torch.Tensor) or t.shape != shape or t.dtype != dtype
-                or t.device != device or t.storage_offset() != off + k * numel
-                or not t.is_contiguous()
-                or t.untyped_storage().data_ptr() != ptr or t.requires_grad):
-            return torch.stack(list(ts))
-    strides, run = [], numel
-    for d in shape:  # canonical contiguous strides, whatever a size-1 dimension holds
-        run //= d
-        strides.append(run)
-    out = t0.as_strided((n, *shape), (numel, *strides), off)
-    return out.clone() if own else out
 
 
 @runtime_checkable
@@ -82,41 +54,80 @@ class TranscriptView:
     def w_t(self, name: str) -> torch.Tensor:
         return self.reader.leaf(self.c.w_t_index(name))
 
+    def product_leaf(self, g: int) -> torch.Tensor:
+        """Product leaf ``g`` as committed: a lone product's ``P``, or a group's
+        ``[n, *p_shape]``. Raises :class:`LeafShapeError` unless it is a tensor of the
+        declared shape."""
+        pl = self.c.product_leaf(g)
+        index = self.c.product_leaf_index(g)
+        obj = self.reader.leaf(index)
+        if not isinstance(obj, torch.Tensor):
+            slot = _tensor_slot(self.c, index)[3]
+            raise LeafShapeError(f"leaf {index} {slot}: expected a tensor, got "
+                                 f"{type(obj).__name__}")
+        if tuple(obj.shape) != pl.shape:
+            slot = _tensor_slot(self.c, index)[3]
+            raise LeafShapeError(f"leaf {index} {slot}: shape {tuple(obj.shape)}, "
+                                 f"declared {pl.shape}")
+        return obj
+
     def product(self, m: int) -> torch.Tensor:
-        return self.reader.leaf(self.c.product_index(m))
+        """Product ``m``: the leaf of a lone product, or ``leaf[i]``, a view, for a member."""
+        g, i = self.c.leaf_of(m)
+        leaf = self.product_leaf(g)
+        return leaf if i is None else leaf[i]
 
     def w_next(self, name: str) -> torch.Tensor:
         return self.reader.leaf(self.c.w_next_index(name))
 
+    def _slice(self, g: int, i0: int, step: int, n: int, own: bool) -> torch.Tensor:
+        out = self.product_leaf(g)[i0:i0 + step * (n - 1) + 1:step]
+        return self._aligned(out, step == 1, own)
+
+    @staticmethod
+    def _aligned(out: torch.Tensor, consecutive: bool, own: bool) -> torch.Tensor:
+        """``out`` as a view only when it is what ``torch.stack`` would give a BLAS kernel: the
+        members consecutive in the leaf (member step 1) and the start 64-byte aligned (where
+        ``torch.stack``'s CPU output starts). Else a fresh contiguous copy at a new aligned
+        allocation (``clone``, not ``.contiguous()``, which returns a contiguous view as is).
+        ``own`` clones the view too."""
+        if consecutive and out.data_ptr() % _ALIGN == 0:
+            return out.clone(memory_format=torch.contiguous_format) if own else out
+        return out.clone(memory_format=torch.contiguous_format)
+
     def product_block(self, ms: Sequence[int], own: bool = False) -> torch.Tensor:
-        """The products ``ms`` stacked, ``[len(ms), *leaf_shape]``, equal bit for bit to
-        ``torch.stack([self.product(m) for m in ms])``, with the same errors at the first
-        failing member. A run of leaves consecutive in one storage (a bmm's members) comes
-        back as a view of it, read-only and aliasing the committed leaves, unless ``own``
-        asks for a fresh copy (see :func:`stack_block`)."""
+        """The products ``ms`` stacked, ``[len(ms), *p_shape]``, equal bit for bit to
+        ``torch.stack([self.product(m) for m in ms])``. Members of one group at member indices
+        in an increasing arithmetic progression come back as a slice of the group's leaf; so
+        does a lone product (``unsqueeze``). The slice is a view, read-only and aliasing the
+        committed leaf, only when the members are consecutive (step 1) and it starts 64-byte
+        aligned, as ``torch.stack``'s output does, so a BLAS kernel sees the same alignment;
+        otherwise (and with ``own``) it is a fresh contiguous aligned copy. Anything else is
+        ``torch.stack``."""
         # Every index is looked up before any leaf is read, so only an invalid ``m`` (which
         # comes from the computation, never the prover) fails in another order than a loop.
-        idx = [self.c.product_index(m) for m in ms]
-        block = getattr(self.reader, "tensor_block", None)
-        if block is not None:
-            return block(idx, own)
-        return stack_block([self.reader.leaf(i) for i in idx], own)
+        pos = [self.c.leaf_of(m) for m in ms]
+        if pos:
+            g, i0 = pos[0]
+            if all(p[0] == g for p in pos):
+                if i0 is None:
+                    if len(pos) == 1:
+                        return self._aligned(self.product_leaf(g).unsqueeze(0), True, own)
+                else:
+                    step = pos[1][1] - i0 if len(pos) > 1 else 1
+                    if step >= 1 and all(p[1] == i0 + step * k for k, p in enumerate(pos)):
+                        return self._slice(g, i0, step, len(pos), own)
+        return torch.stack([self.product(m) for m in ms])
 
     def product_run(self, m0: int, stride: int, n: int, own: bool = False) -> torch.Tensor:
         """``product_block([m0 + stride·i for i in range(n)])``, from the range alone: the
-        same bits, the same errors, and no per-member Python when the reader has a range read
-        (``tensor_run``). The index arithmetic is done once, on the first and last member.
-        A range the fast read doesn't take (``n < 1``, ``stride < 1``, a last ``m`` outside
-        the computation) goes through :meth:`product_block`, which raises as a loop does."""
-        if n >= 1 and stride >= 1:
-            try:
-                first = self.c.product_index(m0)
-                self.c.product_index(m0 + stride * (n - 1))
-            except IndexError:
-                first = None  # the loop raises at the first member outside, not the last
-            if first is not None:
-                run = getattr(self.reader, "tensor_run", None)
-                if run is not None:
-                    return run(first, stride, n, own)
-                return stack_block([self.reader.leaf(first + stride * i) for i in range(n)], own)
+        same bits, the same errors, and no per-member Python when the run lies in one group
+        whose member spacing divides ``stride``. The lookup is done on the first and last
+        member. Any other range goes through :meth:`product_block`."""
+        c = self.c
+        if n >= 1 and stride >= 1 and 1 <= m0 and m0 + stride * (n - 1) <= c.M:
+            g0, i0 = c.leaf_of(m0)
+            g1, i1 = c.leaf_of(m0 + stride * (n - 1))
+            if i0 is not None and g0 == g1 and stride % c.product_leaf(g0).stride == 0:
+                return self._slice(g0, i0, stride // c.product_leaf(g0).stride, n, own)
         return self.product_block([m0 + stride * i for i in range(n)], own)

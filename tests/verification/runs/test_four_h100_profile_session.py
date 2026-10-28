@@ -155,12 +155,13 @@ def test_the_estimates_are_the_briefs_and_the_limits_about_twice_them():
     e = fs.FOUR_PROFILE_ESTIMATE_MIN
     assert e == {"native_build": 1, "peer_check": 1, "models": 6, "four_tests": 6, "probe": 7,
                  "plain": 3, "card": 2, "seq": 6, "pipe": 4}
-    assert fs.four_profile_estimated_min() == 21 + 3 * 15 == 66
+    assert fs.four_profile_estimated_min() == 21 + 3 * 15 + 10 == 76
     for part, limit in fs.FOUR_PROFILE_TIMEOUT_S.items():
         assert limit == 2 * 60 * e[part], part
 
 
 def test_four_h100s_plan_is_unchanged(tmp_path):
+    (tmp_path / "up" / "repo_base").mkdir(parents=True)
     plan = fs.four_h100_plan(tmp_path / "up", tmp_path / "out")
     assert [p.name for p in plan] == [n for n in fs.four_h100_parts()
                                       if n != fs.NATIVE_BUILD_NAME]
@@ -187,7 +188,7 @@ def test_the_refusal_is_the_same_as_four_h100s():
 
 
 def test_the_deadline_is_twice_the_estimate_and_the_job_holds_it():
-    assert fs.four_profile_default_deadline_s() == 10500  # (66 + 1 + 20) * 2 * 60 = 10440, up 100
+    assert fs.four_profile_default_deadline_s() == 11700  # (76 + 1 + 20) * 2 * 60 = 11640, up 100
     text = JOB.read_text()
     want = f"[ \"$SESSION\" = four-h100-profile ] && DEFAULT_DEADLINE_S=" \
            f"{fs.four_profile_default_deadline_s()}"
@@ -578,7 +579,7 @@ def test_an_error_in_the_acceptance_is_recorded_and_the_session_runs_on(tmp_path
 PY = "/Users/amitainevo/Projects/pots-2.0/.venv/bin/python"
 
 
-def _readme_commands():
+def _readme_all_commands():
     """The profiling section's fenced commands, each joined into one line, split into the
     ``python -m`` commands it holds."""
     text = README.read_text()
@@ -591,6 +592,20 @@ def _readme_commands():
     return cmds
 
 
+def _is_base(c):
+    return any("seq_base" in a or "pipe_base" in a for a in c)
+
+
+def _readme_commands():
+    """The O18 arms' commands (trace, two analyzes, report); the base arms' are
+    :func:`_readme_base_commands`."""
+    return [c for c in _readme_all_commands() if not _is_base(c)]
+
+
+def _readme_base_commands():
+    return [c for c in _readme_all_commands() if _is_base(c)]
+
+
 def _flags(argv):
     return [a for a in argv if a.startswith("--")]
 
@@ -601,18 +616,18 @@ def test_the_readme_has_the_runbook_commands_with_placeholders():
     assert mods == ["evaluation.results.profile.trace", "evaluation.results.profile.analyze",
                     "evaluation.results.profile.analyze", "evaluation.results.profile.report"]
     text = README.read_text()
-    assert "FS11_SESSION=four-h100-profile" in text and "10,500 s" in text
+    assert "FS11_SESSION=four-h100-profile" in text and "11,700 s" in text
     assert "summary.json[\"four_h100_profile\"]" in text
     for c in cmds:
         assert any("$PROFILES" in a for a in c) and any("--out" == a for a in c)
         assert c[2].endswith("report") or any("$OUT" in a for a in c)
-    assert str(fs.four_profile_default_deadline_s()) == "10500"
+    assert str(fs.four_profile_default_deadline_s()) == "11700"
 
 
 def test_the_readme_commands_use_only_flags_the_tools_have_and_all_they_require():
     required = {"trace": {"--trace", "--out"}, "analyze": {"--run-dir", "--session", "--out"},
                 "report": {"--out"}}
-    for c in _readme_commands():
+    for c in _readme_all_commands():
         tool = c[2].rsplit(".", 1)[1]
         help_text = subprocess.run([PY, "-m", c[2], "--help"], capture_output=True, text=True,
                                    cwd=Path(fs.__file__).parents[2]).stdout
@@ -638,10 +653,10 @@ def test_the_readme_gives_the_cost_line_the_ratios_and_the_interval():
     sec = " ".join(sec[:sec.index("\n## ")].split())  # the README's line breaks do not count
     est = fs.four_profile_estimated_min()
     assert f"{est} min" in sec and "about 15 min of pod setup and fetch" in sec
-    assert "$P/h" in sec and "$15.96/h" in sec and "10,500 s" in sec and "12,900 s" in sec
-    assert "(87 + 20) x 2" in sec and "20 is the pod's setup" in sec
-    assert est + fs.FOUR_PACK_MIN + fs.FOUR_GRACE_MIN == 87
-    assert -(-(87 + 20) * 2 * 60 // 100) * 100 == 12900
+    assert "$P/h" in sec and "$15.96/h" in sec and "11,700 s" in sec and "14,100 s" in sec
+    assert "(97 + 20) x 2" in sec and "20 is the pod's setup" in sec
+    assert est + fs.FOUR_PACK_MIN + fs.FOUR_GRACE_MIN == 97
+    assert -(-(97 + 20) * 2 * 60 // 100) * 100 == 14100
     assert "wall time" in sec and "verify_over_train_accumulated" in sec
     assert "(accumulated GPU time)" in sec
     assert "`plain_baseline --steps 3 --metrics`" in sec
@@ -667,3 +682,196 @@ def test_the_readme_commands_chain_trace_to_analyze_to_report():
     assert {p.rsplit("_", 1)[1] for p in profiles} == {"seq.json", "pipe.json"}
     assert {p.split("/")[1].rsplit("_", 1)[0] for p in profiles} == set(fs.FOUR_PROFILE_ORDER)
     assert val(seq, "--out").replace("${MODEL}", "Qwen2.5-0.5B") in profiles
+
+
+# ---- the base arm of the A/B (O18, FS49s) -----------------------------------------------------
+
+BASE_SHA = "387b991" + "0" * 33
+ROOTS_BASE = ["%064x" % i for i in (11, 12, 13, 14)]  # a different leaf layout: other roots
+BASE_INTERVAL = {"seq": [40.0, 31.0, 29.0, 35.0], "pipe": [30.0, 20.0, 18.0, 22.0]}
+BASE_NAMES = [f"{a}_{K}_base" for a in ("seq", "pipe")]
+
+
+def _base_arm(k, arm, roots=None, **over):
+    part = _arm(k, arm, roots=ROOTS_BASE if roots is None else roots,
+                step_interval_s=BASE_INTERVAL[arm], **over)
+    return {**part, "name": f"{arm}_{k}_base",
+            "info": {**part["info"], "base": True, "base_commit": BASE_SHA, "model_key": k}}
+
+
+def _base_parts(**over):
+    parts = _parts()
+    at = next(i for i, p in enumerate(parts) if p["name"] == f"pipe_{K}") + 1
+    parts[at:at] = [_base_arm(K, "seq"), _base_arm(K, "pipe")]
+    return [over.get(p["name"], p) for p in parts]
+
+
+def _upload(tmp_path, base_dir=True, commit=BASE_SHA):
+    up = tmp_path / "up"
+    up.mkdir()
+    (up / "manifest.json").write_text(json.dumps({"base_commit": commit} if commit else {}))
+    if base_dir:
+        (up / "repo_base").mkdir()
+    return up
+
+
+def test_the_plan_gets_the_base_arms_after_llamas_o18_arms(tmp_path):
+    up = _upload(tmp_path)
+    plan = fs.four_h100_profile_plan(up, tmp_path / "out")
+    names = [p.name for p in plan]
+    i = names.index(f"pipe_{K}")
+    assert names[i + 1:i + 3] == BASE_NAMES and fs.FOUR_PROFILE_BASE_MODELS == (K,)
+    assert sum(n.endswith("_base") for n in names) == 2
+    by = {p.name: p for p in plan}
+    for arm in ("seq", "pipe"):
+        o18, base = by[f"{arm}_{K}"], by[f"{arm}_{K}_base"]
+        assert base.argv == o18.argv and base.kind == o18.kind == "profile_run"
+        skip = ("VERIF_OUTPUT_DIR", "PYTHONPATH")  # the run dir and the import root differ
+        assert {k: v for k, v in base.env.items() if k not in skip} == \
+            {k: v for k, v in o18.env.items() if k not in skip}
+        assert base.env["PYTHONPATH"] == str(up / "repo_base") and "PYTHONPATH" not in o18.env
+        assert base.env["VERIF_OUTPUT_DIR"].endswith(f"_{arm}_base")
+        assert base.env["VERIF_OUTPUT_DIR"] != o18.env["VERIF_OUTPUT_DIR"]
+        assert base.cwd == up / "repo_base" and o18.cwd is None
+        assert base.info["arm"] == arm and base.info["base"] is True
+        assert base.info["base_commit"] == BASE_SHA and "base" not in o18.info
+        assert base.timeout_s == o18.timeout_s and base.info["gpu_peak"]
+        assert base.info["samples_check"] and base.info["records"] != o18.info["records"]
+    assert by[f"seq_{K}_base"].env["VERIF_TRACE_STEP"] == "4"  # traced as the O18 one is
+    assert by[f"pipe_{K}_base"].env["VERIF_PIPELINED"] == "1"
+    assert all(p.cwd is None for p in plan if not p.name.endswith("_base"))
+    assert len({p.env.get("VERIF_OUTPUT_DIR") for p in plan if p.kind == "profile_run"}) == \
+        sum(p.kind == "profile_run" for p in plan)
+
+
+def test_without_repo_base_there_are_no_base_arms_and_the_log_says_why(tmp_path, capsys):
+    plan = fs.four_h100_profile_plan(_upload(tmp_path, base_dir=False), tmp_path / "out")
+    assert [p.name for p in plan] == [n for n in fs.four_profile_parts()
+                                      if n != fs.NATIVE_BUILD_NAME]
+    assert not any(p.name.endswith("_base") or p.cwd is not None for p in plan)
+    assert "FS49 A/B arm skipped" in capsys.readouterr().out
+    # the plain four-H100 session never has them, repo_base or not
+    (tmp_path / "up" / "repo_base").mkdir(parents=True)
+    plan = fs.four_h100_plan(tmp_path / "up", tmp_path / "out")
+    assert not any(p.name.endswith("_base") for p in plan)
+
+
+def test_the_estimate_counts_the_base_arms_always():
+    e = fs.FOUR_PROFILE_ESTIMATE_MIN
+    assert fs.four_profile_estimated_min() == 21 + 3 * (e["plain"] + e["card"] + e["seq"]
+                                                        + e["pipe"]) + e["seq"] + e["pipe"]
+
+
+def test_run_part_runs_in_its_own_cwd_and_the_default_is_the_sessions(tmp_path):
+    other, mine = tmp_path / "other", tmp_path / "mine"
+    other.mkdir()
+    mine.mkdir()
+    code = "import os; print(os.getcwd())"
+    log = tmp_path / "log.txt"
+    for cwd, want in ((other, other), (None, mine)):
+        part = fs.Part("p", [fs.sys.executable, "-c", code], cwd=cwd)
+        assert fs._run_part(part, dict(fs.os.environ), mine, log, deadline=time.time() + 60,
+                            python=fs.sys.executable)[0] == "ok"
+        assert str(want.resolve()) in log.read_text().splitlines()
+        log.unlink()
+
+
+def test_base_arms_accepted_with_equal_roots_pass_and_roots_are_not_compared_with_o18():
+    res = _prof(_base_parts())
+    assert res["pass"], _fails(res)
+    assert ROOTS_BASE != ROOTS4 and res["models"][K]["roots_equal"]
+    base = res["models"][K]["base"]
+    assert base["accepted"] == {"seq": True, "pipe": True} and base["roots_equal"]
+    assert base["base_commit"] == BASE_SHA and res["ab_skipped"] is None
+    assert any(f"{K} base: the arms' step roots are equal" == t for _, t in res["items"])
+    assert not any("base" in t for t in _fails(_prof()))
+    plain = _prof()
+    assert "ab" not in plain["models"][K] and "base" not in plain["models"][K]
+    assert "repo_base" in plain["ab_skipped"]
+
+
+def test_the_base_arms_report_the_same_numbers_and_the_ab_block():
+    row = _prof(_base_parts())["models"][K]
+    seq, pipe = row["base"]["arms"]["seq"], row["base"]["arms"]["pipe"]
+    assert seq["steady_s"] == pytest.approx(30.0) and pipe["steady_s"] == pytest.approx(19.0)
+    assert seq["verify_over_train"] == pytest.approx(13.0 / 7.0)
+    assert seq["wall_over_train"] == pytest.approx(30.0 / 7.0)
+    assert pipe["latency_steady_s"] == pytest.approx(21.0) and seq["latency_steady_s"] is None
+    assert seq["accumulated_steady_s"] == pytest.approx(27.0)
+    assert seq["verify_over_train_accumulated"] is not None and seq["gpu_peak_mib"]
+    assert row["ab"]["seq"] == {"o18_steady_s": pytest.approx(20.0), "base_steady_s":
+                                pytest.approx(30.0), "diff_s": pytest.approx(-10.0),
+                                "ratio": pytest.approx(20.0 / 30.0)}
+    assert row["ab"]["pipe"]["diff_s"] == pytest.approx(-8.0)
+    assert row["ab"]["pipe"]["ratio"] == pytest.approx(11.0 / 19.0)
+    assert json.dumps(row)
+
+
+def test_a_base_arm_with_the_o18_roots_did_not_run_the_base_code():
+    res = _prof(_base_parts(**{f"{a}_{K}_base": _base_arm(K, a, roots=ROOTS4)
+                               for a in ("seq", "pipe")}))
+    bad = _fails(res)
+    assert not res["pass"] and len(bad) == 2, bad
+    for a in ("seq", "pipe"):
+        assert any(f"{K} base {a}" in b and "appears to have run the O18 code" in b
+                   and "step 1, 2, 3, 4" in b for b in bad), bad
+    # one equal step is enough (the pipelined base arm's other steps follow the seq arm's)
+    one = [ROOTS4[0], *ROOTS_BASE[1:]]
+    res = _prof(_base_parts(**{f"{a}_{K}_base": _base_arm(K, a, roots=one)
+                               for a in ("seq", "pipe")}))
+    assert any("base pipe" in b and "run the O18 code" in b and "step 1)" in b
+               for b in _fails(res))
+
+
+def test_unequal_base_roots_fail():
+    bad = [*ROOTS_BASE[:3], "%064x" % 99]
+    res = _prof(_base_parts(**{f"pipe_{K}_base": _base_arm(K, "pipe", roots=bad)}))
+    _one_fail(res, K, "base", "step roots differ")
+
+
+def test_a_base_arm_not_accepted_or_with_missing_inputs_fails():
+    res = _prof(_base_parts(**{f"seq_{K}_base": _base_arm(K, "seq", accepted=False)}))
+    assert not res["pass"] and any("base: the seq arm was not accepted" in t for t in _fails(res))
+    res = _prof(_base_parts(**{f"pipe_{K}_base": _base_arm(
+        K, "pipe", profile=_profile("pipe", layout=False))}))
+    _one_fail(res, f"{K} base pipe", "layout")
+    res = _prof(_base_parts(**{f"seq_{K}_base": _base_arm(K, "seq", samples={"version": 1})}))
+    assert not res["pass"] and any(f"seq_{K}_base" in t for t in _fails(res))
+    res = _prof(_base_parts(**{f"seq_{K}_base": _base_arm(K, "seq", gpu_peak_mib=None,
+                                                          device_peaks={})}))
+    assert res["missing_numbers"] and any(f"{K} base seq" in m for m in res["missing_numbers"])
+
+
+def test_a_missing_base_part_fails_only_when_planned():
+    parts = _base_parts()
+    gone = [{**p, "status": "not_started", "extras": None} if p["name"] == f"seq_{K}_base" else p
+            for p in parts]
+    res = _prof(gone)
+    assert not res["pass"] and any(f"seq_{K}_base did not run" in t for t in _fails(res))
+    assert _prof(_parts())["pass"]  # not in the plan: nothing fails
+
+
+def test_the_ab_lines_hold_the_numbers():
+    lines = fs._profile_lines(_prof(_base_parts()))
+    ab = [x for x in lines if x.startswith("FS49 A/B")]
+    assert ab == [f"FS49 A/B {K} seq: O18 20.0 s, base 30.0 s (Δ -10.0 s, ratio 0.67)",
+                  f"FS49 A/B {K} pipe: O18 11.0 s, base 19.0 s (Δ -8.0 s, ratio 0.58)"]
+    assert not any(x.startswith("FS49") for x in fs._profile_lines(_prof()))
+
+
+def test_the_readme_base_commands_mirror_the_o18_ones_with_distinct_sessions():
+    trace, seq, pipe, _ = _readme_commands()
+    btrace, bseq, bpipe = _readme_base_commands()
+
+    def val(c, flag):
+        return c[c.index(flag) + 1]
+
+    for o, b in ((trace, btrace), (seq, bseq), (pipe, bpipe)):
+        assert _flags(o) == _flags(b)
+    assert val(btrace, "--out") == val(bseq, "--trace-summary")
+    assert "four_${KEY}_seq_base" in val(bseq, "--run-dir")
+    assert "four_${KEY}_pipe_base" in val(bpipe, "--run-dir")
+    assert "seq_${MODEL}_base" in val(bseq, "--samples")
+    assert "pipe_${MODEL}_base" in val(bpipe, "--samples")
+    assert val(bseq, "--session") == val(bpipe, "--session") == val(seq, "--session") + "-base"
+    assert val(seq, "--session") == val(pipe, "--session")

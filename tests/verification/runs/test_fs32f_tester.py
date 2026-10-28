@@ -83,7 +83,7 @@ def forge_unit(kind, unit):
         if kind == "product":
             m = next((s.m for s in c.products
                       if s.kind.name == "FORWARD" and c.product_unit(s.m) == unit), None)
-            i = None if m is None else c.product_index(m)
+            i = None if m is None else c.product_leaf_index(c.leaf_of(m)[0])
         else:
             names = c.linear_weights if kind == "linear" else c.glue_gradient_weights
             n = next((n for n in names if c.weight_unit(n) == unit), None)
@@ -188,18 +188,17 @@ from verification.runs import cheats  # noqa: E402
 from verification.runs import flipped_matmul_sweep as fsw  # noqa: E402
 
 
-class SpyLeaf:
-    """Stands for a stored product leaf: ``to`` notes its arguments, then converts."""
+def SpyLeaf(t, log):
+    """Stands for a stored product leaf: a tensor (the reader checks the type) whose ``to``
+    notes its arguments, then converts."""
+    spy = t.detach()
+    real = spy.to
 
-    def __init__(self, t, log):
-        self.t, self.log = t, log
-
-    def to(self, *a, **k):
-        self.log.append((a, k))
-        return self.t.to(*a, **k)
-
-    def __getattr__(self, name):
-        return getattr(self.t, name)
+    def to(*a, **k):
+        log.append((a, k))
+        return real(*a, **k)
+    spy.to = to
+    return spy
 
 
 def _trial(env, store, name):
@@ -214,7 +213,7 @@ def _first_read_of_the_product(store, c, name, wrap):
     real, calls = store.leaf, []
 
     def leaf(i):
-        if i == c.product_index(g_m) and not calls:
+        if i == c.product_leaf_index(c.leaf_of(g_m)[0]) and not calls:
             calls.append(i)
             return wrap(real(i))
         return real(i)

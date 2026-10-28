@@ -115,7 +115,7 @@ def test_a_store_serving_other_bytes_is_caught(tmp_path):
     class Tampering(DiskHandoff):
         def hold(self, c_, t, leaves, tree, dataset_paths=None):
             store = super().hold(c_, t, leaves, tree, dataset_paths)
-            i = c_.product_index(1)
+            i = c_.product_leaf_index(0)
             p = store.leaf(i)
             p.view(-1)[0] += 1.0
             torch.save(p, store.directory / LEAF_FILE.format(i))

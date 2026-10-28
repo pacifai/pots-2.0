@@ -37,7 +37,7 @@ from benchmarks.hashing.sizes import FULL_SCALE, MODELS, TEST_SCALE, model_confi
 from setup.config import load_config
 
 MB = 1 << 20
-TEST_STEP = f"{TEST_SCALE}:4x128:fp32"  # the test-scale run's step: 7,661 leaves, 2.62 GB
+TEST_STEP = f"{TEST_SCALE}:4x128:fp32"  # the test-scale run's step: 1,361 leaves, 2.62 GB
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 
 H100 = {

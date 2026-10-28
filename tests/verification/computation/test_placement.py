@@ -176,8 +176,8 @@ def test_leaf_map_matches_an_independent_derivation(switch, B, slots):
         s = p.unit_slot(c.weight_unit(n))
         expect[c.w_t_index(n)] = s
         expect[c.w_next_index(n)] = s
-    for s_ in c.products:
-        expect[c.product_index(s_.m)] = p.unit_slot(c.product_unit(s_.m))
+    for pl in c.product_leaves:  # O18: a group's leaf sits with its first member's unit
+        expect[c.product_leaf_index(pl.g)] = p.unit_slot(c.product_unit(pl.m0))
     assert sorted(expect) == list(range(c.n_s, c.n_leaves))  # exactly the non-record leaves
     assert len(p._leaf_device) == c.n_leaves
     for i in range(c.n_s):
@@ -188,8 +188,10 @@ def test_leaf_map_matches_an_independent_derivation(switch, B, slots):
     for n in c.weight_names:
         assert p.leaf_device(c.w_t_index(n)) == p.leaf_device(c.w_next_index(n)) \
             == p.weight_device(n)
-    for s_ in c.products:
-        assert p.leaf_device(c.product_index(s_.m)) == p.product_device(s_.m)
+    for pl in c.product_leaves:
+        assert p.leaf_device(c.product_leaf_index(pl.g)) == p.product_leaf_device(pl.g) \
+            == p.product_device(pl.m0)
+        assert all(p.product_device(m) == p.product_device(pl.m0) for m in pl.ms)
     with pytest.raises(IndexError):
         p.leaf_device(c.n_leaves)
 
@@ -205,10 +207,25 @@ def test_leaf_map_distinguishes_slots():
         s = fake.unit_slot(c.weight_unit(n))
         assert fake.leaf_device(c.w_t_index(n)) == torch.device("cuda", s)
         assert fake.leaf_device(c.w_next_index(n)) == torch.device("cuda", s)
-    for s_ in c.products:
-        assert fake.leaf_device(c.product_index(s_.m)) == \
-            torch.device("cuda", fake.unit_slot(c.product_unit(s_.m)))
+    for pl in c.product_leaves:
+        assert fake.leaf_device(c.product_leaf_index(pl.g)) == \
+            torch.device("cuda", fake.unit_slot(c.product_unit(pl.m0)))
+        assert fake.product_leaf_device(pl.g) == fake.leaf_device(c.product_leaf_index(pl.g))
     assert [fake.unit_slot(j) for j in c.units] == [p.unit_slot(j) for j in c.units]
+
+
+@pytest.mark.parametrize("switch", SWITCHES, ids=switch_id)
+def test_product_leaf_device_bounds_and_unsharded(switch):
+    c = tiny(switch, layers=3, B=2, devices=THREE)
+    p = c.placement
+    for g in (-1, c.n_product_leaves):
+        with pytest.raises(IndexError):
+            p.product_leaf_device(g)
+    off = tiny(switch, layers=3, B=2)
+    assert all(off.placement.product_leaf_device(g) == HOST for g in range(off.n_product_leaves))
+    with pytest.raises(IndexError):
+        off.placement.product_leaf_device(-1)
+    assert len(p._leaf_device) == c.n_leaves == c.n_s + 2 * c.n_w + c.n_product_leaves
 
 
 def test_split_units_matches_brute_force_many_seeds():

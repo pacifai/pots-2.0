@@ -256,7 +256,7 @@ _RECORD_KEYS = ("ids", "mask", "targets")
 
 def _owned(t: torch.Tensor) -> torch.Tensor:
     """``t`` itself when it owns its whole storage, else a copy that does. ``torch.save``
-    writes a tensor's whole storage, so a view (an attention member of a ``bmm`` output, a
+    writes a tensor's whole storage, so a view (a
     record sliced out of ``D``) would write its base with it. A device leaf is copied to the
     host first, so its file is its host twin's."""
     t = host_tensor(t.detach())

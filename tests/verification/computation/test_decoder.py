@@ -107,7 +107,9 @@ def test_inventory_order_names_and_count(setup):
         for x in "qkv":
             want += [f"L{l}.dX_{x}", f"L{l}.G_{x}"]
     assert [p.name for p in c.products] == want
-    assert c.n_leaves == n_s + 2 * c.n_w + c.M
+    K = 27 * L + 3  # O18: one leaf per attention product (6 per layer), the rest lone
+    assert c.n_product_leaves == K == c.M - 6 * L * (n_s * n_h - 1)
+    assert c.n_leaves == n_s + 2 * c.n_w + K
 
 
 def test_shapes_q_width_and_kinds(setup):
@@ -177,7 +179,8 @@ def test_matmul_count():
 
 def test_smollm2_declaration_numbers():
     c = DecoderComputation(smollm2_config(), n_s=4, n=128, eta=1e-3)
-    assert (c.M, c.n_w, c.n_leaves) == (7113, 272, 7661)
+    assert (c.M, c.n_w, c.n_leaves) == (7113, 272, 1361)
+    assert c.n_product_leaves == 813 and c.n_leaves == 4 + 272 + 813 + 272
     assert sum(map(lambda s: torch.Size(s).numel(), c.weight_shapes.values())) == 134_515_008
     assert Counter(p.kind for p in c.products) == {FWD: 2371, IG: 211, WG: 211, OG: 4320}
     q = {c.product_class(p): p.q for p in c.products}
@@ -284,9 +287,10 @@ def test_prove_step_commit_and_leaves(setup):
     c, model, records = setup
     w0 = {n: p.detach().clone() for n, p in model.named_parameters()}
     out = prove_step(c, model, w0, records)
-    assert len(out.products) == c.M
-    for p, t in zip(c.products, out.products):
-        assert tuple(t.shape) == p.p_shape and t.dtype == torch.float32 and t.is_contiguous()
+    assert len(out.products) == c.n_product_leaves
+    for g, t in enumerate(out.products):
+        assert tuple(t.shape) == c.product_leaf(g).shape and t.dtype == torch.float32
+        assert t.is_contiguous()
     leaves = out.leaves()
     assert len(leaves) == c.n_leaves
     for i, obj in enumerate(leaves):
@@ -314,7 +318,7 @@ def test_label_by_identity_against_autograd(setup, monkeypatch):
 
     monkeypatch.setattr(modeling_llama, "eager_attention_forward", spy)
     cap = run_capture(c, model, records)
-    slots = c.label(cap, model)
+    slots = _per_product(c, c.label(cap, model))
     assert len(seen) == c.L
     P = lambda name: slots[c.m_of(name) - 1]  # noqa: E731
     g = c.n_h // c.n_kv
@@ -364,7 +368,7 @@ def test_linear_products_against_autograd(setup):
             handles.append(mod.register_forward_hook(hook(w if w in mods else "lm_head")))
     try:
         cap = run_capture(c, model, records)
-        slots = c.label(cap, model)
+        slots = _per_product(c, c.label(cap, model))
     finally:
         for h in handles:
             h.remove()
@@ -399,7 +403,7 @@ def test_all_zero_mask_is_rejected_in_loss(setup):
 def test_dK_leaf_is_the_transpose_of_the_capture(setup):
     c, model, records = setup
     cap = run_capture(c, model, records)
-    slots = c.label(cap, model)
+    slots = _per_product(c, c.label(cap, model))
     outs = {r.out.untyped_storage().data_ptr() for r in cap.records}
     for p, t in zip(c.products, slots):
         own = t.untyped_storage().data_ptr() in outs
@@ -477,6 +481,7 @@ def test_label_rejects_tampered_capture(setup, tamper):
 def _label_by(c, cap, model, runs):
     """``c.label`` with ``member_runs`` set to ``runs`` (``{}``: every member filled alone);
     returns the slots, or the ``LabelingError`` raised."""
+    c.product_groups  # the leaf layout is fixed before the runs change (O18)
     saved = c.__dict__.pop("member_runs", None)
     c.__dict__["member_runs"] = runs
     try:
@@ -487,6 +492,27 @@ def _label_by(c, cap, model, runs):
         c.__dict__.pop("member_runs")
         if saved is not None:
             c.__dict__["member_runs"] = saved
+
+
+def _per_product(c, leaves):
+    """The product leaves as ``M`` per-product tensors: a group's members are views of its leaf."""
+    out = [None] * c.M
+    for g, leaf in enumerate(leaves):
+        pl = c.product_leaf(g)
+        for i, m in enumerate(pl.ms):
+            out[m - 1] = leaf[i] if pl.grouped else leaf
+    return out
+
+
+def _bump_product(c, leaves, m, index=-1):
+    """Replace, in the leaf list ``leaves`` (whole step), the leaf of product ``m`` by a copy
+    with that product's entry ``index`` raised by 1 (a member is bumped inside a copy of its
+    group's leaf)."""
+    g, i = c.leaf_of(m)
+    k = c.product_leaf_index(g)
+    leaf = leaves[k].clone()
+    (leaf if i is None else leaf[i]).view(-1)[index] += 1.0
+    leaves[k] = leaf
 
 
 def _same_slots(got, want):
@@ -521,18 +547,26 @@ def test_run_labeling_equals_member_labeling(setup, monkeypatch):
 
     monkeypatch.setattr(_Labeler, "_fill_run", spy)
     cap = run_capture(c, model, records)
-    fast = c.label(cap, model)
+    fast = _per_product(c, c.label(cap, model))
     assert filled.count(True) == len(c.member_runs) == 6 * c.L
     filled.clear()
     slow = _label_by(c, cap, model, {})
     assert not any(filled)
     mixed = _label_by(c, cap, model, {k: v for k, v in c.member_runs.items() if k[1] != "dQ"})
     assert filled.count(True) == 5 * c.L
-    for other in (slow, mixed):
-        _same_slots(fast, other)
+    for label, leaves in (("slow", slow), ("mixed", mixed)):
+        _same_slots(fast, _per_product(c, leaves))
+        other = _per_product(c, leaves)
         for p, f, o in zip(c.products, fast, other):
-            if c.product_class(p) != "dK":
-                assert f.untyped_storage().data_ptr() == o.untyped_storage().data_ptr(), p.name
+            lone = p.member is None
+            role = c.product_class(p)
+            # A lone product and a member of a whole-run leaf (not dK, a fresh transpose) are
+            # the capture's own output; a member filled one by one is a stack (O18).
+            if lone or (label == "mixed" and role not in ("dQ", "dK")):
+                assert (o.untyped_storage().data_ptr(), o.storage_offset(), o.stride()) == \
+                    (f.untyped_storage().data_ptr(), f.storage_offset(), f.stride()), p.name
+            else:
+                assert o.untyped_storage().data_ptr() != f.untyped_storage().data_ptr(), p.name
     model.zero_grad(set_to_none=True)
 
 
@@ -562,6 +596,31 @@ def test_run_labeling_fails_as_members_do(setup, tamper):
     want = _label_by(c, cap, model, {})
     assert isinstance(want, LabelingError) and isinstance(got, LabelingError)
     assert (type(got), str(got)) == (type(want), str(want))
+    model.zero_grad(set_to_none=True)
+
+
+def test_run_labeling_stacks_a_noncontiguous_batch_output(setup, monkeypatch):
+    """A record whose members are each contiguous but whose batch tensor is not (a slice
+    ``big[::2]``) is not taken whole: the per-member fill labels it, and the leaf is a
+    contiguous stack of the members (O18)."""
+    c, model, records = setup
+    cap = run_capture(c, model, records)
+    rec = _bmm_records(cap, "forward")[0]
+    big = torch.zeros(2 * rec.out.shape[0], *rec.out.shape[1:], dtype=rec.out.dtype)
+    big[::2] = rec.out
+    out = big[::2]
+    assert not out.is_contiguous() and all(o.is_contiguous() for o in out)
+    cap.records[cap.records.index(rec)] = dataclasses.replace(rec, out=out)
+    filled = []
+    orig = _Labeler._fill_run
+    monkeypatch.setattr(_Labeler, "_fill_run",
+                        lambda self, *a: filled.append(orig(self, *a)) or filled[-1])
+    leaves = c.label(cap, model)
+    assert filled.count(False) == 1 and filled.count(True) == 6 * c.L - 1
+    want = _label_by(c, run_capture(c, model, records), model, c.member_runs)
+    g, _ = c.leaf_of(c.member_runs[(1, "S")][0])
+    k = c.product_leaf_index(g)
+    assert leaves[k].is_contiguous() and torch.equal(leaves[k], want[k])
     model.zero_grad(set_to_none=True)
 
 
@@ -597,7 +656,7 @@ def test_label_rejects_a_grad_not_linked_to_its_G(family, dtype):
             assert str(e.value).startswith(f"G of {c.w(1, 'k')} "), e.value
         finally:
             w_k.grad = honest
-    assert len(c.label(cap, model)) == c.M
+    assert len(c.label(cap, model)) == c.n_product_leaves
     model.zero_grad(set_to_none=True)
 
 
@@ -642,7 +701,7 @@ def honest(setup):
     w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
     cap = run_capture(c, model, records)
     products = [p.detach() for p in c.label(cap, model)]
-    expected = captured_forward_operands(c, cap, products)
+    expected = captured_forward_operands(c, cap, _per_product(c, products))
     model.zero_grad(set_to_none=True)
     return c, [*records, *w0.values(), *products, *w0.values()], expected
 
@@ -693,6 +752,7 @@ def captured_operands(c, model, records):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(_Labeler, "_fill", fill)
         # The whole-run fill never calls _fill; no runs makes every member go through it.
+        c.product_groups  # the leaf layout is fixed before the runs go (O18)
         mp.setitem(c.__dict__, "member_runs", {})
         cap = run_capture(c, model, records)
         products = [p.detach() for p in c.label(cap, model)]
@@ -891,8 +951,7 @@ def test_committed_product_flows_into_later_operands(honest, perturbed, changed,
     names = changed + unchanged
     base = _replayed(c, leaves, names)
     bad = list(leaves)
-    i = c.product_index(c.m_of(perturbed))
-    bad[i] = _bump(bad[i])
+    _bump_product(c, bad, c.m_of(perturbed))
     got = _replayed(c, bad, names)
     for n in changed:
         assert not (torch.equal(got[n][0], base[n][0]) and torch.equal(got[n][1], base[n][1])), n
@@ -984,8 +1043,8 @@ def test_the_replay_reads_each_product_leaf_once(blocks):
     for spec in c.products:
         replay.operands(spec.m)
     replay.glue_gradients()
-    assert {spec.name: reads[c.product_index(spec.m)] for spec in c.products} == {
-        spec.name: 1 for spec in c.products}
+    assert {spec.name: reads[c.product_leaf_index(c.leaf_of(spec.m)[0])]
+            for spec in c.products} == {spec.name: 1 for spec in c.products}
 
 
 def test_backward_frees_each_unit_of_the_pass(honest_all):
@@ -1136,8 +1195,7 @@ def test_committed_product_flows_into_backward_operands(honest_all, perturbed, i
     names = changed + unchanged
     base = _replayed(c, leaves, names)
     bad = list(leaves)
-    i = c.product_index(c.m_of(perturbed))
-    bad[i] = _bump(bad[i], index if isinstance(index, int) else index(c))
+    _bump_product(c, bad, c.m_of(perturbed), index if isinstance(index, int) else index(c))
     got = _replayed(c, bad, names)
     for n in changed:
         assert not (torch.equal(got[n][0], base[n][0]) and torch.equal(got[n][1], base[n][1])), n
@@ -1162,8 +1220,7 @@ def test_glue_gradients_follow_the_committed_leaves(honest_all):
             ("L1.dX_q", [c.w_e, c.gamma_attn(1)], [c.gamma_mlp(1), c.gamma_final]),
             ("dF", [c.gamma_final], [c.gamma_attn(c.L)])]:
         bad = list(leaves)
-        i = c.product_index(c.m_of(perturbed))
-        bad[i] = _bump(bad[i], 0)
+        _bump_product(c, bad, c.m_of(perturbed), 0)
         got = glue(bad)
         for n in changed:
             assert not torch.equal(got[n], base[n]), (perturbed, n)
@@ -1300,7 +1357,7 @@ def test_switches_declaration(switched):
     want += [c.gamma_final, *([] if tied else ["lm_head.weight"])]
     assert list(c.weight_names) == want and c.n_w == len(want)
     assert {n: tuple(p.shape) for n, p in model.named_parameters()} == dict(c.weight_shapes)
-    assert c.n_leaves == c.n_s + 2 * c.n_w + c.M
+    assert c.n_leaves == c.n_s + 2 * c.n_w + c.n_product_leaves
 
     g_head = "G_E_head" if tied else "G_head"
     base = DecoderComputation(tiny_config(), n_s=c.n_s, n=c.n, eta=c.eta)
@@ -1343,9 +1400,10 @@ def test_switches_label_every_slot_once(switched):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(_Labeler, "_fill", fill)
         # The whole-run fill never calls _fill; no runs makes every member go through it.
+        c.product_groups  # the leaf layout is fixed before the runs go (O18)
         mp.setitem(c.__dict__, "member_runs", {})
         cap = run_capture(c, model, records)
-        slots = c.label(cap, model)
+        slots = _per_product(c, c.label(cap, model))
     mixed = c.operand_dtype != c.weight_dtype
     try:
         assert len(slots) == c.M and calls == Counter(p.name for p in c.products)
@@ -1602,7 +1660,7 @@ def test_label_refuses_a_misplaced_bias():
                     c.label(cap, model)
             finally:
                 setattr(rec, attr, keep)
-        assert len(c.label(cap, model)) == c.M
+        assert len(c.label(cap, model)) == c.n_product_leaves
         model.zero_grad(set_to_none=True)
 
 
@@ -1642,7 +1700,7 @@ def test_smollm2_real_step_m2():
                     f"VERIF_OUTPUT_DIR")
     setup_determinism(cfg)
     c = DecoderComputation.from_config(cfg)
-    assert (c.M, c.n_leaves) == (7113, 7661)
+    assert (c.M, c.n_leaves) == (7113, 1361)
     t0 = time.perf_counter()
     model = c.build_model()
     D = load_dataset_records(cfg.data_dir / "D.bin", c.n)
@@ -1654,10 +1712,11 @@ def test_smollm2_real_step_m2():
     tree = commit(c, out)
     t3 = time.perf_counter()
 
-    assert len(out.products) == c.M
-    for p, t in zip(c.products, out.products):
-        assert tuple(t.shape) == p.p_shape and t.dtype == c.product_dtype, p.name
-        assert torch.isfinite(t).all(), p.name
+    assert len(out.products) == c.n_product_leaves
+    for g, t in enumerate(out.products):
+        name = c.product_leaf(g).name
+        assert tuple(t.shape) == c.product_leaf(g).shape and t.dtype == c.product_dtype, name
+        assert torch.isfinite(t).all(), name
     assert len(out.leaves()) == c.n_leaves == tree.n_leaves
     kinds = Counter(p.kind.value for p in c.products)
     assert kinds == {"forward": 2371, "input_grad": 211, "weight_grad": 211,
@@ -1694,7 +1753,7 @@ def test_smollm2_real_step_forward_replay_a8():
     w0 = {n: model.get_parameter(n).detach().clone() for n in c.weight_names}
     cap = run_capture(c, model, records)
     products = [p.detach() for p in c.label(cap, model)]
-    expected = captured_forward_operands(c, cap, products)
+    expected = captured_forward_operands(c, cap, _per_product(c, products))
     model.zero_grad(set_to_none=True)
     del model
     leaves = [*records, *w0.values(), *products, *w0.values()]
@@ -2149,6 +2208,7 @@ def test_captured_operands_follow_the_head_blocks(tied):
     c = DecoderComputation(tiny_config(tied=tied), n_s=2, n=12, eta=1e-3, head_blocks=2)
     model = c.build_model()
     products, seen, _ = captured_operands(c, model, make_records((12, 7)))
+    products = _per_product(c, products)
     assert len(products) == c.M
     for b in range(2):
         m = c.m_of(f"Lambda[{b}]")

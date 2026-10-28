@@ -96,7 +96,6 @@ def challenge_matrices(h: bytes, ms: Sequence[int], k: int, width: int) -> torch
 
 # ---- the call list --------------------------------------------------------------------------
 
-_MEMBER = re.compile(r"^L(\d+)\.\w+\[\d+,\d+\]$")
 _LAYER = re.compile(r"^L(\d+)\.")
 
 
@@ -128,15 +127,32 @@ class Call:
         return len(self.ms)  # times k
 
 
+def _members(l, m: int, stride: int, layer: int | None) -> list[Product]:
+    return [Product(m + stride * i, f"{l.name}[{i}]", l.shape[1:], layer, True)
+            for i in range(l.shape[0])]
+
+
 def products(step: Step) -> list[Product]:
+    """The step's products in ``m`` order. O18: an attention product leaf is 3-D and holds its
+    members; the backward leaves ``dA, dV`` and ``dQ, dK`` (adjacent) interleave their members
+    (stride 2), ``S`` and ``O`` do not."""
     out = []
     leaves = [l for l in step.leaves if l.section == "product"]
-    first = leaves[0].index
-    for l in leaves:
+    m, i = 1, 0
+    while i < len(leaves):
+        l = leaves[i]
         layer = _LAYER.match(l.name)
-        out.append(Product(l.index - first + 1, l.name, l.shape,
-                           int(layer.group(1)) if layer else None,
-                           bool(_MEMBER.match(l.name))))
+        layer = int(layer.group(1)) if layer else None
+        if len(l.shape) != 3:
+            out.append(Product(m, l.name, l.shape, layer, False))
+            m, i = m + 1, i + 1
+        elif l.name.endswith((".dA", ".dQ")):
+            pair = _members(l, m, 2, layer) + _members(leaves[i + 1], m + 1, 2, layer)
+            out += sorted(pair, key=lambda p: p.m)
+            m, i = m + len(pair), i + 2
+        else:
+            out += _members(l, m, 1, layer)
+            m, i = m + l.shape[0], i + 1
     return out
 
 

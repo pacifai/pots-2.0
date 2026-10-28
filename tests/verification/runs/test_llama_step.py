@@ -365,29 +365,30 @@ def test_real_smollm2_step_is_accepted(monkeypatch, capsys):
 
 def _tiny_leaf_counts(c):
     n_w = len(c.weight_names)
-    dk = [q for q in c.products if c.product_class(q) == "dK"]
+    dk = [pl for pl in c.product_leaves if c.product_class(c.product(pl.m0)) == "dK"]
     psize = torch.empty((), dtype=c.product_dtype).element_size()
     wsize = torch.empty((), dtype=c.weight_dtype).element_size()
     w_bytes = sum(wsize * math.prod(s) for s in c.weight_shapes.values())
-    p_bytes = [psize * math.prod(q.p_shape) for q in c.products]
+    p_bytes = [psize * math.prod(pl.shape) for pl in c.product_leaves]  # O18: per leaf
     return n_w, dk, w_bytes, p_bytes
 
 
 def test_work_rows_on_cuda_commit_hashes_records_weights_and_dk_only(tiny, monkeypatch):
     """With the prover on CUDA the commit's row counts the records, W_t, W_{t+1} and the dK
-    products (the rest come from arrival digests); check 2's row keeps every leaf."""
+    product leaves (the rest come from arrival digests); check 2's row keeps every leaf."""
     c = tiny[0]
     monkeypatch.setattr(c, "device", torch.device("cuda"))
     n_w, dk, w_bytes, p_bytes = _tiny_leaf_counts(c)
     rec_n, rec_bytes = c.n_s, 1234  # the batch records, a made-up byte total
-    leaves = rec_n + 2 * n_w + len(c.products)
+    leaves = rec_n + 2 * n_w + c.n_product_leaves
     nbytes = rec_bytes + 2 * w_bytes + sum(p_bytes)
     step = {"step": 1, "leaves": leaves, "transcript_bytes": nbytes}
     rows = llama_step.work_rows(c, "r", "honest", [step])
     by = {r["component"]: r for r in rows if r["record"] == "count"}
     want_n = rec_n + 2 * n_w + len(dk)
     want_bytes = (rec_bytes + 2 * w_bytes
-                  + sum(b for q, b in zip(c.products, p_bytes) if c.product_class(q) == "dK"))
+                  + sum(b for pl, b in zip(c.product_leaves, p_bytes)
+                        if c.product_class(c.product(pl.m0)) == "dK"))
     com = by["P3.commit"]
     assert len(dk) > 0 and want_n < leaves
     assert com["hash_leaves"] == com["hash_calls"] == want_n
@@ -399,7 +400,7 @@ def test_work_rows_on_cuda_commit_hashes_records_weights_and_dk_only(tiny, monke
 
 def _cuda_step(c, known, t=1):
     n_w, dk, w_bytes, p_bytes = _tiny_leaf_counts(c)
-    leaves = c.n_s + 2 * n_w + len(c.products)
+    leaves = c.n_s + 2 * n_w + c.n_product_leaves
     step = {"step": t, "leaves": leaves, "transcript_bytes": 1234 + 2 * w_bytes + sum(p_bytes)}
     return {**step, "known": known}, c.n_s + 2 * n_w + len(dk)
 

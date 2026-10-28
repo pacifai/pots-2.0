@@ -58,7 +58,7 @@ def forge(which):
         if which == "product":
             m = next(s.m for s in c.products
                      if s.name.startswith("L2.") and s.kind.name == "FORWARD")
-            i = c.product_index(m)
+            i = c.product_leaf_index(c.leaf_of(m)[0])
         else:
             names = c.linear_weights if which == "linear" else c.glue_gradient_weights
             i = c.w_next_index(_last_layer(names))

@@ -140,10 +140,10 @@ def test_update_leaf_matches_rebuild():
 
 
 def test_step_tree_path_length():
-    n = 7661
+    n = 1361
     t = MerkleTree(leaves(n))
     lengths = [len(t.path(i)) for i in range(n)]
-    assert max(lengths) <= 13
+    assert max(lengths) <= 11
 
 
 @pytest.mark.parametrize("threads", [1, 4])

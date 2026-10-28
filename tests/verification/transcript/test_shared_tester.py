@@ -317,6 +317,6 @@ def test_a_real_smollm2_step_hashes_the_same_through_the_store(compute_dtype):
     store = SharedStore.open(c, _wire(pkg))
     got = hash_step_leaves(c, [store.leaf(i) for i in range(len(leaves))])
     assert got == want and store.root == tree.root
-    assert pkg.n_leaves == len(leaves) == 7661
+    assert pkg.n_leaves == len(leaves) == c.n_leaves
     store.close()
     hold.release()

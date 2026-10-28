@@ -1763,6 +1763,13 @@ def test_hw3_leaf_labels_cover_every_section():
                       ("w_next", "w_c")]
 
 
+def test_hw3_leaf_labels_read_product_leaves_from_k_and_fall_back_to_the_old_keys():
+    new = {"n_s": 2, "n_w": 3, "M": 9, "K": 2, "n_leaves": 10,
+           "weight_names": ["w_a", "w_b", "w_c"], "product_leaf_names": ["L0.S", "dF"]}
+    assert [fs._leaf_label(new, i) for i in (5, 6, 7, 9)] == [
+        ("product", "L0.S"), ("product", "dF"), ("w_next", "w_a"), ("w_next", "w_c")]
+
+
 def test_hw3_flags_a_card_that_did_not_run(tmp_path):
     parts = [_card_part(tmp_path, "o/m", 0, _digests()),
              _card_part(tmp_path, "o/m", 1, b"", status="failed", write=False)]
