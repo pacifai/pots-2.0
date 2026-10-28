@@ -1694,6 +1694,25 @@ interface.
     time would (the window before it is judged first, then, for a serving error, the products
     of run `i` served before it; the error is raised only if none rejects, else left to the
     record pass in `StepState.run_rest_error`).
+  - **Check 5's per-computation cache (FS50, 2026-10-28).** What check 5 derives from the
+    declared computation and the unit schedule alone is built once per computation, not per
+    step (`_c5_static(c)` -> `_Check5Static`): the runs (`_member_runs`, as tuples), each run's
+    groups (`_measure_groups`) and `group0`, the windows (`_judge_windows`) and per window
+    (`_WindowStatic`) its specs, `m`, names, κ classes, `q`, `n`, `biased` and class codes and
+    the canonical permutation of its rows (checked against each run's `order` every step and
+    rebuilt if one differs); per schedule (`_ScheduleStatic`, `for_schedule`) the steps and
+    each step's prefetch `(ms, widths)` as tuples; κ's per-class ceiling array
+    (`kappa_ceiling`), kept for one bands' values. `check_5_matmuls`, `_check_5_canonical`,
+    `_check_5_units`, `_prefetch_step`, `_measure_step_kernel`, `_finish_columns`,
+    `_first_failing` and `_judge_window` read it; `_judge_window` uses a window's entry only
+    when the batch is exactly that window (a window cut short by an error is judged from its
+    specs), and `_judge_product` is unchanged. Key: the computation object (a
+    `WeakKeyDictionary`; one that is unhashable keeps it in `_check5_static`), the products
+    (identity, then equality), `_JUDGE_WINDOW` and `_GROUP_BYTES` as at the build; the schedule
+    by identity, then equality, rebuilt otherwise. It holds no prover data (no leaf, operand or
+    `h`). `checks.check5_static_cache(False)` bypasses it, so every function derives its inputs
+    as before; every `ProductStat` field, rejection, message and `run_rest` are the same either
+    way (`tests/verification/verifier/test_check5_static.py`).
   - **The record pass (EV2, EVALUATION_SPEC §4.1).** `record_rest(store, c, ctx, bands,
     slot) -> str` measures, for the record only, the tests a rejecting check skipped. A
     check-5 rejection first records the products check 5 measured after the failing one and
