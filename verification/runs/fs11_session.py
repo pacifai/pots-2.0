@@ -24,7 +24,8 @@ log ends with :func:`_four_lines`'s ``FS35 ok`` / ``FS35 FAIL`` lines), or
 ``four-h100-profile``, FS42 (d)'s profiling run on the same layout (:func:`four_h100_profile_plan`:
 per model a plain run, the card and the two arms at four steps, the sequential arm tracing
 step 4; ``summary.json["four_h100_profile"]`` is :func:`four_h100_profile`'s result and the log
-ends with :func:`_profile_lines`'s ``FS42 ok`` / ``FS42 FAIL`` lines).
+ends with :func:`_profile_lines`'s ``FS42 ok`` / ``FS42 FAIL`` lines; with ``repo_base/`` in the
+upload, Llama-3.2-1B's two arms run again on the code before O18, ``FS49 A/B`` lines).
 The first session's parts, in this
 order (every plan the session runs, but the self-test's, starts with **native_build**:
 ``python -m verification.commitment.native``, which compiles the native BLAKE3 library from
@@ -436,6 +437,9 @@ class Part:
     # models, peer_check, benchmark, bring_up, smooth, plain, probe, kernel_speed, other
     kind: str = "other"
     info: dict[str, Any] = field(default_factory=dict)  # model, task, run_dir, report
+    # The part's working directory (and its sampler's); None: the session's own, the repository
+    # root. The base arm (O18, FS49s) runs in the upload's ``repo_base/`` with the same python.
+    cwd: Path | None = None
 
 
 def _run_dir(out: Path, upload: Path, key: str, name: str | None = None) -> Path:
@@ -1316,6 +1320,10 @@ FOUR_PROFILE_PINS: tuple[tuple[str, str], ...] = tuple(sorted(
 # step (a full-scale step's trace is a JSON of about 1-1.5 GB, gzipped at level 1: an estimate,
 # adding 2-3 minutes to a step of about 195 s), so 6 minutes and 720 s; the plain run (three steps
 # and a memory pass on one GPU) is estimated, not measured, at 3.
+# The base arms (O18, FS49s) run the O18 arms' loops again on the code before O18, so the same
+# 6 and 4 minutes; they are counted always, a pod without ``repo_base/`` just ends early, so
+# the deadline stays one figure (``fs11_job.sh``'s ``DEFAULT_DEADLINE_S``).
+FOUR_PROFILE_BASE_MODELS = ("Llama-3.2-1B",)  # the models that get base arms
 FOUR_PROFILE_ESTIMATE_MIN = {"native_build": 1, "peer_check": 1, "models": 6, "four_tests": 6,
                              "probe": 7, "plain": 3, "card": 2, "seq": 6, "pipe": 4}
 # Time limits, seconds, about twice the estimates (the native build's is the build part's own).
@@ -1325,10 +1333,13 @@ FOUR_PROFILE_TIMEOUT_S = {"models": 720, "four_tests": 720, "probe": 840, "plain
 
 def four_profile_estimated_min() -> int:
     """``four-h100-profile``'s estimated runtime, minutes: every part's estimate, the models'
-    parts once per model."""
+    parts once per model, and the base arms (``seq`` and ``pipe`` again) of each model of
+    :data:`FOUR_PROFILE_BASE_MODELS`, counted whether or not the upload has ``repo_base/``."""
     e = FOUR_PROFILE_ESTIMATE_MIN
+    base = sum(four_model_key(r) in FOUR_PROFILE_BASE_MODELS for r, _ in FOUR_PROFILE_PINS)
     return (e["native_build"] + e["peer_check"] + e["models"] + e["four_tests"] + e["probe"]
-            + len(FOUR_PROFILE_PINS) * (e["plain"] + e["card"] + e["seq"] + e["pipe"]))
+            + len(FOUR_PROFILE_PINS) * (e["plain"] + e["card"] + e["seq"] + e["pipe"])
+            + base * (e["seq"] + e["pipe"]))
 
 
 def four_profile_default_deadline_s() -> int:
@@ -1359,11 +1370,24 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
     :data:`RECHECK_ENV`: ``card_<key>`` (``card_identity`` on GPU 0 alone, one card's proved
     step-1 root), ``seq_<key>`` (``llama_step``, ``steps`` steps, metrics, no counting pass, sharded
     over GPUs 1-3) and ``pipe_<key>`` (the same with ``VERIF_PIPELINED=1``), each in its own run
-    directory. Only the ``pipe_*`` parts set ``VERIF_PIPELINED``. Every part records its GPUs'
-    peak memory."""
+    directory. Only the ``pipe_*`` parts set ``VERIF_PIPELINED``. With ``profile`` and an upload
+    with ``repo_base/`` (O18, FS49s), right after each model of :data:`FOUR_PROFILE_BASE_MODELS`'s
+    ``pipe_<key>``: ``seq_<key>_base`` and ``pipe_<key>_base``, the same environment and argv,
+    run directories ``four_<key>_seq_base``/``four_<key>_pipe_base``, ``cwd`` the upload's
+    ``repo_base/``, ``info`` ``base`` true and the manifest's ``base_commit``. Every part
+    records its GPUs' peak memory."""
     from setup.data import TEST_SCALE_TOKENIZER as pin  # the tests' model: SmolLM2
     small = data_key(pin.repo, SMOLLM2_TASK)
     sharded = {"VERIF_DEVICE": FOUR_PROVER, "VERIF_VERIFIER_DEVICES": FOUR_VERIFIERS}
+    has_base = profile and (upload / "repo_base").is_dir()
+    base_commit = None
+    if has_base:
+        try:
+            base_commit = json.loads((upload / "manifest.json").read_text()).get("base_commit")
+        except (OSError, ValueError, AttributeError):
+            pass
+    if profile and not has_base:
+        _say("FS49 A/B arm skipped: the upload has no repo_base/ (prepared without --base-commit)")
     junit = out / "parts" / "four_tests" / "junit.xml"
     expr = " or ".join([f"({PAIR_SLOW_SELECT})",
                         *(Path(f).stem for f in (FS34_TESTS_FILE, *FOUR_TEST_FILES))])
@@ -1400,18 +1424,26 @@ def _four_plan(upload: Path, out: Path, *, pins: Sequence[tuple[str, str]],
                               "VERIF_VERIFIER_DEVICES": None, "VERIF_PIPELINED": None},
                          timeout_s=t["card"], kind="four_card",
                          info={**info, "run_dir": str(d), "report": str(d / "card.json")}))
-        for arm, piped in (("seq", None), ("pipe", "1")):  # only the pipelined arm sets the mode
-            d = _run_dir(out, upload, key, f"four_{key}_{arm}")
+        # After the O18 arms of a model of FOUR_PROFILE_BASE_MODELS: the same two arms on the
+        # code before O18 (the upload's repo_base/), one host, one session (O18, FS49s).
+        arms = [(arm, piped, False) for arm, piped in (("seq", None), ("pipe", "1"))]
+        if profile and k in FOUR_PROFILE_BASE_MODELS and has_base:
+            arms += [(arm, piped, True) for arm, piped, _ in arms]
+        for arm, piped, is_base in arms:  # only the pipelined arm sets the mode
+            tag = "_base" if is_base else ""
+            d = _run_dir(out, upload, key, f"four_{key}_{arm}{tag}")
             env = {**base, **sharded, "VERIF_OUTPUT_DIR": str(d), "VERIF_PIPELINED": piped}
             if profile:  # only the sequential arm is traced, at its last step, check 5 whole
                 env["VERIF_TRACE_STEP"] = str(FOUR_PROFILE_TRACE_STEP) if arm == "seq" else None
                 env["VERIF_TRACE_C5"] = "all" if arm == "seq" else None
             plan.append(Part(
-                f"{arm}_{k}", ["{python}", "-m", "verification.runs.llama_step", "--steps",
-                               str(steps), "--metrics", "--no-count"],
+                f"{arm}_{k}{tag}", ["{python}", "-m", "verification.runs.llama_step", "--steps",
+                                    str(steps), "--metrics", "--no-count"],
                 env=env, timeout_s=t[arm], kind="profile_run" if profile else "four_run",
                 info={**info, "arm": arm, "model_key": k, "run_dir": str(d),
-                      "records": str(d / FOUR_RUN_NAME / "records.jsonl")}))
+                      "records": str(d / FOUR_RUN_NAME / "records.jsonl"),
+                      **({"base": True, "base_commit": base_commit} if is_base else {})},
+                cwd=upload / "repo_base" if is_base else None))
     for p in plan:
         p.info["gpu_peak"] = True
         if profile:
@@ -2681,6 +2713,27 @@ def _four_missing_numbers(models: Mapping[str, Mapping[str, Any]],
     return why
 
 
+def _four_arm_numbers(e: Mapping[str, Any], a: str, steps: int, traced_last: bool,
+                      steady: tuple[float | None, str | None]) -> dict[str, Any]:
+    """One arm's reported numbers (``row["arms"][a]``) from its extras ``e``; ``steady`` is
+    :func:`_steady_s`'s result."""
+    pipelined, last = a == "pipe", traced_last and a == "seq"
+    return {"step_roots": e.get("step_roots"), "step_times": e.get("step_times"),
+            "step_wall_s": e.get("step_wall_s"),
+            "step_interval_s": e.get("step_interval_s"),
+            "latency_steady_s": _steady_mean(e.get("step_wall_s"), steps, True)
+            if pipelined else None,
+            "steady_steps": _steady_steps_text(steps, pipelined, last),
+            "gpu_held_upper_s": e.get("gpu_held_upper_s"),
+            "accumulated_gpu_s": e.get("accumulated_gpu_s"),
+            "verifier_steady_s": _steady_mean(e.get("verifier_s"), steps, pipelined, last),
+            "accumulated_steady_s": _steady_mean(e.get("accumulated_gpu_s"), steps,
+                                                 pipelined, last),
+            "steady_s": steady[0], "steady_source": steady[1],
+            "device_peaks": e.get("device_peaks"), "loop_mode": e.get("loop_mode"),
+            "gpu_peak_mib": e.get("gpu_peak_mib")}
+
+
 def _four_model_items(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any],
                       steps: int, traced_last: bool = False) -> list[tuple[bool, str]]:
     """One model's acceptance items of the four-H100 sessions (``steps`` verified steps per
@@ -2707,22 +2760,7 @@ def _four_model_items(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str,
     row.update({
         "accepted": accepted, "roots_equal": equal, "step1_equals_card": card_ok,
         "card_root": card.get("root"), "gpu_problems": gpu_why,
-        "arms": {a: {"step_roots": e.get("step_roots"), "step_times": e.get("step_times"),
-                     "step_wall_s": e.get("step_wall_s"),
-                     "step_interval_s": e.get("step_interval_s"),
-                     "latency_steady_s": _steady_mean(e.get("step_wall_s"), steps, True)
-                     if a == "pipe" else None,
-                     "steady_steps": _steady_steps_text(steps, pipe[a], last[a]),
-                     "gpu_held_upper_s": e.get("gpu_held_upper_s"),
-                     "accumulated_gpu_s": e.get("accumulated_gpu_s"),
-                     "verifier_steady_s": _steady_mean(e.get("verifier_s"), steps, pipe[a],
-                                                       last[a]),
-                     "accumulated_steady_s": _steady_mean(e.get("accumulated_gpu_s"), steps,
-                                                          pipe[a], last[a]),
-                     "steady_s": steady[a][0], "steady_source": steady[a][1],
-                     "device_peaks": e.get("device_peaks"), "loop_mode": e.get("loop_mode"),
-                     "gpu_peak_mib": (_pair_part(parts, f"{a}_{k}").get("extras")
-                                      or {}).get("gpu_peak_mib")}
+        "arms": {a: _four_arm_numbers(e, a, steps, traced_last, steady[a])
                  for a, e in arm_ex.items()}})
     items += [
         (all(accepted.values()),
@@ -2864,6 +2902,74 @@ def four_profile_parts() -> tuple[str, ...]:
               for a in ("plain", "card", "seq", "pipe")))
 
 
+def _base_models(parts: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The model keys whose base arms (O18, FS49s) are in the plan, in plan order."""
+    out: list[str] = []
+    for p in parts:
+        info = p.get("info") or {}
+        if p.get("kind") == "profile_run" and info.get("base") and info.get("model_key") not in out:
+            out.append(info["model_key"])
+    return out
+
+
+def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any],
+                  plain_steady: float | None) -> list[tuple[bool, str]]:
+    """The base arms' (``seq_<k>_base``, ``pipe_<k>_base``) acceptance items and numbers, filled
+    into ``row["base"]`` and ``row["ab"]`` (O18, FS49s). Judged like the O18 arms: every step
+    accepted in the loop's mode, the four GPUs named, the profile inputs there; the two base arms'
+    step roots equal to each other. A base root is not compared with the O18 arms' or the
+    card's (the leaf layout differs). ``ab[<arm>]``: the O18 arm's steady step interval, the base
+    arm's, their difference (O18 minus base: negative when O18 is faster) and ratio (O18 over
+    base)."""
+    steps = FOUR_PROFILE_STEPS
+    mode = {"seq": "sequential", "pipe": "pipelined"}
+    ex = {a: (_pair_part(parts, f"{a}_{k}_base").get("extras") or {}) for a in FOUR_ARMS}
+    accepted = {a: bool(e.get("accepted")) and len(e.get("step_roots") or ()) == steps
+                and e.get("loop_mode") == mode[a] for a, e in ex.items()}
+    seq_roots, pipe_roots = (ex[a].get("step_roots") or [] for a in FOUR_ARMS)
+    equal = len(seq_roots) == steps and seq_roots == pipe_roots
+    gpu_why = {a: _four_gpu_problems(e) for a, e in ex.items()}
+    arms: dict[str, Any] = {}
+    inputs: dict[str, list[str]] = {}
+    for a, e in ex.items():
+        arm = _four_arm_numbers(e, a, steps, True, _steady_s(e, steps, a == "pipe", a == "seq"))
+        n_ver = _role_gpus(e.get("gpu_roles"), "verifier")
+        arm["verify_over_train"] = _ratio(arm["verifier_steady_s"], plain_steady)
+        arm["verify_over_train_accumulated"] = _ratio(
+            arm["verifier_steady_s"] * n_ver if arm["verifier_steady_s"] is not None and n_ver
+            else None, plain_steady)
+        arm["wall_over_train"] = (_ratio(arm["steady_s"], plain_steady)
+                                  if arm["steady_source"] == "step_interval" else None)
+        arms[a] = arm
+        inputs[a] = _profile_arm_problems(e, a)
+    row["base"] = {"accepted": accepted, "roots_equal": equal, "gpu_problems": gpu_why,
+                   "arms": arms, "inputs": inputs,
+                   "base_commit": (_pair_part(parts, f"seq_{k}_base").get("info")
+                                   or {}).get("base_commit")}
+    row["ab"] = {}
+    for a in FOUR_ARMS:
+        o18, base = row["arms"][a].get("steady_s"), arms[a].get("steady_s")
+        ok = (row["arms"][a].get("steady_source") == "step_interval"
+              and arms[a].get("steady_source") == "step_interval")
+        row["ab"][a] = {"o18_steady_s": o18, "base_steady_s": base,
+                        "diff_s": o18 - base if ok and o18 is not None and base is not None
+                        else None, "ratio": _ratio(o18, base) if ok else None}
+    items = [
+        (all(accepted.values()),
+         f"{k} base: both arms accepted at all {steps} steps" if all(accepted.values())
+         else f"{k} base: " + ", ".join(f"the {a} arm was not accepted at all {steps} steps "
+                                        "in its loop mode" for a, ok in accepted.items()
+                                        if not ok)),
+        (equal, f"{k} base: the arms' step roots are equal" if equal
+         else f"{k} base: the sequential and pipelined arms' step roots differ"),
+        (not any(gpu_why.values()), f"{k} base: the environment records name the four GPUs"
+         if not any(gpu_why.values()) else f"{k} base: " + "; ".join(
+             f"{a} arm: " + ", ".join(w) for a, w in gpu_why.items() if w))]
+    items += [(not w, f"{k} base {a}: the profile's inputs are there" if not w
+               else f"{k} base {a}: " + "; ".join(w)) for a, w in inputs.items()]
+    return items
+
+
 def _missing_steps(have: Sequence[int], steps: int = FOUR_PROFILE_STEPS) -> str:
     """``"steps 2, 4"``: the steps of 1..``steps`` not in ``have``."""
     gone = [t for t in range(1, steps + 1) if t not in set(have)]
@@ -2968,12 +3074,15 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
     ``verify_over_train_accumulated`` (the verifier side's step time times its GPUs, from the
     arm's ``gpu_roles``, over the plain step on its one GPU: the accumulated GPU time ratio
     that EQ14 puts beside PoTS's verify over train) and ``wall_over_train`` (the arm's step
-    interval over the plain step)."""
+    interval over the plain step). With base arms in the plan (FS49s, :func:`_profile_base`):
+    their items and numbers under each model's ``base`` and ``ab`` (the O18 and base steady
+    step intervals, their difference and ratio, per loop); ``ab_skipped`` says why not otherwise."""
     if not any(p.get("kind") == "profile_run" for p in parts):
         return None
     names = {p["name"] for p in parts}
     models = {four_model_key(r): {} for r, _ in FOUR_PROFILE_PINS}
-    want = four_profile_parts()
+    base_keys = _base_models(parts)  # only when the plan has them (FS49s)
+    want = (*four_profile_parts(), *(f"{a}_{k}_base" for k in base_keys for a in FOUR_ARMS))
     problems = {n: _pair_part(parts, n).get("status", "not_started") for n in want
                 if n not in names or _pair_part(parts, n).get("status") not in _PAIR_OK}
     peer = (_pair_part(parts, PEER_CHECK_NAME).get("extras") or {}).get("peer_check")
@@ -3014,6 +3123,8 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
                                       if arm["steady_source"] == "step_interval" else None)
             items.append((not why, f"{k} {a}: the profile's inputs are there" if not why
                           else f"{k} {a}: " + "; ".join(why)))
+        if k in base_keys:
+            items += _profile_base(parts, k, row, steady_plain)
     sample_why = {n: w for n in want if n != NATIVE_BUILD_NAME
                   and (w := _samples_problem(_pair_part(parts, n).get("extras") or {}))}
     items += [(False, f"{n}: {w}") for n, w in sample_why.items()]
@@ -3026,12 +3137,16 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
                   f"{len(probe.get('per_device') or {})} per_device entries, not version 2 "
                   f"with {FOUR_CARDS}"))
     check_rates = (peer or {}).get("gbps") or {}
-    missing = _four_missing_numbers(models, probe, check_rates)
+    missing = _four_missing_numbers(
+        {**models, **{f"{k} base": {"arms": models[k]["base"]["arms"]} for k in base_keys}},
+        probe, check_rates)
     items.append((not missing, "the step times, per-GPU peaks and peer rates are all reported"
                   if not missing else "numbers missing: " + "; ".join(missing)))
+    ab_skipped = (None if base_keys else "FS49 A/B arm skipped: the plan has no base arms "
+                  "(the upload has no repo_base/, prepared without --base-commit)")
     return {"pass": all(ok for ok, _ in items), "items": [[ok, text] for ok, text in items],
             "missing_numbers": missing, "models": models, "part_problems": problems,
-            "peer_bytes_ok": peer_ok,
+            "peer_bytes_ok": peer_ok, "ab_skipped": ab_skipped,
             "tests": {k: tests_ex.get(k) for k in ("tests", "failures", "errors", "skipped",
                                                    "files", "missing_files")},
             "tests_problems": tests_problems, "samples_problems": sample_why,
@@ -3068,6 +3183,11 @@ def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
                 f"step; verifier ÷ training {rat(arm.get('verify_over_train'))} (wall time), "
                 f"{rat(arm.get('verify_over_train_accumulated'))} (accumulated GPU time); step "
                 f"÷ training {rat(arm.get('wall_over_train'))}")
+        for a, ab in (row.get("ab") or {}).items():
+            lines.append(
+                f"FS49 A/B {k} {a}: O18 {sec(ab.get('o18_steady_s'))}, base "
+                f"{sec(ab.get('base_steady_s'))} (Δ {sec(ab.get('diff_s'))}, ratio "
+                f"{rat(ab.get('ratio'))})")
     return lines
 
 
@@ -3452,6 +3572,8 @@ def _run_part(part: Part, env: dict[str, str], cwd: Path, log: Path, *, deadline
     kill and at a time-limit or deadline kill ``parts/<name>/hang.txt`` holds the process
     snapshot, and, for a pytest part, ``stacks.txt`` every thread's stack."""
     argv = [python if a == "{python}" else a for a in part.argv]
+    if part.cwd is not None:
+        cwd = part.cwd
     penv = dict(env)
     for k, v in part.env.items():
         if v is None:

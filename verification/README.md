@@ -1417,13 +1417,14 @@ measured times of 2026-10-25 scaled to four steps (FS35's card measured 37-62 s)
 run's is a guess, and the sequential arm's 6 adds an estimated 2-3 minutes for the trace of
 one full-scale step, all of check 5 included (`VERIF_TRACE_C5=all`: the measuring kernel runs
 outside the sampled serving stamps), a JSON of about 1-1.5 GB gzipped at level 1, to a step of
-about 195 s, so its limit is 720 s. In all, 21 + 3 x 15 = 66 min, plus packing 1 and the grace window 20,
-87 min; the job's default deadline is twice that, 10,440 s rounded up to 10,500 s (2 h
-55 min), set in `fs11_job.sh` and `four_profile_default_deadline_s()`, which a test holds
-equal. The pod's boot guard is (87 + 20) x 2 = 214 min = 12,840 s, rounded up to 12,900 s: 87
+about 195 s, so its limit is 720 s. In all, 21 + 3 x 15 + 10 = 76 min (the last 10 are the A/B
+arm's, below, counted whether or not the upload has it), plus packing 1 and the grace window 20,
+97 min; the job's default deadline is twice that, 11,640 s rounded up to 11,700 s (3 h
+15 min), set in `fs11_job.sh` and `four_profile_default_deadline_s()`, which a test holds
+equal. The pod's boot guard is (97 + 20) x 2 = 234 min = 14,040 s, rounded up to 14,100 s: 97
 is the job's estimated runtime with its packing and grace window (the job deadline's own
 basis), 20 is the pod's setup (image pull, set-up script, upload), and the 2 is the margin.
-The pod's start command is the four-H100 session's above with a `sleep` of 12,900 s in place of
+The pod's start command is the four-H100 session's above with a `sleep` of 14,100 s in place of
 17,100. Each part's time limit is about twice its estimate.
 
 **Measured (2026-10-25, one four-H100 SXM pod, every part passed).** From `job.log`: the native
@@ -1436,10 +1437,10 @@ estimate. The tests ran 9.3 min against an estimate of 6, the sequential arm of 
 and 4.3 min; the plain runs (a guess of 3 min) and the cards ran well under theirs. The
 estimates above stay what sets the limits.
 
-**Expected cost.** The parts' estimated runtime, 66 min, plus about 15 min of pod setup and
-fetch, is about 81 min, so a run costs about 81 / 60 x $P/h, at $P/h the pod's hourly price;
-at FS35's $15.96/h that is about $22. The job deadline caps the job at 10,500 s, about
-$47 at that price, and the boot guard caps the whole pod at 12,900 s, about $57.
+**Expected cost.** The parts' estimated runtime, 76 min, plus about 15 min of pod setup and
+fetch, is about 91 min, so a run costs about 91 / 60 x $P/h, at $P/h the pod's hourly price;
+at FS35's $15.96/h that is about $24. The job deadline caps the job at 11,700 s, about
+$52 at that price, and the boot guard caps the whole pod at 14,100 s, about $63.
 
 - `plain_<model>`: `plain_baseline --steps 3 --metrics` on GPU 0 alone (`VERIF_DEVICE=cuda:0`,
   no verifier devices, no pipelining): the plain training step the verifier's cost is compared
@@ -1450,6 +1451,20 @@ $47 at that price, and the boot guard caps the whole pod at 12,900 s, about $57.
 - `pipe_<model>`: the same with `VERIF_PIPELINED=1` and no `VERIF_TRACE_STEP`.
 
 Every part records its GPUs' peaks and a `samples.jsonl` with four GPUs in its header.
+
+**The A/B arm (O18, FS49s).** Same-type pods differ in host-side costs, and O18's gain (one
+Merkle leaf per attention product instead of one per member) is host-side, so the comparison
+with the code before O18 is made on one pod, in one session. Prepare the upload with
+`--base-commit 387b991` (the commit before O18, "the base") and the upload also carries
+`repo_base/`, `git archive` of that commit; the manifest records `base_commit`, and the pod's
+upload check verifies `repo_base/` like `repo/`. Then, right after Llama-3.2-1B's `pipe_<model>`
+(`FOUR_PROFILE_BASE_MODELS`), the plan adds `seq_Llama-3.2-1B_base` and
+`pipe_Llama-3.2-1B_base`: the same environment and command as the O18 arms (the sequential one
+traced at step 4 too), each in its own run directory (`runs/four_<key>_seq_base`,
+`runs/four_<key>_pipe_base`), run with the session's own python but with `repo_base/` as the
+working directory, so they import the base code. They add 6 + 4 = 10 min to the estimate. A
+prep without `--base-commit` has no `repo_base/`, the plan has no base arms and says so in the
+job log, and `summary.json` carries `ab_skipped`.
 
 **Reading the result.** `summary.json["four_h100_profile"]["pass"]` fails closed. It is true
 only when: every part ended `ok` (or was done earlier); the peer copies landed the right bytes;
@@ -1474,6 +1489,14 @@ accumulated GPU time ratio, the one EQ14 puts beside PoTS's verify over train) a
 `wall_over_train` (the arm's step interval over the plain step). The job log ends with one
 `FS42 ok:` or `FS42 FAIL:` line per item, then per model and arm
 `FS42 <model> <arm>: step X s (interval between verified steps), verifier Y s per step, plain training Z s per step; verifier ÷ training A (wall time), B (accumulated GPU time); step ÷ training C`.
+With the A/B arm, the base arms are judged like the O18 arms (every step accepted in the loop's
+mode, the profile's inputs, the samples, the peaks) and their two arms' step roots must be equal
+to each other; a base root is not compared with the O18 arms' or the card's, since the leaf
+layout differs. `pass` fails closed on them only when they are in the plan. Each model's `base`
+holds the same numbers as its O18 arms, and `ab` per loop the O18 and the base steady step
+interval, their difference (O18 minus base) and ratio (O18 over base); the log gets one
+`FS49 A/B <model> <loop>: O18 X s, base Y s (Δ Z s, ratio R)` line per loop, after the
+`FS42` lines of that model.
 An acceptance failure does not change the job's exit code; if computing it raises,
 `four_h100_profile_error` holds the error and the job runs on.
 
