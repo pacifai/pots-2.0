@@ -75,12 +75,11 @@ def test_capture_hashes_every_product_but_dK_on_arrival(dtype, head_blocks, dete
 
 
 def test_a_nan_inside_a_matmul_output_has_no_digest_and_the_cpu_paths_leaf():
-    """A NaN made by a bmm in member 1 of 3: members 1 and 2 get no digest (the kernel stops at
-    the first bad leaf), member 0 gets the C library's, and the first leaf the host check
-    rejects is member 1, the leaf where the arrival hash stopped."""
+    """A NaN made by a bmm in member 1 of 3 (O18: the whole output is one leaf): the output gets
+    no digest, and neither does any member view; the first member the host check rejects is
+    member 1."""
     from verification.commitment.encoding import (
         NonFiniteError, tensor_leaf_header, tensor_leaf_payload)
-    from verification.commitment.merkle import hash_tensor_leaf
     from verification.prover.capture import HostBuffers, MatmulCapture
 
     g = torch.Generator().manual_seed(0)
@@ -91,8 +90,8 @@ def test_a_nan_inside_a_matmul_output_has_no_digest_and_the_cpu_paths_leaf():
     with cap, cap.phase("forward"):
         torch.bmm(a, b)
     out = cap.records[0].out
-    assert [cap.arrival_digest(out[i]) is None for i in range(3)] == [False, True, True]
-    assert cap.arrival_digest(out[0]) == hash_tensor_leaf(3, out[0])
+    assert cap.arrival_digest(out) is None
+    assert [cap.arrival_digest(out[i]) is None for i in range(3)] == [True] * 3
     first = None
     for i in range(3):
         try:
@@ -102,7 +101,7 @@ def test_a_nan_inside_a_matmul_output_has_no_digest_and_the_cpu_paths_leaf():
             assert "NaN or Inf" in str(e)
             break
     assert first == 1
-    assert cap.summary()["arrival_hash"]["nonfinite"] == 2
+    assert cap.summary()["arrival_hash"]["nonfinite"] == 1  # the one output
     assert tensor_leaf_header(3, out[0]) == tensor_leaf_header(3, out[1])
 
 
