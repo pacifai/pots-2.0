@@ -11,12 +11,14 @@ before check 5 (zero rows), a calibration step (no bands, NaN scores) and the ML
 
 import json
 import math
+import threading
 
 import numpy as np
 import pytest
 
 from verification.computation.interface import ProductKind
 from verification.parameters import LAMBDA, LOG2_G, UNIT_ROUNDOFF
+from verification.runs import metrics
 from verification.runs.metrics import MetricsWriter, read_residuals, step_record
 from verification.verifier import calibration
 from verification.verifier.bands import Bands, product_class
@@ -255,7 +257,17 @@ def test_the_archive_reads_back_as_the_steps_stats(tmp_path, env, accepted):
         [(p.q, p.p_norm, p.nu, p.p_abs1, p.u) for p in stats.products]
 
 
-def test_several_steps_in_a_row_write_every_archive(tmp_path, env, accepted, rejected_at_5):
+@pytest.fixture(params=["thread", "calling_thread"])
+def archive_path(request, monkeypatch):
+    """Both paths of ``write_residuals`` (FS52b): the writer thread (threshold 0) and the
+    calling thread (the default threshold; the test archives are small)."""
+    if request.param == "thread":
+        monkeypatch.setattr(metrics, "ARCHIVE_THREAD_MIN_BYTES", 0)
+    return request.param
+
+
+def test_several_steps_in_a_row_write_every_archive(tmp_path, env, accepted, rejected_at_5,
+                                                    archive_path):
     """A background writer holds at most one archive in flight; none may be lost or mixed."""
     w = MetricsWriter(tmp_path, "run")
     sources = [accepted.stats[1], rejected_at_5.stats[1], accepted.stats[1]]
@@ -269,7 +281,7 @@ def test_several_steps_in_a_row_write_every_archive(tmp_path, env, accepted, rej
         check_archive(got, expected_archive("run", "honest", t, st, env.c, bands=BANDS, k=K))
 
 
-def test_a_failed_archive_surfaces_and_leaves_no_run_end(tmp_path, env, accepted):
+def test_a_failed_archive_surfaces_and_leaves_no_run_end(tmp_path, env, accepted, archive_path):
     """The archive cannot be written (its path is a directory): the error surfaces before the
     run ends, and a run with a failed archive has no ``run_end``."""
     (tmp_path / "residuals" / "honest" / "step_00001.npz").mkdir(parents=True)
@@ -281,6 +293,36 @@ def test_a_failed_archive_surfaces_and_leaves_no_run_end(tmp_path, env, accepted
     kinds = [json.loads(line)["record"]
              for line in (tmp_path / "records.jsonl").read_text().splitlines()]
     assert "run_end" not in kinds
+
+
+def _archive_threads():
+    return [t for t in threading.enumerate() if t.name == "residual-archive"]
+
+
+def test_a_small_archive_runs_no_thread_and_exists_at_once(tmp_path, env, accepted):
+    w = MetricsWriter(tmp_path, "run")
+    path = w.write_residuals("honest", 1, accepted.stats[1], env.c, bands=BANDS, k=K)
+    assert w._writer_thread is None and not _archive_threads()
+    assert path.exists()  # before flush or close
+    w.close()
+
+
+def test_a_threshold_of_zero_takes_the_thread_path(tmp_path, env, accepted, monkeypatch):
+    monkeypatch.setattr(metrics, "ARCHIVE_THREAD_MIN_BYTES", 0)
+    w = MetricsWriter(tmp_path, "run")
+    path = w.write_residuals("honest", 1, accepted.stats[1], env.c, bands=BANDS, k=K)
+    assert w._writer_thread is not None
+    w.flush()
+    assert path.exists() and not _archive_threads()
+    w.close()
+
+
+def test_a_small_archives_write_error_raises_from_write_residuals(tmp_path, env, accepted):
+    (tmp_path / "residuals" / "honest" / "step_00001.npz").mkdir(parents=True)
+    w = MetricsWriter(tmp_path, "run")
+    with pytest.raises(Exception):  # noqa: B017 (OSError or a wrap)
+        w.write_residuals("honest", 1, accepted.stats[1], env.c, bands=BANDS, k=K)
+    w.close()
 
 
 # ---- the step record -------------------------------------------------------------------------
