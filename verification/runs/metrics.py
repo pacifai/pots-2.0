@@ -2880,6 +2880,12 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 # §4.6): the data files, and the evaluation's results.
 RESERVED_NAMES = ("data", "evaluation")
 
+# FS52b: an archive under this size is written on the calling thread. ``np.savez`` of a small
+# archive is mostly interpreter work that holds the GIL, so a thread only moves it into the next
+# step's timed sections (2.5 MB: the main thread slowed 137% of the write; 17.5 MB: 7%); only the
+# file write and the checksum run without the GIL, and they dominate in a large archive.
+ARCHIVE_THREAD_MIN_BYTES = 16 * 2**20
+
 
 def run_name(scenario: str, model: str, attack: str, bpr_records: int, seed: int) -> str:
     """A cell's unique run name, ``<scenario>-<model>-<attack>-bpr<n>-s<seed>`` (EV2): the
@@ -2991,16 +2997,21 @@ class MetricsWriter:
         """The step's residual arrays, with its scores under ``bands`` (:func:`rho_arrays`;
         NaN without bands; ``rho`` when the caller has them already).
 
-        The arrays are built here, on the calling thread; ``np.savez`` runs on one writer thread
-        (FS52), at most one archive in flight: a call first waits for the previous one. The
-        returned file exists only once :meth:`flush` (or :meth:`close`) has returned, and an
-        error in the thread is raised by the next ``write_residuals``, ``flush`` or ``close``."""
+        The arrays are built here, on the calling thread. An archive of at least
+        ``ARCHIVE_THREAD_MIN_BYTES`` goes to one writer thread (FS52), at most one in flight: a
+        call first waits for the previous one. Its file exists only once :meth:`flush` (or
+        :meth:`close`) has returned, and an error in the thread is raised by the next
+        ``write_residuals``, ``flush`` or ``close``. A smaller archive is written on the calling
+        thread (FS52b): its file exists, and its error is raised, when this returns."""
         d = self.dir / "residuals" / _SAFE_NAME.sub("_", scenario)
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"step_{step:05d}.npz"
         self.flush()
         arrays = _residual_arrays(self.run, scenario, step, stats, c, bands=bands, k=k,
                                   kappa_guard=kappa_guard, rho=rho)
+        if sum(a.nbytes for a in arrays.values()) < ARCHIVE_THREAD_MIN_BYTES:
+            np.savez(path, **arrays)
+            return path
         self._writer_thread = threading.Thread(target=self._save, args=(path, arrays),
                                                name="residual-archive")
         self._writer_thread.start()
