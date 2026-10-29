@@ -62,7 +62,7 @@ The **step transcript** is the ordered leaf sequence
 
 `L = ( b, W_t, P_1, …, P_M, W_{t+1} )`,
 
-with the products `P_1, …, P_M` in a fixed canonical order. Glue outputs are **not** included. Each leaf is encoded under a **canonical serialization**: a deterministic, injective byte encoding with no optional, reserved, or nonce fields, so that a given mathematical object has exactly one admissible encoding.
+with the products `P_1, …, P_M` in a fixed canonical order. The members of one batched product (Section 2) share a leaf: it holds their values in member order under the canonical serialization, at the position of the first member. Every other product is a leaf of its own. A member remains its own matmul, with its own position `m` and its own challenges (Section 5). Glue outputs are **not** included. Each leaf is encoded under a **canonical serialization**: a deterministic, injective byte encoding with no optional, reserved, or nonce fields, so that a given mathematical object has exactly one admissible encoding.
 
 ### 4.2 Merkle commitment
 

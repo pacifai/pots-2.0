@@ -228,6 +228,25 @@ pod 4.5 h, H100 job 3.5 h. Mac rehearsal: Qwen2.5-0.5B refusal at
   validator round on the Mac (`2096ce2`), and FS34 is merged (`4746fc2`) and in validation. Both
   wait on the pair session for their GPU criteria. The user gave FS35 the per-device tools (`check5_profile.py`,
   `runs/probe.py`, `setup/machine.py`) on 2026-10-21.
+  **Speed directions from FS42 (user, 2026-10-26).** The bottleneck list became directions in
+  `PERFORMANCE_TASKS.md`: check 5's host side (O2), between-step and hand-off costs (O17), and
+  one leaf per attention product (O18), which the user took up the same day as a protocol
+  change; its plan is `ATTENTION_LEAF_PLAN_DRAFT.md`, drafted for the user's approval and
+  **approved on 2026-10-28** ("set a plan … and then you will begin orchestrating"), with the
+  agent waves (§5) and the interface pins (§2.6) added and the tag decided on its recommendation
+  (`0x03`, `ndim = 3`). FS44 (the amendments to spec §4.1, the reference block §5–§6,
+  `DECISIONS_SETUP.md` P9b and P8a) is applied. FS45–FS48 and FS49's session code (the
+  base-code A/B arm) were built on `o18-leaves` and **merged into `verification-impl` on
+  2026-10-28 (c3f8d37)**: a test-scale step has 1,361 leaves (was 7,661); the Mac acceptance
+  (FS48: run_verified bit-identical to the plain baseline, every cheat caught where expected,
+  store cross-check, k tunability, the slow suite, whose two stale-count failures were fixed and
+  rerun) and the A40 GPU check passed; the validator passed in three rounds, nothing blocking.
+  **Next: FS49**, the four-H100 measurement, which the user chose (2026-10-28) to run on one pod
+  together with the host-side arms (FS54), after the host-side changes are merged onto c3f8d37
+  (`--base-commit 387b991 --o18-commit c3f8d37`); its price is quoted to the user before the pod
+  is rented. Then **Milestone FM12**. The two
+  same-bits alternatives, batching the per-leaf work (O15) and the cross-process store (O16),
+  are archived in `archive/LEAF_SPEED_ALTERNATIVES.md`.
   **Resource profiling (user, 2026-10-18).** `archive/PROFILING_PLAN.md` holds the plan: tasks
   FS18–FS27, built beside the hashing build, and a short H100 check (FS27) that also measures
   check 5 on the four full-scale models and ends at **Milestone FM8** before FS14. Approved
@@ -523,6 +542,7 @@ pod 4.5 h, H100 job 3.5 h. Mac rehearsal: Qwen2.5-0.5B refusal at
 
 The session-start hook reads the phrase "the next item is **ID**" in the setup line, so
 keep that wording when you update it. It builds its task menu from the `- **ID — Title.**`
+| `ATTENTION_LEAF_PLAN_DRAFT.md` | Draft plan for committing each attention product's members as one leaf: spec and decision changes, code, tests and measurement (O18), drafted 2026-10-26, approved 2026-10-28, built and merged 2026-10-28 (c3f8d37); FS49's measurement waits |
 items of the four task files.
 
 ## Files

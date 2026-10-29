@@ -1260,6 +1260,9 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       machine.
     - *Why the `+1`.* The naive `2·(a/2²⁴) − 1` gives the grid `−1, …, 1 − 2⁻²³`, which holds
       `−1` but not `+1` and has mean `−2⁻²⁴`. The `+1` moves each point to the centre of its
+    - *Since O18 (2026-10-28) a leaf may hold several labels*: the members of one attention
+      product share a leaf (P9b, amended), and each keeps its own position `m` as its label, so
+      labels stay distinct and injective as before.
       cell: the 2²⁴ values from `−1 + 2⁻²⁴` to `1 − 2⁻²⁴`, spaced `2⁻²³`, exactly symmetric, so
       the mean is exactly 0 as spec §2 requires. The variance is `(1 − 2⁻⁴⁸)/3`.
     - *The 32 → 24-bit reduction is exactly uniform (checked at the user's request).* Each `a`
@@ -1314,11 +1317,49 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
       8 become per-tensor hash comparisons, with no re-reading of weights.
     - *Each product `P_m` is its own leaf*, including every `(s, h)` member of an attention
       product, matching the spec's rule that a batched product is one matmul per member. The
-      leaf and the challenge label `m` (P8a) then name the same object.
-    - *Size at test scale:* 4 + 272 + 7,113 + 272 = **7,661 leaves**, about 13 levels.
+      leaf and the challenge label `m` (P8a) then name the same object. (Until O18: the
+      attention members now share a leaf, amended below.)
+    - *Size at test scale:* 4 + 272 + 7,113 + 272 = **7,661 leaves**, about 13 levels (until
+      O18, below: 1,361).
     - *Rejected: one leaf per batched operation* (e.g. all 36 `S_{s,h}` of a layer). A leaf
       would no longer be one `m`, opening one member would open all of them, and nothing is
-      saved, since the verifier reads every product anyway.
+      saved, since the verifier reads every product anyway. **Reversed 2026-10-26, below**: FS42
+      measured the premise "nothing is saved" false.
+    - **Amended (user, 2026-10-26, plan approved 2026-10-28; O18): an attention product's
+      members share one leaf.** The `n_s·n_h` members of one attention role of one layer (`S`,
+      `O`, `δA`, `δV`, `δQ̃` or `δK̃`) are one leaf, `[n_s·n_h, a, b]` under tag `0x03` with
+      `ndim = 3`, members in lexicographic `(s, h)` order, at the position of the role's first
+      member; every other product, every record and every weight stays its own leaf. Each
+      member stays its own matmul with its own `m` and challenges (P8a). Plan:
+      `ATTENTION_LEAF_PLAN_DRAFT.md`.
+      - *Why.* FS42's four-H100 profile (2026-10-25) found step time following the leaf count,
+        not bytes or FLOPs: per-leaf host work (labeling, the commit, check 2's reads and
+        hashing, the cross-process store) was 85–90% of the step, about 30–40 µs a leaf over
+        Llama-3.2-1B's 393,996 leaves, 393,216 of them attention members. The change takes
+        Llama to 876 leaves; the plan estimates the pipelined step interval from 12.5 s to
+        about 6.3 s (estimate, to be measured by FS49).
+      - *What it costs.* Soundness doesn't change: no term of the floor
+        `f = c·τ·e·2^(N/k)`, `N = λ + log₂T + log₂M + log₂G`, counts leaves; `M` still counts
+        matmuls, so `N`, `k` and the bands stay. A grinding attempt re-hashes an altered leaf
+        and its path; the path shrinks from 19 to 10 hashes, which cheapens an attempt by under
+        1%, far below a tenth of a bit of the chosen `log₂G = 52`. Binding doesn't change on one
+        condition: the grouped leaf's encoding has no free bytes (member order and shapes follow
+        from `C`, no padding, no prover-chosen header field), which a test pins. The one
+        deficit is coarser openings: the smallest unit the outer tree confirms is a whole
+        attention product (67–200 MB on Llama), so showing one member to a third party needs
+        the whole product or a BLAKE3 verified slice, which no code builds and no check uses
+        (the verifier reads every product; check 4's record paths are the only path checks).
+        The largest leaf doesn't grow (the output layer's 525 MB on Llama stays the largest).
+      - *Leaf counts.* Test scale `4 + 272 + 813 + 272 = 1,361` (13 → 11 levels); Llama-3.2-1B
+        876, Qwen2.5-0.5B 1,380, Falcon3-1B 968.
+      - *Rejected.* The same-bits alternatives, batching the per-leaf work (O15) and the
+        cross-process store (O16), keep about 394k leaves and their per-leaf hash cost and need
+        more new code (estimated 0.5 s a step slower pipelined on Llama;
+        `archive/LEAF_SPEED_ALTERNATIVES.md`). One leaf per sequence's members keeps
+        per-sequence openings nobody uses and about 15 times the per-leaf work. One leaf per
+        layer's six attention products saves little more and puts three shapes in one leaf.
+        A new tag `0x05` for a grouped leaf is no more injective than `ndim = 3` under `0x03`
+        (decided on the recommendation, 2026-10-28).
     - *Deferred, not rejected: splitting large tensors into fixed-size chunks.* It would cap the
       largest leaf, the logits at about 100 MB at test scale, and with it the verifier's memory
       per read. Test scale has no memory concern (§8.A.8), and chunking adds a second level of

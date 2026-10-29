@@ -185,15 +185,19 @@ therefore has
 
 `M = L·(21 + 6·n_s·n_h) + 3`
 
-matmuls. Every `X_x`, `A_{s,h}`, `Q̃`, `K̃`, `δS`, `F`, and `δΛ` is glue output and is not
-committed; the verifier reconstructs each from committed leaves as Sections 3 and 4 describe.
+matmuls, committed as `L·27 + 3` product leaves (Section 6: per layer the 21 linear products
+and one leaf per attention product), so the transcript has `n_s + 2·272 + L·27 + 3` leaves,
+1,361 at the test-scale configuration (`n_s = 4`). Every `X_x`, `A_{s,h}`, `Q̃`, `K̃`, `δS`, `F`, and `δΛ`
+is glue output and is not committed; the verifier reconstructs each from committed leaves as Sections 3 and 4 describe.
 
 
 ## 6. Transcript layout
 
 The step transcript `L = (b, W_t, P_1, …, P_M, W_{t+1})` of Specification Section 4.1 is
-instantiated with the following canonical order. The order is a fixed labeling of the leaves and need not match the
-order in which the prover computes them.
+instantiated with the following canonical order. The order is a fixed labeling of the products, and the leaves
+follow it: each attention product's `n_s·n_h` members form one leaf, an `n_s·n_h × n × n` or
+`n_s·n_h × n × d_h` array in lexicographic order of `(s, h)`, at the position of its first
+member. The order need not match the order in which the prover computes the products.
 
 1. The batch `b`, as its `n_s` records in batch order.
 2. The weights `W_t`, in the order `W_E`; then for `ℓ = 1, …, L` the tensors `γ_attn`, `W_q`,
@@ -208,7 +212,8 @@ order in which the prover computes them.
 5. The weights `W_{t+1}`, in the order of item 2.
 
 The label `⟨m, j⟩` of Specification Section 5 is formed from the position `m` of the product in
-this order.
+this order. A member's label is its own position, so the members of one leaf keep distinct
+labels.
 
 
 ## 7. Verification of the instance
