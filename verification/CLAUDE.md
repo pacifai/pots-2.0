@@ -2401,12 +2401,16 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `write_residuals` (the optional `rho`); `p_layer` and `p_spec_class` come from per-computation
     columns (`_static_columns`, a weak-keyed cache) gathered by the step's `m`, with the dtype
     the per-product lists gave. `write_residuals` builds the arrays on the calling thread and
-    hands `np.savez` to one writer thread, at most one archive in flight; its error is raised
-    by the next `write_residuals`, by `flush()` or by `close`, and `close` joins before it
-    writes `run_end`, so a failed archive leaves none. The file exists only after `flush()` or
-    `close`; every reader in the repo (`load_kept_step`, `evaluation.records`) reads a finished
-    run's directory. The name and class strings stay per-step lists (`np.array` of them is
-    about 20 ms at 393k products; a gather needs a verifying pass that costs as much).
+    hands `np.savez` of an archive of 16 MiB or more to one writer thread, at most one archive
+    in flight; its error is raised by the next `write_residuals`, by `flush()` or by `close`,
+    and `close` joins before it writes `run_end`, so a failed archive leaves none. Such a file
+    exists only after `flush()` or `close`; every reader in the repo (`load_kept_step`,
+    `evaluation.records`) reads a finished run's directory. FS52b: a smaller archive is written
+    on the calling thread, since its `np.savez` is mostly interpreter work that holds the GIL,
+    so a thread only moves it into the next step's sections (the MLP's metrics overhead went
+    from 1% to 36% with every archive on the thread). The name and class strings stay per-step
+    lists (`np.array` of them is about 20 ms at 393k products; a gather needs a verifying pass
+    that costs as much).
     `model`, `corpus`, `attack` (`VERIF_ATTACK`, `None` for a run on other data) and `seed`
     go into the `environment` record and every `step` record. The `environment` record
     (`environment_record`) also holds the allocator's settings (`allocator_settings`): both
