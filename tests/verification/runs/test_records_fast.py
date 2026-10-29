@@ -259,6 +259,7 @@ def test_a_writer_error_surfaces_at_close_with_no_run_end(c, tmp_path, monkeypat
         raise OSError("disk full")
 
     monkeypatch.setattr(metrics.np, "savez", boom)
+    monkeypatch.setattr(metrics, "ARCHIVE_THREAD_MIN_BYTES", 0)  # the thread path (FS52b)
     mw = MetricsWriter(tmp_path, "r")
     mw.write_residuals("s", 1, _stats_one(), None, k=K)  # returns: the error is in the thread
     with pytest.raises(OSError, match="disk full"):
@@ -278,6 +279,7 @@ def test_a_writer_error_surfaces_at_the_next_write(c, tmp_path, monkeypatch):
         real(path, **arrays)
 
     monkeypatch.setattr(metrics.np, "savez", once)
+    monkeypatch.setattr(metrics, "ARCHIVE_THREAD_MIN_BYTES", 0)  # the thread path (FS52b)
     mw = MetricsWriter(tmp_path, "r")
     mw.write_residuals("s", 1, _stats_one(), None, k=K)
     with pytest.raises(OSError, match="first fails"):
@@ -298,6 +300,7 @@ def test_close_waits_for_the_archive_in_flight(tmp_path, monkeypatch):
         real(path, **arrays)
 
     monkeypatch.setattr(metrics.np, "savez", slow)
+    monkeypatch.setattr(metrics, "ARCHIVE_THREAD_MIN_BYTES", 0)  # the thread path (FS52b)
     mw = MetricsWriter(tmp_path, "r")
     path = mw.write_residuals("s", 1, _stats_one(), None, k=K)
     assert not path.exists()  # still being written
