@@ -3382,7 +3382,7 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `repo_o18/`, O18's merge without the host-side fixes, and records `o18_commit`; the profiling
     session's host-side arms run it. A bad REV stops the prep (exit 1) naming its flag, and
     kernel-speed refuses both flags (exit 2). FS49's runbook command is
-    `fs11_prep --out DIR --base-commit 387b991 --o18-commit 3dbf7aa`.
+    `fs11_prep --out DIR --base-commit 387b991 --o18-commit c3f8d37`.
     Every cached file is checked against its blob name first. It never downloads and never
     packs the cache's token; a pinned model missing from the cache is reported (exit 1 for a run model). The
     unsloth mirror needs only its config and tokenizer (`CONFIG_ONLY`): E6 times Meta's weights

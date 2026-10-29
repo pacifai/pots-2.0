@@ -1482,9 +1482,9 @@ verifier devices exclude the prover's) change no bit, and this session measures 
 one pod. The full prep command is
 
     HF_HUB_OFFLINE=1 .venv/bin/python -m verification.runs.fs11_prep --out DIR \
-        --base-commit 387b991 --o18-commit 3dbf7aa
+        --base-commit 387b991 --o18-commit c3f8d37
 
-where `387b991` is the code before O18 and `3dbf7aa` the O18 merge without the host-side fixes
+where `387b991` is the code before O18 and `c3f8d37` the O18 merge without the host-side fixes
 (`fs11_prep.py --o18-commit REV`, the fs11 session only, packs `repo_o18/` the way `repo_base/` is
 packed and records `o18_commit` in the manifest; the pod's upload check verifies it too). The
 code under test, "main", is the checkout's own (`repo/`). For Llama-3.2-1B

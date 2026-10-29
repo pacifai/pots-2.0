@@ -681,7 +681,7 @@ def test_the_readme_gives_the_cost_line_the_ratios_and_the_interval():
     assert est + fs.FOUR_PACK_MIN + fs.FOUR_GRACE_MIN == 117
     assert -(-(117 + 20) * 2 * 60 // 100) * 100 == 16500
     assert "sleep` of 16,500 s" in sec and "21 + 3 x 15 + 10 + 20 = 96 min" in sec
-    assert "--o18-commit 3dbf7aa" in sec and "--base-commit 387b991" in sec
+    assert "--o18-commit c3f8d37" in sec and "--base-commit 387b991" in sec
     assert "about 111 min" in sec and "`VERIF_RELEASE_CACHE` unset" in sec
     assert "wall time" in sec and "verify_over_train_accumulated" in sec
     assert "(accumulated GPU time)" in sec
