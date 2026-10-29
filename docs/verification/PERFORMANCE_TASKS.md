@@ -313,6 +313,21 @@
   session should pin each process to its GPU's NUMA node (node 1 on the 2026-10-19 one-GPU
   pod). On the four-GPU pod the prover's process goes to GPU 0's node and the verifier's to
   the node of GPUs 1–3, or the record says they span nodes (`nvidia-smi topo -m`).
+- **O18 — One leaf per attention product (a protocol change).** *From FS42's profile; added with
+  the user's yes, 2026-10-26; taken up by the user the same day as a protocol change, plan in
+  `ATTENTION_LEAF_PLAN_DRAFT.md`, approved 2026-10-28 and being built (FS44–FS49, milestone
+  FM12; `IMPLEMENTATION_PLAN.md`).* Commit all `(s, h)` members of an attention product as one
+  leaf. Llama-3.2-1B's leaves drop from about 394k to under 1,000 (estimate), so most of the
+  per-leaf work and check 5's per-member serving goes. The two same-bits alternatives, batching
+  the per-leaf work (O15) and the cross-process store (O16), are archived in
+  `archive/LEAF_SPEED_ALTERNATIVES.md`. It reopens P9b (`DECISIONS_SETUP.md`, 2026-09-30), whose
+  rejection of one leaf per batched operation rested on "nothing is saved, since the verifier
+  reads every product anyway"; FS42 measured per-leaf host work at 85–90% of the step. Price: a
+  leaf no longer names one challenge label `m` (P8a), so opening one member opens the whole
+  product; the spec, the reference block, the leaf counts in `verification/CLAUDE.md` and every
+  root change. Its effect on the floors and on soundness was worked through with the user on
+  2026-10-26: the detection floor and `k` stay, the hashing floor drops, and the one deficit is
+  coarser openings (plan §1).
 - **Deferred with O10–O13:** overlapping check 5 with check 2's CPU hashing. Check 2's flow
   was redone: a leaf on a GPU is hashed by F23's kernel (FS34), and O2's measure stream per
   device (FS39) covers the overlap there. Open for the one-H100 path's CPU hashing only.

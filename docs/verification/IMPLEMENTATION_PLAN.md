@@ -461,6 +461,22 @@ change `setup/data.py`, the config and the pinned roots.
 | FS39 | Overlap with the glue (2.5): a measure stream per device, one unit in flight, holds, worker-thread challenges, pinned row readback; the metrics of 2.7 | FS38 | on the A40 rows and verdicts equal FS38's bit for bit, a write to a held operand raised; on a two-GPU NVLink pod (two A100 SXM, about $3.6 per hour) with `VERIF_VERIFIER_DEVICES`, rows and verdicts equal the one-GPU run's |
 | FS40 | H100 timing: one verified step per full-scale model, traced on Llama-3.2-1B, check 5's sections against the plan's estimates, the band fit rerun with the kernel (one H100 SXM, about $4 per hour, about 1.5 h) | FS39 | each model's `5.measure` and verifier time reported against the 2026-10-20 pod's, the kernel equal to the host build on sampled products → **Milestone FM11** |
 | FS41 | The GPU challenge source: the hashing session's keyed XOF behind `ChallengeSource` (2.6) | FS39, the hashing session's XOF | on a CUDA GPU the device challenges equal `challenge_matrices`' bit for bit for every product of a step; FS40's Llama step timed again |
+| FS44 | One leaf per attention product (O18), the amendments: spec §4.1, the reference block §5–§6, `DECISIONS_SETUP.md` P9b and P8a, this table, `STATUS.md`, `PERFORMANCE_TASKS.md` O18 (orchestrator) | the user's approval (2026-10-28) | the texts are in, the files unlocked |
+| FS45 | O18's code core, in three parts (`ATTENTION_LEAF_PLAN_DRAFT.md` §5): FS45a `C`'s leaf map, placement, the commitment's slots, `leaf_sizes` and the reads; FS45b labeling into product leaves and `prove_step`; FS45t the security tests of §4.1 | FS44 beside FS45a and FS45t; FS45a before FS45b | an honest SmolLM2 step commits 1,361 leaves and is accepted; §4.1's five tests pass |
+| FS46 | O18: the capture's arrival hashing of whole outputs | the user's approval | the capture's tests pass on the Mac; its CUDA tests on the A40 in FS48 |
+| FS47 | O18: the runs and tools (sweep, work rows, the device-leaves line and gate, card names), and the remaining test fallout (FS47x) | FS45b | the fast suite passes on `o18-leaves` |
+| FS48 | O18's test-scale acceptance (plan §4.2) and the A40 run (§4.3) | FS45–FS47 | every item of §4.2 and §4.3 holds; then the Opus validator |
+| FS49 | O18's four-H100 measurement (§4.3), with the A/B arm on the code before the change, with the user's go on the pod | FS48, the validator | all three models accepted in both loops, roots equal across loops; sections and step interval against FS42 and the A/B arms → **Milestone FM12** |
+
+**One leaf per attention product (O18; user, 2026-10-26, plan approved 2026-10-28).** A protocol
+change: the members of each attention product share one Merkle leaf; every member keeps its own
+matmul, label and challenges. `ATTENTION_LEAF_PLAN_DRAFT.md` holds the reasoning (§1), the
+amendments (§2.5), the interface pins every agent codes against (§2.6), the code changes by
+module (§3), the tests and acceptance (§4) and the agent waves (§5). The feature is built on the
+branch `o18-leaves` and merged into `verification-impl` once, after FS48 and the validator.
+FS44–FS49 make **FM12**. Agent rule: the profiling tasks' (an Opus orchestrator; Sonnet coders,
+testers and reviewers at medium effort, at most 10 at once; a fresh Opus validator at xhigh
+effort per feature).
 
 **Resource profiling (user, 2026-10-18).** The user asked for full resource profiling of the
 full-scale runs: time and utilization per protocol section, tied to the hardware parts, with
