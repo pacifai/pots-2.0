@@ -39,6 +39,19 @@ EQ18 closed on 2026-10-08, and the user approved `EVALUATION_SPEC.md` the same d
   a figure.
   - Came from: the hardware-environment exploration, 2026-10-19 (the user called it "an
     interesting comparison").
+- **E4 — The plain-training baseline reloads every weight each step.** *From FS49's profile
+  (O18's milestone FM12); added with the user's yes, 2026-10-29.* The plain-training baseline
+  (P0, run H3) is the denominator of every verify ÷ train ratio, the PoTS comparison's
+  included (EQ12). Its load section copies every fp32 master weight from host memory to GPU 0
+  each step (`plain_step` loads from the host `W_t` in the unsharded placement), so its step
+  time is training plus a copy the verified run doesn't make: on four H100s the load takes
+  0.19 s, 0.47 s and 0.61 s (Qwen2.5-0.5B, Llama-3.2-1B, Falcon3-1B), against forward,
+  backward and update of 0.27 s, 0.41 s and 0.44 s, and the verified run's load 0.02 s
+  (measured). Against training itself the pipelined step is 5.0–7.4×; against the plain step,
+  2.1–4.4×. Open: whether H3 keeps the weights on the GPU between steps, as training
+  does and the verified run does, or the cost grid divides by training's own sections; and
+  whether any figure or ratio already reported used the plain step.
+  - Came from: the step-time comparison in FM12's review, 2026-10-29.
 
 Section references (§3, §5, §9) point to `DECISIONS_ALGORITHM.md`, §8.A and S-items to
 `DECISIONS_SETUP.md` or `SETUP_TASKS.md`.

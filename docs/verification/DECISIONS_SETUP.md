@@ -1337,7 +1337,8 @@ bespoke loop, not the repo's CUDA-hardcoded `model_loader`; MLP-then-transformer
         hashing, the cross-process store) was 85–90% of the step, about 30–40 µs a leaf over
         Llama-3.2-1B's 393,996 leaves, 393,216 of them attention members. The change takes
         Llama to 876 leaves; the plan estimates the pipelined step interval from 12.5 s to
-        about 6.3 s (estimate, to be measured by FS49).
+        about 6.3 s (estimate). FS49 measured 11 s before and 3.8 s after on one four-H100
+        pod (2026-10-29), 2.5 s with the host-side fixes (`ATTENTION_LEAF_PLAN_DRAFT.md` §4.3).
       - *What it costs.* Soundness doesn't change: no term of the floor
         `f = c·τ·e·2^(N/k)`, `N = λ + log₂T + log₂M + log₂G`, counts leaves; `M` still counts
         matmuls, so `N`, `k` and the bands stay. A grinding attempt re-hashes an altered leaf

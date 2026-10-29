@@ -474,7 +474,8 @@ matmul, label and challenges. `ATTENTION_LEAF_PLAN_DRAFT.md` holds the reasoning
 amendments (§2.5), the interface pins every agent codes against (§2.6), the code changes by
 module (§3), the tests and acceptance (§4) and the agent waves (§5). The feature is built on the
 branch `o18-leaves` and merged into `verification-impl` once, after FS48 and the validator.
-FS44–FS49 make **FM12**. Agent rule: the profiling tasks' (an Opus orchestrator; Sonnet coders,
+FS44–FS49 make **FM12**, closed by the user on 2026-10-29 after FS49's four-H100 measurement
+(plan §4.3). Agent rule: the profiling tasks' (an Opus orchestrator; Sonnet coders,
 testers and reviewers at medium effort, at most 10 at once; a fresh Opus validator at xhigh
 effort per feature).
 

@@ -241,10 +241,15 @@ pod 4.5 h, H100 job 3.5 h. Mac rehearsal: Qwen2.5-0.5B refusal at
   (FS48: run_verified bit-identical to the plain baseline, every cheat caught where expected,
   store cross-check, k tunability, the slow suite, whose two stale-count failures were fixed and
   rerun) and the A40 GPU check passed; the validator passed in three rounds, nothing blocking.
-  **Next: FS49**, the four-H100 measurement, which the user chose (2026-10-28) to run on one pod
-  together with the host-side arms (FS54), after the host-side changes are merged onto c3f8d37
-  (`--base-commit 387b991 --o18-commit c3f8d37`); its price is quoted to the user before the pod
-  is rented. Then **Milestone FM12**. The two
+  **FS49 ran on 2026-10-29**, the four-H100 measurement, on one pod together with the
+  host-side arms (FS54) on the merged code (b18a3f0, `--base-commit 387b991 --o18-commit
+  c3f8d37`; about 75 minutes, about $20 by time × price): every arm accepted, roots equal
+  across loops. On Llama-3.2-1B, same pod, steady steps 2–3 (measured), the step interval went
+  from 14 s to 4.2 s sequential and from 11 s to 3.8 s pipelined (the plan's estimate: 6.3 s),
+  and with the host-side fixes to 2.8 s and 2.5 s; with both changes Qwen2.5-0.5B takes 2.5 s
+  and 2.0 s and Falcon3-1B 2.6 s and 2.2 s. **Milestone FM12 closed by the user on
+  2026-10-29**: O18 moved to Done in `PERFORMANCE_TASKS.md`, and the plan's §4.3 holds what it
+  removed and the remaining bottlenecks. The two
   same-bits alternatives, batching the per-leaf work (O15) and the cross-process store (O16),
   are archived in `archive/LEAF_SPEED_ALTERNATIVES.md`.
   **Resource profiling (user, 2026-10-18).** `archive/PROFILING_PLAN.md` holds the plan: tasks
@@ -542,7 +547,7 @@ pod 4.5 h, H100 job 3.5 h. Mac rehearsal: Qwen2.5-0.5B refusal at
 
 The session-start hook reads the phrase "the next item is **ID**" in the setup line, so
 keep that wording when you update it. It builds its task menu from the `- **ID — Title.**`
-| `ATTENTION_LEAF_PLAN_DRAFT.md` | Draft plan for committing each attention product's members as one leaf: spec and decision changes, code, tests and measurement (O18), drafted 2026-10-26, approved 2026-10-28, built and merged 2026-10-28 (c3f8d37); FS49's measurement waits |
+| `ATTENTION_LEAF_PLAN_DRAFT.md` | Draft plan for committing each attention product's members as one leaf: spec and decision changes, code, tests and measurement (O18), drafted 2026-10-26, approved 2026-10-28, built and merged 2026-10-28 (c3f8d37), measured on four H100s (FS49) and closed at FM12 on 2026-10-29 |
 items of the four task files.
 
 ## Files

@@ -313,21 +313,21 @@
   session should pin each process to its GPU's NUMA node (node 1 on the 2026-10-19 one-GPU
   pod). On the four-GPU pod the prover's process goes to GPU 0's node and the verifier's to
   the node of GPUs 1–3, or the record says they span nodes (`nvidia-smi topo -m`).
-- **O18 — One leaf per attention product (a protocol change).** *From FS42's profile; added with
-  the user's yes, 2026-10-26; taken up by the user the same day as a protocol change, plan in
-  `ATTENTION_LEAF_PLAN_DRAFT.md`, approved 2026-10-28 and being built (FS44–FS49, milestone
-  FM12; `IMPLEMENTATION_PLAN.md`).* Commit all `(s, h)` members of an attention product as one
-  leaf. Llama-3.2-1B's leaves drop from about 394k to under 1,000 (estimate), so most of the
-  per-leaf work and check 5's per-member serving goes. The two same-bits alternatives, batching
-  the per-leaf work (O15) and the cross-process store (O16), are archived in
-  `archive/LEAF_SPEED_ALTERNATIVES.md`. It reopens P9b (`DECISIONS_SETUP.md`, 2026-09-30), whose
-  rejection of one leaf per batched operation rested on "nothing is saved, since the verifier
-  reads every product anyway"; FS42 measured per-leaf host work at 85–90% of the step. Price: a
-  leaf no longer names one challenge label `m` (P8a), so opening one member opens the whole
-  product; the spec, the reference block, the leaf counts in `verification/CLAUDE.md` and every
-  root change. Its effect on the floors and on soundness was worked through with the user on
-  2026-10-26: the detection floor and `k` stay, the hashing floor drops, and the one deficit is
-  coarser openings (plan §1).
+- **O19 — The verifier GPUs take turns in check 5.** *From FS49's profile (O18's milestone
+  FM12); added with the user's yes, 2026-10-29.* On the four-H100 layout each verifier GPU
+  owns a block of layers (F22), and check 5 serves its units in layer order with one step's
+  measuring in flight per device (FS39), so the three GPUs measure one after another. In FS49's
+  traced sequential step on Llama-3.2-1B (the trace's busy spans per GPU, measured), check 5 took
+  1.7 s: exactly one verifier GPU busy for 1.44 s, two for 0.06 s, none for 0.2 s. Each GPU's
+  own work is about 0.5 s, about 0.43 s of it the measuring kernel at about 10% occupancy (O2).
+  Qwen2.5-0.5B and Falcon3-1B show the same pattern. Floor: 0.04–0.1 s (memory bandwidth);
+  with the three GPUs working at once, check 5 would take about 0.55 s on Llama-3.2-1B
+  (estimate), against 1.6 s pipelined now. Options, every number the same since judging stays
+  in canonical order at the end (FS38a): serve the backward units round-robin over their owner
+  GPUs, so each device's measuring overlaps the others' serving, if the unit schedule leaves
+  that order free (the forward replay runs once through the layers in order); or one host
+  thread per verifier GPU, each serving its own block. The kernel's occupancy (O2) shrinks each
+  GPU's share either way.
 - **Deferred with O10–O13:** overlapping check 5 with check 2's CPU hashing. Check 2's flow
   was redone: a leaf on a GPU is hashed by F23's kernel (FS34), and O2's measure stream per
   device (FS39) covers the overlap there. Open for the one-H100 path's CPU hashing only.
@@ -359,3 +359,21 @@ hashing for checks 0 and 8.
   noise, so the finiteness pass remains the largest part of commit and check 2. Any further
   gain belongs with F15 (hashing throughput at full scale), for example a native kernel that
   checks and hashes in one pass.
+
+The leaf-count item O18 came from FS42's four-H100 profile (2026-10-25), which found step time
+following the leaf count, not bytes or FLOPs.
+
+- O18, one leaf per attention product, a protocol change (plan `ATTENTION_LEAF_PLAN_DRAFT.md`,
+  approved 2026-10-28; FS44–FS49; merge `c3f8d37`, 2026-10-28). The `n_s·n_h` members of each
+  attention product of a layer share one leaf; each member keeps its own matmul, label `m` and
+  challenges (`DECISIONS_SETUP.md` P9b and P8a, amended). Leaves per step: Llama-3.2-1B 876 (was
+  393,996), Qwen2.5-0.5B 1,380, Falcon3-1B 968, SmolLM2 at test scale 1,361 (was 7,661). Its
+  measurement (FS49, one four-H100 pod, 2026-10-29, steady steps 2–3, measured): on
+  Llama-3.2-1B the step interval went from 14 s to 4.2 s sequential and from 11 s to 3.8 s
+  pipelined, against the plan's estimate of 6.3 s pipelined; labeling 2.8 s → 0.03 s, the
+  commit's hashing 2.3 s → about 0, check 2 3.5 s sequential and 6.6 s pipelined → 0.07 s, the
+  store write and the hand-off's totals 1.0 s and 0.6 s → 0. With the host-side fixes
+  (`HOST_SIDE_PLAN_DRAFT.md`, FM13) the step interval is 2.8 s and 2.5 s (Llama-3.2-1B), 2.5 s
+  and 2.0 s (Qwen2.5-0.5B) and 2.6 s and 2.2 s (Falcon3-1B), sequential and pipelined. Every
+  arm was accepted, with roots equal across loops. The results and the remaining bottlenecks
+  are in the plan's §4.3. Milestone FM12 closed by the user on 2026-10-29.

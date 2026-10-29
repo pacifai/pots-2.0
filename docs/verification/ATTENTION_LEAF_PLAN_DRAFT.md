@@ -13,7 +13,8 @@ same day as a protocol change (`PERFORMANCE_TASKS.md`): commit all `(s, h)` memb
 attention product as one leaf of the step's Merkle tree, while every member stays its own
 matmul `P_m` with its own label `m` and its own `k` challenges. The two same-bits
 alternatives, batching the per-leaf work (O15) and the cross-process store (O16), are archived
-in `archive/LEAF_SPEED_ALTERNATIVES.md`.
+in `archive/LEAF_SPEED_ALTERNATIVES.md`. **Built and merged 2026-10-28 (c3f8d37); measured on
+four H100s (FS49, §4.3) and closed by the user at Milestone FM12 on 2026-10-29.**
 
 What changes: the leaf sequence of spec §4.1 (a batched product's members share one leaf),
 P9b's "one leaf per mathematical object" for those products (`DECISIONS_SETUP.md`), the
@@ -462,7 +463,41 @@ run) change; the final weights' root (`bb9aec2a…`), `h_D` and the band-file ha
   FS54 are merged on top of this change, so every comparison is on one host. The other
   session's figures for the combined run: parts about 96 minutes, about $30; job deadline
   14,100 s (about $63), boot guard 16,500 s (about $73). The exact price is quoted to the user
-  again before the pod is rented.
+  again before the pod is rented. *Done 2026-10-29* (code at b18a3f0, the host-side changes
+  merged on this change; the pod lived about 75 minutes, about $20 by time × price, and is
+  deleted). Steady steps 2–3, measured; profiles in
+  `trainer_output/verification/fs49_four_h100_profile_2026-10-29/profiles/`.
+  - *Acceptance.* Every arm accepted on every step. The arms on the code before the change
+    have other roots, as they must; this change alone, this change with the host-side fixes,
+    and the arm with the cache release forced on give identical roots, step records and
+    residual archives. The largest GPU peak is 55 GiB, on the prover's GPU; the verifier GPUs
+    stay at or under 42 GiB.
+  - *Step interval, Llama-3.2-1B, same pod.* Before the change 14 s sequential and 11 s
+    pipelined; this change alone 4.2 s and 3.8 s; with the host-side fixes 2.8 s and 2.5 s.
+    Qwen2.5-0.5B and Falcon3-1B ran with both changes only: 2.5 s and 2.0 s, and 2.6 s and
+    2.2 s, against FS42's 12 s and 9.5 s, and 6.5 s and 5.2 s (another pod and an older
+    commit, so a rough "before").
+  - *What the change removed (Llama-3.2-1B).* Labeling 2.8 s → 0.03 s; the commit's hashing
+    2.3 s → about 0, its digests now coming from the capture's arrival hashing; check 2 3.5 s
+    sequential and 6.6 s pipelined → 0.07 s; the store write and the hand-off's totals 1.0 s
+    and 0.6 s → 0. Every row 1.3 targeted came in at or under its estimate. The step beat the
+    6.3 s estimate because two rows 1.3 held fixed were smaller on this pod: check 5 took
+    2.5 s on the code before the change, not FS42's 3.4 s, and the time between steps fell
+    from about 1.4 s to 1.0 s.
+  - *The training yardstick.* Forward, backward and update take 0.27 s, 0.41 s and 0.44 s
+    (Qwen2.5-0.5B, Llama-3.2-1B, Falcon3-1B). The plain run's step also copies every fp32
+    weight from host memory to GPU 0 (0.19 s, 0.47 s, 0.61 s), which the verified run doesn't,
+    so its step time overstates training. Against training itself, the pipelined step interval
+    is 7.4×, 6.1× and 5.0×, the verifier's time 6.1×, 5.0× and 4.4×, and the accumulated GPU
+    time per pipelined step 5.7 s, 6.9 s and 6.5 s.
+  - *Remaining bottlenecks (Llama-3.2-1B, pipelined, 2.5 s; the verifier sets the pace).*
+    Check 5 1.6 s against a floor of 0.04–0.1 s: in the traced step one verifier GPU at a time
+    is busy for 1.4 s of its 1.7 s, each GPU's own work being about 0.5 s, about 0.43 s of it
+    the measuring kernel at about 10% occupancy (O2). The time between steps 0.43 s (O17).
+    Check 6a 0.28 s, host-bound: about 26,000 kernel launches and 1,900 reads to the host a
+    step (O1). Training under capture 0.48–0.67 s against 0.27–0.44 s plain, off the critical
+    path when pipelined. Step 1 builds the verifier's model inside check 5 (O14), 6.6 s once
+    per run.
 
 ## 5. Tasks
 
