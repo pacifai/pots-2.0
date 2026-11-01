@@ -392,6 +392,35 @@ def test_the_gpu_note_for_three_verifier_gpus():
     assert "run on the verifier GPUs, so" in flow and "four GPUs" not in flow
 
 
+def test_the_gpu_note_layouts_and_plurals():
+    def r(*pairs):
+        return [{"device": d, "roles": list(ro)} for d, ro in pairs]
+    one = two_gpu_flow(r(("cuda:0", ["prover", "verifier"])))
+    assert "GPUs (" not in one and "GPU (" not in one and "understates" not in one
+    pair = two_gpu_flow(r(("cuda:0", ["prover", "verifier"]), ("cuda:1", ["verifier"])))
+    assert "With 2 GPUs (cuda:0 trains and verifies; cuda:1 verifies)" in pair
+    assert "run partly on cuda:1" in pair and "peer copies of the products to that GPU" in pair
+    two = two_gpu_flow(r(("cuda:0", ["prover"]), ("cuda:1", ["verifier"])))
+    assert "With 2 GPUs (cuda:0 trains; cuda:1 verifies)" in two
+    four = two_gpu_flow(r(("cuda:0", ["prover"]), ("cuda:1", ["verifier"]),
+                          ("cuda:2", ["verifier"]), ("cuda:3", ["verifier"])))
+    assert "With 4 GPUs (cuda:0 trains; cuda:1, cuda:2, cuda:3 verify)" in four
+    provs = two_gpu_flow(r(("cuda:0", ["prover"]), ("cuda:1", ["prover"]),
+                           ("cuda:2", ["verifier"])))
+    assert "With 3 GPUs (cuda:0, cuda:1 train; cuda:2 verifies)" in provs
+    bad = two_gpu_flow(r(("<b>", ["prover"]), ("cuda:1", ["verifier"])))
+    assert "&lt;b&gt; trains" in bad and "<b> trains" not in bad
+
+
+def test_steps_steady_of_only_nulls_has_no_summary_rows():
+    v = steps_view()
+    v["steps_steady"] = {k: None for k in v["steps_steady"]}
+    p = profile(runs={"honest": v})
+    p["comparisons"] = {"sections": {}, "step": {"training_proper_s": 0.5}}
+    out = panel(page(p), "r0-steps")
+    assert "Steady mean" not in out and "÷ training proper</td>" not in out
+
+
 def test_the_gpu_note_is_left_out_without_roles():
     for roles in (None, []):
         flow = two_gpu_flow(roles)
@@ -455,7 +484,7 @@ def test_plain_panel_divides_by_training_proper_when_present():
                                  "verifier_side_s": 0.25, "training_proper_s": 0.3,
                                  "reload_s": 0.2}
     out = panel(page(p), "r0-plain")
-    assert "÷ training proper" in out and "÷ plain<" not in out
+    assert "<th>Ratio</th>" in out and "÷ plain<" not in out
     assert "against training proper</td><td>1.5</td><td>0.30</td><td>5.0</td>" in out
     assert "Prover&#x27;s work per step against training proper</td><td>0.75</td><td>0.30</td>" \
         "<td>2.5</td>" in out
