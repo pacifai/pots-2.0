@@ -347,3 +347,16 @@ def test_two_gpus_smollm2_hint_never_misses_and_digests_equal(monkeypatch):
     pairs = list(zip(ref.leaves()[len(ref.records):], out.leaves()[len(out.records):]))
     for i, (x, y) in enumerate(pairs):
         assert same(x, y), i
+
+
+# ---- staging (FS58) ----------------------------------------------------------------------
+
+
+def test_staging_needs_a_sharded_placement_and_a_cuda_device():
+    with pytest.raises(ValueError, match="sharded"):
+        MatmulCapture(staging="cuda:0")
+    with pytest.raises(ValueError, match="sharded"):
+        MatmulCapture(placement=tiny(("qwen2", False)).placement, staging="cuda:0")
+    sharded = tiny(("qwen2", False), devices=THREE).placement
+    with pytest.raises(ValueError, match="CUDA"):
+        MatmulCapture(placement=sharded, staging="cpu")

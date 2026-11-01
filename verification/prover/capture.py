@@ -157,6 +157,13 @@ A wrong hint costs a copy, never a bit. The copy:
   :class:`MutatedCaptureError`, and never a digest of a later version); a hint that is the host
   takes the host-buffer path above.
 
+**Staging (FS58).** With ``staging`` set (a CUDA device, sharded placement only) every GPU
+product goes to that device instead of its hint, which is still computed and recorded, so the
+unit tracking and the intended owner stay. The prover's own GPU is the usual choice, so the
+output is already there and takes the in-place path: hashed on arrival on that device's side
+stream, never moved. The pipelined loop with one verifier GPU keeps the products on the
+prover's GPU this way until its process ships them. Unset, nothing changes.
+
 On CPU nothing is copied, but the hint is computed and counted all the same.
 """
 
@@ -415,8 +422,20 @@ class MatmulCapture(TorchDispatchMode):
     def __init__(self, param_names: Mapping[int, str] | None = None,
                  buffers: HostBuffers | None = None,
                  placement: Placement | None = None, *, hash_arrivals: bool = True,
-                 hasher: GpuBlake3 | None = None) -> None:
+                 hasher: GpuBlake3 | None = None,
+                 staging: torch.device | str | None = None) -> None:
         super().__init__()
+        # FS58: keep every CUDA product on this device instead of its hint (module docstring).
+        self.staging: torch.device | None = None
+        if staging is not None:
+            dev = torch.device(staging)
+            if dev.type != "cuda":
+                raise ValueError(f"staging must be a CUDA device, got {dev}")
+            if placement is None or not placement.sharded:
+                raise ValueError("staging needs a sharded placement")
+            if dev.index is None:
+                dev = torch.device("cuda", torch.cuda.current_device())
+            self.staging = dev
         # FS30: hash each CUDA product on arrival: unsharded, on the side stream after its host
         # copy; sharded (FS34), on the owner after the peer copy or where it is kept.
         # ``hasher`` is the kernel's host for tests.
@@ -563,7 +582,7 @@ class MatmulCapture(TorchDispatchMode):
             if rec.hint is None or rec.hint.type == "cpu":
                 self._offload(rec)
             else:
-                self._route(rec)
+                self._route(rec, self.staging)  # None: the hint (FS58)
 
     def _hint(self, rec: MatmulRecord) -> torch.device:
         """The device to send ``rec``'s output to (module docstring). Operand storages are held
@@ -592,7 +611,8 @@ class MatmulCapture(TorchDispatchMode):
         ``device_of(g)``, ``g`` being the leaf's position, and keep the count for
         :meth:`summary`. A leaf that is a record's output (or a view of it) is judged by that
         record's hint, so a CPU run checks the hint too; any other leaf (the δK̃ transpose, a
-        new tensor) by the device it sits on, and not at all on the CPU."""
+        new tensor) by the device it sits on, and not at all on the CPU. With ``staging`` set
+        such a leaf is a miss only when it is off the staging device (FS58)."""
         hints = {StorageWeakRef(r.out.untyped_storage()): r.hint
                  for r in self.records + self.glue_outer if r.hint is not None}
         miss = 0
@@ -600,14 +620,18 @@ class MatmulCapture(TorchDispatchMode):
             at = hints.get(StorageWeakRef(p.untyped_storage()))
             if at is None and p.device.type == "cpu":
                 continue  # a new CPU tensor was never sent anywhere: nothing to judge
+            if at is None and self.staging is not None:
+                miss += p.device != self.staging
+                continue
             miss += (p.device if at is None else at) != device_of(g)
         self.n_hint_misses = miss
         return miss
 
-    def _route(self, rec: MatmulRecord) -> None:
-        """Peer-copy a GPU output to ``rec.hint``, whole, on the source device's side stream;
-        ``rec.out`` becomes the copy (module docstring)."""
-        out, dest = rec.out, rec.hint
+    def _route(self, rec: MatmulRecord, dest: torch.device | None = None) -> None:
+        """Peer-copy a GPU output to ``dest`` (default ``rec.hint``), whole, on the source
+        device's side stream; ``rec.out`` becomes the copy (module docstring)."""
+        out = rec.out
+        dest = rec.hint if dest is None else dest
         assert dest is not None
         if out.device == dest:
             self._hash_in_place(rec)  # already on its owner: kept, as on CPU
@@ -835,4 +859,5 @@ class MatmulCapture(TorchDispatchMode):
             "q_max": max(qs) if qs else None,
             "output_bytes": sum(r.out.numel() * r.out.element_size() for r in self.records),
         } | ({"arrival_hash": dict(self._arrival_stats)} if self._arrival_stats["records"]
-             else {}) | ({} if self.placement is None else {"hint_misses": self.n_hint_misses})
+             else {}) | ({} if self.placement is None else {"hint_misses": self.n_hint_misses}
+                         ) | ({} if self.staging is None else {"staging": str(self.staging)})

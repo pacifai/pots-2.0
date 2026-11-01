@@ -77,3 +77,37 @@ def test_a_cuda_prover_with_an_unsharded_placement_is_refused():
     assert not c.placement.sharded
     with pytest.raises(ValueError, match="sharded"):
         run_loop(c, None, D, w0, None, final={}, pipelined=True, prover=P.DecoderSpec(None))
+
+
+@pytest.mark.skipif(not TWO, reason="needs two CUDA devices")
+def test_one_verifier_gpu_runs_staged_and_equals_sequential():
+    """Prover cuda:0, verifier cuda:1: auto staging is on, and the run is the sequential run."""
+    P.determinism("cuda:0")
+    w = _world()
+
+    def run(pipelined):
+        return run_scenario(w.c, w.D, w.w0, Scenario("x", "", HONEST.fault, Expected()),
+                            T=w.T, k=K, seed=SEED, final=w.final, pipelined=pipelined,
+                            prover=w.spec if pipelined else None)
+
+    a, b = run(False), run(True)
+    assert b.loop.child_info["staging"] is True and b.loop.child_info["max_unreleased"] == 1
+    assert b.loop.child_info["verifier_reserved"] == {"cuda:1": 0}  # the child never used it
+    assert_equal(a, b)
+
+
+@pytest.mark.skipif(not TWO, reason="needs two CUDA devices")
+def test_a_staged_product_flip_rejects_where_the_sequential_run_does():
+    P.determinism("cuda:0")
+    w = _world()
+    m = next(s.m for s in w.c.products if s.name.startswith("L2.") and s.kind.name == "FORWARD")
+
+    def run(pipelined):
+        return run_scenario(w.c, w.D, w.w0, Scenario("x", "", FlipProduct(2, m), Expected()),
+                            T=w.T, k=K, seed=SEED, final=w.final, pipelined=pipelined,
+                            prover=w.spec if pipelined else None)
+
+    a, b = run(False), run(True)
+    assert b.loop.child_info["staging"] is True
+    assert b.loop.rejection is not None and b.loop.rejection == a.loop.rejection
+    assert_equal(a, b)

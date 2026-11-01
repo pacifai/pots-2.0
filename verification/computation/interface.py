@@ -264,10 +264,11 @@ def load_weights(computation: DeclaredComputation, model: torch.nn.Module,
 
 
 def snapshot_weights(computation: DeclaredComputation,
-                     model: torch.nn.Module) -> dict[str, torch.Tensor]:
+                     model: torch.nn.Module, *,
+                     device: torch.device | str | None = None) -> dict[str, torch.Tensor]:
     """Copies of ``model``'s declared weights, each on its weight's device
     (``computation.placement.weight_device``: :data:`HOST` unsharded), in ``weight_names``
-    order.
+    order. ``device`` puts every copy there instead (FS58 staging); ``None`` is the above.
 
     The one way to take weights out of a model: the prover's ``W_{t+1}`` leaves (its ``W_t``
     leaves are the caller's tensors where ``prove_step`` can share them, else a clone as here),
@@ -275,7 +276,8 @@ def snapshot_weights(computation: DeclaredComputation,
     included, so both start from the same tensors).
     """
     place = computation.placement
-    return {n: model.get_parameter(n).detach().to(place.weight_device(n), copy=True)
+    return {n: model.get_parameter(n).detach().to(
+                place.weight_device(n) if device is None else device, copy=True)
             for n in computation.weight_names}
 
 
