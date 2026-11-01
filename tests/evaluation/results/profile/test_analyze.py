@@ -1264,3 +1264,142 @@ def test_an_empty_trace_entry_is_a_trace_not_a_missing_one(tmp_path):
 def test_peer_bytes_are_a_float_even_without_pairs(tmp_path):
     _, a = kind_floors(tmp_path, kinds(h2d_pinned=1e9))
     assert isinstance(a["work"]["bytes"]["peer"], float) and a["work"]["bytes"]["peer"] == 0.0
+
+
+# --- FS59a: the per-step prover, verifier and waiting rows -------------------------------------
+
+def _mk_step(step: int, t0_s: float, secs: list[tuple[str, float, float]], close_s: float,
+             traced: bool = False) -> dict:
+    return {"step": step, "traced": traced, "t0_ns": round(t0_s * 1e9),
+            "t1_ns": round((t0_s + close_s) * 1e9),
+            "sections": [{"name": n, "depth": 0, "host_us": [[a * 1e6, b * 1e6]], "rest": None}
+                         for n, a, b in secs]}
+
+
+def _trow(step: int, comp: str, t: float, side: str, traced: bool = False) -> dict:
+    return {"record": "time", "step": step, "side": side, "component": comp, "level": "total",
+            "time_s": t, "traced": traced, "derived": False}
+
+
+def _flow_row(rows, step):
+    return next(r for r in rows if r["step"] == step)
+
+
+def _approx_row(row: dict, want: dict):
+    assert set(row) == {"step", "warmup", "traced", "drain", "prover_s", "verifier_s",
+                        "prover_wait_s", "verifier_wait_s", "handoff_s", "interval_s",
+                        "latency_s"}
+    for k, v in want.items():
+        if isinstance(v, float):
+            assert row[k] == pytest.approx(v, abs=1e-9), k
+        else:
+            assert row[k] == v, k
+
+
+def test_step_flow_of_a_sequential_run():
+    # step k opens at 10k s: prover 0-0.7, verifier 0.8-2.3 (a hand-off section 2.3-2.4 is left
+    # out of both), the step closes 2.5 s after it opened; step 2 is traced
+    secs = [("train.forward", 0.0, 0.7), ("4", 0.8, 2.3), ("handoff.release", 2.3, 2.4)]
+    steps = [_mk_step(k, 10.0 * k, secs, 2.5, traced=(k == 2)) for k in (0, 1, 2, 3)]
+    recs = [_trow(k, "prover", 0.7, "prover", k == 2) for k in (1, 2, 3)] \
+        + [_trow(k, "verifier", 1.5, "verifier", k == 2) for k in (1, 2, 3)] \
+        + [_trow(3, "step_interval", 9.9, "run")]
+    sides = {"train.forward": "prover"}
+    rows, steady = analyze._step_flow(steps, recs, sides, [3])
+    assert [r["step"] for r in rows] == [1, 2, 3]
+    _approx_row(_flow_row(rows, 1), dict(
+        warmup=False, traced=False, drain=False, prover_s=0.7, verifier_s=1.5,
+        prover_wait_s=None, verifier_wait_s=None, handoff_s=None, interval_s=None,
+        latency_s=None))
+    # step 2: no interval row, so the close difference (10 s); prover wait 20 - 10.7
+    _approx_row(_flow_row(rows, 2), dict(
+        warmup=False, traced=True, drain=False, prover_s=0.7, verifier_s=1.5,
+        prover_wait_s=9.3, verifier_wait_s=8.2, handoff_s=10.0 - 1.5 - 8.2, interval_s=10.0,
+        latency_s=None))
+    # step 3: the interval row (9.9) wins over the close difference
+    _approx_row(_flow_row(rows, 3), dict(
+        warmup=False, traced=False, drain=False, prover_s=0.7, verifier_s=1.5,
+        prover_wait_s=9.3, verifier_wait_s=8.2, handoff_s=9.9 - 1.5 - 8.2, interval_s=9.9,
+        latency_s=None))
+    assert steady["prover_wait_s"] == pytest.approx(9.3) and steady["interval_s"] == \
+        pytest.approx(9.9)
+    assert steady["handoff_s"] == pytest.approx(0.2) and steady["latency_s"] is None
+
+
+def test_step_flow_of_a_pipelined_run():
+    # step k opens at 1.5k s; the prover of k+1 runs while the verifier of k checks (0.8-2.3)
+    secs = [("train.forward", 0.0, 0.7), ("4", 0.8, 2.3)]
+    steps = [_mk_step(k, 1.5 * k, secs, 2.3) for k in (1, 2, 3)]
+    steps[0]["merged"] = True
+    recs = [_trow(k, "prover", 0.7, "prover") for k in (1, 2, 3)] \
+        + [_trow(k, "verifier", 1.4, "verifier") for k in (1, 2, 3)] \
+        + [_trow(k, "step_interval", 1.5, "run") for k in (2, 3)] \
+        + [_trow(k, "step_wall", 2.2 + k / 10, "run") for k in (1, 2, 3)]
+    rows, steady = analyze._step_flow(steps, recs, {"train.forward": "prover"}, [2, 3], True)
+    _approx_row(_flow_row(rows, 1), dict(
+        warmup=False, traced=False, drain=False, prover_s=0.7, verifier_s=1.4,
+        prover_wait_s=None, verifier_wait_s=None, handoff_s=None, interval_s=None,
+        latency_s=2.3))
+    # prover of 2 starts at 3.0, the prover of 1 ended at 2.2: wait 0.8; the prover of 2 ends at
+    # 3.7, before the verifier of 1 ends (3.8): no verifier wait; hand-off 1.5 - 1.4 = 0.1
+    _approx_row(_flow_row(rows, 2), dict(
+        warmup=False, traced=False, drain=False, prover_s=0.7, verifier_s=1.4,
+        prover_wait_s=0.8, verifier_wait_s=0.0, handoff_s=0.1, interval_s=1.5, latency_s=2.4))
+    _approx_row(_flow_row(rows, 3), dict(
+        warmup=False, traced=False, drain=True, prover_s=0.7, verifier_s=1.4,
+        prover_wait_s=0.8, verifier_wait_s=0.0, handoff_s=0.1, interval_s=1.5, latency_s=2.5))
+    assert steady["prover_wait_s"] == pytest.approx(0.8)
+    assert steady["latency_s"] == pytest.approx(2.45) and steady["handoff_s"] == \
+        pytest.approx(0.1)
+
+
+def test_step_flow_means_are_none_without_values():
+    steps = [_mk_step(1, 10.0, [("4", 0.8, 2.3)], 2.5)]
+    rows, steady = analyze._step_flow(steps, [], {}, [1])
+    assert rows[0]["prover_s"] is None and steady == {k: None for k in analyze._STEP_FIELDS}
+
+
+def test_the_run_view_holds_the_steps_and_the_gpu_roles(tmp_path):
+    out, _ = run(tmp_path)
+    v = out["runs"]["honest"]
+    assert [r["step"] for r in v["steps"]] == [1, 2, 3]
+    assert [r["warmup"] for r in v["steps"]] == [True, False, False]
+    assert set(v["steps_steady"]) == set(analyze._STEP_FIELDS) and v["gpu_roles"] is None
+    paths = build_run(tmp_path / "roles")
+    roles = [{"device": "cuda:0", "roles": ["prover"]}, {"device": "cuda:1", "roles": ["verifier"]}]
+    recs = io.read_records(paths["run_dir"])
+    recs[0] = {**recs[0], "gpu_roles": roles}
+    jl(paths["run_dir"] / "records.jsonl", recs)
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"])
+    assert out["runs"]["honest"]["gpu_roles"] == roles
+
+
+def _plain_step(tmp_path, names: dict[str, float], warm: dict[str, float]):
+    paths = build_run(tmp_path / "run", steps=3, secs={"train.forward": (0.0, 0.4)})
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    rows = []
+    for step, vals in ((1, warm), (2, names), (3, names)):
+        rows += [time_row(step, n, t, "prover", "phase") for n, t in vals.items()]
+    jl(plain / "records.jsonl", rows)
+    out = analyze.analyze(paths["run_dir"], paths["samples"], paths["probe"], plain=plain)
+    return out["comparisons"]["step"]
+
+
+def test_the_plain_comparison_adds_training_proper_and_the_reload(tmp_path):
+    st = _plain_step(tmp_path / "a", {"P0.forward": 0.1, "P0.backward": 0.2, "P0.update": 0.05,
+                                      "P0.load": 0.19},
+                     {"P0.forward": 0.2, "P0.backward": 0.3, "P0.update": 0.1, "P0.load": 0.5})
+    assert st["training_proper_s"] == pytest.approx(0.35)
+    assert st["warmup_training_proper_s"] == pytest.approx(0.6)
+    assert st["reload_s"] == pytest.approx(0.19) and "plain_s" in st
+    st = _plain_step(tmp_path / "b", {"train.forward": 0.1, "train.backward": 0.2,
+                                      "train.update": 0.05, "train.load": 0.3},
+                     {"train.forward": 0.2, "train.backward": 0.3, "train.update": 0.1})
+    assert st["training_proper_s"] == pytest.approx(0.35)
+    assert st["warmup_training_proper_s"] == pytest.approx(0.6)
+    assert st["reload_s"] == pytest.approx(0.3)
+    st = _plain_step(tmp_path / "c", {"P0.forward": 0.1, "P0.backward": 0.2},
+                     {"P0.forward": 0.2, "P0.backward": 0.3})
+    assert st["training_proper_s"] is None and st["warmup_training_proper_s"] is None
+    assert st["reload_s"] is None
