@@ -1406,3 +1406,33 @@ def test_the_plain_comparison_adds_training_proper_and_the_reload(tmp_path):
                      {"P0.forward": 0.2, "P0.backward": 0.3})
     assert st["training_proper_s"] is None and st["warmup_training_proper_s"] is None
     assert st["reload_s"] is None
+
+
+def test_step_flow_with_a_gap_in_the_step_numbers():
+    secs = [("train.forward", 0.0, 0.7), ("4", 0.8, 2.3)]
+    steps = [_mk_step(k, 10.0 * k, secs, 2.5) for k in (1, 2, 4)]
+    recs = [_trow(k, "prover", 0.7, "prover") for k in (1, 2, 4)] \
+        + [_trow(k, "verifier", 1.5, "verifier") for k in (1, 2, 4)]
+    sides = {"train.forward": "prover"}
+    rows, _ = analyze._step_flow(steps, recs, sides, [4])
+    r4 = _flow_row(rows, 4)
+    _approx_row(r4, dict(warmup=False, traced=False, drain=False, prover_s=0.7, verifier_s=1.5,
+                         prover_wait_s=None, verifier_wait_s=None, handoff_s=None,
+                         interval_s=None, latency_s=None))
+    rows, _ = analyze._step_flow(steps, [*recs, _trow(4, "step_interval", 7.5, "run")], sides,
+                                 [4])
+    r4 = _flow_row(rows, 4)
+    assert r4["interval_s"] == pytest.approx(7.5, abs=1e-9)
+    assert r4["prover_wait_s"] is None and r4["verifier_wait_s"] is None
+    assert r4["handoff_s"] is None
+
+
+def test_step_flow_of_a_step_with_no_prover_section():
+    full = [("train.forward", 0.0, 0.7), ("4", 0.8, 2.3)]
+    steps = [_mk_step(1, 10.0, full, 2.5), _mk_step(2, 20.0, [("4", 0.8, 2.3)], 2.5)]
+    recs = [_trow(2, "verifier", 1.5, "verifier"), _trow(2, "step_interval", 10.0, "run")]
+    rows, _ = analyze._step_flow(steps, recs, {"train.forward": "prover"}, [2])
+    _approx_row(_flow_row(rows, 2), dict(
+        warmup=False, traced=False, drain=False, prover_s=None, verifier_s=1.5,
+        prover_wait_s=None, verifier_wait_s=None, handoff_s=None, interval_s=10.0,
+        latency_s=None))
