@@ -32,7 +32,7 @@ from collections.abc import Callable, Mapping
 from setup.config import RunConfig, load_config, setup_determinism
 from verification.computation.instances.decoder import DecoderComputation
 from verification.computation.interface import snapshot_weights
-from verification.runs.pipeline import ProverSide, ProverSpec
+from verification.runs.pipeline import ProverSide, ProverSpec, staging_setting
 from verification.runs.scenarios import ReusedModel
 
 __all__ = ["decoder_prover", "decoder_spec", "spec_env", "loop_mode", "refuse_pipelined"]
@@ -71,7 +71,10 @@ def decoder_prover(env: Mapping[str, str],
     c = (build_computation or DecoderComputation.from_config)(cfg)
     D, _ = load_committed_dataset(c, cfg.data_dir)
     models = ReusedModel(c.build_model)
-    w0 = snapshot_weights(c, models())
+    # Staged (FS58b): W_0 lives on the prover's device, so the child holds nothing on the
+    # verifier GPU. Unstaged it is on the placement's weight devices, as before.
+    w0 = snapshot_weights(c, models(),
+                          device=c.placement.prover if staging_setting(c, None) else None)
     return ProverSide(c, models, D, w0)
 
 

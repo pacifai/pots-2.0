@@ -74,7 +74,13 @@ store, releases the step and only then verifies its own copy. The window is one 
 starts step ``t + 1`` only when no step is held, so it proves ``t + 1`` while the parent
 verifies ``t`` but never holds two transcripts. The copy and the early release are in
 ``handoff_s``, not ``verify_s``; the kept step is written from the parent's copy. The decision
-is in ``child_info["staging"]``.
+is in ``child_info["staging"]``, and ``child_info["verifier_reserved"]`` is the child's
+allocator reserve on each verifier GPU at the end (0: the child never touched it).
+The parent's cache is not released before the copy, on purpose: in this layout the cache
+release is off (auto), and step ``t``'s copy reuses the blocks step ``t - 1``'s verification
+freed in the same allocator, which is the point of the parent making the copy. A refused
+release (``StoreMutationError``) or a reply for the wrong step now raises before step ``t`` is
+verified, so that step has no ``StepRecord``.
 
 **The child reads its pipe only between steps**, so a release message waits until the step in
 progress ends. That costs no throughput: the parent cannot verify step ``t + 1`` before it has
@@ -475,6 +481,11 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
     if last >= 1:
         w_host = {n: v.detach().to("cpu", copy=True) for n, v in w_by[last].items()}
     info = {**stats, "events": events, "pid": os.getpid()}
+    if args.staging:  # the allocator's counter: it creates no context on a device never used
+        info["verifier_reserved"] = {
+            str(d): torch.cuda.memory_reserved(d)
+            for d in dict.fromkeys(torch.device(x) for x in (c.placement.devices or ())
+                                   if _is_cuda(x))}
     conn.send(("final", w_host, info))
     del w_host
     _await_bye(conn)
@@ -674,16 +685,20 @@ def _ship(c: DeclaredComputation, store: SharedStore, tree: Any,
     with sec(SHIP_SECTION):
         leaves: list[Any] = []
         sources: dict[torch.device, None] = {}
-        for i in range(c.n_leaves):
-            x = store.leaf(i)
-            if isinstance(x, torch.Tensor):
-                if x.is_cuda:
-                    sources[x.device] = None
-                x = x.to(c.placement.leaf_device(i), copy=True)
-            leaves.append(x)
-        for d in sources:
-            torch.cuda.synchronize(d)
-        return InMemoryStore.hold(c, leaves, tree, dataset_paths)
+        try:
+            for i in range(c.n_leaves):
+                x = store.leaf(i)
+                if isinstance(x, torch.Tensor):
+                    if x.is_cuda:
+                        sources[x.device] = None
+                    x = x.to(c.placement.leaf_device(i), copy=True)
+                leaves.append(x)
+            for d in sources:
+                torch.cuda.synchronize(d)
+            return InMemoryStore.hold(c, leaves, tree, dataset_paths)
+        except BaseException:
+            leaves.clear()  # a traceback must not pin a partial copy on the verifier's GPU
+            raise
 
 
 def _await_release(link: _Link, stash: dict[int, tuple], t: int) -> None:
@@ -741,7 +756,7 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
     # Everything below that can hold a package of the child's memory, defined before the try
     # so the finally can drop it (a traceback keeps the frame's locals alive).
     stash: dict[int, tuple] = {}
-    msg = pkg = part = released = None
+    msg = pkg = part = released = own = None
     try:
         result = LoopResult(verdict=RunVerdict(False, None, 0, None), pipelined=True)
         # The parent's kernels: its checks 0, 2 and 7 hash the GPU-resident leaves (the
@@ -842,6 +857,6 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
         if store is not None:
             store.close()
         stash.clear()
-        msg = pkg = part = released = None
+        msg = pkg = part = released = own = None
         gc.collect()  # no package outlives this point: the child exits only after it
         link.stop()
