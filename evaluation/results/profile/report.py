@@ -608,6 +608,33 @@ def _gauge(x: float, y: float, label: str, frac: float | None, value: str) -> st
     return "".join(out)
 
 
+def _gpu_roles_words(roles: Any) -> str:
+    """The sentence on which GPU trains and which verify, from the environment record's
+    ``gpu_roles``; empty when the profile has none (the count is never guessed)."""
+    if not isinstance(roles, list) or not roles:
+        return ""
+    ent = [r for r in roles if isinstance(r, dict)]
+    if not ent:
+        return ""
+    def devs(role: str) -> str:
+        return ", ".join(str(r.get("device")) for r in ent if role in (r.get("roles") or []))
+    prover, ver = devs("prover"), devs("verifier")
+    n_ver = sum("verifier" in (r.get("roles") or []) for r in ent)
+    parts = []
+    if prover:
+        parts.append(f"{prover} trains")
+    if ver:
+        parts.append(f"{ver} verify" if n_ver > 1 else f"{ver} verifies")
+    who = "the verifier GPUs" if n_ver > 1 else "the verifier GPU"
+    return (f"With {len(ent)} GPUs ({'; '.join(parts)}), the commit's hashing of the weights and "
+            f"the dK leaves and the copies of the next weights run on {who}, so a "
+            f"prover-side section's GPU figure here understates them. The largest prover-side "
+            f"work on {who} is the peer copies of the products to "
+            f"{'those GPUs' if n_ver > 1 else 'that GPU'} and their hashing on arrival during "
+            "training, beside the commit's hashing and the next weights' copies. The profile's "
+            "per-GPU utilization holds each GPU. ")
+
+
 def _flow(run: Run) -> str:
     top = run.top()
     if not top:
@@ -662,13 +689,7 @@ def _flow(run: Run) -> str:
     gpu_words = "" if cpu else ("GPU: the share of the section's time in which a GPU kernel "
                                 "was running. ")
     if not cpu and any(len(s.get("util_by_device") or {}) > 1 for s in top.values()):
-        gpu_words += ("With four GPUs, the commit's hashing of the weights and the dK leaves "
-                      "and the copies of the next weights run on the verifier GPUs, so a "
-                      "prover-side section's GPU figure here understates them. The largest "
-                      "prover-side work on GPUs 1 to 3 is the peer copies of the products to "
-                      "those GPUs and their hashing on arrival during training, beside the "
-                      "commit's hashing and the next weights' copies. The profile's "
-                      "per-GPU utilization holds each GPU. ")
+        gpu_words += _gpu_roles_words(run.view.get("gpu_roles"))
     return (_svg(w + 2, y, "".join(out))
             + f'<p class="mute small">Each box is one section of the step, in the order it runs '
               f"(left to right, then down); its color strip is the one the overview and the "
@@ -940,21 +961,80 @@ def _plain(run: Run) -> str:
     st = cmp.get("step") or {}
     pr, pl = st.get("prover_s"), st.get("plain_s")
     iv, ps, vs = st.get("interval_s"), st.get("prover_side_s"), st.get("verifier_side_s")
+    tp, rl = st.get("training_proper_s"), st.get("reload_s")
+    proper = isinstance(tp, (int, float)) and not isinstance(tp, bool) and tp > 0
+    den, what = (tp, "training proper") if proper else (pl, "plain")
     if iv is not None:
-        rows.append(["Whole step: interval between verified steps against plain", fmt(iv),
-                     fmt(pl), fmt(iv / pl if pl else None)])
-        rows.append(["Prover's work per step against plain", fmt(ps), fmt(pl),
-                     fmt(ps / pl if ps is not None and pl else None)])
-        rows.append(["Verifier's work per step against plain", fmt(vs), fmt(pl),
-                     fmt(vs / pl if vs is not None and pl else None)])
+        rows.append(["Whole step: interval between verified steps against " + what, fmt(iv),
+                     fmt(den), fmt(iv / den if den else None)])
+        rows.append(["Prover's work per step against " + what, fmt(ps), fmt(den),
+                     fmt(ps / den if ps is not None and den else None)])
+        rows.append(["Verifier's work per step against " + what, fmt(vs), fmt(den),
+                     fmt(vs / den if vs is not None and den else None)])
     else:
-        rows.append(["Whole step: verified (prover, hand-off, verifier) against plain", fmt(pr),
-                     fmt(pl), fmt(pr / pl if pr and pl else None)])
-    return (_table(["Row", "Verified run (s)", "Plain training (s)", "÷ plain"], rows)
+        rows.append(["Whole step: verified (prover, hand-off, verifier) against " + what,
+                     fmt(pr), fmt(den), fmt(pr / den if pr and den else None)])
+    if proper:
+        rows.append(["Plain step with the weight reload", "—", fmt(pl), "—"])
+        rows.append(["Weight reload, left out of training proper", "—", fmt(rl), "—"])
+    head = ["Row", "Verified run (s)", "Plain training (s)",
+            "÷ training proper" if proper else "÷ plain"]
+    if proper:
+        note = ("The whole-step, prover and verifier rows are divided by training proper, plain "
+                "training's forward, backward and update without the weight reload; the plain "
+                "step with the reload and the reload itself are shown below them. A section row's "
+                "ratio compares like sections. ")
+    else:
+        note = "The plain step includes the weight reload. "
+    return (_table(head, rows)
             + '<p class="mute small">Plain training runs the same steps on the same model '
-              "without the protocol. The whole-step row puts the verified step beside one plain "
-              "step: with an interval, the time between verified steps; else the prover and "
-              "the verifier together.</p>")
+              "without the protocol. " + note + "The whole-step row puts the verified step "
+              "beside one plain step: with an interval, the time between verified steps; else "
+              "the prover and the verifier together.</p>")
+
+
+def _steps(run: Run) -> str:
+    """One row per step: each side's own work, the waits, the hand-off and the interval."""
+    steps = run.view.get("steps")
+    if not steps:
+        return ""
+    piped = bool(run.view.get("pipelined"))
+    keys = ["prover_s", "verifier_s", "prover_wait_s", "verifier_wait_s", "handoff_s",
+            "interval_s"] + (["latency_s"] if piped else [])
+    head = ["Step", "Prover only (s)", "Verifier only (s)", "Prover waiting (s)",
+            "Verifier waiting (s)", "Hand-off and records (s)", "Interval (s)"]
+    if piped:
+        head.append("Latency (s)")
+    head.append("Notes")
+    rows = []
+    for st in steps:
+        notes = [n for f, n in (("warmup", "warm-up"), ("traced", "traced"),
+                                ("drain", "drain (prover idle)")) if st.get(f)]
+        rows.append([fmt(st.get("step"))] + [fmt(st.get(k)) for k in keys]
+                    + [", ".join(notes)])
+    steady = run.view.get("steps_steady")
+    if steady:
+        rows.append(["Steady mean"] + [fmt(steady.get(k)) for k in keys] + [""])
+        tp = ((run.profile.get("comparisons") or {}).get("step") or {}).get("training_proper_s")
+        if isinstance(tp, (int, float)) and not isinstance(tp, bool) and tp > 0:
+            rows.append(["÷ training proper"]
+                        + [fmt(steady[k] / tp if steady.get(k) is not None else None)
+                           for k in keys] + [""])
+            proper = (f" Training proper is {fmt(tp)} s per step in the plain run.")
+        else:
+            proper = ""
+    else:
+        proper = ""
+    return (_table(head, rows, left=(0, len(head) - 1))
+            + '<p class="mute small">Prover only and verifier only are each side\'s own work per '
+              "step. Prover waiting is the time from the prover's end of one step to its start of "
+              "the next. Verifier waiting is the time the verifier sat idle for the prover's "
+              "step. Hand-off and records is the rest of the interval. The interval is the time "
+              "between two verified steps, close to close. "
+            + ("Latency is a step's first start to its last end. " if piped else "")
+            + "Training proper is plain training's forward, backward and update, without the "
+              "weight reload." + proper + " All waits come from timestamps on one clock shared "
+              "by both processes.</p>")
 
 
 # ---- the page ----------------------------------------------------------------------------
@@ -983,7 +1063,8 @@ def build(profiles: Sequence[dict[str, Any]], names: Sequence[str] | None = None
 
     add("inputs", "Inputs", _inputs(profiles, names, runs))
     per_run = (("overview", "Overview", _overview), ("diagram", "Step flow", _flow),
-               ("timeline", "Timeline", _timeline), ("check5", "Check 5", _c5),
+               ("timeline", "Timeline", _timeline), ("steps", "Steps", _steps),
+               ("check5", "Check 5", _c5),
                ("plain", "Prover beside plain", _plain))
     for r in runs:
         for key, title, fn in per_run:
