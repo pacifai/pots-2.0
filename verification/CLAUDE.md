@@ -1412,7 +1412,11 @@ interface.
       owner hashes each product on arrival (`_hash_arrival`, on the owner's side stream after
       a cross-device `wait_event` for the copy), a kept product where it sits; the entries of
       `_pending` carry the `_version` the hash was queued under (`arrived`), so a digest of a
-      later version is never taken.
+      later version is never taken. `MatmulCapture(..., staging=device)` (FS58; a CUDA device,
+      sharded placement only, default `None` = off) sends every CUDA product to `device`
+      instead of its hint, which is still computed, and hashes it there in place; in
+      `prove_step` every tensor leaf of the step sits there (FS58). The pipelined loop with
+      one verifier GPU turns it on, with the prover's GPU.
     - Operands are not copied. They stay on the GPU until `release_operands` in labeling,
       as before; the README's "Workflow: a run on a GPU" measures what that costs.
     - The `δK̃` leaf is a contiguous transpose made in labeling, so it is the one product
@@ -1428,8 +1432,11 @@ interface.
     checkpointing must stay off.
 - `step.py` (A3, merged):
   - `prove_step(computation, model, w_t, records, *, train_records=None, perturb=None,
-    section=None) -> StepOutput`. `section` is B6's metrics seam (see `runs/metrics.py`),
+    section=None, staging=None) -> StepOutput`. `section` is B6's metrics seam (see `runs/metrics.py`),
     with phases `train.*` (training under capture), `P1.label`, `P2.w_t` and `P2.w_next`.
+    `staging` (FS58; default off) passes the capture's staging device and keeps every tensor
+    leaf of the step there instead of on its owner (products, `W_t`, `W_{t+1}`; `snapshot_weights`
+    takes `device=`); the pipelined loop with one verifier GPU turns it on.
     Training runs `computation.forward_backward` with `stage(p)` = the capture's phase `p`
     plus the section `train.p`; the decoder's head blocks enter each several times per step,
     and a section sums its entries. `Section` and `no_section` live here; `verifier/context.py` repeats them, because the

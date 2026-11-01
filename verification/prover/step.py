@@ -140,16 +140,17 @@ def _shareable(w: torch.Tensor, p: torch.Tensor, model_storages: set[int],
 
 
 def _w_t_leaves(computation: DeclaredComputation, model: torch.nn.Module,
-                w_t: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+                w_t: Mapping[str, torch.Tensor],
+                device: torch.device | None = None) -> dict[str, torch.Tensor]:
     """The committed ``W_t``: the caller's tensor where :func:`_shareable`, else a copy of the
-    loaded parameter, on the weight's device (F22). Either way the bytes are those the model
-    holds after ``load_weights``."""
+    loaded parameter, on the weight's device (F22), or on ``device`` when given (FS58 staging).
+    Either way the bytes are those the model holds after ``load_weights``."""
     place = computation.placement
     storages = {q.untyped_storage().data_ptr() for q in model.parameters()}
     out = {}
     for n in computation.weight_names:
         w, p = w_t[n], model.get_parameter(n)
-        dev = place.weight_device(n)
+        dev = place.weight_device(n) if device is None else device
         out[n] = w if _shareable(w, p, storages, dev) else p.detach().to(dev, copy=True)
     return out
 
@@ -192,6 +193,7 @@ def prove_step(
     train_records: Sequence[Any] | None = None,
     perturb: Mapping[int, Perturbation] | None = None,
     section: Section | None = None,
+    staging: torch.device | str | None = None,
 ) -> StepOutput:
     """Execute ``C(b, W_t)`` on ``model`` and emit the step's leaves.
 
@@ -212,6 +214,13 @@ def prove_step(
     write: :meth:`StepOutput.assert_unmodified` in the commit, the store on every read. The run
     loop meets this: its ``w_t`` is ``W_0``, the previous step's ``W_{t+1}`` copy or a fault's
     entry weights, and nothing in the loop writes to them.
+
+    ``staging`` (FS58; a CUDA device, sharded placement only, default off) keeps every tensor
+    leaf on that device instead of on its owner: the capture routes the products there and each
+    labeled leaf is moved there (a no-op when it already is), a perturbation is built on it,
+    ``W_t`` is the caller's tensor when it already sits there (else a copy) and ``W_{t+1}`` is
+    snapshotted there. Records stay on the host. The pipelined loop with one verifier GPU sets
+    it to the prover's GPU and ships the leaves later.
     """
     if len(records) != computation.n_s:
         raise ValueError(f"batch has {len(records)} records, the computation declares "
@@ -219,18 +228,19 @@ def prove_step(
     if not torch.is_grad_enabled():
         raise RuntimeError("prove_step needs grad mode on")
     sec = section or no_section
+    # Built first: it validates and normalizes ``staging``, which the weight leaves follow too.
+    cap = MatmulCapture(param_names=param_storage_map(model), placement=computation.placement,
+                        staging=staging)
     record_versions = _versions(records)
     with sec("train.load"):
         load_weights(computation, model, w_t)
     with sec("P2.w_t"):
         # Never the parameters themselves: they change in place at the step.
-        w_t_leaves = _w_t_leaves(computation, model, w_t)
+        w_t_leaves = _w_t_leaves(computation, model, w_t, cap.staging)
         w_t_versions = _versions(list(w_t_leaves.values()))
     with sec("train.load"):
         model.zero_grad(set_to_none=True)
         opt = _optimizer(computation, model)
-
-    cap = MatmulCapture(param_names=param_storage_map(model), placement=computation.placement)
 
     @contextmanager
     def stage(p: str) -> Iterator[None]:
@@ -250,7 +260,9 @@ def prove_step(
                        if place.sharded else 0)
         # Each leaf goes to its owner (F22); a right hint left nothing to move, a wrong one
         # costs this copy.
-        products = [p.detach().to(place.product_leaf_device(g)) for g, p in enumerate(labeled)]
+        # With staging (FS58) every leaf goes to the staging device instead.
+        products = [p.detach().to(cap.staging or place.product_leaf_device(g))
+                    for g, p in enumerate(labeled)]
         # Invariant 6: the products are fixed and nothing has touched the captured tensors.
         cap.assert_unmodified()
         product_versions = list(_versions(products))
@@ -280,7 +292,8 @@ def prove_step(
         new = fn((leaf if i is None else leaf[i]).clone())
         if tuple(new.shape) != spec.p_shape or new.dtype != leaf.dtype:
             raise ValueError(f"perturbation of {spec.name} changed its shape or dtype")
-        # The leaf stays on its owner, whatever device the fault built its tensor on.
+        # The leaf stays where it is (its owner, or the staging device), whatever device the
+        # fault built its tensor on.
         new = new.detach().to(leaf.device).contiguous()
         if i is None:
             products[g] = new
@@ -299,7 +312,7 @@ def prove_step(
     with sec("train.update"):
         opt.step()
     with sec("P2.w_next"):
-        w_next = snapshot_weights(computation, model)
+        w_next = snapshot_weights(computation, model, device=cap.staging)
     with sec("train.update"):
         # set_to_none drops the model's reference; G_ℓ products stay intact (invariant 6).
         model.zero_grad(set_to_none=True)
