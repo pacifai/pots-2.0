@@ -267,7 +267,7 @@ class PlantedSpec:
         return self.inner()
 
 
-def _pipelined_plant_body(spec, devices, device, monkeypatch):
+def _pipelined_plant_body(spec, devices, device, monkeypatch, staging=None):
     """The child's kernel is wrong for one key; the parent has no plant. The run stops with a
     ``ProverProcessError`` carrying the mismatch, and no verdict. Returns its message."""
     import multiprocessing
@@ -287,7 +287,7 @@ def _pipelined_plant_body(spec, devices, device, monkeypatch):
     w = World("decoder", c, D, w0, spec, 2)
     with pytest.raises(ProverProcessError) as e:
         run_scenario(c, D, w0, Scenario("x", "", HONEST.fault, Expected()), T=w.T, k=K,
-                     seed=SEED, final=w.final, pipelined=True, prover=spec)
+                     seed=SEED, final=w.final, pipelined=True, prover=spec, staging=staging)
     msg = str(e.value)
     assert e.value.kind == "exception" and "KernelMismatchError" in msg and "tag 0x03" in msg
     assert ends == []
@@ -297,15 +297,17 @@ def _pipelined_plant_body(spec, devices, device, monkeypatch):
 
 @needs_cuda
 @needs_two
-def test_a_planted_wrong_arrival_digest_stops_the_pipelined_run(monkeypatch):
+@pytest.mark.parametrize("staging", [False, None], ids=["unstaged", "auto"])
+def test_a_planted_wrong_arrival_digest_stops_the_pipelined_run(monkeypatch, staging):
     """The two-GPU twin of ``test_a_planted_wrong_kernel_digest_stops_run_loop``: the child's
     arrival digests are wrong, the child stops, the parent gets its error and no verdict. The
-    devices are the ones the pipelined CUDA tests use (the transcript on ``cuda:1``)."""
+    devices are the ones the pipelined CUDA tests use (prover ``cuda:0``, weights and products
+    placed on ``cuda:1``), unstaged (routed to ``cuda:1``) and at auto (staged on ``cuda:0``)."""
     from tests.verification.runs import pipelined_helpers as P
 
     devices = ("cuda:1",)
-    spec = PlantedSpec(P.DecoderSpec(devices=devices, device="cuda:0"))
-    msg = _pipelined_plant_body(spec, devices, "cuda:0", monkeypatch)
+    spec = PlantedSpec(P.DecoderSpec(devices=devices, device="cuda:0", stage_w0=staging))
+    msg = _pipelined_plant_body(spec, devices, "cuda:0", monkeypatch, staging)
     assert "(arrival path)" in msg
 
 

@@ -395,7 +395,8 @@ class TrainedElsewhereWNext(ProverFault):
     def emit(self, t: int, out: StepOutput) -> StepOutput:
         if t != self.t:
             return out
-        forged, _ = plain_step(self.c, self.build_model(), out.w_t, self.batch)
+        forged, _ = plain_step(self.c, self.build_model(), out.w_t, self.batch,
+                               device=self.staging_device)
         return out.with_w_next(forged)
 
 
@@ -418,7 +419,8 @@ class HiddenStep(ProverFault):
     def entry_weights(self, t: int, w: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
         if t != self.t:
             return w
-        hidden, _ = plain_step(self.c, self.build_model(), w, self.batch)
+        hidden, _ = plain_step(self.c, self.build_model(), w, self.batch,
+                               device=self.staging_device)
         return hidden
 
 

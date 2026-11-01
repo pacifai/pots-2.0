@@ -93,6 +93,8 @@ SECTIONS: dict[str, tuple[str, int, str, str]] = {
                        "add up the transcript's size for the run log"),
     "handoff.empty_cache": ("hand", 1, "Free GPU cache",
                             "release the prover's cached GPU memory before the verifier"),
+    "handoff.ship": ("hand", 2, "Copy to the verifier GPU",
+                     "copy the step from the shared store to the verifier's GPU, then release it"),
     "4": ("read", 2, "Check 4: batch in dataset",
           "the batch's records lead to the dataset root"),
     "7": ("read", 1, "Check 7: weights chain", "this step's W_t is the previous step's W_t+1"),

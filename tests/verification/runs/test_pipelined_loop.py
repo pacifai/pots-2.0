@@ -542,6 +542,8 @@ def test_merged_steps_carry_step_interval_beside_step_wall(mlp, tmp_path):
 
 
 # ---- staged mode (FS58b) --------------------------------------------------------------------
+# ``WriteIntoLeaf(2)`` cannot test staged mode: its write lands after the release, when the
+# child holds nothing; ``LateWrite`` writes while the step is shared and the parent is slowed.
 
 
 def _pl(sharded, prover, devices):
@@ -625,3 +627,37 @@ def test_with_w_next_keeps_each_clone_on_its_replaced_leaf_s_device(three):
         assert v.device == out.w_next[n].device and v.is_contiguous()
         assert torch.equal(v, out.w_next[n] + 1)
         assert v.data_ptr() != out.w_next[n].data_ptr()
+
+
+def test_a_staged_write_into_a_held_leaf_fails_the_release_before_verify(mlp, monkeypatch):
+    real = pipeline._ship
+
+    def slow_ship(*a, **k):  # the child's write lands before the parent releases
+        time.sleep(0.6)
+        return real(*a, **k)
+
+    monkeypatch.setattr(pipeline, "_ship", slow_ship)
+    steps = []
+    with pytest.raises(StoreMutationError, match=r"step 2|leaf"):
+        go(mlp, P.LateWrite(2), pipelined=True, staging=True, on_step=steps.append)
+    assert [s.t for s in steps] == [1]  # no on_step (nor StepRecord) for the step
+    assert multiprocessing.active_children() == []
+
+
+def test_an_exception_in_ship_is_a_clean_run_error(mlp, monkeypatch):
+    def bad_ship(*a, **k):
+        raise RuntimeError("ship failed")
+
+    monkeypatch.setattr(pipeline, "_ship", bad_ship)
+    steps = []
+    with pytest.raises(RuntimeError, match="ship failed"):
+        go(mlp, pipelined=True, staging=True, on_step=steps.append)
+    assert steps == []
+    assert multiprocessing.active_children() == []
+
+
+def test_a_staged_recorder_spec_names_the_prover_device_only():
+    c = SimpleNamespace(placement=SimpleNamespace(prover="cuda:0", devices=("cuda:1",)))
+    rec = MemoryRecorder("r", "s", memory_probe("cpu"))
+    assert pipeline._recorder_spec(rec, c, True).devices == ("cuda:0",)
+    assert pipeline._recorder_spec(rec, c, False).devices == ("cuda:0", "cuda:1")
