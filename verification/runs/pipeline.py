@@ -386,7 +386,9 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
     model = side.build_model()
     device = model_device(model)
     staged_cuda = args.staging and _is_cuda(device)
-    if staged_cuda:  # FS58b: no tensor of the child's lives on a verifier GPU
+    if staged_cuda:  # FS58b: a fallback that frees W_0's tensors on a verifier GPU. A spec must
+        # build W_0 on the prover's device for that GPU to stay untouched (context, cached
+        # reserve); ``child_info["verifier_context"]`` reports whether it did.
         fault.staging_device = device
         w0 = {n: v if v.device == device else v.to(device) for n, v in w0.items()}
         side = dataclasses.replace(side, w0=w0)

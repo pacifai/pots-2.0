@@ -34,13 +34,16 @@ class DecoderSpec:
     stage_w0: bool | None = None  # None: as ``decoder_prover``, follow ``staging_setting``
 
     def __call__(self):
+        from tests.verification.runs.test_sharded_run import _tiny
         from tests.verification.transcript.shared_helpers import setup
         from verification.runs.pipeline import staging_setting
 
         determinism(self.device)
-        c, D, model, w0 = setup(self.devices, self.device, self.layers)
-        if staging_setting(c, self.stage_w0):  # a staged child holds no W_0 on a verifier GPU
-            w0 = {n: v.to(c.placement.prover) for n, v in w0.items()}
+        c = _tiny(self.devices, self.device, self.layers)[0]
+        # A staged child snapshots W_0 straight onto the prover's device: nothing of its is
+        # ever allocated on a verifier GPU.
+        w0_device = c.placement.prover if staging_setting(c, self.stage_w0) else None
+        c, D, model, w0 = setup(self.devices, self.device, self.layers, w0_device=w0_device)
         return ProverSide(c, c.build_model, D, w0)
 
 
@@ -128,7 +131,11 @@ class SelfKillAt(ProverFault):
 class LateWrite(ProverFault):
     """At step ``t``, bumps a leaf's version 0.2 s after ``emit``: while the step is shared and
     the child waits for the release. Unlike ``WriteIntoLeaf`` (whose write lands after the
-    release when staged) it fails a staged release, if the parent is slow to release."""
+    release when staged) it fails a staged release, if the parent is slow to release.
+
+    Timing-dependent: the 0.2 s timer must fire after ``commit_step`` and ``share_step`` have
+    run, or the child raises inside the commit (kind ``exception``) instead of the release
+    failing. The tiny test models commit in a few ms; no hook runs after the step is shared."""
 
     def __init__(self, t):
         self.t = t

@@ -108,7 +108,7 @@ def test_one_verifier_gpu_runs_staged_and_equals_sequential(recorder, tmp_path):
         if pipelined and recorder == "time":
             rec = MetricsWriter(tmp_path / "t", "r").recorder("s", devices=("cuda:1",))  # run_devices
         elif pipelined and recorder == "memory":
-            rec = MemoryRecorder("r", "s", memory_probe("cuda:0"), devices=("cuda:1",))
+            rec = MemoryRecorder("r", "s", memory_probe("cuda:1"), devices=("cuda:1",))
         return run_scenario(w.c, w.D, w.w0, Scenario("x", "", HONEST.fault, Expected()),
                             T=w.T, k=K, seed=SEED, final=w.final, pipelined=pipelined,
                             prover=w.spec if pipelined else None, recorder=rec)

@@ -46,12 +46,14 @@ def reap(proc, wait=30.0):
             time.sleep(0.1)
 
 
-def setup(devices, device="cpu", layers=None):
-    """``(c, D, model, w0)``, the same in the parent and the child (seeded)."""
+def setup(devices, device="cpu", layers=None, *, w0_device=None):
+    """``(c, D, model, w0)``, the same in the parent and the child (seeded). ``w0_device`` puts
+    ``W_0`` there directly (a staged child's prover device, FS58b) instead of on the weights'
+    devices, so nothing is ever allocated on a verifier GPU."""
     c, D, build = _tiny(devices, device, layers)
     model = build()
     randomize_biases(dict(model.named_parameters()))
-    return c, D, model, snapshot_weights(c, model)
+    return c, D, model, snapshot_weights(c, model, device=w0_device)
 
 
 def configure(strategy=None, alloc=None):
