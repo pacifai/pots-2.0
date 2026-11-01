@@ -360,18 +360,119 @@ def test_check_5_partial_floor_says_not_counted_and_the_profile_says_it_once():
     assert "not comparable with a traced run" in panel(out, "r0-overview")
 
 
-def test_the_four_gpu_note_is_drawn_only_with_several_gpus_on_a_section():
+def two_gpu_flow(roles) -> str:
     v = view(gpu=True)
-    flow = panel(page(profile(gpu=True, runs={"honest": v})), "r0-diagram")
-    assert "With four GPUs" not in flow
     v["sections"]["train.forward"]["util_by_device"] = {"cuda:0": {}, "cuda:1": {}}
+    v["gpu_roles"] = roles
+    return panel(page(profile(gpu=True, runs={"honest": v})), "r0-diagram")
+
+
+def test_the_gpu_note_is_drawn_only_with_several_gpus_on_a_section():
+    v = view(gpu=True)
+    v["gpu_roles"] = [{"device": "cuda:0", "roles": ["prover"]},
+                      {"device": "cuda:1", "roles": ["verifier"]}]
     flow = panel(page(profile(gpu=True, runs={"honest": v})), "r0-diagram")
-    assert ("With four GPUs, the commit's hashing of the weights and the dK leaves and the "
-            "copies of the next weights run on the verifier GPUs, so a prover-side section's "
-            "GPU figure here understates them. The largest prover-side work on GPUs 1 to 3 is "
-            "the peer copies of the products to those GPUs and their hashing on arrival during "
-            "training, beside the commit's hashing and the next weights' copies. The "
-            "profile's per-GPU utilization holds each GPU.") in flow
+    assert "With 2 GPUs" not in flow
+
+
+def test_the_gpu_note_for_one_verifier_gpu():
+    flow = two_gpu_flow([{"device": "cuda:0", "roles": ["prover"]},
+                         {"device": "cuda:1", "roles": ["verifier"]}])
+    assert "With 2 GPUs (cuda:0 trains; cuda:1 verifies), the commit's hashing" in flow
+    assert "run on the verifier GPU, so" in flow and "GPUs 1 to 3" not in flow
+    assert "The profile's per-GPU utilization holds each GPU." in flow
+
+
+def test_the_gpu_note_for_three_verifier_gpus():
+    flow = two_gpu_flow([{"device": "cuda:0", "roles": ["prover"]},
+                         {"device": "cuda:1", "roles": ["verifier"]},
+                         {"device": "cuda:2", "roles": ["verifier"]},
+                         {"device": "cuda:3", "roles": ["verifier"]}])
+    assert "With 4 GPUs (cuda:0 trains; cuda:1, cuda:2, cuda:3 verify)" in flow
+    assert "run on the verifier GPUs, so" in flow and "four GPUs" not in flow
+
+
+def test_the_gpu_note_is_left_out_without_roles():
+    for roles in (None, []):
+        flow = two_gpu_flow(roles)
+        assert "With " not in flow.replace("With a ", "") and "GPUs (" not in flow
+        assert "GPU: the share of the section's time" in flow
+
+
+def steps_view(*, pipelined: bool = False) -> dict[str, Any]:
+    v = view(gpu=False)
+    v["pipelined"] = pipelined
+    row = {"step": 1, "warmup": True, "traced": False, "drain": False, "prover_s": 1.0,
+           "verifier_s": 2.0, "prover_wait_s": None, "verifier_wait_s": None,
+           "handoff_s": None, "interval_s": 3.5, "latency_s": 3.5}
+    row2 = row | {"step": 2, "warmup": False, "traced": True, "drain": True, "prover_s": 1.5,
+                  "verifier_s": 2.5, "prover_wait_s": 2.25, "verifier_wait_s": 0.5,
+                  "handoff_s": 0.25, "interval_s": 3.25, "latency_s": 4.5}
+    v["steps"] = [row, row2]
+    v["steps_steady"] = {"prover_s": 1.5, "verifier_s": 2.5, "prover_wait_s": 2.25,
+                         "verifier_wait_s": 0.5, "handoff_s": 0.25, "interval_s": 3.25,
+                         "latency_s": 4.5}
+    return v
+
+
+def test_the_steps_panel_has_rows_a_steady_row_and_the_training_proper_ratio():
+    p = profile(runs={"honest": steps_view()})
+    p["comparisons"] = {"sections": {}, "step": {"plain_s": 0.5, "training_proper_s": 0.5}}
+    out = panel(page(p), "r0-steps")
+    assert out.index("Steps</h2>") < out.index("Prover only (s)")
+    assert "Latency (s)" not in out
+    assert '<td class="l">warm-up</td>' in out
+    assert '<td class="l">traced, drain (prover idle)</td>' in out
+    assert "<td>—</td><td>—</td>" in out  # step 1's waits
+    assert ('<tr><td class="l">Steady mean</td><td>1.5</td><td>2.5</td><td>2.2</td>'
+            '<td>0.50</td><td>0.25</td><td>3.2</td><td class="l"></td></tr>') in out
+    assert ("÷ training proper</td><td>3.0</td><td>5.0</td><td>4.5</td><td>1.0</td>"
+            "<td>0.50</td><td>6.5</td>") in out
+    assert "Training proper is 0.50 s per step" in out
+    assert '<a href="#r0-steps">' in page(p)
+    assert page(p).index('id="r0-timeline"') < page(p).index('id="r0-steps"') < \
+        page(p).index('id="r0-check5"')
+
+
+def test_the_steps_panel_shows_latency_only_when_pipelined():
+    out = panel(page(profile(runs={"honest": steps_view(pipelined=True)})), "r0-steps")
+    assert "<th>Latency (s)</th>" in out and "<td>4.5</td>" in out
+    assert "to its last end" in out
+    assert "to its last end" not in panel(page(profile(runs={"honest": steps_view()})),
+                                          "r0-steps")
+
+
+def test_no_steps_panel_without_steps():
+    assert "-steps" not in page(profile())
+    v = view(gpu=False)
+    v["steps"] = []
+    assert "-steps" not in page(profile(runs={"honest": v}))
+
+
+def test_plain_panel_divides_by_training_proper_when_present():
+    p = with_plain("A", 2.0)
+    p["comparisons"]["step"] |= {"interval_s": 1.5, "prover_side_s": 0.75,
+                                 "verifier_side_s": 0.25, "training_proper_s": 0.3,
+                                 "reload_s": 0.2}
+    out = panel(page(p), "r0-plain")
+    assert "÷ training proper" in out and "÷ plain<" not in out
+    assert "against training proper</td><td>1.5</td><td>0.30</td><td>5.0</td>" in out
+    assert "Prover&#x27;s work per step against training proper</td><td>0.75</td><td>0.30</td>" \
+        "<td>2.5</td>" in out
+    assert "Plain step with the weight reload</td><td>—</td><td>0.50</td>" in out
+    assert "Weight reload, left out of training proper</td><td>—</td><td>0.20</td>" in out
+    assert "<td>2.0</td>" in out  # the section row's ratio is unchanged
+
+
+def test_plain_panel_without_training_proper_keeps_the_plain_denominator():
+    p = with_plain("A", 2.0)
+    p["comparisons"]["step"] |= {"interval_s": 1.5, "prover_side_s": 0.75,
+                                 "verifier_side_s": 0.25}
+    out = panel(page(p), "r0-plain")
+    assert "÷ plain" in out and "training proper</td>" not in out
+    assert "against plain</td><td>1.5</td><td>0.50</td><td>3.0</td>" in out
+    assert "Plain step with the weight reload" not in out
+    assert "The plain step includes the weight reload." in out
 
 
 def test_the_phase_by_product_caption_says_how_measure_time_is_split():
