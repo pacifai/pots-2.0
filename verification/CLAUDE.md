@@ -2224,6 +2224,11 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     its job.
   - `runs/pipeline.py` (FS33b): child to parent `ready` (handshake), `step`, `released`,
     `final`, `error`; parent to child `release`, `stop`, `bye`. At most 2 steps are unreleased.
+    Staged mode (FS58b; `staging_setting`, auto on a CUDA prover with one other CUDA verifier
+    device): the child proves with `prove_step(staging=<its device>)`, builds no kernel on a
+    verifier GPU and holds one step at most; the parent copies each opened step to its
+    placement devices (section `handoff.ship`, harness, in no total), releases it, then
+    verifies its copy. The copy and early release are in `handoff_s`. `child_info["staging"]`.
     The child exits only after `bye` or EOF, after an error or `final` too: `_await_bye` has no
     deadline (the parent's `link.stop()` ends a child that outlives the run).
     `ProverProcessError.kind` is `exception`,

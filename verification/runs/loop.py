@@ -265,6 +265,7 @@ def run_loop(
     recorder: Any = None,
     pipelined: bool | None = None,
     prover: Callable[[], Any] | None = None,
+    staging: bool | None = None,
 ) -> LoopResult:
     """Run ``verifier.n_steps`` steps of ``C`` from ``W_0`` on ``dataset``.
 
@@ -295,6 +296,9 @@ def run_loop(
     verifier's), ``prover`` is the :class:`~verification.runs.pipeline.ProverSpec` the child
     rebuilds from, and ``recorder`` is the run's ``TimeRecorder`` or ``MemoryRecorder`` (whose
     seam is ``section``). Without ``pipelined``, ``recorder`` and ``prover`` are ignored.
+    ``staging`` (pipelined only; ``None`` is auto, :func:`~verification.runs.pipeline.
+    staging_setting`) has the parent copy each step to its verifier GPU and release it first
+    (FS58b); the sequential loop ignores it.
 
     The :class:`StepRecord` times, by mode. Sequential: ``prove_s`` is ``prove_step``;
     ``commit_s`` the paths, the commit and ``P5.write`` (the in-memory hold); ``verify_s``
@@ -315,7 +319,7 @@ def run_loop(
                              handoff=handoff,
                              release_cache=release_cache_setting(release_cache, c,
                                                                  c.placement.prover),
-                             recorder=recorder, prover=prover)
+                             recorder=recorder, prover=prover, staging=staging)
     if model is None or w0 is None:
         raise ValueError("run_loop needs a model and w0 unless it is pipelined")
     sec = section or no_section

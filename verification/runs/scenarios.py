@@ -265,7 +265,8 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
                  verifier: Callable[[Section | None], Verifier] | None = None,
                  handoff: StoreHandoff | None = None,
                  release_cache: bool | None = None, pipelined: bool | None = None,
-                 prover: Callable[[], Any] | None = None) -> ScenarioResult:
+                 prover: Callable[[], Any] | None = None,
+                 staging: bool | None = None) -> ScenarioResult:
     """One scenario's run. ``recorder`` (B6) observes it through the ``section`` seams.
     ``handoff`` is the loop's store hand-off (default in memory; C3 passes a ``DiskHandoff``).
     ``release_cache`` is ``run_loop``'s: ``False`` skips the CUDA cache release between the
@@ -304,7 +305,8 @@ def run_scenario(c: DeclaredComputation, dataset: Sequence[Any],
     model = None if pl else (build_model or c.build_model)()
     loop = run_loop(c, model, dataset, w0, v, final=final, fault=scenario.fault,
                     on_step=on_step, section=section, handoff=handoff,
-                    release_cache=release_cache, recorder=recorder, pipelined=pl, prover=prover)
+                    release_cache=release_cache, recorder=recorder, pipelined=pl, prover=prover,
+                    staging=staging)
     if recorder is not None:
         recorder.finish(loop.verdict)
     return ScenarioResult(scenario, loop, v, judge(scenario.expected, loop, T))

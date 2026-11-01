@@ -539,3 +539,89 @@ def test_merged_steps_carry_step_interval_beside_step_wall(mlp, tmp_path):
         start = by[t]["t0_ns"] if t == 1 else by[t - 1]["t1_ns"]
         assert iv[t]["time_s"] == pytest.approx((by[t]["t1_ns"] - start) / 1e9, abs=1e-9)
         assert iv[t]["side"] == "run" and wall[t]["time_s"] > 0
+
+
+# ---- staged mode (FS58b) --------------------------------------------------------------------
+
+
+def _pl(sharded, prover, devices):
+    return SimpleNamespace(placement=SimpleNamespace(sharded=sharded, prover=prover,
+                                                     devices=devices))
+
+
+@pytest.mark.parametrize("sharded, prover, devices, want", [
+    (True, "cuda:0", ("cuda:1",), True),
+    (True, "cuda", ("cuda:1",), True),
+    (True, "cuda:0", ("cuda",), False),  # a bare ``cuda`` is the current device, cuda:0
+    (True, "cuda:0", ("cuda:0",), False),
+    (True, "cuda:0", ("cuda:1", "cuda:2", "cuda:3"), False),
+    (True, "cuda:0", ("cuda:1", "cuda:2"), False),
+    (True, "cpu", ("cuda:1",), False),
+    (True, "cuda:0", ("cpu",), False),
+    (True, "cpu", ("cpu",), False),
+    (False, "cuda:0", None, False),
+    (False, "cpu", None, False),
+])
+def test_staging_auto_is_on_for_one_other_cuda_verifier_device(sharded, prover, devices, want):
+    c = _pl(sharded, prover, devices)
+    assert pipeline.staging_setting(c, None) is want
+    assert pipeline.staging_setting(c, True) is True
+    assert pipeline.staging_setting(c, False) is False
+
+
+@pytest.fixture(scope="module", params=[("cpu",), THREE], ids=["one", "three"])
+def staged_world(request):
+    return _decoder(request.param)
+
+
+def test_a_forced_staged_run_equals_the_unstaged_and_the_sequential_run(staged_world):
+    w = staged_world
+    seq = go(w, pipelined=False)
+    off = go(w, pipelined=True, staging=False)
+    on = go(w, pipelined=True, staging=True)
+    assert off.loop.child_info["staging"] is False and on.loop.child_info["staging"] is True
+    assert on.loop.verdict.accepted and len(on.loop.steps) == w.T
+    assert_equal(seq, on)
+    assert off.loop.verdict == on.loop.verdict
+    assert [(s.t, s.root, s.loss) for s in off.loop.steps] == [(s.t, s.root, s.loss)
+                                                               for s in on.loop.steps]
+    assert all(torch.equal(off.loop.w_final[n], on.loop.w_final[n]) for n in on.loop.w_final)
+    assert_window(off.loop.child_info, w.T)
+    assert off.loop.child_info["max_unreleased"] == 2
+
+
+def test_a_staged_run_holds_one_step_and_starts_the_next_after_its_release(staged_world):
+    w = staged_world
+    info = go(w, pipelined=True, staging=True).loop.child_info
+    ev = info["events"]
+    assert info["max_unreleased"] == 1 and info["sent"] == w.T
+    for t in range(1, w.T):
+        assert ev.index(("release", t)) < ev.index(("start", t + 1))
+    assert_window(info, w.T)
+
+
+def test_a_staged_run_rejects_at_the_same_step(three):
+    a = go(three, three.faults(FAULT_STEP)["flip"], pipelined=False)
+    b = go(three, three.faults(FAULT_STEP)["flip"], pipelined=True, staging=True)
+    assert b.loop.rejection.step == FAULT_STEP and len(b.loop.steps) == FAULT_STEP
+    assert b.loop.child_info["staging"] is True
+    assert_equal(a, b)
+
+
+def test_a_staged_mlp_run_reads_its_hand_off_time_apart_from_verify(mlp):
+    r = go(mlp, pipelined=True, staging=True).loop
+    assert r.verdict.accepted and all(s.handoff_s > 0 and s.verify_s > 0 for s in r.steps)
+
+
+def test_with_w_next_keeps_each_clone_on_its_replaced_leaf_s_device(three):
+    from verification.prover.step import prove_step
+
+    model = three.c.build_model()
+    out = prove_step(three.c, model, three.w0,
+                     [three.D[i] for i in range(three.c.n_s)])
+    new = out.with_w_next({n: v + 1 for n, v in out.w_next.items()})
+    assert list(new.w_next) == list(out.w_next)
+    for n, v in new.w_next.items():
+        assert v.device == out.w_next[n].device and v.is_contiguous()
+        assert torch.equal(v, out.w_next[n] + 1)
+        assert v.data_ptr() != out.w_next[n].data_ptr()

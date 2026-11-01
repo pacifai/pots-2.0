@@ -58,10 +58,23 @@ all the same: it delays step ``t``'s release, so the child's step ``t + 2`` star
 write's time. A step the run never reaches is never written. Any other hand-off is refused.
 
 **Two transcripts at most.** The child starts step ``t + 2`` only after the parent has released
-step ``t``: it blocks, before each step, while two steps are unreleased. The release order is
+step ``t``: it blocks, before each step, while two steps are unreleased (one, staged). The release order is
 the parent's ``close``, then the child's ``StepHold.release``. A failed release
 (``StoreMutationError``: the prover wrote into a leaf while it was shared) is a run error: no
 verdict and no ``on_step`` for that step.
+
+**Staged mode (FS58b).** With one verifier GPU that is not the prover's (``staging=None`` picks
+it on exactly that layout, :func:`staging_setting`; ``True`` and ``False`` force it), the
+capture would route step ``t + 1``'s products to the GPU that still holds step ``t``. Staged,
+the child proves with ``staging=<its device>`` (FS58a): every tensor leaf stays on the prover's
+side, and the child builds no kernel and creates no context on a verifier GPU. The parent
+copies each opened step to its placement devices in the harness section ``handoff.ship``
+(``SHIP_SECTION``, side ``run``, in no total), synchronizes the source GPU, closes the shared
+store, releases the step and only then verifies its own copy. The window is one step: the child
+starts step ``t + 1`` only when no step is held, so it proves ``t + 1`` while the parent
+verifies ``t`` but never holds two transcripts. The copy and the early release are in
+``handoff_s``, not ``verify_s``; the kept step is written from the parent's copy. The decision
+is in ``child_info["staging"]``.
 
 **The child reads its pipe only between steps**, so a release message waits until the step in
 progress ends. That costs no throughput: the parent cannot verify step ``t + 1`` before it has
@@ -178,11 +191,14 @@ from verification.verifier.driver import RunVerdict, Verifier
 from verification.verifier.matmul_check import measure_kernel
 
 __all__ = ["ProverSide", "ProverSpec", "ProverProcessError", "RecorderSpec", "run_pipelined",
-           "RELEASE_SECTION"]
+           "RELEASE_SECTION", "SHIP_SECTION", "staging_setting"]
 
 # The child's own hand-off section: ``hold.release()`` and, with the cache release on, the
 # CUDA cache release. Not the parent's HANDOFF_SECTION, so no merged step has two of one name.
 RELEASE_SECTION = "handoff.release"
+# The parent's copy of a step from the shared store to its verifier GPUs, staged mode only
+# (FS58b). Harness work (side ``run``, in no total), named like ``handoff.release``.
+SHIP_SECTION = "handoff.ship"
 
 STOP_GRACE_S = 20.0  # how long a stopping parent lets the child finish its step
 TERMINATE_GRACE_S = 5.0  # after terminate(), before kill()
@@ -252,6 +268,7 @@ class _ChildArgs:
     release_cache: bool
     seed: int
     n_steps: int
+    staging: bool = False
 
 
 def _is_cuda(d: str | torch.device) -> bool:
@@ -286,6 +303,23 @@ def _w_hashes(c: DeclaredComputation, w: Mapping[str, torch.Tensor]) -> tuple[by
     if set(w) != set(c.weight_names):
         raise ValueError("weights differ from the declared weight names")
     return tuple(leaf_hashes_of(c, ((c.w_t_index(n), w[n].detach()) for n in c.weight_names)))
+
+
+def staging_setting(c: DeclaredComputation, staging: bool | None) -> bool:
+    """``staging`` as given, or (``None``) on exactly when the one-GPU verifier needs it (FS58b).
+
+    Auto: the placement is sharded, the prover's device is CUDA, there is exactly one verifier
+    device, it is CUDA and it is not the prover's. Then step ``t + 1``'s products would be
+    routed to the GPU that still holds step ``t``; staged, they stay on the prover's side and
+    the parent copies each step to its verifier GPU. A bare ``cuda`` means the current
+    device's index."""
+    if staging is not None:
+        return staging
+    p = c.placement
+    if not p.sharded or not _is_cuda(p.prover) or len(p.devices or ()) != 1:
+        return False
+    (dev,) = p.devices
+    return _is_cuda(dev) and normalize_devices((dev,)) != normalize_devices((p.prover,))
 
 
 # ---- the child ---------------------------------------------------------------------------
@@ -340,7 +374,9 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
     assert_no_dropout(model)
     device = model_device(model)
     cache = args.release_cache and any(_is_cuda(d) for d in (device, *(c.placement.devices or ())))
-    kernel_devs = [torch.device(d) for d in (device, *(c.placement.devices or ()))
+    # Staged (FS58b): the child never creates a context on a verifier GPU.
+    kernel_devs = [torch.device(d) for d in
+                   (device, *(() if args.staging else (c.placement.devices or ())))
                    if _is_cuda(d)]
     for d in dict.fromkeys(kernel_devs):
         GpuBlake3().kernels(d)  # outside every section (FS30)
@@ -392,8 +428,9 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
             handle(conn.recv())  # between steps only
         if stop_at:
             break
-        if t >= args.n_steps or len(holds) >= _MAX_UNRELEASED:
-            # nothing to do (all steps sent) or two steps unreleased: wait for the parent
+        if t >= args.n_steps or len(holds) >= (1 if args.staging else _MAX_UNRELEASED):
+            # nothing to do (all steps sent) or the window is full (two steps unreleased, one
+            # staged: the parent copies a step and releases it before the next starts)
             handle(conn.recv())
             continue
         t += 1
@@ -403,7 +440,8 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
         w_t = fault.entry_weights(t, w)
         t0 = time.perf_counter()
         out = prove_step(c, model, w_t, records, train_records=fault.train_records(t, records),
-                         perturb=fault.perturb(t), section=section)
+                         perturb=fault.perturb(t), section=section,
+                         staging=device if args.staging and _is_cuda(device) else None)
         t1 = time.perf_counter()
         capture = out.capture
         out = fault.emit(t, out)
@@ -628,6 +666,35 @@ def _check_handshake(hs: dict[str, Any], c: DeclaredComputation, verifier: Verif
                                  + "; ".join(bad))
 
 
+def _ship(c: DeclaredComputation, store: SharedStore, tree: Any,
+          dataset_paths: Sequence[Sequence[bytes]] | None, sec: Section) -> InMemoryStore:
+    """Copy the opened step to the verifier's GPUs (staged mode, FS58b): every tensor leaf to
+    its placement device, records as they are. The source GPUs are synchronized once, so the
+    caller may close the shared store."""
+    with sec(SHIP_SECTION):
+        leaves: list[Any] = []
+        sources: dict[torch.device, None] = {}
+        for i in range(c.n_leaves):
+            x = store.leaf(i)
+            if isinstance(x, torch.Tensor):
+                if x.is_cuda:
+                    sources[x.device] = None
+                x = x.to(c.placement.leaf_device(i), copy=True)
+            leaves.append(x)
+        for d in sources:
+            torch.cuda.synchronize(d)
+        return InMemoryStore.hold(c, leaves, tree, dataset_paths)
+
+
+def _await_release(link: _Link, stash: dict[int, tuple], t: int) -> None:
+    """Wait for the child's answer to ``("release", t)``; a refused release is a run error."""
+    released = link.expect("released", stash)
+    if released[1] != t:
+        raise ProverProcessError("protocol", f"released step {released[1]}, not {t}")
+    if released[2] is not None:
+        raise StoreMutationError(f"step {t}: {released[2]}")
+
+
 def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
                   w0: Mapping[str, torch.Tensor] | None, verifier: Verifier, *,
                   final: Mapping[str, torch.Tensor] | Sequence[bytes],
@@ -635,8 +702,10 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
                   on_step: Callable[[StepRecord], None] | None, section: Section | None,
                   handoff: StoreHandoff | None, release_cache: bool,
                   recorder: TimeRecorder | MemoryRecorder | None,
-                  prover: ProverSpec | None) -> LoopResult:
-    """The pipelined loop; see the module docstring. ``run_loop`` calls it with its arguments."""
+                  prover: ProverSpec | None, staging: bool | None = None) -> LoopResult:
+    """The pipelined loop; see the module docstring. ``run_loop`` calls it with its arguments.
+
+    ``staging`` (``None``: :func:`staging_setting`'s auto) picks the staged mode (FS58b)."""
     kernel_check.new_run()  # first, before anything is dispatched (FS34)
     fault = fault or ProverFault()
     if prover is None:
@@ -656,9 +725,10 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
         raise ValueError("pipelined: section must be the recorder's seam")
     rspec = _recorder_spec(recorder, c)
     sec = section or no_section
+    staged = staging_setting(c, staging)
     args = _ChildArgs(_pickled("ProverSpec", prover), _pickled("fault", fault),
                       _pickled("schedule", schedule), rspec, release_cache, verifier.seed,
-                      verifier.n_steps)
+                      verifier.n_steps, staged)
 
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe()
@@ -701,35 +771,55 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
             store = SharedStore.open(c, pkg)
             kept_from = (pkg.tree, pkg.dataset_paths) if keep is not None and t == keep.step \
                 else None
-            del pkg
-            h1 = time.perf_counter()
-            try:
-                rej = verifier.verify_step(t, store)
-            finally:
-                h2 = time.perf_counter()
-            wr = 0.0
-            if kept_from is not None:  # the stored step: in no section, inside step t's interval
-                w0_ = time.perf_counter()
-                leaves = [store.leaf(i) for i in range(c.n_leaves)]
-                keep.write_from(c, leaves, *kept_from)
-                del leaves, kept_from
-                wr = time.perf_counter() - w0_
-            store.close()
-            store = None
-            h3 = time.perf_counter()
-            link.send(("release", t))
-            if release_cache:
-                release_device_cache("cpu", section, devices=c.placement.devices)
-            h4 = time.perf_counter()
-            released = link.expect("released", stash)
-            if released[1] != t:
-                raise ProverProcessError("protocol", f"released step {released[1]}, not {t}")
-            if released[2] is not None:
-                raise StoreMutationError(f"step {t}: {released[2]}")
+            if staged:
+                # FS58b: copy the step to the verifier's GPUs, release it, then verify the copy.
+                own = _ship(c, store, pkg.tree, pkg.dataset_paths, sec)
+                del pkg
+                store.close()
+                store = None
+                link.send(("release", t))
+                if release_cache:
+                    release_device_cache("cpu", section, devices=c.placement.devices)
+                hs = time.perf_counter()
+                _await_release(link, stash, t)
+                h1 = time.perf_counter()
+                try:
+                    rej = verifier.verify_step(t, own)
+                finally:
+                    h2 = time.perf_counter()
+                if kept_from is not None:  # the stored step, from the parent's own copy
+                    leaves = [own.leaf(i) for i in range(c.n_leaves)]
+                    keep.write_from(c, leaves, *kept_from)
+                    del leaves, kept_from
+                own = None
+                handoff_s = hs - h0
+            else:
+                del pkg
+                h1 = time.perf_counter()
+                try:
+                    rej = verifier.verify_step(t, store)
+                finally:
+                    h2 = time.perf_counter()
+                wr = 0.0
+                if kept_from is not None:  # the stored step: in no section, inside step t's interval
+                    w0_ = time.perf_counter()
+                    leaves = [store.leaf(i) for i in range(c.n_leaves)]
+                    keep.write_from(c, leaves, *kept_from)
+                    del leaves, kept_from
+                    wr = time.perf_counter() - w0_
+                store.close()
+                store = None
+                h3 = time.perf_counter()
+                link.send(("release", t))
+                if release_cache:
+                    release_device_cache("cpu", section, devices=c.placement.devices)
+                h4 = time.perf_counter()
+                _await_release(link, stash, t)
+                handoff_s = (h1 - h0) + (h3 - h2) + (h4 - h3) - wr
             if recorder is not None:
                 recorder.merge_step(t, part)
             rec = StepRecord(t, rej, f["loss"], f["prove_s"], f["commit_s"], h2 - h1,
-                             (h1 - h0) + (h3 - h2) + (h4 - h3) - wr, f["capture"],
+                             handoff_s, f["capture"],
                              f["transcript_bytes"], f["leaves"], f["root"], f["known"])
             del part, f
             result.steps.append(rec)
@@ -745,7 +835,7 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
         link.finished = True
         link.send(("bye",))
         result.w_final = None if w_host is None else dict(w_host)
-        result.child_info = info
+        result.child_info = {**info, "staging": staged}
         result.verdict = verifier.end_run(final)
         return result
     finally:
