@@ -478,7 +478,7 @@ def test_the_log_lines_hold_the_numbers_and_ratios():
     proper = [x for x in lines if x.startswith(f"FS42 proper {K} ")]
     assert proper == [
         f"FS42 proper {K} {a}: against training proper (forward, backward, update; the weight reload "
-        f"left out) 5.0 s per step: verifier ÷ proper 2.6, step ÷ proper {w}"
+        f"left out) 5 s per step: verifier ÷ proper 2.6, step ÷ proper {w}"
         for a, w in (("seq", "4"), ("pipe", "2.2"))]
     assert sum(" plain training " in x for x in lines) == 2 * len(PKEYS)
     assert [x for x in lines if x.startswith("FS42") and not x.startswith("FS42 proper")][-1] \

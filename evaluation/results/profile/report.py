@@ -10,8 +10,10 @@ left out of the page and the contents bar; a comparison is drawn only when the i
 
 The page is a summary for a reader, not a dump: every measure stays in the ``profile.json``
 files, and the page shows only the step's sections, their times and shares, their marks, the
-hardware they kept busy, the timeline, check 5's phases and the comparisons (§12 item 8, user,
-2026-10-20). Choices taken here:
+hardware they kept busy, the timeline, check 5's phases, the Steps panel (per step: prover only,
+verifier only, prover waiting, verifier waiting, hand-off and records, the interval and, for a
+pipelined run, the latency; then the steady mean and, when the plain run gives training proper,
+a ÷ training proper row) and the comparisons (§12 item 8, user, 2026-10-20). Choices taken here:
 
 - Sections carry a plain name and a one-line description (``SECTIONS``) and fall into seven
   groups (``GROUPS``), one color each; a section is a tint of its group's color. The
@@ -1042,7 +1044,8 @@ def _steps(run: Run) -> str:
             rows.append(["÷ training proper"]
                         + [fmt(steady[k] / tp if steady.get(k) is not None else None)
                            for k in keys] + [""])
-            proper = (f" Training proper is {fmt(tp)} s per step in the plain run.")
+            proper = ("Training proper is plain training's forward, backward and update, "
+                      f"without the weight reload; it is {fmt(tp)} s per step in the plain run.")
         else:
             proper = ""
     else:
@@ -1054,9 +1057,8 @@ def _steps(run: Run) -> str:
               "step. Hand-off and records is the rest of the interval. The interval is the time "
               "between two verified steps, close to close. "
             + ("Latency is a step's first start to its last end. " if piped else "")
-            + "Training proper is plain training's forward, backward and update, without the "
-              "weight reload." + proper + " All waits come from timestamps on one clock shared "
-              "by both processes.</p>")
+            + (proper + " " if proper else "")
+            + "All waits come from timestamps on one clock shared by both processes.</p>")
 
 
 # ---- the page ----------------------------------------------------------------------------

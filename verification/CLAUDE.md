@@ -128,7 +128,7 @@ profile/analyze.py`) reads versions 1 and 2 and matches each device to its GPU b
 a section's headline utilization from the GPUs of the section's role (`gpu_roles`: the mean over
 the section's listed prover or verifier devices; `util_by_device` keeps each GPU), its floors
 from each device's `probe.json` rates, and its step time as the interval between verified steps
-when the run has one (the `step_interval` time row). `--steady-steps A-B` (or `2,3`) names the steady steps; without it every untraced step after the warm-up counts, with a warning when a pipelined run's set includes its last step (verified with the prover idle) or a step that follows a traced one.
+when the run has one (the `step_interval` time row). `--steady-steps A-B` (or `2,3`) names the steady steps; without it every untraced step after the warm-up counts, with a warning when a pipelined run's set includes its last step (verified with the prover idle) or a step that follows a traced one. The analysis also gives each run's per-step flow (`steps`, `steps_steady`: prover only, verifier only, prover waiting, verifier waiting, hand-off and records, interval, and latency for a pipelined run) and the GPU roles from the environment record.
 
 Data artifacts (`D`, `DÌƒ`, manifest) are written to `$VERIF_OUTPUT_DIR/data/`, and the band
 file to `$VERIF_OUTPUT_DIR/bands.json`. `meta.json` records the seed, task, level and batch
@@ -3590,7 +3590,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `_role_gpus`, over the plain step on its one GPU) and `wall_over_train` (the interval over
     the plain steady step, the mean of the `step` total over steps 2-3), and the log's
     `FS42 <model> <arm>: step X s ...` lines (`_profile_lines`, both verifier ratios labelled
-    wall time and accumulated GPU time). The refusal on fewer than four CUDA devices names its
+    wall time and accumulated GPU time). The plain row also holds `proper_steady_s` (training
+    proper: forward + backward + update of steps 2-3, weight reload left out) and each arm
+    `verify_over_proper` and `wall_over_proper`, logged as `FS42 proper <model> <arm>:` lines (base
+    arms too, as `<arm>_base`); the profile page's Steps panel shows the per-step flow. The refusal on fewer than four CUDA devices names its
     session (`four-h100` or `four-h100-profile`). README: "The four-H100 profiling session
     (FS42)" holds the Mac-side commands (`profile.trace`, `profile.analyze` with
     `--steady-steps 2-3`, `profile.report`), the boot guard's terms and the expected cost.

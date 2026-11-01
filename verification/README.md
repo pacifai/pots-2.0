@@ -1522,6 +1522,12 @@ accumulated GPU time ratio, the one EQ14 puts beside PoTS's verify over train) a
 `wall_over_train` (the arm's step interval over the plain step). The job log ends with one
 `FS42 ok:` or `FS42 FAIL:` line per item, then per model and arm
 `FS42 <model> <arm>: step X s (interval between verified steps), verifier Y s per step, plain training Z s per step; verifier ÷ training A (wall time), B (accumulated GPU time); step ÷ training C`.
+The plain run also gives `proper_steady_s`, training proper: forward, backward and update of its
+steps 2-3, the weight reload left out. Each arm then holds `verify_over_proper` and
+`wall_over_proper` (the verifier time and the interval over it), and the log gets one
+`FS42 proper <model> <arm>: against training proper ... P s per step: verifier ÷ proper A, step ÷ proper C`
+line per arm, the base arms too (as `<arm>_base`). The profile page's Steps panel shows each step's
+prover, verifier, waiting, hand-off and interval, with the steady mean and its ratio to training proper.
 With the A/B arm, the base arms are judged like the O18 arms (every step accepted in the loop's
 mode, the profile's inputs, the samples, the peaks) and their two arms' step roots must be equal
 to each other and each base root must differ from the O18 arm's at the same step (equal roots

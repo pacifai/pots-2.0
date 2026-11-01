@@ -457,10 +457,21 @@ def test_the_steps_panel_has_rows_a_steady_row_and_the_training_proper_ratio():
             '<td>0.50</td><td>0.25</td><td>3.2</td><td class="l"></td></tr>') in out
     assert ("÷ training proper</td><td>3.0</td><td>5.0</td><td>4.5</td><td>1.0</td>"
             "<td>0.50</td><td>6.5</td>") in out
-    assert "Training proper is 0.50 s per step" in out
+    assert "it is 0.50 s per step in the plain run" in out
     assert '<a href="#r0-steps">' in page(p)
     assert page(p).index('id="r0-timeline"') < page(p).index('id="r0-steps"') < \
         page(p).index('id="r0-check5"')
+
+
+def test_the_steps_panel_defines_training_proper_only_with_its_row():
+    p = profile(runs={"honest": steps_view()})
+    p["comparisons"] = {"sections": {}, "step": {"plain_s": 0.5}}
+    out = panel(page(p), "r0-steps")
+    assert "Steady mean" in out and "÷ training proper" not in out
+    assert "Training proper" not in out and "forward, backward and update" not in out
+    p["comparisons"]["step"]["training_proper_s"] = 0.5
+    out = panel(page(p), "r0-steps")
+    assert "÷ training proper" in out and "Training proper is plain training's forward" in out
 
 
 def test_the_steps_panel_shows_latency_only_when_pipelined():

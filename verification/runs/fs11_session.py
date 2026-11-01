@@ -3527,7 +3527,7 @@ def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
 
         def proper_line(k, a, arm, proper=proper):
             return (f"FS42 proper {k} {a}: against training proper (forward, backward, update; "
-                    f"the weight reload left out) {sec(proper)} per step: verifier ÷ proper "
+                    f"the weight reload left out) {sec3(proper)} per step: verifier ÷ proper "
                     f"{rat(arm.get('verify_over_proper'))}, step ÷ proper "
                     f"{rat(arm.get('wall_over_proper'))}")
         for a, arm in row["arms"].items():
