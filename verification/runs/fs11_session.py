@@ -2616,19 +2616,34 @@ def _profile_plain_extras(report: Path) -> dict[str, Any]:
     """:func:`_plain_extras` and what the profile reads of the plain run: the steps with a
     ``P0.*`` time row (``p0_steps``), the ``step`` total row per step (``step_totals_s``, the
     row ``time`` / ``total`` / ``step``), their ``steady_s`` (mean of steps 2 and 3, ``None``
-    without both) and the size of ``final_weights.json`` beside the records."""
+    without both), ``proper_steady_s`` (training proper: the mean over steps 2 and 3 of that
+    step's ``P0.forward`` + ``P0.backward`` + ``P0.update`` time rows, ``train.*`` names accepted
+    too, the weight reload left out; ``None`` unless all three exist in both steps) and the size
+    of ``final_weights.json`` beside the records."""
     out = _plain_extras(report)
     rows = _four_records(report)
     time_rows = [r for r in rows if r.get("record") == "time" and isinstance(r.get("step"), int)
                  and r["step"] >= 1 and _number(r.get("time_s"))]
     totals = {r["step"]: r["time_s"] for r in time_rows
               if r.get("level") == "total" and r.get("component") == "step"}
+    proper: dict[int, float] = {}
+    for t in (2, 3):
+        parts = []
+        for part in ("forward", "backward", "update"):
+            v = [r["time_s"] for r in time_rows if r["step"] == t
+                 and r.get("component") in (f"P0.{part}", f"train.{part}")]
+            if v:
+                parts.append(sum(v))
+        if len(parts) == 3:
+            proper[t] = sum(parts)
     weights = report.parent / WEIGHTS_FILE
     out.update({"p0_steps": sorted({r["step"] for r in time_rows
                                     if str(r.get("component", "")).startswith("P0.")}),
                 "step_totals_s": [totals[t] for t in sorted(totals)],
                 "steady_s": statistics.fmean([totals[2], totals[3]])
                 if 2 in totals and 3 in totals else None,
+                "proper_steady_s": statistics.fmean(proper.values()) if len(proper) == 2
+                else None,
                 "weights_bytes": weights.stat().st_size if weights.is_file() else 0})
     return out
 
@@ -3030,7 +3045,8 @@ def _base_models(parts: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any],
-                  plain_steady: float | None, o18_names: bool = False) -> list[tuple[bool, str]]:
+                  plain_steady: float | None, o18_names: bool = False,
+                  proper_steady: float | None = None) -> list[tuple[bool, str]]:
     """The base arms' (``seq_<k>_base``, ``pipe_<k>_base``) acceptance items and numbers, filled
     into ``row["base"]`` and ``row["ab"]`` (O18, FS49s). Judged like the O18 arms: every step
     accepted in the loop's mode, the four GPUs named, the profile inputs there; the two base arms'
@@ -3061,6 +3077,9 @@ def _profile_base(parts: Sequence[Mapping[str, Any]], k: str, row: dict[str, Any
             else None, plain_steady)
         arm["wall_over_train"] = (_ratio(arm["steady_s"], plain_steady)
                                   if arm["steady_source"] == "step_interval" else None)
+        arm["verify_over_proper"] = _ratio(arm["verifier_steady_s"], proper_steady)
+        arm["wall_over_proper"] = (_ratio(arm["steady_s"], proper_steady)
+                                   if arm["steady_source"] == "step_interval" else None)
         arms[a] = arm
         inputs[a] = _profile_arm_problems(e, a)
     row["base"] = {"accepted": accepted, "roots_equal": equal, "gpu_problems": gpu_why,
@@ -3370,7 +3389,10 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
     ``verify_over_train_accumulated`` (the verifier side's step time times its GPUs, from the
     arm's ``gpu_roles``, over the plain step on its one GPU: the accumulated GPU time ratio
     that EQ14 puts beside PoTS's verify over train) and ``wall_over_train`` (the arm's step
-    interval over the plain step). With base arms in the plan (FS49s, :func:`_profile_base`):
+    interval over the plain step); against training proper (the plain run's
+    ``proper_steady_s``, forward + backward + update, the weight reload left out)
+    ``verify_over_proper`` and ``wall_over_proper``, ``None`` when it is missing. With base arms
+    in the plan (FS49s, :func:`_profile_base`):
     their items and numbers under each model's ``base`` and ``ab`` (the O18 and base steady
     step intervals, their difference and ratio, per loop; the O18 side is the o18 arms when the
     plan has them); ``ab_skipped`` says why not otherwise. With the host-side arms (FS54,
@@ -3409,8 +3431,10 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
         plain = _pair_part(parts, f"plain_{k}").get("extras") or {}
         why_plain = _profile_plain_problems(plain)
         steady_plain = plain.get("steady_s")
+        proper_plain = plain.get("proper_steady_s")
         row["plain"] = {"steady_s": steady_plain, "steady_row": "time / total / step, mean of "
                         "steps 2-3", "step_totals_s": plain.get("step_totals_s"),
+                        "proper_steady_s": proper_plain,
                         "problems": why_plain}
         items.append((not why_plain, f"{k} plain: the records and final weights are there"
                       if not why_plain else f"{k} plain: " + "; ".join(why_plain)))
@@ -3426,10 +3450,14 @@ def four_h100_profile(parts: Sequence[Mapping[str, Any]],
                 and n_ver else None, steady_plain)
             arm["wall_over_train"] = (_ratio(arm["steady_s"], steady_plain)
                                       if arm["steady_source"] == "step_interval" else None)
+            arm["verify_over_proper"] = _ratio(arm["verifier_steady_s"], proper_plain)
+            arm["wall_over_proper"] = (_ratio(arm["steady_s"], proper_plain)
+                                       if arm["steady_source"] == "step_interval" else None)
             items.append((not why, f"{k} {a}: the profile's inputs are there" if not why
                           else f"{k} {a}: " + "; ".join(why)))
         if k in base_keys:
-            items += _profile_base(parts, k, row, steady_plain, host_keys.get(k, False))
+            items += _profile_base(parts, k, row, steady_plain, host_keys.get(k, False),
+                                  proper_plain)
         if k in host_keys:
             items += _profile_host_side(parts, k, row, host_keys[k])
     items += _memory_items(models)
@@ -3492,6 +3520,7 @@ def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
     lines = [f"FS42 {'ok' if ok else 'FAIL'}: {text}" for ok, text in res["items"]]
     for k, row in res["models"].items():
         plain = (row.get("plain") or {}).get("steady_s")
+        proper = (row.get("plain") or {}).get("proper_steady_s")
         for a, arm in row["arms"].items():
             src = arm.get("steady_source")
             what = ("interval between verified steps" if src == "step_interval"
@@ -3502,6 +3531,11 @@ def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
                 f"step; verifier ÷ training {rat(arm.get('verify_over_train'))} (wall time), "
                 f"{rat(arm.get('verify_over_train_accumulated'))} (accumulated GPU time); step "
                 f"÷ training {rat(arm.get('wall_over_train'))}")
+            lines.append(
+                f"FS42 {k} {a}: against training proper (forward, backward, update; the "
+                f"weight reload left out) {sec(proper)} per step: verifier ÷ proper "
+                f"{rat(arm.get('verify_over_proper'))}, step ÷ proper "
+                f"{rat(arm.get('wall_over_proper'))}")
         for a, ab in (row.get("ab") or {}).items():
             lines.append(
                 f"FS49 A/B {k} {a}: O18 ({row.get('ab_basis', 'main arm')}) "

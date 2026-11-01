@@ -54,7 +54,7 @@ def _arm(k, arm, roots=None, profile=None, samples=None, **over):
 
 def _plain(k, **over):
     ex = {"record": "p", "completed": True, "step_s": PLAIN_STEPS, "p0_steps": [1, 2, 3],
-          "step_totals_s": PLAIN_STEPS, "steady_s": 7.0, "weights_bytes": 100,
+          "step_totals_s": PLAIN_STEPS, "steady_s": 7.0, "proper_steady_s": 5.0, "weights_bytes": 100,
           "samples": {"version": 2, "gpus": 4}}
     return base._part(f"plain_{k}", "profile_plain", {**ex, **over})
 
@@ -415,6 +415,24 @@ def test_the_verifier_ratio_is_given_in_wall_time_and_in_accumulated_gpu_time():
     assert arm["verify_over_train_accumulated"] == pytest.approx(13.0 * 2 / 7.0)
 
 
+def test_the_proper_ratios_are_against_the_plain_runs_proper_steady_step():
+    res = _prof()
+    row = res["models"][K]
+    assert row["plain"]["proper_steady_s"] == 5.0
+    for a, wall in (("seq", 20.0), ("pipe", 11.0)):
+        arm = row["arms"][a]
+        assert arm["verify_over_proper"] == pytest.approx(13.0 / 5.0)
+        assert arm["wall_over_proper"] == pytest.approx(wall / 5.0)
+    res = _prof(_parts(**{f"plain_{K}": _plain(K, proper_steady_s=None)}))
+    arm = res["models"][K]["arms"]["seq"]
+    assert arm["verify_over_proper"] is None and arm["wall_over_proper"] is None
+    assert arm["verify_over_train"] == pytest.approx(13.0 / 7.0)
+    res = _prof(_parts(**{f"pipe_{K}": _arm(K, "pipe", step_interval_s=[])}))
+    arm = res["models"][K]["arms"]["pipe"]
+    assert arm["wall_over_proper"] is None
+    assert arm["verify_over_proper"] == pytest.approx(13.0 / 5.0)
+
+
 def test_the_accumulated_ratio_is_unknown_without_roles_a_verifier_time_or_a_plain_step():
     for over in ({"gpu_roles": None}, {"verifier_s": []}):
         res = _prof(_parts(**{f"seq_{K}": _arm(K, "seq", **over)}))
@@ -450,6 +468,7 @@ def test_the_log_lines_hold_the_numbers_and_ratios():
     lines = fs._profile_lines(_prof())
     assert lines[0].startswith("FS42 ok:") and not any(x.startswith("FS42 FAIL") for x in lines)
     per = [x for x in lines if x.startswith(f"FS42 {K} ")]
+    per = [x for x in per if "against training proper" not in x]
     assert per == [
         f"FS42 {K} seq: step 20.0 s (interval between verified steps), verifier 13.0 s per "
         "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), "
@@ -457,6 +476,11 @@ def test_the_log_lines_hold_the_numbers_and_ratios():
         f"FS42 {K} pipe: step 11.0 s (interval between verified steps), verifier 13.0 s per "
         "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), "
         f"5.6 (accumulated GPU time); step ÷ training 1.6"]
+    proper = [x for x in lines if x.startswith(f"FS42 {K} ") and "against training proper" in x]
+    assert proper == [
+        f"FS42 {K} {a}: against training proper (forward, backward, update; the weight reload "
+        f"left out) 5.0 s per step: verifier ÷ proper 2.6, step ÷ proper {w}"
+        for a, w in (("seq", "4"), ("pipe", "2.2"))]
     assert sum(" plain training " in x for x in lines) == 2 * len(PKEYS)
     assert [x for x in lines if x.startswith("FS42")][-1].startswith(f"FS42 {PKEYS[-1]} pipe:")
 
@@ -556,10 +580,37 @@ def test_the_plain_extras_read_the_p0_rows_and_the_weights(tmp_path):
     ex = fs._profile_plain_extras(d / "records.jsonl")
     assert ex["p0_steps"] == [1, 2, 3] and ex["step_totals_s"] == PLAIN_STEPS
     assert ex["steady_s"] == pytest.approx(7.0) and ex["weights_bytes"] == 0
+    assert ex["proper_steady_s"] is None  # only P0.forward is there
     assert fs._profile_plain_problems(ex) == [f"no {fs.WEIGHTS_FILE}"]
     (d / fs.WEIGHTS_FILE).write_text("{}")
     assert fs._profile_plain_problems(fs._profile_plain_extras(d / "records.jsonl")) == []
     assert fs._profile_plain_extras(d / "nope.jsonl")["record"] is None
+
+
+def test_proper_steady_s_is_forward_backward_update_over_steps_2_and_3(tmp_path):
+    def run(name, comps, names=("P0.forward", "P0.backward", "P0.update")):
+        d = tmp_path / name
+        d.mkdir()
+        rows = [{"record": "environment", "machine": {"gpus": base._gpus()}}]
+        for t, s in enumerate(PLAIN_STEPS, 1):
+            for c, v in zip(names, (1.0 * t, 2.0, 0.5)):
+                if (t, c) not in comps:
+                    rows.append({"record": "time", "level": "component", "component": c,
+                                 "step": t, "time_s": v})
+            rows.append({"record": "time", "level": "total", "component": "step", "step": t,
+                         "time_s": s})
+            rows.append({"record": "time", "level": "component", "component": "P0.reload",
+                         "step": t, "time_s": 9.0})
+        rows.append({"record": "run_end"})
+        (d / "records.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+        return fs._profile_plain_extras(d / "records.jsonl")["proper_steady_s"]
+    # step 2: 2 + 2 + 0.5, step 3: 3 + 2 + 0.5; the reload row stays out
+    assert run("a", set()) == pytest.approx((4.5 + 5.5) / 2)
+    assert run("b", set(), ("train.forward", "train.backward", "train.update")) \
+        == pytest.approx(5.0)
+    assert run("c", {(3, "P0.update")}) is None
+    assert run("d", {(1, "P0.update")}) == pytest.approx(5.0)  # step 1 is not read
+    assert run("e", {(2, "P0.backward")}) is None
 
 
 def test_the_samples_header_is_read_with_its_version_and_gpu_count(tmp_path):
