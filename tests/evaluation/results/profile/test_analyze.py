@@ -1311,19 +1311,22 @@ def test_step_flow_of_a_sequential_run():
         warmup=False, traced=False, drain=False, prover_s=0.7, verifier_s=1.5,
         prover_wait_s=None, verifier_wait_s=None, handoff_s=None, interval_s=None,
         latency_s=None))
-    # step 2: no interval row, so the close difference (10 s); prover wait 20 - 10.7
+    # step 2: no interval row, so the close difference (10 s); prover wait 20 - 10.7; the
+    # prover starts (20.0) after close(1) (12.5): the verifier waits for the prover's whole step
+    # (20.7 - 20.0) and the gap before it falls into the hand-off (10 - 1.5 - 0.7)
     _approx_row(_flow_row(rows, 2), dict(
         warmup=False, traced=True, drain=False, prover_s=0.7, verifier_s=1.5,
-        prover_wait_s=9.3, verifier_wait_s=8.2, handoff_s=10.0 - 1.5 - 8.2, interval_s=10.0,
+        prover_wait_s=9.3, verifier_wait_s=0.7, handoff_s=10.0 - 1.5 - 0.7, interval_s=10.0,
         latency_s=None))
     # step 3: the interval row (9.9) wins over the close difference
     _approx_row(_flow_row(rows, 3), dict(
         warmup=False, traced=False, drain=False, prover_s=0.7, verifier_s=1.5,
-        prover_wait_s=9.3, verifier_wait_s=8.2, handoff_s=9.9 - 1.5 - 8.2, interval_s=9.9,
+        prover_wait_s=9.3, verifier_wait_s=0.7, handoff_s=9.9 - 1.5 - 0.7, interval_s=9.9,
         latency_s=None))
+    assert steady["verifier_wait_s"] == pytest.approx(0.7)
     assert steady["prover_wait_s"] == pytest.approx(9.3) and steady["interval_s"] == \
         pytest.approx(9.9)
-    assert steady["handoff_s"] == pytest.approx(0.2) and steady["latency_s"] is None
+    assert steady["handoff_s"] == pytest.approx(7.7) and steady["latency_s"] is None
 
 
 def test_step_flow_of_a_pipelined_run():

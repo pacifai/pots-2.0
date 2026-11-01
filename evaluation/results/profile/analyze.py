@@ -186,7 +186,8 @@ not (time rows are read directly, a traced step's included): ``prover_s`` / ``ve
 the step's ``prover`` / ``verifier`` total time rows; the extents are the first start and last
 end of that side's depth-0 sections (``handoff.*`` left out), on the shared monotonic clock.
 For a step with a predecessor (t >= 2): ``prover_wait_s`` = prover start(t) - prover end(t-1);
-``verifier_wait_s`` = max(0, prover end(t) - max(close(t-1), verifier end(t-1)));
+``verifier_wait_s`` = max(0, prover end(t) - max(close(t-1), verifier end(t-1), prover
+start(t)));
 ``handoff_s`` = ``interval_s`` - ``verifier_s`` - ``verifier_wait_s`` (not clamped). Else
 ``None``. ``interval_s`` is the ``step_interval`` row, else the difference of closes;
 ``latency_s`` the ``step_wall`` row (pipelined only). ``steps_steady`` is the mean of each
@@ -901,7 +902,7 @@ def _step_flow(steps: Sequence[dict[str, Any]], records: list[dict[str, Any]],
                 vend = pe["verifier"][1] if "verifier" in pe else None
                 if vend is not None:
                     row["verifier_wait_s"] = max(
-                        0.0, (ce["prover"][1] - max(pp["t1_ns"], vend)) / 1e9)
+                        0.0, (ce["prover"][1] - max(pp["t1_ns"], vend, ce["prover"][0])) / 1e9)
             if None not in (interval, row["verifier_s"], row["verifier_wait_s"]):
                 row["handoff_s"] = interval - row["verifier_s"] - row["verifier_wait_s"]
         out.append(row)
