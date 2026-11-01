@@ -271,7 +271,8 @@ it with the declared expected point (S6b).
 2. **Glue is recomputed with the model's own modules** (S4b), for example
    `layer.input_layernorm(x)`. Never hand-write RMSNorm, softmax or RoPE.
 3. **Determinism** (S4c):
-   - `torch.use_deterministic_algorithms(True)`, threads pinned, TF32 off.
+   - `torch.use_deterministic_algorithms(True)` with its NaN fill of new tensors off
+     (`fill_uninitialized_memory = False`, FS56), threads pinned, TF32 off.
    - Seeds are set.
    - Dropout is asserted to be 0 on the loaded config.
 4. **Plain SGD** (S8a): `torch.optim.SGD(lr=η, momentum=0, weight_decay=0)`, with no clipping
@@ -361,9 +362,10 @@ interface.
     is `data_dir`. `require_eta()` raises when `η` is unset.
   - `load_config(env=None)`. A bad value raises `ValueError`, and `VERIF_ATTN_IMPL` must be
     `eager` (§8.A.4).
-  - `setup_determinism(cfg)`: deterministic algorithms, threads, seeds,
-    `set_float32_matmul_precision("highest")`, cuBLAS bf16 reduced-precision reductions off
-    (F5a; a no-op without CUDA), cuDNN TF32 off, cuDNN deterministic.
+  - `setup_determinism(cfg)`: deterministic algorithms, the NaN fill of uninitialized memory off
+    (FS56), threads, seeds, `set_float32_matmul_precision("highest")`, cuBLAS bf16
+    reduced-precision reductions off (F5a; a no-op without CUDA), cuDNN TF32 off, cuDNN
+    deterministic.
   - `assert_no_dropout(model_or_config)`.
 - `records.py` (B1, merged): the token record.
   - `TAG_RECORD = 0x01`, `INT32_CODE = 0x10` (the tensor-leaf int32 code), and

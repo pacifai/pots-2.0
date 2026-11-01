@@ -128,6 +128,7 @@ def test_setup_determinism():
     prev_prec = torch.get_float32_matmul_precision()
     prev_cudnn = (cudnn.allow_tf32, cudnn.benchmark, cudnn.deterministic)
     prev_bf16_red = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    prev_fill = torch.utils.deterministic.fill_uninitialized_memory
     py_state, np_state = random.getstate(), np.random.get_state()
     try:
         with torch.random.fork_rng(devices=[]):
@@ -136,9 +137,12 @@ def test_setup_determinism():
             assert torch.backends.mkldnn.matmul.fp32_precision == "bf16"
             # torch's default; setup must switch it off (F5a).
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+            # torch's default; setup must switch it off (FS56).
+            torch.utils.deterministic.fill_uninitialized_memory = True
             cfg = load_config({"VERIF_THREADS": "2", "VERIF_SEED": "5"})
             setup_determinism(cfg)
             assert torch.are_deterministic_algorithms_enabled()
+            assert torch.utils.deterministic.fill_uninitialized_memory is False
             assert torch.get_num_threads() == 2
             assert torch.get_float32_matmul_precision() == "highest"
             assert torch.backends.mkldnn.matmul.fp32_precision == "ieee"
@@ -156,6 +160,7 @@ def test_setup_determinism():
         torch.set_float32_matmul_precision(prev_prec)
         cudnn.allow_tf32, cudnn.benchmark, cudnn.deterministic = prev_cudnn
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = prev_bf16_red
+        torch.utils.deterministic.fill_uninitialized_memory = prev_fill
         random.setstate(py_state)
         np.random.set_state(np_state)
 

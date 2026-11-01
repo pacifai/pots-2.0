@@ -268,6 +268,11 @@ def setup_determinism(cfg: RunConfig) -> None:
             )
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     torch.use_deterministic_algorithms(True)
+    # Deterministic mode's default fills every empty/empty_strided allocation with NaN, a debugging
+    # net that costs a full write of each new tensor (about 7% of a Llama-3.2-1B training step on an
+    # H100, FS49's trace). No honest result changes unless an op reads memory before writing it,
+    # which the step roots and the replay would expose (FS56, F25).
+    torch.utils.deterministic.fill_uninitialized_memory = False
     torch.set_num_threads(cfg.threads)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
