@@ -2617,25 +2617,28 @@ def _profile_plain_extras(report: Path) -> dict[str, Any]:
     ``P0.*`` time row (``p0_steps``), the ``step`` total row per step (``step_totals_s``, the
     row ``time`` / ``total`` / ``step``), their ``steady_s`` (mean of steps 2 and 3, ``None``
     without both), ``proper_steady_s`` (training proper: the mean over steps 2 and 3 of that
-    step's ``P0.forward`` + ``P0.backward`` + ``P0.update`` time rows, ``train.*`` names accepted
-    too, the weight reload left out; ``None`` unless all three exist in both steps) and the size
-    of ``final_weights.json`` beside the records."""
+    step's forward + backward + update time rows, the weight reload left out; read as the
+    profile's analyze ``_times`` reads: ``traced`` and ``derived`` rows skipped, the first row per
+    step and component; one name family per run, ``P0.*`` when all three are in both steps, else
+    ``train.*``; ``None`` unless one family has all three in both steps) and the size of
+    ``final_weights.json`` beside the records."""
     out = _plain_extras(report)
     rows = _four_records(report)
     time_rows = [r for r in rows if r.get("record") == "time" and isinstance(r.get("step"), int)
                  and r["step"] >= 1 and _number(r.get("time_s"))]
     totals = {r["step"]: r["time_s"] for r in time_rows
               if r.get("level") == "total" and r.get("component") == "step"}
+    first: dict[tuple[int, Any], float] = {}
+    for r in time_rows:
+        if not (r.get("traced") or r.get("derived")):
+            first.setdefault((r["step"], r.get("component")), r["time_s"])
     proper: dict[int, float] = {}
-    for t in (2, 3):
-        parts = []
-        for part in ("forward", "backward", "update"):
-            v = [r["time_s"] for r in time_rows if r["step"] == t
-                 and r.get("component") in (f"P0.{part}", f"train.{part}")]
-            if v:
-                parts.append(sum(v))
-        if len(parts) == 3:
-            proper[t] = sum(parts)
+    for fam in ("P0", "train"):
+        got = {t: [first.get((t, f"{fam}.{p}")) for p in ("forward", "backward", "update")]
+               for t in (2, 3)}
+        if all(v is not None for vs in got.values() for v in vs):
+            proper = {t: sum(vs) for t, vs in got.items()}
+            break
     weights = report.parent / WEIGHTS_FILE
     out.update({"p0_steps": sorted({r["step"] for r in time_rows
                                     if str(r.get("component", "")).startswith("P0.")}),
@@ -3521,6 +3524,12 @@ def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
     for k, row in res["models"].items():
         plain = (row.get("plain") or {}).get("steady_s")
         proper = (row.get("plain") or {}).get("proper_steady_s")
+
+        def proper_line(k, a, arm, proper=proper):
+            return (f"FS42 proper {k} {a}: against training proper (forward, backward, update; "
+                    f"the weight reload left out) {sec(proper)} per step: verifier ÷ proper "
+                    f"{rat(arm.get('verify_over_proper'))}, step ÷ proper "
+                    f"{rat(arm.get('wall_over_proper'))}")
         for a, arm in row["arms"].items():
             src = arm.get("steady_source")
             what = ("interval between verified steps" if src == "step_interval"
@@ -3531,11 +3540,9 @@ def _profile_lines(res: Mapping[str, Any] | None) -> list[str]:
                 f"step; verifier ÷ training {rat(arm.get('verify_over_train'))} (wall time), "
                 f"{rat(arm.get('verify_over_train_accumulated'))} (accumulated GPU time); step "
                 f"÷ training {rat(arm.get('wall_over_train'))}")
-            lines.append(
-                f"FS42 {k} {a}: against training proper (forward, backward, update; the "
-                f"weight reload left out) {sec(proper)} per step: verifier ÷ proper "
-                f"{rat(arm.get('verify_over_proper'))}, step ÷ proper "
-                f"{rat(arm.get('wall_over_proper'))}")
+            lines.append(proper_line(k, a, arm))
+        for a, arm in ((row.get("base") or {}).get("arms") or {}).items():
+            lines.append(proper_line(k, f"{a}_base", arm))
         for a, ab in (row.get("ab") or {}).items():
             lines.append(
                 f"FS49 A/B {k} {a}: O18 ({row.get('ab_basis', 'main arm')}) "
