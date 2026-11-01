@@ -51,11 +51,13 @@ sections, ``handoff.release``). The harness section ``handoff.totals`` is in non
 
 **The stored step.** With a ``KeptStepHandoff`` naming step ``t`` (``run_verified``'s stored
 step, EV2), the parent writes step ``t`` to disk from the opened store's leaves and the
-package's ``tree`` and ``h_D`` paths, after ``verify_step(t)`` and before ``close``, and checks
+package's ``tree`` and ``h_D`` paths, after ``verify_step(t)`` and before ``close`` (staged: from
+the parent's own copy, after the early release), and checks
 the files' root as ``KeptStepHandoff.write`` does. The write is in no section and in none of
 the step's four clocks (``handoff_s`` excludes it), as in the sequential loop. Its cost is real
-all the same: it delays step ``t``'s release, so the child's step ``t + 2`` starts later by the
-write's time. A step the run never reaches is never written. Any other hand-off is refused.
+all the same: unstaged it delays step ``t``'s release, so the child's step ``t + 2`` starts
+later by the write's time (staged, the release came first and the write delays only the
+parent's next step). A step the run never reaches is never written. Any other hand-off is refused.
 
 **Two transcripts at most.** The child starts step ``t + 2`` only after the parent has released
 step ``t``: it blocks, before each step, while two steps are unreleased (one, staged). The release order is
@@ -75,7 +77,12 @@ starts step ``t + 1`` only when no step is held, so it proves ``t + 1`` while th
 verifies ``t`` but never holds two transcripts. The copy and the early release are in
 ``handoff_s``, not ``verify_s``; the kept step is written from the parent's copy. The decision
 is in ``child_info["staging"]``, and ``child_info["verifier_reserved"]`` is the child's
-allocator reserve on each verifier GPU at the end (0: the child never touched it).
+allocator reserve on each verifier GPU at the end, and ``child_info["verifier_context"]`` whether
+it holds a primary context there (CUDA builds that expose the query; else ``None``). The child's
+recorder is built on the prover's device only, W_0 and any fault's own weights are put on the
+prover's device, so both read 0 and ``False``: the child never touched the verifier GPU. Its
+sections' device lists then hold the prover's device only (``gpu_held_s``, ``gpu_us_by_device``
+and the memory lists of the child's rows count one GPU, not two).
 The parent's cache is not released before the copy, on purpose: in this layout the cache
 release is off (auto), and step ``t``'s copy reuses the blocks step ``t - 1``'s verification
 freed in the same allocator, which is the point of the parent making the copy. A refused
@@ -88,7 +95,7 @@ package ``t + 1``, which the child sends when that step ends, and the child answ
 of ``t`` right after, before it starts step ``t + 2``. The parent's wait for the release result
 is the child's post-step bookkeeping, not a training step. The release (and its CUDA cache
 release) is timed in the child's table for the step in progress then, so the last two steps'
-release rows are never merged.
+release rows are never merged (staged, the last step's only).
 
 **Stopping.** After the last step, or a verified rejection at ``t`` (after its release
 succeeded and ``on_step(t)`` ran), the parent sends ``stop``. The child discards later steps and
@@ -146,6 +153,7 @@ never measures, so it builds no measuring kernel.
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import multiprocessing
 import os
@@ -371,14 +379,20 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
     schedule = pickle.loads(args.schedule)  # noqa: S301
     side = spec()
     c, dataset = side.c, side.dataset
+    w0 = side.w0
     rec = None if args.recorder is None else args.recorder.build()
     section: Section | None = None if rec is None else rec.seam()
     sec = section or no_section
     model = side.build_model()
+    device = model_device(model)
+    staged_cuda = args.staging and _is_cuda(device)
+    if staged_cuda:  # FS58b: no tensor of the child's lives on a verifier GPU
+        fault.staging_device = device
+        w0 = {n: v if v.device == device else v.to(device) for n, v in w0.items()}
+        side = dataclasses.replace(side, w0=w0)
     if type(fault).bind is not ProverFault.bind:
         fault.bind(c, ReusedModel(side.build_model))
     assert_no_dropout(model)
-    device = model_device(model)
     cache = args.release_cache and any(_is_cuda(d) for d in (device, *(c.placement.devices or ())))
     # Staged (FS58b): the child never creates a context on a verifier GPU.
     kernel_devs = [torch.device(d) for d in
@@ -390,7 +404,7 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
     with sec("run:P4.tree"):
         tree = dataset_tree(c, dataset)
     part0 = None if rec is None else rec.close_step(0)
-    handshake = {"w0": _w_hashes(c, side.w0), "dataset_root": tree.root,
+    handshake = {"w0": _w_hashes(c, w0), "dataset_root": tree.root,
                  "dataset_len": len(dataset), **_fingerprint(c)}
     conn.send(("ready", handshake, part0))
 
@@ -427,7 +441,9 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
         else:
             raise RuntimeError(f"the prover's process got an unknown message {msg[0]!r}")
 
-    w: Mapping[str, torch.Tensor] = side.w0
+    w: Mapping[str, torch.Tensor] = w0
+    if args.staging:  # W_0 stays in ``w`` only: step 1's end frees it (1.8 GiB for Qwen)
+        side = w0 = None  # type: ignore[assignment]
     t = 0
     while not stop_at:
         while conn.poll(0):
@@ -486,6 +502,11 @@ def _child_run(conn: Connection, args: _ChildArgs) -> None:
             str(d): torch.cuda.memory_reserved(d)
             for d in dict.fromkeys(torch.device(x) for x in (c.placement.devices or ())
                                    if _is_cuda(x))}
+        has_ctx = getattr(torch._C, "_cuda_hasPrimaryContext", None)  # CUDA builds only
+        info["verifier_context"] = {
+            str(d): None if has_ctx is None else bool(has_ctx(d.index))
+            for d in dict.fromkeys(normalize_devices(
+                [x for x in (c.placement.devices or ()) if _is_cuda(x)]))}
     conn.send(("final", w_host, info))
     del w_host
     _await_bye(conn)
@@ -622,8 +643,8 @@ def _pickled(what: str, x: Any) -> bytes:
                         f"process: {type(e).__name__}: {e}") from e
 
 
-def _recorder_spec(recorder: TimeRecorder | MemoryRecorder | None, c: DeclaredComputation
-                   ) -> RecorderSpec | None:
+def _recorder_spec(recorder: TimeRecorder | MemoryRecorder | None, c: DeclaredComputation,
+                   staged: bool = False) -> RecorderSpec | None:
     if recorder is None:
         return None
     if type(recorder) is TimeRecorder:
@@ -637,7 +658,10 @@ def _recorder_spec(recorder: TimeRecorder | MemoryRecorder | None, c: DeclaredCo
         raise ValueError(f"pipelined: a {type(recorder).__name__} cannot split a step; only "
                          f"TimeRecorder and MemoryRecorder run pipelined")
     p = c.placement
-    devs = tuple(str(d) for d in normalize_devices((p.prover, *(p.devices or ()))))
+    # Staged (FS58b): the child's recorder knows the prover's device only, so it never
+    # synchronizes or probes a verifier GPU; its sections' own device lists carry that.
+    devs = tuple(str(d) for d in normalize_devices(
+        (p.prover,) if staged else (p.prover, *(p.devices or ()))))
     on_cuda = any(_is_cuda(d) for d in devs)
     return RecorderSpec(kind, recorder.run, recorder.scenario, devs if on_cuda else ())
 
@@ -738,9 +762,9 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
                          "which is another process")
     if recorder is not None and section is not None and section is not recorder.seam():
         raise ValueError("pipelined: section must be the recorder's seam")
-    rspec = _recorder_spec(recorder, c)
-    sec = section or no_section
     staged = staging_setting(c, staging)
+    rspec = _recorder_spec(recorder, c, staged)
+    sec = section or no_section
     args = _ChildArgs(_pickled("ProverSpec", prover), _pickled("fault", fault),
                       _pickled("schedule", schedule), rspec, release_cache, verifier.seed,
                       verifier.n_steps, staged)

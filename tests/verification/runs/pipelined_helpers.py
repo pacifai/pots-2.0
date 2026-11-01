@@ -31,12 +31,16 @@ class DecoderSpec:
     devices: tuple = ("cpu", "cpu", "cpu")
     device: str = "cpu"
     layers: int | None = None
+    stage_w0: bool | None = None  # None: as ``decoder_prover``, follow ``staging_setting``
 
     def __call__(self):
         from tests.verification.transcript.shared_helpers import setup
+        from verification.runs.pipeline import staging_setting
 
         determinism(self.device)
         c, D, model, w0 = setup(self.devices, self.device, self.layers)
+        if staging_setting(c, self.stage_w0):  # a staged child holds no W_0 on a verifier GPU
+            w0 = {n: v.to(c.placement.prover) for n, v in w0.items()}
         return ProverSide(c, c.build_model, D, w0)
 
 
@@ -118,6 +122,23 @@ class SelfKillAt(ProverFault):
     def emit(self, t, out):
         if t == self.t:
             os.kill(os.getpid(), signal.SIGKILL)
+        return out
+
+
+class LateWrite(ProverFault):
+    """At step ``t``, bumps a leaf's version 0.2 s after ``emit``: while the step is shared and
+    the child waits for the release. Unlike ``WriteIntoLeaf`` (whose write lands after the
+    release when staged) it fails a staged release, if the parent is slow to release."""
+
+    def __init__(self, t):
+        self.t = t
+
+    def emit(self, t, out):
+        if t == self.t:
+            import threading
+
+            leaf = out.w_next[next(iter(out.w_next))]
+            threading.Timer(0.2, lambda: leaf.add_(0)).start()
         return out
 
 

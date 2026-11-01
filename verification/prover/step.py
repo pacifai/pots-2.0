@@ -163,14 +163,15 @@ def _optimizer(computation: DeclaredComputation, model: torch.nn.Module) -> torc
 def plain_step(computation: DeclaredComputation, model: torch.nn.Module,
                w_t: Mapping[str, torch.Tensor],
                records: Sequence[Any], *,
-               section: Section | None = None) -> tuple[dict[str, torch.Tensor], float]:
+               section: Section | None = None, device: torch.device | str | None = None
+               ) -> tuple[dict[str, torch.Tensor], float]:
     """The same SGD step with no capture and no transcript: ``(W_{t+1}, loss)``.
 
     For hidden steps, η tuning and the capture-on/off comparison. With ``section`` it is EQ1b's
     P0, the plain baseline: ``P0.load``, ``P0.forward``, ``P0.backward`` and ``P0.update`` cover
     the same work as :func:`prove_step`'s ``train.*`` phases (forward and backward entered once
     per head block and summed, as there). Copying out ``W_{t+1}`` is the
-    caller's and sits outside them.
+    caller's and sits outside them. ``device`` puts ``W_{t+1}`` there (FS58 staging).
     """
     sec = section or no_section
     with sec("P0.load"):
@@ -181,7 +182,7 @@ def plain_step(computation: DeclaredComputation, model: torch.nn.Module,
     with sec("P0.update"):
         opt.step()
         model.zero_grad(set_to_none=True)
-    return snapshot_weights(computation, model), float(loss.detach())
+    return snapshot_weights(computation, model, device=device), float(loss.detach())
 
 
 def prove_step(

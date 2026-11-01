@@ -80,6 +80,10 @@ class ProverFault:
       its own through :meth:`bind` before step 1.
     """
 
+    staging_device: torch.device | None = None
+    """Set by the staged pipelined child (FS58b) before :meth:`bind`: the device a fault that
+    computes weights itself puts them on, so the child never touches a verifier GPU."""
+
     def bind(self, c: DeclaredComputation, build_model: Callable[[], torch.nn.Module]) -> None:
         """Take the prover process's computation and model builder. Default: nothing."""
 
@@ -305,8 +309,9 @@ def run_loop(
     ``verify_step`` and the hand-off's release; ``handoff_s`` the cache release. Pipelined:
     ``prove_s`` and ``commit_s`` are the child's (``commit_s`` holds ``P5.write``, which copies
     a CPU transcript into shared memory); ``verify_s`` is the parent's ``verify_step`` alone;
-    ``handoff_s`` the parent's ``SharedStore.open``, ``close`` and cache release. The child's
-    release and the wait for its answer are in none of them.
+    ``handoff_s`` the parent's ``SharedStore.open``, ``close`` and cache release (staged, FS58b:
+    ``open``, the copy to the verifier GPU, ``handoff.ship``, and the early release). The
+    child's release and the wait for its answer are in none of them.
     """
     kernel_check.new_run()  # first: a new run checks every kernel shape afresh (FS34)
     if pipelined_setting(pipelined):

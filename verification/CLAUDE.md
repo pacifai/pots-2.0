@@ -2233,7 +2233,9 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     deadline (the parent's `link.stop()` ends a child that outlives the run).
     `ProverProcessError.kind` is `exception`,
     `died`, `handshake`, `protocol` or `timeout`. Child recorder rows merge into the parent's,
-    except the child's `handoff.release` rows of the last two steps, which are never merged.
+    except the child's `handoff.release` rows of the last two steps (staged: the last one), which are never merged.
+    Staged, the child's recorder lists the prover's device only, so its rows' per-device lists
+    hold one GPU.
     The handshake compares the whole computation and the data: `n_leaves`, `M`, `n_s`, `eta`,
     the weight names and shapes, the four dtypes, the devices, a BLAKE3 digest of the products
     (and the list itself when it has at most 512), `pad_id`, `source`, the `W_0` hashes
