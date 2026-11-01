@@ -616,23 +616,45 @@ def _gpu_roles_words(roles: Any) -> str:
     ent = [r for r in roles if isinstance(r, dict)]
     if not ent:
         return ""
-    def devs(role: str) -> str:
-        return ", ".join(str(r.get("device")) for r in ent if role in (r.get("roles") or []))
+    def devs(role: str) -> list[str]:
+        return [str(r.get("device")) for r in ent if role in (r.get("roles") or [])]
     prover, ver = devs("prover"), devs("verifier")
-    n_ver = sum("verifier" in (r.get("roles") or []) for r in ent)
+    others = [d for d in ver if d not in prover]
+    if not others:
+        return ""  # nothing runs off the training GPU: nothing to understate
+
+    def names(ds: list[str]) -> str:
+        return ", ".join(esc(d) for d in ds)
+    both = [d for d in prover if d in ver]
+    n = len(ent)
+    head = f"With {n} GPU{'s' if n != 1 else ''}"
+    verb_o = "verifies" if len(others) == 1 else "verify"
+    who = "the verifier GPU" if len(others) == 1 else "the verifier GPUs"
+    that = "that GPU" if len(others) == 1 else "those GPUs"
+    tail = ("The profile's per-GPU utilization holds each GPU. ")
+    if both:
+        trains = "trains and verifies" if len(both) == 1 else "train and verify"
+        solo = [d for d in prover if d not in both]
+        parts = [f"{names(both)} {trains}"]
+        if solo:
+            parts.append(f"{names(solo)} {'trains' if len(solo) == 1 else 'train'}")
+        parts.append(f"{names(others)} {verb_o}")
+        return (f"{head} ({'; '.join(parts)}), the commit's hashing of the weights and the dK "
+                f"leaves and the copies of the next weights run partly on {names(others)}, so a "
+                "prover-side section's GPU figure here understates them. The largest "
+                f"prover-side work on {names(others)} is the peer copies of the products to "
+                f"{that} and their hashing on arrival during training, beside the commit's "
+                "hashing and the next weights' copies. " + tail)
     parts = []
     if prover:
-        parts.append(f"{prover} trains")
-    if ver:
-        parts.append(f"{ver} verify" if n_ver > 1 else f"{ver} verifies")
-    who = "the verifier GPUs" if n_ver > 1 else "the verifier GPU"
-    return (f"With {len(ent)} GPUs ({'; '.join(parts)}), the commit's hashing of the weights and "
+        parts.append(f"{names(prover)} {'trains' if len(prover) == 1 else 'train'}")
+    parts.append(f"{names(others)} {verb_o}")
+    return (f"{head} ({'; '.join(parts)}), the commit's hashing of the weights and "
             f"the dK leaves and the copies of the next weights run on {who}, so a "
             f"prover-side section's GPU figure here understates them. The largest prover-side "
-            f"work on {who} is the peer copies of the products to "
-            f"{'those GPUs' if n_ver > 1 else 'that GPU'} and their hashing on arrival during "
-            "training, beside the commit's hashing and the next weights' copies. The profile's "
-            "per-GPU utilization holds each GPU. ")
+            f"work on {who} is the peer copies of the products to {that} and their hashing on "
+            "arrival during training, beside the commit's hashing and the next weights' "
+            "copies. " + tail)
 
 
 def _flow(run: Run) -> str:
@@ -978,7 +1000,7 @@ def _plain(run: Run) -> str:
         rows.append(["Plain step with the weight reload", "—", fmt(pl), "—"])
         rows.append(["Weight reload, left out of training proper", "—", fmt(rl), "—"])
     head = ["Row", "Verified run (s)", "Plain training (s)",
-            "÷ training proper" if proper else "÷ plain"]
+            "Ratio" if proper else "÷ plain"]
     if proper:
         note = ("The whole-step, prover and verifier rows are divided by training proper, plain "
                 "training's forward, backward and update without the weight reload; the plain "
@@ -1013,7 +1035,7 @@ def _steps(run: Run) -> str:
         rows.append([fmt(st.get("step"))] + [fmt(st.get(k)) for k in keys]
                     + [", ".join(notes)])
     steady = run.view.get("steps_steady")
-    if steady:
+    if steady and any(v is not None for v in steady.values()):
         rows.append(["Steady mean"] + [fmt(steady.get(k)) for k in keys] + [""])
         tp = ((run.profile.get("comparisons") or {}).get("step") or {}).get("training_proper_s")
         if isinstance(tp, (int, float)) and not isinstance(tp, bool) and tp > 0:
