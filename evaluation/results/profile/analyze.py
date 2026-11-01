@@ -180,6 +180,20 @@ of 16 MiB or more) and ``other``. A part with no row is 0, since a zero is not w
 parts. The one floor is the hash floor, bytes × ``hash.per_byte_s`` + leaves × ``hash.per_leaf_s``
 of the probe; it goes beside the wall time and the ``native`` part. There is no tree floor: the
 probe times whole ``leaf_hashes_of`` calls and has no rate for the tree's nodes.
+
+**Per-step flow (FS59).** ``steps`` of a run view has one row per markers step >= 1, traced or
+not (time rows are read directly, a traced step's included): ``prover_s`` / ``verifier_s`` are
+the step's ``prover`` / ``verifier`` total time rows; the extents are the first start and last
+end of that side's depth-0 sections (``handoff.*`` left out), on the shared monotonic clock.
+For a step with a predecessor (t >= 2): ``prover_wait_s`` = prover start(t) - prover end(t-1);
+``verifier_wait_s`` = max(0, prover end(t) - max(close(t-1), verifier end(t-1), prover
+start(t)));
+``handoff_s`` = ``interval_s`` - ``verifier_s`` - ``verifier_wait_s`` (not clamped). Else
+``None``. ``interval_s`` is the ``step_interval`` row, else the difference of closes;
+``latency_s`` the ``step_wall`` row (pipelined only). ``steps_steady`` is the mean of each
+seconds field over the steady steps, ``None``s skipped. ``gpu_roles`` is the environment
+record's, as written. The plain comparison's ``step`` adds ``training_proper_s`` (forward +
+backward + update), ``warmup_training_proper_s`` and ``reload_s`` (``load``).
 """
 
 from __future__ import annotations
@@ -838,6 +852,66 @@ def _times(rows: list[dict[str, Any]]
         sides.setdefault(r["component"], r["side"])
         levels.setdefault(r["component"], r.get("level", "component"))
     return out, sides, levels
+
+
+_STEP_FIELDS = ("prover_s", "verifier_s", "prover_wait_s", "verifier_wait_s", "handoff_s",
+                "interval_s", "latency_s")
+
+
+def _step_flow(steps: Sequence[dict[str, Any]], records: list[dict[str, Any]],
+               sides: dict[str, str], steady: Sequence[int], pipelined: bool = False
+               ) -> tuple[list[dict[str, Any]], dict[str, float | None]]:
+    """FS59: one row per markers step >= 1 (prover and verifier alone, each side's wait,
+    hand-off, interval, latency) and the mean of each seconds field over ``steady``."""
+    rows_t: dict[tuple[int, str, str], float] = {}
+    for r in records:
+        if r.get("record") == "time" and r.get("level") == "total" and r["step"] >= 1:
+            rows_t.setdefault((r["step"], r["component"], "t"), r["time_s"])
+    by_step = {s["step"]: s for s in steps if s["step"] >= 1}
+    ext: dict[int, dict[str, tuple[int, int] | None]] = {}
+    for t, st in by_step.items():
+        e: dict[str, list[int]] = {}
+        for sec in st["sections"]:
+            if sec["depth"] != 0 or sec["name"].startswith("handoff"):
+                continue
+            for a, b in _spans_ns(sec, st["t0_ns"]):
+                lo = e.setdefault(_side(sec["name"], sides), [a, b])
+                lo[0], lo[1] = min(lo[0], a), max(lo[1], b)
+        ext[t] = {k: (v[0], v[1]) for k, v in e.items()}
+    last = max(by_step, default=None)
+    out: list[dict[str, Any]] = []
+    for t in sorted(by_step):
+        st = by_step[t]
+        g = lambda name: rows_t.get((t, name, "t"))  # noqa: E731
+        interval = g("step_interval")
+        prev = by_step.get(t - 1)
+        if interval is None and prev is not None and t >= 2:
+            interval = (st["t1_ns"] - prev["t1_ns"]) / 1e9
+        row: dict[str, Any] = {
+            "step": t, "warmup": False, "traced": bool(st["traced"]),
+            "drain": bool(pipelined and t == last),
+            "prover_s": g("prover"), "verifier_s": g("verifier"),
+            "prover_wait_s": None, "verifier_wait_s": None, "handoff_s": None,
+            "interval_s": interval,
+            "latency_s": g("step_wall") if pipelined else None}
+        if prev is not None and t >= 2:
+            pe, ce, pp = ext[t - 1], ext[t], prev
+            if "prover" in ce and "prover" in pe:
+                row["prover_wait_s"] = (ce["prover"][0] - pe["prover"][1]) / 1e9
+            if "prover" in ce:
+                vend = pe["verifier"][1] if "verifier" in pe else None
+                if vend is not None:
+                    row["verifier_wait_s"] = max(
+                        0.0, (ce["prover"][1] - max(pp["t1_ns"], vend, ce["prover"][0])) / 1e9)
+            if None not in (interval, row["verifier_s"], row["verifier_wait_s"]):
+                row["handoff_s"] = interval - row["verifier_s"] - row["verifier_wait_s"]
+        out.append(row)
+    stable = set(steady)
+    means: dict[str, float | None] = {}
+    for f in _STEP_FIELDS:
+        vals = [r[f] for r in out if r["step"] in stable and r[f] is not None]
+        means[f] = statistics.fmean(vals) if vals else None
+    return out, means
 
 
 def _warm_step(steps: Sequence[int]) -> int | None:
@@ -1549,7 +1623,12 @@ def _run_view(markers: io.Markers, records: list[dict[str, Any]], sampler: Sampl
                                    _only(special, lambda t: t == warm))
         warmup = {"step": warm, "n_steps": 1, **w_info, "sections": w_sections}
 
+    flow, flow_steady = _step_flow(markers.steps, records, sides, used, pipelined)
+    for row in flow:
+        row["warmup"] = row["step"] == warm
+    env_rec = next((r for r in records if r.get("record") == "environment"), {})
     return {
+        "steps": flow, "steps_steady": flow_steady, "gpu_roles": env_rec.get("gpu_roles"),
         "device": markers.header.get("device"), "n_steps": len(untraced),
         "warmup_excluded": warm is not None, "warmup": warmup, "steady_steps": used, **info,
         "share_total": sum(s["share"] or 0.0 for s in sections.values()
@@ -1597,8 +1676,18 @@ def _plain_comparison(records: list[dict[str, Any]], plain_dir: Path, warns: set
                          "ratio": t / plain[other] if plain[other] else None,
                          "warmup_prover_s": prover_warm.get(name),
                          "warmup_plain_s": plain_warm.get(other)}
+    def proper(src: dict[str, float]) -> float | None:
+        for pre in ("P0.", "train."):
+            vals = [src.get(pre + n) for n in ("forward", "backward", "update")]
+            if None not in vals:
+                return sum(vals)
+        return None
+
+    load = next((plain[n] for n in ("P0.load", "train.load") if n in plain), None)
     return {"plain_run_dir": str(plain_dir), "sections": out,
-            "step": {"prover_s": prover.get("step"), "plain_s": plain.get("step"),
+            "step": {"training_proper_s": proper(plain),
+                     "warmup_training_proper_s": proper(plain_warm), "reload_s": load,
+                     "prover_s": prover.get("step"), "plain_s": plain.get("step"),
                      "interval_s": prover.get("step_interval"),
                      "prover_side_s": prover.get("prover"),
                      "verifier_side_s": prover.get("verifier"),
