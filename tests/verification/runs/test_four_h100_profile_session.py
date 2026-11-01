@@ -468,7 +468,6 @@ def test_the_log_lines_hold_the_numbers_and_ratios():
     lines = fs._profile_lines(_prof())
     assert lines[0].startswith("FS42 ok:") and not any(x.startswith("FS42 FAIL") for x in lines)
     per = [x for x in lines if x.startswith(f"FS42 {K} ")]
-    per = [x for x in per if "against training proper" not in x]
     assert per == [
         f"FS42 {K} seq: step 20.0 s (interval between verified steps), verifier 13.0 s per "
         "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), "
@@ -476,13 +475,28 @@ def test_the_log_lines_hold_the_numbers_and_ratios():
         f"FS42 {K} pipe: step 11.0 s (interval between verified steps), verifier 13.0 s per "
         "step, plain training 7.0 s per step; verifier ÷ training 1.9 (wall time), "
         f"5.6 (accumulated GPU time); step ÷ training 1.6"]
-    proper = [x for x in lines if x.startswith(f"FS42 {K} ") and "against training proper" in x]
+    proper = [x for x in lines if x.startswith(f"FS42 proper {K} ")]
     assert proper == [
-        f"FS42 {K} {a}: against training proper (forward, backward, update; the weight reload "
+        f"FS42 proper {K} {a}: against training proper (forward, backward, update; the weight reload "
         f"left out) 5.0 s per step: verifier ÷ proper 2.6, step ÷ proper {w}"
         for a, w in (("seq", "4"), ("pipe", "2.2"))]
     assert sum(" plain training " in x for x in lines) == 2 * len(PKEYS)
-    assert [x for x in lines if x.startswith("FS42")][-1].startswith(f"FS42 {PKEYS[-1]} pipe:")
+    assert [x for x in lines if x.startswith("FS42") and not x.startswith("FS42 proper")][-1] \
+        .startswith(f"FS42 {PKEYS[-1]} pipe:")
+
+
+def test_the_base_arms_print_their_proper_ratios():
+    lines = fs._profile_lines(_prof(_base_parts()))
+    assert [x for x in lines if x.startswith(f"FS42 {K} ")] == [
+        x for x in lines if x.startswith(f"FS42 {K} ") and "proper" not in x.split(":")[0]]
+    got = [x for x in lines if x.startswith(f"FS42 proper {K} ")]
+    assert [x.split(":")[0] for x in got] == [f"FS42 proper {K} {a}" for a in
+                                              ("seq", "pipe", "seq_base", "pipe_base")]
+    assert got[2].endswith("verifier ÷ proper 2.6, step ÷ proper 6")
+    assert got[3].endswith("verifier ÷ proper 2.6, step ÷ proper 3.8")
+    base = fs.four_h100_profile(_base_parts(), EXPECTED34)["models"][K]["base"]["arms"]
+    assert base["seq"]["wall_over_proper"] == pytest.approx(6.0)
+    assert base["pipe"]["verify_over_proper"] == pytest.approx(13.0 / 5.0)
 
 
 def test_a_failed_item_prints_as_fs42_fail_and_unknown_numbers_say_so():
@@ -611,6 +625,33 @@ def test_proper_steady_s_is_forward_backward_update_over_steps_2_and_3(tmp_path)
     assert run("c", {(3, "P0.update")}) is None
     assert run("d", {(1, "P0.update")}) == pytest.approx(5.0)  # step 1 is not read
     assert run("e", {(2, "P0.backward")}) is None
+
+
+def test_proper_steady_s_reads_first_untraced_rows_and_one_name_family(tmp_path):
+    def rec(name, rows):
+        d = tmp_path / name
+        d.mkdir()
+        allrows = [{"record": "environment", "machine": {"gpus": base._gpus()}}]
+        allrows += [{"record": "time", "level": "component", "step": t, "time_s": v,
+                     "component": c, **extra} for t, c, v, extra in rows]
+        (d / "records.jsonl").write_text("\n".join(json.dumps(r) for r in allrows) + "\n")
+        return fs._profile_plain_extras(d / "records.jsonl")["proper_steady_s"]
+
+    def fam(f, fwd=1.0, extra=()):
+        return [(t, f"{f}.{c}", v, {}) for t in (2, 3)
+                for c, v in (("forward", fwd), ("backward", 2.0), ("update", 0.5))] + list(extra)
+    assert rec("a", fam("P0")) == pytest.approx(3.5)
+    # a duplicated P0.forward row in step 2 is not summed: the first one counts
+    assert rec("b", fam("P0", extra=[(2, "P0.forward", 5.0, {})])) == pytest.approx(3.5)
+    # a traced or derived row is skipped, even when it comes first
+    first = [(2, "P0.forward", 50.0, {"traced": True}), (3, "P0.update", 50.0, {"derived": True})]
+    assert rec("c", first + fam("P0")) == pytest.approx(3.5)
+    assert rec("d", [first[0]] + [r for r in fam("P0") if r[:2] != (2, "P0.forward")]) is None
+    # both families: P0 wins when complete, train when P0 is not; never a mix
+    assert rec("e", fam("P0") + fam("train", fwd=9.0)) == pytest.approx(3.5)
+    part = [r for r in fam("P0") if r[:2] != (3, "P0.update")]
+    assert rec("f", part + fam("train", fwd=9.0)) == pytest.approx(11.5)
+    assert rec("g", part + [r for r in fam("train") if r[:2] != (2, "train.backward")]) is None
 
 
 def test_the_samples_header_is_read_with_its_version_and_gpu_count(tmp_path):
