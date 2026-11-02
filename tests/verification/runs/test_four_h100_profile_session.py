@@ -6,6 +6,7 @@ import copy
 import gzip
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -691,7 +692,7 @@ def test_an_error_in_the_acceptance_is_recorded_and_the_session_runs_on(tmp_path
 
 # ---- the README's Mac-side commands ---------------------------------------------------------------
 
-PY = "/Users/amitainevo/Projects/pots-2.0/.venv/bin/python"
+PY = sys.executable
 
 
 def _readme_all_commands():

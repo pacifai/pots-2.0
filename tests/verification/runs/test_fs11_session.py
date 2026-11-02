@@ -921,7 +921,8 @@ def test_job_terminates_when_the_session_refuses(tmp_path):
     # The refusal ends the job at once, so a long deadline costs nothing; on a loaded pod the
     # session's start alone took over 6 s and the timer terminated the pod first.
     r, out = _job(tmp_path, plan=OK_PLAN, deadline=60, extra={"FS11_ALLOW_ANY_GPU": "0"})
-    if "H100 check passes" in _log(out):
+    env = json.loads((out / "environment.json").read_text())
+    if fs.refusal(env, False) is None:
         pytest.skip("this machine has an H100")
     assert r.returncode == fs.EXIT_REFUSED, r.stdout + r.stderr
     assert json.loads((out / "summary.json").read_text())["refused"]
