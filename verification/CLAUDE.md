@@ -1717,7 +1717,8 @@ interface.
     `freivalds.drain(dev)` leaves one step in flight per device (a moved operand `_version`
     raises `ReplayError`, so the unit pass falls back); the coming step's challenges are
     prefetched on the worker thread (`_prefetch_step`, only when every run of it is a kernel
-    run and overlap is on) and passed as `prefetched=`; the `5.measure` sections are host
+    run and overlap is on, and only when the default source is a `HostChallengeSource`: under
+    the GPU default (FS41) `_prefetch_step` gets `None`) and passed as `prefetched=`; the `5.measure` sections are host
     timed. Every run's float64 row
     (`freivalds.ROW`) stays on the device. At window 0, inside its `c5.judge` stamp and
     `5.measure` section, `_ReadOnce` makes the one read of the whole step (`_read_rows`: one

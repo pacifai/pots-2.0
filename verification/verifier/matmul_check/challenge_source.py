@@ -9,10 +9,10 @@ follow one another in ``ms`` order. ``event`` is recorded on ``stream`` after th
 fills the buffer, or ``None`` when there is nothing to wait for (a CPU device). Work enqueued on
 ``stream`` afterwards sees the buffer filled; any other stream waits on ``event`` first.
 
-:class:`HostChallengeSource` is the source in use today: the native library draws the entries on
-the host (:func:`challenges.challenge_matrices`, once per distinct width) into one pinned
-buffer, which one non-blocking copy sends to the device. :class:`GpuChallengeSource` (FS41,
-§2.9) is the second source, with the same bytes: ``pots_challenge_xof`` (``challenge_xof.cu``)
+:class:`HostChallengeSource` is the CPU path and the reference: the native library draws the
+entries on the host (:func:`challenges.challenge_matrices`, once per distinct width) into one
+pinned buffer, which one non-blocking copy sends to the device. :class:`GpuChallengeSource` (FS41,
+§2.9) draws the same bytes: ``pots_challenge_xof`` (``challenge_xof.cu``)
 draws them on the device that measures them, from an item table cached per request. It is the
 default on CUDA (``measure_kernel.default_source``); the host source is the CPU path and the
 reference, and the GPU source delegates a CPU device to it.

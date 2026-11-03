@@ -79,25 +79,41 @@ def test_draw_equals_the_host_sources_on_about_30000_attention_like_members():
     assert_draws_equal(cs.GpuChallengeSource(), H, ms, 9, widths)
 
 
-def test_a_repeated_request_with_another_h_hits_the_cache_and_is_still_equal():
+def test_a_repeated_request_with_another_h_hits_the_cache_and_is_still_equal(monkeypatch):
     src = cs.GpuChallengeSource()
+    uploads = []
+    real = src._upload
+
+    def counted(plan, device, stream):
+        uploads.append(plan)
+        return real(plan, device, stream)
+
+    monkeypatch.setattr(src, "_upload", counted)
     ms, widths = (3, 5, 3, 9), (17, 128, 33, 896)  # tuples: the cache's identity hit
     for h in (H, bytes(32), b"\xff" * 32):
         assert_draws_equal(src, h, ms, 9, widths)
+    assert len(uploads) == 1  # one table upload for three draws
     assert_draws_equal(src, H, list(ms), 9, list(widths))  # equal lists: the equality hit
+    assert len(uploads) == 1
 
 
 def test_a_draw_on_a_side_stream_is_read_on_the_default_stream_after_its_event():
+    """The side stream is held back by a sleep before the draw, so a missing or misplaced event
+    would read unwritten memory; the target starts as a sentinel."""
     src = cs.GpuChallengeSource()
     ms, widths, k = [4, 8, 4], [33, 896, 128], 21
     side = torch.cuda.Stream(device=DEV)
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(int(5e8))
     buf, offs, event = src.draw(H, ms, k, widths, stream=side, device=DEV)
-    torch.cuda.current_stream(DEV).wait_event(event)
-    got = buf.clone()  # on the default stream, ordered after the draw by the event
-    torch.cuda.current_stream(DEV).synchronize()
+    cur = torch.cuda.current_stream(DEV)
+    cur.wait_event(event)
+    got = torch.full(buf.shape, 0x7FC0DEAD, dtype=torch.int32, device=DEV)
+    got.copy_(buf.view(torch.int32))  # on the default stream, ordered after the draw
+    cur.synchronize()
     want, want_offs, _ = cs.HostChallengeSource().draw(H, ms, k, widths, stream=None)
     assert np.array_equal(offs, want_offs)
-    assert torch.equal(got.cpu().view(torch.int32), want.view(torch.int32))
+    assert torch.equal(got.cpu(), want.view(torch.int32))
 
 
 def test_xof_kernels_load_and_a_second_call_returns_the_same_object():
