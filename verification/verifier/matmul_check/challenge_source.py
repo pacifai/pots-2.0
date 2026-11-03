@@ -495,6 +495,15 @@ class _XofEntry:
     stream: Any
 
 
+def _stream_device(dev: torch.device, stream: Any) -> torch.device:
+    """``dev`` with the stream's index: the buffer, the table and the launch all sit on the
+    stream's device. An index that differs from the stream's raises ``ValueError``."""
+    on = torch.device(stream.device)
+    if dev.index is not None and dev.index != on.index:
+        raise ValueError(f"device {dev} but the stream is on {on}")
+    return torch.device("cuda", on.index)
+
+
 class GpuChallengeSource:
     """Challenges drawn by the XOF kernel on the device that measures them (FS41): the bytes of
     :class:`HostChallengeSource`'s inline draw, at the same offsets. ``prefetched`` is ignored.
@@ -564,8 +573,7 @@ class GpuChallengeSource:
             return self._host.draw(h, ms, k, widths, stream=stream, device=dev)
         if len(h) != 32:
             raise ValueError("h must be 32 bytes")
-        if dev.index is None:
-            dev = torch.device("cuda", torch.cuda.current_device())
+        dev = _stream_device(dev, stream)
         entry = self._lookup(dev, k, ms, widths, stream)
         stream.wait_event(entry.ready)
         if stream != entry.stream:
