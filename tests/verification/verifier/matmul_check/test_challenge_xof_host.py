@@ -140,6 +140,13 @@ def test_find_first_and_last_unit(hostlib):
             assert hostlib.pots_xof_find_host(ctypes.byref(req.params), u) == i
 
 
+def test_one_item_request(hostlib):
+    req = Request(KEYS[0], [(2 ** 32 - 1, 33)], 5)
+    for u in (0, req.units - 1):
+        assert hostlib.pots_xof_find_host(ctypes.byref(req.params), u) == 0
+    req.check(req.run(hostlib.pots_host_xof))
+
+
 @pytest.mark.parametrize("grid", [2, 5, 1000])
 def test_sim_matches_host(hostlib, simlib, grid):
     items = [(7, 1), (2 ** 32 - 1, 33), (2 ** 24, 128), (3, 17), (11, 896)]
