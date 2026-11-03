@@ -34,7 +34,13 @@ static __host__ __device__ __forceinline__ void pots_compress_xof(
     const pots_u32 *cv, const pots_u32 *block, pots_u32 counter, pots_u32 block_len,
     pots_u32 flags, pots_u32 *out) {
   pots_u32 m[16], v[16], t[16];
+#ifdef POTS_ON_GPU
+#pragma unroll
+#endif
   for (int i = 0; i < 16; i++) m[i] = block[i];
+#ifdef POTS_ON_GPU
+#pragma unroll
+#endif
   for (int i = 0; i < 8; i++) v[i] = cv[i];
   v[8] = POTS_IV0; v[9] = POTS_IV1; v[10] = POTS_IV2; v[11] = POTS_IV3;
   v[12] = counter; v[13] = 0; v[14] = block_len; v[15] = flags;
@@ -45,6 +51,9 @@ static __host__ __device__ __forceinline__ void pots_compress_xof(
   POTS_ROUND(v, m); POTS_PERMUTE(m, t);
   POTS_ROUND(v, m); POTS_PERMUTE(m, t);
   POTS_ROUND(v, m);
+#ifdef POTS_ON_GPU
+#pragma unroll
+#endif
   for (int i = 0; i < 8; i++) {
     out[i] = v[i] ^ v[i + 8];
     out[i + 8] = v[i + 8] ^ cv[i];
@@ -63,7 +72,7 @@ static __host__ __device__ __forceinline__ void pots_xof_label(pots_u32 m, pots_
 /* The item holding unit u: the last i with unit0[i] <= u. */
 static __host__ __device__ __forceinline__ pots_u32 pots_xof_find(const pots_xparams_t *P,
                                                                   pots_u64 u) {
-  const pots_xitem_t *items = (const pots_xitem_t *)(size_t)P->items;
+  const pots_xitem_t *items = (const pots_xitem_t *)P->items;
   pots_u32 lo = 0, hi = P->n;  /* items[lo].unit0 <= u, and u < items[hi].unit0 (or hi == n) */
   while (hi - lo > 1) {
     pots_u32 mid = lo + (hi - lo) / 2;
@@ -80,15 +89,25 @@ static __host__ __device__ __forceinline__ float pots_xof_entry(pots_u32 w) {
 
 static __host__ __device__ __forceinline__ void pots_xof_unit(const pots_xparams_t *P,
                                                               pots_u64 u) {
-  const pots_xitem_t *it = (const pots_xitem_t *)(size_t)P->items + pots_xof_find(P, u);
+  const pots_xitem_t *it = (const pots_xitem_t *)P->items + pots_xof_find(P, u);
   pots_u64 local = u - it->unit0;
   pots_u32 k = P->k;
-  pots_u32 b = (pots_u32)(local / k);
-  pots_u32 j = (pots_u32)(local % k) + 1;
+  pots_u32 b, j;
+  if (local < 0x100000000ull) {
+    pots_u32 l = (pots_u32)local;
+    b = l / k;
+    j = l % k + 1;
+  } else {
+    b = (pots_u32)(local / k);
+    j = (pots_u32)(local % k) + 1;
+  }
   pots_u32 block[16], words[16];
   pots_xof_label(it->m, j, block);
   pots_compress_xof(P->key, block, b, 6, 27, words);
-  float *out = (float *)(size_t)P->out + it->out_off + (pots_u64)j - 1;
+  float *out = (float *)P->out + it->out_off + (pots_u64)j - 1;
+#ifdef POTS_ON_GPU
+#pragma unroll
+#endif
   for (pots_u32 w = 0; w < 16; w++) {
     pots_u64 row = 16ull * b + w;
     if (row < it->width) out[row * k] = pots_xof_entry(words[w]);
