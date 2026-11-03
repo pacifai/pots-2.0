@@ -13,6 +13,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 
 from tests.verification.verifier.matmul_check.test_measure_core import H, bits  # noqa: E402
 from tests.verification.verifier.matmul_check.test_table_cache_host import groups_of  # noqa: E402
+from verification.verifier.matmul_check import challenge_source as cs  # noqa: E402
 from verification.verifier.matmul_check import freivalds as fv  # noqa: E402
 from verification.verifier.matmul_check import measure_kernel as mk  # noqa: E402
 from verification.verifier.matmul_check.freivalds import MeasureGroup  # noqa: E402
@@ -77,13 +78,26 @@ def test_a_moved_shared_view_is_rebuilt_counted_and_the_same_bits():
     assert np.array_equal(bits(got), bits(want))
 
 
-def test_prefetched_challenges_with_the_cache_give_the_same_rows():
+@pytest.fixture
+def host_source():
+    """The host source as the default while a test runs: the default is the GPU source (FS41),
+    whose ``prefetch`` returns ``None``, so a test of the host source's prefetch needs this."""
+    before = mk.set_default_source(cs.HostChallengeSource())
+    try:
+        yield
+    finally:
+        mk.set_default_source(before)
+
+
+def test_prefetched_challenges_with_the_cache_give_the_same_rows(host_source):
+    """Pinned to the host source (``host_source``): it is the one that prefetches."""
     k = 9
     step = on_device(groups_of(1, torch.float32))
     ms = [m for g in step for m in g.ms]
     widths = [g.b.shape[2] for g in step for _ in g.ms]
     rows_of(step, k, True)  # fills both caches
     pf = mk.prefetch(H, ms, k, widths)
+    assert pf is not None
     got = fv.measure_groups_rows(step, h=H, k=k, share=True, prefetched=pf)
     fv.drain()
     assert np.array_equal(bits(got.cpu().numpy()), bits(rows_of(step, k, True)))

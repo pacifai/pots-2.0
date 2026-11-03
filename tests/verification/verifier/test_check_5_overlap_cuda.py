@@ -280,9 +280,23 @@ def test_prefetched_challenges_on_the_device_equal_challenge_matrix_bit_for_bit(
                                challenge_matrix(H, m, k, w).view(torch.int32)), (rep, m, w)
 
 
-def test_a_prefetched_step_gives_the_rows_of_an_inline_draw(hostlib, phased):  # noqa: F811
+@pytest.fixture
+def host_source():
+    """The host source as the default while a test runs: the default is the GPU source (FS41),
+    whose ``prefetch`` returns ``None``, so a test of the host source's prefetch needs this."""
+    before = mk.set_default_source(cs.HostChallengeSource())
+    try:
+        yield
+    finally:
+        mk.set_default_source(before)
+
+
+def test_a_prefetched_step_gives_the_rows_of_an_inline_draw(hostlib, phased,  # noqa: F811
+                                                           host_source):
+    """Pinned to the host source (``host_source``): it is the one that prefetches."""
     group = _group(2)
     pf = mk.prefetch(H, [3], 3, [group.b.shape[2]])
+    assert pf is not None
     pre = freivalds.measure_groups_rows([group], h=H, k=3, prefetched=pf)
     inline = freivalds.measure_groups_rows([group], h=H, k=3)
     freivalds.drain()
