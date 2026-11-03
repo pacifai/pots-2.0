@@ -538,9 +538,9 @@ class GpuChallengeSource:
             if (e.ms is tm or e.ms == tm) and (e.widths is tw or e.widths == tw):
                 self._entries.move_to_end(bucket)
                 return e
-        tm = tuple(int(m) for m in tm)
-        tw = tuple(int(w) for w in tw)
-        plan = xof_plan(tm, k, tw)
+        plan = xof_plan(tm, k, tw)  # validates the values; the stored tuples are the request's
+        tm = ms if isinstance(ms, tuple) else tuple(int(m) for m in ms)
+        tw = widths if isinstance(widths, tuple) else tuple(int(w) for w in widths)
         items, ready = self._upload(plan, device, stream)
         entry = _XofEntry(device, k, tm, tw, plan, items, ready, stream)
         self._entries.setdefault(bucket, []).append(entry)
