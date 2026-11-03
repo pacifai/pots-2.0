@@ -1,5 +1,6 @@
 """Check 5's overlap with the glue on a GPU (FS39, ``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.5):
-the measure stream, the prefetched challenges, one step in flight per device and the pinned
+the measure stream, the challenge sources (the GPU default and the host source with its
+prefetch, each under the step-level tests), one step in flight per device and the pinned
 read, through the real kernel (``cuda`` engine of ``test_kernel_step``). Skipped without CUDA;
 collects anywhere.
 
@@ -41,6 +42,35 @@ ENGINE = "cuda"
 DEV = torch.device("cuda", 0)
 
 
+@pytest.fixture(params=["host", "gpu"])
+def source(request):
+    """The default source for the step-level tests: the host source (counting its ``prefetch``
+    calls, so a test can show check 5's prefetch ran) or the GPU source (FS41's default). The
+    previous default is restored."""
+    src = cs.HostChallengeSource() if request.param == "host" else cs.GpuChallengeSource()
+    src.prefetches = 0
+    if request.param == "host":
+        real = src.prefetch
+
+        def counted(*a, **kw):
+            src.prefetches += 1
+            return real(*a, **kw)
+
+        src.prefetch = counted
+    before = mk.set_default_source(src)
+    try:
+        yield src
+    finally:
+        mk.set_default_source(before)
+
+
+def assert_prefetched(src):
+    """Under the host source check 5's prefetch was submitted at least once; the GPU source
+    never prefetches."""
+    if isinstance(src, cs.HostChallengeSource):
+        assert src.prefetches > 0, "the host source's prefetch was never used"
+
+
 def run(setup, hostlib, *, overlap, unit=True, flip_m=None):
     """``(result, rows by m, spy)`` of check 5 alone on the kernel, with the measure stream on
     or off, in the unit order or the canonical one."""
@@ -74,24 +104,26 @@ def same(setup, hostlib, flip_m=None):
 @pytest.mark.parametrize("dtype", list(DTYPES))
 @pytest.mark.parametrize("switch", SWITCHES, ids=switch_id)
 def test_honest_step_with_overlap_equals_without_and_the_canonical_path(switch, dtype, hostlib,
-                                                                      phased):  # noqa: F811
+                                                                      phased, source):  # noqa: F811
     on = same(tiny(switch, dtype, ENGINE), hostlib)
+    assert_prefetched(source)
     assert on.rejection is None and on.error is None
 
 
 @pytest.mark.parametrize("where", FLIPS, ids=lambda w: "-".join(map(str, w)))
 @pytest.mark.parametrize("dtype", list(DTYPES))
 def test_a_flip_in_each_class_is_rejected_naming_its_product_with_overlap(dtype, where, hostlib,
-                                                                         phased):  # noqa: F811
+                                                                         phased, source):  # noqa: F811
     setup = tiny(CHEAP, dtype, ENGINE)
     on = same(setup, hostlib, _target(setup.c, where))
     assert on.rejection is not None
+    assert_prefetched(source)
 
 
 @pytest.mark.slow
 @pytest.mark.parametrize("dtype", list(DTYPES))
 def test_llama_3_2_1b_shapes_two_layers_rows_equal_with_overlap_on_and_off(dtype, hostlib,
-                                                                         phased):  # noqa: F811
+                                                                         phased, source):  # noqa: F811
     setup = llama_setup(dtype, "cuda")
     on, on_rows, _ = run(setup, hostlib, overlap=True)
     off, off_rows, _ = run(setup, hostlib, overlap=False)
@@ -99,12 +131,13 @@ def test_llama_3_2_1b_shapes_two_layers_rows_equal_with_overlap_on_and_off(dtype
     assert sorted(on_rows) == list(range(1, setup.c.M + 1))
     assert on_rows == off_rows
     assert_same(on, off)
+    assert_prefetched(source)
 
 
 @pytest.mark.parametrize("which", [pytest.param("tiny", id="tiny"),
                                    pytest.param("llama", id="llama", marks=pytest.mark.slow)])
 @pytest.mark.parametrize("dtype", list(DTYPES))
-def test_stats_with_overlap_equal_without_when_no_recorder_syncs_the_host(which, dtype):
+def test_stats_with_overlap_equal_without_when_no_recorder_syncs_the_host(which, dtype, source):
     """Check 5 alone, with no spy copying every operand to the host before each call: the
     replay's own reads still sync the host, so this is a bit-equality test, not a test of the
     wait (the next two are)."""
@@ -115,6 +148,7 @@ def test_stats_with_overlap_equal_without_when_no_recorder_syncs_the_host(which,
         off = run_check5(setup)
     assert on.rejection is None and on.error is None
     assert_same(on, off)
+    assert_prefetched(source)
 
 
 def test_check_5s_launches_run_on_the_measure_stream_and_without_overlap_on_the_current():

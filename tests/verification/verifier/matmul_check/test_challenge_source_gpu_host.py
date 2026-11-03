@@ -125,6 +125,31 @@ def test_cache_identity_and_equality_hits(monkeypatch):
     assert e.plan is ups[0][0] and e.ms == ms and e.widths == widths
 
 
+class CountingTuple(tuple):
+    """A tuple whose ``==`` is counted, to tell an identity hit from an equality hit."""
+
+    eqs = 0
+
+    def __eq__(self, other):
+        type(self).eqs += 1
+        return tuple.__eq__(self, other)
+
+    __hash__ = tuple.__hash__
+
+
+def test_cache_identity_hit_never_compares_and_an_equal_distinct_tuple_does(monkeypatch):
+    src, ups = _source(monkeypatch)
+    dev, st = torch.device("cuda", 0), FakeStream()
+    ms, widths = CountingTuple((3, 4, 5)), CountingTuple((8, 8, 20))
+    CountingTuple.eqs = 0
+    e = src._lookup(dev, 2, ms, widths, st)
+    assert src._lookup(dev, 2, ms, widths, st) is e and len(ups) == 1
+    assert CountingTuple.eqs == 0  # the very same objects: the identity shortcut, no ``==``
+    again = src._lookup(dev, 2, CountingTuple((3, 4, 5)), CountingTuple((8, 8, 20)), st)
+    assert again is e and len(ups) == 1
+    assert CountingTuple.eqs > 0  # equal but distinct: compared, and still a hit
+
+
 def test_cache_misses_on_k_device_and_members(monkeypatch):
     src, ups = _source(monkeypatch)
     st = FakeStream()
