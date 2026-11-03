@@ -236,3 +236,17 @@ def test_cache_stores_the_requests_own_tuples_so_identity_hits(monkeypatch):
     assert e.ms is ms and e.widths is widths
     assert src._lookup(dev, 2, ms, widths, st) is e
     assert src._lookup(dev, 2, (3, 4, 5), (8, 8, 20), st) is e and len(ups) == 1  # equality
+
+
+def test_stream_device_takes_the_streams_index():
+    st = SimpleNamespace(device=torch.device("cuda", 1))
+    assert cs._stream_device(torch.device("cuda"), st) == torch.device("cuda", 1)
+    assert cs._stream_device(torch.device("cuda", 1), st) == torch.device("cuda", 1)
+    with pytest.raises(ValueError, match="stream is on"):
+        cs._stream_device(torch.device("cuda", 0), st)
+
+
+def test_draw_rejects_a_device_that_is_not_the_streams():
+    st = SimpleNamespace(device=torch.device("cuda", 1))
+    with pytest.raises(ValueError, match="stream is on"):
+        cs.GpuChallengeSource().draw(H, [3], 2, [8], stream=st, device="cuda:0")
