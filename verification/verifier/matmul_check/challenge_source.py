@@ -14,8 +14,8 @@ entries on the host (:func:`challenges.challenge_matrices`, once per distinct wi
 pinned buffer, which one non-blocking copy sends to the device. :class:`GpuChallengeSource` (FS41,
 §2.9) draws the same bytes: ``pots_challenge_xof`` (``challenge_xof.cu``)
 draws them on the device that measures them, from an item table cached per request. It is the
-default on CUDA (``measure_kernel.default_source``); the host source is the CPU path and the
-reference, and the GPU source delegates a CPU device to it.
+default on CUDA (``measure_kernel.default_source``) and delegates a CPU device to the host
+source.
 
 FS39 (``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.5): :meth:`HostChallengeSource.prefetch` hands the
 draw of a later call to one worker thread (the native call releases the GIL), which fills a
