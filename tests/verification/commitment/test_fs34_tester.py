@@ -833,7 +833,7 @@ def _preload_order(monkeypatch, pipelined):
 
     from verification.runs import loop
     from verification.runs import pipeline as P
-    from verification.verifier.matmul_check import measure_kernel
+    from verification.verifier.matmul_check import challenge_source, measure_kernel
 
     order = []
     real = L._enqueue_table
@@ -849,6 +849,7 @@ def _preload_order(monkeypatch, pipelined):
     monkeypatch.setattr(mod, "GpuBlake3", lambda: type(
         "G", (), {"kernels": lambda s, d: order.append(("hash", str(d)))})())
     monkeypatch.setattr(measure_kernel, "kernels", lambda d, k=None: order.append(("measure", str(d))))
+    monkeypatch.setattr(challenge_source, "xof_kernels", lambda d: order.append(("xof", str(d))))
     assert _scenario_run(pipelined).loop.verdict.accepted
     return order
 

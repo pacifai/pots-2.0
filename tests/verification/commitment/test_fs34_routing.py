@@ -348,7 +348,7 @@ def test_the_pipelined_parent_builds_both_kernels_once_per_cuda_device_before_st
 
     from verification.runs import pipeline as P
     from verification.verifier.driver import Verifier
-    from verification.verifier.matmul_check import measure_kernel
+    from verification.verifier.matmul_check import challenge_source, measure_kernel
 
     calls = []
     monkeypatch.setattr(P, "_is_cuda", lambda d: True)
@@ -356,6 +356,7 @@ def test_the_pipelined_parent_builds_both_kernels_once_per_cuda_device_before_st
                         lambda: type("G", (), {"kernels": lambda s, d:
                                                calls.append(("hash", d))})())
     monkeypatch.setattr(measure_kernel, "kernels", lambda d, k=None: calls.append(("measure", d)))
+    monkeypatch.setattr(challenge_source, "xof_kernels", lambda d: calls.append(("xof", d)))
     real = Verifier.verify_step
 
     def first(self, t, store):
@@ -365,6 +366,6 @@ def test_the_pipelined_parent_builds_both_kernels_once_per_cuda_device_before_st
     monkeypatch.setattr(Verifier, "verify_step", first)
     assert _scenario_run(True).loop.verdict.accepted
     cpu = torch.device("cpu")
-    assert calls[:3] == [("hash", cpu), ("measure", cpu), ("step", 1)]
-    assert sum(k in ("hash", "measure") for k, _ in calls) == 2
+    assert calls[:4] == [("hash", cpu), ("measure", cpu), ("xof", cpu), ("step", 1)]  # FS41's too
+    assert sum(k in ("hash", "measure", "xof") for k, _ in calls) == 3
     assert "measure_kernel" not in inspect.getsource(P._child_run)
