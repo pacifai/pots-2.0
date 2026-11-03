@@ -149,3 +149,49 @@ def test_sim_matches_host(hostlib, simlib, grid):
     assert grid * 64 < req.units or grid == 1000
     assert np.array_equal(got, want)
     req.check(got)
+
+
+# ---- FS41c: the GPU source's plan through the host build, against the host source's draw ----
+
+def layer_step_request():
+    """A layer step's shape: a few linear products, then attention members of width 128 and 64
+    whose labels run consecutively and then in strides."""
+    ms, widths = [101, 102, 103], [896, 128, 4864]
+    ms += list(range(1000, 1000 + 150))
+    widths += [128] * 150
+    ms += list(range(5000, 5000 + 7 * 150, 7))
+    widths += [64] * 150
+    ms += [2 ** 32 - 1, 2 ** 24]
+    widths += [128, 64]
+    return ms, widths
+
+
+PLAN_REQUESTS = {
+    "mixed_repeated_m": ([7, 3, 7, 1, 2 ** 32 - 1, 3], [1, 15, 16, 17, 33, 896], 21),
+    "layer_step": (*layer_step_request(), 21),
+    "vocab_width": ([11, 12], [151936, 128], 21),
+    "k1": ([5, 6, 5], [1, 17, 128], 1),
+    "k255": ([5, 2 ** 32 - 1, 1], [1, 17, 33], 255),
+}
+
+
+@pytest.mark.parametrize("name", list(PLAN_REQUESTS))
+def test_gpu_plan_through_the_host_build_equals_the_host_sources_draw(hostlib, name):
+    """``GpuChallengeSource.plan``'s table and params, run by the host build, write the bytes
+    of ``HostChallengeSource``'s inline draw at the same offsets."""
+    from verification.verifier.matmul_check import challenge_source as cs
+
+    ms, widths, k = PLAN_REQUESTS[name]
+    h = KEYS[0]
+    plan, params = cs.GpuChallengeSource().plan(h, ms, k, widths)
+    want, offsets, _ = cs.HostChallengeSource().draw(h, ms, k, widths, stream=None)
+    assert np.array_equal(plan.offsets, offsets)
+    assert plan.total == want.numel()
+    out = np.full(plan.total, SENTINEL, np.uint32)
+    params.items = plan.items.ctypes.data
+    params.out = out.ctypes.data
+    assert ctypes.sizeof(params) == ctypes.sizeof(Params)
+    # XParams and the test's Params mirror are two classes of the one struct
+    hostlib.pots_host_xof(ctypes.cast(ctypes.byref(params), ctypes.POINTER(Params)))
+    assert np.array_equal(out, want.numpy().view(np.uint32))
+    assert not np.any(out == SENTINEL)
