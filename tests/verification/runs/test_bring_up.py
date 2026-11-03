@@ -273,6 +273,7 @@ def test_release_cache_reaches_the_steps_and_the_tampers(monkeypatch, release):
     monkeypatch.setattr(loop_mod, "_on_cuda", lambda device: True)
     monkeypatch.setattr(loop_mod, "GpuBlake3", lambda: SimpleNamespace(kernels=lambda d: None))
     monkeypatch.setattr(loop_mod.measure_kernel, "kernels", lambda d, k=None: None)  # FS37's kernel
+    monkeypatch.setattr(loop_mod.challenge_source, "xof_kernels", lambda d: None)  # FS41's
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
     torch.manual_seed(0)
     c = DecoderComputation(tiny_config(family="qwen2", tied=False), n_s=2, n=12, eta=1e-3)

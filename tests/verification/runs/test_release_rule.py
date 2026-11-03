@@ -101,6 +101,7 @@ def spy(monkeypatch):
 
     monkeypatch.setattr(loop_mod, "GpuBlake3", Warm)
     monkeypatch.setattr(loop_mod.measure_kernel, "kernels", lambda device, k=None: None)
+    monkeypatch.setattr(loop_mod.challenge_source, "xof_kernels", lambda device: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(1))
     c = MLPComputation((16, 32, 32, 8), n_s=4, eta=tl.ETA)
     D = tl.synthetic_dataset(c.widths, tl.N_RECORDS, seed=0)

@@ -50,7 +50,7 @@ from verification.prover.step import (
 from verification.transcript.store import IN_MEMORY, InMemoryStore, StoreHandoff
 from verification.verifier.context import Rejection
 from verification.verifier.driver import RunVerdict, Verifier
-from verification.verifier.matmul_check import measure_kernel
+from verification.verifier.matmul_check import challenge_source, measure_kernel
 
 __all__ = ["ProverFault", "StepRecord", "LoopResult", "run_loop", "PlainStepRecord", "PlainResult",
            "run_plain", "HANDOFF_SECTION", "TOTALS_SECTION", "release_device_cache",
@@ -343,6 +343,7 @@ def run_loop(
                            if _on_cuda(x)):
         GpuBlake3().kernels(d)
         measure_kernel.kernels(d, verifier.k)  # check 5's fused measuring kernel (FS37)
+        challenge_source.xof_kernels(d)  # and the GPU challenge source's kernel (FS41)
     if verifier.start_run(dataset) is not None:
         result.verdict = verifier.end_run(final)
         return result

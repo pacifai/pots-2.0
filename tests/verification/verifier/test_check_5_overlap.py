@@ -20,9 +20,18 @@ from verification.verifier import checks
 from verification.verifier.bands import Bands
 from verification.verifier.context import CommittedLeaves, StepContext
 from verification.verifier.matmul_check import freivalds, measure_kernel
+from verification.verifier.matmul_check.challenge_source import HostChallengeSource
 
 from tests.verification.verifier.test_kernel_views import Kernel
 from tests.verification.verifier.test_unit_schedule import CHEAP, _flipped, _layer_target, proved
+
+
+@pytest.fixture(autouse=True)
+def host_source():
+    """These tests are about the host source's prefetch (FS39); the default is the GPU's (FS41)."""
+    before = measure_kernel.set_default_source(HostChallengeSource())
+    yield
+    measure_kernel.set_default_source(before)
 
 
 @pytest.fixture

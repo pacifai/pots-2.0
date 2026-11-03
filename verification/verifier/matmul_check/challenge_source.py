@@ -11,8 +11,11 @@ fills the buffer, or ``None`` when there is nothing to wait for (a CPU device). 
 
 :class:`HostChallengeSource` is the source in use today: the native library draws the entries on
 the host (:func:`challenges.challenge_matrices`, once per distinct width) into one pinned
-buffer, which one non-blocking copy sends to the device. The hashing session's GPU XOF (FS41)
-will be a second source with the same bytes.
+buffer, which one non-blocking copy sends to the device. :class:`GpuChallengeSource` (FS41,
+§2.9) is the second source, with the same bytes: ``pots_challenge_xof`` (``challenge_xof.cu``)
+draws them on the device that measures them, from an item table cached per request. It is the
+default on CUDA (``measure_kernel.default_source``); the host source is the CPU path and the
+reference, and the GPU source delegates a CPU device to it.
 
 FS39 (``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.5): :meth:`HostChallengeSource.prefetch` hands the
 draw of a later call to one worker thread (the native call releases the GIL), which fills a
@@ -26,18 +29,24 @@ each product at its offset.
 
 from __future__ import annotations
 
+import ctypes
+import functools
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 import torch
 
+from verification.commitment import gpu_blake3 as gb
+from verification.commitment import native
 from verification.verifier.matmul_check.challenges import challenge_matrices
 
-__all__ = ["ChallengeSource", "HostChallengeSource", "Prefetch"]
+__all__ = ["ChallengeSource", "GpuChallengeSource", "HostChallengeSource", "Prefetch",
+           "XParams", "XofPlan", "xof_kernels", "xof_params", "xof_plan"]
 
 
 class ChallengeSource(Protocol):
@@ -313,3 +322,264 @@ class HostChallengeSource:
             event.record(stream)
         slot.events.append(event)
         return buf, offsets, event
+
+
+# ---- the GPU source (FS41, ``MEASURE_KERNEL_PLAN_DRAFT.md`` §2.9) ----
+
+XITEM_DTYPE = np.dtype([("m", "<u4"), ("width", "<u4"), ("unit0", "<u8"), ("out_off", "<u8")])
+"""``pots_xitem_t`` of ``challenge_xof.h``: one product of the request."""
+
+
+class XParams(ctypes.Structure):
+    """``pots_xparams_t`` of ``challenge_xof.h``: the kernel's one argument."""
+
+    _fields_ = [("key", ctypes.c_uint32 * 8), ("k", ctypes.c_uint32), ("n", ctypes.c_uint32),
+                ("units", ctypes.c_uint64), ("items", ctypes.c_uint64),
+                ("out", ctypes.c_uint64)]
+
+
+assert XITEM_DTYPE.itemsize == 24 and ctypes.sizeof(XParams) == 64
+
+XOF_THREADS = 256
+XOF_MAX_BLOCKS = 1 << 16
+"""The kernel's block size and grid cap; it strides over the units past the cap."""
+XOF_NAME = "challenge_xof.cu"
+XOF_HEADER = "challenge_xof.h"
+XOF_CORE = "gpu_blake3_core.h"
+XOF_KERNEL = "pots_challenge_xof"
+HERE = Path(__file__).resolve().parent
+COMMITMENT = HERE.parents[1] / "commitment"
+
+
+@dataclass(frozen=True)
+class XofPlan:
+    """A request's item table and layout: ``items`` (``XITEM_DTYPE``, one per product, in
+    request order), the byte ``offsets`` (read-only int64, the host source's inline draw's), the
+    float32 entries in ``total``, the XOF blocks in ``units`` and the vectors per product ``k``."""
+
+    items: np.ndarray
+    offsets: np.ndarray
+    total: int
+    units: int
+    k: int
+
+
+def xof_plan(ms: Sequence[int], k: int, widths: Sequence[int]) -> XofPlan:
+    """The plan of ``challenge_matrix(h, ms[i], k, widths[i])`` for every ``i``, each one its own
+    ``[width, k]`` matrix after the one before. Raises ``ValueError`` outside P8a's ranges."""
+    if not 1 <= k <= 255:
+        raise ValueError(f"k must be in [1, 255], got {k}")
+    if len(ms) != len(widths):
+        raise ValueError(f"{len(ms)} labels but {len(widths)} widths")
+    if len(ms) == 0:
+        raise ValueError("no products to draw challenges for")
+    try:
+        m = np.asarray(ms, dtype=np.int64)
+        w = np.asarray(widths, dtype=np.int64)
+    except OverflowError:
+        raise ValueError("a label or width does not fit 64 bits") from None
+    if m.min() < 1 or m.max() >= 1 << 32:
+        raise ValueError(f"every m must be in [1, 2^32), got {list(ms)}")
+    if w.min() < 1:
+        raise ValueError(f"a width is below 1 (widths {list(widths)})")
+    if w.max() >= 1 << 32:
+        raise ValueError(f"a width is 2^32 or more (widths {list(widths)})")
+    units = k * ((w + 15) // 16)
+    ends = np.cumsum(units)
+    entries = np.cumsum(w * k)
+    items = np.empty(len(m), dtype=XITEM_DTYPE)
+    items["m"], items["width"] = m, w
+    items["unit0"] = ends - units
+    items["out_off"] = entries - w * k
+    offsets = (items["out_off"].astype(np.int64)) * 4
+    offsets.flags.writeable = False
+    return XofPlan(items, offsets, int(entries[-1]), int(ends[-1]), k)
+
+
+def xof_params(h: bytes, plan: XofPlan, items_addr: int, out_addr: int) -> XParams:
+    """The kernel's argument for key ``h`` (32 bytes, as eight little-endian words) and ``plan``,
+    with the item table at ``items_addr`` and the float32 output at ``out_addr``."""
+    if len(h) != 32:
+        raise ValueError("h must be 32 bytes")
+    p = XParams()
+    p.key[:] = np.frombuffer(bytes(h), "<u4").tolist()
+    p.k, p.n, p.units = plan.k, len(plan.items), plan.units
+    p.items, p.out = items_addr, out_addr
+    return p
+
+
+def xof_blocks(units: int) -> int:
+    return max(1, min(-(-units // XOF_THREADS), XOF_MAX_BLOCKS))
+
+
+# ---- the build ----
+
+def xof_source() -> gb.Source:
+    """The kernel, its header, the BLAKE3 core it includes and the cache prefix."""
+    return gb.Source(XOF_NAME, (HERE / XOF_NAME).read_text(),
+                     {XOF_HEADER: (HERE / XOF_HEADER).read_text(),
+                      XOF_CORE: (COMMITMENT / XOF_CORE).read_text()}, "challenge_xof")
+
+
+def xof_build(nvrtc: gb.Nvrtc, cc: tuple[int, int], *, cache: Path | None = None,
+              use_cache: bool = True) -> gb.Built:
+    """The compiled image for compute capability ``cc``, cached in ``cache`` when given."""
+    return gb.build_image(nvrtc, cc, cache=cache, use_cache=use_cache, source=xof_source(),
+                          extra_options=("--fmad=false",))
+
+
+class XofKernels:
+    """A device's loaded module and its XOF kernel."""
+
+    def __init__(self, driver: gb.Driver, dev: int, built: gb.Built) -> None:
+        self.driver = driver
+        self.dev = dev
+        self.built = built
+        driver.push(dev)
+        try:
+            self.module = driver.load_module(built.image)
+            self.fn = driver.function(self.module, XOF_KERNEL)
+        finally:
+            driver.pop()
+
+    def run(self, params: XParams, blocks: int, stream: int) -> None:
+        """Launch ``pots_challenge_xof`` on the raw ``stream``."""
+        self.driver.push(self.dev)
+        try:
+            self.driver.launch(self.fn, blocks, XOF_THREADS, params, stream)  # pyright: ignore
+        finally:
+            self.driver.pop()
+
+
+@functools.lru_cache(maxsize=None)
+def _xof_built(cc: tuple[int, int]) -> gb.Built:
+    return xof_build(gb._nvrtc(), cc, cache=native.cache_dir())
+
+
+@functools.lru_cache(maxsize=None)
+def _xof_kernels(ordinal: int) -> XofKernels:
+    driver = gb._driver()
+    dev = driver.device(ordinal)
+    cc = driver.compute_capability(dev)
+    built = _xof_built(cc)
+    try:
+        return XofKernels(driver, dev, built)
+    except RuntimeError:
+        if not built.cached:
+            raise
+        built.forget()  # a cached image the driver rejects: compile afresh once
+        return XofKernels(driver, dev, xof_build(gb._nvrtc(), cc, cache=native.cache_dir(),
+                                                 use_cache=False))
+
+
+def xof_kernels(device: torch.device | str) -> XofKernels:
+    """``device``'s XOF kernel, compiled (or loaded from the cache) on the first call."""
+    index = torch.device(device).index
+    return _xof_kernels(torch.cuda.current_device() if index is None else index)
+
+
+# ---- the source ----
+
+@dataclass
+class _XofEntry:
+    """One cached request: its plan, the item table on the device and the event after its
+    upload (every draw's stream waits for it), keyed by ``(device, k, ms, widths)``."""
+
+    device: torch.device
+    k: int
+    ms: tuple[int, ...]
+    widths: tuple[int, ...]
+    plan: XofPlan
+    items: Any
+    ready: Any
+    stream: Any
+
+
+class GpuChallengeSource:
+    """Challenges drawn by the XOF kernel on the device that measures them (FS41): the bytes of
+    :class:`HostChallengeSource`'s inline draw, at the same offsets. ``prefetched`` is ignored.
+    ``run(device, params, blocks, stream_handle)`` replaces the loaded kernel, for tests; a CPU
+    device draws on the host."""
+
+    def __init__(self, run: Callable[[torch.device, XParams, int, int], None] | None = None
+                 ) -> None:
+        self._run = run
+        self._host = HostChallengeSource()
+        self._entries: OrderedDict[tuple, list[_XofEntry]] = OrderedDict()
+        self._entries_n = 0
+
+    def plan(self, h: bytes, ms: Sequence[int], k: int, widths: Sequence[int]
+             ) -> tuple[XofPlan, XParams]:
+        """The plan and the params with no device (item and output addresses 0)."""
+        plan = xof_plan(ms, k, widths)
+        return plan, xof_params(h, plan, 0, 0)
+
+    def _upload(self, plan: XofPlan, device: torch.device, stream: Any) -> tuple[Any, Any]:
+        """The item table on ``device``, copied on ``stream``, and the event after the copy. A
+        pageable source buffer is staged before the call returns."""
+        with torch.cuda.stream(stream):
+            items = torch.from_numpy(plan.items.view(np.uint8)).to(device, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(stream)
+        return items, ready
+
+    def _lookup(self, device: torch.device, k: int, ms: Sequence[int], widths: Sequence[int],
+                stream: Any) -> _XofEntry:
+        """The cached entry of this request (tuples compared by identity, then equality), built
+        and stored when missing."""
+        if len(ms) != len(widths):
+            raise ValueError(f"{len(ms)} labels but {len(widths)} widths")
+        if len(ms) == 0:
+            raise ValueError("no products to draw challenges for")
+        tm = ms if isinstance(ms, tuple) else tuple(ms)
+        tw = widths if isinstance(widths, tuple) else tuple(widths)
+        bucket = (device, k, len(tm), int(tm[0]), int(tm[-1]), int(tw[0]), int(tw[-1]))
+        for e in self._entries.get(bucket, ()):
+            if (e.ms is tm or e.ms == tm) and (e.widths is tw or e.widths == tw):
+                self._entries.move_to_end(bucket)
+                return e
+        tm = tuple(int(m) for m in tm)
+        tw = tuple(int(w) for w in tw)
+        plan = xof_plan(tm, k, tw)
+        items, ready = self._upload(plan, device, stream)
+        entry = _XofEntry(device, k, tm, tw, plan, items, ready, stream)
+        self._entries.setdefault(bucket, []).append(entry)
+        self._entries.move_to_end(bucket)
+        self._entries_n += 1
+        while self._entries_n > LAYOUT_CACHE_MAX and len(self._entries) > 1:
+            _, old = self._entries.popitem(last=False)
+            self._entries_n -= len(old)
+        if self._entries_n > LAYOUT_CACHE_MAX:  # one bucket left over the cap: oldest go
+            drop = self._entries_n - LAYOUT_CACHE_MAX
+            del self._entries[bucket][:drop]
+            self._entries_n -= drop
+        return entry
+
+    def draw(self, h: bytes, ms: Sequence[int], k: int, widths: Sequence[int], *,
+             stream: Any, device: torch.device | str | None = None,
+             prefetched: Prefetch | None = None) -> tuple[torch.Tensor, np.ndarray, Any]:
+        dev = torch.device("cpu" if stream is None else stream.device) if device is None \
+            else torch.device(device)
+        if dev.type != "cuda" or stream is None:
+            return self._host.draw(h, ms, k, widths, stream=stream, device=dev)
+        if len(h) != 32:
+            raise ValueError("h must be 32 bytes")
+        if dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        entry = self._lookup(dev, k, ms, widths, stream)
+        stream.wait_event(entry.ready)
+        if stream != entry.stream:
+            entry.items.record_stream(stream)  # the table outlives its upload stream's order
+        plan = entry.plan
+        with torch.cuda.stream(stream):
+            buf = torch.empty(plan.total, dtype=torch.float32, device=dev)
+        params = xof_params(h, plan, entry.items.data_ptr(), buf.data_ptr())
+        blocks = xof_blocks(plan.units)
+        if self._run is not None:
+            self._run(dev, params, blocks, stream.cuda_stream)
+        else:
+            xof_kernels(dev).run(params, blocks, stream.cuda_stream)
+        with torch.cuda.stream(stream):
+            event = torch.cuda.Event()
+            event.record(stream)
+        return buf, plan.offsets, event

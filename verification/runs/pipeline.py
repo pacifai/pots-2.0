@@ -202,7 +202,7 @@ from verification.transcript.errors import StoreMutationError
 from verification.transcript.shared import SharedStore, share_step
 from verification.transcript.store import IN_MEMORY, InMemoryStore, StoreHandoff
 from verification.verifier.driver import RunVerdict, Verifier
-from verification.verifier.matmul_check import measure_kernel
+from verification.verifier.matmul_check import challenge_source, measure_kernel
 
 __all__ = ["ProverSide", "ProverSpec", "ProverProcessError", "RecorderSpec", "run_pipelined",
            "RELEASE_SECTION", "SHIP_SECTION", "staging_setting"]
@@ -793,6 +793,7 @@ def run_pipelined(c: DeclaredComputation, dataset: Sequence[Any],
                                if _is_cuda(x)):
             GpuBlake3().kernels(d)
             measure_kernel.kernels(d, verifier.k)
+            challenge_source.xof_kernels(d)  # the GPU challenge source's kernel (FS41)
         if verifier.start_run(dataset) is not None:
             link.stop(grace=0)
             result.verdict = verifier.end_run(final)

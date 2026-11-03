@@ -33,8 +33,9 @@ on that stream until a :func:`drain` has waited for the call's event, so the cac
 reusing their blocks is stream-ordered and needs no ``record_stream``; the inputs made on the
 current stream are held by :class:`Pending` until that event, which is what keeps their blocks
 out of reuse (the capture's staging does the same, ``prover/capture.py``). :func:`overlap`
-turns the whole thing off for tests. :func:`prefetch` hands the draw of a later call to the
-challenge source's worker thread (``challenge_source``).
+turns the whole thing off for tests. The challenges come from :func:`default_source`, the GPU
+source (FS41), which draws them on the measure stream; :func:`prefetch` hands a later call's
+draw to the host source's worker thread, and does nothing for any other source.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ from verification.commitment import gpu_blake3 as gb
 from verification.commitment import native
 from verification.verifier.matmul_check.challenge_source import (
     ChallengeSource,
+    GpuChallengeSource,
     HostChallengeSource,
     Prefetch,
 )
@@ -1034,7 +1036,7 @@ def prefetch(h: bytes, ms: Sequence[int], k: int, widths: Sequence[int],
     :func:`enqueue` takes them: each product's ``P`` columns) to the source's worker thread, for
     a later call's ``prefetched=``. ``None`` while :func:`overlap` is off or when the source
     cannot prefetch."""
-    source = challenges if challenges is not None else _DEFAULT_SOURCE
+    source = challenges if challenges is not None else default_source()
     if not _overlap_on or not isinstance(source, HostChallengeSource):
         return None
     return source.prefetch(h, ms, k, widths)
@@ -1042,7 +1044,19 @@ def prefetch(h: bytes, ms: Sequence[int], k: int, widths: Sequence[int],
 
 # ---- the call ----
 
-_DEFAULT_SOURCE = HostChallengeSource()
+_DEFAULT_SOURCE: ChallengeSource = GpuChallengeSource()
+
+
+def default_source() -> ChallengeSource:
+    """The source :func:`enqueue` and :func:`prefetch` use when not given one."""
+    return _DEFAULT_SOURCE
+
+
+def set_default_source(src: ChallengeSource) -> ChallengeSource:
+    """Make ``src`` the default source and return the previous one, for tests and comparisons."""
+    global _DEFAULT_SOURCE
+    before, _DEFAULT_SOURCE = _DEFAULT_SOURCE, src
+    return before
 
 
 def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool = True,
@@ -1053,7 +1067,7 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
     :func:`overlap` is off), after the work the current stream has enqueued; nothing is read
     back and nothing waits for the device (see :func:`drain`). ``prefetched`` (:func:`prefetch`)
     supplies the challenges when it covers them. ``run`` replaces the loaded kernel
-    (``run(launches, stream)``) and ``challenges`` the host source. Every call is one launch per
+    (``run(launches, stream)``) and ``challenges`` the default source. Every call is one launch per
     level of a plan through ``pots_measure_level`` (the launches of ``run`` carry
     :class:`LevelArgs`): :func:`read_plan` for ``share=True`` (which also appends the plan to
     ``plan_out``, a list) and :func:`plain_plan` (three levels, no shared reads) otherwise; the
@@ -1069,7 +1083,7 @@ def enqueue(groups: Sequence["MeasureGroup"], *, h: bytes, k: int, guard: bool =
         produced.record(stream)
         side.wait_event(produced)
         stream = side
-    source = challenges if challenges is not None else _DEFAULT_SOURCE
+    source = challenges if challenges is not None else default_source()
     structure = table_structure(groups, k, guard, share, _validated=(device, counts))
     extra = {}
     if prefetched is not None and isinstance(source, HostChallengeSource):

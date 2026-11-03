@@ -40,6 +40,7 @@ from verification.verifier.driver import Verifier
 from verification.verifier.matmul_check import freivalds
 from verification.verifier.matmul_check import measure_kernel as mk
 from verification.verifier.matmul_check import measure_table as mt
+from verification.verifier.matmul_check.challenge_source import HostChallengeSource
 
 
 def emulation(hostlib):
@@ -99,6 +100,7 @@ def test_the_honest_step_is_the_same_cold_warm_and_with_both_caches_off(switch, 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(freivalds, "kernel_device", lambda device: freivalds._reference_depth == 0)
         mp.setattr(freivalds, "measure_groups_rows", emulation(hostlib))
+        mp.setattr(mk, "_DEFAULT_SOURCE", HostChallengeSource())  # FS41: the default is the GPU's
         c, D, tree, w0 = _setup("mac", switch, dtype)
         mk.table_cache_clear()
         mk.table_cache_stats(reset=True)
@@ -140,6 +142,7 @@ def test_a_planted_flip_is_the_same_cold_warm_and_with_both_caches_off(cls, dtyp
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(freivalds, "kernel_device", lambda device: freivalds._reference_depth == 0)
         mp.setattr(freivalds, "measure_groups_rows", emulation(hostlib))
+        mp.setattr(mk, "_DEFAULT_SOURCE", HostChallengeSource())  # FS41: the default is the GPU's
         c, D, tree, w0 = _setup("mac", SWITCHES[0], dtype)
         m = _flip_target(c, cls)
         out, _ = _prove(c, D, w0, perturb={m: _flip})
