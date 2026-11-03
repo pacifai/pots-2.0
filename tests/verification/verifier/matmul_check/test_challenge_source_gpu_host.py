@@ -275,3 +275,9 @@ def test_draw_rejects_a_device_that_is_not_the_streams():
     st = SimpleNamespace(device=torch.device("cuda", 1))
     with pytest.raises(ValueError, match="stream is on"):
         cs.GpuChallengeSource().draw(H, [3], 2, [8], stream=st, device="cuda:0")
+
+
+def test_draw_rejects_an_h_of_31_bytes_on_a_cuda_stream_before_touching_the_device():
+    """The length check runs before any CUDA call, so a stand-in stream is enough."""
+    with pytest.raises(ValueError, match="32 bytes"):
+        cs.GpuChallengeSource().draw(bytes(31), [1], 2, [8], stream=FakeStream())
