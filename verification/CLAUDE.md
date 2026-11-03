@@ -2134,6 +2134,15 @@ interface.
     (`HostChallengeSource.fast_draws` counts them). The slot's fill, `h` and `k` are still
     compared on every call. Both LRUs (`TABLE_CACHE_MAX`, `LAYOUT_CACHE_MAX`) also drop the
     oldest entries of a last bucket that is over the cap.
+- `challenge_xof.h`, `challenge_xof.cu` (FS41a): check 5's challenge entries drawn on the GPU,
+  bit for bit P8b's. A unit is one output block of one vector (item, `j` fastest, block `b`):
+  one `pots_compress_xof` (the key as chaining value, the label as the block, flags 27, all 16
+  words) and up to 16 entries written at `[row, j - 1]` of the item's `[width, k]` matrix.
+  `pots_xitem_t` (24 bytes) and `pots_xparams_t` (64 bytes) are pinned; the params hold the
+  item table's and output's addresses. `pots_challenge_xof` is a 256-thread grid-stride loop.
+  `test_challenge_xof_host.py` builds the header (`challenge_xof_host.c`) and the `.cu` itself
+  (`challenge_xof_sim.cpp`, a grid smaller than the units) on the Mac and compares every entry
+  with `challenge_matrices`, with a NaN sentinel for write-once, and pins the structs' layout.
 - `sizing.py` (B4, merged):
   - `Z`, `F_TARGET` and `C_ANTI`.
   - `e_m(q, eps_in, eps_acc, u_ratio=1.0)` is F18's split, `√2·ε_in + √q·ε_acc·max(1,
