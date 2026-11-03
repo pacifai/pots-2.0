@@ -45,12 +45,16 @@ def test_prebuild_builds_every_k_on_every_cuda_device_and_nothing_on_cpu(monkeyp
     placement (no repeats), and a CPU run builds nothing."""
     built = []
     monkeypatch.setattr(kt.measure_kernel, "kernels", lambda d, k=None: built.append((str(d), k)))
+    xof = []
+    monkeypatch.setattr(kt.challenge_source, "xof_kernels", lambda d: xof.append(str(d)))
     plc = SimpleNamespace(devices=(torch.device("cuda", 1), torch.device("cuda", 0)))
     kt.prebuild_measure_kernels(SimpleNamespace(placement=plc), "cuda:0", [1, 2])
     assert built == [("cuda:0", 1), ("cuda:0", 2), ("cuda:1", 1), ("cuda:1", 2)]
+    assert xof == ["cuda:0", "cuda:1"]  # FS41: the GPU challenge source's kernel, once a device
     built.clear()
+    xof.clear()
     kt.prebuild_measure_kernels(SimpleNamespace(), "cpu", [1, 2, 3])
-    assert built == []
+    assert built == [] and xof == []
 
 
 def test_run_k_prebuilds_every_swept_k_before_the_timed_rounds(env, stored, monkeypatch):  # noqa: F811

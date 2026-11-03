@@ -2108,11 +2108,22 @@ interface.
     stream wait for writes queued behind a long sleep on the current stream.
   - `challenge_source.py`: `ChallengeSource.draw(h, ms, k, widths, *, stream)` returns one
     float32 buffer holding each product's `challenge_matrix(h, m, k, width)`, the byte offset
-    of each, and an event recorded after the work that fills it (`None` on the CPU). It is the
-    seam for the hashing session's GPU XOF (FS41). `HostChallengeSource` is the one in use:
+    of each, and an event recorded after the work that fills it (`None` on the CPU).
+    `HostChallengeSource` is the CPU path and the reference:
     the native library draws the entries on the host into a pinned buffer, once per distinct
     width, and one non-blocking copy sends it up; the staging buffer lives until that copy's
     event completes.
+    FS41: `GpuChallengeSource` is the default on CUDA (`measure_kernel.default_source()`;
+    `set_default_source(src)` swaps it and returns the previous one, for tests and comparisons).
+    `xof_plan(ms, k, widths)` builds the item table (`XITEM_DTYPE`, `pots_xitem_t`) and the
+    offsets, the host source's inline draw's; `xof_params` fills `XParams` (`pots_xparams_t`);
+    `xof_kernels(device)` builds `challenge_xof.cu` through `gpu_blake3` (`--fmad=false`, cached,
+    loaded once per device; the run's pre-build calls it). `draw` looks the request up in an LRU
+    of `LAYOUT_CACHE_MAX` entries per `(device, k, ms, widths)` (identity, then equality), each
+    holding the item table on the device, uploaded once on the drawing stream with an event
+    every later draw's stream waits on, and the read-only offsets; it then allocates the
+    output on its stream, launches one kernel and records an event. `prefetched` is ignored and
+    `measure_kernel.prefetch` returns `None` for it; a CPU device draws on the host source.
     FS39: `prefetch(h, ms, k, widths)` fills one of a pool of two pinned buffers on a single
     worker thread and returns a `Prefetch` (layout keyed `(m, width)`, the future, its slot);
     `draw(prefetched=)` waits for it and makes the one device copy, or draws inline when the
@@ -2172,9 +2183,10 @@ sequential schedule and seed 0. The re-runs of 2026-10-11, on today's `D` and `Ï
     `final` is the agreed final weights for check 8.
   - Before `verifier.start_run` (so before step 1), `run_loop` builds
     `measure_kernel.kernels(d, k)` beside `GpuBlake3().kernels(d)` on every CUDA device of the run
-    (FS37; `k` is `verifier.k`, one image per chunk size), so the first NVRTC build or cache load
+    (FS37; `k` is `verifier.k`, one image per chunk size) and `challenge_source.xof_kernels(d)`
+    (FS41, the GPU challenge source's kernel), so the first NVRTC build or cache load
     lands outside every timed section, check 0's hash of `W_0` included. The pipelined loop's
-    pre-build is FS34's, at the same place.
+    pre-build is FS34's, at the same place, and so is `k_tunability.prebuild_measure_kernels`'s.
   - `release_device_cache(device, section=None, *, devices=None)`: only when the run's
     `device` or any of `devices` (the sharded run's verifier devices, `c.placement.devices`;
     FS32d) is CUDA (`torch.device(device).type == "cuda"`, not whether CUDA is initialized in

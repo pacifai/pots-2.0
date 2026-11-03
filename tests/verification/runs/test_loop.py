@@ -266,12 +266,13 @@ def test_loop_is_instance_agnostic():
 # ---- the hand-off's cache release ---------------------------------------------------------
 
 
-def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, kernel_calls=None, **kw):
+def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, kernel_calls=None, xof_calls=None, **kw):
     """Run the loop with ``torch.cuda`` stubbed and the model's device taken for CUDA when
     ``cuda``, logging sections, cache releases and verifier calls in order; also whether each
     step's ``StepOutput`` was gone at its release. ``env`` sets ``VERIF_RELEASE_CACHE`` (unset
     by default). ``kernel_calls``, when a list, collects ``(device, len(log), k)`` for every call of
-    ``measure_kernel.kernels``, so a test can place the call among the logged sections."""
+    ``measure_kernel.kernels``, so a test can place the call among the logged sections;
+    ``xof_calls`` likewise collects the devices of ``challenge_source.xof_kernels``."""
     log, refs, gone = [], {}, []
     monkeypatch.delenv("VERIF_RELEASE_CACHE", raising=False)
     if env is not None:
@@ -299,6 +300,9 @@ def _watch_handoff(c, D, w0, final, monkeypatch, *, cuda, env=None, kernel_calls
             kernel_calls.append((torch.device(device), len(log), k))
 
     monkeypatch.setattr(loop_mod.measure_kernel, "kernels", kernels)
+    monkeypatch.setattr(loop_mod.challenge_source, "xof_kernels",  # FS41's kernel, faked
+                        lambda device: xof_calls is None or xof_calls.append(
+                            (torch.device(device), len(log))))
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: not cuda)  # not what decides
     monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
     orig = Verifier.verify_step
@@ -352,9 +356,12 @@ def test_the_measuring_kernel_is_built_once_before_every_section_on_cuda(c, D, w
     """Mac twin of the CUDA file's pre-build test: ``measure_kernel.kernels`` is called once
     before the first section opens (before ``start_run``'s check 0 and the dataset tree), for the
     model's device, and sections follow."""
-    calls = []
-    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, kernel_calls=calls)
+    calls, xof = [], []
+    res, log, _ = _watch_handoff(c, D, w0, final, monkeypatch, cuda=True, kernel_calls=calls,
+                                 xof_calls=xof)
     assert res.verdict.accepted
+    assert [d for d, _ in xof] == [torch.device("cpu")], xof  # FS41: the XOF kernel, same place
+    assert xof[0][1] == calls[0][1], (xof, calls)
     first = next(i for i, x in enumerate(log) if not x.startswith("warm"))  # the first section
     assert [d for d, _, _ in calls] == [torch.device("cpu")], calls  # the model's device, once
     assert [k for _, _, k in calls] == [K], calls  # the run's k, one image per chunk size

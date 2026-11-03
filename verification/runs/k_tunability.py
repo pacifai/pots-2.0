@@ -104,7 +104,7 @@ from verification.verifier.bands import Bands
 from verification.verifier.calibration import band_context, load_bands
 from verification.verifier.checks import CHECKS, DEFAULT_ORDER
 from verification.verifier.context import Rejection, StepContext, StepState, StepStats
-from verification.verifier.matmul_check import measure_kernel
+from verification.verifier.matmul_check import challenge_source, measure_kernel
 from verification.verifier.matmul_check.challenges import encode_label
 from verification.verifier.matmul_check.sizing import (
     C_ANTI,
@@ -415,6 +415,7 @@ def prebuild_measure_kernels(c: DeclaredComputation, device: str | torch.device,
         if d.type == "cuda":
             for k in ks:
                 measure_kernel.kernels(d, k)
+            challenge_source.xof_kernels(d)  # the GPU challenge source's kernel (FS41)
 
 
 def run_k(c: DeclaredComputation, kept: KeptStep, bands: Bands, *, seed: int, h_D: bytes,
