@@ -460,7 +460,11 @@ change `setup/data.py`, the config and the pinned roots.
 | FS38b | Shared reads in the kernel, one table per unit, one-sided shares only (2.4, 2.4a, §5; user, 2026-10-22) | FS38a | on the A40 kernel rows equal FS37's bit for bit, reads saved reported per unit |
 | FS39 | Overlap with the glue (2.5): a measure stream per device, one unit in flight, holds, worker-thread challenges, pinned row readback; the metrics of 2.7 | FS38 | on the A40 rows and verdicts equal FS38's bit for bit, a write to a held operand raised; on a two-GPU NVLink pod (two A100 SXM, about $3.6 per hour) with `VERIF_VERIFIER_DEVICES`, rows and verdicts equal the one-GPU run's |
 | FS40 | H100 timing: one verified step per full-scale model, traced on Llama-3.2-1B, check 5's sections against the plan's estimates, the band fit rerun with the kernel (one H100 SXM, about $4 per hour, about 1.5 h) | FS39 | each model's `5.measure` and verifier time reported against the 2026-10-20 pod's, the kernel equal to the host build on sampled products → **Milestone FM11** |
-| FS41 | The GPU challenge source: the hashing session's keyed XOF behind `ChallengeSource` (2.6) | FS39, the hashing session's XOF | on a CUDA GPU the device challenges equal `challenge_matrices`' bit for bit for every product of a step; FS40's Llama step timed again |
+| FS41 | The GPU challenge source (2.9, planned 2026-11-03): the keyed XOF on the verifier GPU behind `ChallengeSource`, from F23's BLAKE3 code | FS39 | FS41a–FS41d: on a CUDA GPU the device challenges equal `challenge_matrices`' bit for bit for every product of a step; the two-H100 Qwen step timed against the code before it |
+| FS41a | The core, the kernel and the host build (2.9) | — | on the Mac: 2.9's host-build tests |
+| FS41b | `GpuChallengeSource`, the default source and the prebuild (2.9) | 2.9's pinned structs | on the Mac: 2.9's Python tests; the fast suite as before |
+| FS41c | Tests (2.9): `plan` through the host build, the CUDA tests, the CUDA prefetch tests pinned to the host source | FS41a, FS41b | on the Mac: pass, the CUDA tests collected and skipped |
+| FS41d | The two-H100 run (2.9) | FS41c merged, the validator | 2.9's expected lines hold |
 | FS44 | One leaf per attention product (O18), the amendments: spec §4.1, the reference block §5–§6, `DECISIONS_SETUP.md` P9b and P8a, this table, `STATUS.md`, `PERFORMANCE_TASKS.md` O18 (orchestrator) | the user's approval (2026-10-28) | the texts are in, the files unlocked |
 | FS45 | O18's code core, in three parts (`ATTENTION_LEAF_PLAN_DRAFT.md` §5): FS45a `C`'s leaf map, placement, the commitment's slots, `leaf_sizes` and the reads; FS45b labeling into product leaves and `prove_step`; FS45t the security tests of §4.1 | FS44 beside FS45a and FS45t; FS45a before FS45b | an honest SmolLM2 step commits 1,361 leaves and is accepted; §4.1's five tests pass |
 | FS46 | O18: the capture's arrival hashing of whole outputs | the user's approval | the capture's tests pass on the Mac; its CUDA tests on the A40 in FS48 |
@@ -588,7 +592,7 @@ soon as its dependencies close, before FM5 if it can. FM3 is dropped with FS8; F
 the end. The profiling tasks run beside the hashing build: {FS18, FS19, FS21, FS22} →
 {FS20, FS24, FS25} → FS23 → FS27 (FM8), all before FS14; FS26 any time before FM7. FM9 and
 FM10 run in parallel: FS28 → FS29 (gate) → FS30 (FM9); FS31 (gate) whenever a four-H100 pod is
-available, and {O10, O11 merged} → FS32 → FS33, then FS34 once FM9 closes → FS35 (FM10). FM11 runs beside them: FS36 → FS37 → FS38a → FS38b → FS39 → FS40 (FM11), FS41 once the keyed XOF exists.
+available, and {O10, O11 merged} → FS32 → FS33, then FS34 once FM9 closes → FS35 (FM10). FM11 runs beside them: FS36 → FS37 → FS38a → FS38b → FS39 → FS40 (FM11), FS41a and FS41b side by side → FS41c → FS41d (planned 2026-11-03).
 
 **Attack-success scoring is postponed (F6c, 2026-10-08, user).** The pilot and its cost
 estimate are gone; FS7, B8 and the attack-success table move to the end of implementation and

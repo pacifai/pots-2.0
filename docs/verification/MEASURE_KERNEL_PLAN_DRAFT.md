@@ -335,7 +335,9 @@ bytes: the host source (the native `challenge_matrices` into a pinned buffer, th
 non-blocking copy), used first, and the GPU source, the hashing session's keyed XOF writing
 the entries straight into device memory (FS41). The layout is today's: fp32 `[width, k]` per
 product, column `j−1` vector `j`. The buffer is on the stream's device: a unit's challenges are
-drawn for the GPU that measures it.
+drawn for the GPU that measures it. (Amended 2026-11-03, FS41: the GPU source is this line of
+work's own keyed XOF on F23's BLAKE3 code, and the default on CUDA; the host source stays the CPU
+path and the reference. 2.9 has the design.)
 
 ### 2.7 Metrics under overlap
 
@@ -350,6 +352,163 @@ new is added to them. Decided with the plan (user, 2026-10-21):
   plan's table build and its copy; `c5.judge` covers the end-of-check windows.
 - `c5_layout.json`'s `served_bytes` counts the products as measured on the device, now in
   their stored dtype rather than fp32, which is what its definition says.
+
+### 2.9 The GPU challenge source (FS41, drafted 2026-11-03)
+
+**Why now (user, 2026-11-03: "Solve FS41 to permanently fix the slow-host problem").** The host
+source (2.6) draws on FS39's worker thread: about 0.73 s of host CPU per Qwen2.5-0.5B step at
+`k = 21` (2.1 GB of entries, about 5.5 million keyed XOF calls). On most hosts that hides under
+the glue. On some the draw runs about 5 times slower and check 5 waits for it: on FS58's pod
+(AMD EPYC 9554, 2026-11-02) 3.9 s of `5.measure`'s 4.3 s were 23 waits of 124–191 ms on the
+prefetch, against 0.48 s on FS57's Xeon host; on 2026-10-20 one Intel host drew 4.4 times slower
+than another (`ONE_VERIFIER_PLAN_DRAFT.md` §3). The host-side cause is not known. Drawing on the
+verifier GPU removes the dependence on it. "The hashing session's XOF" the row below waited on is
+this line of work's own: F23's BLAKE3 code, extended to the keyed XOF here.
+
+**What changes.** Nothing that is committed or checked: every entry is P8b's, bit for bit. Only
+where the bytes are made moves, from the host to the GPU that measures them.
+
+**The core (`verification/verifier/matmul_check/challenge_xof.h`).** Plain C that NVRTC and a host
+C compiler both build, like `gpu_blake3_core.h`, which it includes for the round macros; that
+header and the hash kernel's cache key are unchanged. A unit is one 64-byte output block of one
+challenge vector: item `i`, vector `j` (1-based), output block `b`. The label `0x10 ‖ m(4,
+big-endian) ‖ j(1)` fits one block, so each output block is one compression: chaining value the
+key `h` (8 little-endian words), the label padded with zeros as the block, counter `b`, block
+length 6, flags `CHUNK_START | CHUNK_END | ROOT | KEYED_HASH` (1 | 2 | 8 | 16 = 27), and all 16
+output words (`v[i] ^ v[i+8]`, then `v[i+8] ^ key[i]`), as BLAKE3's XOF defines them. Word `w` of
+block `b` is entry `16b + w` (entries at or past the width are dropped), mapped as P8b says
+(`a = w >> 8`, `(2a + 1 − 2²⁴)·2⁻²⁴`, exact in fp32), and written at row `16b + w`, column
+`j − 1` of the item's `[width, k]` matrix. Pinned structs:
+
+```c
+typedef struct {        /* 24 bytes */
+  pots_u32 m;           /* the product's label m, 1 <= m < 2^32 */
+  pots_u32 width;       /* entries per vector, >= 1 */
+  pots_u64 unit0;       /* the item's first unit: sum over earlier items of k*ceil(width/16) */
+  pots_u64 out_off;     /* the item's first entry in out, in float32 entries */
+} pots_xitem_t;
+
+typedef struct {        /* 64 bytes */
+  pots_u32 key[8];      /* h as 8 little-endian words */
+  pots_u32 k;           /* 1 <= k <= 255 */
+  pots_u32 n;           /* items */
+  pots_u64 units;       /* sum of k*ceil(width/16) over all items */
+  pots_u64 items;       /* address of pots_xitem_t[n] */
+  pots_u64 out;         /* address of the float32 output */
+} pots_xparams_t;
+```
+
+`pots_compress_xof` returns the 16 words; `pots_xof_unit(P, u)` finds the item holding unit `u`
+(binary search on `unit0`), takes `b = (u − unit0) / k` and `j = (u − unit0) % k + 1`, compresses
+once and writes up to 16 entries. An item's units run with `j` fastest, so a warp's writes to one
+row land on neighbouring addresses.
+
+**The kernel (`challenge_xof.cu`).** `pots_challenge_xof(pots_xparams_t P)`: 256 threads a block,
+a grid-stride loop over the units. Built by NVRTC through `gpu_blake3`'s `Source` and
+`build_image` with `--fmad=false`, prefix `challenge_xof`, cached under `native.cache_dir()`,
+loaded once per device, launched on the stream `draw` is given.
+
+**The source (`challenge_source.py`, `GpuChallengeSource`).** `draw(h, ms, k, widths, *, stream,
+device=None, prefetched=None)`, as `ChallengeSource` says; `prefetched` is ignored. Items are in
+request order, each member its own matrix, the layout of the host source's inline draw, so the
+offsets are the same bytes. A cache entry per request (device, `k`, `ms`, `widths`; the tuples
+compared by identity, then equality; evicted as the host source's layout cache evicts, by
+bucket, least recently used first, past `LAYOUT_CACHE_MAX`) holds the item table on the device, copied once on the drawing stream with an event that every later
+draw's stream waits on, the offsets (read-only) and the totals. P8a's ranges and `k` in 1–255
+are checked when an entry is built; `h` (32 bytes), which no entry holds, on every draw. A draw then allocates the output on its
+stream, launches one kernel and records the event. A CPU device delegates to a
+`HostChallengeSource`. `plan(h, ms, k, widths)` returns the item table, offsets and params with no
+device, for the host build's tests.
+
+**Routing.** `measure_kernel`'s default source becomes `GpuChallengeSource()`. `enqueue` runs only
+on CUDA, so every kernel draw takes it. `prefetch` already returns `None` for a source that is not
+a `HostChallengeSource`, so check 5's prefetch (`_prefetch_step`) does nothing and FS39's worker
+thread stays idle. `set_default_source(src) -> previous` swaps the source, for tests and
+comparisons. The host source stays, as the CPU path and the reference. `run_loop`, the pipelined
+parent and `k_tunability.prebuild_measure_kernels` build the XOF kernel beside the measuring
+kernel, outside every section.
+
+**Expected cost** (estimates, Qwen2.5-0.5B's step at `k = 21`, one H100).
+- The work: 2.1 GB of entries, 33 million compressions.
+- Floor: about 1.6 ms of 32-bit integer work (about 800 operations a compression, 64 a clock per
+  SM, 132 SMs at 1.98 GHz) beside 0.7 ms of writes at 3 TB/s.
+- Measured kernel expected at 3–10 ms a step, on the measure stream ahead of each unit's
+  measuring; about 32 draws a step, each one cached lookup, one allocation and one launch on the
+  host.
+- Removed: 0.73 s of host CPU a step (about 3.6 s on FS58's host) and 2.1 GB of pinned
+  host-to-device copies (about 40 ms of link time, hidden today).
+- Check 5: on a fast host about as now, since the draw was hidden; on a slow host it drops by the
+  waits, `5.measure` 4.3 s → about 0.5 s on FS58's host.
+- GPU memory: the output buffer replaces the host source's device copy; the cached item tables
+  add 24 bytes a product, under 1 MB a request, at most `LAYOUT_CACHE_MAX` requests a source.
+
+**Tests.**
+- Mac, the host build (`tests/verification/verifier/matmul_check/challenge_xof_host.c`, built
+  with `-ffp-contract=off`): every entry equal to `challenge_matrices` bit for bit, written, and
+  nothing outside the items touched (a NaN sentinel), on widths 1, 15, 16, 17, 31, 33, 128, 896, 4,864 and 151,936,
+  `m` at 1 and 2³² − 1, `k` at 1, 2, 9, 16, 21 and 255, several keys; the structs' sizes and field
+  offsets against the ctypes mirror; `plan`'s table and offsets against the host source's inline
+  draw, run through the host build.
+- Mac, Python: the cache (identity hit, equality hit, eviction), the validation errors, the default
+  source and `set_default_source`, the prebuild calls.
+- CUDA (on the pod): `GpuChallengeSource.draw` equal to `HostChallengeSource.draw` byte for byte on
+  random requests and on every request a tiny decoder step's check 5 makes; a draw on a side
+  stream read on another stream after its event; check 5's rows of the tiny decoder step equal
+  under either source. CUDA tests of the host source's prefetch are pinned to the host source,
+  and the step-level overlap tests run under both sources, so each keeps step-level coverage.
+
+**The run (FS41d).** Two H100 SXM in the one-verifier layout of `ONE_VERIFIER_PLAN_DRAFT.md` §2
+(Qwen2.5-0.5B, GPU 0 trains, GPU 1 verifies), where the slow draw was seen, in place of FS40's
+one-H100 Llama step: the target layout has changed since the row was written. The plan file is
+built by a scratch script, as FS57's was. Parts: the native build, the models part, the CUDA tests
+of this section and the measuring kernel's, a full-step draw check (a scratch script whose source
+draws on the GPU and on the host and compares every request of one Qwen step), then `seq_Qwen`,
+`seq_Qwen_base`, `pipe_Qwen` and `pipe_Qwen_base` (`llama_step --steps 4 --metrics --no-count`,
+the sequential arms' step 4 traced with `VERIF_TRACE_C5=all`; base = `verification-impl` before
+FS41 from `repo_base/`; `compare` on). Expected:
+- every step accepted; roots, step records and residual archives equal across main and base;
+- the full-step draw check equal on every request;
+- in the main arms no main-thread wait in `5.measure` on the draw, and the XOF kernel's GPU time
+  in step 4's trace within the estimate above;
+- on the same pod, the base arms' waits against none in the main arms. If this host draws fast,
+  the arms come out close and the trace still shows the draw gone from the host.
+
+About 60 minutes on two H100s at about $8 an hour; the self-delete deadline at 120 minutes caps it
+near $16.
+
+**Measured (FS41d, 2026-11-03).** Two pods, each two H100 SXM in AP-JP-1 at $7.98 an hour on an
+Intel Xeon Platinum 8460Y+ host, about $8.7 in all. The first (`ngkh7l1nwit7bt`) ran the CUDA tests
+(624 passed) and the full-step draw check: 64 requests, 1,009,913,856 entries, no mismatch. Its
+models part timed out fetching from Hugging Face (720 s), and the arms were lost. The second
+(`f19gij23yw6rjk`) took the Qwen weights with the upload and dropped the models part. It ran the
+four arms at `--steps 5`, the sequential arms tracing step 5 so that steps 2–4 stay untraced, then
+a CPU-starved pair: both sequential arms pinned to four cores (`taskset -c 0-3`), standing in for a
+slow host. Every step of the six arms was accepted; their roots, step records and residual
+archives are equal bit for bit.
+
+Steady steps 2–4, wall time per step:
+
+| arm | interval, main | interval, base | check 5, main | check 5, base |
+|---|---|---|---|---|
+| sequential | 2.69 s | 2.74 s | 1.30 s | 1.36 s |
+| pipelined | 1.93 s | 2.02 s | 1.22 s | 1.32 s |
+| sequential, four cores | 3.13 s | 3.23 s | 1.40 s | 1.60 s |
+
+The traced step 5 of the sequential arms (`5.measure`'s 81 host spans):
+- `5.measure` on the host: main 0.46 s, base 0.52 s; on four cores main 0.48 s, base 0.85 s.
+- The part no op and no CUDA call covers (on the base, mostly the wait for the worker's draw):
+  main 0.14 s, base 0.24 s; on four cores main 0.18 s, base 0.41 s. No span has more than 50 ms
+  of it in any arm.
+- The XOF kernel: 32 launches, 1.78 ms of GPU time for the step, below the 3–10 ms estimate and
+  about 1.1 times the 1.6 ms integer floor.
+
+This host draws fast, so on all its cores main and base come out close, as the expected lines
+allowed: the interval is 2–4% shorter and check 5 4–8%. On four cores the base's `5.measure`
+rises by 0.33 s and main's by 0.02 s, so main's check 5 no longer depends on the host for its
+challenges. Main's check 5 still grows by 0.10 s on four cores, from the glue and the serving on
+the host, not the draw. FS58's AMD host, where the draw cost 3.9 s, wasn't available to rerun, and
+four Intel cores make a milder slow host: the starved pair shows the direction, not FS58's size.
+Results are in session a0413674's scratchpad, `fs41/pod/out/` (the first pod's in `fs41/pod/run1/`).
 
 ## 3. Expected cost
 
@@ -382,7 +541,11 @@ to three rounds.
 | FS38b | Shared reads in the kernel, one table per unit, one-sided shares only (2.4, 2.4a, §5) | FS38a | on the A40: kernel rows equal FS37's bit for bit, and the reads saved reported per unit |
 | FS39 | Overlap (2.5): a measure stream per device, one unit in flight, holds, the worker-thread challenges, pinned row readback; the metrics of 2.7 | FS38b | on the A40: rows and verdicts equal FS38's bit for bit, a write to a held operand during a read raised; on a two-GPU NVLink pod with `VERIF_VERIFIER_DEVICES`: rows and verdicts equal the one-GPU run's |
 | FS40 | H100 timing: one verified step per full-scale model with the trace on Llama-3.2-1B, check 5's sections against §3's estimates, and the band fit rerun with the kernel | FS39 | each model's `5.measure` and verifier time reported against the old pod's, the kernel equal to the host build on a sample of products → **Milestone FM11** |
-| FS41 | The GPU challenge source: the hashing session's keyed XOF behind `ChallengeSource` | FS39, the hashing session's XOF | on a CUDA GPU the device challenges equal `challenge_matrices`' bit for bit for every product of a step; FS40's Llama step timed again |
+| FS41 | The GPU challenge source (2.9): the keyed XOF on the verifier GPU behind `ChallengeSource`, from F23's BLAKE3 code (planned 2026-11-03) | FS39 | FS41a–FS41d done: on a CUDA GPU the device challenges equal `challenge_matrices`' bit for bit for every product of a step; the two-H100 Qwen step timed against the code before it (2.9's run) |
+| FS41a | The core, the kernel and the host build (2.9): `challenge_xof.h`, `challenge_xof.cu`, `challenge_xof_host.c` | — | on the Mac: 2.9's host-build tests |
+| FS41b | `GpuChallengeSource`, the default source and the prebuild (2.9) | the pinned structs (2.9) | on the Mac: 2.9's Python tests; the fast suite as before |
+| FS41c | Tests (2.9): `plan` through the host build, the CUDA tests, the CUDA prefetch tests pinned to the host source | FS41a, FS41b | on the Mac: pass, the CUDA tests collected and skipped |
+| FS41d | The two-H100 run (2.9) | FS41c merged, the validator | 2.9's expected lines hold |
 
 FS36 starts at once. FM11 doesn't wait for FS41. The four-GPU work (FM10) built FS32 and FS33
 on the same check-5 code; FS38 and FS39 change `_read_rows` and the serving, so they are
@@ -423,8 +586,9 @@ deadline.
   stamp on another GPU's measure stream must resolve against its own device's anchor; FS39
   builds that.
 
-- **The GPU XOF.** FS41 waits on the hashing session's keyed-XOF kernel; until then the host
-  draw runs on a worker thread, still about 0.73 s of host CPU per step.
+- **The GPU XOF** (resolved 2026-11-03). FS41 waited on a keyed-XOF kernel; it was built as
+  2.9's own kernel and merged on 2026-11-03 (a903d57), so the draw no longer runs on the host
+  (2.9's "Measured").
 - **The CUDA test that failed (resolved 2026-10-21).** `test_tiny_decoder_step_on_cuda[fp32-2]`
   and `[bf16-2]` raised a `LabelingError` (`Lambda[0]` got `(24, 32)`, expected `(12, 32)`).
   The cause was the test helper, not CUDA: `run_capture` captured the step as one whole-batch

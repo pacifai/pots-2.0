@@ -252,6 +252,20 @@ pod 4.5 h, H100 job 3.5 h. Mac rehearsal: Qwen2.5-0.5B refusal at
   removed and the remaining bottlenecks. The two
   same-bits alternatives, batching the per-leaf work (O15) and the cross-process store (O16),
   are archived in `archive/LEAF_SPEED_ALTERNATIVES.md`.
+  **The GPU challenge source (2026-11-03).** FS41 (`MEASURE_KERNEL_PLAN_DRAFT.md` §2.9): check
+  5's challenge matrices are drawn on the verifier GPU by our own keyed BLAKE3 XOF kernel
+  (`challenge_xof.cu`, on F23's BLAKE3 core), bit for bit P8b's, so check 5 no longer waits on a
+  host draw that runs about 5× slower on some pods (FS58's AMD pod: 3.9 s of `5.measure`'s
+  4.3 s). FS41a–FS41c **merged into `verification-impl` on 2026-11-03 (a903d57)**:
+  `GpuChallengeSource` is the default on CUDA, the host source stays the CPU path and the
+  reference, and no protocol bit changed. The validator passed in two rounds. **FS41d ran on
+  2026-11-03** (two pods of two H100s, Intel hosts, about $8.7; §2.9's "Measured"): 624 CUDA tests
+  passed, the full-step draw check matched all 1.0e9 entries, and every arm was accepted with
+  roots, step records and residual archives equal to the code before (253cbf9). The XOF kernel
+  takes 1.8 ms of GPU time a step. On this fast host the steady interval is 2–4% shorter (2.69 s
+  against 2.74 s sequential, 1.93 s against 2.02 s pipelined); with the arms pinned to four cores
+  check 5 takes 1.40 s against the base's 1.60 s, and `5.measure` on the host 0.48 s against
+  0.85 s, so check 5 no longer waits on the host for its challenges. FS41 is closed.
   **Resource profiling (user, 2026-10-18).** `archive/PROFILING_PLAN.md` holds the plan: tasks
   FS18–FS27, built beside the hashing build, and a short H100 check (FS27) that also measures
   check 5 on the four full-scale models and ends at **Milestone FM8** before FS14. Approved
