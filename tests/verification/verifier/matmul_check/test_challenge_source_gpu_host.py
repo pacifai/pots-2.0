@@ -226,3 +226,13 @@ def test_commitment_dir_points_at_the_core_header():
 def test_importing_builds_and_loads_nothing():
     assert cs._xof_built.cache_info().currsize == 0
     assert cs._xof_kernels.cache_info().currsize == 0
+
+
+def test_cache_stores_the_requests_own_tuples_so_identity_hits(monkeypatch):
+    src, ups = _source(monkeypatch)
+    dev, st = torch.device("cuda", 0), FakeStream()
+    ms, widths = (3, 4, 5), (8, 8, 20)
+    e = src._lookup(dev, 2, ms, widths, st)
+    assert e.ms is ms and e.widths is widths
+    assert src._lookup(dev, 2, ms, widths, st) is e
+    assert src._lookup(dev, 2, (3, 4, 5), (8, 8, 20), st) is e and len(ups) == 1  # equality
